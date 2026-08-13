@@ -90,6 +90,116 @@ strength) rather than a stack of horizontal cuts.
   slicing — same core pattern (direction field -> integrated scalar
   field -> isosurfaces), different objective functions.
 
+## Alternative `order` construction: angle-driven front propagation
+
+A variant worth recording alongside S³-Slicer's deformation-based
+construction (point 3 above): build `order` directly as a **front-
+propagation / arrival-time field** instead of integrating a separately-
+optimized direction field.
+
+Concretely, treat `order` as the solution to an **Eikonal equation**,
+
+```
+|∇order(p)| = 1 / speed(p)
+```
+
+seeded at `order = 0` on the build plate (or on any already-solid
+geometry), solved via Fast Marching Method (FMM) or Fast Sweeping Method
+(FSM) — standard, decades-old computational-geometry machinery, not
+novel research. `order(p)` becomes the arrival time of a wavefront
+expanding outward from already-printed material; isosurfaces of that
+arrival-time field are the curved layers, exactly as in the main proposal
+above — the difference is *how* `order` is built, not what it means once
+built.
+
+The interesting part is what `speed(p)` encodes. This is motivated by how
+existing 2.5D slicers already handle small unsupported horizontal
+overhangs: print a "bridge" that overlaps the edge of already-solid
+material by just enough for adhesion/stiffness to hold it up, rather than
+generating support material. That is a discrete, per-layer heuristic
+today (e.g. the common "~1 nozzle diameter of unsupported cantilever"
+rule used for overhang/bridge detection in mainstream slicers). Folded
+into `speed(p)`, it generalizes directly into the continuous non-planar
+case:
+
+- Where the local surface normal is close to vertical (steep wall,
+  `angle_field(p)` near 90° from the gravity reference), `speed(p)` is
+  effectively unconstrained — the front advances at the normal per-layer
+  rate, same as ordinary slicing.
+- As the surface tips toward horizontal (`angle_field(p)` → 0°, i.e. an
+  overhang facing straight down), `speed(p)` shrinks, capping how far the
+  front is allowed to race ahead of already-solid material beneath or
+  beside it — i.e. bounding the unsupported bridging distance exactly the
+  way real bridge printing requires "correct overlap" with the previous
+  extrusion to hold.
+
+So `speed(p) = g(angle_field(tree, p, gravity))` for some monotonically
+increasing-with-angle shaping function `g`, built directly on the
+angle-field primitive already implemented in `manifold-fidget`
+(`angle_field` in `lib.rs`) — no new field abstraction needed, just an
+Eikonal solve consuming it as a spatially-varying speed term.
+
+This reframing is worth keeping alongside the deformation-based approach
+because it gives more concrete, checkable answers to two of the open
+questions below rather than leaving them purely hypothetical:
+
+- It doesn't dodge open question 1 (composability of derived fields) so
+  much as make its answer explicit up front: FMM/FSM are inherently
+  grid/narrow-band algorithms regardless of how the base SDF is
+  represented, so `order` was never going to be expressible as a fidget
+  `Tree` under this construction — a separate grid-based solve consuming
+  functional SDF/angle-field samples (the same pattern `marching_cubes`/
+  `slice::sample_plane` already use) is the expected shape, not an open
+  risk.
+- It gives a concrete mechanism for open question 2 (does `order` need
+  global re-solves, or can it be updated locally/incrementally as
+  printing progresses?): Fast Marching is inherently an incremental,
+  priority-queue-driven algorithm, and multiple disconnected sources of
+  already-solid material (e.g. two walls a bridge spans between) fall
+  out for free as multiple simultaneous seeds — no extra bookkeeping
+  needed for that case, unlike a from-scratch global deformation re-solve.
+
+**What this does not yet address**: it only encodes the "don't advance
+faster than the local bridging/overhang limit" printability constraint.
+S³-Slicer's objective also covers strength/fiber-alignment and surface-
+quality goals; folding those in here would mean generalizing `speed(p)`
+into a proper multi-term anisotropic cost function, not just a function
+of overhang angle — not attempted by this note.
+
+**Open sub-questions specific to this construction**:
+
+1. **Well-posedness**: `speed(p)` must stay strictly positive everywhere
+   the solve runs, or `order` diverges to infinity. Needs either a floor
+   speed (accepting that some regions genuinely need conventional support
+   material — a legitimate fallback outcome, not a bug) or an explicit
+   "unprintable without support" classification wherever the solve fails
+   to complete within a reasonable step bound.
+2. **Calibrating `g`**: the angle → max-reach mapping is an empirical/
+   physical question (filament stiffness, layer height, cooling, print
+   speed, extrusion width), not a purely mathematical one. Likely needs
+   to be a tunable function — candidate for eventually living on
+   `Material`/`SlicerConfig` rather than a fixed formula — calibrated
+   against real bridging-test prints, not derived from first principles
+   alone.
+3. **Grid/narrow-band vs. functional tension**: this needs a grid or
+   narrow-band discretization for the FMM/FSM solve itself, in tension
+   with the "functional representation" framing of the main proposal.
+   The expected resolution is a hybrid — `fidget::Tree` for the base SDF
+   and angle-field evaluation (functional, JIT/GPU-accelerated), grid-
+   sampled only for the `order` front-propagation solve — consistent with
+   how `manifold-fidget`'s existing `marching_cubes`/`slice::sample_plane`
+   already sample a functional field onto a grid, so not a new pattern
+   for this codebase, just a new consumer of it.
+4. **Relationship to extrusion amount (flow rate, pressure advance)**:
+   deliberately out of scope for this construction. `order`/`speed(p)`
+   govern *where and in what sequence* deposition happens; flow-rate
+   compensation and pressure advance govern *how much* material is pushed
+   once a path through that ordered geometry already exists. Keeping
+   these decoupled mirrors the existing pipeline's own separation between
+   `toolpath::plan` (geometry/sequencing) and `gcode::emit` (motion/
+   extrusion commands) — tracked as a distinct future TODO, not solved by
+   this field construction.
+
 ## Crate candidate: `fidget`
 
 <https://docs.rs/fidget> (mkeeter, MPL-2.0, actively maintained, v0.5) —
