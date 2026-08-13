@@ -164,12 +164,28 @@ viewport to center for).
   keeps this phase's scope contained. Revisit if/when Phase 7 needs
   live-updating transforms without a full re-upload.
 
-## Phase 6 — Scene content: origin, bed/substrate, toolhead (needs 3 + 5)
+## Phase 6 — Scene content: origin, bed/substrate, toolhead (needs 3 + 5) — ✅ done
 
 - Origin gizmo: fixed-size axis triad at world origin.
 - Print bed/substrate mesh + grid, sized from `Machine` (Phase 3).
 - Toolhead placeholder geometry, positioned per `Tool` offset; multiple
   toolheads for multi-tool machines.
+
+**Implementation notes**: landed as `manifold-gui/src/scene.rs` (pure
+geometry builders operating on `manifold_core::machine::Machine` — no
+wgpu types, kept separate from `render.rs`'s GPU concerns):
+`build_origin_axes` (fixed-length RGB line triad), `build_grid` +
+`build_bed_quad` (line-list grid and translucent triangle-list quad, both
+sized from `Machine::build_volume`'s bounding box), and
+`build_toolhead_markers` (a small pyramid per `Tool`, positioned at
+`tool.mount`'s translation — already iterates all of `machine.tools`, so
+multi-tool machines get one marker each with no further work needed).
+Uploaded via `ManifoldApp::build_scene` into a `render::UploadedScene`
+(separate line-list and triangle-list vertex buffers) and painted each
+frame via `render::ScenePaintCallback` alongside the mesh callback.
+Rebuilt whenever the settings panel edits `machine.build_volume` (wired
+as part of Phase 3), so bed/toolhead dressing stays live without an app
+restart.
 
 ## Phase 7 — Interactive transform gizmos (needs 4 + 5)
 
