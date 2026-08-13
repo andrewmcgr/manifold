@@ -4,25 +4,23 @@
 //! (+ a per-file tool assignment flag) and build a multi-object
 //! `Workspace` instead of the single-tool-for-all-objects placeholder
 //! below.
-//!
-//! TODO(roadmap): Phase 1 (see ROADMAP.md) — add STL loading; only `.3mf`
-//! input is wired up today.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use glam::DVec3;
 use manifold_core::{
-    bounds::BoundingVolume, ids::ToolId, machine::Machine, slice_to_gcode, threemf, SlicerConfig,
-    Workspace,
+    bounds::BoundingVolume, ids::ObjectId, ids::ToolId, machine::Machine, object::Object,
+    slice_to_gcode, stl, threemf, SlicerConfig, Workspace,
 };
 use std::fs::File;
+use std::io::BufReader;
 use std::path::PathBuf;
 
 /// Non-planar slicer CLI.
 #[derive(Debug, Parser)]
 #[command(name = "manifold", version, about)]
 struct Cli {
-    /// Input mesh file (currently only 3MF is supported).
+    /// Input mesh file (STL or 3MF).
     input: PathBuf,
 
     /// Output Gcode file.
@@ -70,7 +68,7 @@ fn main() -> Result<()> {
 ///
 /// All loaded objects are assigned to [`ToolId(0)`], since multi-tool
 /// input assignment (Phase 8, see ROADMAP.md) is not yet wired up.
-fn load_objects(input: &PathBuf) -> Result<Vec<manifold_core::object::Object>> {
+fn load_objects(input: &PathBuf) -> Result<Vec<Object>> {
     let extension = input
         .extension()
         .and_then(|ext| ext.to_str())
@@ -79,13 +77,19 @@ fn load_objects(input: &PathBuf) -> Result<Vec<manifold_core::object::Object>> {
 
     match extension.as_str() {
         "3mf" => {
-            let file = File::open(input)
-                .with_context(|| format!("failed to open {}", input.display()))?;
+            let file =
+                File::open(input).with_context(|| format!("failed to open {}", input.display()))?;
             let objects = threemf::load_3mf(file, ToolId(0))?;
             Ok(objects)
         }
+        "stl" => {
+            let file =
+                File::open(input).with_context(|| format!("failed to open {}", input.display()))?;
+            let mesh = stl::load_stl(BufReader::new(file))?;
+            Ok(vec![Object::new(ObjectId(0), mesh, ToolId(0))])
+        }
         other => bail!(
-            "unsupported input format {:?} for {}: only .3mf is supported today (STL loading is pending, see ROADMAP.md)",
+            "unsupported input format {:?} for {}: only .3mf and .stl are supported today",
             other,
             input.display()
         ),

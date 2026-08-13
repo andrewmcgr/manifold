@@ -78,7 +78,10 @@ at the relevant stub sites in source.
 
 ## Phase 1 — Mesh format loading (needs Phase 0 for multi-object targets)
 
-- STL loader (`stl_io`) → `Mesh`. **Not yet done.**
+- STL loader (`stl_io`) → `Mesh`. **✅ done** —
+  `manifold_core::stl::load_stl`, wired into `manifold-cli` for `.stl`
+  input (wrapped into a single `Object` with identity transform, tool 0,
+  since STL has no build-item/transform/material concept of its own).
 - 3MF loader (`lib3mf`) → populates `Object`s directly (3MF natively
   models build items/transforms/materials, which is exactly the
   `Object`/`Tool`/`Material` shape from Phase 0). **✅ done** —

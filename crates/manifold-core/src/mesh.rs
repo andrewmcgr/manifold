@@ -1,10 +1,10 @@
 //! Mesh representation and loading.
 //!
-//! 3MF loading lives in [`crate::threemf`] (via `lib3mf`), since 3MF
-//! natively models multiple build items with transforms and materials and
-//! so populates `Object`s (Phase 0) directly rather than a bare `Mesh`.
-//!
-//! TODO(roadmap): Phase 1 (see ROADMAP.md) — add STL loading via `stl_io`.
+//! Format-specific loaders live in their own modules: [`crate::threemf`]
+//! (via `lib3mf`) for 3MF, since it natively models multiple build items
+//! with transforms and materials and so populates `Object`s (Phase 0)
+//! directly rather than a bare `Mesh`; [`crate::stl`] (via `stl_io`) for
+//! STL, which only ever describes a single triangle [`Mesh`].
 
 use glam::DVec3;
 
