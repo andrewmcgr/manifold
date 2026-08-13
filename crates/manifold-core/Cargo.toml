@@ -1,0 +1,21 @@
+[package]
+name = "manifold-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Non-planar slicing engine: mesh -> toolpath -> Gcode, headless-capable"
+
+[lib]
+name = "manifold_core"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+glam.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

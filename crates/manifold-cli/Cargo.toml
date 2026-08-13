@@ -1,0 +1,18 @@
+[package]
+name = "manifold-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI front-end for the Manifold non-planar slicing engine"
+
+[[bin]]
+name = "manifold"
+path = "src/main.rs"
+
+[dependencies]
+manifold-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
