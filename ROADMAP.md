@@ -105,11 +105,33 @@ at the relevant stub sites in source.
   decision (sequential single-object-at-a-time vs. naive simultaneous
   printing) recorded before implementation.
 
-## Phase 3 — Machine/printer definition (needs 0)
+## Phase 3 — Machine/printer definition (needs 0) — ✅ done
 
 - Flesh out `Machine`: bed size/shape, build volume height, toolhead
   count/geometry/offsets — feeds both slicing bounds-checks and GUI scene
   visualization (Phase 6).
+
+**Implementation notes**: the `Machine`/`BoundingVolume`/`Tool` domain
+model already existed from Phase 0; Phase 3 replaces the hardcoded
+`default_machine()` placeholder's static role with a live, editable
+`Machine` field on `ManifoldApp` (`app.rs`). The settings panel gained a
+"Machine" section: bed X/Y/Z (`build_volume`) sliders and the tool 0
+nozzle diameter, which rebuild the Phase 6 scene dressing
+(`Self::build_scene`) on change. Multi-tool count/geometry editing is
+still Phase 8 territory (needs per-object tool assignment UI to be
+meaningful) and machine persistence (save/load a project file) is not yet
+implemented — the edited `Machine` only lives for the app session.
+
+Also landed alongside this (not itself part of the roadmap, but needed a
+real bed size to be meaningful): newly-imported objects are now
+auto-centered on the bed instead of sitting at the origin —
+`manifold_core::object::center_on_bed` computes the combined world-space
+bounding box of a freshly-loaded group (preserving relative placement,
+e.g. a 3MF assembly's build-item transforms) and translates it to be
+XY-centered on `Machine::build_volume` and resting on its floor (minimum
+Z). Wired into `ManifoldApp::import` in the GUI; `manifold-cli`'s
+single-shot batch import is unchanged (out of scope — no interactive
+viewport to center for).
 
 ## Phase 4 — GUI shell/layout (needs 0) — ✅ done
 

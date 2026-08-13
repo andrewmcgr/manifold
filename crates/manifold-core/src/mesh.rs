@@ -24,4 +24,41 @@ impl Mesh {
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
     }
+
+    /// The axis-aligned bounding box (min, max corners) enclosing every
+    /// vertex, in local mesh space. `None` for an empty mesh.
+    pub fn bounding_box(&self) -> Option<(DVec3, DVec3)> {
+        let mut vertices = self.vertices.iter();
+        let first = *vertices.next()?;
+        let (min, max) = vertices.fold((first, first), |(min, max), &vertex| {
+            (min.min(vertex), max.max(vertex))
+        });
+        Some((min, max))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounding_box_is_none_for_empty_mesh() {
+        assert_eq!(Mesh::default().bounding_box(), None);
+    }
+
+    #[test]
+    fn bounding_box_encloses_all_vertices() {
+        let mesh = Mesh::new(
+            vec![
+                DVec3::new(-1.0, 2.0, 0.0),
+                DVec3::new(3.0, -2.0, 1.0),
+                DVec3::new(0.0, 0.0, -5.0),
+            ],
+            vec![0, 1, 2],
+        );
+        assert_eq!(
+            mesh.bounding_box(),
+            Some((DVec3::new(-1.0, -2.0, -5.0), DVec3::new(3.0, 2.0, 1.0)))
+        );
+    }
 }

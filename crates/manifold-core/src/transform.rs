@@ -42,6 +42,15 @@ impl Transform {
     pub fn transform_point(&self, point: DVec3) -> DVec3 {
         self.0.transform_point3(point)
     }
+
+    /// Compose this transform with an additional world-space translation
+    /// applied afterwards — i.e. `result.transform_point(p) ==
+    /// self.transform_point(p) + offset`. Used to re-center already-placed
+    /// objects (e.g. a 3MF assembly's build-item transforms) without
+    /// disturbing their relative arrangement.
+    pub fn then_translate(&self, offset: DVec3) -> Self {
+        Self(DAffine3::from_translation(offset) * self.0)
+    }
 }
 
 impl Default for Transform {
@@ -66,6 +75,16 @@ mod tests {
         assert_eq!(
             transform.transform_point(DVec3::ZERO),
             DVec3::new(1.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn then_translate_offsets_result_in_world_space() {
+        let transform = Transform::from_translation(DVec3::new(1.0, 0.0, 0.0))
+            .then_translate(DVec3::new(0.0, 2.0, 0.0));
+        assert_eq!(
+            transform.transform_point(DVec3::ZERO),
+            DVec3::new(1.0, 2.0, 0.0)
         );
     }
 }

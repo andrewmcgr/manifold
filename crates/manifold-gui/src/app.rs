@@ -11,7 +11,7 @@ use manifold_core::bounds::BoundingVolume;
 use manifold_core::machine::Machine;
 use manifold_core::tool::Tool;
 use manifold_core::transform::Transform;
-use manifold_core::{ids::ObjectId, ids::ToolId, mesh::Mesh, object::Object, stl, threemf};
+use manifold_core::{ids::ObjectId, ids::ToolId, mesh::Mesh, object, object::Object, stl, threemf};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -21,12 +21,16 @@ use transform_gizmo_egui::prelude::*;
 
 pub struct ManifoldApp {
     config: manifold_core::SlicerConfig,
+    /// The machine (bed/build-volume/tools) objects are sliced and
+    /// centered against, editable from the settings panel (Phase 3, see
+    /// ROADMAP.md).
+    machine: Machine,
     objects: Vec<Object>,
     /// GPU-uploaded copies of `objects`, rebuilt whenever `objects` changes.
     uploaded_meshes: Arc<Vec<UploadedMesh>>,
     /// Scene dressing (origin axes, bed grid/quad, toolhead markers),
-    /// uploaded once at startup — the placeholder `Machine` doesn't change
-    /// at runtime yet, see ROADMAP.md Phase 6.
+    /// rebuilt via `Self::build_scene` whenever `machine`'s bed/tool
+    /// geometry changes in the settings panel (Phase 3/6, see ROADMAP.md).
     uploaded_scene: Arc<UploadedScene>,
     camera: OrbitCamera,
     next_object_id: u32,
@@ -62,15 +66,7 @@ impl ManifoldApp {
             ));
 
         let machine = default_machine();
-        let mut lines = scene::build_origin_axes(50.0);
-        lines.extend(scene::build_grid(&machine, 10.0));
-        let mut triangles = scene::build_bed_quad(&machine);
-        triangles.extend(scene::build_toolhead_markers(&machine, 8.0));
-        let uploaded_scene = Arc::new(UploadedScene::upload(
-            &wgpu_render_state.device,
-            &lines,
-            &triangles,
-        ));
+        let uploaded_scene = Arc::new(Self::build_scene(&wgpu_render_state.device, &machine));
 
         #[cfg(feature = "mcp-server")]
         let mcp_rx = match crate::mcp::spawn(crate::mcp::ADDR) {
@@ -83,6 +79,7 @@ impl ManifoldApp {
 
         Self {
             config: manifold_core::SlicerConfig::default(),
+            machine,
             objects: Vec::new(),
             uploaded_meshes: Arc::new(Vec::new()),
             uploaded_scene,
@@ -161,11 +158,24 @@ impl ManifoldApp {
         }
     }
 
+    /// Build the scene dressing (origin axes, bed grid/quad, toolhead
+    /// markers) for the given `machine` and upload it to the GPU. Called at
+    /// startup and whenever `machine`'s bed/tool geometry changes in the
+    /// settings panel.
+    fn build_scene(device: &eframe::egui_wgpu::wgpu::Device, machine: &Machine) -> UploadedScene {
+        let mut lines = scene::build_origin_axes(50.0);
+        lines.extend(scene::build_grid(machine, 10.0));
+        let mut triangles = scene::build_bed_quad(machine);
+        triangles.extend(scene::build_toolhead_markers(machine, 8.0));
+        UploadedScene::upload(device, &lines, &triangles)
+    }
+
     /// Load every object from `path`, dispatching on its file extension
     /// (mirrors `manifold-cli`'s `load_objects`).
     fn import(&mut self, path: &Path, device: &eframe::egui_wgpu::wgpu::Device) {
         match load_objects(path, &mut self.next_object_id) {
             Ok(mut new_objects) => {
+                object::center_on_bed(&mut new_objects, &self.machine.build_volume);
                 self.objects.append(&mut new_objects);
                 self.reupload(device);
                 self.import_error = None;
@@ -183,7 +193,7 @@ impl ManifoldApp {
         self.uploaded_meshes = Arc::new(uploaded);
     }
 
-    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+    fn settings_panel(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         ui.heading("Settings");
         ui.add(
             egui::Slider::new(&mut self.config.layer_height, 0.05..=1.0).text("Layer height (mm)"),
@@ -192,6 +202,35 @@ impl ManifoldApp {
             egui::Slider::new(&mut self.config.nozzle_diameter, 0.1..=1.5)
                 .text("Nozzle diameter (mm)"),
         );
+
+        ui.separator();
+        ui.heading("Machine");
+        let (min, mut max) = self.machine.build_volume.bounding_box();
+        let mut bed_changed = false;
+        bed_changed |= ui
+            .add(egui::Slider::new(&mut max.x, 50.0..=1000.0).text("Bed X (mm)"))
+            .changed();
+        bed_changed |= ui
+            .add(egui::Slider::new(&mut max.y, 50.0..=1000.0).text("Bed Y (mm)"))
+            .changed();
+        bed_changed |= ui
+            .add(egui::Slider::new(&mut max.z, 50.0..=1000.0).text("Build height (mm)"))
+            .changed();
+        if bed_changed {
+            self.machine.build_volume = BoundingVolume::Aabb { min, max };
+            let device = frame
+                .wgpu_render_state()
+                .expect("wgpu renderer is required")
+                .device
+                .clone();
+            self.uploaded_scene = Arc::new(Self::build_scene(&device, &self.machine));
+        }
+        if let Some(tool) = self.machine.tools.first_mut() {
+            ui.add(
+                egui::Slider::new(&mut tool.nozzle_diameter, 0.1..=1.5)
+                    .text("Tool 0 nozzle diameter (mm)"),
+            );
+        }
 
         ui.separator();
         ui.heading("Objects");
@@ -342,7 +381,7 @@ impl eframe::App for ManifoldApp {
 
         egui::SidePanel::left("settings_panel")
             .default_width(260.0)
-            .show(ctx, |ui| self.settings_panel(ui));
+            .show(ctx, |ui| self.settings_panel(ui, frame));
 
         egui::CentralPanel::default().show(ctx, |ui| self.viewport(ui, frame));
     }
