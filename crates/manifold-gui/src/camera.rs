@@ -23,7 +23,7 @@ impl Default for OrbitCamera {
         Self {
             target: DVec3::ZERO,
             distance: 200.0,
-            yaw: std::f64::consts::FRAC_PI_4,
+            yaw: -std::f64::consts::FRAC_PI_4,
             pitch: std::f64::consts::FRAC_PI_6,
             fov_y_radians: 45.0_f32.to_radians(),
             near: 0.1,
