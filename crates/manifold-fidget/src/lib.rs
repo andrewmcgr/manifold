@@ -13,6 +13,8 @@
 use fidget::{context::Tree, shape::EzShape, types::Grad, vm::VmShape};
 use glam::DVec3;
 
+pub mod geometry;
+
 /// Builds a `fidget::context::Tree` for a sphere of the given `radius`
 /// centered at the origin: `f(p) = |p| - radius`.
 pub fn sphere_tree(radius: f64) -> Tree {
@@ -30,27 +32,55 @@ pub struct FieldSample {
     pub gradient: DVec3,
 }
 
+/// A scalar field over 3D space that can be sampled for value and gradient
+/// at a point, e.g. `f(p) = |p| - radius` for a sphere SDF.
+pub trait ScalarField {
+    /// Samples the field at `p`, returning its value and gradient.
+    fn sample(&self, p: DVec3) -> FieldSample;
+}
+
+/// A [`ScalarField`] backed by a `fidget::context::Tree` expression.
+pub struct TreeField {
+    tree: Tree,
+}
+
+impl TreeField {
+    /// Wraps `tree` as a [`ScalarField`].
+    pub fn new(tree: Tree) -> Self {
+        Self { tree }
+    }
+}
+
+impl ScalarField for TreeField {
+    fn sample(&self, p: DVec3) -> FieldSample {
+        let shape = VmShape::from(self.tree.clone());
+        let mut eval = VmShape::new_grad_slice_eval();
+        let tape = shape.ez_grad_slice_tape();
+        let out = eval
+            .eval(
+                &tape,
+                &[Grad::new(p.x as f32, 1.0, 0.0, 0.0)],
+                &[Grad::new(p.y as f32, 0.0, 1.0, 0.0)],
+                &[Grad::new(p.z as f32, 0.0, 0.0, 1.0)],
+            )
+            .expect("grad-slice evaluation on a single point should not fail");
+        let g = out[0];
+        FieldSample {
+            value: g.v as f64,
+            gradient: DVec3::new(g.dx as f64, g.dy as f64, g.dz as f64),
+        }
+    }
+}
+
 /// Evaluates `tree` at `p`, returning its value and gradient (`grad f(p)`).
 ///
 /// This is the core capability the spike doc's angle-field primitive needs:
 /// `angle(p) = angle_between(normalize(grad f(p)), v)`.
+///
+/// Thin wrapper over [`TreeField`]/[`ScalarField::sample`]; kept as a free
+/// function for existing callers.
 pub fn evaluate(tree: &Tree, p: DVec3) -> FieldSample {
-    let shape = VmShape::from(tree.clone());
-    let mut eval = VmShape::new_grad_slice_eval();
-    let tape = shape.ez_grad_slice_tape();
-    let out = eval
-        .eval(
-            &tape,
-            &[Grad::new(p.x as f32, 1.0, 0.0, 0.0)],
-            &[Grad::new(p.y as f32, 0.0, 1.0, 0.0)],
-            &[Grad::new(p.z as f32, 0.0, 0.0, 1.0)],
-        )
-        .expect("grad-slice evaluation on a single point should not fail");
-    let g = out[0];
-    FieldSample {
-        value: g.v as f64,
-        gradient: DVec3::new(g.dx as f64, g.dy as f64, g.dz as f64),
-    }
+    TreeField::new(tree.clone()).sample(p)
 }
 
 /// The angle-field primitive from `NON_PLANAR_SLICING.md`: the angle (in
@@ -132,6 +162,29 @@ mod tests {
         // overhang-prone point.
         let bottom_angle = angle_field(&tree, DVec3::new(0.0, 0.0, -1.0), down).unwrap();
         assert!(approx_eq(bottom_angle, 0.0, 1e-3));
+    }
+
+    #[test]
+    fn tree_field_sample_matches_free_function_evaluate() {
+        let tree = sphere_tree(1.0);
+        let field = TreeField::new(tree.clone());
+
+        let p = DVec3::new(1.0, 0.0, 0.0);
+        let via_trait = field.sample(p);
+        let via_free_fn = evaluate(&tree, p);
+        assert_eq!(via_trait, via_free_fn);
+    }
+
+    #[test]
+    fn tree_field_gradient_is_outward_normal() {
+        let tree = sphere_tree(1.0);
+        let field = TreeField::new(tree);
+
+        let sample = field.sample(DVec3::new(0.0, 1.0, 0.0));
+        let normal = sample.gradient.normalize();
+        assert!(approx_eq(normal.x, 0.0, 1e-4));
+        assert!(approx_eq(normal.y, 1.0, 1e-4));
+        assert!(approx_eq(normal.z, 0.0, 1e-4));
     }
 
     #[test]
