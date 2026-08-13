@@ -38,3 +38,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let base_color = vec3<f32>(0.65, 0.68, 0.72);
     return vec4<f32>(base_color * intensity, 1.0);
 }
+
+// Overlay variant: used for the SDF isosurface debug overlay
+// (`MESH_SDF_VISUALIZATION.md` Phase D) so it is visually distinguishable
+// from the real, opaque mesh render above — semi-transparent orange,
+// alpha-blended, sharing the same vertex layout/pipeline layout as
+// `fs_main` (only the render pipeline's blend state and this fragment
+// entry point differ).
+@fragment
+fn fs_overlay(in: VertexOutput) -> @location(0) vec4<f32> {
+    let light_dir = normalize(vec3<f32>(0.4, 0.6, 0.8));
+    let ambient = 0.35;
+    let diffuse = max(dot(normalize(in.normal), light_dir), 0.0);
+    let intensity = ambient + (1.0 - ambient) * diffuse;
+    let base_color = vec3<f32>(1.0, 0.55, 0.15);
+    return vec4<f32>(base_color * intensity, 0.45);
+}

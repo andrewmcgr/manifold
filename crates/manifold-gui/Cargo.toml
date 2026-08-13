@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 manifold-core.workspace = true
+manifold-fidget.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

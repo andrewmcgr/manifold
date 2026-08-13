@@ -4,7 +4,8 @@
 use crate::camera::OrbitCamera;
 use crate::profile::Profile;
 use crate::render::{
-    MeshPaintCallback, MeshRenderResources, ScenePaintCallback, UploadedMesh, UploadedScene,
+    MeshPaintCallback, MeshRenderResources, OverlayPaintCallback, ScenePaintCallback, UploadedMesh,
+    UploadedScene,
 };
 use crate::scene;
 use eframe::egui;
@@ -19,6 +20,27 @@ use std::path::Path;
 use std::sync::Arc;
 use transform_gizmo_egui::math::Transform as GizmoTransform;
 use transform_gizmo_egui::prelude::*;
+
+/// Axis-aligned plane the SDF slice view samples over (subtask 09). Basis
+/// vectors and the world-space origin for a given `offset` are derived in
+/// [`ManifoldApp::recompute_slice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlicePlane {
+    Xy,
+    Xz,
+    Yz,
+}
+
+impl SlicePlane {
+    /// `(basis1, basis2, normal)` for this plane, all orthonormal.
+    fn basis(self) -> (glam::DVec3, glam::DVec3, glam::DVec3) {
+        match self {
+            SlicePlane::Xy => (glam::DVec3::X, glam::DVec3::Y, glam::DVec3::Z),
+            SlicePlane::Xz => (glam::DVec3::X, glam::DVec3::Z, glam::DVec3::Y),
+            SlicePlane::Yz => (glam::DVec3::Y, glam::DVec3::Z, glam::DVec3::X),
+        }
+    }
+}
 
 pub struct ManifoldApp {
     config: manifold_core::SlicerConfig,
@@ -52,6 +74,38 @@ pub struct ManifoldApp {
     /// ROADMAP.md).
     profile_error: Option<String>,
     next_tool_id: u32,
+    /// Whether the SDF debug panel (Phase D, see MESH_SDF_VISUALIZATION.md)
+    /// is shown as an additional right-hand side panel.
+    show_sdf_panel: bool,
+    /// Sign method the SDF panel will use when constructing a `MeshSdf`
+    /// (subtask 08 wires the actual construction).
+    sdf_sign_method: manifold_fidget::mesh_sdf::SignMethod,
+    /// Iso-level (mm) the SDF panel will pass to isosurface extraction
+    /// (subtask 08).
+    sdf_iso_level: f64,
+    /// Set by a failed SDF recompute/extraction action (subtask 08/09 will
+    /// populate this; wired here so the display path exists already).
+    sdf_error: Option<String>,
+    /// Isosurface triangle soup from the last successful recompute
+    /// (subtask 08 populates this; `None` until then).
+    sdf_isosurface: Option<Vec<manifold_fidget::marching_cubes::Vertex>>,
+    /// Slice heatmap grid from the last successful recompute (subtask 09
+    /// populates this; `None` until then).
+    sdf_slice: Option<manifold_fidget::slice::SliceGrid>,
+    /// GPU-uploaded copy of `sdf_isosurface`, rebuilt whenever a recompute
+    /// succeeds; rendered as a semi-transparent overlay alongside
+    /// `uploaded_meshes` in `viewport()`. `None` until the first successful
+    /// recompute.
+    sdf_overlay_mesh: Option<Arc<UploadedMesh>>,
+    /// Which axis-aligned plane the slice view samples over (subtask 09).
+    sdf_slice_plane: SlicePlane,
+    /// Offset (mm) along the plane's normal axis at which the slice is
+    /// sampled (subtask 09).
+    sdf_slice_offset: f64,
+    /// Uploaded heatmap texture for the last `sdf_slice`, rebuilt whenever
+    /// the slice is recomputed (recompute-on-demand only, never rebuilt
+    /// per-frame; subtask 09).
+    sdf_slice_texture: Option<egui::TextureHandle>,
     /// Commands from the Phase 9 MCP automation server, drained once per
     /// frame in `update()`. `None` if the `mcp-server` feature is off or
     /// the server thread failed to start.
@@ -106,6 +160,16 @@ impl ManifoldApp {
             slice_error: None,
             profile_error: None,
             next_tool_id: 1,
+            show_sdf_panel: false,
+            sdf_sign_method: manifold_fidget::mesh_sdf::SignMethod::Pseudonormal,
+            sdf_iso_level: 0.0,
+            sdf_error: None,
+            sdf_isosurface: None,
+            sdf_slice: None,
+            sdf_overlay_mesh: None,
+            sdf_slice_plane: SlicePlane::Xy,
+            sdf_slice_offset: 0.0,
+            sdf_slice_texture: None,
             #[cfg(feature = "mcp-server")]
             mcp_rx,
         }
@@ -371,6 +435,10 @@ impl ManifoldApp {
             ui.separator();
             ui.colored_label(egui::Color32::RED, format!("Profile failed: {err}"));
         }
+
+        ui.separator();
+        ui.checkbox(&mut self.show_sdf_panel, "Show SDF debug panel");
+
         if let Some(gcode) = &self.gcode {
             ui.separator();
             ui.heading("Gcode");
@@ -381,6 +449,213 @@ impl ManifoldApp {
                     ui.monospace(gcode);
                 });
         }
+    }
+
+    /// Builds a `MeshSdf` from the selected object's mesh, samples it over
+    /// the current `sdf_slice_plane`/`sdf_slice_offset`, and uploads the
+    /// resulting grid as a heatmap texture into `sdf_slice_texture`.
+    ///
+    /// Recompute-on-demand only (called from the "Recompute Slice" button),
+    /// never per-frame — matches `MESH_SDF_VISUALIZATION.md` Phase D.
+    fn recompute_slice(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.selected else {
+            self.sdf_error = Some("no object selected".to_string());
+            return;
+        };
+        let Some(object) = self.objects.get(index) else {
+            self.sdf_error = Some("selected object no longer exists".to_string());
+            return;
+        };
+
+        let mesh = &object.mesh;
+        let faces: Vec<[usize; 3]> = mesh
+            .indices
+            .chunks_exact(3)
+            .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
+            .collect();
+        let mut sdf = manifold_fidget::mesh_sdf::MeshSdf::new(mesh.vertices.clone(), faces);
+        sdf.set_sign_method(self.sdf_sign_method);
+
+        if sdf.is_empty() {
+            self.sdf_error = Some("selected object's mesh has no triangles".to_string());
+            return;
+        }
+
+        let (basis1, basis2, _normal) = self.sdf_slice_plane.basis();
+        let origin = self.sdf_slice_plane.basis().2 * self.sdf_slice_offset;
+
+        // Fixed extent/resolution: covers the mesh's bounding box
+        // generously with a simple default rather than exposing more
+        // controls in this pass.
+        let (min, max) = mesh
+            .bounding_box()
+            .unwrap_or((glam::DVec3::ZERO, glam::DVec3::ONE));
+        let extent = (max - min).max_element().max(1.0) * 1.5;
+        const RESOLUTION: usize = 96;
+
+        let grid = manifold_fidget::slice::sample_plane(
+            &sdf, origin, basis1, basis2, extent, extent, RESOLUTION, RESOLUTION,
+        );
+
+        let color_image = slice_grid_to_color_image(&grid);
+        let texture = ctx.load_texture("sdf_slice", color_image, egui::TextureOptions::LINEAR);
+
+        self.sdf_slice = Some(grid);
+        self.sdf_slice_texture = Some(texture);
+        self.sdf_error = None;
+    }
+
+    /// SDF debug panel (Phase D, see MESH_SDF_VISUALIZATION.md): object
+    /// picker (reflects `self.selected`), sign-method toggle, iso-level
+    /// control, and a recompute trigger. Isosurface extraction is wired
+    /// (subtask 08); slice sampling wiring (subtask 09) is still stubbed.
+    fn sdf_panel(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        ui.heading("SDF");
+
+        match self.selected {
+            Some(index) => {
+                let object = &self.objects[index];
+                ui.label(format!(
+                    "Object {} — {} triangles",
+                    object.id.0,
+                    object.mesh.triangle_count()
+                ));
+            }
+            None => {
+                ui.label("No object selected — select one in the Objects list.");
+            }
+        }
+
+        ui.separator();
+        ui.label("Sign method");
+        ui.horizontal(|ui| {
+            ui.radio_value(
+                &mut self.sdf_sign_method,
+                manifold_fidget::mesh_sdf::SignMethod::Pseudonormal,
+                "Pseudonormal",
+            );
+            ui.add_enabled(false, egui::RadioButton::new(false, "Winding number"))
+                .on_disabled_hover_text("not yet implemented");
+        });
+
+        ui.separator();
+        ui.add(egui::Slider::new(&mut self.sdf_iso_level, -2.0..=2.0).text("Iso level (mm)"));
+
+        ui.separator();
+        if ui
+            .add_enabled(self.selected.is_some(), egui::Button::new("Recompute"))
+            .clicked()
+        {
+            let device = frame
+                .wgpu_render_state()
+                .expect("wgpu renderer is required")
+                .device
+                .clone();
+            self.recompute_sdf(&device);
+        }
+
+        ui.separator();
+        ui.heading("Slice view");
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("sdf_slice_plane")
+                .selected_text(format!("{:?}", self.sdf_slice_plane))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.sdf_slice_plane, SlicePlane::Xy, "XY");
+                    ui.selectable_value(&mut self.sdf_slice_plane, SlicePlane::Xz, "XZ");
+                    ui.selectable_value(&mut self.sdf_slice_plane, SlicePlane::Yz, "YZ");
+                });
+            ui.add(egui::Slider::new(&mut self.sdf_slice_offset, -50.0..=50.0).text("Offset (mm)"));
+        });
+        if ui
+            .add_enabled(
+                self.selected.is_some(),
+                egui::Button::new("Recompute Slice"),
+            )
+            .clicked()
+        {
+            self.recompute_slice(ui.ctx());
+        }
+        if let Some(texture) = &self.sdf_slice_texture {
+            ui.add(egui::Image::new(texture).max_width(240.0));
+        }
+
+        if let Some(err) = &self.sdf_error {
+            ui.separator();
+            ui.colored_label(egui::Color32::RED, format!("SDF failed: {err}"));
+        }
+    }
+
+    /// Builds a `MeshSdf` from the selected object's mesh (in world space,
+    /// with `object.transform` baked into the vertex positions so the
+    /// extracted isosurface lines up with the already-transformed mesh
+    /// rendered by `viewport()`), extracts the isosurface at
+    /// `self.sdf_iso_level` via marching cubes, and uploads the result as a
+    /// semi-transparent overlay. Recompute-on-demand only — never called
+    /// per-frame (see `MESH_SDF_VISUALIZATION.md` Phase D). Sets
+    /// `self.sdf_error` and clears any stale overlay/isosurface on failure
+    /// instead of panicking.
+    fn recompute_sdf(&mut self, device: &eframe::egui_wgpu::wgpu::Device) {
+        let Some(index) = self.selected else {
+            self.sdf_error = Some("no object selected".to_string());
+            return;
+        };
+        let object = &self.objects[index];
+        let mesh = &object.mesh;
+
+        let Some((local_min, local_max)) = mesh.bounding_box() else {
+            self.sdf_error = Some("selected object has an empty mesh".to_string());
+            self.sdf_isosurface = None;
+            self.sdf_overlay_mesh = None;
+            return;
+        };
+
+        let vertices: Vec<glam::DVec3> = mesh
+            .vertices
+            .iter()
+            .map(|&v| object.transform.transform_point(v))
+            .collect();
+        let faces: Vec<[usize; 3]> = mesh
+            .indices
+            .chunks_exact(3)
+            .map(|tri| [tri[0] as usize, tri[1] as usize, tri[2] as usize])
+            .collect();
+
+        let mut sdf = manifold_fidget::mesh_sdf::MeshSdf::new(vertices, faces);
+        sdf.set_sign_method(self.sdf_sign_method);
+
+        // Extraction box: the (transformed) mesh's bounding box, padded so
+        // an iso-level offset outward from the surface is still captured.
+        let (min, max) = (
+            object.transform.transform_point(local_min),
+            object.transform.transform_point(local_max),
+        );
+        let (min, max) = (min.min(max), min.max(max));
+        let padding = glam::DVec3::splat(self.sdf_iso_level.abs() + 1.0);
+        let (min, max) = (min - padding, max + padding);
+
+        const RESOLUTION: usize = 48;
+        let isosurface = manifold_fidget::marching_cubes::extract_isosurface(
+            &sdf,
+            min,
+            max,
+            RESOLUTION,
+            self.sdf_iso_level,
+        );
+
+        if isosurface.is_empty() {
+            self.sdf_error =
+                Some("isosurface extraction produced no triangles at this iso level".to_string());
+            self.sdf_isosurface = None;
+            self.sdf_overlay_mesh = None;
+            return;
+        }
+
+        self.sdf_overlay_mesh = Some(Arc::new(UploadedMesh::upload_from_vertices(
+            device,
+            &isosurface,
+        )));
+        self.sdf_isosurface = Some(isosurface);
+        self.sdf_error = None;
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -461,6 +736,16 @@ impl ManifoldApp {
                         meshes: self.uploaded_meshes.clone(),
                     },
                 ));
+            if let Some(overlay_mesh) = &self.sdf_overlay_mesh {
+                ui.painter()
+                    .add(eframe::egui_wgpu::Callback::new_paint_callback(
+                        rect,
+                        OverlayPaintCallback {
+                            view_proj,
+                            mesh: overlay_mesh.clone(),
+                        },
+                    ));
+            }
 
             // Gizmo paints as plain egui geometry into this `Ui`'s layer, so
             // it must run after the wgpu scene/mesh paint callbacks above to
@@ -512,6 +797,44 @@ impl ManifoldApp {
     }
 }
 
+/// Converts a slice heatmap grid to an `egui::ColorImage` using a simple
+/// blue-white-red diverging colormap centered at zero: negative values
+/// (inside the surface) shade toward blue, positive (outside) toward red,
+/// and values near zero (the surface itself) are white. Scaled by the
+/// grid's own max absolute value so the colormap always spans the full
+/// range of the current slice.
+fn slice_grid_to_color_image(grid: &manifold_fidget::slice::SliceGrid) -> egui::ColorImage {
+    let max_abs = grid
+        .values
+        .iter()
+        .fold(0.0_f32, |acc, v| acc.max(v.abs()))
+        .max(f32::EPSILON);
+
+    let pixels: Vec<egui::Color32> = grid
+        .values
+        .iter()
+        .map(|&v| {
+            let t = (v / max_abs).clamp(-1.0, 1.0);
+            if t < 0.0 {
+                // Inside: blend white -> blue.
+                let f = -t;
+                let c = (255.0 * (1.0 - f)) as u8;
+                egui::Color32::from_rgb(c, c, 255)
+            } else {
+                // Outside: blend white -> red.
+                let f = t;
+                let c = (255.0 * (1.0 - f)) as u8;
+                egui::Color32::from_rgb(255, c, c)
+            }
+        })
+        .collect();
+
+    egui::ColorImage {
+        size: [grid.width, grid.height],
+        pixels,
+    }
+}
+
 /// A placeholder 200x200x200mm three-axis machine with a single tool at
 /// the origin, used until machine configuration is loaded from a project
 /// file (see ROADMAP.md).
@@ -533,6 +856,12 @@ impl eframe::App for ManifoldApp {
         egui::SidePanel::left("settings_panel")
             .default_width(260.0)
             .show(ctx, |ui| self.settings_panel(ui, frame));
+
+        if self.show_sdf_panel {
+            egui::SidePanel::right("sdf_panel")
+                .default_width(260.0)
+                .show(ctx, |ui| self.sdf_panel(ui, frame));
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| self.viewport(ui, frame));
     }

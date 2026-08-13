@@ -2455,6 +2455,7 @@ dependencies = [
  "egui-wgpu",
  "glam 0.29.3",
  "manifold-core",
+ "manifold-fidget",
  "rfd",
  "rmcp",
  "schemars",

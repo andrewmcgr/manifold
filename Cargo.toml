@@ -15,6 +15,7 @@ repository = "https://github.com/andrewmcgr/manifold"
 
 [workspace.dependencies]
 manifold-core = { path = "crates/manifold-core" }
+manifold-fidget = { path = "crates/manifold-fidget" }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }

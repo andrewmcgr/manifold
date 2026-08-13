@@ -12,6 +12,7 @@ use eframe::egui_wgpu::{self, wgpu};
 use egui_wgpu::wgpu::util::DeviceExt as _;
 use glam::Mat4;
 use manifold_core::mesh::Mesh;
+use manifold_fidget::marching_cubes::Vertex as FieldVertex;
 
 /// One GPU vertex: position + flat face normal, both in world space.
 #[repr(C)]
@@ -50,10 +51,34 @@ impl UploadedMesh {
             }
         }
 
+        Self::from_vertices(device, &vertices, "manifold mesh vertex buffer")
+    }
+
+    /// Upload a triangle soup that already carries its own per-vertex
+    /// normals (e.g. field-gradient normals from marching-cubes isosurface
+    /// extraction — see `MESH_SDF_VISUALIZATION.md` Phase D), without
+    /// recomputing flat per-triangle normals from positions the way
+    /// [`Self::upload`] does. Reuses the same GPU `Vertex` layout and
+    /// upload path — no separate pipeline.
+    pub fn upload_from_vertices(device: &wgpu::Device, vertices: &[FieldVertex]) -> Self {
+        let vertices: Vec<Vertex> = vertices
+            .iter()
+            .map(|v| Vertex {
+                position: v.position.as_vec3().to_array(),
+                normal: v.normal.as_vec3().to_array(),
+            })
+            .collect();
+
+        Self::from_vertices(device, &vertices, "manifold sdf overlay vertex buffer")
+    }
+
+    /// Shared buffer-creation tail for [`Self::upload`] and
+    /// [`Self::upload_from_vertices`].
+    fn from_vertices(device: &wgpu::Device, vertices: &[Vertex], label: &str) -> Self {
         let vertex_count = vertices.len() as u32;
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("manifold mesh vertex buffer"),
-            contents: bytemuck::cast_slice(&vertices),
+            label: Some(label),
+            contents: bytemuck::cast_slice(vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
@@ -102,6 +127,7 @@ impl UploadedScene {
 /// `egui_wgpu::CallbackResources`), shared across frames.
 pub struct MeshRenderResources {
     pipeline: wgpu::RenderPipeline,
+    overlay_pipeline: wgpu::RenderPipeline,
     scene_line_pipeline: wgpu::RenderPipeline,
     scene_tri_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
@@ -159,6 +185,40 @@ impl MeshRenderResources {
             }),
             primitive: wgpu::PrimitiveState {
                 cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Semi-transparent overlay variant (SDF isosurface debug overlay,
+        // see `MESH_SDF_VISUALIZATION.md` Phase D): same shader module,
+        // vertex layout, and pipeline layout as `pipeline` above \u2014 only the
+        // fragment entry point (alpha < 1) and blend/cull state differ, so
+        // this reuses rather than duplicates the mesh rendering setup.
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("manifold mesh overlay pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &vertex_buffers,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_overlay",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
                 ..Default::default()
             },
             depth_stencil: None,
@@ -250,6 +310,7 @@ impl MeshRenderResources {
 
         Self {
             pipeline,
+            overlay_pipeline,
             scene_line_pipeline,
             scene_tri_pipeline,
             camera_buffer,
@@ -272,6 +333,17 @@ impl MeshRenderResources {
             render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             render_pass.draw(0..mesh.vertex_count, 0..1);
         }
+    }
+
+    /// Draws a single overlay mesh (e.g. the SDF isosurface debug overlay,
+    /// `MESH_SDF_VISUALIZATION.md` Phase D) with the semi-transparent
+    /// `overlay_pipeline` instead of the opaque `pipeline`, so it renders
+    /// visually distinct from the real mesh(es) drawn by [`Self::paint`].
+    fn paint_overlay(&self, render_pass: &mut wgpu::RenderPass<'_>, mesh: &UploadedMesh) {
+        render_pass.set_pipeline(&self.overlay_pipeline);
+        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+        render_pass.draw(0..mesh.vertex_count, 0..1);
     }
 
     fn paint_scene(&self, render_pass: &mut wgpu::RenderPass<'_>, scene: &UploadedScene) {
@@ -353,5 +425,39 @@ impl egui_wgpu::CallbackTrait for ScenePaintCallback {
     ) {
         let resources: &MeshRenderResources = callback_resources.get().unwrap();
         resources.paint_scene(render_pass, &self.scene);
+    }
+}
+
+/// The per-frame paint callback for a single semi-transparent overlay mesh
+/// (currently the SDF isosurface debug overlay, see
+/// `MESH_SDF_VISUALIZATION.md` Phase D). Drawn after `MeshPaintCallback` so
+/// it composites on top of the real mesh(es).
+pub struct OverlayPaintCallback {
+    pub view_proj: Mat4,
+    pub mesh: std::sync::Arc<UploadedMesh>,
+}
+
+impl egui_wgpu::CallbackTrait for OverlayPaintCallback {
+    fn prepare(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let resources: &MeshRenderResources = callback_resources.get().unwrap();
+        resources.write_camera(queue, self.view_proj);
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+        let resources: &MeshRenderResources = callback_resources.get().unwrap();
+        resources.paint_overlay(render_pass, &self.mesh);
     }
 }
