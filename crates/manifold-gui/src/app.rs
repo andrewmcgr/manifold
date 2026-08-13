@@ -78,6 +78,10 @@ impl ManifoldApp {
         let machine = default_machine();
         let uploaded_scene = Arc::new(Self::build_scene(&wgpu_render_state.device, &machine));
 
+        let mut camera = OrbitCamera::default();
+        let (min, max) = machine.build_volume.bounding_box();
+        camera.frame(min, max);
+
         #[cfg(feature = "mcp-server")]
         let mcp_rx = match crate::mcp::spawn(crate::mcp::ADDR) {
             Ok(rx) => Some(rx),
@@ -93,7 +97,7 @@ impl ManifoldApp {
             objects: Vec::new(),
             uploaded_meshes: Arc::new(Vec::new()),
             uploaded_scene,
-            camera: OrbitCamera::default(),
+            camera,
             next_object_id: 0,
             import_error: None,
             selected: None,

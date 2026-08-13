@@ -69,6 +69,18 @@ impl OrbitCamera {
         self.distance = (self.distance * factor).max(MIN_DISTANCE);
     }
 
+    /// Re-center and re-distance the camera so the axis-aligned box
+    /// `min..max` (e.g. the machine's build volume) fits in view, keeping
+    /// the current `yaw`/`pitch`/`fov_y_radians`. Used to frame the whole
+    /// bed on startup instead of defaulting to a view of the origin.
+    pub fn frame(&mut self, min: DVec3, max: DVec3) {
+        const FIT_MARGIN: f64 = 1.3;
+        self.target = (min + max) * 0.5;
+        let radius = (max - min).length() * 0.5;
+        let half_fov = self.fov_y_radians as f64 * 0.5;
+        self.distance = (radius / half_fov.tan() * FIT_MARGIN).max(MIN_DISTANCE);
+    }
+
     /// The camera-space view matrix (world -> camera).
     pub fn view_matrix(&self) -> Mat4 {
         let eye = self.eye().as_vec3();
@@ -103,5 +115,37 @@ impl OrbitCamera {
     /// ratio (width / height).
     pub fn view_proj(&self, aspect_ratio: f32) -> Mat4 {
         self.projection_matrix(aspect_ratio) * self.view_matrix()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_centers_target_on_bounds_midpoint() {
+        let mut camera = OrbitCamera::default();
+        camera.frame(DVec3::ZERO, DVec3::new(200.0, 200.0, 200.0));
+        assert_eq!(camera.target, DVec3::new(100.0, 100.0, 100.0));
+    }
+
+    #[test]
+    fn frame_sets_distance_wide_enough_to_fit_bounds() {
+        let mut camera = OrbitCamera::default();
+        let min = DVec3::ZERO;
+        let max = DVec3::new(200.0, 200.0, 200.0);
+        camera.frame(min, max);
+
+        let radius = (max - min).length() * 0.5;
+        let half_fov = camera.fov_y_radians as f64 * 0.5;
+        let fit_distance = radius / half_fov.tan();
+        assert!(camera.distance > fit_distance);
+    }
+
+    #[test]
+    fn frame_never_goes_below_minimum_distance_for_a_tiny_box() {
+        let mut camera = OrbitCamera::default();
+        camera.frame(DVec3::ZERO, DVec3::splat(1e-9));
+        assert!(camera.distance >= MIN_DISTANCE);
     }
 }
