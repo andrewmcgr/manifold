@@ -275,6 +275,77 @@ impl ManifoldApp {
         self.uploaded_meshes = Arc::new(uploaded);
     }
 
+    /// Interact with the transform gizmo, but only let it capture pointer
+    /// input (and thus contend with the orbit-camera drag on `viewport`'s
+    /// canvas response) when the cursor is actually near the gizmo, or the
+    /// gizmo is already mid-drag.
+    ///
+    /// `Gizmo::interact` (from `transform_gizmo_egui`) registers its own
+    /// tiny probe widget at the cursor position *every frame it is called*,
+    /// unconditionally reporting `hovered: true` regardless of proximity to
+    /// the actual handles (real hit-testing happens afterward, internally).
+    /// Because that probe widget is registered after — and thus takes
+    /// pointer-interaction priority over — the canvas's own
+    /// `Sense::click_and_drag` response, calling it every frame while any
+    /// object is selected silently steals every orbit/pan drag anywhere in
+    /// the viewport, not just drags that start on a handle. This method
+    /// reimplements the crate's `GizmoExt::interact` convenience wrapper
+    /// (see its source) but computes `hovered` from screen-space proximity
+    /// to the gizmo's origin instead of an unconditional probe widget, so
+    /// camera orbiting away from the selected object's gizmo works again.
+    fn gizmo_interact(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        view_proj: glam::Mat4,
+        origin: glam::DVec3,
+        targets: &[GizmoTransform],
+    ) -> Option<(GizmoResult, Vec<GizmoTransform>)> {
+        const HOVER_RADIUS_PX: f32 = 220.0;
+
+        let cursor_pos = ui.input(|i| i.pointer.hover_pos()).unwrap_or_default();
+
+        // Only require screen-space proximity to *start* a new gizmo
+        // interaction; once a subgizmo is already active (`is_focused`,
+        // reflecting last frame's result), keep tracking the drag
+        // regardless of how far the cursor has since moved — normal for
+        // e.g. a long rotation drag.
+        let near_gizmo = self.gizmo.is_focused()
+            || world_to_screen(view_proj, rect, origin)
+                .is_some_and(|screen_pos| screen_pos.distance(cursor_pos) < HOVER_RADIUS_PX);
+        let hovered = ui.rect_contains_pointer(rect) && near_gizmo;
+
+        let gizmo_result = self.gizmo.update(
+            GizmoInteraction {
+                cursor_pos: (cursor_pos.x, cursor_pos.y),
+                hovered,
+                drag_started: hovered
+                    && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)),
+                dragging: hovered
+                    && ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary)),
+            },
+            targets,
+        );
+
+        let draw_data = self.gizmo.draw();
+        ui.painter().add(egui::Mesh {
+            indices: draw_data.indices,
+            vertices: draw_data
+                .vertices
+                .into_iter()
+                .zip(draw_data.colors)
+                .map(|(pos, [r, g, b, a])| egui::epaint::Vertex {
+                    pos: pos.into(),
+                    uv: egui::Pos2::default(),
+                    color: egui::Rgba::from_rgba_premultiplied(r, g, b, a).into(),
+                })
+                .collect(),
+            ..Default::default()
+        });
+
+        gizmo_result
+    }
+
     /// Run the slicing pipeline over the current `objects`/`machine`/
     /// `config` and store the result (or error) for preview/export
     /// (Phase 8, see ROADMAP.md).
@@ -770,7 +841,7 @@ impl ManifoldApp {
                     );
 
                     if let Some((_, mut new_transforms)) =
-                        self.gizmo.interact(ui, &[gizmo_transform])
+                        self.gizmo_interact(ui, rect, view_proj, translation, &[gizmo_transform])
                     {
                         if let Some(new_transform) = new_transforms.pop() {
                             let scale: mint::Vector3<f64> = new_transform.scale;
@@ -795,6 +866,25 @@ impl ManifoldApp {
             }
         });
     }
+}
+
+/// Projects a world-space point to screen-space pixel coordinates within
+/// `rect`, given a camera `view_proj` matrix. Returns `None` if the point
+/// projects behind the camera (`w <= 0`).
+fn world_to_screen(
+    view_proj: glam::Mat4,
+    rect: egui::Rect,
+    point: glam::DVec3,
+) -> Option<egui::Pos2> {
+    let clip = view_proj * point.as_vec3().extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    Some(egui::Pos2::new(
+        rect.min.x + (ndc.x * 0.5 + 0.5) * rect.width(),
+        rect.min.y + (1.0 - (ndc.y * 0.5 + 0.5)) * rect.height(),
+    ))
 }
 
 /// Converts a slice heatmap grid to an `egui::ColorImage` using a simple
