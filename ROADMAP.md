@@ -187,10 +187,25 @@ Rebuilt whenever the settings panel edits `machine.build_volume` (wired
 as part of Phase 3), so bed/toolhead dressing stays live without an app
 restart.
 
-## Phase 7 — Interactive transform gizmos (needs 4 + 5)
+## Phase 7 — Interactive transform gizmos (needs 4 + 5) — ✅ done
 
 - Integrate `transform-gizmo-egui` for per-object move/rotate/scale in the
   3D viewport, wired to selection state and `Object.transform`.
+
+**Implementation notes**: landed in `manifold-gui/src/app.rs`. Selecting
+an object in the Phase 4 settings-panel object list (or via the Phase 9
+MCP `select_object` tool) sets `ManifoldApp::selected`; `viewport()` then
+drives a single reused `Gizmo` (`transform_gizmo_egui::prelude::Gizmo`)
+configured with the camera's view/projection matrices, `GizmoMode::all()`
+(move + rotate + scale together), and `GizmoOrientation::Local`. The
+gizmo is fed the selected object's current transform (decomposed via
+`glam`'s `to_scale_rotation_translation`), and `Gizmo::interact()`'s
+result is written back into `Object.transform` and triggers a mesh
+reupload so the dragged object updates live. Deliberately painted via
+plain egui geometry *after* the Phase 5/6 wgpu paint callbacks in the
+same `Ui` so it composites on top of the 3D scene rather than being
+z-tested against it. Multi-select (dragging several objects at once) is
+out of scope — `self.selected` is a single `Option<usize>`.
 
 ## Phase 8 — End-to-end wiring (needs all of the above)
 
