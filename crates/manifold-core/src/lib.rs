@@ -12,6 +12,7 @@ pub mod machine;
 pub mod material;
 pub mod mesh;
 pub mod object;
+pub mod ordering;
 pub mod slicing;
 pub mod stl;
 pub mod threemf;
@@ -28,6 +29,9 @@ pub use workspace::Workspace;
 pub struct SlicerConfig {
     pub layer_height: f64,
     pub nozzle_diameter: f64,
+    /// Strategy used to decide the order objects are printed in. See
+    /// `ordering` module and ROADMAP.md open decision #2.
+    pub object_ordering: ordering::ObjectOrderingKind,
 }
 
 impl Default for SlicerConfig {
@@ -35,29 +39,28 @@ impl Default for SlicerConfig {
         Self {
             layer_height: 0.2,
             nozzle_diameter: 0.4,
+            object_ordering: ordering::ObjectOrderingKind::default(),
         }
     }
 }
 
-/// Run the full pipeline: workspace -> slice -> plan toolpaths -> emit Gcode.
+/// Run the full pipeline: workspace -> order objects -> slice -> plan
+/// toolpaths -> emit Gcode.
 ///
 /// # Errors
 ///
 /// Returns [`Error::InvalidMesh`] if `workspace` has no objects, or
 /// whatever error the slicing/toolpath stages produce.
-///
-/// TODO(roadmap): Phase 2 (see ROADMAP.md) — this only slices the first
-/// object in the workspace today; true multi-object/multi-tool slicing
-/// (per-object transforms applied in world space, tool-change-aware
-/// toolpath planning, tool-change Gcode) lands there.
 pub fn slice_to_gcode(workspace: &Workspace) -> Result<String> {
-    let object = workspace
-        .objects
-        .first()
-        .ok_or_else(|| Error::InvalidMesh("workspace has no objects".to_string()))?;
+    if workspace.objects.is_empty() {
+        return Err(Error::InvalidMesh("workspace has no objects".to_string()));
+    }
 
-    let layers = slicing::slice_mesh(&object.mesh, &workspace.config)?;
-    let paths = toolpath::plan(&layers, &workspace.config)?;
+    let strategy = ordering::strategy_for(workspace.config.object_ordering);
+    let order = strategy.order(&workspace.objects)?;
+
+    let layers = slicing::slice_workspace(&workspace.objects, &order, &workspace.config)?;
+    let paths = toolpath::plan(&layers, &workspace.objects, &workspace.config)?;
     Ok(gcode::emit(&paths, &workspace.config))
 }
 
@@ -102,6 +105,32 @@ mod tests {
             crate::ids::ToolId(0),
         );
         let workspace = Workspace::new(vec![object], machine, SlicerConfig::default());
+
+        assert!(slice_to_gcode(&workspace).is_ok());
+    }
+
+    #[test]
+    fn slice_to_gcode_handles_multiple_objects_and_tools() {
+        let machine = crate::machine::Machine::new(
+            crate::bounds::BoundingVolume::Sphere {
+                center: glam::DVec3::ZERO,
+                radius: 1.0,
+            },
+            Vec::new(),
+        );
+        let objects = vec![
+            crate::object::Object::new(
+                crate::ids::ObjectId(0),
+                mesh::Mesh::default(),
+                crate::ids::ToolId(0),
+            ),
+            crate::object::Object::new(
+                crate::ids::ObjectId(1),
+                mesh::Mesh::default(),
+                crate::ids::ToolId(1),
+            ),
+        ];
+        let workspace = Workspace::new(objects, machine, SlicerConfig::default());
 
         assert!(slice_to_gcode(&workspace).is_ok());
     }
