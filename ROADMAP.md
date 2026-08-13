@@ -42,12 +42,12 @@ at the relevant stub sites in source.
 - **File-open dialogs**: [`rfd`](https://crates.io/crates/rfd) — not yet a
   dependency; needed for GUI mesh import.
 
-## Phase 0 — Domain model (prerequisite for everything below)
+## Phase 0 — Domain model (prerequisite for everything below) — ✅ done
 
 `manifold-core` is the only crate allowed to hold this domain logic (see
-`CODE_STYLE.md`) — none of it belongs in the GUI/CLI layers. Today the
-engine models exactly one `Mesh` sliced by one `SlicerConfig` into one
-Gcode stream; this phase replaces that with:
+`CODE_STYLE.md`) — none of it belongs in the GUI/CLI layers. Landed as
+`ids`, `bounds`, `transform`, `tool`, `material`, `object`, `machine`, and
+`workspace` modules in `manifold-core/src/`:
 
 - **`Tool`** — id, nozzle diameter, offset. Also add now, even though
   unused until the deferred collision-avoidance work:

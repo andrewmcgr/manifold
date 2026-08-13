@@ -9,7 +9,7 @@
 use glam::DVec3;
 
 /// A triangle mesh in model space (millimeters).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Mesh {
     pub vertices: Vec<DVec3>,
     /// Triangle vertex indices, three per triangle.

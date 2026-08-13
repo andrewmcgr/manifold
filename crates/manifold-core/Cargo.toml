@@ -11,11 +11,10 @@ name = "manifold_core"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-glam.workspace = true
+glam = { workspace = true, features = ["serde"] }
 tracing.workspace = true
 
 [dev-dependencies]

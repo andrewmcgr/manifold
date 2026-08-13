@@ -1,7 +1,7 @@
 //! Gcode emission from planned toolpaths.
 //!
 //! TODO(roadmap): Phase 2 (see ROADMAP.md) — add tool-change Gcode
-//! (tool-select + prime/purge) once Phase 0/2's multi-tool planning lands.
+//! (tool-select + prime/purge) once multi-tool toolpath planning lands.
 
 use crate::{toolpath::Path, SlicerConfig};
 

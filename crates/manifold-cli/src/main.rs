@@ -1,12 +1,21 @@
 //! `manifold` CLI: drives `manifold-core` headlessly to slice a mesh to Gcode.
 //!
 //! TODO(roadmap): Phase 8 (see ROADMAP.md) — accept multiple input files
-//! (+ a per-file tool assignment flag) and build a `Workspace` (Phase 0)
-//! instead of the single `Mesh::default()` placeholder below.
+//! (+ a per-file tool assignment flag) and build a multi-object
+//! `Workspace` instead of the single-object/single-tool placeholder
+//! below.
 
 use anyhow::Result;
 use clap::Parser;
-use manifold_core::{mesh::Mesh, slice_to_gcode, SlicerConfig};
+use glam::DVec3;
+use manifold_core::{
+    bounds::BoundingVolume,
+    ids::{ObjectId, ToolId},
+    machine::Machine,
+    mesh::Mesh,
+    object::Object,
+    slice_to_gcode, SlicerConfig, Workspace,
+};
 use std::path::PathBuf;
 
 /// Non-planar slicer CLI.
@@ -42,7 +51,19 @@ fn main() -> Result<()> {
         nozzle_diameter: cli.nozzle_diameter,
     };
 
-    let gcode = slice_to_gcode(&mesh, &config)?;
+    // Single-object, single-tool workspace until Phase 8 wires up real
+    // multi-file/multi-tool input (see ROADMAP.md).
+    let object = Object::new(ObjectId(0), mesh, ToolId(0));
+    let machine = Machine::new(
+        BoundingVolume::Aabb {
+            min: DVec3::ZERO,
+            max: DVec3::new(200.0, 200.0, 200.0),
+        },
+        Vec::new(),
+    );
+    let workspace = Workspace::new(vec![object], machine, config);
+
+    let gcode = slice_to_gcode(&workspace)?;
     std::fs::write(&cli.output, gcode)?;
     tracing::info!(output = %cli.output.display(), "wrote gcode");
 
