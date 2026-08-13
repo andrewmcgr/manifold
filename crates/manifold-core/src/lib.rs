@@ -13,6 +13,7 @@ pub mod material;
 pub mod mesh;
 pub mod object;
 pub mod slicing;
+pub mod threemf;
 pub mod tool;
 pub mod toolpath;
 pub mod transform;

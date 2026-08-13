@@ -28,6 +28,10 @@ at the relevant stub sites in source.
   (`lib3mf-core`/`lib3mf-cli`/`lib3mf-converters`/`lib3mf-async` from
   `sscargal/lib3mf-rs`) — Phase 1 must explicitly disambiguate these two
   before locking in the dependency, not assume they're the same project.
+  **Resolved**: the `lib3mf` dependency is `telecos/lib3mf_rust` v0.1.6+,
+  added with `default-features = false` (skipping its `mesh-ops`/
+  `polygon-ops` extras — parry3d/nalgebra/clipper2/earcutr — which
+  `manifold-core` doesn't need for basic parsing).
 - **3D transform gizmos**: [`transform-gizmo-egui`](https://crates.io/crates/transform-gizmo-egui)
   — actively maintained egui integration for move/rotate/scale gizmos.
   **Version check required**: this workspace currently pins
@@ -74,11 +78,14 @@ at the relevant stub sites in source.
 
 ## Phase 1 — Mesh format loading (needs Phase 0 for multi-object targets)
 
-- STL loader (`stl_io`) → `Mesh`.
-- 3MF loader (`lib3mf`, pending the disambiguation above) → populates
-  `Object`s directly (3MF natively models build items/transforms/
-  materials, which is exactly the `Object`/`Tool`/`Material` shape from
-  Phase 0).
+- STL loader (`stl_io`) → `Mesh`. **Not yet done.**
+- 3MF loader (`lib3mf`) → populates `Object`s directly (3MF natively
+  models build items/transforms/materials, which is exactly the
+  `Object`/`Tool`/`Material` shape from Phase 0). **✅ done** —
+  `manifold_core::threemf::load_3mf`, wired into `manifold-cli` for
+  `.3mf` input. Follow-ups not yet covered: flattening `Object`
+  assemblies/`components` into world-space geometry, and extracting the
+  Materials extension into `Material`/`MaterialId`.
 
 ## Phase 2 — Multi-object / multi-tool slicing pipeline (needs 0 + 1)
 
@@ -131,8 +138,9 @@ at the relevant stub sites in source.
 - GUI: import → arrange/assign tool in 3D view → configure settings →
   Slice action in toolbar → `slice_to_gcode(&Workspace)` → preview/export.
 - CLI: extend `manifold-cli` to accept multiple input files (+ per-file
-  tool assignment flag) building a `Workspace`, instead of a single
-  `Mesh::default()`.
+  tool assignment flag) building a `Workspace`. **Partially done**: 3MF
+  input now builds a multi-object `Workspace` via one file; still needs
+  multiple input files and per-file tool assignment.
 
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
@@ -147,8 +155,9 @@ at the relevant stub sites in source.
 
 ## Open decisions to resolve during implementation
 
-1. Disambiguate `lib3mf` (telecos) vs. the `lib3mf-core` family
-   (sscargal) before adding either as a dependency (Phase 1).
+1. ~~Disambiguate `lib3mf` (telecos) vs. the `lib3mf-core` family
+   (sscargal) before adding either as a dependency (Phase 1).~~ **Resolved**:
+   `lib3mf` (telecos/lib3mf_rust) is the dependency in use; see Phase 1.
 2. Sequential vs. naive-simultaneous multi-object print ordering for v1,
    given collision avoidance is deferred (Phase 2).
 3. Stay on `eframe`/`egui` 0.29 or upgrade workspace-wide for

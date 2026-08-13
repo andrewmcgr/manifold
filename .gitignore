@@ -1,3 +1,5 @@
 /target
 *.gcode
 .DS_Store
+.tmp/
+thoughts/

@@ -1,10 +1,10 @@
 //! Mesh representation and loading.
 //!
-//! TODO(roadmap): Phase 1 (see ROADMAP.md) — add STL loading via `stl_io`
-//! and 3MF loading via `lib3mf` (pending disambiguation from the unrelated
-//! `lib3mf-core` crate family; see ROADMAP.md). The 3MF loader should
-//! populate `Object`s (Phase 0) directly, since 3MF natively models
-//! multiple build items with transforms and materials.
+//! 3MF loading lives in [`crate::threemf`] (via `lib3mf`), since 3MF
+//! natively models multiple build items with transforms and materials and
+//! so populates `Object`s (Phase 0) directly rather than a bare `Mesh`.
+//!
+//! TODO(roadmap): Phase 1 (see ROADMAP.md) — add STL loading via `stl_io`.
 
 use glam::DVec3;
 

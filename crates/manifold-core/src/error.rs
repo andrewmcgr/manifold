@@ -15,4 +15,7 @@ pub enum Error {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("3mf error: {0}")]
+    ThreeMf(#[from] lib3mf::Error),
 }
