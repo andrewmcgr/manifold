@@ -4,6 +4,7 @@ members = [
     "crates/manifold-core",
     "crates/manifold-cli",
     "crates/manifold-gui",
+    "crates/manifold-fidget-spike",
 ]
 
 [workspace.package]
