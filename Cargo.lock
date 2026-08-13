@@ -2437,7 +2437,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "manifold-fidget-spike"
+name = "manifold-fidget"
 version = "0.1.0"
 dependencies = [
  "fidget",

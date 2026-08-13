@@ -1,15 +1,14 @@
-//! Research spike: prototype the [`fidget`] crate as a functional
-//! (closed-form) SDF backend, per `NON_PLANAR_SLICING.md`.
+//! SDF/angle-field backend for Manifold, originally prototyped as a
+//! research spike around the [`fidget`] crate (see `NON_PLANAR_SLICING.md`)
+//! and now depended on by `manifold-gui` for isosurface/slice visualization
+//! (see `MESH_SDF_VISUALIZATION.md`).
 //!
-//! This crate is **not** part of Manifold's production pipeline — it is a
-//! standalone scratch space for evaluating whether `fidget` is a workable
-//! foundation for the `order`/angle-field primitives described in the spike
-//! doc, before any `manifold-core` integration is attempted.
-//!
-//! Scope of this first prototype (spike structure step 2): build a toy SDF
-//! (a sphere), evaluate its value and gradient at sample points via
-//! `fidget`, and hand-verify the angle-field primitive
-//! `angle(p) = angle_between(normalize(grad f(p)), v)` behaves as expected.
+//! This crate is still independent of `manifold-core`'s domain logic (no
+//! slicing/toolpath/Gcode code here) — it provides scalar-field primitives
+//! (`fidget`-`Tree`-backed fields and mesh-derived SDFs) and the
+//! angle-field primitive `angle(p) = angle_between(normalize(grad f(p)), v)`
+//! that both the slicing research and the GUI visualization tooling build
+//! on.
 
 use fidget::{context::Tree, shape::EzShape, types::Grad, vm::VmShape};
 use glam::DVec3;
