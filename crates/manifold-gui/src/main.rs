@@ -10,6 +10,7 @@ mod app;
 mod camera;
 #[cfg(feature = "mcp-server")]
 mod mcp;
+mod profile;
 mod render;
 mod scene;
 

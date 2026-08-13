@@ -2,6 +2,7 @@
 //! an in-panel import toolbar (Phase 4, see ROADMAP.md).
 
 use crate::camera::OrbitCamera;
+use crate::profile::Profile;
 use crate::render::{
     MeshPaintCallback, MeshRenderResources, ScenePaintCallback, UploadedMesh, UploadedScene,
 };
@@ -47,6 +48,9 @@ pub struct ManifoldApp {
     /// "Export…".
     gcode: Option<String>,
     slice_error: Option<String>,
+    /// Set by a failed "Save Profile…"/"Load Profile…" action (Phase 10, see
+    /// ROADMAP.md).
+    profile_error: Option<String>,
     next_tool_id: u32,
     /// Commands from the Phase 9 MCP automation server, drained once per
     /// frame in `update()`. `None` if the `mcp-server` feature is off or
@@ -96,6 +100,7 @@ impl ManifoldApp {
             gizmo: Gizmo::default(),
             gcode: None,
             slice_error: None,
+            profile_error: None,
             next_tool_id: 1,
             #[cfg(feature = "mcp-server")]
             mcp_rx,
@@ -268,6 +273,55 @@ impl ManifoldApp {
             self.next_tool_id += 1;
         }
 
+        ui.horizontal(|ui| {
+            if ui.button("Save Profile…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Profile", &["json"])
+                    .set_file_name("profile.json")
+                    .save_file()
+                {
+                    let profile = Profile {
+                        machine: self.machine.clone(),
+                        config: self.config.clone(),
+                    };
+                    match profile.save(&path) {
+                        Ok(()) => self.profile_error = None,
+                        Err(error) => self.profile_error = Some(error.to_string()),
+                    }
+                }
+            }
+            if ui.button("Load Profile…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Profile", &["json"])
+                    .pick_file()
+                {
+                    match Profile::load(&path) {
+                        Ok(profile) => {
+                            self.machine = profile.machine;
+                            self.config = profile.config;
+                            self.next_tool_id = self
+                                .machine
+                                .tools
+                                .iter()
+                                .map(|tool| tool.id.0)
+                                .max()
+                                .map_or(0, |max_id| max_id + 1);
+                            self.profile_error = None;
+
+                            let device = frame
+                                .wgpu_render_state()
+                                .expect("wgpu renderer is required")
+                                .device
+                                .clone();
+                            self.uploaded_scene =
+                                Arc::new(Self::build_scene(&device, &self.machine));
+                        }
+                        Err(error) => self.profile_error = Some(error.to_string()),
+                    }
+                }
+            }
+        });
+
         ui.separator();
         ui.heading("Objects");
         if self.objects.is_empty() {
@@ -308,6 +362,10 @@ impl ManifoldApp {
         if let Some(err) = &self.slice_error {
             ui.separator();
             ui.colored_label(egui::Color32::RED, format!("Slice failed: {err}"));
+        }
+        if let Some(err) = &self.profile_error {
+            ui.separator();
+            ui.colored_label(egui::Color32::RED, format!("Profile failed: {err}"));
         }
         if let Some(gcode) = &self.gcode {
             ui.separator();

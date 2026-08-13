@@ -337,19 +337,27 @@ preserved from the object's current transform), `import_file`. The
 screenshot tool (lowest priority per the note above) is not yet
 implemented.
 
+## Phase 10 — Settings profiles (needs 3 + 8, no new manifold-core domain logic) — ✅ done
+
+Save/load named presets for `Machine` + `SlicerConfig` so a user doesn't
+have to re-enter bed size, tool layout, layer height, etc. each session.
+
+**Implementation notes**: landed as `manifold-gui/src/profile.rs` —
+a `Profile { machine: Machine, config: SlicerConfig }` struct (JSON via
+`serde_json`, pretty-printed) with `Profile::save`/`Profile::load`
+helpers. `serde`/`serde_json` moved from optional (`mcp-server`-gated) to
+required deps of `manifold-gui`. "Save Profile…"/"Load Profile…"
+buttons sit in the settings panel's Machine section, using the same
+`rfd` dialog pattern as Import/Export (filtered to `*.json`). Loading a
+profile replaces `self.machine`/`self.config`, recomputes `next_tool_id`
+from the loaded tools' max id, and rebuilds the scene (bed geometry may
+have changed). Deliberately excludes `objects`/`selected` — a profile
+captures printer + slicer setup, not an in-progress project. No
+profiles directory/registry UI yet; users pick a file location each
+time via the save/open dialog, same as Gcode export.
+
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
-- **Settings profiles (machine / slicer / filament)**: save/load named
-  presets for `Machine`, `SlicerConfig`, and (once it exists) a
-  `Material`/filament settings profile, so a user doesn't have to
-  re-enter bed size, tool layout, layer height, etc. each session.
-  `Machine` and `SlicerConfig` already derive `Serialize`/`Deserialize`
-  specifically so this is additive later (see `CODE_STYLE.md`'s config
-  guidance) — this is a GUI/CLI-level feature (profile file format,
-  load/save UI, a profiles directory) with no `manifold-core` domain
-  changes anticipated. Phase 8's Machine-editing UI (tool add/remove,
-  bed size) keeps using `Machine`/`SlicerConfig` as the single source of
-  truth so this slots in later without re-plumbing state.
 - **Multi-object collision avoidance**: toolhead-vs-already-printed-object
   clearance checking to safely order/interleave simultaneous multi-object
   printing. Depends on `Tool.collision_envelope` (added in Phase 0) and
