@@ -1,4 +1,8 @@
 //! `manifold` CLI: drives `manifold-core` headlessly to slice a mesh to Gcode.
+//!
+//! TODO(roadmap): Phase 8 (see ROADMAP.md) — accept multiple input files
+//! (+ a per-file tool assignment flag) and build a `Workspace` (Phase 0)
+//! instead of the single `Mesh::default()` placeholder below.
 
 use anyhow::Result;
 use clap::Parser;

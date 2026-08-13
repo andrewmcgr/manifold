@@ -5,12 +5,18 @@
 //! in a service) or be driven by the `manifold-cli` front-end.
 
 pub mod error;
+pub mod gcode;
 pub mod mesh;
 pub mod slicing;
 pub mod toolpath;
-pub mod gcode;
 
 pub use error::{Error, Result};
+
+// TODO(roadmap): Phase 0 (see ROADMAP.md) — add `object`, `tool`, `material`,
+// `machine`, and `workspace` modules here. `Workspace` (a collection of
+// `Object`s + `Machine` + `SlicerConfig`) becomes the new input to
+// `slice_to_gcode`, replacing the single-`Mesh` signature below — a
+// breaking change both front-ends must migrate to.
 
 /// Slicer configuration shared across the pipeline.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

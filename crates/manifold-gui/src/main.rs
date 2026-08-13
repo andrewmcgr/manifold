@@ -1,4 +1,13 @@
 //! `manifold-gui`: egui/wgpu desktop front-end for the Manifold slicer.
+//!
+//! TODO(roadmap): Phases 4-7 (see ROADMAP.md) — grow this scaffold into the
+//! full slicer layout: left `SidePanel` settings, `CentralPanel` 3D
+//! viewport with an in-panel top toolbar (Phase 4); a wgpu render pipeline
+//! embedded via `egui_wgpu::Callback` with an orbit camera (Phase 5);
+//! in-scene origin/bed/toolhead visualization driven by `Machine` (Phase
+//! 6); and `transform-gizmo-egui`-based per-object move/rotate/scale
+//! gizmos (Phase 7, needs an egui-version compatibility check against the
+//! `eframe = "0.29"` pin below).
 
 use eframe::egui;
 

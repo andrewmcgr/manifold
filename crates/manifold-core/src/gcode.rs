@@ -1,4 +1,7 @@
 //! Gcode emission from planned toolpaths.
+//!
+//! TODO(roadmap): Phase 2 (see ROADMAP.md) — add tool-change Gcode
+//! (tool-select + prime/purge) once Phase 0/2's multi-tool planning lands.
 
 use crate::{toolpath::Path, SlicerConfig};
 
@@ -10,7 +13,13 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
 
     for path in paths {
         for (i, p) in path.points.iter().enumerate() {
-            let cmd = if i == 0 { "G0" } else if path.extruding { "G1" } else { "G0" };
+            let cmd = if i == 0 {
+                "G0"
+            } else if path.extruding {
+                "G1"
+            } else {
+                "G0"
+            };
             out.push_str(&format!("{cmd} X{:.3} Y{:.3} Z{:.3}\n", p.x, p.y, p.z));
         }
     }

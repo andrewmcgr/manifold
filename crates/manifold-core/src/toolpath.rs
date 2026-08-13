@@ -14,6 +14,12 @@ pub struct Path {
 ///
 /// Placeholder implementation: real path planning (perimeters, infill,
 /// non-planar toolpath deformation) lives here.
+///
+/// TODO(roadmap): Phase 2 (see ROADMAP.md) — add tool-change-aware
+/// planning (per-tool paths, tool switch points) once Phase 0's `Tool`
+/// model lands. Toolhead-vs-neighbor collision avoidance for simultaneous
+/// multi-object printing is explicitly deferred (see ROADMAP.md); it will
+/// use `Tool.collision_envelope` once tackled.
 pub fn plan(_layers: &[Layer], _config: &SlicerConfig) -> Result<Vec<Path>> {
     Ok(Vec::new())
 }
