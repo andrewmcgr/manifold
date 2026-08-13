@@ -12,9 +12,10 @@
 
 use fidget::{context::Tree, shape::EzShape, types::Grad, vm::VmShape};
 use glam::DVec3;
-
 pub mod geometry;
+pub mod marching_cubes;
 pub mod mesh_sdf;
+pub mod slice;
 
 /// Builds a `fidget::context::Tree` for a sphere of the given `radius`
 /// centered at the origin: `f(p) = |p| - radius`.
