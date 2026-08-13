@@ -43,8 +43,9 @@ at the relevant stub sites in source.
   dependency needed). Standard pattern: paint the 3D scene via a wgpu
   callback, with egui widgets (toolbar, panels, gizmo overlay) layered on
   top in the same frame.
-- **File-open dialogs**: [`rfd`](https://crates.io/crates/rfd) — not yet a
-  dependency; needed for GUI mesh import.
+- **File-open dialogs**: [`rfd`](https://crates.io/crates/rfd) v0.15 —
+  native file-open dialog, added to `manifold-gui` for mesh import
+  (Phase 4).
 
 ## Phase 0 — Domain model (prerequisite for everything below) — ✅ done
 
@@ -110,19 +111,36 @@ at the relevant stub sites in source.
   count/geometry/offsets — feeds both slicing bounds-checks and GUI scene
   visualization (Phase 6).
 
-## Phase 4 — GUI shell/layout (needs 0)
+## Phase 4 — GUI shell/layout (needs 0) — ✅ done
 
-- `egui::SidePanel::left` — settings (global `SlicerConfig` + per-object
-  tool/material assignment).
-- `egui::CentralPanel` — 3D viewport, with an in-panel top toolbar (import,
-  select/move/rotate/scale modes, slice, export).
-- Wire `rfd` for mesh import (STL/3MF via Phase 1 loaders).
+- `egui::SidePanel::left` — settings (global `SlicerConfig`) + object list.
+  Per-object tool/material assignment UI not yet added (needs Phase 8
+  end-to-end wiring to be meaningful).
+- `egui::CentralPanel` — 3D viewport, with an in-panel top toolbar (import
+  only so far; select/move/rotate/scale modes, slice, export land with
+  Phase 7/8).
+- Wired `rfd` for mesh import (STL/3MF via Phase 1 loaders), mirroring
+  `manifold-cli`'s extension-dispatch `load_objects`.
 
-## Phase 5 — 3D rendering pipeline (needs Phase 4)
+## Phase 5 — 3D rendering pipeline (needs Phase 4) — ✅ done
 
-- Minimal wgpu triangle-mesh pipeline (vertex/index buffers from `Mesh`,
-  basic normal-lit shader), embedded via `egui_wgpu::Callback`.
-- Orbit camera (pan/zoom/rotate) driven by pointer input in the viewport.
+- Minimal wgpu triangle-mesh pipeline (`manifold-gui/src/render.rs`,
+  `mesh_shader.wgsl`): flat per-triangle-face-normal lit shading, embedded
+  via `egui_wgpu::Callback`/`CallbackTrait` per the verified
+  `egui-wgpu 0.29.1` pattern (resources stored in
+  `Renderer::callback_resources`, camera uniform updated in `prepare`,
+  draw issued in `paint`).
+- Orbit camera (`manifold-gui/src/camera.rs`): drag-to-rotate, secondary-
+  drag-to-pan, scroll-to-zoom.
+- **Note**: `Mesh` has no per-vertex normal data, so normals are computed
+  as flat per-triangle face normals at upload time, expanding to a
+  non-indexed vertex buffer (each triangle's 3 vertices duplicated with
+  that face's normal) rather than reusing `Mesh.indices` directly.
+- **Note**: object transforms are baked into vertex positions at import
+  time (CPU-side), not applied as a per-draw model-matrix uniform.
+  Interactive per-object transform editing is Phase 7's job (gizmos); this
+  keeps this phase's scope contained. Revisit if/when Phase 7 needs
+  live-updating transforms without a full re-upload.
 
 ## Phase 6 — Scene content: origin, bed/substrate, toolhead (needs 3 + 5)
 
