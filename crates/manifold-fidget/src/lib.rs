@@ -14,6 +14,7 @@ use fidget::{context::Tree, shape::EzShape, types::Grad, vm::VmShape};
 use glam::DVec3;
 
 pub mod geometry;
+pub mod mesh_sdf;
 
 /// Builds a `fidget::context::Tree` for a sphere of the given `radius`
 /// centered at the origin: `f(p) = |p| - radius`.

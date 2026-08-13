@@ -66,7 +66,11 @@ pub fn closest_point_on_triangle(p: DVec3, tri: &Triangle) -> DVec3 {
     let vc = d1 * d4 - d3 * d2;
     if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
         let denom = d1 - d3;
-        let v = if denom.abs() > f64::EPSILON { d1 / denom } else { 0.0 };
+        let v = if denom.abs() > f64::EPSILON {
+            d1 / denom
+        } else {
+            0.0
+        };
         return a + ab * v;
     }
 
@@ -82,7 +86,11 @@ pub fn closest_point_on_triangle(p: DVec3, tri: &Triangle) -> DVec3 {
     let vb = d5 * d2 - d1 * d6;
     if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
         let denom = d2 - d6;
-        let w = if denom.abs() > f64::EPSILON { d2 / denom } else { 0.0 };
+        let w = if denom.abs() > f64::EPSILON {
+            d2 / denom
+        } else {
+            0.0
+        };
         return a + ac * w;
     }
 
