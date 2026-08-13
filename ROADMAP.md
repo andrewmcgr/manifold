@@ -91,7 +91,7 @@ at the relevant stub sites in source.
   assemblies/`components` into world-space geometry, and extracting the
   Materials extension into `Material`/`MaterialId`.
 
-## Phase 2 — Multi-object / multi-tool slicing pipeline (needs 0 + 1)
+## Phase 2 — Multi-object / multi-tool slicing pipeline (needs 0 + 1) — ✅ done
 
 - `slicing::slice_mesh` → operate per-`Object` (apply transform, slice in
   world space), tagging output layers by object id.
@@ -104,6 +104,43 @@ at the relevant stub sites in source.
   multi-object printing — see Deferred Work below. v1 needs an open
   decision (sequential single-object-at-a-time vs. naive simultaneous
   printing) recorded before implementation.
+
+**Implementation notes**: print ordering is v1-sequential (whole object
+at a time) but built **pluggable** from the start, landed as
+`manifold-core/src/ordering.rs`: an `ObjectOrderStrategy` trait
+(`fn order(&self, objects: &[Object]) -> Result<Vec<ObjectId>>`), one
+implementation (`SequentialOrder`, declaration order), and a
+config-selectable `ObjectOrderingKind` enum (`Serialize`/`Deserialize`/
+`Default`, currently just `Sequential`) resolved to a strategy via
+`strategy_for`. `SlicerConfig` gained `object_ordering: ObjectOrderingKind`
+so the choice persists like any other slicing parameter. Adding a future
+algorithm (naive-simultaneous, Z-interleaved, eventually
+collision-aware) is an additive change: new enum variant + new struct
+implementing the trait + one match arm in `strategy_for` — no changes to
+the rest of the pipeline.
+
+`slicing::Layer` gained an `object: ObjectId` tag. `slicing::slice_object`
+bakes an `Object`'s `transform` into world-space vertices (same
+transform-at-upload-time pattern the GUI renderer already uses) before
+slicing; `slicing::slice_workspace(objects, order, config)` slices every
+object in the strategy's chosen order and concatenates their layer stacks
+back-to-back — that concatenation *is* what makes ordering "sequential";
+a future Z-interleaving strategy would replace it with a per-Z merge
+across objects instead of a straight `extend`.
+
+`toolpath::Path` gained a `tool: ToolId` field; `toolpath::plan` now takes
+`&[Object]` alongside `&[Layer]` to look up each layer's source object's
+assigned tool and tag the resulting path with it. `gcode::emit` tracks the
+last-emitted tool and inserts a `T{n}` tool-select line whenever
+consecutive paths differ in `tool`. Prime/purge Gcode around a tool change
+is **not yet implemented** — real toolpath/Gcode content is still a
+placeholder pipeline (per Phase 0/2 scope), so this is a follow-up once
+actual path planning lands, not a gap introduced by this phase.
+
+`slice_to_gcode` (`lib.rs`) now rejects an empty workspace up front, then
+wires `strategy_for(config.object_ordering).order(&objects)` →
+`slice_workspace` → `toolpath::plan` (passed `objects`) → `gcode::emit` —
+replacing the old "slices only the first object" placeholder.
 
 ## Phase 3 — Machine/printer definition (needs 0) — ✅ done
 
@@ -207,7 +244,7 @@ same `Ui` so it composites on top of the 3D scene rather than being
 z-tested against it. Multi-select (dragging several objects at once) is
 out of scope — `self.selected` is a single `Option<usize>`.
 
-## Phase 8 — End-to-end wiring (needs all of the above)
+## Phase 8 — End-to-end wiring (needs all of the above) — ✅ done
 
 - GUI: import → arrange/assign tool in 3D view → configure settings →
   Slice action in toolbar → `slice_to_gcode(&Workspace)` → preview/export.
@@ -215,6 +252,28 @@ out of scope — `self.selected` is a single `Option<usize>`.
   tool assignment flag) building a `Workspace`. **Partially done**: 3MF
   input now builds a multi-object `Workspace` via one file; still needs
   multiple input files and per-file tool assignment.
+
+**Implementation notes**: `manifold-cli`'s `inputs` is now `Vec<String>`
+(`num_args = 1..`); each entry is `path` or `path:tool` (e.g.
+`part.stl:1`, defaulting to tool `0`) — `parse_input_entry` splits the
+suffix, `load_objects` allocates sequential `ObjectId`s across every file
+and assigns the parsed `ToolId`, and `tools_for` builds one `Tool` per
+distinct tool id referenced (sorted/deduped), all sharing
+`--nozzle-diameter` today (per-tool nozzle diameter flags are a further
+follow-up, not blocking this phase).
+
+`manifold-gui`'s `app.rs` gained: an "Add tool" button in the Machine
+section (`Tool::new` with an incrementing `next_tool_id`, starting after
+the one default tool); a per-object tool-assignment `egui::ComboBox` in
+the Objects list (writes `object.tool` directly, listing every
+`machine.tools` entry by id); a "Slice"/"Export…" pair in the viewport
+toolbar ("Slice" enabled once objects are loaded, builds a `Workspace`
+from current `objects`/`machine`/`config` and calls
+`manifold_core::slice_to_gcode`, storing the result in `self.gcode` or
+`self.slice_error`; "Export…" enabled once `gcode` is `Some`, opens
+`rfd::FileDialog::save_file` and writes it out); and a Gcode preview
+section in the settings panel (line count + a scrolling `ui.monospace`
+dump) shown whenever `self.gcode` is populated.
 
 ## Phase 9 — MCP automation server for GUI testability (needs 4 + 7, dev/test-only) — ✅ done
 
@@ -280,6 +339,17 @@ implemented.
 
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
+- **Settings profiles (machine / slicer / filament)**: save/load named
+  presets for `Machine`, `SlicerConfig`, and (once it exists) a
+  `Material`/filament settings profile, so a user doesn't have to
+  re-enter bed size, tool layout, layer height, etc. each session.
+  `Machine` and `SlicerConfig` already derive `Serialize`/`Deserialize`
+  specifically so this is additive later (see `CODE_STYLE.md`'s config
+  guidance) — this is a GUI/CLI-level feature (profile file format,
+  load/save UI, a profiles directory) with no `manifold-core` domain
+  changes anticipated. Phase 8's Machine-editing UI (tool add/remove,
+  bed size) keeps using `Machine`/`SlicerConfig` as the single source of
+  truth so this slots in later without re-plumbing state.
 - **Multi-object collision avoidance**: toolhead-vs-already-printed-object
   clearance checking to safely order/interleave simultaneous multi-object
   printing. Depends on `Tool.collision_envelope` (added in Phase 0) and
@@ -294,8 +364,13 @@ implemented.
 1. ~~Disambiguate `lib3mf` (telecos) vs. the `lib3mf-core` family
    (sscargal) before adding either as a dependency (Phase 1).~~ **Resolved**:
    `lib3mf` (telecos/lib3mf_rust) is the dependency in use; see Phase 1.
-2. Sequential vs. naive-simultaneous multi-object print ordering for v1,
-   given collision avoidance is deferred (Phase 2).
+2. ~~Sequential vs. naive-simultaneous multi-object print ordering for
+   v1, given collision avoidance is deferred (Phase 2).~~ **Resolved**:
+   sequential (whole-object-at-a-time) for v1, but implemented behind a
+   pluggable `ObjectOrderStrategy` trait + config-selectable
+   `ObjectOrderingKind` so alternative algorithms (naive-simultaneous,
+   Z-interleaved, eventually collision-aware) can be added later without
+   touching the slicing/toolpath/gcode pipeline — see Phase 2.
 3. ~~Stay on `eframe`/`egui` 0.29 or upgrade workspace-wide for
    `transform-gizmo-egui` compatibility (Phase 4/7).~~ **Resolved**: stayed
    on `eframe`/`egui` 0.29; `transform-gizmo-egui = "0.4.0"` is compatible

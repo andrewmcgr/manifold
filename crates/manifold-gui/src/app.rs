@@ -42,6 +42,12 @@ pub struct ManifoldApp {
     /// The move/rotate/scale gizmo, reused across frames so drag state
     /// persists between `interact()` calls.
     gizmo: Gizmo,
+    /// Gcode from the last successful "Slice" action (Phase 8, see
+    /// ROADMAP.md), previewed in the settings panel and written out by
+    /// "Export…".
+    gcode: Option<String>,
+    slice_error: Option<String>,
+    next_tool_id: u32,
     /// Commands from the Phase 9 MCP automation server, drained once per
     /// frame in `update()`. `None` if the `mcp-server` feature is off or
     /// the server thread failed to start.
@@ -88,6 +94,9 @@ impl ManifoldApp {
             import_error: None,
             selected: None,
             gizmo: Gizmo::default(),
+            gcode: None,
+            slice_error: None,
+            next_tool_id: 1,
             #[cfg(feature = "mcp-server")]
             mcp_rx,
         }
@@ -193,6 +202,27 @@ impl ManifoldApp {
         self.uploaded_meshes = Arc::new(uploaded);
     }
 
+    /// Run the slicing pipeline over the current `objects`/`machine`/
+    /// `config` and store the result (or error) for preview/export
+    /// (Phase 8, see ROADMAP.md).
+    fn slice(&mut self) {
+        let workspace = manifold_core::Workspace::new(
+            self.objects.clone(),
+            self.machine.clone(),
+            self.config.clone(),
+        );
+        match manifold_core::slice_to_gcode(&workspace) {
+            Ok(gcode) => {
+                self.gcode = Some(gcode);
+                self.slice_error = None;
+            }
+            Err(error) => {
+                self.gcode = None;
+                self.slice_error = Some(error.to_string());
+            }
+        }
+    }
+
     fn settings_panel(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         ui.heading("Settings");
         ui.add(
@@ -231,28 +261,63 @@ impl ManifoldApp {
                     .text("Tool 0 nozzle diameter (mm)"),
             );
         }
+        if ui.button("Add tool").clicked() {
+            self.machine
+                .tools
+                .push(Tool::new(ToolId(self.next_tool_id), 0.4));
+            self.next_tool_id += 1;
+        }
 
         ui.separator();
         ui.heading("Objects");
         if self.objects.is_empty() {
             ui.label("No objects loaded. Use Import to load an STL or 3MF file.");
         } else {
-            for (index, object) in self.objects.iter().enumerate() {
+            let tool_ids: Vec<ToolId> = self.machine.tools.iter().map(|tool| tool.id).collect();
+            for (index, object) in self.objects.iter_mut().enumerate() {
                 let selected = self.selected == Some(index);
                 let label = format!(
                     "Object {} — {} triangles",
                     object.id.0,
                     object.mesh.triangle_count()
                 );
-                if ui.selectable_label(selected, label).clicked() {
-                    self.selected = if selected { None } else { Some(index) };
-                }
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(selected, label).clicked() {
+                        self.selected = if selected { None } else { Some(index) };
+                    }
+                    egui::ComboBox::from_id_salt(("object_tool", object.id.0))
+                        .selected_text(format!("Tool {}", object.tool.0))
+                        .show_ui(ui, |ui| {
+                            for &tool_id in &tool_ids {
+                                ui.selectable_value(
+                                    &mut object.tool,
+                                    tool_id,
+                                    format!("Tool {}", tool_id.0),
+                                );
+                            }
+                        });
+                });
             }
         }
 
         if let Some(err) = &self.import_error {
             ui.separator();
             ui.colored_label(egui::Color32::RED, err);
+        }
+
+        if let Some(err) = &self.slice_error {
+            ui.separator();
+            ui.colored_label(egui::Color32::RED, format!("Slice failed: {err}"));
+        }
+        if let Some(gcode) = &self.gcode {
+            ui.separator();
+            ui.heading("Gcode");
+            ui.label(format!("{} line(s) generated", gcode.lines().count()));
+            egui::ScrollArea::vertical()
+                .max_height(150.0)
+                .show(ui, |ui| {
+                    ui.monospace(gcode);
+                });
         }
     }
 
@@ -272,6 +337,30 @@ impl ManifoldApp {
                 }
             }
             ui.label(format!("{} object(s) loaded", self.objects.len()));
+
+            ui.separator();
+            if ui
+                .add_enabled(!self.objects.is_empty(), egui::Button::new("Slice"))
+                .clicked()
+            {
+                self.slice();
+            }
+            if ui
+                .add_enabled(self.gcode.is_some(), egui::Button::new("Export…"))
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Gcode", &["gcode"])
+                    .set_file_name("out.gcode")
+                    .save_file()
+                {
+                    if let Some(gcode) = &self.gcode {
+                        if let Err(error) = std::fs::write(&path, gcode) {
+                            self.slice_error = Some(error.to_string());
+                        }
+                    }
+                }
+            }
         });
 
         egui::Frame::canvas(ui.style()).show(ui, |ui| {
