@@ -8,6 +8,8 @@
 
 mod app;
 mod camera;
+#[cfg(feature = "mcp-server")]
+mod mcp;
 mod render;
 mod scene;
 

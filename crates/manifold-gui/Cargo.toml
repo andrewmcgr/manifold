@@ -23,3 +23,13 @@ bytemuck = { version = "1", features = ["derive"] }
 glam = { workspace = true, features = ["bytemuck"] }
 rfd = "0.15"
 transform-gizmo-egui = "0.4.0"
+
+# Phase 9 (ROADMAP.md): dev/test-only MCP automation server, off by default.
+rmcp = { version = "0.9", features = ["server", "transport-async-rw"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros"], optional = true }
+schemars = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+mcp-server = ["dep:rmcp", "dep:tokio", "dep:schemars", "dep:serde", "dep:serde_json"]

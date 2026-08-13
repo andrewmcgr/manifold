@@ -38,6 +38,11 @@ pub struct ManifoldApp {
     /// The move/rotate/scale gizmo, reused across frames so drag state
     /// persists between `interact()` calls.
     gizmo: Gizmo,
+    /// Commands from the Phase 9 MCP automation server, drained once per
+    /// frame in `update()`. `None` if the `mcp-server` feature is off or
+    /// the server thread failed to start.
+    #[cfg(feature = "mcp-server")]
+    mcp_rx: Option<std::sync::mpsc::Receiver<crate::mcp::Command>>,
 }
 
 impl ManifoldApp {
@@ -67,6 +72,15 @@ impl ManifoldApp {
             &triangles,
         ));
 
+        #[cfg(feature = "mcp-server")]
+        let mcp_rx = match crate::mcp::spawn(crate::mcp::ADDR) {
+            Ok(rx) => Some(rx),
+            Err(error) => {
+                tracing::warn!(?error, "failed to start MCP automation server");
+                None
+            }
+        };
+
         Self {
             config: manifold_core::SlicerConfig::default(),
             objects: Vec::new(),
@@ -77,6 +91,73 @@ impl ManifoldApp {
             import_error: None,
             selected: None,
             gizmo: Gizmo::default(),
+            #[cfg(feature = "mcp-server")]
+            mcp_rx,
+        }
+    }
+
+    /// Drain pending automation commands from the MCP server thread and
+    /// apply them against scene state, same as any other UI mutation.
+    #[cfg(feature = "mcp-server")]
+    fn drain_mcp_commands(&mut self, frame: &mut eframe::Frame) {
+        let Some(rx) = &self.mcp_rx else { return };
+        let commands: Vec<_> = rx.try_iter().collect();
+        for command in commands {
+            match command {
+                crate::mcp::Command::SelectObject(index) => {
+                    self.selected = if index < self.objects.len() {
+                        Some(index)
+                    } else {
+                        None
+                    };
+                }
+                crate::mcp::Command::SetTransform { index, x, y, z } => {
+                    if let Some(object) = self.objects.get_mut(index) {
+                        let (scale, rotation, _) =
+                            object.transform.0.to_scale_rotation_translation();
+                        object.transform = Transform::from_scale_rotation_translation(
+                            scale,
+                            rotation,
+                            glam::DVec3::new(x, y, z),
+                        );
+                        let device = frame
+                            .wgpu_render_state()
+                            .expect("wgpu renderer is required")
+                            .device
+                            .clone();
+                        self.reupload(&device);
+                    }
+                }
+                crate::mcp::Command::ImportFile(path) => {
+                    let device = frame
+                        .wgpu_render_state()
+                        .expect("wgpu renderer is required")
+                        .device
+                        .clone();
+                    self.import(&path, &device);
+                }
+                crate::mcp::Command::ListObjects(reply) => {
+                    let json = serde_json::to_string(
+                        &self
+                            .objects
+                            .iter()
+                            .enumerate()
+                            .map(|(index, object)| {
+                                serde_json::json!({
+                                    "index": index,
+                                    "id": object.id.0,
+                                    "triangle_count": object.mesh.triangle_count(),
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_else(|_| "[]".to_string());
+                    let _ = reply.send(json);
+                }
+                crate::mcp::Command::GetSelected(reply) => {
+                    let _ = reply.send(self.selected);
+                }
+            }
         }
     }
 
@@ -256,6 +337,9 @@ fn default_machine() -> Machine {
 
 impl eframe::App for ManifoldApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(feature = "mcp-server")]
+        self.drain_mcp_commands(frame);
+
         egui::SidePanel::left("settings_panel")
             .default_width(260.0)
             .show(ctx, |ui| self.settings_panel(ui));

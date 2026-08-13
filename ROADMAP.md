@@ -163,6 +163,68 @@ at the relevant stub sites in source.
   input now builds a multi-object `Workspace` via one file; still needs
   multiple input files and per-file tool assignment.
 
+## Phase 9 — MCP automation server for GUI testability (needs 4 + 7, dev/test-only) — ✅ done
+
+Expose an MCP (Model Context Protocol) server from inside `manifold-gui`
+so an agent/test harness can drive and inspect the app programmatically
+(select objects, set transforms, import files, read state, screenshot),
+without synthesizing real pointer/keyboard input. This repurposes MCP's
+tool-call transport as an automation RPC layer — legitimate for this use
+case because the calling agent already speaks MCP, not because this is
+MCP's intended end-user tool-calling purpose. Gate the whole thing behind
+a Cargo feature (e.g. `mcp-server`, off by default) — it must not be
+present in a release binary (a standing debug automation port is not
+something to ship).
+
+- **Crate/dependency**: `rmcp` (the official Rust MCP SDK,
+  `modelcontextprotocol/rust-sdk`) — actively maintained, supports
+  stdio, HTTP/SSE, and generic async read/write transports. Use HTTP/SSE
+  or plain TCP on `127.0.0.1:<port>`, **not stdio** — `eframe` already
+  owns the process's stdio (logging via `tracing_subscriber::fmt::init()`
+  per `CODE_STYLE.md`), so only one thing can own it.
+- **Threading model**: spawn the MCP server on its own background thread
+  with a small tokio runtime, using `rmcp`'s worker-transport pattern
+  (`serve_server_with_ct` + `LocalSessionHandle`/`LocalSessionWorker`) —
+  designed exactly for running the server's message loop independently of
+  a host application's own event loop (here, `eframe::run_native`'s
+  blocking native loop on the main thread).
+- **Crossing the thread boundary**: no cross-thread `egui::Context`/UI
+  mutation. Each MCP tool call sends a `Command` enum (e.g.
+  `SelectObject(usize)`, `SetTransform{index, transform}`,
+  `ImportFile(PathBuf)`, `Screenshot`) over an `mpsc::Sender<Command>`
+  owned by `ManifoldApp`, then calls `ctx.request_repaint()` (documented
+  as safe from any thread — this is how `eframe` already wakes its loop
+  for background events). `ManifoldApp::update()` drains the channel at
+  the top of each frame and applies commands on the UI thread, same as
+  all existing state mutation. Query-style tools (`get_objects`,
+  `screenshot`) pair the command with a `oneshot::Sender<Response>` so the
+  MCP handler can await the result after the next frame processes it.
+- **In scope**: object list state (ids/triangle counts/selection),
+  programmatic `select_object`/`set_transform` (bypassing gizmo drag math
+  entirely — actually more precise for testing than synthesizing pointer
+  drags), headless `import_file` (STL/3MF), and eventually a screenshot
+  tool (read back the wgpu surface texture via a copy-to-buffer +
+  map-read — more plumbing than everything else combined, lowest
+  priority).
+- **Out of scope**: injecting synthetic pointer drags to test
+  `transform-gizmo-egui`'s drag interaction pixel-accurately. egui's input
+  model wants a `RawInput` fed into `Context::run_ui` per frame — normally
+  `eframe`'s job, not something to fight from a side channel. Gizmo drag
+  interaction itself is better tested via a separate headless
+  `egui::Context::run` integration-test harness (no window, no MCP
+  needed) — a distinct, more contained effort from this phase.
+
+**Implementation notes**: landed as `manifold-gui/src/mcp.rs`, gated
+behind the `mcp-server` Cargo feature (off by default — build/run with
+`--features mcp-server` to enable it). Uses `rmcp` 0.9 + `schemars` 1 +
+`tokio` (private `Builder::new_multi_thread()` runtime inside a spawned
+`std::thread`, raw TCP via `transport-async-rw`, no HTTP framework). Fixed
+port `127.0.0.1:8931`. Tools landed: `list_objects`, `get_selected`,
+`select_object`, `set_transform` (translation only — rotation/scale
+preserved from the object's current transform), `import_file`. The
+screenshot tool (lowest priority per the note above) is not yet
+implemented.
+
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
 - **Multi-object collision avoidance**: toolhead-vs-already-printed-object
@@ -181,5 +243,7 @@ at the relevant stub sites in source.
    `lib3mf` (telecos/lib3mf_rust) is the dependency in use; see Phase 1.
 2. Sequential vs. naive-simultaneous multi-object print ordering for v1,
    given collision avoidance is deferred (Phase 2).
-3. Stay on `eframe`/`egui` 0.29 or upgrade workspace-wide for
-   `transform-gizmo-egui` compatibility (Phase 4/7).
+3. ~~Stay on `eframe`/`egui` 0.29 or upgrade workspace-wide for
+   `transform-gizmo-egui` compatibility (Phase 4/7).~~ **Resolved**: stayed
+   on `eframe`/`egui` 0.29; `transform-gizmo-egui = "0.4.0"` is compatible
+   as-is (see Phase 4/5/7, all landed against 0.29).

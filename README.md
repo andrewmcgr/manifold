@@ -24,4 +24,17 @@ cargo run -p manifold-cli -- path/to/model.stl -o out.gcode
 cargo run -p manifold-gui
 ```
 
+### Automation (dev only)
+
+`manifold-gui` can optionally expose a local MCP automation server for
+driving the GUI programmatically (agent/test harnesses) — see
+`ROADMAP.md` Phase 9. Off by default; enable with:
+
+```sh
+cargo run -p manifold-gui --features mcp-server
+```
+
+Listens on `127.0.0.1:8931`. Never enable this feature in a release
+build.
+
 See `ARCHITECTURE.md` and `CODE_STYLE.md` for more detail.
