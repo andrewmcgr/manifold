@@ -1,7 +1,7 @@
 //! Orbit camera: drag-to-rotate, scroll-to-zoom, driven by pointer input
 //! in the viewport (Phase 5, see ROADMAP.md).
 
-use glam::{DVec3, Mat4, Vec3};
+use glam::{DMat4, DVec3, Mat4, Vec3};
 
 /// An orbit camera looking at `target` from `distance` away, at
 /// `yaw`/`pitch` angles.
@@ -69,13 +69,39 @@ impl OrbitCamera {
         self.distance = (self.distance * factor).max(MIN_DISTANCE);
     }
 
+    /// The camera-space view matrix (world -> camera).
+    pub fn view_matrix(&self) -> Mat4 {
+        let eye = self.eye().as_vec3();
+        let target = self.target.as_vec3();
+        Mat4::look_at_rh(eye, target, Vec3::Z)
+    }
+
+    /// The projection matrix for the given viewport aspect ratio (width /
+    /// height).
+    pub fn projection_matrix(&self, aspect_ratio: f32) -> Mat4 {
+        Mat4::perspective_rh(self.fov_y_radians, aspect_ratio, self.near, self.far)
+    }
+
+    /// Double-precision view matrix, for feeding into APIs (e.g.
+    /// `transform-gizmo-egui`) that expect `f64` matrices to line up with
+    /// `manifold-core`'s `f64` object transforms.
+    pub fn view_matrix_f64(&self) -> DMat4 {
+        DMat4::look_at_rh(self.eye(), self.target, DVec3::Z)
+    }
+
+    /// Double-precision projection matrix — see [`Self::view_matrix_f64`].
+    pub fn projection_matrix_f64(&self, aspect_ratio: f32) -> DMat4 {
+        DMat4::perspective_rh(
+            self.fov_y_radians as f64,
+            aspect_ratio as f64,
+            self.near as f64,
+            self.far as f64,
+        )
+    }
+
     /// The combined view-projection matrix for the given viewport aspect
     /// ratio (width / height).
     pub fn view_proj(&self, aspect_ratio: f32) -> Mat4 {
-        let eye = self.eye().as_vec3();
-        let target = self.target.as_vec3();
-        let view = Mat4::look_at_rh(eye, target, Vec3::Z);
-        let proj = Mat4::perspective_rh(self.fov_y_radians, aspect_ratio, self.near, self.far);
-        proj * view
+        self.projection_matrix(aspect_ratio) * self.view_matrix()
     }
 }

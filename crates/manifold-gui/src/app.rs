@@ -10,11 +10,14 @@ use eframe::egui;
 use manifold_core::bounds::BoundingVolume;
 use manifold_core::machine::Machine;
 use manifold_core::tool::Tool;
+use manifold_core::transform::Transform;
 use manifold_core::{ids::ObjectId, ids::ToolId, mesh::Mesh, object::Object, stl, threemf};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
+use transform_gizmo_egui::math::Transform as GizmoTransform;
+use transform_gizmo_egui::prelude::*;
 
 pub struct ManifoldApp {
     config: manifold_core::SlicerConfig,
@@ -28,6 +31,13 @@ pub struct ManifoldApp {
     camera: OrbitCamera,
     next_object_id: u32,
     import_error: Option<String>,
+    /// Index into `objects` of the currently selected object, if any —
+    /// drives which object the move/rotate/scale gizmo manipulates
+    /// (Phase 7, see ROADMAP.md).
+    selected: Option<usize>,
+    /// The move/rotate/scale gizmo, reused across frames so drag state
+    /// persists between `interact()` calls.
+    gizmo: Gizmo,
 }
 
 impl ManifoldApp {
@@ -65,6 +75,8 @@ impl ManifoldApp {
             camera: OrbitCamera::default(),
             next_object_id: 0,
             import_error: None,
+            selected: None,
+            gizmo: Gizmo::default(),
         }
     }
 
@@ -105,12 +117,16 @@ impl ManifoldApp {
         if self.objects.is_empty() {
             ui.label("No objects loaded. Use Import to load an STL or 3MF file.");
         } else {
-            for object in &self.objects {
-                ui.label(format!(
+            for (index, object) in self.objects.iter().enumerate() {
+                let selected = self.selected == Some(index);
+                let label = format!(
                     "Object {} — {} triangles",
                     object.id.0,
                     object.mesh.triangle_count()
-                ));
+                );
+                if ui.selectable_label(selected, label).clicked() {
+                    self.selected = if selected { None } else { Some(index) };
+                }
             }
         }
 
@@ -174,6 +190,53 @@ impl ManifoldApp {
                         meshes: self.uploaded_meshes.clone(),
                     },
                 ));
+
+            // Gizmo paints as plain egui geometry into this `Ui`'s layer, so
+            // it must run after the wgpu scene/mesh paint callbacks above to
+            // composite on top of them (see ROADMAP.md Phase 7).
+            if let Some(index) = self.selected {
+                if let Some(object) = self.objects.get(index) {
+                    self.gizmo.update_config(GizmoConfig {
+                        view_matrix: self.camera.view_matrix_f64().into(),
+                        projection_matrix: self.camera.projection_matrix_f64(aspect_ratio).into(),
+                        viewport: rect,
+                        modes: GizmoMode::all(),
+                        orientation: GizmoOrientation::Local,
+                        ..Default::default()
+                    });
+
+                    let (scale, rotation, translation) =
+                        object.transform.0.to_scale_rotation_translation();
+                    let gizmo_transform = GizmoTransform::from_scale_rotation_translation(
+                        scale,
+                        rotation,
+                        translation,
+                    );
+
+                    if let Some((_, mut new_transforms)) =
+                        self.gizmo.interact(ui, &[gizmo_transform])
+                    {
+                        if let Some(new_transform) = new_transforms.pop() {
+                            let scale: mint::Vector3<f64> = new_transform.scale;
+                            let rotation: mint::Quaternion<f64> = new_transform.rotation;
+                            let translation: mint::Vector3<f64> = new_transform.translation;
+                            self.objects[index].transform =
+                                Transform::from_scale_rotation_translation(
+                                    scale.into(),
+                                    rotation.into(),
+                                    translation.into(),
+                                );
+
+                            let device = frame
+                                .wgpu_render_state()
+                                .expect("wgpu renderer is required")
+                                .device
+                                .clone();
+                            self.reupload(&device);
+                        }
+                    }
+                }
+            }
         });
     }
 }

@@ -22,3 +22,4 @@ wgpu = "22"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { workspace = true, features = ["bytemuck"] }
 rfd = "0.15"
+transform-gizmo-egui = "0.4.0"
