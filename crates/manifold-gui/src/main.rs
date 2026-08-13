@@ -9,6 +9,7 @@
 mod app;
 mod camera;
 mod render;
+mod scene;
 
 use app::ManifoldApp;
 

@@ -2,8 +2,14 @@
 //! an in-panel import toolbar (Phase 4, see ROADMAP.md).
 
 use crate::camera::OrbitCamera;
-use crate::render::{MeshPaintCallback, MeshRenderResources, UploadedMesh};
+use crate::render::{
+    MeshPaintCallback, MeshRenderResources, ScenePaintCallback, UploadedMesh, UploadedScene,
+};
+use crate::scene;
 use eframe::egui;
+use manifold_core::bounds::BoundingVolume;
+use manifold_core::machine::Machine;
+use manifold_core::tool::Tool;
 use manifold_core::{ids::ObjectId, ids::ToolId, mesh::Mesh, object::Object, stl, threemf};
 use std::fs::File;
 use std::io::BufReader;
@@ -15,6 +21,10 @@ pub struct ManifoldApp {
     objects: Vec<Object>,
     /// GPU-uploaded copies of `objects`, rebuilt whenever `objects` changes.
     uploaded_meshes: Arc<Vec<UploadedMesh>>,
+    /// Scene dressing (origin axes, bed grid/quad, toolhead markers),
+    /// uploaded once at startup — the placeholder `Machine` doesn't change
+    /// at runtime yet, see ROADMAP.md Phase 6.
+    uploaded_scene: Arc<UploadedScene>,
     camera: OrbitCamera,
     next_object_id: u32,
     import_error: Option<String>,
@@ -36,10 +46,22 @@ impl ManifoldApp {
                 wgpu_render_state.target_format,
             ));
 
+        let machine = default_machine();
+        let mut lines = scene::build_origin_axes(50.0);
+        lines.extend(scene::build_grid(&machine, 10.0));
+        let mut triangles = scene::build_bed_quad(&machine);
+        triangles.extend(scene::build_toolhead_markers(&machine, 8.0));
+        let uploaded_scene = Arc::new(UploadedScene::upload(
+            &wgpu_render_state.device,
+            &lines,
+            &triangles,
+        ));
+
         Self {
             config: manifold_core::SlicerConfig::default(),
             objects: Vec::new(),
             uploaded_meshes: Arc::new(Vec::new()),
+            uploaded_scene,
             camera: OrbitCamera::default(),
             next_object_id: 0,
             import_error: None,
@@ -139,6 +161,14 @@ impl ManifoldApp {
             ui.painter()
                 .add(eframe::egui_wgpu::Callback::new_paint_callback(
                     rect,
+                    ScenePaintCallback {
+                        view_proj,
+                        scene: self.uploaded_scene.clone(),
+                    },
+                ));
+            ui.painter()
+                .add(eframe::egui_wgpu::Callback::new_paint_callback(
+                    rect,
                     MeshPaintCallback {
                         view_proj,
                         meshes: self.uploaded_meshes.clone(),
@@ -146,6 +176,19 @@ impl ManifoldApp {
                 ));
         });
     }
+}
+
+/// A placeholder 200x200x200mm three-axis machine with a single tool at
+/// the origin, used until machine configuration is loaded from a project
+/// file (see ROADMAP.md).
+fn default_machine() -> Machine {
+    Machine::new(
+        BoundingVolume::Aabb {
+            min: glam::DVec3::ZERO,
+            max: glam::DVec3::new(200.0, 200.0, 200.0),
+        },
+        vec![Tool::new(ToolId(0), 0.4)],
+    )
 }
 
 impl eframe::App for ManifoldApp {

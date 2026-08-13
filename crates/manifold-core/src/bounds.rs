@@ -29,6 +29,19 @@ impl BoundingVolume {
             BoundingVolume::Sphere { center, radius } => center.distance(point) <= radius,
         }
     }
+
+    /// The axis-aligned min/max corners enclosing this volume — for
+    /// `Aabb` this is the volume itself; for `Sphere` it's the cube
+    /// circumscribing it. Useful for sizing scene geometry (e.g. a print
+    /// bed) from any `BoundingVolume` without duplicating this logic.
+    pub fn bounding_box(&self) -> (DVec3, DVec3) {
+        match *self {
+            BoundingVolume::Aabb { min, max } => (min, max),
+            BoundingVolume::Sphere { center, radius } => {
+                (center - DVec3::splat(radius), center + DVec3::splat(radius))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -53,5 +66,29 @@ mod tests {
         };
         assert!(volume.contains(DVec3::new(0.5, 0.0, 0.0)));
         assert!(!volume.contains(DVec3::new(1.5, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn bounding_box_returns_aabb_corners_unchanged() {
+        let volume = BoundingVolume::Aabb {
+            min: DVec3::new(-1.0, -2.0, -3.0),
+            max: DVec3::new(1.0, 2.0, 3.0),
+        };
+        assert_eq!(
+            volume.bounding_box(),
+            (DVec3::new(-1.0, -2.0, -3.0), DVec3::new(1.0, 2.0, 3.0))
+        );
+    }
+
+    #[test]
+    fn bounding_box_circumscribes_sphere() {
+        let volume = BoundingVolume::Sphere {
+            center: DVec3::new(1.0, 1.0, 1.0),
+            radius: 2.0,
+        };
+        assert_eq!(
+            volume.bounding_box(),
+            (DVec3::new(-1.0, -1.0, -1.0), DVec3::new(3.0, 3.0, 3.0))
+        );
     }
 }
