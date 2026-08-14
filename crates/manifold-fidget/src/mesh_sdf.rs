@@ -9,6 +9,7 @@
 use crate::geometry::{Triangle, TriangleBvh};
 use crate::{FieldSample, ScalarField};
 use glam::DVec3;
+use std::collections::HashMap;
 
 /// Squared-length tolerance below which a vector is treated as zero (used
 /// both for "query point coincides with the closest surface point" and for
@@ -59,6 +60,15 @@ pub struct MeshSdf {
     /// Angle-weighted pseudonormal per vertex, same indexing as
     /// `vertex_positions`.
     vertex_pseudonormals: Vec<DVec3>,
+    /// Averaged face normal per undirected edge (key: the edge's two vertex
+    /// indices, sorted so `(a, b)` and `(b, a)` map to the same entry).
+    /// Used for edge-Voronoi-region sign queries (see
+    /// [`MeshSdf::feature_normal`]) — the standard pseudonormal
+    /// construction for edges is the average of the (up to two) adjacent
+    /// faces' normals, which is only correct when both share the edge;
+    /// boundary edges (only one adjacent face, e.g. a non-watertight mesh)
+    /// fall back to that single face's normal.
+    edge_pseudonormals: HashMap<(usize, usize), DVec3>,
     sign_method: SignMethod,
 }
 
@@ -101,6 +111,7 @@ impl MeshSdf {
 
         let vertex_pseudonormals =
             Self::compute_vertex_pseudonormals(&vertices, &faces, &face_normals);
+        let edge_pseudonormals = Self::compute_edge_pseudonormals(&faces, &face_normals);
 
         let bvh = TriangleBvh::build(triangles);
 
@@ -110,6 +121,7 @@ impl MeshSdf {
             face_vertex_indices: faces,
             vertex_positions: vertices,
             vertex_pseudonormals,
+            edge_pseudonormals,
             sign_method: SignMethod::Pseudonormal,
         }
     }
@@ -162,6 +174,47 @@ impl MeshSdf {
             .collect()
     }
 
+    /// Precomputes averaged edge normals: for each undirected edge, sums
+    /// the face normals of every triangle incident to it (1 for a boundary
+    /// edge, 2 for a proper manifold edge, more only for a non-manifold
+    /// mesh) and normalizes. This is the piece the original face-normal-only
+    /// `feature_normal` fallback was missing — a query point whose closest
+    /// surface point lies on an edge shared by two triangles with very
+    /// different normals (e.g. a vertical wall meeting a flat cap at a
+    /// sharp angle) previously used just the BVH's arbitrarily-chosen
+    /// nearest triangle's own normal, which can be nearly orthogonal to the
+    /// true outward direction and flip the sign.
+    fn compute_edge_pseudonormals(
+        faces: &[[usize; 3]],
+        face_normals: &[DVec3],
+    ) -> HashMap<(usize, usize), DVec3> {
+        let mut accum: HashMap<(usize, usize), DVec3> = HashMap::new();
+        for (face, &normal) in faces.iter().zip(face_normals.iter()) {
+            for corner in 0..3 {
+                let a = face[corner];
+                let b = face[(corner + 1) % 3];
+                let key = if a < b { (a, b) } else { (b, a) };
+                *accum.entry(key).or_insert(DVec3::ZERO) += normal;
+            }
+        }
+        accum
+            .into_iter()
+            .map(|(key, n)| {
+                let normal = if n.length_squared() > DEGENERATE_EPSILON {
+                    n.normalize()
+                } else {
+                    // Both adjacent faces degenerate, or their normals
+                    // exactly cancel (e.g. a zero-thickness fold): no
+                    // well-defined edge normal. `feature_normal` treats a
+                    // zero result as "no edge information" and falls back
+                    // to the nearest triangle's own face normal.
+                    DVec3::ZERO
+                };
+                (key, normal)
+            })
+            .collect()
+    }
+
     /// Number of triangles in this SDF's mesh.
     pub fn len(&self) -> usize {
         self.bvh.len()
@@ -188,21 +241,25 @@ impl MeshSdf {
     /// The normal to use for sign determination at `closest` on triangle
     /// `face_idx`.
     ///
-    /// Simplification (documented per the task spec): this crate has only a
-    /// single "current nearest triangle" available in the query path, not a
-    /// full mesh half-edge/adjacency structure. The textbook pseudonormal
-    /// construction uses per-edge pseudonormals (average of the two
-    /// adjacent faces' normals) for edge-Voronoi-region queries; instead,
-    /// this implementation uses:
+    /// Uses the standard three-region pseudonormal construction:
     /// - the precomputed vertex pseudonormal when `closest` coincides with
-    ///   one of the triangle's vertices (vertex-Voronoi region), and
-    /// - the nearest triangle's own flat face normal for both the face
-    ///   interior *and* edge regions.
+    ///   one of the triangle's vertices (vertex-Voronoi region);
+    /// - the precomputed edge pseudonormal (averaged normal of the faces
+    ///   sharing that edge) when `closest` lies on one of the triangle's
+    ///   edges, identified via `closest`'s barycentric coordinates having a
+    ///   near-zero component (edge-Voronoi region); and
+    /// - the nearest triangle's own flat face normal otherwise (face
+    ///   interior), or as a fallback if the vertex/edge pseudonormal is
+    ///   itself degenerate.
     ///
-    /// This is a standard, acceptable approximation (edge regions are a
-    /// measure-zero part of the surface and the face-normal fallback is
-    /// only off by the angle between the two adjacent faces), but it is
-    /// less accurate than full per-edge pseudonormals near sharp edges.
+    /// The edge case matters because the BVH may report any one of
+    /// multiple equidistant triangles as "nearest" for a point whose
+    /// closest surface point sits exactly on a shared edge; using only that
+    /// triangle's own face normal (as a prior, simpler version of this
+    /// method did) is only a good approximation when the two faces sharing
+    /// the edge have similar normals, and can flip the sign entirely when
+    /// they're near-perpendicular (e.g. a vertical wall meeting a flat
+    /// cap).
     fn feature_normal(&self, face_idx: usize, closest: DVec3) -> DVec3 {
         let verts = self.face_vertex_indices[face_idx];
         for &vertex_idx in &verts {
@@ -216,26 +273,163 @@ impl MeshSdf {
                 break;
             }
         }
+
+        if let Some(edge_key) = Self::edge_containing_point(verts, &self.vertex_positions, closest)
+        {
+            if let Some(&en) = self.edge_pseudonormals.get(&edge_key) {
+                if en.length_squared() > DEGENERATE_EPSILON {
+                    return en;
+                }
+            }
+        }
+
         self.face_normals[face_idx]
+    }
+
+    /// If `closest` (already known to lie within triangle `verts`, and
+    /// already checked *not* to coincide with any of its vertices) lies on
+    /// one of the triangle's three edges, returns that edge's key (sorted
+    /// vertex-index pair) for an [`MeshSdf::edge_pseudonormals`] lookup.
+    /// Returns `None` if `closest` is strictly in the triangle's interior.
+    ///
+    /// Identifies the edge via barycentric coordinates: `closest`'s
+    /// barycentric weight for a vertex is ~0 exactly when `closest` lies on
+    /// the opposite edge.
+    fn edge_containing_point(
+        verts: [usize; 3],
+        vertex_positions: &[DVec3],
+        closest: DVec3,
+    ) -> Option<(usize, usize)> {
+        let a = vertex_positions[verts[0]];
+        let b = vertex_positions[verts[1]];
+        let c = vertex_positions[verts[2]];
+
+        let v0 = b - a;
+        let v1 = c - a;
+        let v2 = closest - a;
+        let d00 = v0.dot(v0);
+        let d01 = v0.dot(v1);
+        let d11 = v1.dot(v1);
+        let d20 = v2.dot(v0);
+        let d21 = v2.dot(v1);
+        let denom = d00 * d11 - d01 * d01;
+        if denom.abs() <= DEGENERATE_EPSILON {
+            // Degenerate (zero-area/collinear) triangle: barycentric
+            // coordinates aren't well-defined, so there's no meaningful
+            // edge to report.
+            return None;
+        }
+
+        // Barycentric weights for (a, b, c) respectively; `bary_b` is the
+        // weight on `b`, etc. Weight ~0 on a vertex means `closest` lies on
+        // the edge opposite that vertex.
+        let bary_c = (d11 * d20 - d01 * d21) / denom;
+        let bary_b = (d00 * d21 - d01 * d20) / denom;
+        let bary_a = 1.0 - bary_b - bary_c;
+
+        const EDGE_EPSILON: f64 = 1e-9;
+        if bary_a.abs() <= EDGE_EPSILON {
+            let (x, y) = (verts[1], verts[2]);
+            Some(if x < y { (x, y) } else { (y, x) })
+        } else if bary_b.abs() <= EDGE_EPSILON {
+            let (x, y) = (verts[0], verts[2]);
+            Some(if x < y { (x, y) } else { (y, x) })
+        } else if bary_c.abs() <= EDGE_EPSILON {
+            let (x, y) = (verts[0], verts[1]);
+            Some(if x < y { (x, y) } else { (y, x) })
+        } else {
+            None
+        }
     }
 
     /// Sign (+1.0 or -1.0) for a query point `p` whose nearest triangle is
     /// `face_idx`, with closest surface point `closest`.
+    ///
+    /// The BVH's single nearest-triangle result is only reliable when it
+    /// is unambiguous: for a query point that is (numerically) equidistant
+    /// to two or more distinct mesh features — e.g. two edges that meet at
+    /// a shared vertex on a regularly-tessellated curved surface — the
+    /// arbitrarily-chosen "nearest" triangle can hand back a feature whose
+    /// pseudonormal is nearly perpendicular to `p - closest`, even though a
+    /// different, equally-close feature would give a confident, correct
+    /// answer. A small dot product is the symptom: it means the chosen
+    /// feature's normal barely distinguishes inside from outside for this
+    /// `diff`, so a tiny numerical perturbation in *which* triangle the BVH
+    /// preferred can flip the sign.
+    ///
+    /// When that happens (see `AMBIGUOUS_COS_THRESHOLD`), fall back to
+    /// [`MeshSdf::sign_via_tie_break`], which considers every triangle
+    /// whose closest point to `p` is within a tie tolerance of `closest`'s
+    /// distance and picks whichever gives the most decisive alignment.
     fn sign_at(&self, face_idx: usize, closest: DVec3, p: DVec3) -> f64 {
         match self.sign_method {
             SignMethod::Pseudonormal => {
                 let normal = self.feature_normal(face_idx, closest);
                 let diff = p - closest;
-                // On the surface (diff ~ zero) or a degenerate normal: sign
-                // is immaterial since value ~= 0 either way, default to
-                // positive (outside).
-                if diff.dot(normal) < 0.0 {
-                    -1.0
-                } else {
-                    1.0
+                let dist = diff.length();
+                if dist <= DEGENERATE_EPSILON.sqrt() {
+                    // On the surface: sign is immaterial since value ~= 0
+                    // either way, default to positive (outside).
+                    return 1.0;
                 }
+
+                // `normal` is expected to be unit-length (or zero, handled
+                // by `feature_normal`'s degenerate fallbacks), so this is
+                // cos(angle between diff and normal).
+                let cos_angle = diff.dot(normal) / dist;
+
+                const AMBIGUOUS_COS_THRESHOLD: f64 = 0.2;
+                if cos_angle.abs() >= AMBIGUOUS_COS_THRESHOLD {
+                    return if cos_angle < 0.0 { -1.0 } else { 1.0 };
+                }
+
+                self.sign_via_tie_break(p, dist)
             }
         }
+    }
+
+    /// Fallback for [`MeshSdf::sign_at`] when the primary (BVH-chosen)
+    /// feature gives an ambiguous sign signal: re-examines every triangle
+    /// in the mesh, keeping only those whose closest point to `p` is
+    /// within `TIE_REL_EPSILON` of `dist` (the primary candidate's
+    /// distance), and returns the sign implied by whichever tied
+    /// candidate's feature normal gives the largest-magnitude (most
+    /// decisive) alignment with `p - candidate_closest`.
+    ///
+    /// This is an O(triangles) scan, but it only runs for the rare
+    /// ambiguous case, so it does not affect the common-case cost of
+    /// [`MeshSdf::sample`].
+    fn sign_via_tie_break(&self, p: DVec3, dist: f64) -> f64 {
+        const TIE_REL_EPSILON: f64 = 1e-6;
+        let tie_dist = dist * (1.0 + TIE_REL_EPSILON) + TIE_REL_EPSILON;
+        let tie_dist_sq = tie_dist * tie_dist;
+
+        let mut best_abs_cos = -1.0f64;
+        let mut best_sign = 1.0;
+        for (face_idx, verts) in self.face_vertex_indices.iter().enumerate() {
+            let tri = Triangle::new(
+                self.vertex_positions[verts[0]],
+                self.vertex_positions[verts[1]],
+                self.vertex_positions[verts[2]],
+            );
+            let cand_closest = crate::geometry::closest_point_on_triangle(p, &tri);
+            if cand_closest.distance_squared(p) > tie_dist_sq {
+                continue;
+            }
+
+            let normal = self.feature_normal(face_idx, cand_closest);
+            let diff = p - cand_closest;
+            let dlen = diff.length();
+            if dlen <= DEGENERATE_EPSILON.sqrt() {
+                continue;
+            }
+            let cos_angle = diff.dot(normal) / dlen;
+            if cos_angle.abs() > best_abs_cos {
+                best_abs_cos = cos_angle.abs();
+                best_sign = if cos_angle < 0.0 { -1.0 } else { 1.0 };
+            }
+        }
+        best_sign
     }
 }
 
@@ -390,6 +584,48 @@ mod tests {
         let sample = sdf.sample(DVec3::new(0.0, 0.0, 0.0));
         assert_eq!(sample.value, f64::MAX);
         assert_eq!(sample.gradient, DVec3::ZERO);
+    }
+
+    /// Regression test for a real-world tie: two triangles sharing a
+    /// shared vertex (but not sharing an edge with each other in a way
+    /// that matters here) can report the *exact* same minimal distance to
+    /// a distant query point via two different edges, one of which (here,
+    /// the near-flat interior "cap" edge) has a pseudonormal that is
+    /// nearly perpendicular to the true displacement direction — a weak,
+    /// unreliable signal that used to flip the sign to "inside" for a
+    /// point that is unambiguously far outside the mesh. Coordinates are
+    /// taken verbatim from the failing case (a wall triangle meeting a
+    /// flat bottom cap on a real STL mesh).
+    #[test]
+    fn tied_distance_to_two_edges_from_a_shared_vertex_resolves_to_the_decisive_normal() {
+        let v59 = DVec3::new(131.707106590271, 93.84999990463257, 5.703026968363187e-11);
+        let v58 = DVec3::new(130.8071050643921, 92.99156427383423, 0.7644127607915876);
+        let v60 = DVec3::new(130.8071050643921, 92.94999980926514, 5.703037990183537e-11);
+        let v371 = DVec3::new(
+            129.07702159881592,
+            93.60407066345215,
+            5.7030269185100044e-11,
+        );
+
+        // Index 0=v59, 1=v58, 2=v60, 3=v371.
+        let vertices = vec![v59, v58, v60, v371];
+        let faces = vec![
+            [0, 1, 2], // wall triangle (59, 58, 60)
+            [2, 3, 0], // cap triangle (60, 371, 59)
+        ];
+        let sdf = MeshSdf::new(vertices, faces);
+
+        let bad_point = DVec3::new(149.55099233709944, 74.59991149106668, 1.0);
+        let sample = sdf.sample(bad_point);
+
+        // This point is far outside the mesh (well beyond its x/y extent);
+        // the correct sign is positive (outside).
+        assert!(
+            sample.value > 0.0,
+            "expected positive (outside) sign, got {}",
+            sample.value
+        );
+        assert!(approx_eq(sample.value, 26.248457115795734, 1e-6));
     }
 
     #[test]
