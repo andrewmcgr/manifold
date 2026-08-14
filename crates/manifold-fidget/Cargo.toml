@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "SDF/angle-field backend (fidget-based Tree fields plus mesh-derived SDFs) used by manifold-gui for visualization — see NON_PLANAR_SLICING.md and MESH_SDF_VISUALIZATION.md."
+description = "SDF/angle-field backend (fidget-based Tree fields plus mesh-derived SDFs): the mesh -> order field -> contour extraction pipeline used by manifold-core::slicing, and by manifold-gui for visualization — see NON_PLANAR_SLICING.md and MESH_SDF_VISUALIZATION.md."
 
 [dependencies]
 glam.workspace = true

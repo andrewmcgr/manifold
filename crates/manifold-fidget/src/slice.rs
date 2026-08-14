@@ -59,23 +59,19 @@ pub fn sample_plane<F: ScalarField + ?Sized>(
 ) -> SliceGrid {
     let mut values = Vec::with_capacity(resolution_u * resolution_v);
 
-    let half_width = width / 2.0;
-    let half_height = height / 2.0;
-
     for row in 0..resolution_v {
-        // Cell-center v-coordinate: map row index to [-half_height, half_height].
-        let v = if resolution_v > 1 {
-            -half_height + (row as f64 + 0.5) * height / resolution_v as f64
-        } else {
-            0.0
-        };
         for col in 0..resolution_u {
-            let u = if resolution_u > 1 {
-                -half_width + (col as f64 + 0.5) * width / resolution_u as f64
-            } else {
-                0.0
-            };
-            let p = origin + u * basis1 + v * basis2;
+            let p = grid_point(
+                origin,
+                basis1,
+                basis2,
+                width,
+                height,
+                resolution_u,
+                resolution_v,
+                col,
+                row,
+            );
             let sample = field.sample(p);
             values.push(sample.value as f32);
         }
@@ -86,6 +82,41 @@ pub fn sample_plane<F: ScalarField + ?Sized>(
         width: resolution_u,
         height: resolution_v,
     }
+}
+
+/// World-space position of the cell-center sample at grid cell `(col, row)`,
+/// using the same `(u, v)` parameterization documented on [`sample_plane`].
+///
+/// Extracted so other modules (e.g. `contour`'s marching-squares extractor)
+/// can reconstruct the exact sample positions behind a [`SliceGrid`]'s flat
+/// `values` without duplicating (and risking drift from) this formula.
+#[allow(clippy::too_many_arguments)]
+pub fn grid_point(
+    origin: DVec3,
+    basis1: DVec3,
+    basis2: DVec3,
+    width: f64,
+    height: f64,
+    resolution_u: usize,
+    resolution_v: usize,
+    col: usize,
+    row: usize,
+) -> DVec3 {
+    let half_width = width / 2.0;
+    let half_height = height / 2.0;
+
+    let u = if resolution_u > 1 {
+        -half_width + (col as f64 + 0.5) * width / resolution_u as f64
+    } else {
+        0.0
+    };
+    let v = if resolution_v > 1 {
+        -half_height + (row as f64 + 0.5) * height / resolution_v as f64
+    } else {
+        0.0
+    };
+
+    origin + u * basis1 + v * basis2
 }
 
 #[cfg(test)]

@@ -16,6 +16,10 @@ plus separate CLI and GUI front-ends.
 - Error handling: `thiserror` (library errors), `anyhow` (application errors).
 - Logging: `tracing` + `tracing-subscriber`.
 - Serialization: `serde` / `serde_json` for config.
+- Geometry backend: `manifold-fidget` (fidget-based SDF/order-field/contour
+  extraction) — depended on by both `manifold-core` (the mesh -> order
+  field -> contour-extraction slicing pipeline) and `manifold-gui`
+  (visualization).
 
 ## Directory Structure
 
@@ -27,9 +31,12 @@ crates/
       lib.rs                # public API: SlicerConfig, slice_to_gcode()
       error.rs               # Error/Result
       mesh.rs                 # Mesh type (vertices/indices)
-      slicing.rs              # mesh -> Layer[]
+      slicing.rs              # mesh -> Layer[] (via manifold-fidget's MeshSdf + contour extraction)
       toolpath.rs              # Layer[] -> Path[]
       gcode.rs                  # Path[] -> Gcode string
+  manifold-fidget/          # SDF/order-field/contour-extraction backend
+    src/                    # depended on by manifold-core (slicing pipeline)
+                            # and manifold-gui (visualization)
   manifold-cli/             # `manifold` binary — headless/batch driver
     src/main.rs
   manifold-gui/              # `manifold-gui` binary — egui/wgpu desktop app
@@ -41,10 +48,18 @@ crates/
 - **`manifold-core`**: the only crate allowed to contain slicing domain
   logic. Structured as a pipeline:
   `Mesh -> slicing::slice_mesh -> Layer[] -> toolpath::plan -> Path[] -> gcode::emit -> String`.
-  Each stage is its own module so slicing, toolpath planning, and Gcode
-  emission can be developed/tested independently. `slice_to_gcode()` in
-  `lib.rs` wires the stages together and is the primary entry point for
-  both front-ends.
+  `slice_mesh` builds a `manifold_fidget::mesh_sdf::MeshSdf` from the mesh
+  and walks a `manifold_fidget::order::OrderField`/
+  `manifold_fidget::contour::extract_contours_at_order` isosurface-walk to
+  produce each `Layer`'s cross-section loops — `manifold-core` depends on
+  `manifold-fidget` for this. Each stage is its own module so slicing,
+  toolpath planning, and Gcode emission can be developed/tested
+  independently. `slice_to_gcode()` in `lib.rs` wires the stages together
+  and is the primary entry point for both front-ends.
+- **`manifold-fidget`**: SDF/order-field/contour-extraction backend (not
+  slicing domain logic itself — a geometry-query library `manifold-core`
+  builds its pipeline on top of). Depended on by both `manifold-core` and
+  `manifold-gui`.
 - **`manifold-cli`**: thin wrapper — parses args with `clap`, builds a
   `SlicerConfig`, calls `manifold_core::slice_to_gcode`, writes the result
   to a file. No slicing logic lives here.

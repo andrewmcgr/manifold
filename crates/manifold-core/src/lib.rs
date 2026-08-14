@@ -109,6 +109,83 @@ mod tests {
         assert!(slice_to_gcode(&workspace).is_ok());
     }
 
+    /// Unit cube spanning [0,1]^3 — same fixture pattern as
+    /// `slicing.rs`'s `cube_mesh` (and `manifold-fidget`'s
+    /// `mesh_sdf`/`contour` tests).
+    fn cube_mesh() -> mesh::Mesh {
+        let vertices = vec![
+            glam::DVec3::new(0.0, 0.0, 0.0),
+            glam::DVec3::new(1.0, 0.0, 0.0),
+            glam::DVec3::new(1.0, 1.0, 0.0),
+            glam::DVec3::new(0.0, 1.0, 0.0),
+            glam::DVec3::new(0.0, 0.0, 1.0),
+            glam::DVec3::new(1.0, 0.0, 1.0),
+            glam::DVec3::new(1.0, 1.0, 1.0),
+            glam::DVec3::new(0.0, 1.0, 1.0),
+        ];
+        let indices = vec![
+            0, 2, 1, 0, 3, 2, // -Z
+            4, 5, 6, 4, 6, 7, // +Z
+            0, 1, 5, 0, 5, 4, // -Y
+            3, 7, 6, 3, 6, 2, // +Y
+            0, 4, 7, 0, 7, 3, // -X
+            1, 2, 6, 1, 6, 5, // +X
+        ];
+        mesh::Mesh::new(vertices, indices)
+    }
+
+    /// End-to-end: slicing a real solid (unit cube) through
+    /// `slice_to_gcode` must produce non-trivial Gcode with real
+    /// extrusion moves — not just the placeholder header. This is the
+    /// first test exercising the full pipeline (slicing -> toolpath ->
+    /// gcode) with a mesh that actually has contour geometry, so it
+    /// would meaningfully fail if the pipeline regressed to producing
+    /// empty layers/paths again.
+    #[test]
+    fn slice_to_gcode_produces_real_extrusion_moves_for_a_solid_cube() {
+        // Arrange: a unit cube, one tool, and a layer height that steps
+        // evenly across the cube's Z extent [0, 1] (5 layers: 0.0, 0.25,
+        // 0.5, 0.75, 1.0 — matching slicing.rs's equivalent fixture/test).
+        let machine = crate::machine::Machine::new(
+            crate::bounds::BoundingVolume::Aabb {
+                min: glam::DVec3::new(-10.0, -10.0, -10.0),
+                max: glam::DVec3::new(10.0, 10.0, 10.0),
+            },
+            Vec::new(),
+        );
+        let object =
+            crate::object::Object::new(crate::ids::ObjectId(0), cube_mesh(), crate::ids::ToolId(0));
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            ..SlicerConfig::default()
+        };
+        let workspace = Workspace::new(vec![object], machine, config);
+
+        // Act.
+        let gcode = slice_to_gcode(&workspace).unwrap();
+
+        // Assert: exactly one tool-select line (single object/tool), and
+        // exactly 3 travel-to-loop-start moves ("G0 X"), one per interior
+        // layer's single contour loop (the two exact-boundary layers at
+        // Z=0 and Z=1 sample directly on the mesh surface and produce no
+        // contour — see slicing.rs's `slice_mesh_produces_nonempty_contour_loops_for_a_solid_cube`).
+        // A regressed/placeholder pipeline (empty layers or empty paths)
+        // would produce zero of both, so this is not a vacuous assertion.
+        assert_eq!(gcode.matches("T0\n").count(), 1);
+        let path_starts = gcode.matches("G0 X").count();
+        assert_eq!(
+            path_starts, 3,
+            "expected one path per interior contour loop (3 layers with geometry)"
+        );
+        // Each contour loop has more than one vertex, so real extrusion
+        // ("G1") moves must follow each path's initial travel move.
+        let extrusion_moves = gcode.matches("G1 X").count();
+        assert!(
+            extrusion_moves > 0,
+            "expected non-zero G1 extrusion moves, got gcode:\n{gcode}"
+        );
+    }
+
     #[test]
     fn slice_to_gcode_handles_multiple_objects_and_tools() {
         let machine = crate::machine::Machine::new(

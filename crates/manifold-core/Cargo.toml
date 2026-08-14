@@ -18,5 +18,6 @@ glam = { workspace = true, features = ["serde"] }
 lib3mf.workspace = true
 stl_io.workspace = true
 tracing.workspace = true
+manifold-fidget.workspace = true
 
 [dev-dependencies]

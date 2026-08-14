@@ -2429,6 +2429,7 @@ version = "0.1.0"
 dependencies = [
  "glam 0.29.3",
  "lib3mf",
+ "manifold-fidget",
  "serde",
  "serde_json",
  "stl_io",

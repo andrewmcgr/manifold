@@ -356,6 +356,50 @@ captures printer + slicer setup, not an in-progress project. No
 profiles directory/registry UI yet; users pick a file location each
 time via the save/open dialog, same as Gcode export.
 
+## Phase 11 — Order-field-driven slicing MVP (needs 0, promotes `NON_PLANAR_SLICING.md`'s spike work) — ✅ done
+
+Prove out the "SDF -> order field -> isosurface walk -> toolpath" pipeline
+shape described in `NON_PLANAR_SLICING.md`, using the simplest possible
+`order` field (a plain height field along the build/gravity direction,
+whose isosurfaces are flat planes — i.e. this deliberately reduces to
+conventional planar slicing as a first, zero-geometric-risk validation
+step), replacing the previous empty-placeholder `slicing`/`toolpath`
+pipeline in `manifold-core` with a real (if minimal) one.
+
+- New `manifold-fidget::order` module: an `OrderField`-shaped abstraction
+  (reusing the existing `ScalarField` trait shape) with one concrete
+  implementation, `HeightOrderField`, whose isosurfaces are flat planes
+  along a chosen direction.
+- New planar contour extraction in `manifold-fidget` (marching squares
+  over a sampled plane grid), producing closed polylines at a given
+  `order` value — the first isoline/contour extractor in the crate,
+  alongside the existing 3D `marching_cubes` isosurface extractor.
+- `manifold-core::slicing::slice_mesh` becomes real: builds a `MeshSdf`,
+  steps `HeightOrderField` values at `config.layer_height` intervals, and
+  extracts contour loops per step into `Layer`.
+- `manifold-core::toolpath::plan` becomes real (minimally): one `Path`
+  per contour loop, tagged with its object's tool via the existing
+  (unchanged) tool-assignment logic.
+- **New dependency**: `manifold-core` now depends on `manifold-fidget`
+  (previously used only by `manifold-gui` for visualization) — the first
+  time the slicing pipeline itself consumes fidget's field/SDF machinery.
+
+**Implementation notes**: this is the first phase promoted out of
+`NON_PLANAR_SLICING.md`'s "research spike, not committed work" status
+into committed `ROADMAP.md` work, per that document's own gating rule
+(no phase there is committed until promoted here). It deliberately stays
+at the degenerate flat-height-field case — proving the pipeline shape
+(SDF -> order field -> contour walk -> toolpath) with minimal risk, not
+the actual non-planar capability. The angle-driven Eikonal `speed(p)`
+field / "Alternative `order` construction" idea from
+`NON_PLANAR_SLICING.md` is explicitly **not** part of this phase; it
+remains future work once this pipeline shape has proven out. Still
+deferred here, same as the placeholder pipeline it replaces: multiple
+perimeters/shells, infill, travel-move ordering/optimization between
+loops, and any actual non-planar toolpath deformation (this phase's
+toolpaths are still flat, planar loops — only the pipeline *shape* is
+new).
+
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
 - **Multi-object collision avoidance**: toolhead-vs-already-printed-object
