@@ -13,6 +13,7 @@ mod mcp;
 mod profile;
 mod render;
 mod scene;
+mod toolpath_view;
 
 use app::ManifoldApp;
 

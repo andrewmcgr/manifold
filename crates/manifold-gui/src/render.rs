@@ -7,6 +7,7 @@
 //! that triangle's flat face normal.
 
 use crate::scene::SceneVertex;
+use crate::toolpath_view::ToolpathVertex;
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 use egui_wgpu::wgpu::util::DeviceExt as _;
@@ -123,6 +124,31 @@ impl UploadedScene {
     }
 }
 
+/// Toolpath preview line geometry (Phase 13, see ROADMAP.md) already
+/// uploaded to the GPU as a non-indexed line-list vertex buffer — mirrors
+/// `UploadedScene`'s line-buffer half.
+pub struct UploadedToolpaths {
+    line_buffer: wgpu::Buffer,
+    line_vertex_count: u32,
+}
+
+impl UploadedToolpaths {
+    /// Upload line-list geometry already built by
+    /// `crate::toolpath_view::build_toolpath_lines`.
+    pub fn upload(device: &wgpu::Device, vertices: &[ToolpathVertex]) -> Self {
+        let line_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("manifold toolpath line buffer"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        Self {
+            line_buffer,
+            line_vertex_count: vertices.len() as u32,
+        }
+    }
+}
+
 /// Resources kept alive alongside the egui render pass (installed into
 /// `egui_wgpu::CallbackResources`), shared across frames.
 pub struct MeshRenderResources {
@@ -130,6 +156,7 @@ pub struct MeshRenderResources {
     overlay_pipeline: wgpu::RenderPipeline,
     scene_line_pipeline: wgpu::RenderPipeline,
     scene_tri_pipeline: wgpu::RenderPipeline,
+    toolpath_line_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
 }
@@ -308,11 +335,54 @@ impl MeshRenderResources {
             cache: None,
         });
 
+        let toolpath_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("manifold toolpath shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("toolpath_shader.wgsl").into()),
+        });
+
+        let toolpath_vertex_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ToolpathVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32],
+        }];
+
+        let toolpath_line_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("manifold toolpath line pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &toolpath_shader,
+                    entry_point: "vs_main",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &toolpath_vertex_buffers,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &toolpath_shader,
+                    entry_point: "fs_main",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
         Self {
             pipeline,
             overlay_pipeline,
             scene_line_pipeline,
             scene_tri_pipeline,
+            toolpath_line_pipeline,
             camera_buffer,
             camera_bind_group,
         }
@@ -344,6 +414,24 @@ impl MeshRenderResources {
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
         render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
         render_pass.draw(0..mesh.vertex_count, 0..1);
+    }
+
+    /// Draws toolpath preview line geometry (Phase 13, see ROADMAP.md)
+    /// with the dedicated `toolpath_line_pipeline`. Called after
+    /// `Self::paint`/`Self::paint_overlay` (via `ToolpathPaintCallback`
+    /// being pushed after `MeshPaintCallback`/`OverlayPaintCallback` in
+    /// `app.rs::viewport`) so toolpaths composite visibly on top given no
+    /// shared depth buffer exists inside the `egui_wgpu::Callback` render
+    /// pass.
+    fn paint_toolpaths(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'_>,
+        toolpaths: &UploadedToolpaths,
+    ) {
+        render_pass.set_pipeline(&self.toolpath_line_pipeline);
+        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, toolpaths.line_buffer.slice(..));
+        render_pass.draw(0..toolpaths.line_vertex_count, 0..1);
     }
 
     fn paint_scene(&self, render_pass: &mut wgpu::RenderPass<'_>, scene: &UploadedScene) {
@@ -459,5 +547,46 @@ impl egui_wgpu::CallbackTrait for OverlayPaintCallback {
     ) {
         let resources: &MeshRenderResources = callback_resources.get().unwrap();
         resources.paint_overlay(render_pass, &self.mesh);
+    }
+}
+
+/// The per-frame paint callback for toolpath preview line geometry (Phase
+/// 13, see ROADMAP.md). Mirrors `ScenePaintCallback`/`OverlayPaintCallback`'s
+/// `prepare`/`paint` shape. Must be pushed *after*
+/// `MeshPaintCallback`/`OverlayPaintCallback` in `app.rs::viewport` so
+/// toolpaths composite visibly on top \u2014 there is no depth buffer available
+/// inside `egui_wgpu::Callback`'s shared render pass (see
+/// `ScenePaintCallback`'s doc comment / ROADMAP.md Phase 6), so draw order
+/// stands in for depth testing.
+///
+/// Not yet pushed from `app.rs::viewport` (that wiring is Phase 13 subtask
+/// 04) \u2014 this type is exercised only by its pipeline/buffer setup for now.
+pub struct ToolpathPaintCallback {
+    pub view_proj: Mat4,
+    pub toolpaths: std::sync::Arc<UploadedToolpaths>,
+}
+
+impl egui_wgpu::CallbackTrait for ToolpathPaintCallback {
+    fn prepare(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let resources: &MeshRenderResources = callback_resources.get().unwrap();
+        resources.write_camera(queue, self.view_proj);
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+        let resources: &MeshRenderResources = callback_resources.get().unwrap();
+        resources.paint_toolpaths(render_pass, &self.toolpaths);
     }
 }

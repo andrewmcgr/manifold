@@ -52,6 +52,23 @@ impl Default for SlicerConfig {
 /// Returns [`Error::InvalidMesh`] if `workspace` has no objects, or
 /// whatever error the slicing/toolpath stages produce.
 pub fn slice_to_gcode(workspace: &Workspace) -> Result<String> {
+    let paths = plan_toolpaths(workspace)?;
+    Ok(gcode::emit(&paths, &workspace.config))
+}
+
+/// Run the pipeline up to (and including) toolpath planning, stopping short
+/// of Gcode emission: workspace -> order objects -> slice -> plan toolpaths.
+///
+/// Exposes the intermediate `Vec<toolpath::Path>` for consumers (e.g. the
+/// GUI's 3D preview) that need the planned geometry without re-parsing
+/// emitted Gcode text. [`slice_to_gcode`] builds on top of this and emits
+/// Gcode from the same planned paths.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidMesh`] if `workspace` has no objects, or
+/// whatever error the ordering/slicing/toolpath stages produce.
+pub fn plan_toolpaths(workspace: &Workspace) -> Result<Vec<toolpath::Path>> {
     if workspace.objects.is_empty() {
         return Err(Error::InvalidMesh("workspace has no objects".to_string()));
     }
@@ -60,8 +77,7 @@ pub fn slice_to_gcode(workspace: &Workspace) -> Result<String> {
     let order = strategy.order(&workspace.objects)?;
 
     let layers = slicing::slice_workspace(&workspace.objects, &order, &workspace.config)?;
-    let paths = toolpath::plan(&layers, &workspace.objects, &workspace.config)?;
-    Ok(gcode::emit(&paths, &workspace.config))
+    toolpath::plan(&layers, &workspace.objects, &workspace.config)
 }
 
 #[cfg(test)]
@@ -210,5 +226,36 @@ mod tests {
         let workspace = Workspace::new(objects, machine, SlicerConfig::default());
 
         assert!(slice_to_gcode(&workspace).is_ok());
+    }
+
+    /// `plan_toolpaths` is the shared helper `slice_to_gcode` now builds on
+    /// top of — verify it returns non-empty paths for a real solid, and
+    /// that `slice_to_gcode`'s Gcode output is unaffected by routing
+    /// through it (still produces the same real extrusion moves as before
+    /// the refactor).
+    #[test]
+    fn plan_toolpaths_returns_paths_and_slice_to_gcode_output_is_unaffected() {
+        let machine = crate::machine::Machine::new(
+            crate::bounds::BoundingVolume::Aabb {
+                min: glam::DVec3::new(-10.0, -10.0, -10.0),
+                max: glam::DVec3::new(10.0, 10.0, 10.0),
+            },
+            Vec::new(),
+        );
+        let object =
+            crate::object::Object::new(crate::ids::ObjectId(0), cube_mesh(), crate::ids::ToolId(0));
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            ..SlicerConfig::default()
+        };
+        let workspace = Workspace::new(vec![object], machine, config);
+
+        let paths = plan_toolpaths(&workspace).unwrap();
+        assert!(!paths.is_empty(), "expected non-empty planned toolpaths");
+
+        let gcode = slice_to_gcode(&workspace).unwrap();
+        assert_eq!(gcode.matches("T0\n").count(), 1);
+        assert_eq!(gcode.matches("G0 X").count(), 3);
+        assert!(gcode.matches("G1 X").count() > 0);
     }
 }

@@ -432,6 +432,36 @@ work. Phase 13 (GUI toolpath preview: rendering, scrubbing-by-order, hover
 tooltips) is the follow-on consumer of this metadata and is out of scope
 here.
 
+## Phase 13 — GUI toolpath preview: rendering, order scrub, hover tooltips (needs 12) — ✅ done
+
+Consumes Phase 12's per-`Segment` metadata to render an interactive
+toolpath preview in `manifold-gui`, without adding any new manifold-core
+domain logic.
+
+- `manifold-gui`: new toolpath line-rendering pipeline (`render.rs`) plus
+  a `toolpath_shader.wgsl` line shader with a per-vertex `order: f32`
+  attribute (reserved for a possible future shader-side discard), driven
+  by a `ManifoldApp.toolpaths: Option<Vec<manifold_core::toolpath::Path>>`
+  populated from `slice()`/`reupload_toolpaths()`.
+- "Show toolpaths" checkbox toggles the pipeline on/off.
+- Order-based scrub slider (`egui::Slider`, "up to and including"
+  semantics: segments with `order <= scrub_order` are drawn) implemented
+  via CPU-side rebuild-on-change filtering (`toolpath_view.rs`) rather
+  than a shader-side discard — simpler given the existing bind-group
+  setup, accepted tradeoff being a full CPU rebuild + GPU re-upload per
+  slider-drag frame at this MVP single-object scale.
+- Hover tooltip: reuses the existing `world_to_screen` projection helper
+  to do a CPU-side O(n) nearest-segment scan (screen-space point-to-
+  segment distance, ~8px threshold) over the current scrub-filtered
+  segment set, showing `kind`, `speed`, `extrusion_rate`,
+  `support_fraction`, and `order` in an egui tooltip when hovering near a
+  rendered segment.
+
+**Explicitly deferred**: real classification-driven styling (e.g. color-
+coding by `MoveKind` once Phase 12's placeholder classification is
+replaced with real detection), and any shader-side discard for the scrub
+slider (the `order` vertex attribute is wired but unused for this).
+
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
 - **Multi-object collision avoidance**: toolhead-vs-already-printed-object

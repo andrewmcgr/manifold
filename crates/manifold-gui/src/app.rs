@@ -4,10 +4,11 @@
 use crate::camera::OrbitCamera;
 use crate::profile::Profile;
 use crate::render::{
-    MeshPaintCallback, MeshRenderResources, OverlayPaintCallback, ScenePaintCallback, UploadedMesh,
-    UploadedScene,
+    MeshPaintCallback, MeshRenderResources, OverlayPaintCallback, ScenePaintCallback,
+    ToolpathPaintCallback, UploadedMesh, UploadedScene, UploadedToolpaths,
 };
 use crate::scene;
+use crate::toolpath_view;
 use eframe::egui;
 use manifold_core::bounds::BoundingVolume;
 use manifold_core::machine::Machine;
@@ -69,6 +70,27 @@ pub struct ManifoldApp {
     /// ROADMAP.md), previewed in the settings panel and written out by
     /// "Export…".
     gcode: Option<String>,
+    /// Planned toolpaths from the last successful "Slice" action (Phase 13,
+    /// see ROADMAP.md), previewed in the 3D viewport when `show_toolpaths`
+    /// is enabled.
+    toolpaths: Option<Vec<manifold_core::toolpath::Path>>,
+    /// GPU-uploaded copy of `toolpaths`, rebuilt whenever `toolpaths`
+    /// changes, same pattern as `uploaded_meshes`/`uploaded_scene`.
+    uploaded_toolpaths: Option<Arc<UploadedToolpaths>>,
+    /// Whether the toolpath preview line geometry is drawn in the viewport
+    /// (Phase 13, see ROADMAP.md).
+    show_toolpaths: bool,
+    /// Order-based scrub slider value (Phase 13 subtask 05): segments with
+    /// `order <= scrub_order` are drawn, others hidden ("up to and
+    /// including" semantics). `f64::INFINITY` (the default) shows every
+    /// segment. Reset to the max order of the newly planned toolpaths each
+    /// time `slice()` succeeds.
+    scrub_order: f64,
+    /// `(min, max)` order value across all segments in `toolpaths`, sizing
+    /// the scrub slider's range — recomputed in `slice()` whenever
+    /// `toolpaths` changes. `None` when `toolpaths` is `None` or contains no
+    /// segments.
+    toolpath_order_range: Option<(f64, f64)>,
     slice_error: Option<String>,
     /// Set by a failed "Save Profile…"/"Load Profile…" action (Phase 10, see
     /// ROADMAP.md).
@@ -157,6 +179,11 @@ impl ManifoldApp {
             selected: None,
             gizmo: Gizmo::default(),
             gcode: None,
+            toolpaths: None,
+            uploaded_toolpaths: None,
+            show_toolpaths: true,
+            scrub_order: f64::INFINITY,
+            toolpath_order_range: None,
             slice_error: None,
             profile_error: None,
             next_tool_id: 1,
@@ -275,6 +302,22 @@ impl ManifoldApp {
         self.uploaded_meshes = Arc::new(uploaded);
     }
 
+    /// Rebuilds and re-uploads `uploaded_toolpaths` from `toolpaths`,
+    /// mirroring `reupload`'s pattern for `uploaded_meshes`. No-op (clears
+    /// the uploaded copy) if `toolpaths` is `None`.
+    ///
+    /// Filters segments via `self.scrub_order` using `toolpath_view`'s
+    /// CPU-side rebuild-on-change approach (see that function's doc
+    /// comment for the tradeoff versus a shader-side discard) — called
+    /// both after a fresh `slice()` and whenever the scrub slider value
+    /// changes.
+    fn reupload_toolpaths(&mut self, device: &eframe::egui_wgpu::wgpu::Device) {
+        self.uploaded_toolpaths = self.toolpaths.as_ref().map(|paths| {
+            let vertices = toolpath_view::build_toolpath_lines(paths, self.scrub_order);
+            Arc::new(UploadedToolpaths::upload(device, &vertices))
+        });
+    }
+
     /// Interact with the transform gizmo, but only let it capture pointer
     /// input (and thus contend with the orbit-camera drag on `viewport`'s
     /// canvas response) when the cursor is actually near the gizmo, or the
@@ -355,12 +398,25 @@ impl ManifoldApp {
             self.machine.clone(),
             self.config.clone(),
         );
-        match manifold_core::slice_to_gcode(&workspace) {
-            Ok(gcode) => {
+        match manifold_core::plan_toolpaths(&workspace) {
+            Ok(paths) => {
+                let gcode = manifold_core::gcode::emit(&paths, &workspace.config);
+                self.toolpath_order_range = toolpath_view::order_range(&paths);
+                // Default the scrub slider to the max order so a fresh
+                // slice shows every segment ("up to and including" the
+                // top of the range).
+                self.scrub_order = self
+                    .toolpath_order_range
+                    .map_or(f64::INFINITY, |(_, max)| max);
+                self.uploaded_toolpaths = None;
+                self.toolpaths = Some(paths);
                 self.gcode = Some(gcode);
                 self.slice_error = None;
             }
             Err(error) => {
+                self.toolpaths = None;
+                self.uploaded_toolpaths = None;
+                self.toolpath_order_range = None;
                 self.gcode = None;
                 self.slice_error = Some(error.to_string());
             }
@@ -752,6 +808,14 @@ impl ManifoldApp {
                 .clicked()
             {
                 self.slice();
+                if self.toolpaths.is_some() {
+                    let device = frame
+                        .wgpu_render_state()
+                        .expect("wgpu renderer is required")
+                        .device
+                        .clone();
+                    self.reupload_toolpaths(&device);
+                }
             }
             if ui
                 .add_enabled(self.gcode.is_some(), egui::Button::new("Export…"))
@@ -768,6 +832,29 @@ impl ManifoldApp {
                         }
                     }
                 }
+            }
+            ui.checkbox(&mut self.show_toolpaths, "Show toolpaths");
+
+            // Order-based scrub slider (Phase 13 subtask 05): ranged over
+            // the min/max `order` value across all segments in the current
+            // `toolpaths`, disabled when there's nothing to scrub. Dragging
+            // triggers a CPU-side rebuild-on-change re-upload (see
+            // `toolpath_view::build_toolpath_lines`'s doc comment for the
+            // tradeoff versus a shader-side discard).
+            let (slider_min, slider_max) = self.toolpath_order_range.unwrap_or((0.0, 0.0));
+            let mut slider_value = self.scrub_order.min(slider_max).max(slider_min);
+            let slider_response = ui.add_enabled(
+                self.toolpaths.is_some(),
+                egui::Slider::new(&mut slider_value, slider_min..=slider_max).text("Scrub order"),
+            );
+            if slider_response.changed() {
+                self.scrub_order = slider_value;
+                let device = frame
+                    .wgpu_render_state()
+                    .expect("wgpu renderer is required")
+                    .device
+                    .clone();
+                self.reupload_toolpaths(&device);
             }
         });
 
@@ -816,6 +903,71 @@ impl ManifoldApp {
                             mesh: overlay_mesh.clone(),
                         },
                     ));
+            }
+            if self.show_toolpaths {
+                if let Some(toolpaths) = &self.uploaded_toolpaths {
+                    ui.painter()
+                        .add(eframe::egui_wgpu::Callback::new_paint_callback(
+                            rect,
+                            ToolpathPaintCallback {
+                                view_proj,
+                                toolpaths: toolpaths.clone(),
+                            },
+                        ));
+                }
+            }
+
+            // Hover tooltip (Phase 13 subtask 06): CPU-side O(n) nearest-
+            // segment picking over the currently visible (scrub-filtered)
+            // segment set, reusing `world_to_screen` (documented after this
+            // impl block) to project each segment's endpoints into the same
+            // screen space as the cursor. Only active when toolpaths are
+            // shown and present.
+            if self.show_toolpaths {
+                if let Some(toolpaths) = &self.toolpaths {
+                    if let Some(hover_pos) = response.hover_pos() {
+                        const PICK_THRESHOLD_PX: f32 = 8.0;
+                        let mut nearest: Option<(f32, &manifold_core::toolpath::Segment)> = None;
+                        for path in toolpaths {
+                            let count = path.points.len();
+                            for i in 0..count {
+                                let segment = &path.segments[i];
+                                if segment.order > self.scrub_order {
+                                    continue;
+                                }
+                                let a = path.points[i];
+                                let b = path.points[(i + 1) % count];
+                                let (Some(screen_a), Some(screen_b)) = (
+                                    world_to_screen(view_proj, rect, a),
+                                    world_to_screen(view_proj, rect, b),
+                                ) else {
+                                    continue;
+                                };
+                                let dist = point_segment_distance(hover_pos, screen_a, screen_b);
+                                if nearest.is_none_or(|(best_dist, _)| dist < best_dist) {
+                                    nearest = Some((dist, segment));
+                                }
+                            }
+                        }
+                        if let Some((dist, segment)) = nearest {
+                            if dist <= PICK_THRESHOLD_PX {
+                                response.clone().show_tooltip_ui(|ui| {
+                                    ui.label(format!("kind: {:?}", segment.kind));
+                                    ui.label(format!("speed: {:.3}", segment.speed));
+                                    ui.label(format!(
+                                        "extrusion_rate: {:.3}",
+                                        segment.extrusion_rate
+                                    ));
+                                    ui.label(format!(
+                                        "support_fraction: {:.3}",
+                                        segment.support_fraction
+                                    ));
+                                    ui.label(format!("order: {:.3}", segment.order));
+                                });
+                            }
+                        }
+                    }
+                }
             }
 
             // Gizmo paints as plain egui geometry into this `Ui`'s layer, so
@@ -885,6 +1037,19 @@ fn world_to_screen(
         rect.min.x + (ndc.x * 0.5 + 0.5) * rect.width(),
         rect.min.y + (1.0 - (ndc.y * 0.5 + 0.5)) * rect.height(),
     ))
+}
+
+/// Distance in screen-space pixels from `point` to the line segment
+/// `a`-`b`, used by the hover-tooltip nearest-segment scan in `viewport()`.
+fn point_segment_distance(point: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let len_sq = ab.length_sq();
+    if len_sq <= f32::EPSILON {
+        return (point - a).length();
+    }
+    let t = ((point - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    let closest = a + ab * t;
+    (point - closest).length()
 }
 
 /// Converts a slice heatmap grid to an `egui::ColorImage` using a simple
