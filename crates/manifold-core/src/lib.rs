@@ -87,7 +87,7 @@ pub fn plan_toolpaths(workspace: &Workspace) -> Result<Vec<toolpath::Path>> {
 /// whatever error the ordering/slicing/toolpath stages produce.
 pub fn plan_toolpaths_with_progress(
     workspace: &Workspace,
-    on_progress: &mut dyn FnMut(f64),
+    on_progress: &mut (dyn FnMut(f64) + Send),
 ) -> Result<Vec<toolpath::Path>> {
     if workspace.objects.is_empty() {
         return Err(Error::InvalidMesh("workspace has no objects".to_string()));

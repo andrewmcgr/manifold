@@ -19,5 +19,6 @@ lib3mf.workspace = true
 stl_io.workspace = true
 tracing.workspace = true
 manifold-fidget.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]

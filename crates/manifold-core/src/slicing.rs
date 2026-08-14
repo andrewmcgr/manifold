@@ -4,6 +4,9 @@ use crate::{ids::ObjectId, mesh::Mesh, object::Object, Result, SlicerConfig};
 use glam::DVec3;
 use manifold_fidget::contour::{extract_contours, plane_basis};
 use manifold_fidget::mesh_sdf::MeshSdf;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// A single (possibly non-planar) slice layer.
 ///
@@ -89,16 +92,24 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
     slice_mesh_with_progress(mesh, config, &mut |_| {})
 }
 
-/// Same as [`slice_mesh`], but calls `on_progress` after each layer with
-/// how far the walk currently is through the order-field domain (`0.0` at
-/// `order_min`, `1.0` at `order_max`) — intended for a caller (e.g. the
-/// GUI, slicing on a background thread) to report progress on a
-/// potentially slow slice without having to know anything about layers,
-/// order fields, or contour resolution itself.
+/// Same as [`slice_mesh`], but calls `on_progress` as each layer finishes
+/// with the fraction of layers completed so far (`0.0..=1.0`) — intended
+/// for a caller (e.g. the GUI, slicing on a background thread) to report
+/// progress on a potentially slow slice without having to know anything
+/// about layers, order fields, or contour resolution itself.
+///
+/// Layers are extracted in parallel across all available cores (via
+/// `rayon`): each layer only reads the shared, immutable [`MeshSdf`] and
+/// produces its own independent [`Layer`], so there's no cross-layer
+/// dependency to serialize on. The returned `Vec<Layer>` is still ordered
+/// by `index`/`order` regardless of completion order, but `on_progress`
+/// calls arrive in whatever order layers happen to finish on their
+/// threads — not strictly in `index` order, though still trending
+/// monotonically toward `1.0`.
 pub fn slice_mesh_with_progress(
     mesh: &Mesh,
     config: &SlicerConfig,
-    on_progress: &mut dyn FnMut(f64),
+    on_progress: &mut (dyn FnMut(f64) + Send),
 ) -> Result<Vec<Layer>> {
     let Some((min, max)) = mesh.bounding_box() else {
         // Empty mesh: no geometry to slice.
@@ -147,27 +158,48 @@ pub fn slice_mesh_with_progress(
 
     let layer_height = config.layer_height.abs().max(f64::EPSILON);
     let resolution = contour_resolution(extent, config.nozzle_diameter, CONTOUR_REFINEMENT_DIVISOR);
-    let order_span = (order_max - order_min).max(f64::EPSILON);
 
-    let mut layers = Vec::new();
+    // Precompute every order-field value this walk will sample, so the
+    // per-layer contour extraction below can run in parallel (each layer
+    // only reads the shared, immutable `sdf` — see `MeshSdf`, whose query
+    // methods all take `&self` — and writes its own independent `Layer`;
+    // there's no cross-layer dependency to serialize on).
+    let mut order_values = Vec::new();
     let mut order_value = order_min;
-    let mut index = 0;
     while order_value <= order_max {
-        let origin =
-            bbox_center + BUILD_DIRECTION * (order_value - bbox_center.dot(BUILD_DIRECTION));
-        let loops = extract_contours(
-            &sdf, origin, basis1, basis2, extent, extent, resolution, resolution, 0.0,
-        );
-        layers.push(Layer {
-            index,
-            object: ObjectId::default(),
-            order: order_value,
-            loops,
-        });
-        index += 1;
+        order_values.push(order_value);
         order_value += layer_height;
-        on_progress(((order_value - order_min) / order_span).clamp(0.0, 1.0));
     }
+
+    let total_steps = order_values.len().max(1);
+    let completed = AtomicUsize::new(0);
+    // `on_progress` is `&mut dyn FnMut`, not `Sync`, so serialize calls into
+    // it behind a `Mutex` — contention is negligible since each holder only
+    // reports one f64 and releases immediately, and the expensive work
+    // (`extract_contours`) happens before the lock is taken.
+    let progress_callback = Mutex::new(on_progress);
+
+    let layers: Vec<Layer> = order_values
+        .par_iter()
+        .enumerate()
+        .map(|(index, &order_value)| {
+            let origin =
+                bbox_center + BUILD_DIRECTION * (order_value - bbox_center.dot(BUILD_DIRECTION));
+            let loops = extract_contours(
+                &sdf, origin, basis1, basis2, extent, extent, resolution, resolution, 0.0,
+            );
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Ok(mut callback) = progress_callback.lock() {
+                callback(done as f64 / total_steps as f64);
+            }
+            Layer {
+                index,
+                object: ObjectId::default(),
+                order: order_value,
+                loops,
+            }
+        })
+        .collect();
 
     Ok(layers)
 }
@@ -221,7 +253,7 @@ pub fn slice_object(object: &Object, config: &SlicerConfig) -> Result<Vec<Layer>
 pub fn slice_object_with_progress(
     object: &Object,
     config: &SlicerConfig,
-    on_progress: &mut dyn FnMut(f64),
+    on_progress: &mut (dyn FnMut(f64) + Send),
 ) -> Result<Vec<Layer>> {
     let world_mesh = Mesh::new(
         object
@@ -271,7 +303,7 @@ pub fn slice_workspace_with_progress(
     objects: &[Object],
     order: &[ObjectId],
     config: &SlicerConfig,
-    on_progress: &mut dyn FnMut(f64),
+    on_progress: &mut (dyn FnMut(f64) + Send),
 ) -> Result<Vec<Layer>> {
     let total = order.len().max(1) as f64;
     let mut layers = Vec::new();
