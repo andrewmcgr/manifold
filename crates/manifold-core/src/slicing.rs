@@ -36,12 +36,16 @@ const BUILD_DIRECTION: DVec3 = DVec3::new(0.0, 0.0, -1.0);
 
 /// Default divisor used to derive the marching-squares contour-extraction
 /// grid's target cell size from `SlicerConfig::nozzle_diameter` (cell_size
-/// = `nozzle_diameter / CONTOUR_REFINEMENT_DIVISOR`): a quarter of the
-/// nozzle diameter keeps grid faceting finer than what the nozzle can
-/// physically resolve anyway, without oversampling. Exposed as a constant
-/// (rather than inlined) so callers wanting coarser/finer refinement can
-/// pass a different divisor to [`contour_resolution`] directly.
-const CONTOUR_REFINEMENT_DIVISOR: f64 = 4.0;
+/// = `nozzle_diameter / CONTOUR_REFINEMENT_DIVISOR`). `4.0` (a quarter of
+/// the nozzle diameter) keeps grid faceting finer than what the nozzle can
+/// physically resolve, but is expensive at real-world scale (grid points
+/// scale with the square of resolution, each doing a BVH nearest-triangle
+/// query); `1.4` trades some of that headroom for tractable slicing time
+/// while still meaningfully improving on the old fixed-120 grid. Exposed
+/// as a constant (rather than inlined) so callers wanting coarser/finer
+/// refinement can pass a different divisor to [`contour_resolution`]
+/// directly.
+const CONTOUR_REFINEMENT_DIVISOR: f64 = 1.4;
 
 /// Lower/upper bounds on the derived grid resolution (samples per axis),
 /// independent of `CONTOUR_REFINEMENT_DIVISOR`: guards against a
