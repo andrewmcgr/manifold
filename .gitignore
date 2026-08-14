@@ -1,5 +1,6 @@
 /target
 *.gcode
+/*.stl
 .DS_Store
 .tmp/
 thoughts/
