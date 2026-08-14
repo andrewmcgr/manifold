@@ -335,7 +335,14 @@ pub fn extract_contours_at_order<F: ScalarField + ?Sized>(
 /// picks whichever of world X/Z is least parallel to `direction` as a seed
 /// to avoid the degenerate cross product when `direction` is itself close
 /// to that axis.
-fn plane_basis(direction: DVec3) -> (DVec3, DVec3) {
+///
+/// Exposed (rather than kept private) so callers that need to size a
+/// sampling extent to fit *only* the in-plane footprint of some bounding
+/// volume (e.g. `manifold-core::slicing::slice_mesh`, which must not let
+/// a mesh's extent along `direction` inflate its per-layer contour grid
+/// extent) can project onto the same basis [`extract_contours_at_order`]
+/// samples against, instead of duplicating this seed-vector logic.
+pub fn plane_basis(direction: DVec3) -> (DVec3, DVec3) {
     let seed = if direction.x.abs() < 0.9 {
         DVec3::X
     } else {

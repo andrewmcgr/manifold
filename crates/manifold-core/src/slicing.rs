@@ -2,7 +2,7 @@
 
 use crate::{ids::ObjectId, mesh::Mesh, object::Object, Result, SlicerConfig};
 use glam::DVec3;
-use manifold_fidget::contour::extract_contours_at_order;
+use manifold_fidget::contour::{extract_contours, plane_basis};
 use manifold_fidget::mesh_sdf::MeshSdf;
 
 /// A single (possibly non-planar) slice layer.
@@ -72,10 +72,30 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
     let order_min = order_at_min.min(order_at_max);
     let order_max = order_at_min.max(order_at_max);
 
-    // In-plane sample extent: large enough to cover the mesh's full
-    // bounding box diagonal (plus margin), regardless of which axes the
-    // contour-extraction plane basis happens to align with.
-    let extent = (max - min).length() * 1.5 + 1.0;
+    // In-plane sample extent: sized off the mesh's bounding box
+    // *projected onto the contour-extraction plane's in-plane basis*
+    // (perpendicular to BUILD_DIRECTION), not its full 3D diagonal. Using
+    // the 3D diagonal (which includes the mesh's extent along
+    // BUILD_DIRECTION, i.e. its height) wastes most of the fixed
+    // CONTOUR_RESOLUTION grid on empty space for any object where height
+    // dominates footprint, causing near-tip/near-base layers to fall
+    // between grid samples and come back with zero contour loops.
+    let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+    let extent = in_plane_extent(min, max, basis1, basis2);
+
+    // Center the sampling plane's origin on the mesh's actual in-plane
+    // (footprint) position rather than the world origin.
+    // `extract_contours_at_order` computes `origin = direction * order_value`,
+    // which always has zero in-plane (basis1/basis2) components — fine only
+    // when the mesh's footprint happens to straddle the world origin. For a
+    // mesh translated far from world (0,0) (e.g. after `object::center_on_bed`
+    // places it at the bed's center), the fixed-extent sampling window then
+    // never reaches the mesh at all, so every layer comes back empty. Instead
+    // we anchor the origin at the mesh's bounding-box center projected onto
+    // the in-plane axes, while still solving for the BUILD_DIRECTION
+    // component so `origin.dot(BUILD_DIRECTION) == order_value` (i.e. origin
+    // stays exactly on the correct slicing plane for each layer).
+    let bbox_center = (min + max) * 0.5;
 
     let layer_height = config.layer_height.abs().max(f64::EPSILON);
 
@@ -83,14 +103,18 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
     let mut order_value = order_min;
     let mut index = 0;
     while order_value <= order_max {
-        let loops = extract_contours_at_order(
+        let origin =
+            bbox_center + BUILD_DIRECTION * (order_value - bbox_center.dot(BUILD_DIRECTION));
+        let loops = extract_contours(
             &sdf,
-            BUILD_DIRECTION,
-            order_value,
+            origin,
+            basis1,
+            basis2,
             extent,
             extent,
             CONTOUR_RESOLUTION,
             CONTOUR_RESOLUTION,
+            0.0,
         );
         layers.push(Layer {
             index,
@@ -103,6 +127,44 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
     }
 
     Ok(layers)
+}
+
+/// Computes a square in-plane sampling extent (see [`slice_mesh`]) large
+/// enough to cover the mesh's bounding box `[min, max]` once projected onto
+/// the `basis1`/`basis2` plane, independent of the mesh's extent along the
+/// (perpendicular) build direction.
+///
+/// Projects all 8 bounding-box corners onto `basis1`/`basis2`, takes the
+/// resulting 2D range's diagonal, and applies the same `* 1.5 + 1.0` margin
+/// the old (buggy) full-3D-diagonal computation used, so behavior for
+/// mostly-flat meshes (where footprint ~= 3D diagonal) is unchanged.
+fn in_plane_extent(min: DVec3, max: DVec3, basis1: DVec3, basis2: DVec3) -> f64 {
+    let corners = [
+        DVec3::new(min.x, min.y, min.z),
+        DVec3::new(max.x, min.y, min.z),
+        DVec3::new(min.x, max.y, min.z),
+        DVec3::new(min.x, min.y, max.z),
+        DVec3::new(max.x, max.y, min.z),
+        DVec3::new(max.x, min.y, max.z),
+        DVec3::new(min.x, max.y, max.z),
+        DVec3::new(max.x, max.y, max.z),
+    ];
+
+    let mut u_min = f64::INFINITY;
+    let mut u_max = f64::NEG_INFINITY;
+    let mut v_min = f64::INFINITY;
+    let mut v_max = f64::NEG_INFINITY;
+    for corner in corners {
+        let u = corner.dot(basis1);
+        let v = corner.dot(basis2);
+        u_min = u_min.min(u);
+        u_max = u_max.max(u);
+        v_min = v_min.min(v);
+        v_max = v_max.max(v);
+    }
+
+    let projected_diagonal = DVec3::new(u_max - u_min, v_max - v_min, 0.0).length();
+    projected_diagonal * 1.5 + 1.0
 }
 
 /// Slice a single [`Object`]: bakes its `transform` into world-space
@@ -266,8 +328,92 @@ mod tests {
     }
 
     #[test]
+    fn slice_mesh_produces_nonempty_contour_loops_for_a_cube_far_from_the_world_origin() {
+        // Regression test: before the fix, the contour-extraction plane's
+        // origin always had zero in-plane (X/Y) components regardless of
+        // where the mesh actually sits, so a mesh translated far from world
+        // (0,0) (e.g. after `object::center_on_bed`) produced zero contour
+        // loops for every layer, even though the SDF field itself is fine.
+        let offset = DVec3::new(500.0, 500.0, 0.0);
+        let mesh = cube_mesh();
+        let translated = Mesh::new(
+            mesh.vertices
+                .iter()
+                .map(|&vertex| vertex + offset)
+                .collect(),
+            mesh.indices.clone(),
+        );
+
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&translated, &config).unwrap();
+
+        assert_eq!(layers.len(), 5);
+        for layer in &layers[1..4] {
+            assert_eq!(layer.loops.len(), 1, "expected exactly one contour loop");
+            assert!(!layer.loops[0].is_empty());
+        }
+    }
+
+    #[test]
     fn slice_mesh_returns_no_layers_for_an_empty_mesh() {
         let layers = slice_mesh(&Mesh::default(), &SlicerConfig::default()).unwrap();
         assert!(layers.is_empty());
+    }
+
+    /// Slim square pyramid: base [-0.5, 0.5]^2 at Z=0, apex at (0, 0, 20)
+    /// — height 20x its footprint. Before the fix, `extent` was sized off
+    /// the full 3D bounding-box diagonal (dominated by the 20-tall
+    /// height), starving the 120x120 sampling grid of resolution across
+    /// the ~1-unit-wide footprint and causing layers through the body
+    /// (not just the near-degenerate apex tip) to come back with zero
+    /// contour loops.
+    fn tall_thin_pyramid_mesh() -> Mesh {
+        let vertices = vec![
+            DVec3::new(-0.5, -0.5, 0.0),
+            DVec3::new(0.5, -0.5, 0.0),
+            DVec3::new(0.5, 0.5, 0.0),
+            DVec3::new(-0.5, 0.5, 0.0),
+            DVec3::new(0.0, 0.0, 20.0),
+        ];
+        let indices = vec![
+            0, 2, 1, 0, 3, 2, // base (-Z winding)
+            0, 1, 4, // side
+            1, 2, 4, // side
+            2, 3, 4, // side
+            3, 0, 4, // side
+        ];
+        Mesh::new(vertices, indices)
+    }
+
+    #[test]
+    fn slice_mesh_has_no_empty_contour_gaps_through_a_tall_thin_pyramid() {
+        let config = SlicerConfig {
+            layer_height: 1.0,
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&tall_thin_pyramid_mesh(), &config).unwrap();
+        assert!(!layers.is_empty());
+
+        let first_nonempty = layers.iter().position(|layer| !layer.loops.is_empty());
+        let last_nonempty = layers.iter().rposition(|layer| !layer.loops.is_empty());
+
+        let (Some(first_nonempty), Some(last_nonempty)) = (first_nonempty, last_nonempty) else {
+            panic!("expected at least one layer with contour loops");
+        };
+
+        for layer in &layers[first_nonempty..=last_nonempty] {
+            assert!(
+                !layer.loops.is_empty(),
+                "layer {} at order {} unexpectedly has no contour loops \
+                 (in-plane sampling extent too large for the footprint)",
+                layer.index,
+                layer.order
+            );
+        }
     }
 }
