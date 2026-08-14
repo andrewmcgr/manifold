@@ -34,11 +34,41 @@ pub struct Layer {
 /// will make this configurable.
 const BUILD_DIRECTION: DVec3 = DVec3::new(0.0, 0.0, -1.0);
 
-/// Grid resolution (samples per axis) used for the marching-squares
-/// contour extraction at each layer. Fixed for this MVP rather than
-/// plumbed through `SlicerConfig`; see ROADMAP.md for a possible
-/// follow-up (e.g. deriving it from `nozzle_diameter`).
-const CONTOUR_RESOLUTION: usize = 120;
+/// Default divisor used to derive the marching-squares contour-extraction
+/// grid's target cell size from `SlicerConfig::nozzle_diameter` (cell_size
+/// = `nozzle_diameter / CONTOUR_REFINEMENT_DIVISOR`): a quarter of the
+/// nozzle diameter keeps grid faceting finer than what the nozzle can
+/// physically resolve anyway, without oversampling. Exposed as a constant
+/// (rather than inlined) so callers wanting coarser/finer refinement can
+/// pass a different divisor to [`contour_resolution`] directly.
+const CONTOUR_REFINEMENT_DIVISOR: f64 = 4.0;
+
+/// Lower/upper bounds on the derived grid resolution (samples per axis),
+/// independent of `CONTOUR_REFINEMENT_DIVISOR`: guards against a
+/// vanishingly coarse grid (degenerate/huge `extent` or `nozzle_diameter`)
+/// and against runaway sampling cost (tiny `nozzle_diameter` on a large
+/// mesh).
+const MIN_CONTOUR_RESOLUTION: usize = 32;
+const MAX_CONTOUR_RESOLUTION: usize = 512;
+
+/// Derives the marching-squares contour-extraction grid resolution
+/// (samples per axis, see [`extract_contours`]) for an in-plane sampling
+/// square of side length `extent`, targeting a grid cell size of
+/// `nozzle_diameter / refinement_divisor`.
+///
+/// Adaptive rather than fixed (as this previously was, via a
+/// `CONTOUR_RESOLUTION` constant): a fixed grid either wastes samples on
+/// small objects or under-samples large ones, producing visibly faceted/
+/// blocky contours. Deriving resolution from the mesh's actual footprint
+/// and the machine's nozzle diameter scales the grid to both.
+///
+/// Clamped to `[MIN_CONTOUR_RESOLUTION, MAX_CONTOUR_RESOLUTION]` to bound
+/// cost and guard against non-finite/non-positive inputs.
+fn contour_resolution(extent: f64, nozzle_diameter: f64, refinement_divisor: f64) -> usize {
+    let cell_size = (nozzle_diameter / refinement_divisor).max(f64::EPSILON);
+    let raw = (extent / cell_size).ceil() as i64 + 1;
+    raw.clamp(MIN_CONTOUR_RESOLUTION as i64, MAX_CONTOUR_RESOLUTION as i64) as usize
+}
 
 /// Slice a single mesh (already in the frame it should be sliced in) into
 /// layers according to `config`.
@@ -98,6 +128,7 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
     let bbox_center = (min + max) * 0.5;
 
     let layer_height = config.layer_height.abs().max(f64::EPSILON);
+    let resolution = contour_resolution(extent, config.nozzle_diameter, CONTOUR_REFINEMENT_DIVISOR);
 
     let mut layers = Vec::new();
     let mut order_value = order_min;
@@ -106,15 +137,7 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
         let origin =
             bbox_center + BUILD_DIRECTION * (order_value - bbox_center.dot(BUILD_DIRECTION));
         let loops = extract_contours(
-            &sdf,
-            origin,
-            basis1,
-            basis2,
-            extent,
-            extent,
-            CONTOUR_RESOLUTION,
-            CONTOUR_RESOLUTION,
-            0.0,
+            &sdf, origin, basis1, basis2, extent, extent, resolution, resolution, 0.0,
         );
         layers.push(Layer {
             index,
@@ -237,6 +260,54 @@ mod tests {
             ],
             vec![0, 1, 2],
         )
+    }
+
+    #[test]
+    fn contour_resolution_scales_with_extent() {
+        let small = contour_resolution(4.0, 0.4, CONTOUR_REFINEMENT_DIVISOR);
+        let large = contour_resolution(40.0, 0.4, CONTOUR_REFINEMENT_DIVISOR);
+        assert!(
+            large > small,
+            "a larger in-plane extent should derive a finer (larger) grid resolution"
+        );
+    }
+
+    #[test]
+    fn contour_resolution_scales_inversely_with_nozzle_diameter() {
+        let coarse_nozzle = contour_resolution(40.0, 0.8, CONTOUR_REFINEMENT_DIVISOR);
+        let fine_nozzle = contour_resolution(40.0, 0.2, CONTOUR_REFINEMENT_DIVISOR);
+        assert!(
+            fine_nozzle > coarse_nozzle,
+            "a smaller nozzle diameter should derive a finer (larger) grid resolution"
+        );
+    }
+
+    #[test]
+    fn contour_resolution_respects_the_refinement_divisor_parameter() {
+        // A larger divisor targets a coarser cell size (nozzle_diameter /
+        // divisor), so resolution should drop as the divisor shrinks.
+        let finer = contour_resolution(40.0, 0.4, 8.0);
+        let coarser = contour_resolution(40.0, 0.4, 2.0);
+        assert!(
+            finer > coarser,
+            "a larger refinement divisor should derive a finer (larger) grid resolution"
+        );
+    }
+
+    #[test]
+    fn contour_resolution_is_clamped_to_the_configured_bounds() {
+        // Vanishingly small extent / huge nozzle diameter -> would derive a
+        // resolution below MIN_CONTOUR_RESOLUTION without clamping.
+        assert_eq!(
+            contour_resolution(0.001, 10.0, CONTOUR_REFINEMENT_DIVISOR),
+            MIN_CONTOUR_RESOLUTION
+        );
+        // Huge extent / vanishingly small nozzle diameter -> would derive a
+        // resolution above MAX_CONTOUR_RESOLUTION without clamping.
+        assert_eq!(
+            contour_resolution(1.0e6, 0.001, CONTOUR_REFINEMENT_DIVISOR),
+            MAX_CONTOUR_RESOLUTION
+        );
     }
 
     #[test]
