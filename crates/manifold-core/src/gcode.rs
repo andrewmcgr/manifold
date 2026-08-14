@@ -1,6 +1,9 @@
 //! Gcode emission from planned toolpaths.
 
-use crate::{toolpath::Path, SlicerConfig};
+use crate::{
+    toolpath::{MoveKind, Path},
+    SlicerConfig,
+};
 
 /// Render toolpaths to a Gcode program string.
 ///
@@ -21,13 +24,11 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
         }
 
         for (i, p) in path.points.iter().enumerate() {
-            let cmd = if i == 0 {
-                "G0"
-            } else if path.extruding {
-                "G1"
-            } else {
-                "G0"
-            };
+            let extruding = path
+                .segments
+                .get(i)
+                .is_some_and(|segment| segment.kind != MoveKind::Travel);
+            let cmd = if i == 0 || !extruding { "G0" } else { "G1" };
             out.push_str(&format!("{cmd} X{:.3} Y{:.3} Z{:.3}\n", p.x, p.y, p.z));
         }
     }
@@ -45,17 +46,17 @@ mod tests {
         let paths = vec![
             Path {
                 points: Vec::new(),
-                extruding: false,
+                segments: Vec::new(),
                 tool: ToolId(0),
             },
             Path {
                 points: Vec::new(),
-                extruding: false,
+                segments: Vec::new(),
                 tool: ToolId(1),
             },
             Path {
                 points: Vec::new(),
-                extruding: false,
+                segments: Vec::new(),
                 tool: ToolId(1),
             },
         ];
@@ -70,5 +71,47 @@ mod tests {
     fn emit_omits_tool_line_when_no_paths() {
         let out = emit(&[], &SlicerConfig::default());
         assert!(!out.contains('T'));
+    }
+
+    #[test]
+    fn emit_derives_g0_g1_from_segment_kind() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        // A single path: first point is always the travel move (G0), then
+        // an explicit Travel-kind segment (G0) followed by a WallOuter-kind
+        // segment (G1) — proving the command derives from `segment.kind`
+        // rather than position alone.
+        let paths = vec![Path {
+            points: vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(2.0, 0.0, 0.0),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::Travel,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    ..Segment::default()
+                },
+            ],
+            tool: ToolId(0),
+        }];
+
+        let out = emit(&paths, &SlicerConfig::default());
+        let commands: Vec<&str> = out
+            .lines()
+            .filter(|line| line.starts_with("G0") || line.starts_with("G1"))
+            .map(|line| &line[..2])
+            .collect();
+
+        assert_eq!(commands, vec!["G0", "G0", "G1"]);
     }
 }

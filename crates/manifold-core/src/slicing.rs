@@ -14,6 +14,12 @@ use manifold_fidget::mesh_sdf::MeshSdf;
 pub struct Layer {
     pub index: usize,
     pub object: ObjectId,
+    /// The order-field value (see [`BUILD_DIRECTION`]/[`slice_mesh`]'s walk)
+    /// whose isosurface produced this layer's contour loops. In today's
+    /// flat-height-field case this is the layer's Z height; retained so
+    /// downstream consumers (e.g. `toolpath::plan`) can stamp it onto
+    /// per-segment metadata once non-planar order fields exist.
+    pub order: f64,
     /// This layer's cross-section geometry: closed polylines (loops) in
     /// world space, one per contour extracted at this layer's order
     /// value. Empty for a layer with no contour (e.g. above/below the
@@ -89,6 +95,7 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
         layers.push(Layer {
             index,
             object: ObjectId::default(),
+            order: order_value,
             loops,
         });
         index += 1;

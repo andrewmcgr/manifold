@@ -400,6 +400,38 @@ loops, and any actual non-planar toolpath deformation (this phase's
 toolpaths are still flat, planar loops — only the pipeline *shape* is
 new).
 
+## Phase 12 — Motion metadata in manifold-core::toolpath (needs 11) — ✅ done
+
+Extend the toolpath data model so each *segment* (point-to-point move within
+a contour loop `Path`) carries classification + kinematic metadata, without
+adding any real detection logic yet — preparatory vocabulary/plumbing for
+the Phase 13 GUI toolpath-preview follow-on.
+
+- New `manifold-core::toolpath::MoveKind` enum: `WallOuter`, `WallInner`,
+  `Infill`, `Bridge`, `Overhang`, `Travel`.
+- `Path` reshaped to carry per-segment metadata via a parallel `segments:
+  Vec<Segment>` (kept alongside `points: Vec<DVec3>` rather than paired in a
+  single `Vec<(DVec3, Segment)>`, so geometry-only callers can read `points`
+  without touching `segments`). `Segment` holds `kind: MoveKind`, `speed:
+  f64`, `extrusion_rate: f64`, `support_fraction: f64`, and `order: f64`.
+- `Layer` threads through the `order`-field value (from
+  `manifold_fidget::order`/`HeightOrderField`) its contours were extracted
+  at, so `toolpath::plan` can stamp it onto every `Segment` per-segment
+  (not per-`Path`/per-`Layer`), ready for non-planar order fields later.
+- `toolpath::plan` populates every `Segment` with `MoveKind::WallOuter`
+  (the closest existing case), fixed placeholder `speed`/`extrusion_rate`
+  defaults, and `support_fraction: 0.0`.
+- `gcode::emit` updated to walk the new `Path`/`Segment` shape, deriving
+  `G0`-vs-`G1` from `segment.kind != MoveKind::Travel` instead of a
+  separate `extruding: bool` field (removed from `Path`).
+
+**Explicitly deferred**: real wall/inner-wall/infill/support/bridge/
+overhang *classification* — `plan()` still tags everything
+`MoveKind::WallOuter` as a placeholder; actual detection logic is future
+work. Phase 13 (GUI toolpath preview: rendering, scrubbing-by-order, hover
+tooltips) is the follow-on consumer of this metadata and is out of scope
+here.
+
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
 - **Multi-object collision avoidance**: toolhead-vs-already-printed-object
