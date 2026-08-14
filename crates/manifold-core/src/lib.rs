@@ -69,6 +69,26 @@ pub fn slice_to_gcode(workspace: &Workspace) -> Result<String> {
 /// Returns [`Error::InvalidMesh`] if `workspace` has no objects, or
 /// whatever error the ordering/slicing/toolpath stages produce.
 pub fn plan_toolpaths(workspace: &Workspace) -> Result<Vec<toolpath::Path>> {
+    plan_toolpaths_with_progress(workspace, &mut |_| {})
+}
+
+/// Same as [`plan_toolpaths`], but calls `on_progress` with a `0.0..=1.0`
+/// fraction of how far through the order-field domain slicing currently
+/// is (see [`slicing::slice_workspace_with_progress`]), so a caller
+/// running this on a background thread (slicing can be slow) can show
+/// live progress without needing to know anything about layers or order
+/// fields. Toolpath planning itself is comparatively fast and is not
+/// separately reported — `on_progress` reaches `1.0` once slicing
+/// finishes, before toolpath planning runs.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidMesh`] if `workspace` has no objects, or
+/// whatever error the ordering/slicing/toolpath stages produce.
+pub fn plan_toolpaths_with_progress(
+    workspace: &Workspace,
+    on_progress: &mut dyn FnMut(f64),
+) -> Result<Vec<toolpath::Path>> {
     if workspace.objects.is_empty() {
         return Err(Error::InvalidMesh("workspace has no objects".to_string()));
     }
@@ -76,7 +96,12 @@ pub fn plan_toolpaths(workspace: &Workspace) -> Result<Vec<toolpath::Path>> {
     let strategy = ordering::strategy_for(workspace.config.object_ordering);
     let order = strategy.order(&workspace.objects)?;
 
-    let layers = slicing::slice_workspace(&workspace.objects, &order, &workspace.config)?;
+    let layers = slicing::slice_workspace_with_progress(
+        &workspace.objects,
+        &order,
+        &workspace.config,
+        on_progress,
+    )?;
     toolpath::plan(&layers, &workspace.objects, &workspace.config)
 }
 

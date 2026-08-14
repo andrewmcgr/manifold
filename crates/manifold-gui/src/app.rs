@@ -43,6 +43,19 @@ impl SlicePlane {
     }
 }
 
+/// Message sent from the background slicing thread spawned by
+/// `ManifoldApp::start_slice` back to the main/UI thread, polled once per
+/// frame in `update()` via `ManifoldApp::drain_slice_messages`.
+enum SliceMessage {
+    /// `0.0..=1.0` fraction of how far through the order-field domain
+    /// slicing currently is, from `manifold_core::plan_toolpaths_with_progress`.
+    Progress(f64),
+    /// The final result, converted to `String` so the message doesn't need
+    /// to carry a non-`'static`-bound error type across the thread
+    /// boundary.
+    Done(Result<Vec<manifold_core::toolpath::Path>, String>),
+}
+
 pub struct ManifoldApp {
     config: manifold_core::SlicerConfig,
     /// The machine (bed/build-volume/tools) objects are sliced and
@@ -92,6 +105,14 @@ pub struct ManifoldApp {
     /// segments.
     toolpath_order_range: Option<(f64, f64)>,
     slice_error: Option<String>,
+    /// Receiver for the background slicing thread spawned by `start_slice`,
+    /// polled once per frame in `update()` via `drain_slice_messages`.
+    /// `None` when no slice is currently in progress.
+    slicing: Option<std::sync::mpsc::Receiver<SliceMessage>>,
+    /// `0.0..=1.0` progress of the in-progress slice, reported by
+    /// `manifold_core::plan_toolpaths_with_progress`. Only meaningful while
+    /// `slicing` is `Some`.
+    slice_progress: f64,
     /// Set by a failed "Save Profile…"/"Load Profile…" action (Phase 10, see
     /// ROADMAP.md).
     profile_error: Option<String>,
@@ -185,6 +206,8 @@ impl ManifoldApp {
             scrub_order: f64::INFINITY,
             toolpath_order_range: None,
             slice_error: None,
+            slicing: None,
+            slice_progress: 0.0,
             profile_error: None,
             next_tool_id: 1,
             show_sdf_panel: false,
@@ -389,18 +412,64 @@ impl ManifoldApp {
         gizmo_result
     }
 
-    /// Run the slicing pipeline over the current `objects`/`machine`/
-    /// `config` and store the result (or error) for preview/export
-    /// (Phase 8, see ROADMAP.md).
-    fn slice(&mut self) {
+    /// Kick off the slicing pipeline over the current `objects`/`machine`/
+    /// `config` on a background thread, so the UI stays responsive while a
+    /// slow slice runs. Progress and the final result arrive via
+    /// `drain_slice_messages`, polled once per frame from `update()`.
+    fn start_slice(&mut self) {
         let workspace = manifold_core::Workspace::new(
             self.objects.clone(),
             self.machine.clone(),
             self.config.clone(),
         );
-        match manifold_core::plan_toolpaths(&workspace) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let progress_tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut on_progress = move |fraction: f64| {
+                let _ = progress_tx.send(SliceMessage::Progress(fraction));
+            };
+            let result = manifold_core::plan_toolpaths_with_progress(&workspace, &mut on_progress)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(SliceMessage::Done(result));
+        });
+        self.slicing = Some(rx);
+        self.slice_progress = 0.0;
+        self.slice_error = None;
+    }
+
+    /// Drains any pending messages from the background slicing thread
+    /// started by `start_slice`, updating `slice_progress` and finalizing
+    /// the result via `finish_slice` once `Done` arrives. Returns `true` if
+    /// slicing just finished this call (so the caller can perform any
+    /// follow-up GPU work that needs a `wgpu::Device`, e.g.
+    /// `reupload_toolpaths`).
+    fn drain_slice_messages(&mut self) -> bool {
+        let mut finished_result = None;
+        if let Some(rx) = &self.slicing {
+            while let Ok(message) = rx.try_recv() {
+                match message {
+                    SliceMessage::Progress(fraction) => self.slice_progress = fraction,
+                    SliceMessage::Done(result) => finished_result = Some(result),
+                }
+            }
+        }
+        match finished_result {
+            Some(result) => {
+                self.slicing = None;
+                self.finish_slice(result);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Store the result of a finished slice (or error) for preview/export
+    /// (Phase 8, see ROADMAP.md). Shared by the synchronous finalization
+    /// path in `drain_slice_messages`.
+    fn finish_slice(&mut self, result: Result<Vec<manifold_core::toolpath::Path>, String>) {
+        match result {
             Ok(paths) => {
-                let gcode = manifold_core::gcode::emit(&paths, &workspace.config);
+                let gcode = manifold_core::gcode::emit(&paths, &self.config);
                 self.toolpath_order_range = toolpath_view::order_range(&paths);
                 // Default the scrub slider to the max order so a fresh
                 // slice shows every segment ("up to and including" the
@@ -418,7 +487,7 @@ impl ManifoldApp {
                 self.uploaded_toolpaths = None;
                 self.toolpath_order_range = None;
                 self.gcode = None;
-                self.slice_error = Some(error.to_string());
+                self.slice_error = Some(error);
             }
         }
     }
@@ -803,19 +872,24 @@ impl ManifoldApp {
             ui.label(format!("{} object(s) loaded", self.objects.len()));
 
             ui.separator();
+            let slicing_in_progress = self.slicing.is_some();
             if ui
-                .add_enabled(!self.objects.is_empty(), egui::Button::new("Slice"))
+                .add_enabled(
+                    !self.objects.is_empty() && !slicing_in_progress,
+                    egui::Button::new("Slice"),
+                )
                 .clicked()
             {
-                self.slice();
-                if self.toolpaths.is_some() {
-                    let device = frame
-                        .wgpu_render_state()
-                        .expect("wgpu renderer is required")
-                        .device
-                        .clone();
-                    self.reupload_toolpaths(&device);
-                }
+                self.start_slice();
+            }
+            if slicing_in_progress {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.add(
+                        egui::ProgressBar::new(self.slice_progress as f32)
+                            .text(format!("Slicing… {:.0}%", self.slice_progress * 100.0)),
+                    );
+                });
             }
             if ui
                 .add_enabled(self.gcode.is_some(), egui::Button::new("Export…"))
@@ -1107,6 +1181,23 @@ impl eframe::App for ManifoldApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(feature = "mcp-server")]
         self.drain_mcp_commands(frame);
+
+        if self.slicing.is_some() {
+            if self.drain_slice_messages() {
+                if self.toolpaths.is_some() {
+                    let device = frame
+                        .wgpu_render_state()
+                        .expect("wgpu renderer is required")
+                        .device
+                        .clone();
+                    self.reupload_toolpaths(&device);
+                }
+            } else {
+                // Still in progress: keep polling every frame rather than
+                // waiting for the next input-driven repaint.
+                ctx.request_repaint();
+            }
+        }
 
         egui::SidePanel::left("settings_panel")
             .default_width(260.0)

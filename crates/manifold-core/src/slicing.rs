@@ -86,6 +86,20 @@ fn contour_resolution(extent: f64, nozzle_diameter: f64, refinement_divisor: f64
 /// [`Object`] should go through [`slice_object`], which bakes the
 /// object's transform into world space first.
 pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
+    slice_mesh_with_progress(mesh, config, &mut |_| {})
+}
+
+/// Same as [`slice_mesh`], but calls `on_progress` after each layer with
+/// how far the walk currently is through the order-field domain (`0.0` at
+/// `order_min`, `1.0` at `order_max`) — intended for a caller (e.g. the
+/// GUI, slicing on a background thread) to report progress on a
+/// potentially slow slice without having to know anything about layers,
+/// order fields, or contour resolution itself.
+pub fn slice_mesh_with_progress(
+    mesh: &Mesh,
+    config: &SlicerConfig,
+    on_progress: &mut dyn FnMut(f64),
+) -> Result<Vec<Layer>> {
     let Some((min, max)) = mesh.bounding_box() else {
         // Empty mesh: no geometry to slice.
         return Ok(Vec::new());
@@ -133,6 +147,7 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
 
     let layer_height = config.layer_height.abs().max(f64::EPSILON);
     let resolution = contour_resolution(extent, config.nozzle_diameter, CONTOUR_REFINEMENT_DIVISOR);
+    let order_span = (order_max - order_min).max(f64::EPSILON);
 
     let mut layers = Vec::new();
     let mut order_value = order_min;
@@ -151,6 +166,7 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
         });
         index += 1;
         order_value += layer_height;
+        on_progress(((order_value - order_min) / order_span).clamp(0.0, 1.0));
     }
 
     Ok(layers)
@@ -198,6 +214,15 @@ fn in_plane_extent(min: DVec3, max: DVec3, basis1: DVec3, basis2: DVec3) -> f64 
 /// vertices, then slices that with [`slice_mesh`], tagging every
 /// resulting layer with the object's id.
 pub fn slice_object(object: &Object, config: &SlicerConfig) -> Result<Vec<Layer>> {
+    slice_object_with_progress(object, config, &mut |_| {})
+}
+
+/// Same as [`slice_object`], forwarding to [`slice_mesh_with_progress`].
+pub fn slice_object_with_progress(
+    object: &Object,
+    config: &SlicerConfig,
+    on_progress: &mut dyn FnMut(f64),
+) -> Result<Vec<Layer>> {
     let world_mesh = Mesh::new(
         object
             .mesh
@@ -208,7 +233,7 @@ pub fn slice_object(object: &Object, config: &SlicerConfig) -> Result<Vec<Layer>
         object.mesh.indices.clone(),
     );
 
-    let mut layers = slice_mesh(&world_mesh, config)?;
+    let mut layers = slice_mesh_with_progress(&world_mesh, config, on_progress)?;
     for layer in &mut layers {
         layer.object = object.id;
     }
@@ -234,8 +259,23 @@ pub fn slice_workspace(
     order: &[ObjectId],
     config: &SlicerConfig,
 ) -> Result<Vec<Layer>> {
+    slice_workspace_with_progress(objects, order, config, &mut |_| {})
+}
+
+/// Same as [`slice_workspace`], reporting overall progress across every
+/// object being sliced (not just the one currently in progress): each
+/// object gets an equal `1 / order.len()` share of the `0.0..=1.0` range,
+/// and within that share [`slice_object_with_progress`]'s own `0.0..=1.0`
+/// order-field-domain progress is linearly mapped in.
+pub fn slice_workspace_with_progress(
+    objects: &[Object],
+    order: &[ObjectId],
+    config: &SlicerConfig,
+    on_progress: &mut dyn FnMut(f64),
+) -> Result<Vec<Layer>> {
+    let total = order.len().max(1) as f64;
     let mut layers = Vec::new();
-    for &object_id in order {
+    for (object_index, &object_id) in order.iter().enumerate() {
         let object = objects
             .iter()
             .find(|object| object.id == object_id)
@@ -244,7 +284,9 @@ pub fn slice_workspace(
                     "print order references unknown object {object_id}"
                 ))
             })?;
-        layers.extend(slice_object(object, config)?);
+        layers.extend(slice_object_with_progress(object, config, &mut |local| {
+            on_progress(((object_index as f64) + local) / total);
+        })?);
     }
     Ok(layers)
 }
@@ -312,6 +354,52 @@ mod tests {
             contour_resolution(1.0e6, 0.001, CONTOUR_REFINEMENT_DIVISOR),
             MAX_CONTOUR_RESOLUTION
         );
+    }
+
+    #[test]
+    fn slice_mesh_with_progress_reports_monotonic_progress_ending_at_one() {
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            ..SlicerConfig::default()
+        };
+
+        let mut reported = Vec::new();
+        slice_mesh_with_progress(&cube_mesh(), &config, &mut |fraction| {
+            reported.push(fraction);
+        })
+        .unwrap();
+
+        assert!(!reported.is_empty());
+        assert!(reported.windows(2).all(|pair| pair[1] >= pair[0]));
+        assert_eq!(*reported.last().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn slice_workspace_with_progress_splits_range_evenly_across_objects() {
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            ..SlicerConfig::default()
+        };
+        let first = Object::new(ObjectId(0), cube_mesh(), ToolId(0));
+        let mut second = Object::new(ObjectId(1), cube_mesh(), ToolId(0));
+        second.transform = Transform::from_translation(DVec3::new(5.0, 0.0, 0.0));
+        let objects = vec![first, second];
+        let order = vec![ObjectId(0), ObjectId(1)];
+
+        let mut reported = Vec::new();
+        slice_workspace_with_progress(&objects, &order, &config, &mut |fraction| {
+            reported.push(fraction);
+        })
+        .unwrap();
+
+        assert!(!reported.is_empty());
+        // First object's progress should stay within [0.0, 0.5], second
+        // object's within [0.5, 1.0], and the overall walk should still end
+        // at 1.0.
+        assert!(reported
+            .iter()
+            .all(|&fraction| (0.0..=1.0).contains(&fraction)));
+        assert_eq!(*reported.last().unwrap(), 1.0);
     }
 
     #[test]
