@@ -32,15 +32,45 @@ pub struct SlicerConfig {
     /// Strategy used to decide the order objects are printed in. See
     /// `ordering` module and ROADMAP.md open decision #2.
     pub object_ordering: ordering::ObjectOrderingKind,
+    /// Nozzle-center line width for a single wall/perimeter pass, in mm.
+    /// Also used as the spacing between successive wall passes.
+    pub wall_line_width: f64,
+    /// Total desired shell thickness (mm), i.e. how far inward the walls
+    /// should extend from the outer surface. The actual number of wall
+    /// passes is derived (see [`SlicerConfig::wall_count`]) by rounding
+    /// `shell_thickness / wall_line_width` to the nearest whole wall,
+    /// clamped to a minimum of one.
+    pub shell_thickness: f64,
+    /// Inset of the outermost wall's nozzle-center path from the true
+    /// mesh surface, in mm. Defaults to half the nozzle diameter so the
+    /// nozzle's outer edge (not its center) lands on the surface.
+    pub wall_offset: f64,
 }
 
 impl Default for SlicerConfig {
     fn default() -> Self {
+        let nozzle_diameter = 0.4;
+        let wall_line_width = nozzle_diameter;
         Self {
             layer_height: 0.2,
-            nozzle_diameter: 0.4,
+            nozzle_diameter,
             object_ordering: ordering::ObjectOrderingKind::default(),
+            wall_line_width,
+            shell_thickness: wall_line_width,
+            wall_offset: nozzle_diameter / 2.0,
         }
+    }
+}
+
+impl SlicerConfig {
+    /// Number of wall/perimeter passes derived from `shell_thickness` /
+    /// `wall_line_width`, rounded to the nearest whole wall and clamped to
+    /// a minimum of one (a `shell_thickness` smaller than `wall_line_width`
+    /// still gets a single outer wall, never zero).
+    #[must_use]
+    pub fn wall_count(&self) -> usize {
+        let line_width = self.wall_line_width.abs().max(f64::EPSILON);
+        (self.shell_thickness / line_width).round().max(1.0) as usize
     }
 }
 
@@ -114,6 +144,10 @@ mod tests {
         let cfg = SlicerConfig::default();
         assert!(cfg.layer_height > 0.0);
         assert!(cfg.nozzle_diameter > 0.0);
+        assert!(cfg.wall_line_width > 0.0);
+        assert!(cfg.shell_thickness > 0.0);
+        assert!(cfg.wall_offset > 0.0);
+        assert_eq!(cfg.wall_count(), 1);
     }
 
     #[test]

@@ -55,6 +55,9 @@ mod tests {
                 layer_height: 0.2,
                 nozzle_diameter: 0.4,
                 object_ordering: Default::default(),
+                wall_line_width: 0.4,
+                shell_thickness: 0.4,
+                wall_offset: 0.2,
             },
         }
     }

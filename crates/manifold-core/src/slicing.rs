@@ -24,10 +24,21 @@ pub struct Layer {
     /// per-segment metadata once non-planar order fields exist.
     pub order: f64,
     /// This layer's cross-section geometry: closed polylines (loops) in
-    /// world space, one per contour extracted at this layer's order
+    /// world space, one per wall pass extracted at this layer's order
     /// value. Empty for a layer with no contour (e.g. above/below the
     /// mesh's extent along the build direction).
-    pub loops: Vec<Vec<DVec3>>,
+    pub loops: Vec<WallLoop>,
+}
+
+/// One contour loop belonging to a specific wall/perimeter pass within a
+/// [`Layer`] (see [`SlicerConfig::wall_count`]).
+#[derive(Debug, Clone, Default)]
+pub struct WallLoop {
+    /// `0` = outermost wall, increasing inward. Used by
+    /// `toolpath::plan` to classify segments as `WallOuter`/`WallInner`.
+    pub wall_index: usize,
+    /// Closed polyline in world space (see [`Layer::loops`]).
+    pub points: Vec<DVec3>,
 }
 
 /// Build/order direction for this MVP: conventional planar slicing along
@@ -185,9 +196,24 @@ pub fn slice_mesh_with_progress(
         .map(|(index, &order_value)| {
             let origin =
                 bbox_center + BUILD_DIRECTION * (order_value - bbox_center.dot(BUILD_DIRECTION));
-            let loops = extract_contours(
-                &sdf, origin, basis1, basis2, extent, extent, resolution, resolution, 0.0,
-            );
+            let wall_count = config.wall_count();
+            let mut loops = Vec::new();
+            for wall_index in 0..wall_count {
+                // Negative iso = inward (see `MeshSdf::sign_at`: positive
+                // outside, negative inside). Wall 0 sits `wall_offset` in
+                // from the true surface (nozzle-center offset so the
+                // nozzle's outer edge lands on the surface); each further
+                // wall steps another `wall_line_width` inward.
+                let iso = -(config.wall_offset + wall_index as f64 * config.wall_line_width);
+                let wall_loops = extract_contours(
+                    &sdf, origin, basis1, basis2, extent, extent, resolution, resolution, iso,
+                );
+                loops.extend(
+                    wall_loops
+                        .into_iter()
+                        .map(|points| WallLoop { wall_index, points }),
+                );
+            }
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if let Ok(mut callback) = progress_callback.lock() {
                 callback(done as f64 / total_steps as f64);
@@ -518,7 +544,7 @@ mod tests {
         assert_eq!(layers.len(), 5);
         for layer in &layers[1..4] {
             assert_eq!(layer.loops.len(), 1, "expected exactly one contour loop");
-            assert!(!layer.loops[0].is_empty());
+            assert!(!layer.loops[0].points.is_empty());
         }
     }
 
@@ -549,7 +575,7 @@ mod tests {
         assert_eq!(layers.len(), 5);
         for layer in &layers[1..4] {
             assert_eq!(layer.loops.len(), 1, "expected exactly one contour loop");
-            assert!(!layer.loops[0].is_empty());
+            assert!(!layer.loops[0].points.is_empty());
         }
     }
 
@@ -582,6 +608,61 @@ mod tests {
             3, 0, 4, // side
         ];
         Mesh::new(vertices, indices)
+    }
+
+    #[test]
+    fn wall_count_rounds_to_nearest_and_clamps_to_one() {
+        let exact = SlicerConfig {
+            wall_line_width: 0.4,
+            shell_thickness: 0.8,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(exact.wall_count(), 2);
+
+        let rounds_up = SlicerConfig {
+            wall_line_width: 0.4,
+            shell_thickness: 0.9,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(rounds_up.wall_count(), 2);
+
+        let rounds_down = SlicerConfig {
+            wall_line_width: 0.4,
+            shell_thickness: 1.1,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(rounds_down.wall_count(), 3);
+
+        let thinner_than_one_wall = SlicerConfig {
+            wall_line_width: 0.4,
+            shell_thickness: 0.1,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(thinner_than_one_wall.wall_count(), 1);
+    }
+
+    #[test]
+    fn slice_mesh_produces_nested_wall_loops_for_a_multi_wall_solid_cube() {
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            wall_line_width: 0.05,
+            shell_thickness: 0.15,
+            wall_offset: 0.02,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(config.wall_count(), 3);
+
+        let layers = slice_mesh(&cube_mesh(), &config).unwrap();
+
+        for layer in &layers[1..4] {
+            assert_eq!(layer.loops.len(), 3, "expected one loop per wall pass");
+            let mut indices: Vec<usize> = layer.loops.iter().map(|l| l.wall_index).collect();
+            indices.sort_unstable();
+            assert_eq!(indices, vec![0, 1, 2]);
+            for wall_loop in &layer.loops {
+                assert!(!wall_loop.points.is_empty());
+            }
+        }
     }
 
     #[test]

@@ -4,9 +4,9 @@ use crate::{ids::ToolId, object::Object, slicing::Layer, Result, SlicerConfig};
 use glam::DVec3;
 
 /// Classification of a single toolpath segment (the move from one point to
-/// the next along a [`Path`]). Real wall/inner-wall/infill/support/bridge/
-/// overhang *detection* is future work — today's [`plan`] tags every
-/// segment [`MoveKind::WallOuter`].
+/// the next along a [`Path`]). [`plan`] derives `WallOuter`/`WallInner`
+/// from each loop's wall index (see `slicing::WallLoop`); real infill/
+/// support/bridge/overhang *detection* is still future work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MoveKind {
     #[default]
@@ -57,10 +57,11 @@ pub struct Path {
 /// Plan toolpaths for a set of layers, tagging each planned path with the
 /// tool assigned to its source object.
 ///
-/// Minimal implementation: emits one [`Path`] per contour loop in each
-/// [`Layer`] (a layer with no loops contributes no paths). Real path
-/// planning beyond this (multiple perimeters/shells, infill, travel-move
-/// ordering/optimization, non-planar toolpath deformation) is future work.
+/// Emits one [`Path`] per contour loop in each [`Layer`] (a layer with no
+/// loops contributes no paths), classifying each as [`MoveKind::WallOuter`]
+/// or [`MoveKind::WallInner`] from its source `WallLoop::wall_index`. Real
+/// path planning beyond this (infill, travel-move ordering/optimization,
+/// non-planar toolpath deformation) is future work.
 ///
 /// # Errors
 ///
@@ -78,17 +79,23 @@ pub fn plan(layers: &[Layer], objects: &[Object], _config: &SlicerConfig) -> Res
                     layer.object
                 ))
             })?;
-        for loop_points in &layer.loops {
-            // Placeholder metadata: real wall/inner-wall/infill/support/
-            // bridge/overhang classification and speed/extrusion-rate
-            // planning is future work (see toolpath-metadata-phase12
-            // subtask 03). Fixed sane defaults are used here rather than
-            // new `SlicerConfig` fields, since these values aren't yet
-            // meaningfully configurable.
-            let segments = loop_points
+        for wall_loop in &layer.loops {
+            // Placeholder metadata: real infill/support/bridge/overhang
+            // classification and speed/extrusion-rate planning is future
+            // work (see toolpath-metadata-phase12 subtask 03). Wall
+            // classification (outer vs. inner) is derived from the loop's
+            // wall index; fixed sane defaults are used for the rest since
+            // they aren't yet meaningfully configurable.
+            let kind = if wall_loop.wall_index == 0 {
+                MoveKind::WallOuter
+            } else {
+                MoveKind::WallInner
+            };
+            let segments = wall_loop
+                .points
                 .iter()
                 .map(|_| Segment {
-                    kind: MoveKind::WallOuter,
+                    kind,
                     speed: 60.0,
                     extrusion_rate: 1.0,
                     support_fraction: 0.0,
@@ -96,7 +103,7 @@ pub fn plan(layers: &[Layer], objects: &[Object], _config: &SlicerConfig) -> Res
                 })
                 .collect();
             paths.push(Path {
-                points: loop_points.clone(),
+                points: wall_loop.points.clone(),
                 segments,
                 tool: object.tool,
             });
@@ -108,7 +115,7 @@ pub fn plan(layers: &[Layer], objects: &[Object], _config: &SlicerConfig) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ids::ObjectId, mesh::Mesh};
+    use crate::{ids::ObjectId, mesh::Mesh, slicing::WallLoop};
 
     #[test]
     fn plan_tags_paths_with_objects_assigned_tool() {
@@ -131,13 +138,19 @@ mod tests {
                 index: 0,
                 object: ObjectId(1),
                 order: 0.0,
-                loops: vec![loop_a.clone()],
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    points: loop_a.clone(),
+                }],
             },
             Layer {
                 index: 0,
                 object: ObjectId(0),
                 order: 0.0,
-                loops: vec![loop_b.clone()],
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    points: loop_b.clone(),
+                }],
             },
         ];
 
@@ -177,11 +190,14 @@ mod tests {
             index: 0,
             object: ObjectId(0),
             order: 0.75,
-            loops: vec![vec![
-                DVec3::ZERO,
-                DVec3::new(1.0, 0.0, 0.0),
-                DVec3::new(0.0, 1.0, 0.0),
-            ]],
+            loops: vec![WallLoop {
+                wall_index: 0,
+                points: vec![
+                    DVec3::ZERO,
+                    DVec3::new(1.0, 0.0, 0.0),
+                    DVec3::new(0.0, 1.0, 0.0),
+                ],
+            }],
         }];
 
         let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
@@ -216,14 +232,60 @@ mod tests {
             object: ObjectId(0),
             order: 0.0,
             loops: vec![
-                vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
-                vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
+                WallLoop {
+                    wall_index: 0,
+                    points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
+                },
+                WallLoop {
+                    wall_index: 1,
+                    points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
+                },
             ],
         }];
 
         let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
 
         assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn plan_classifies_nonzero_wall_index_as_wall_inner() {
+        let objects = vec![Object::new(ObjectId(0), Mesh::default(), ToolId(0))];
+        let layers = vec![Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: vec![
+                WallLoop {
+                    wall_index: 0,
+                    points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
+                },
+                WallLoop {
+                    wall_index: 1,
+                    points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
+                },
+                WallLoop {
+                    wall_index: 2,
+                    points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
+                },
+            ],
+        }];
+
+        let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
+
+        assert_eq!(paths.len(), 3);
+        assert!(paths[0]
+            .segments
+            .iter()
+            .all(|segment| segment.kind == MoveKind::WallOuter));
+        assert!(paths[1]
+            .segments
+            .iter()
+            .all(|segment| segment.kind == MoveKind::WallInner));
+        assert!(paths[2]
+            .segments
+            .iter()
+            .all(|segment| segment.kind == MoveKind::WallInner));
     }
 
     #[test]

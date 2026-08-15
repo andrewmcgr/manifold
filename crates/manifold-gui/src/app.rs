@@ -501,6 +501,15 @@ impl ManifoldApp {
             egui::Slider::new(&mut self.config.nozzle_diameter, 0.1..=1.5)
                 .text("Nozzle diameter (mm)"),
         );
+        ui.add(
+            egui::Slider::new(&mut self.config.wall_line_width, 0.05..=1.5)
+                .text("Wall line width (mm)"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.config.shell_thickness, 0.0..=5.0)
+                .text("Shell thickness (mm)"),
+        );
+        ui.add(egui::Slider::new(&mut self.config.wall_offset, 0.0..=1.0).text("Wall offset (mm)"));
 
         ui.separator();
         ui.heading("Machine");

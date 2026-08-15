@@ -432,6 +432,17 @@ work. Phase 13 (GUI toolpath preview: rendering, scrubbing-by-order, hover
 tooltips) is the follow-on consumer of this metadata and is out of scope
 here.
 
+**Addendum (multi-wall slicing)**: real wall classification has since
+landed (see `wall_line_width`/`shell_thickness`/`wall_offset` below,
+not part of the original Phase 12 scope) — `slicing::slice_mesh` now
+extracts one contour loop per wall pass at successively deeper SDF iso-
+values (`manifold_fidget::mesh_sdf::MeshSdf` is positive outside/negative
+inside, so inward walls sample at negative iso), tagged with a
+`WallLoop::wall_index`; `toolpath::plan` derives `MoveKind::WallOuter`
+(index 0) vs. `MoveKind::WallInner` (index > 0) from that index instead
+of the old always-`WallOuter` placeholder. Infill/support/bridge/overhang
+classification remains future work.
+
 ## Phase 13 — GUI toolpath preview: rendering, order scrub, hover tooltips (needs 12) — ✅ done
 
 Consumes Phase 12's per-`Segment` metadata to render an interactive
@@ -461,6 +472,44 @@ domain logic.
 coding by `MoveKind` once Phase 12's placeholder classification is
 replaced with real detection), and any shader-side discard for the scrub
 slider (the `order` vertex attribute is wired but unused for this).
+
+## Phase 14 — Multi-wall (shell) slicing (needs 11 + 12) — ✅ done
+
+Adds configurable shell thickness so the slicer produces more than the
+original single outer-wall contour, tracing additional inner-wall passes
+inward from the surface.
+
+- New `SlicerConfig` fields: `wall_line_width` (nozzle-center line width
+  per wall pass, also the spacing between walls; defaults to
+  `nozzle_diameter`), `shell_thickness` (total desired wall depth, mm;
+  defaults to `wall_line_width`, i.e. one wall), and `wall_offset` (inset
+  of the outermost wall's nozzle-center path from the true surface;
+  defaults to `nozzle_diameter / 2.0`).
+- `SlicerConfig::wall_count()` derives the actual pass count as
+  `round(shell_thickness / wall_line_width)`, clamped to a minimum of 1.
+- **Deliberately kept separate from the order field**: the order field
+  (`manifold_fidget::order::OrderField`/`HeightOrderField`) only decides
+  *which plane* to slice at; wall inset is a different axis entirely,
+  expressed directly as an `MeshSdf` iso-value offset within a plane
+  (negative = inward, since the SDF is positive outside/negative inside).
+  Multiplexing wall inset through the order field's sign was considered
+  and rejected — it would tie inset distances to the order field's
+  gradient magnitude (only trivially 1.0 for `HeightOrderField`; not
+  necessarily 1.0 for a future curved/non-planar field), silently
+  corrupting wall spacing once Phase 11's deferred non-planar order
+  fields land.
+- `slicing::Layer.loops` changed shape from `Vec<Vec<DVec3>>` to
+  `Vec<WallLoop>` (`WallLoop { wall_index: usize, points: Vec<DVec3> }`)
+  so `toolpath::plan` can classify `MoveKind::WallOuter` (index 0) vs.
+  `MoveKind::WallInner` (index > 0) — the first real (if still simple)
+  move classification, closing out part of Phase 12's placeholder.
+- GUI: settings panel gained "Wall line width", "Shell thickness", and
+  "Wall offset" sliders alongside the existing layer-height/nozzle-
+  diameter controls.
+
+**Explicitly out of scope**: inner-wall-specific speed/extrusion-rate
+tuning (still fixed placeholder defaults per existing `Segment` fields),
+infill, and any change to inner-wall travel-move ordering.
 
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
