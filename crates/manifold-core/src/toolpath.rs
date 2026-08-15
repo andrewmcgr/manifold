@@ -1,5 +1,6 @@
 //! Toolpath planning: layers -> ordered extrusion moves.
 
+use crate::infill::{self, InfillRegion};
 use crate::{ids::ToolId, object::Object, slicing::Layer, Result, SlicerConfig};
 use glam::DVec3;
 
@@ -59,16 +60,20 @@ pub struct Path {
 ///
 /// Emits one [`Path`] per contour loop in each [`Layer`] (a layer with no
 /// loops contributes no paths), classifying each as [`MoveKind::WallOuter`]
-/// or [`MoveKind::WallInner`] from its source `WallLoop::wall_index`. Real
-/// path planning beyond this (infill, travel-move ordering/optimization,
-/// non-planar toolpath deformation) is future work.
+/// or [`MoveKind::WallInner`] from its source `WallLoop::wall_index`, then
+/// appends one [`MoveKind::Infill`] [`Path`] per layer (if any) generated
+/// by `config.infill_pattern` (see `infill` module) over the layer's
+/// infill boundary (`Layer::infill_boundary`). Real path planning beyond this (travel-move
+/// ordering/optimization across paths, non-planar toolpath deformation) is
+/// future work.
 ///
 /// # Errors
 ///
 /// Returns [`crate::Error::InvalidMesh`] if a layer references an object
 /// id not present in `objects`.
-pub fn plan(layers: &[Layer], objects: &[Object], _config: &SlicerConfig) -> Result<Vec<Path>> {
+pub fn plan(layers: &[Layer], objects: &[Object], config: &SlicerConfig) -> Result<Vec<Path>> {
     let mut paths = Vec::new();
+    let generator = infill::generator_for(config.infill_pattern);
     for layer in layers {
         let object = objects
             .iter()
@@ -80,7 +85,7 @@ pub fn plan(layers: &[Layer], objects: &[Object], _config: &SlicerConfig) -> Res
                 ))
             })?;
         for wall_loop in &layer.loops {
-            // Placeholder metadata: real infill/support/bridge/overhang
+            // Placeholder metadata: real support/bridge/overhang
             // classification and speed/extrusion-rate planning is future
             // work (see toolpath-metadata-phase12 subtask 03). Wall
             // classification (outer vs. inner) is derived from the loop's
@@ -107,6 +112,12 @@ pub fn plan(layers: &[Layer], objects: &[Object], _config: &SlicerConfig) -> Res
                 segments,
                 tool: object.tool,
             });
+        }
+
+        let region = InfillRegion::from_layer(layer);
+        for mut infill_path in generator.generate(&region, config, layer, &object.transform) {
+            infill_path.tool = object.tool;
+            paths.push(infill_path);
         }
     }
     Ok(paths)
@@ -142,6 +153,7 @@ mod tests {
                     wall_index: 0,
                     points: loop_a.clone(),
                 }],
+                infill_boundary: Vec::new(),
             },
             Layer {
                 index: 0,
@@ -151,33 +163,50 @@ mod tests {
                     wall_index: 0,
                     points: loop_b.clone(),
                 }],
+                infill_boundary: Vec::new(),
             },
         ];
 
         let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
 
-        assert_eq!(paths.len(), 2);
-        assert_eq!(paths[0].tool, ToolId(2));
-        assert_eq!(paths[0].points, loop_a);
-        assert_eq!(paths[0].segments.len(), paths[0].points.len());
-        assert!(paths[0]
+        // No `infill_boundary` is set on either layer, so `plan` emits no
+        // infill paths here — every emitted path is a wall path.
+        let wall_paths: Vec<_> = paths
+            .iter()
+            .filter(|p| {
+                p.segments
+                    .iter()
+                    .all(|segment| segment.kind == MoveKind::WallOuter)
+            })
+            .collect();
+        assert_eq!(wall_paths.len(), 2);
+        assert_eq!(wall_paths[0].tool, ToolId(2));
+        assert_eq!(wall_paths[0].points, loop_a);
+        assert_eq!(wall_paths[0].segments.len(), wall_paths[0].points.len());
+        assert!(wall_paths[0]
             .segments
             .iter()
             .all(|segment| segment.kind == MoveKind::WallOuter));
-        assert!(paths[0].segments.iter().all(|segment| segment.order == 0.0));
-        assert!(paths[0]
+        assert!(wall_paths[0]
+            .segments
+            .iter()
+            .all(|segment| segment.order == 0.0));
+        assert!(wall_paths[0]
             .segments
             .iter()
             .all(|segment| segment.support_fraction == 0.0));
-        assert_eq!(paths[1].tool, ToolId(0));
-        assert_eq!(paths[1].points, loop_b);
-        assert_eq!(paths[1].segments.len(), paths[1].points.len());
-        assert!(paths[1]
+        assert_eq!(wall_paths[1].tool, ToolId(0));
+        assert_eq!(wall_paths[1].points, loop_b);
+        assert_eq!(wall_paths[1].segments.len(), wall_paths[1].points.len());
+        assert!(wall_paths[1]
             .segments
             .iter()
             .all(|segment| segment.kind == MoveKind::WallOuter));
-        assert!(paths[1].segments.iter().all(|segment| segment.order == 0.0));
-        assert!(paths[1]
+        assert!(wall_paths[1]
+            .segments
+            .iter()
+            .all(|segment| segment.order == 0.0));
+        assert!(wall_paths[1]
             .segments
             .iter()
             .all(|segment| segment.support_fraction == 0.0));
@@ -198,12 +227,23 @@ mod tests {
                     DVec3::new(0.0, 1.0, 0.0),
                 ],
             }],
+            infill_boundary: Vec::new(),
         }];
 
         let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
 
-        assert_eq!(paths.len(), 1);
-        assert!(paths[0]
+        // No `infill_boundary` is set, so `plan` emits no infill path
+        // here — every emitted path is a wall path.
+        let wall_paths: Vec<_> = paths
+            .iter()
+            .filter(|p| {
+                p.segments
+                    .iter()
+                    .all(|segment| segment.kind == MoveKind::WallOuter)
+            })
+            .collect();
+        assert_eq!(wall_paths.len(), 1);
+        assert!(wall_paths[0]
             .segments
             .iter()
             .all(|segment| segment.order == 0.75));
@@ -217,6 +257,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.0,
             loops: Vec::new(),
+            infill_boundary: Vec::new(),
         }];
 
         let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
@@ -241,11 +282,22 @@ mod tests {
                     points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
                 },
             ],
+            infill_boundary: Vec::new(),
         }];
 
         let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
 
-        assert_eq!(paths.len(), 2);
+        // No `infill_boundary` is set, so `plan` emits no infill path
+        // here — every emitted path is a wall path.
+        let wall_paths: Vec<_> = paths
+            .iter()
+            .filter(|p| {
+                p.segments.iter().all(|segment| {
+                    matches!(segment.kind, MoveKind::WallOuter | MoveKind::WallInner)
+                })
+            })
+            .collect();
+        assert_eq!(wall_paths.len(), 2);
     }
 
     #[test]
@@ -269,20 +321,31 @@ mod tests {
                     points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
                 },
             ],
+            infill_boundary: Vec::new(),
         }];
 
         let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
 
-        assert_eq!(paths.len(), 3);
-        assert!(paths[0]
+        // No `infill_boundary` is set, so `plan` emits no infill path
+        // here — every emitted path is a wall path.
+        let wall_paths: Vec<_> = paths
+            .iter()
+            .filter(|p| {
+                p.segments.iter().all(|segment| {
+                    matches!(segment.kind, MoveKind::WallOuter | MoveKind::WallInner)
+                })
+            })
+            .collect();
+        assert_eq!(wall_paths.len(), 3);
+        assert!(wall_paths[0]
             .segments
             .iter()
             .all(|segment| segment.kind == MoveKind::WallOuter));
-        assert!(paths[1]
+        assert!(wall_paths[1]
             .segments
             .iter()
             .all(|segment| segment.kind == MoveKind::WallInner));
-        assert!(paths[2]
+        assert!(wall_paths[2]
             .segments
             .iter()
             .all(|segment| segment.kind == MoveKind::WallInner));
@@ -296,6 +359,7 @@ mod tests {
             object: ObjectId(99),
             order: 0.0,
             loops: Vec::new(),
+            infill_boundary: Vec::new(),
         }];
 
         let err = plan(&layers, &objects, &SlicerConfig::default()).unwrap_err();

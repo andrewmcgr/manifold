@@ -58,6 +58,9 @@ mod tests {
                 wall_line_width: 0.4,
                 shell_thickness: 0.4,
                 wall_offset: 0.2,
+                infill_pattern: Default::default(),
+                infill_line_width: 0.4,
+                infill_angle_deg: 45.0,
             },
         }
     }

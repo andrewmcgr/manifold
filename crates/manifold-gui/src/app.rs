@@ -11,6 +11,7 @@ use crate::scene;
 use crate::toolpath_view;
 use eframe::egui;
 use manifold_core::bounds::BoundingVolume;
+use manifold_core::infill::InfillPatternKind;
 use manifold_core::machine::Machine;
 use manifold_core::tool::Tool;
 use manifold_core::transform::Transform;
@@ -510,6 +511,26 @@ impl ManifoldApp {
                 .text("Shell thickness (mm)"),
         );
         ui.add(egui::Slider::new(&mut self.config.wall_offset, 0.0..=1.0).text("Wall offset (mm)"));
+
+        ui.separator();
+        ui.heading("Infill");
+        egui::ComboBox::from_label("Pattern")
+            .selected_text(format!("{:?}", self.config.infill_pattern))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.config.infill_pattern,
+                    InfillPatternKind::Monotonic,
+                    "Monotonic",
+                );
+            });
+        ui.add(
+            egui::Slider::new(&mut self.config.infill_line_width, 0.05..=1.5)
+                .text("Infill line width (mm)"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.config.infill_angle_deg, 0.0..=180.0)
+                .text("Infill angle (deg)"),
+        );
 
         ui.separator();
         ui.heading("Machine");
@@ -1013,7 +1034,7 @@ impl ManifoldApp {
                         let mut nearest: Option<(f32, &manifold_core::toolpath::Segment)> = None;
                         for path in toolpaths {
                             let count = path.points.len();
-                            for i in 0..count {
+                            for i in 0..path.segments.len() {
                                 let segment = &path.segments[i];
                                 if segment.order > self.scrub_order {
                                     continue;

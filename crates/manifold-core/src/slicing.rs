@@ -28,6 +28,15 @@ pub struct Layer {
     /// value. Empty for a layer with no contour (e.g. above/below the
     /// mesh's extent along the build direction).
     pub loops: Vec<WallLoop>,
+    /// The infill fill area's boundary: closed polylines in world space,
+    /// one `wall_line_width` step further inward than the innermost
+    /// *printed* wall in [`Layer::loops`] — i.e. where wall pass
+    /// `wall_count` would sit if one more were printed (see
+    /// [`SlicerConfig::wall_count`]). Kept separate from `loops` so it is
+    /// never mistaken for a printable wall pass by `toolpath::plan`; used
+    /// by `infill::InfillRegion::from_layer` as the fillable area. Empty
+    /// for a layer with no contour.
+    pub infill_boundary: Vec<Vec<DVec3>>,
 }
 
 /// One contour loop belonging to a specific wall/perimeter pass within a
@@ -46,7 +55,7 @@ pub struct WallLoop {
 /// bottom-to-top print). Hardcoded per this task's scope — see
 /// `NON_PLANAR_SLICING.md` for the follow-up angle-driven order field that
 /// will make this configurable.
-const BUILD_DIRECTION: DVec3 = DVec3::new(0.0, 0.0, -1.0);
+pub(crate) const BUILD_DIRECTION: DVec3 = DVec3::new(0.0, 0.0, -1.0);
 
 /// Default divisor used to derive the marching-squares contour-extraction
 /// grid's target cell size from `SlicerConfig::nozzle_diameter` (cell_size
@@ -218,11 +227,29 @@ pub fn slice_mesh_with_progress(
             if let Ok(mut callback) = progress_callback.lock() {
                 callback(done as f64 / total_steps as f64);
             }
+            // The infill boundary sits where wall pass `wall_count` would
+            // be if one more wall were printed — one further
+            // `wall_line_width` step inward from the innermost printed
+            // wall (`wall_index == wall_count - 1`). Kept out of `loops`
+            // so `toolpath::plan` never treats it as a printable wall.
+            let boundary_iso = -(config.wall_offset + wall_count as f64 * config.wall_line_width);
+            let infill_boundary = extract_contours(
+                &sdf,
+                origin,
+                basis1,
+                basis2,
+                extent,
+                extent,
+                resolution,
+                resolution,
+                boundary_iso,
+            );
             Layer {
                 index,
                 object: ObjectId::default(),
                 order: order_value,
                 loops,
+                infill_boundary,
             }
         })
         .collect();
@@ -662,6 +689,54 @@ mod tests {
             for wall_loop in &layer.loops {
                 assert!(!wall_loop.points.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn slice_mesh_infill_boundary_sits_one_wall_pass_inward_of_the_innermost_wall() {
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            wall_line_width: 0.05,
+            shell_thickness: 0.15,
+            wall_offset: 0.02,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(config.wall_count(), 3);
+
+        let layers = slice_mesh(&cube_mesh(), &config).unwrap();
+
+        // In-plane half-extent (max distance from the cube's in-plane
+        // center, 0.5) of a set of loops, used as a proxy for how far
+        // inward a contour has been inset.
+        fn half_extent(loops: &[Vec<DVec3>]) -> f64 {
+            loops
+                .iter()
+                .flatten()
+                .map(|p| (p.x - 0.5).abs().max((p.y - 0.5).abs()))
+                .fold(0.0, f64::max)
+        }
+
+        for layer in &layers[1..4] {
+            assert!(
+                !layer.infill_boundary.is_empty(),
+                "expected a non-empty infill boundary"
+            );
+            let innermost_wall = layer
+                .loops
+                .iter()
+                .filter(|w| w.wall_index == config.wall_count() - 1)
+                .map(|w| w.points.clone())
+                .collect::<Vec<_>>();
+            let wall_extent = half_extent(&innermost_wall);
+            let boundary_extent = half_extent(&layer.infill_boundary);
+            // The infill boundary is one further `wall_line_width` step
+            // inward from the innermost printed wall — i.e. where wall
+            // pass `wall_count` would sit if one more were printed.
+            assert!(
+                boundary_extent < wall_extent - config.wall_line_width * 0.5,
+                "expected infill boundary ({boundary_extent}) to sit noticeably \
+                 inward of the innermost wall ({wall_extent})"
+            );
         }
     }
 
