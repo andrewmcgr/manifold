@@ -24,10 +24,16 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
         }
 
         for (i, p) in path.points.iter().enumerate() {
-            let extruding = path
-                .segments
-                .get(i)
-                .is_some_and(|segment| segment.kind != MoveKind::Travel);
+            // `segments[i]` describes the edge `points[i] -> points[i + 1]`
+            // (see `toolpath::Path`'s contract), so the move *arriving* at
+            // `points[i]` (i >= 1) is `segments[i - 1]`, not `segments[i]`.
+            // The very first point has no incoming edge - it's always a
+            // plain positioning move (G0).
+            let extruding = i > 0
+                && path
+                    .segments
+                    .get(i - 1)
+                    .is_some_and(|segment| segment.kind != MoveKind::Travel);
             let cmd = if i == 0 || !extruding { "G0" } else { "G1" };
             out.push_str(&format!("{cmd} X{:.3} Y{:.3} Z{:.3}\n", p.x, p.y, p.z));
         }
@@ -78,10 +84,13 @@ mod tests {
         use crate::toolpath::Segment;
         use glam::DVec3;
 
-        // A single path: first point is always the travel move (G0), then
-        // an explicit Travel-kind segment (G0) followed by a WallOuter-kind
-        // segment (G1) — proving the command derives from `segment.kind`
-        // rather than position alone.
+        // A single path: first point is always the travel move (G0).
+        // `segments[i]` describes the edge `points[i] -> points[i + 1]`, so
+        // the move arriving at `points[1]` is governed by `segments[0]`
+        // (WallOuter -> G1) and the move arriving at `points[2]` is
+        // governed by `segments[1]` (Travel -> G0) — proving the command
+        // derives from the *incoming* segment's kind rather than position
+        // alone.
         let paths = vec![Path {
             points: vec![
                 DVec3::new(0.0, 0.0, 0.0),
@@ -112,6 +121,6 @@ mod tests {
             .map(|line| &line[..2])
             .collect();
 
-        assert_eq!(commands, vec!["G0", "G0", "G1"]);
+        assert_eq!(commands, vec!["G0", "G1", "G0"]);
     }
 }
