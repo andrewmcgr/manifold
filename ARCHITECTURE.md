@@ -20,6 +20,9 @@ plus separate CLI and GUI front-ends.
   extraction) — depended on by both `manifold-core` (the mesh -> order
   field -> contour-extraction slicing pipeline) and `manifold-gui`
   (visualization).
+- 2D polygon geometry: `i_overlay` (pure-Rust polygon boolean ops and
+  inward offsetting) — used by `manifold-core::polygon2d` for per-layer
+  infill/solid-fill boundary computation (no C/C++ FFI).
 
 ## Directory Structure
 

@@ -586,6 +586,66 @@ behavior, nozzle collision with already-curved geometry) — this phase is
 about the slicing *pipeline* producing correct curved geometry, not the
 full physical printability story.
 
+## Phase 16 — Top/bottom solid infill layers (needs 11 + 14) — ✅ done
+
+Adds solid (fully dense) infill near the top and bottom of a print — the
+standard "N top layers / N bottom layers" shell behavior — and, along the
+way, fixes a reported bug where `Layer.infill_boundary` could come back
+empty even when wall geometry existed (e.g. near thin surface detail),
+by replacing the old 3D SDF probe for `infill_boundary` with a 2D offset
+of the innermost wall loop.
+
+- New `crates/manifold-core/src/polygon2d.rs` module wraps `i_overlay`
+  (pure-Rust polygon boolean ops/offsetting, no C/C++ FFI) behind
+  `to_2d`/`from_2d` (using the same plane-basis convention as
+  `manifold_fidget::contour::plane_basis`), `inward_offset`,
+  `difference`, `union`, `intersection` — all `DVec3`-loop-in,
+  `DVec3`-loop-out at the module boundary. Repeated per-layer overlay
+  calls reuse `FloatOverlay`/`reinit_with_subj_and_clip` rather than
+  `SingleFloatOverlay` to avoid reallocation churn.
+- `slice_mesh_with_progress`'s `infill_boundary` computation dropped its
+  3D `boundary_iso` SDF probe entirely in favor of
+  `polygon2d::inward_offset` of the innermost wall loop (the highest
+  `wall_index` in `Layer.loops`) by `wall_line_width` — `infill_boundary`
+  is now non-empty whenever an innermost wall loop exists, regardless of
+  3D depth, directly fixing the empty-`infill_boundary`-despite-walls bug.
+- New `SlicerConfig` fields `top_layers`/`bottom_layers` (`usize`, default
+  3 each), matching Phase 14's `wall_line_width`/`shell_thickness` style.
+- New `Layer.solid_fill_boundary: Vec<Vec<DVec3>>` field and
+  `compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig)`
+  post-pass (run once per object, after the per-layer parallel slice loop,
+  so one object's solid-layer detection never leaks into a neighboring
+  object's layer stack): for each layer, the region exposed to open air
+  above/below (`infill_boundary(i)` minus the neighboring layer's
+  `infill_boundary`, treating a missing neighbor as fully exposed) is
+  unioned across `top_layers`/`bottom_layers` neighbors in each direction
+  and intersected back with that layer's own `infill_boundary` — all via
+  `polygon2d` boolean ops, no SDF/3D queries involved.
+- `infill::InfillRegion`'s sparse fillable region is now
+  `infill_boundary \ solid_fill_boundary` (via `polygon2d::difference`)
+  instead of all of `infill_boundary`; `toolpath::plan` generates an
+  additional infill pass over `solid_fill_boundary` using the same
+  `generator_for(config.infill_pattern)` as sparse infill, appended
+  alongside the existing sparse-infill paths under the existing
+  `MoveKind::Infill` — no new solid-fill-specific pattern, generator, or
+  `MoveKind` was introduced.
+
+**Explicitly out of scope**: a distinct dense infill *pattern* for solid
+layers (e.g. always-rectilinear regardless of `config.infill_pattern`),
+per-region extrusion-rate tuning for solid vs. sparse infill, and any
+change to wall generation itself.
+
+**Open decision deferred**: this phase's exposed-region detection compares
+each layer's `infill_boundary` against its immediate Z-neighbor's
+`infill_boundary` as flat 2D polygons — correct for today's planar
+slicing, but a print surface that is sloped or curved (Phase 15's
+pluggable/curved order fields, once landed) will need exposed-region
+detection generalized beyond simple layer-to-layer polygon comparison
+(e.g. accounting for a slanted top surface spanning several layers'
+worth of Z at a shallow angle). That generalization is deferred to
+whichever future phase promotes non-planar toolpath printing itself,
+not tackled here.
+
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
 - **Multi-object collision avoidance**: toolhead-vs-already-printed-object
