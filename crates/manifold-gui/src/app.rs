@@ -584,6 +584,27 @@ impl ManifoldApp {
         }
 
         ui.separator();
+        ui.heading("Print Gcode");
+        ui.label("Start Gcode");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.config.start_gcode)
+                .desired_rows(3)
+                .code_editor()
+                .hint_text("e.g. PRINT_START T_TOOL=240 T_BED=105 T_CHAMBER=45 PRINT_MIN={print_min_x},{print_min_y} PRINT_MAX={print_max_x},{print_max_y}"),
+        );
+        ui.label("End Gcode");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.config.end_gcode)
+                .desired_rows(2)
+                .code_editor()
+                .hint_text("e.g. PRINT_END"),
+        );
+        ui.label(
+            "Placeholders: {print_min_x} {print_min_y} {print_max_x} {print_max_y} \
+             (first layer's XY bounding box, substituted at slice time).",
+        );
+
+        ui.separator();
         ui.heading("Machine");
         let (min, mut max) = self.machine.build_volume.bounding_box();
         let mut bed_changed = false;

@@ -96,6 +96,20 @@ pub struct SlicerConfig {
     /// length (the Gcode `E` axis). Defaults to `1.75`, the common
     /// consumer-FDM standard (the other being `2.85`/`3.0`).
     pub filament_diameter: f64,
+    /// Gcode template emitted once at the very start of the program,
+    /// before any tool-select/path Gcode. Supports `{print_min_x}`,
+    /// `{print_min_y}`, `{print_max_x}`, `{print_max_y}` placeholders (see
+    /// `gcode::interpolate`), substituted with the first layer's XY
+    /// bounding box at emit time -- mirrors the common Klipper/Moonraker
+    /// `PRINT_START` macro-invocation convention (e.g. Voron configs),
+    /// where the slicer's "start gcode" is just a macro call with
+    /// bed/chamber temps and the print's footprint as named parameters.
+    /// Defaults to a `PRINT_START` invocation with placeholder temps.
+    pub start_gcode: String,
+    /// Gcode template emitted once at the very end of the program, after
+    /// all path Gcode. No placeholders are substituted by default.
+    /// Defaults to a bare `PRINT_END` macro invocation.
+    pub end_gcode: String,
 }
 
 impl Default for SlicerConfig {
@@ -119,6 +133,8 @@ impl Default for SlicerConfig {
             order_field_axis: slicing::BUILD_DIRECTION,
             order_field_slope: 0.0,
             filament_diameter: 1.75,
+            start_gcode: "PRINT_START T_TOOL=240 T_BED=105 T_CHAMBER=45 PRINT_MIN={print_min_x},{print_min_y} PRINT_MAX={print_max_x},{print_max_y}".to_string(),
+            end_gcode: "PRINT_END".to_string(),
         }
     }
 }
