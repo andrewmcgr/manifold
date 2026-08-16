@@ -56,6 +56,17 @@ const STITCH_EPSILON: f64 = 1e-6;
 ///    clipped by the plane's finite extent) is still emitted as an open
 ///    "loop" best-effort, since the common case (a closed solid fully
 ///    inside the sampled plane extent) always closes.
+/// 4. Orientations are canonicalized by nesting depth (see
+///    [`canonicalize_orientation`]): a loop directly enclosing the sampled
+///    solid (even containment depth, e.g. an outer boundary) winds
+///    counter-clockwise in the `(basis1, basis2)` plane, and a loop
+///    bounding a hole (odd depth) winds clockwise — needed because
+///    per-cell marching-squares segments aren't stitched with a
+///    consistent direction (see [`stitch_loops`]), so without this pass a
+///    hole boundary can come back with the *same* winding as its
+///    enclosing outer boundary, which downstream nonzero-fill-rule
+///    polygon booleans (e.g. `i_overlay`) would then treat as solid
+///    material rather than a hole.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_contours<F: ScalarField + ?Sized>(
     field: &F,
@@ -150,7 +161,7 @@ pub fn extract_contours<F: ScalarField + ?Sized>(
         }
     }
 
-    stitch_loops(segments)
+    canonicalize_orientation(stitch_loops(segments), basis1, basis2)
 }
 
 /// Linearly interpolates the position where the field crosses `iso` along
@@ -294,6 +305,101 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
     loops
 }
 
+/// Fixes up loop winding so nesting parity determines orientation: a loop
+/// at even containment depth (not inside any other loop, or inside an
+/// even number of them) winds counter-clockwise in the `(basis1, basis2)`
+/// plane, and a loop at odd depth (bounding a hole one level in, or three
+/// levels in, etc.) winds clockwise. Needed because [`stitch_loops`]
+/// doesn't guarantee a consistent per-loop direction (see its docs), so
+/// raw output can have a hole boundary sharing its enclosing outer
+/// boundary's winding — which a nonzero-fill-rule polygon boolean (e.g.
+/// `i_overlay`) would then read as solid material, not a hole.
+///
+/// Containment is decided by testing each loop's first point against
+/// every other loop with a standard even-odd ray cast; `O(n^2)` in loop
+/// count, which is fine for the small per-layer loop counts this is
+/// applied to.
+fn canonicalize_orientation(
+    loops: Vec<Vec<DVec3>>,
+    basis1: DVec3,
+    basis2: DVec3,
+) -> Vec<Vec<DVec3>> {
+    if loops.len() <= 1 {
+        return loops;
+    }
+
+    let projected: Vec<Vec<(f64, f64)>> = loops
+        .iter()
+        .map(|l| l.iter().map(|p| (p.dot(basis1), p.dot(basis2))).collect())
+        .collect();
+
+    let depths: Vec<usize> = (0..loops.len())
+        .map(|i| {
+            if projected[i].is_empty() {
+                return 0;
+            }
+            let test_point = projected[i][0];
+            (0..loops.len())
+                .filter(|&j| j != i && point_in_polygon(test_point, &projected[j]))
+                .count()
+        })
+        .collect();
+
+    loops
+        .into_iter()
+        .zip(projected)
+        .zip(depths)
+        .map(|((loop_points, poly2d), depth)| {
+            let want_ccw = depth % 2 == 0;
+            let is_ccw = signed_area(&poly2d) > 0.0;
+            if want_ccw == is_ccw {
+                loop_points
+            } else {
+                loop_points.into_iter().rev().collect()
+            }
+        })
+        .collect()
+}
+
+/// Signed area (shoelace formula) of a closed 2D polygon; positive for
+/// counter-clockwise winding, negative for clockwise. `< 3` points yields
+/// `0.0`.
+fn signed_area(points: &[(f64, f64)]) -> f64 {
+    let n = points.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut area = 0.0;
+    for i in 0..n {
+        let (x0, y0) = points[i];
+        let (x1, y1) = points[(i + 1) % n];
+        area += x0 * y1 - x1 * y0;
+    }
+    area * 0.5
+}
+
+/// Standard even-odd ray-casting point-in-polygon test (casts along `+u`
+/// from `point`, counting crossings of `polygon`'s edges). `< 3` points
+/// yields `false`.
+fn point_in_polygon(point: (f64, f64), polygon: &[(f64, f64)]) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    let (px, py) = point;
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = polygon[i];
+        let (xj, yj) = polygon[j];
+        if (yi > py) != (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 /// Extracts the contour of `field` at the plane `{ p : p.dot(direction) ==
 /// order_value }`, deriving the plane's origin and in-plane basis generally
 /// from `direction` (never hardcoded to a fixed axis), so a future
@@ -413,6 +519,79 @@ mod tests {
                 "expected radius ~{radius}, got {r} at {p:?}"
             );
         }
+    }
+
+    /// A 2D annulus (ring) `ScalarField`: negative inside the ring band
+    /// (between `inner_radius` and `outer_radius`), positive elsewhere —
+    /// same sign convention as `MeshSdf` (negative = inside solid). Used
+    /// to test that a hole's contour loop comes back with the opposite
+    /// winding from its enclosing outer boundary.
+    struct AnnulusField {
+        inner_radius: f64,
+        outer_radius: f64,
+    }
+
+    impl ScalarField for AnnulusField {
+        fn sample(&self, p: DVec3) -> crate::FieldSample {
+            let r = (p.x * p.x + p.y * p.y).sqrt();
+            let outer = r - self.outer_radius;
+            let inner = self.inner_radius - r;
+            let value = outer.max(inner);
+            let gradient = if r > f64::EPSILON {
+                DVec3::new(p.x / r, p.y / r, 0.0) * if outer > inner { 1.0 } else { -1.0 }
+            } else {
+                DVec3::X
+            };
+            crate::FieldSample { value, gradient }
+        }
+    }
+
+    #[test]
+    fn annulus_hole_loop_winds_opposite_to_its_enclosing_outer_loop() {
+        let field = AnnulusField {
+            inner_radius: 0.5,
+            outer_radius: 1.0,
+        };
+        let loops = extract_contours(
+            &field,
+            DVec3::ZERO,
+            DVec3::X,
+            DVec3::Y,
+            3.0,
+            3.0,
+            80,
+            80,
+            0.0,
+        );
+
+        assert_eq!(loops.len(), 2, "expected an outer loop and a hole loop");
+
+        let signed_area_3d = |points: &[DVec3]| -> f64 {
+            let n = points.len();
+            let mut area = 0.0;
+            for i in 0..n {
+                let a = points[i];
+                let b = points[(i + 1) % n];
+                area += a.x * b.y - b.x * a.y;
+            }
+            area * 0.5
+        };
+
+        let areas: Vec<f64> = loops.iter().map(|l| signed_area_3d(l)).collect();
+        let outer_idx = areas
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap())
+            .unwrap()
+            .0;
+        let hole_idx = 1 - outer_idx;
+
+        assert!(
+            areas[outer_idx].signum() != areas[hole_idx].signum(),
+            "expected outer loop ({}) and hole loop ({}) to wind oppositely",
+            areas[outer_idx],
+            areas[hole_idx]
+        );
     }
 
     #[test]
