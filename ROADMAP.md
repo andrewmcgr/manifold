@@ -511,6 +511,57 @@ inward from the surface.
 tuning (still fixed placeholder defaults per existing `Segment` fields),
 infill, and any change to inner-wall travel-move ordering.
 
+## Phase 15 — Pluggable order fields + curved contour extraction (needs 11 + 14, promotes `ConicalOrderField`/`NON_PLANAR_SLICING.md` follow-on)
+
+Generalizes `manifold-core::slicing::slice_mesh` to slice along an
+arbitrary `manifold_fidget::order::OrderField` instead of the hardcoded
+`BUILD_DIRECTION`/`HeightOrderField` (see `crates/manifold-fidget/src/
+order.rs`'s `ConicalOrderField`, added ahead of this phase as a concrete
+curved field to design against), and generalizes contour extraction so a
+curved order field's isosurfaces produce real curved walls/infill instead
+of silently falling back to flat slicing.
+
+- `SlicerConfig` gains a config-selectable order-field choice (mirroring
+  Phase 2's `ObjectOrderingKind` pattern: a serializable enum + a
+  `strategy_for`-style constructor), so `HeightOrderField` remains the
+  default/zero-risk case and `ConicalOrderField` (or later fields) are
+  opt-in, not a breaking change to existing profiles/configs.
+- `slice_mesh`/`slice_mesh_with_progress` take the resolved `OrderField`
+  instead of reading `BUILD_DIRECTION` directly; `order_min`/`order_max`
+  bounds must be derived generically (sampling the field's range over the
+  mesh's bounding box) rather than via `min.dot(direction)`/
+  `max.dot(direction)`, which is `HeightOrderField`-specific.
+- **Contour extraction generalization (the hard part)**: today's
+  `extract_contours` (marching squares over a *flat* sampling plane
+  anchored at `origin`, spanned by `plane_basis(BUILD_DIRECTION)`) is only
+  correct when the order field's isosurface actually is that flat plane.
+  A curved field's isosurface (e.g. `ConicalOrderField`'s cone) needs a
+  genuine curved-surface walk — evaluating `order(p)` (not just the SDF)
+  over a curved sampling manifold, or marching-cubes-style extraction of
+  the 3D isosurface `order(p) == c` intersected with the mesh's SDF,
+  followed by projecting/parameterizing that curved patch into a walkable
+  toolpath curve. Needs its own design pass (open question, not resolved
+  by this roadmap entry) before implementation: whether to adapt
+  `manifold_fidget::marching_cubes` to walk `order` instead of the SDF, or
+  build a dedicated curved-contour walker.
+- `Layer.loops`/`infill_boundary`/`solid_fill_boundary` stay `Vec<DVec3>`-
+  based polylines (no data-model change) — only *how* those points are
+  generated changes, not what downstream (`toolpath::plan`, `gcode::emit`,
+  GUI preview) consumes.
+- Non-planar wall/infill support in the GUI preview (Phase 13's toolpath
+  view) should need no changes if the above stays within the existing
+  `Path`/`Segment` data model — worth a smoke test once this phase lands,
+  not a design requirement here.
+
+**Explicitly out of scope**: any new order-field *shape* beyond
+`ConicalOrderField` (e.g. the Eikonal/front-propagation `speed(p)`
+construction from `NON_PLANAR_SLICING.md`'s "Alternative order
+construction" section remains its own unpromoted spike); real toolpath-
+level adaptations for non-planar printing itself (retraction/Z-hop
+behavior, nozzle collision with already-curved geometry) — this phase is
+about the slicing *pipeline* producing correct curved geometry, not the
+full physical printability story.
+
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
 - **Multi-object collision avoidance**: toolhead-vs-already-printed-object
