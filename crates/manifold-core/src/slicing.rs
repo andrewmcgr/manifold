@@ -129,8 +129,8 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
     slice_mesh_with_progress(mesh, config, &mut |_| {})
 }
 
-/// Same as [`slice_mesh`], but calls `on_progress` as each layer finishes
-/// with the fraction of layers completed so far (`0.0..=1.0`) — intended
+/// Same as [`slice_mesh`], but calls `on_progress` as work finishes with
+/// the fraction of total work completed so far (`0.0..=1.0`) — intended
 /// for a caller (e.g. the GUI, slicing on a background thread) to report
 /// progress on a potentially slow slice without having to know anything
 /// about layers, order fields, or contour resolution itself.
@@ -143,6 +143,14 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
 /// calls arrive in whatever order layers happen to finish on their
 /// threads — not strictly in `index` order, though still trending
 /// monotonically toward `1.0`.
+///
+/// For a curved order field (anything but `Height`), the per-wall-pass
+/// `curved_wall_meshes` isosurface precompute below counts as reportable
+/// work too, one unit per wall pass, ahead of the per-layer units — that
+/// precompute is itself an expensive whole-mesh extraction (already
+/// internally parallel via `rayon`, just not previously visible to
+/// `on_progress`), so without this the bar would sit frozen for however
+/// long it takes before the first per-layer tick ever arrived.
 pub fn slice_mesh_with_progress(
     mesh: &Mesh,
     config: &SlicerConfig,
@@ -213,13 +221,6 @@ pub fn slice_mesh_with_progress(
     }
 
     let total_steps = order_values.len().max(1);
-    let completed = AtomicUsize::new(0);
-    // `on_progress` is `&mut dyn FnMut`, not `Sync`, so serialize calls into
-    // it behind a `Mutex` — contention is negligible since each holder only
-    // reports one f64 and releases immediately, and the expensive work
-    // (`extract_contours`/`extract_order_contours_on_mesh`) happens before
-    // the lock is taken.
-    let progress_callback = Mutex::new(on_progress);
 
     let wall_count = config.wall_count();
 
@@ -231,10 +232,36 @@ pub fn slice_mesh_with_progress(
     // isosurface once (not once per layer) and walks it per layer.
     let is_height = matches!(config.order_field, order_field::OrderFieldKind::Height);
 
+    // Total units of reportable work: for `Height` this is just the
+    // per-layer loop (unchanged from before). For a curved field, the
+    // `curved_wall_meshes` precompute below is itself an expensive
+    // whole-mesh isosurface extraction per wall pass — done once, before
+    // the per-layer loop, previously with *no* progress reporting at all,
+    // so `on_progress` sat frozen at its last value for however long that
+    // took (seconds, on a real mesh) even though the extraction itself is
+    // internally parallel. Counting each wall pass as one more reportable
+    // unit alongside the `total_steps` layers keeps the bar moving through
+    // that phase instead of appearing stalled.
+    let total_units = if is_height {
+        total_steps
+    } else {
+        wall_count + total_steps
+    };
+    let completed = AtomicUsize::new(0);
+    // `on_progress` is `&mut dyn FnMut`, not `Sync`, so serialize calls into
+    // it behind a `Mutex` — contention is negligible since each holder only
+    // reports one f64 and releases immediately, and the expensive work
+    // (`extract_contours`/`extract_order_contours_on_mesh`/
+    // `extract_isosurface`) happens before the lock is taken.
+    let progress_callback = Mutex::new(on_progress);
+
     // Curved path only: one triangle soup per wall pass, shared across every
     // layer's `extract_order_contours_on_mesh` call below. Computed up front
     // (outside the per-layer parallel loop) since it does not depend on the
-    // layer's `order_value` — only on the wall pass's `iso`.
+    // layer's `order_value` — only on the wall pass's `iso`. Each wall's
+    // isosurface extraction reports one `total_units` step as it finishes,
+    // so `on_progress` keeps advancing through this whole-mesh precompute
+    // instead of only starting once the per-layer loop below begins.
     let curved_wall_meshes: Vec<Vec<DVec3>> = if is_height {
         Vec::new()
     } else {
@@ -253,7 +280,12 @@ pub fn slice_mesh_with_progress(
                 // (see its doc comment), decoupled from `marching_cubes`'s
                 // `Vertex` (position + normal) — no `OrderField` dependency
                 // is added to `marching_cubes` itself.
-                vertices.into_iter().map(|v| v.position).collect()
+                let positions: Vec<DVec3> = vertices.into_iter().map(|v| v.position).collect();
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Ok(mut callback) = progress_callback.lock() {
+                    callback(done as f64 / total_units as f64);
+                }
+                positions
             })
             .collect()
     };
@@ -295,7 +327,7 @@ pub fn slice_mesh_with_progress(
             }
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if let Ok(mut callback) = progress_callback.lock() {
-                callback(done as f64 / total_steps as f64);
+                callback(done as f64 / total_units as f64);
             }
             // The infill boundary sits where wall pass `wall_count` would
             // be if one more wall were printed — one further

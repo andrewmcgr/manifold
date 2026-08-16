@@ -262,6 +262,7 @@ impl InfillGenerator for MonotonicInfill {
                     extrusion_rate: 1.0,
                     support_fraction: 0.0,
                     order: layer.order,
+                    extrusion_length: 0.0,
                 });
             }
             points.push(world);

@@ -19,6 +19,13 @@ pub struct Tool {
     /// frame (relative to `mount`). Unused until the deferred
     /// collision-avoidance work lands — see ROADMAP.md.
     pub collision_envelope: BoundingVolume,
+    /// Per-tool (per-filament) flow-rate scale applied to every extrusion
+    /// this tool prints, on top of the geometric bead-volume calculation
+    /// (see `crate::extrusion`) and any per-segment `Segment::extrusion_rate`.
+    /// Lets a material that behaves differently (e.g. shrinks/expands more
+    /// than nominal when extruded) be tuned without touching the shared
+    /// bead-area math. Defaults to `1.0` (no adjustment).
+    pub extrusion_multiplier: f64,
 }
 
 impl Tool {
@@ -33,6 +40,7 @@ impl Tool {
                 center: DVec3::ZERO,
                 radius: 0.0,
             },
+            extrusion_multiplier: 1.0,
         }
     }
 }

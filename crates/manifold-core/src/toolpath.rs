@@ -1,7 +1,9 @@
 //! Toolpath planning: layers -> ordered extrusion moves.
 
 use crate::infill::{self, InfillRegion};
-use crate::{ids::ToolId, object::Object, slicing::Layer, Result, SlicerConfig};
+use crate::{
+    extrusion, ids::ToolId, object::Object, slicing::Layer, tool::Tool, Result, SlicerConfig,
+};
 use glam::DVec3;
 use rayon::prelude::*;
 
@@ -33,6 +35,14 @@ pub struct Segment {
     /// per-segment (rather than per-`Path`/per-`Layer`) so it can vary
     /// once non-planar order fields exist.
     pub order: f64,
+    /// Linear filament feed length (mm) to extrude for this segment --
+    /// the Gcode `E`-axis delta `gcode::emit` accumulates into a running
+    /// total. `0.0` for `MoveKind::Travel`. Computed by `plan` from the
+    /// segment's geometric length, its `kind`'s configured line width,
+    /// `SlicerConfig::layer_height`/`filament_diameter` (see
+    /// `crate::extrusion`), `extrusion_rate`, and the printing tool's
+    /// `Tool::extrusion_multiplier`.
+    pub extrusion_length: f64,
 }
 
 /// A single continuous toolpath (e.g. one perimeter or infill pass).
@@ -71,7 +81,6 @@ pub struct Path {
 /// pattern or `MoveKind`; both passes are tagged `MoveKind::Infill`. Real
 /// path planning beyond this (travel-move ordering/optimization across
 /// paths, non-planar toolpath deformation) is future work.
-///
 /// Layers are planned in parallel across all available cores (via
 /// `rayon`): each layer only reads the shared, immutable `layers`/`objects`
 /// slices and produces its own independent `Vec<Path>` (the expensive part
@@ -80,12 +89,30 @@ pub struct Path {
 /// serialize on). Output order matches input layer order regardless of
 /// completion order, since `rayon`'s indexed `map`/`collect` preserves it.
 ///
+/// Every segment's `Segment::extrusion_length` is finalized in a second
+/// pass over the assembled paths, once all of a layer's wall/infill paths
+/// exist (see `crate::extrusion`): using each segment's geometric length
+/// (`points[i] -> points[(i + 1) % points.len()]`, the same wrap-around
+/// contract documented on [`Path`], which works uniformly for both closed
+/// wall loops and open infill polylines), its `kind`'s configured line
+/// width, `config.layer_height`/`config.filament_diameter`, its
+/// `extrusion_rate`, and `tools`' matching `Tool::extrusion_multiplier`
+/// (looked up by the layer's object's assigned `ToolId`; defaults to
+/// `1.0` if `tools` has no matching entry, so callers that don't model
+/// machine tools at all — most existing tests — keep working unchanged).
+///
 /// # Errors
 ///
 /// Returns [`crate::Error::InvalidMesh`] if a layer references an object
 /// id not present in `objects`.
-pub fn plan(layers: &[Layer], objects: &[Object], config: &SlicerConfig) -> Result<Vec<Path>> {
+pub fn plan(
+    layers: &[Layer],
+    objects: &[Object],
+    tools: &[Tool],
+    config: &SlicerConfig,
+) -> Result<Vec<Path>> {
     let generator = infill::generator_for(config.infill_pattern);
+    let filament_area = extrusion::filament_cross_section_area(config.filament_diameter);
     let per_layer: Vec<Vec<Path>> = layers
         .par_iter()
         .map(|layer| -> Result<Vec<Path>> {
@@ -121,6 +148,7 @@ pub fn plan(layers: &[Layer], objects: &[Object], config: &SlicerConfig) -> Resu
                         extrusion_rate: 1.0,
                         support_fraction: 0.0,
                         order: layer.order,
+                        extrusion_length: 0.0,
                     })
                     .collect();
                 paths.push(Path {
@@ -145,6 +173,31 @@ pub fn plan(layers: &[Layer], objects: &[Object], config: &SlicerConfig) -> Resu
                 {
                     infill_path.tool = object.tool;
                     paths.push(infill_path);
+                }
+            }
+
+            let extrusion_multiplier = tools
+                .iter()
+                .find(|tool| tool.id == object.tool)
+                .map_or(1.0, |tool| tool.extrusion_multiplier);
+            for path in &mut paths {
+                let point_count = path.points.len();
+                if point_count == 0 {
+                    continue;
+                }
+                for (i, segment) in path.segments.iter_mut().enumerate() {
+                    if segment.kind == MoveKind::Travel {
+                        segment.extrusion_length = 0.0;
+                        continue;
+                    }
+                    let distance = path.points[i].distance(path.points[(i + 1) % point_count]);
+                    let line_width = extrusion::line_width_for_kind(segment.kind, config);
+                    let bead_area =
+                        extrusion::bead_cross_section_area(line_width, config.layer_height);
+                    segment.extrusion_length =
+                        extrusion::segment_extrusion_length(distance, bead_area, filament_area)
+                            * segment.extrusion_rate
+                            * extrusion_multiplier;
                 }
             }
 
@@ -201,7 +254,7 @@ mod tests {
             },
         ];
 
-        let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
+        let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
 
         // No `infill_boundary` is set on either layer, so `plan` emits no
         // infill paths here — every emitted path is a wall path.
@@ -265,7 +318,7 @@ mod tests {
             solid_fill_boundary: Vec::new(),
         }];
 
-        let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
+        let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
 
         // No `infill_boundary` is set, so `plan` emits no infill path
         // here — every emitted path is a wall path.
@@ -296,7 +349,7 @@ mod tests {
             solid_fill_boundary: Vec::new(),
         }];
 
-        let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
+        let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
 
         assert!(paths.is_empty());
     }
@@ -335,8 +388,8 @@ mod tests {
             ..SlicerConfig::default()
         };
 
-        let paths_no_solid = plan(&[layer_no_solid], &objects, &cfg).unwrap();
-        let paths_with_solid = plan(&[layer_with_solid], &objects, &cfg).unwrap();
+        let paths_no_solid = plan(&[layer_no_solid], &objects, &[], &cfg).unwrap();
+        let paths_with_solid = plan(&[layer_with_solid], &objects, &[], &cfg).unwrap();
 
         let infill_paths = |paths: &[Path]| -> usize {
             paths
@@ -373,7 +426,7 @@ mod tests {
             solid_fill_boundary: Vec::new(),
         }];
 
-        let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
+        let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
 
         // No `infill_boundary` is set, so `plan` emits no infill path
         // here — every emitted path is a wall path.
@@ -413,7 +466,7 @@ mod tests {
             solid_fill_boundary: Vec::new(),
         }];
 
-        let paths = plan(&layers, &objects, &SlicerConfig::default()).unwrap();
+        let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
 
         // No `infill_boundary` is set, so `plan` emits no infill path
         // here — every emitted path is a wall path.
@@ -452,7 +505,7 @@ mod tests {
             solid_fill_boundary: Vec::new(),
         }];
 
-        let err = plan(&layers, &objects, &SlicerConfig::default()).unwrap_err();
+        let err = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap_err();
         assert!(matches!(err, crate::Error::InvalidMesh(_)));
     }
 }

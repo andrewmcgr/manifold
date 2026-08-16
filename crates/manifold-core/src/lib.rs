@@ -6,6 +6,7 @@
 
 pub mod bounds;
 pub mod error;
+pub mod extrusion;
 pub mod gcode;
 pub mod ids;
 pub mod infill;
@@ -89,6 +90,12 @@ pub struct SlicerConfig {
     /// (`0.0` degenerates to a flat height field). Inert (unused)
     /// otherwise. Defaults to `0.0`.
     pub order_field_slope: f64,
+    /// Diameter of the filament being fed into the extruder, in
+    /// millimeters — the cross-section `crate::extrusion` divides a
+    /// segment's deposited bead volume by to get linear filament feed
+    /// length (the Gcode `E` axis). Defaults to `1.75`, the common
+    /// consumer-FDM standard (the other being `2.85`/`3.0`).
+    pub filament_diameter: f64,
 }
 
 impl Default for SlicerConfig {
@@ -111,6 +118,7 @@ impl Default for SlicerConfig {
             order_field_apex: glam::DVec3::ZERO,
             order_field_axis: slicing::BUILD_DIRECTION,
             order_field_slope: 0.0,
+            filament_diameter: 1.75,
         }
     }
 }
@@ -185,7 +193,12 @@ pub fn plan_toolpaths_with_progress(
         &workspace.config,
         on_progress,
     )?;
-    toolpath::plan(&layers, &workspace.objects, &workspace.config)
+    toolpath::plan(
+        &layers,
+        &workspace.objects,
+        &workspace.machine.tools,
+        &workspace.config,
+    )
 }
 
 #[cfg(test)]
@@ -203,6 +216,7 @@ mod tests {
         assert_eq!(cfg.wall_count(), 1);
         assert!(cfg.infill_line_width > 0.0);
         assert!(cfg.infill_angle_deg > 0.0);
+        assert!(cfg.filament_diameter > 0.0);
     }
 
     #[test]

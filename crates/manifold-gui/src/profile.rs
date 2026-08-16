@@ -67,6 +67,7 @@ mod tests {
                 order_field_apex: glam::DVec3::ZERO,
                 order_field_axis: glam::DVec3::new(0.0, 0.0, 1.0),
                 order_field_slope: 0.0,
+                filament_diameter: 1.75,
             },
         }
     }

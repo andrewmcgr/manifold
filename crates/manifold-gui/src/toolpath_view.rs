@@ -123,6 +123,7 @@ mod tests {
                 extrusion_rate: 1.0,
                 support_fraction: 0.0,
                 order,
+                extrusion_length: 0.0,
             })
             .collect();
         Path {
