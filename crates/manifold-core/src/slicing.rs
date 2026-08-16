@@ -1081,4 +1081,172 @@ mod tests {
             );
         }
     }
+
+    /// Box (5x5x2) with a small, shallow spike (footprint 0.2x0.2,
+    /// protruding 0.3 above the box's otherwise-flat top face at Z=2) —
+    /// approximates the originally reported bug's shape: a flat top
+    /// surface plus a shallow, thin surface detail near it. The spike's
+    /// cross-section is thin enough that some of its layers can fit an
+    /// outer wall pass but not the innermost *configured* pass (same
+    /// failure mode `tall_thin_pyramid_mesh` exercises at a pyramid's
+    /// apex), while the box's plateau layers below stay comfortably wide.
+    fn flat_top_with_shallow_spike_mesh() -> Mesh {
+        let box_height = 2.0;
+        let spike_height = 0.3;
+        let (hole_min, hole_max) = (2.4, 2.6);
+        let spike_top = box_height + spike_height;
+        let spike_center = (hole_min + hole_max) * 0.5;
+
+        let vertices = vec![
+            DVec3::new(0.0, 0.0, 0.0),                         // 0: A0
+            DVec3::new(5.0, 0.0, 0.0),                         // 1: B0
+            DVec3::new(5.0, 5.0, 0.0),                         // 2: C0
+            DVec3::new(0.0, 5.0, 0.0),                         // 3: D0
+            DVec3::new(0.0, 0.0, box_height),                  // 4: A
+            DVec3::new(5.0, 0.0, box_height),                  // 5: B
+            DVec3::new(5.0, 5.0, box_height),                  // 6: C
+            DVec3::new(0.0, 5.0, box_height),                  // 7: D
+            DVec3::new(hole_min, hole_min, box_height),        // 8: a
+            DVec3::new(hole_max, hole_min, box_height),        // 9: b
+            DVec3::new(hole_max, hole_max, box_height),        // 10: c
+            DVec3::new(hole_min, hole_max, box_height),        // 11: d
+            DVec3::new(spike_center, spike_center, spike_top), // 12: E (apex)
+        ];
+        let indices = vec![
+            0, 2, 1, 0, 3, 2, // bottom (-Z)
+            0, 1, 5, 0, 5, 4, // -Y side
+            1, 2, 6, 1, 6, 5, // +X side
+            2, 3, 7, 2, 7, 6, // +Y side
+            3, 0, 4, 3, 4, 7, // -X side
+            4, 5, 9, 4, 9, 8, // top ring: -Y edge
+            5, 6, 10, 5, 10, 9, // top ring: +X edge
+            6, 7, 11, 6, 11, 10, // top ring: +Y edge
+            7, 4, 8, 7, 8, 11, // top ring: -X edge
+            8, 9, 12, // spike side: -Y
+            9, 10, 12, // spike side: +X
+            10, 11, 12, // spike side: +Y
+            11, 8, 12, // spike side: -X
+        ];
+        Mesh::new(vertices, indices)
+    }
+
+    #[test]
+    fn slice_mesh_infill_boundary_is_never_empty_when_walls_exist_near_a_flat_top_with_shallow_surface_detail(
+    ) {
+        let config = SlicerConfig {
+            layer_height: 0.1,
+            wall_line_width: 0.05,
+            shell_thickness: 0.15,
+            wall_offset: 0.02,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(config.wall_count(), 3);
+
+        let layers = slice_mesh(&flat_top_with_shallow_spike_mesh(), &config).unwrap();
+        assert!(!layers.is_empty());
+
+        let mut any_layer_had_walls = false;
+        for layer in &layers {
+            if layer.loops.is_empty() {
+                continue;
+            }
+            any_layer_had_walls = true;
+            assert!(
+                !layer.infill_boundary.is_empty(),
+                "layer {} (order {}) has wall geometry but an empty infill_boundary \
+                 -- the walls-present-but-empty-infill_boundary bug has recurred",
+                layer.index,
+                layer.order
+            );
+        }
+        assert!(
+            any_layer_had_walls,
+            "fixture produced no layers with contour loops at all"
+        );
+    }
+
+    /// Symmetric-`top_layers`/`bottom_layers` complement to
+    /// `compute_solid_fill_boundaries_propagates_top_and_bottom_in_the_correct_direction`:
+    /// checks the *magnitude*/extent of propagation (top `top_layers` and
+    /// bottom `bottom_layers` layers end up essentially fully solid, and
+    /// layers strictly further than that from either end are left empty)
+    /// rather than just the up/down direction.
+    #[test]
+    fn compute_solid_fill_boundaries_covers_only_top_and_bottom_layers_leaving_the_interior_empty()
+    {
+        let config = SlicerConfig {
+            layer_height: 0.5,
+            top_layers: 2,
+            bottom_layers: 2,
+            ..SlicerConfig::default()
+        };
+
+        let mut layers = slice_mesh(&big_cube_mesh(), &config).unwrap();
+        compute_solid_fill_boundaries(&mut layers, &config);
+
+        fn area(loops: &[Vec<DVec3>]) -> f64 {
+            loops
+                .iter()
+                .map(|pts| {
+                    let n = pts.len();
+                    if n < 3 {
+                        return 0.0;
+                    }
+                    (0..n)
+                        .map(|i| {
+                            let a = pts[i];
+                            let b = pts[(i + 1) % n];
+                            a.x * b.y - b.x * a.y
+                        })
+                        .sum::<f64>()
+                        * 0.5
+                })
+                .sum()
+        }
+
+        // Solid-fill ratio (solid area / infill area) for a layer with a
+        // nonempty infill_boundary; `None` for a layer with no fillable
+        // area on this layer at all.
+        let solid_ratio = |layer: &Layer| -> Option<f64> {
+            let infill = area(&layer.infill_boundary).abs();
+            if infill < 1e-9 {
+                return None;
+            }
+            Some(area(&layer.solid_fill_boundary).abs() / infill)
+        };
+
+        let ratios: Vec<Option<f64>> = layers.iter().map(solid_ratio).collect();
+        let first_real = ratios.iter().position(Option::is_some).unwrap();
+        let last_real = ratios.iter().rposition(Option::is_some).unwrap();
+        let real_count = last_real - first_real + 1;
+        assert!(
+            real_count >= 2 * config.top_layers.max(config.bottom_layers) + 2,
+            "fixture needs enough layers with contours to leave a genuinely \
+             empty interior between the top/bottom solid bands"
+        );
+
+        for (offset, &ratio) in ratios[first_real..=last_real].iter().enumerate() {
+            let ratio = ratio.expect("all layers in this range have a nonempty infill_boundary");
+            let distance_from_top = offset;
+            let distance_from_bottom = real_count - 1 - offset;
+
+            if distance_from_top < config.top_layers || distance_from_bottom < config.bottom_layers
+            {
+                assert!(
+                    (ratio - 1.0).abs() < 1e-6,
+                    "layer at offset {offset} from the top-real layer should be \
+                     essentially fully solid (top_layers={}, bottom_layers={}), got ratio {ratio}",
+                    config.top_layers,
+                    config.bottom_layers
+                );
+            } else {
+                assert!(
+                    ratio < 1e-6,
+                    "layer at offset {offset} is further than top_layers/bottom_layers \
+                     from either end and should have an empty solid_fill_boundary, \
+                     got ratio {ratio}"
+                );
+            }
+        }
+    }
 }
