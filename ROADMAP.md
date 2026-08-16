@@ -511,7 +511,7 @@ inward from the surface.
 tuning (still fixed placeholder defaults per existing `Segment` fields),
 infill, and any change to inner-wall travel-move ordering.
 
-## Phase 15 — Pluggable order fields + curved contour extraction (needs 11 + 14, promotes `ConicalOrderField`/`NON_PLANAR_SLICING.md` follow-on)
+## Phase 15 — Pluggable order fields + curved contour extraction (needs 11 + 14, promotes `ConicalOrderField`/`NON_PLANAR_SLICING.md` follow-on) — ✅ done
 
 Generalizes `manifold-core::slicing::slice_mesh` to slice along an
 arbitrary `manifold_fidget::order::OrderField` instead of the hardcoded
