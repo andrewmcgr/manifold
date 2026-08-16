@@ -24,6 +24,7 @@
 
 use crate::ScalarField;
 use glam::DVec3;
+use rayon::prelude::*;
 
 /// One vertex of the extracted isosurface: a position on the surface and
 /// the field's (normalized) gradient at that position, used directly as
@@ -41,7 +42,15 @@ pub struct Vertex {
 /// Returns a triangle soup (see module docs): 3 consecutive [`Vertex`]
 /// entries form one triangle. Returns an empty `Vec` if `resolution == 0`
 /// or the field does not cross `iso` anywhere in the box.
-pub fn extract_isosurface<F: ScalarField>(
+///
+/// Both the grid-sampling pass and the per-cell triangle-generation pass run
+/// in parallel across all available cores (via `rayon`): every grid point's
+/// `field.sample` call and every cell's triangle emission only read `field`
+/// (shared, immutable) and write their own independent output slot, so
+/// there's no cross-point/cross-cell dependency to serialize on. Output is a
+/// triangle soup with no ordering contract, so scrambled cell-completion
+/// order (inherent to parallel iteration) doesn't affect correctness.
+pub fn extract_isosurface<F: ScalarField + Sync>(
     field: &F,
     min: DVec3,
     max: DVec3,
@@ -61,21 +70,22 @@ pub fn extract_isosurface<F: ScalarField>(
 
     // Cache samples over the whole grid: (dims)^3 evaluations, one
     // ScalarField::sample per grid point.
-    let mut values = vec![0.0_f64; dims * dims * dims];
     let idx = |xi: usize, yi: usize, zi: usize| -> usize { (zi * dims + yi) * dims + xi };
-    for zi in 0..dims {
-        for yi in 0..dims {
-            for xi in 0..dims {
-                let p = min
-                    + DVec3::new(
-                        xi as f64 * cell_size.x,
-                        yi as f64 * cell_size.y,
-                        zi as f64 * cell_size.z,
-                    );
-                values[idx(xi, yi, zi)] = field.sample(p).value;
-            }
-        }
-    }
+    let values: Vec<f64> = (0..dims * dims * dims)
+        .into_par_iter()
+        .map(|flat| {
+            let xi = flat % dims;
+            let yi = (flat / dims) % dims;
+            let zi = flat / (dims * dims);
+            let p = min
+                + DVec3::new(
+                    xi as f64 * cell_size.x,
+                    yi as f64 * cell_size.y,
+                    zi as f64 * cell_size.z,
+                );
+            field.sample(p).value
+        })
+        .collect();
 
     // Corner offsets in grid-index space, in the standard marching-cubes
     // corner order.
@@ -106,79 +116,80 @@ pub fn extract_isosurface<F: ScalarField>(
         (3, 7),
     ];
 
-    let mut vertices = Vec::new();
+    (0..resolution * resolution * resolution)
+        .into_par_iter()
+        .flat_map_iter(|flat| {
+            let xi = flat % resolution;
+            let yi = (flat / resolution) % resolution;
+            let zi = flat / (resolution * resolution);
 
-    for zi in 0..resolution {
-        for yi in 0..resolution {
-            for xi in 0..resolution {
-                let corner_pos: [DVec3; 8] = std::array::from_fn(|c| {
-                    let (dx, dy, dz) = CORNER_OFFSETS[c];
-                    min + DVec3::new(
-                        (xi + dx) as f64 * cell_size.x,
-                        (yi + dy) as f64 * cell_size.y,
-                        (zi + dz) as f64 * cell_size.z,
-                    )
-                });
-                let corner_val: [f64; 8] = std::array::from_fn(|c| {
-                    let (dx, dy, dz) = CORNER_OFFSETS[c];
-                    values[idx(xi + dx, yi + dy, zi + dz)]
-                });
+            let corner_pos: [DVec3; 8] = std::array::from_fn(|c| {
+                let (dx, dy, dz) = CORNER_OFFSETS[c];
+                min + DVec3::new(
+                    (xi + dx) as f64 * cell_size.x,
+                    (yi + dy) as f64 * cell_size.y,
+                    (zi + dz) as f64 * cell_size.z,
+                )
+            });
+            let corner_val: [f64; 8] = std::array::from_fn(|c| {
+                let (dx, dy, dz) = CORNER_OFFSETS[c];
+                values[idx(xi + dx, yi + dy, zi + dz)]
+            });
 
-                let mut cube_index = 0usize;
-                for (c, &v) in corner_val.iter().enumerate() {
-                    if v < iso {
-                        cube_index |= 1 << c;
-                    }
-                }
-
-                let edge_flags = EDGE_TABLE[cube_index];
-                if edge_flags == 0 {
-                    continue;
-                }
-
-                // Interpolated vertex position (and field-gradient normal)
-                // for each of the 12 cube edges, computed lazily only for
-                // edges this configuration actually crosses.
-                let mut edge_vertex: [Option<Vertex>; 12] = [None; 12];
-                for (e, &(c0, c1)) in EDGE_CORNERS.iter().enumerate() {
-                    if edge_flags & (1 << e) == 0 {
-                        continue;
-                    }
-                    let v0 = corner_val[c0];
-                    let v1 = corner_val[c1];
-                    let denom = v1 - v0;
-                    let t = if denom.abs() <= f64::EPSILON {
-                        0.5
-                    } else {
-                        (iso - v0) / denom
-                    };
-                    let t = t.clamp(0.0, 1.0);
-                    let position = corner_pos[c0].lerp(corner_pos[c1], t);
-                    let sample = field.sample(position);
-                    let normal = if sample.gradient.length_squared() > f64::EPSILON {
-                        sample.gradient.normalize()
-                    } else {
-                        DVec3::ZERO
-                    };
-                    edge_vertex[e] = Some(Vertex { position, normal });
-                }
-
-                for tri in TRI_TABLE[cube_index].chunks(3) {
-                    if tri.len() < 3 || tri[0] < 0 {
-                        break;
-                    }
-                    for &e in tri {
-                        vertices.push(
-                            edge_vertex[e as usize]
-                                .expect("TRI_TABLE only references edges flagged in EDGE_TABLE"),
-                        );
-                    }
+            let mut cube_index = 0usize;
+            for (c, &v) in corner_val.iter().enumerate() {
+                if v < iso {
+                    cube_index |= 1 << c;
                 }
             }
-        }
-    }
 
-    vertices
+            let edge_flags = EDGE_TABLE[cube_index];
+            let mut cell_vertices = Vec::new();
+            if edge_flags == 0 {
+                return cell_vertices;
+            }
+
+            // Interpolated vertex position (and field-gradient normal)
+            // for each of the 12 cube edges, computed lazily only for
+            // edges this configuration actually crosses.
+            let mut edge_vertex: [Option<Vertex>; 12] = [None; 12];
+            for (e, &(c0, c1)) in EDGE_CORNERS.iter().enumerate() {
+                if edge_flags & (1 << e) == 0 {
+                    continue;
+                }
+                let v0 = corner_val[c0];
+                let v1 = corner_val[c1];
+                let denom = v1 - v0;
+                let t = if denom.abs() <= f64::EPSILON {
+                    0.5
+                } else {
+                    (iso - v0) / denom
+                };
+                let t = t.clamp(0.0, 1.0);
+                let position = corner_pos[c0].lerp(corner_pos[c1], t);
+                let sample = field.sample(position);
+                let normal = if sample.gradient.length_squared() > f64::EPSILON {
+                    sample.gradient.normalize()
+                } else {
+                    DVec3::ZERO
+                };
+                edge_vertex[e] = Some(Vertex { position, normal });
+            }
+
+            for tri in TRI_TABLE[cube_index].chunks(3) {
+                if tri.len() < 3 || tri[0] < 0 {
+                    break;
+                }
+                for &e in tri {
+                    cell_vertices.push(
+                        edge_vertex[e as usize]
+                            .expect("TRI_TABLE only references edges flagged in EDGE_TABLE"),
+                    );
+                }
+            }
+            cell_vertices
+        })
+        .collect()
 }
 
 /// Standard marching-cubes edge table: for each of the 256 cube

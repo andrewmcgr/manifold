@@ -245,6 +245,7 @@ pub fn slice_mesh_with_progress(
             CONTOUR_REFINEMENT_DIVISOR,
         );
         (0..wall_count)
+            .into_par_iter()
             .map(|wall_index| {
                 let iso = -(config.wall_offset + wall_index as f64 * config.wall_line_width);
                 let vertices = extract_isosurface::<MeshSdf>(&sdf, min, max, iso_resolution, iso);

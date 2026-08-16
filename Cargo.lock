@@ -2488,6 +2488,7 @@ version = "0.1.0"
 dependencies = [
  "fidget",
  "glam 0.29.3",
+ "rayon",
 ]
 
 [[package]]
