@@ -3,6 +3,7 @@
 use crate::infill::{self, InfillRegion};
 use crate::{ids::ToolId, object::Object, slicing::Layer, Result, SlicerConfig};
 use glam::DVec3;
+use rayon::prelude::*;
 
 /// Classification of a single toolpath segment (the move from one point to
 /// the next along a [`Path`]). [`plan`] derives `WallOuter`/`WallInner`
@@ -71,72 +72,87 @@ pub struct Path {
 /// path planning beyond this (travel-move ordering/optimization across
 /// paths, non-planar toolpath deformation) is future work.
 ///
+/// Layers are planned in parallel across all available cores (via
+/// `rayon`): each layer only reads the shared, immutable `layers`/`objects`
+/// slices and produces its own independent `Vec<Path>` (the expensive part
+/// per layer — `InfillRegion::from_layer`'s polygon boolean ops and the
+/// scanline infill generator itself — has no cross-layer dependency to
+/// serialize on). Output order matches input layer order regardless of
+/// completion order, since `rayon`'s indexed `map`/`collect` preserves it.
+///
 /// # Errors
 ///
 /// Returns [`crate::Error::InvalidMesh`] if a layer references an object
 /// id not present in `objects`.
 pub fn plan(layers: &[Layer], objects: &[Object], config: &SlicerConfig) -> Result<Vec<Path>> {
-    let mut paths = Vec::new();
     let generator = infill::generator_for(config.infill_pattern);
-    for layer in layers {
-        let object = objects
-            .iter()
-            .find(|object| object.id == layer.object)
-            .ok_or_else(|| {
-                crate::Error::InvalidMesh(format!(
-                    "layer references unknown object {}",
-                    layer.object
-                ))
-            })?;
-        for wall_loop in &layer.loops {
-            // Placeholder metadata: real support/bridge/overhang
-            // classification and speed/extrusion-rate planning is future
-            // work (see toolpath-metadata-phase12 subtask 03). Wall
-            // classification (outer vs. inner) is derived from the loop's
-            // wall index; fixed sane defaults are used for the rest since
-            // they aren't yet meaningfully configurable.
-            let kind = if wall_loop.wall_index == 0 {
-                MoveKind::WallOuter
-            } else {
-                MoveKind::WallInner
-            };
-            let segments = wall_loop
-                .points
+    let per_layer: Vec<Vec<Path>> = layers
+        .par_iter()
+        .map(|layer| -> Result<Vec<Path>> {
+            let object = objects
                 .iter()
-                .map(|_| Segment {
-                    kind,
-                    speed: 60.0,
-                    extrusion_rate: 1.0,
-                    support_fraction: 0.0,
-                    order: layer.order,
-                })
-                .collect();
-            paths.push(Path {
-                points: wall_loop.points.clone(),
-                segments,
-                tool: object.tool,
-            });
-        }
+                .find(|object| object.id == layer.object)
+                .ok_or_else(|| {
+                    crate::Error::InvalidMesh(format!(
+                        "layer references unknown object {}",
+                        layer.object
+                    ))
+                })?;
 
-        let region = InfillRegion::from_layer(layer, config);
-        for mut infill_path in generator.generate(&region, config, layer, &object.transform) {
-            infill_path.tool = object.tool;
-            paths.push(infill_path);
-        }
+            let mut paths = Vec::new();
+            for wall_loop in &layer.loops {
+                // Placeholder metadata: real support/bridge/overhang
+                // classification and speed/extrusion-rate planning is future
+                // work (see toolpath-metadata-phase12 subtask 03). Wall
+                // classification (outer vs. inner) is derived from the loop's
+                // wall index; fixed sane defaults are used for the rest since
+                // they aren't yet meaningfully configurable.
+                let kind = if wall_loop.wall_index == 0 {
+                    MoveKind::WallOuter
+                } else {
+                    MoveKind::WallInner
+                };
+                let segments = wall_loop
+                    .points
+                    .iter()
+                    .map(|_| Segment {
+                        kind,
+                        speed: 60.0,
+                        extrusion_rate: 1.0,
+                        support_fraction: 0.0,
+                        order: layer.order,
+                    })
+                    .collect();
+                paths.push(Path {
+                    points: wall_loop.points.clone(),
+                    segments,
+                    tool: object.tool,
+                });
+            }
 
-        if !layer.solid_fill_boundary.is_empty() {
-            let solid_region = InfillRegion {
-                loops: layer.solid_fill_boundary.clone(),
-            };
-            for mut infill_path in
-                generator.generate(&solid_region, config, layer, &object.transform)
-            {
+            let region = InfillRegion::from_layer(layer, config);
+            for mut infill_path in generator.generate(&region, config, layer, &object.transform) {
                 infill_path.tool = object.tool;
                 paths.push(infill_path);
             }
-        }
-    }
-    Ok(paths)
+
+            if !layer.solid_fill_boundary.is_empty() {
+                let solid_region = InfillRegion {
+                    loops: layer.solid_fill_boundary.clone(),
+                };
+                for mut infill_path in
+                    generator.generate(&solid_region, config, layer, &object.transform)
+                {
+                    infill_path.tool = object.tool;
+                    paths.push(infill_path);
+                }
+            }
+
+            Ok(paths)
+        })
+        .collect::<Result<Vec<Vec<Path>>>>()?;
+
+    Ok(per_layer.into_iter().flatten().collect())
 }
 
 #[cfg(test)]

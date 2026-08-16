@@ -449,7 +449,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
         }
 
         let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
-            .iter()
+            .par_iter()
             .map(|&pos| polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin))
             .collect();
         let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
@@ -459,6 +459,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
         // physically above `k` is `k - 1` and the layer physically below is
         // `k + 1`.
         let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
+            .into_par_iter()
             .map(|k| {
                 if k == 0 {
                     boundaries_2d[k].clone()
@@ -468,6 +469,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             })
             .collect();
         let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
+            .into_par_iter()
             .map(|k| {
                 let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
                 if next.is_empty() {
@@ -478,33 +480,39 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             })
             .collect();
 
-        for k in 0..n {
-            let mut regions: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
-            if config.top_layers > 0 {
-                // A top-facing surface at layer `j` makes `top_layers` worth
-                // of layers *below* it (physically below = larger index,
-                // i.e. `j..=j+top_layers-1`) solid. So layer `k` picks up
-                // contributions from `exposed_above(j)` for `j` in
-                // `k-top_layers+1..=k` (backward from `k`, since index
-                // increases going down).
-                let start = k.saturating_sub(config.top_layers - 1);
-                for exposed in exposed_above.iter().take(k + 1).skip(start) {
-                    regions.push(exposed.clone());
+        let solid_2d_per_k: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
+            .into_par_iter()
+            .map(|k| {
+                let mut regions: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
+                if config.top_layers > 0 {
+                    // A top-facing surface at layer `j` makes `top_layers` worth
+                    // of layers *below* it (physically below = larger index,
+                    // i.e. `j..=j+top_layers-1`) solid. So layer `k` picks up
+                    // contributions from `exposed_above(j)` for `j` in
+                    // `k-top_layers+1..=k` (backward from `k`, since index
+                    // increases going down).
+                    let start = k.saturating_sub(config.top_layers - 1);
+                    for exposed in exposed_above.iter().take(k + 1).skip(start) {
+                        regions.push(exposed.clone());
+                    }
                 }
-            }
-            if config.bottom_layers > 0 {
-                // Symmetric: a bottom-facing surface at `j` makes
-                // `bottom_layers` worth of layers *above* it (physically
-                // above = smaller index, i.e. `j-bottom_layers+1..=j`)
-                // solid, so layer `k` picks up `exposed_below(j)` for `j` in
-                // `k..=k+bottom_layers-1` (forward from `k`).
-                let end = (k + config.bottom_layers - 1).min(n - 1);
-                for exposed in exposed_below.iter().take(end + 1).skip(k) {
-                    regions.push(exposed.clone());
+                if config.bottom_layers > 0 {
+                    // Symmetric: a bottom-facing surface at `j` makes
+                    // `bottom_layers` worth of layers *above* it (physically
+                    // above = smaller index, i.e. `j-bottom_layers+1..=j`)
+                    // solid, so layer `k` picks up `exposed_below(j)` for `j` in
+                    // `k..=k+bottom_layers-1` (forward from `k`).
+                    let end = (k + config.bottom_layers - 1).min(n - 1);
+                    for exposed in exposed_below.iter().take(end + 1).skip(k) {
+                        regions.push(exposed.clone());
+                    }
                 }
-            }
-            let exposed_union = polygon2d::union(&regions);
-            let solid_2d = polygon2d::intersection(&exposed_union, &boundaries_2d[k]);
+                let exposed_union = polygon2d::union(&regions);
+                polygon2d::intersection(&exposed_union, &boundaries_2d[k])
+            })
+            .collect();
+
+        for (k, solid_2d) in solid_2d_per_k.into_iter().enumerate() {
             let layer_origin = BUILD_DIRECTION * layers[positions[k]].order;
             layers[positions[k]].solid_fill_boundary =
                 polygon2d::from_2d(solid_2d, basis1, basis2, layer_origin);

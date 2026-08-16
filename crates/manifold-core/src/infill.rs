@@ -93,7 +93,7 @@ pub enum InfillPatternKind {
 
 /// Resolve an [`InfillPatternKind`] to its [`InfillGenerator`] implementation.
 #[must_use]
-pub fn generator_for(kind: InfillPatternKind) -> Box<dyn InfillGenerator> {
+pub fn generator_for(kind: InfillPatternKind) -> Box<dyn InfillGenerator + Sync> {
     match kind {
         InfillPatternKind::Monotonic => Box::new(MonotonicInfill),
     }
