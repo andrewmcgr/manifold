@@ -61,7 +61,8 @@ impl InfillRegion {
                 loops: layer.infill_boundary.clone(),
             };
         }
-        let (axis, apex, slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
+        let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
+        let field = order_field::order_field_for(config.order_field, config);
         let (basis1, basis2) = plane_basis(axis);
         let infill_2d = polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, apex);
         let solid_2d = polygon2d::to_2d(&layer.solid_fill_boundary, basis1, basis2, apex);
@@ -74,7 +75,7 @@ impl InfillRegion {
                 axis,
                 apex,
                 layer.order,
-                slope,
+                field.as_ref(),
             ),
         }
     }

@@ -467,7 +467,8 @@ pub fn slice_mesh_with_progress(
 pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig) {
     use std::collections::BTreeMap;
 
-    let (axis, apex, slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
+    let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
+    let field = order_field::order_field_for(config.order_field, config);
     let (basis1, basis2) = plane_basis(axis);
     let origin = apex;
 
@@ -550,7 +551,13 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
         for (k, solid_2d) in solid_2d_per_k.into_iter().enumerate() {
             let order = layers[positions[k]].order;
             layers[positions[k]].solid_fill_boundary = order_field::reconstruct_on_order_field(
-                solid_2d, basis1, basis2, axis, apex, order, slope,
+                solid_2d,
+                basis1,
+                basis2,
+                axis,
+                apex,
+                order,
+                field.as_ref(),
             );
         }
     }

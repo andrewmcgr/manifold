@@ -64,29 +64,40 @@ pub fn resolve_axis_apex_slope(kind: OrderFieldKind, config: &SlicerConfig) -> (
 }
 
 /// Order-field-aware inverse of [`crate::polygon2d::from_2d`]: reconstructs
-/// each `(u, v)` point's true height along `axis` by solving
-/// `order(p) = along - slope * radial` for `along`, where
-/// `radial = sqrt(u*u + v*v)` is `(u, v)`'s distance from the axis line
-/// (exact when `origin` is `apex` and `basis1`/`basis2` are the orthonormal
-/// perpendicular-to-`axis` basis from `plane_basis(axis)` — see
-/// `ConicalOrderField`'s doc comment for the same `radial` identity).
-/// `slope == 0.0` (the `Height` case, see [`resolve_axis_apex_slope`])
-/// degenerates `along` to exactly `order` for every point, matching
-/// `polygon2d::from_2d`'s flat reconstruction exactly.
+/// each `(u, v)` point's true position along `axis` by numerically solving
+/// `field.order(apex + basis1*u + basis2*v + axis*along) == target_order`
+/// for `along`, via bracket expansion + bisection on `field` itself.
 ///
-/// This must be used instead of `polygon2d::from_2d` whenever `origin` is
-/// a genuinely curved field's apex — `from_2d` assumes one flat height for
-/// every point, which is wrong for `Conical` wherever `radial` varies
-/// across the loop (i.e. essentially always, since a cone's radius varies
-/// continuously along its surface).
-pub fn reconstruct_on_order_field(
+/// This works for *any* [`OrderField`], not just axisymmetric ones: it
+/// replaces the previous closed-form cone inversion
+/// (`along = order + slope * radial`), which only held for
+/// [`ConicalOrderField`]/[`HeightOrderField`] and had no meaning for a
+/// non-axisymmetric field such as a future Eikonal/front-propagation field
+/// (see `NON_PLANAR_SLICING.md`) — rather than adding a second closed-form
+/// special case, every field now goes through the same numeric solve, so
+/// adding another field kind later needs no change here at all.
+///
+/// Relies on the documented well-posedness precondition that `field.order`
+/// is strictly monotonically increasing along `axis` at any fixed in-plane
+/// position (true of `Height`/`Conical` by construction, and required of
+/// any future field for slicing to make sense in the first place — see
+/// `NON_PLANAR_SLICING.md`'s well-posedness discussion). Bracket expansion
+/// assumes this monotonicity holds arbitrarily far from the initial guess;
+/// it is capped (see [`solve_along`]) rather than looping forever if that
+/// assumption is violated.
+///
+/// `basis1`/`basis2` must be the orthonormal in-plane basis perpendicular
+/// to `axis` (e.g. from `manifold_fidget::contour::plane_basis(axis)`),
+/// matching whatever produced `contours`' `(u, v)` coordinates via
+/// `polygon2d::to_2d(.., basis1, basis2, apex)`.
+pub fn reconstruct_on_order_field<F: OrderField + ?Sized>(
     contours: Vec<Vec<[f64; 2]>>,
     basis1: DVec3,
     basis2: DVec3,
     axis: DVec3,
     apex: DVec3,
-    order: f64,
-    slope: f64,
+    target_order: f64,
+    field: &F,
 ) -> Vec<Vec<DVec3>> {
     contours
         .into_iter()
@@ -94,13 +105,81 @@ pub fn reconstruct_on_order_field(
             contour
                 .into_iter()
                 .map(|[u, v]| {
-                    let radial = (u * u + v * v).sqrt();
-                    let along = order + slope * radial;
-                    apex + basis1 * u + basis2 * v + axis * along
+                    let planar = apex + basis1 * u + basis2 * v;
+                    let along = solve_along(field, planar, axis, target_order);
+                    planar + axis * along
                 })
                 .collect()
         })
         .collect()
+}
+
+/// Solves `field.order(planar + axis * along) == target` for `along`,
+/// assuming `field.order` is strictly increasing along `axis` from
+/// `planar` (see [`reconstruct_on_order_field`]'s preconditions).
+///
+/// Expands a bracket `[lo, hi]` outward from `along == 0.0` by doubling
+/// steps until the target sign is bracketed (capped at `MAX_EXPAND_STEPS`
+/// doublings), then bisects (`MAX_BISECT_ITERS` iterations — comfortably
+/// enough for `f64` precision on any bracket reached by the doubling
+/// above). Returns the midpoint of the last bracket if the search never
+/// finds a sign change or the residual never reaches tolerance, rather
+/// than panicking — a caller-visible "best effort" position for a
+/// pathological/misbehaving field instead of a hard failure.
+fn solve_along<F: OrderField + ?Sized>(field: &F, planar: DVec3, axis: DVec3, target: f64) -> f64 {
+    const TOLERANCE: f64 = 1e-9;
+    const MAX_EXPAND_STEPS: u32 = 64;
+    const MAX_BISECT_ITERS: u32 = 64;
+
+    let residual = |along: f64| field.order(planar + axis * along) - target;
+
+    let mut lo = 0.0_f64;
+    let mut hi = 0.0_f64;
+    let mut f_lo = residual(lo);
+    if f_lo.abs() <= TOLERANCE {
+        return lo;
+    }
+
+    let mut step = 1.0_f64;
+    if f_lo < 0.0 {
+        // Need a larger `along`; grow `hi` until the residual turns
+        // non-negative.
+        loop {
+            hi += step;
+            let f_hi = residual(hi);
+            if f_hi >= 0.0 || step >= f64::from(MAX_EXPAND_STEPS).exp2() {
+                break;
+            }
+            step *= 2.0;
+        }
+    } else {
+        // Need a smaller `along`; shrink `lo` until the residual turns
+        // non-positive.
+        loop {
+            lo -= step;
+            let f_lo_candidate = residual(lo);
+            if f_lo_candidate <= 0.0 || step >= f64::from(MAX_EXPAND_STEPS).exp2() {
+                break;
+            }
+            step *= 2.0;
+        }
+    }
+
+    f_lo = residual(lo);
+    for _ in 0..MAX_BISECT_ITERS {
+        let mid = 0.5 * (lo + hi);
+        let f_mid = residual(mid);
+        if f_mid.abs() <= TOLERANCE {
+            return mid;
+        }
+        if (f_mid < 0.0) == (f_lo < 0.0) {
+            lo = mid;
+            f_lo = f_mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
 }
 
 #[cfg(test)]
@@ -138,5 +217,51 @@ mod tests {
         )
         .order(p);
         assert_eq!(field.order(p), expected);
+    }
+
+    #[test]
+    fn reconstruct_on_order_field_matches_closed_form_for_height_field() {
+        let axis = BUILD_DIRECTION;
+        let apex = DVec3::ZERO;
+        let field = HeightOrderField::new(axis);
+        let (basis1, basis2) = manifold_fidget::contour::plane_basis(axis);
+
+        let target_order = 5.0;
+        let contours = vec![vec![[1.0, -2.0], [3.0, 4.0]]];
+        let reconstructed =
+            reconstruct_on_order_field(contours, basis1, basis2, axis, apex, target_order, &field);
+
+        for p in &reconstructed[0] {
+            assert!((field.order(*p) - target_order).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn reconstruct_on_order_field_matches_closed_form_for_conical_field() {
+        let axis = DVec3::new(0.0, 0.0, 1.0);
+        let apex = DVec3::new(1.0, 2.0, 3.0);
+        let slope = 0.4;
+        let field = ConicalOrderField::new(apex, axis, slope);
+        let (basis1, basis2) = manifold_fidget::contour::plane_basis(axis);
+
+        let target_order = -2.0;
+        let contours = vec![vec![[2.0, 0.0], [0.0, 5.0], [-3.0, -1.0]]];
+        let reconstructed = reconstruct_on_order_field(
+            contours.clone(),
+            basis1,
+            basis2,
+            axis,
+            apex,
+            target_order,
+            &field,
+        );
+
+        for (p, [u, v]) in reconstructed[0].iter().zip(&contours[0]) {
+            assert!((field.order(*p) - target_order).abs() < 1e-6);
+            let radial = (u * u + v * v).sqrt();
+            let expected_along = target_order + slope * radial;
+            let expected = apex + basis1 * u + basis2 * v + axis * expected_along;
+            assert!((*p - expected).length() < 1e-6);
+        }
     }
 }
