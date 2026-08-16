@@ -9,17 +9,17 @@ use manifold_fidget::contour::{
 };
 use manifold_fidget::marching_cubes::extract_isosurface;
 use manifold_fidget::mesh_sdf::MeshSdf;
-use manifold_fidget::order::order_range_over_bbox;
+use manifold_fidget::order::{order_range_over_bbox, HeightOrderField, OrderField};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// A single (possibly non-planar) slice layer.
 ///
 /// Tagged with the source [`ObjectId`] so multi-object toolpath planning
 /// (tool lookup) and any future Z-interleaving ordering strategy can tell
 /// which object a layer came from.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct Layer {
     pub index: usize,
     pub object: ObjectId,
@@ -54,6 +54,56 @@ pub struct Layer {
     /// Empty until that post-pass runs; always a subset of
     /// `infill_boundary`.
     pub solid_fill_boundary: Vec<Vec<DVec3>>,
+    /// The resolved order field used to produce this layer, cached at
+    /// construction time (see [`slice_mesh_with_progress`], the only site
+    /// with mesh access) so downstream passes
+    /// ([`compute_solid_fill_boundaries`], `infill::InfillRegion::from_layer`)
+    /// reuse this one solve instead of re-resolving
+    /// [`order_field::order_field_for`] blind from `config` alone. This
+    /// matters once an [`order_field::OrderFieldKind::Eikonal`] variant
+    /// exists: unlike `Height`/`Conical` (pure closed-form functions of
+    /// `config`), an Eikonal field's values come from a precomputed FMM
+    /// grid solve over the mesh's actual geometry, which cannot be cheaply
+    /// reconstructed from `config` alone at call sites with no mesh in
+    /// scope. `Height`/`Conical` populate this the same way for
+    /// consistency, even though re-resolving them would be free.
+    pub order_field: Arc<dyn OrderField>,
+}
+
+impl std::fmt::Debug for Layer {
+    /// Manual impl: `order_field` is `Arc<dyn OrderField>`, and
+    /// `OrderField` does not implement `Debug` (it's a `manifold-fidget`
+    /// geometry-query trait, not a plain data type) — so `order_field` is
+    /// rendered as a placeholder rather than derived.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Layer")
+            .field("index", &self.index)
+            .field("object", &self.object)
+            .field("order", &self.order)
+            .field("loops", &self.loops)
+            .field("infill_boundary", &self.infill_boundary)
+            .field("solid_fill_boundary", &self.solid_fill_boundary)
+            .field("order_field", &"<dyn OrderField>")
+            .finish()
+    }
+}
+
+impl Default for Layer {
+    /// Defaults `order_field` to a [`HeightOrderField`] along
+    /// [`BUILD_DIRECTION`] — matching [`order_field::OrderFieldKind`]'s own
+    /// `#[default]` variant — since `Arc<dyn OrderField>` has no derivable
+    /// `Default`.
+    fn default() -> Self {
+        Self {
+            index: usize::default(),
+            object: ObjectId::default(),
+            order: f64::default(),
+            loops: Vec::default(),
+            infill_boundary: Vec::default(),
+            solid_fill_boundary: Vec::default(),
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
+        }
+    }
 }
 
 /// One contour loop belonging to a specific wall/perimeter pass within a
@@ -177,7 +227,11 @@ pub fn slice_mesh_with_progress(
     // old `min.dot(BUILD_DIRECTION)`/`max.dot(BUILD_DIRECTION)` shortcut —
     // exact for any field whose extrema are attained at box corners, which
     // covers the affine `HeightOrderField` default used everywhere today.
-    let field = order_field::order_field_for(config.order_field, config);
+    let field: Arc<dyn OrderField> = Arc::from(order_field::order_field_for(
+        config.order_field,
+        config,
+        mesh,
+    ));
     let (order_min, order_max) = order_range_over_bbox(&*field, min, max);
 
     // In-plane sample extent: sized off the mesh's bounding box
@@ -414,6 +468,7 @@ pub fn slice_mesh_with_progress(
                 loops,
                 infill_boundary,
                 solid_fill_boundary: Vec::new(),
+                order_field: Arc::clone(&field),
             }
         })
         .collect();
@@ -468,7 +523,6 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
     use std::collections::BTreeMap;
 
     let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
-    let field = order_field::order_field_for(config.order_field, config);
     let (basis1, basis2) = plane_basis(axis);
     let origin = apex;
 
@@ -550,6 +604,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
 
         for (k, solid_2d) in solid_2d_per_k.into_iter().enumerate() {
             let order = layers[positions[k]].order;
+            let field = Arc::clone(&layers[positions[k]].order_field);
             layers[positions[k]].solid_fill_boundary = order_field::reconstruct_on_order_field(
                 solid_2d,
                 basis1,
@@ -1090,6 +1145,34 @@ mod tests {
                 for wall_loop in &layer.loops {
                     assert!(!wall_loop.points.is_empty());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn slice_mesh_eikonal_order_field_produces_nonempty_layer_output_for_a_simple_solid_cube() {
+        // Proves `OrderFieldKind::Eikonal` is wired through `order_field_for`
+        // and `slice_mesh_with_progress`'s curved ("contour-on-mesh") path
+        // end to end: a mesh-derived FMM front (seeded from the cube's
+        // base/contact surface with the build plate) still produces real,
+        // non-empty layer geometry, exercising `reconstruct_on_order_field`'s
+        // generic numeric solve against a genuinely non-axisymmetric field.
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            order_field: crate::order_field::OrderFieldKind::Eikonal,
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&cube_mesh(), &config).unwrap();
+
+        assert!(!layers.is_empty());
+        assert!(
+            layers.iter().any(|layer| !layer.loops.is_empty()),
+            "expected at least one layer with non-empty loops from the Eikonal-seeded curved path"
+        );
+        for layer in &layers {
+            for wall_loop in &layer.loops {
+                assert!(!wall_loop.points.is_empty());
             }
         }
     }

@@ -13,6 +13,7 @@
 use fidget::{context::Tree, shape::EzShape, types::Grad, vm::VmShape};
 use glam::DVec3;
 pub mod contour;
+pub mod eikonal;
 pub mod geometry;
 pub mod marching_cubes;
 pub mod mesh_sdf;

@@ -62,7 +62,6 @@ impl InfillRegion {
             };
         }
         let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
-        let field = order_field::order_field_for(config.order_field, config);
         let (basis1, basis2) = plane_basis(axis);
         let infill_2d = polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, apex);
         let solid_2d = polygon2d::to_2d(&layer.solid_fill_boundary, basis1, basis2, apex);
@@ -75,7 +74,7 @@ impl InfillRegion {
                 axis,
                 apex,
                 layer.order,
-                field.as_ref(),
+                layer.order_field.as_ref(),
             ),
         }
     }
@@ -336,6 +335,7 @@ mod tests {
                 DVec3::new(-half_extent, half_extent, 0.0),
             ]],
             solid_fill_boundary: Vec::new(),
+            ..Layer::default()
         }
     }
 
@@ -356,6 +356,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: vec![vec![DVec3::Y, DVec3::new(1.0, 1.0, 0.0)]],
             solid_fill_boundary: Vec::new(),
+            ..Layer::default()
         };
         let region = InfillRegion::from_layer(&layer, &config());
         assert_eq!(region.loops.len(), 1);
@@ -371,6 +372,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            ..Layer::default()
         };
         assert!(InfillRegion::from_layer(&layer, &config()).is_empty());
     }
@@ -477,6 +479,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            ..Layer::default()
         };
         let region = InfillRegion::from_layer(&layer, &config());
         let paths =
@@ -570,6 +573,7 @@ mod tests {
                 ],
             ],
             solid_fill_boundary: Vec::new(),
+            ..Layer::default()
         };
         let cfg = SlicerConfig {
             infill_line_width: 0.5,

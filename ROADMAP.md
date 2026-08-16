@@ -578,13 +578,14 @@ of silently falling back to flat slicing.
   not a design requirement here.
 
 **Explicitly out of scope**: any new order-field *shape* beyond
-`ConicalOrderField` (e.g. the Eikonal/front-propagation `speed(p)`
-construction from `NON_PLANAR_SLICING.md`'s "Alternative order
-construction" section remains its own unpromoted spike); real toolpath-
-level adaptations for non-planar printing itself (retraction/Z-hop
-behavior, nozzle collision with already-curved geometry) — this phase is
-about the slicing *pipeline* producing correct curved geometry, not the
-full physical printability story.
+`ConicalOrderField` (the Eikonal/front-propagation `speed(p)` construction
+from `NON_PLANAR_SLICING.md`'s "Alternative order construction" section
+was its own unpromoted spike at the time this phase landed — see Phase 17
+for its follow-on); real toolpath-level adaptations for non-planar
+printing itself (retraction/Z-hop behavior, nozzle collision with
+already-curved geometry) — this phase is about the slicing *pipeline*
+producing correct curved geometry, not the full physical printability
+story.
 
 ## Phase 16 — Top/bottom solid infill layers (needs 11 + 14) — ✅ done
 
@@ -645,6 +646,51 @@ detection generalized beyond simple layer-to-layer polygon comparison
 worth of Z at a shallow angle). That generalization is deferred to
 whichever future phase promotes non-planar toolpath printing itself,
 not tackled here.
+
+## Phase 17 — Eikonal order field (FMM front-propagation slicing) (needs 15) — ✅ done
+
+Adds a third `OrderFieldKind::Eikonal`, backed by a genuine grid-based Fast
+Marching Method (FMM) solver, alongside Phase 15's `Height`/`Conical`
+fields — the follow-on to the Eikonal spike that Phase 15 had explicitly
+deferred.
+
+- New `crates/manifold-fidget/src/eikonal.rs` module: `EikonalOrderField`
+  implements `manifold_fidget::order::OrderField` via a heap-based
+  narrow-band FMM solve over an auto-sized regular grid (resolution
+  derived from the mesh's bounding box and `SlicerConfig::layer_height`,
+  no new user-facing resolution knob). v1 uses uniform propagation speed
+  (`speed(p) == 1.0` everywhere), so it reduces to an FMM-computed,
+  grid-discretized approximation of Euclidean/geodesic distance from the
+  seed front — intentionally naive, landing the real solver machinery
+  (grid, heap-based marching, front seeding) so a later phase can swap in
+  non-uniform `speed(p)` shaping without re-architecting. Degenerate
+  inputs (empty seed set, unreachable query point) return a documented
+  best-effort fallback rather than panicking.
+- `OrderFieldKind::Eikonal` wired into `order_field_for` in
+  `crates/manifold-core/src/order_field.rs`, but only constructible at
+  the `slice_mesh_with_progress` call site (the only one with mesh
+  access) — the front is seeded from the mesh's actual base/contact
+  surface with the build plate, matching Phase 15's front-propagation
+  framing. `reconstruct_on_order_field`'s existing generic bisection
+  solve needed no `Eikonal`-specific change.
+- **Architectural change enabling this**: `order_field_for` is called
+  from three places, but only `slice_mesh_with_progress` has mesh access;
+  `compute_solid_fill_boundaries` and `InfillRegion::from_layer` do not.
+  `Height`/`Conical` were cheap to re-resolve at all three (pure
+  functions of `SlicerConfig`), but an `Eikonal` field's FMM solve is not.
+  Rather than threading the mesh through `toolpath::plan`'s public
+  signature, `Layer` (in `crates/manifold-core/src/slicing.rs`) gained a
+  cached `pub order_field: Arc<dyn OrderField>` field, populated once per
+  layer in `slice_mesh_with_progress` and read directly by
+  `compute_solid_fill_boundaries`/`InfillRegion::from_layer` instead of
+  each re-calling `order_field_for` — one uniform code path for all
+  `OrderFieldKind` values, no `if Eikonal` special case at either
+  downstream call site.
+
+**Explicitly out of scope**: non-uniform `speed(p)` shaping (e.g. slower
+near overhangs) — v1 is uniform-speed only; any toolpath-level
+adaptation for genuinely non-planar printing (retraction/Z-hop,
+nozzle-collision with curved geometry) remains deferred per Phase 15.
 
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 

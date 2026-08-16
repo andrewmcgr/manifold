@@ -219,6 +219,10 @@ pub fn plan(
 mod tests {
     use super::*;
     use crate::{ids::ObjectId, mesh::Mesh, slicing::WallLoop};
+    use manifold_fidget::order::HeightOrderField;
+    use std::sync::Arc;
+
+    use crate::slicing::BUILD_DIRECTION;
 
     #[test]
     fn plan_tags_paths_with_objects_assigned_tool() {
@@ -247,6 +251,7 @@ mod tests {
                 }],
                 infill_boundary: Vec::new(),
                 solid_fill_boundary: Vec::new(),
+                order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
             },
             Layer {
                 index: 0,
@@ -258,6 +263,7 @@ mod tests {
                 }],
                 infill_boundary: Vec::new(),
                 solid_fill_boundary: Vec::new(),
+                order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
             },
         ];
 
@@ -323,6 +329,7 @@ mod tests {
             }],
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 
         let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
@@ -354,6 +361,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 
         let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
@@ -383,6 +391,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: square.clone(),
             solid_fill_boundary: Vec::new(),
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         };
         let layer_with_solid = Layer {
             solid_fill_boundary: solid_square,
@@ -440,6 +449,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: square,
             solid_fill_boundary: solid_square,
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         };
 
         let cfg = SlicerConfig {
@@ -482,6 +492,7 @@ mod tests {
             ],
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 
         let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
@@ -522,6 +533,7 @@ mod tests {
             ],
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 
         let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
@@ -561,6 +573,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 
         let err = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap_err();

@@ -11,9 +11,10 @@
 //! `manifold-fidget` type implementing the trait, and one match arm here.
 
 use glam::DVec3;
+use manifold_fidget::eikonal::EikonalOrderField;
 use manifold_fidget::order::{ConicalOrderField, HeightOrderField, OrderField};
 
-use crate::{slicing::BUILD_DIRECTION, SlicerConfig};
+use crate::{mesh::Mesh, slicing::BUILD_DIRECTION, SlicerConfig};
 
 /// Selects which [`OrderField`] `slice_mesh`/`slice_mesh_with_progress` use.
 /// Persisted on [`crate::SlicerConfig`] like any other slicing parameter.
@@ -28,12 +29,36 @@ pub enum OrderFieldKind {
     /// Curved, cone-shaped slicing around a configurable apex/axis/slope.
     /// See `manifold_fidget::order::ConicalOrderField`.
     Conical,
+    /// Front-propagation slicing: a grid-based Fast Marching Method (FMM)
+    /// solve (see `manifold_fidget::eikonal::EikonalOrderField`) seeded from
+    /// the mesh's actual base/contact surface with the build plate, marching
+    /// outward with uniform speed. Unlike `Height`/`Conical` (pure
+    /// closed-form functions of `config` alone), this field's values depend
+    /// on the mesh's actual geometry, so it can only be resolved where a
+    /// mesh is in scope (see [`order_field_for`]) -- downstream passes with
+    /// no mesh in scope reuse the field cached on `slicing::Layer` instead
+    /// of re-resolving this variant.
+    Eikonal,
 }
 
 /// Resolve a config-level [`OrderFieldKind`] to a concrete
 /// `manifold_fidget::order::OrderField`, using `config`'s `apex`/`axis`/
-/// `slope` fields for the [`OrderFieldKind::Conical`] case.
-pub fn order_field_for(kind: OrderFieldKind, config: &SlicerConfig) -> Box<dyn OrderField> {
+/// `slope` fields for the [`OrderFieldKind::Conical`] case, and `mesh` for
+/// the [`OrderFieldKind::Eikonal`] case (its front is seeded from `mesh`'s
+/// actual base/contact surface with the build plate -- see
+/// [`eikonal_field_for`]).
+///
+/// `mesh` is only actually used for `Eikonal`; `Height`/`Conical` ignore it.
+/// This is only called from `slicing::slice_mesh_with_progress`, the one
+/// call site with mesh access -- downstream passes
+/// (`slicing::compute_solid_fill_boundaries`, `infill::InfillRegion::from_layer`)
+/// have no mesh in scope and instead reuse the field cached on
+/// `slicing::Layer` (see [`Layer::order_field`](crate::slicing::Layer::order_field)).
+pub fn order_field_for(
+    kind: OrderFieldKind,
+    config: &SlicerConfig,
+    mesh: &Mesh,
+) -> Box<dyn OrderField> {
     match kind {
         OrderFieldKind::Height => Box::new(HeightOrderField::new(BUILD_DIRECTION)),
         OrderFieldKind::Conical => Box::new(ConicalOrderField::new(
@@ -41,7 +66,42 @@ pub fn order_field_for(kind: OrderFieldKind, config: &SlicerConfig) -> Box<dyn O
             config.order_field_axis,
             config.order_field_slope,
         )),
+        OrderFieldKind::Eikonal => Box::new(eikonal_field_for(config, mesh)),
     }
+}
+
+/// Builds the [`OrderFieldKind::Eikonal`] field for `mesh`: seeds the FMM
+/// front from `mesh`'s base/contact surface with the build plate (vertices
+/// at or within a small tolerance of the mesh's minimum Z -- the "rests on
+/// floor" convention already used by `object::center_on_bed` and
+/// `manifold-gui`'s `scene::build_bed_quad`, both of which treat `min.z` as
+/// the build plate's height), and derives grid resolution from `mesh`'s
+/// bounding box and `config.layer_height` (reusing that existing
+/// resolution-driving config field rather than adding a new one).
+///
+/// An empty mesh (no vertices, so no bounding box) is a documented
+/// best-effort fallback -- a degenerate unit-box field with no seeds, whose
+/// `order()` always returns `f64::INFINITY` (see
+/// [`manifold_fidget::eikonal::EikonalOrderField`]'s own documented
+/// behavior for an empty seed set) -- rather than a panic.
+fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
+    let Some((min, max)) = mesh.bounding_box() else {
+        return EikonalOrderField::new(DVec3::ZERO, DVec3::ONE, &[], 1.0);
+    };
+
+    let layer_height = config.layer_height.abs().max(f64::EPSILON);
+    // Contact-surface tolerance: within one layer height of the mesh's
+    // minimum Z counts as "touching" the build plate, generous enough to
+    // include a slightly-faceted/non-flat mesh base without pulling in
+    // vertices from well above the true contact surface.
+    let seeds: Vec<DVec3> = mesh
+        .vertices
+        .iter()
+        .copied()
+        .filter(|v| v.z <= min.z + layer_height)
+        .collect();
+
+    EikonalOrderField::new(min, max, &seeds, layer_height)
 }
 
 /// Resolves `kind`'s effective `(axis, apex, slope)` for order-field-aware
@@ -60,6 +120,15 @@ pub fn resolve_axis_apex_slope(kind: OrderFieldKind, config: &SlicerConfig) -> (
             config.order_field_apex,
             config.order_field_slope,
         ),
+        // Eikonal has no single global axis/apex (its front is a
+        // mesh-derived FMM grid, not axisymmetric) -- treated the same as
+        // `Height` here (degenerate cone along `BUILD_DIRECTION`) purely as
+        // a projection-plane choice for `compute_solid_fill_boundaries`'s 2D
+        // flattening; `reconstruct_on_order_field`'s numeric solve against
+        // the *actual* cached `EikonalOrderField` (not this closed-form
+        // triple) is what makes the reconstructed geometry correct
+        // regardless of this choice.
+        OrderFieldKind::Eikonal => (BUILD_DIRECTION, DVec3::ZERO, 0.0),
     }
 }
 
@@ -190,7 +259,8 @@ mod tests {
     #[test]
     fn default_config_resolves_to_height_field_matching_build_direction() {
         let config = SlicerConfig::default();
-        let field = order_field_for(config.order_field, &config);
+        let mesh = crate::mesh::Mesh::default();
+        let field = order_field_for(config.order_field, &config, &mesh);
 
         let p = DVec3::new(1.0, 2.0, 3.0);
         let expected = HeightOrderField::new(BUILD_DIRECTION).order(p);
@@ -207,7 +277,8 @@ mod tests {
         config.order_field_axis = DVec3::new(0.0, 0.0, 1.0);
         config.order_field_slope = 0.5;
 
-        let field = order_field_for(config.order_field, &config);
+        let mesh = crate::mesh::Mesh::default();
+        let field = order_field_for(config.order_field, &config, &mesh);
 
         let p = DVec3::new(4.0, 6.0, 10.0);
         let expected = ConicalOrderField::new(
