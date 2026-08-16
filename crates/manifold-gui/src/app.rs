@@ -532,6 +532,9 @@ impl ManifoldApp {
             egui::Slider::new(&mut self.config.infill_angle_deg, 0.0..=180.0)
                 .text("Infill angle (deg)"),
         );
+        ui.add(
+            egui::Slider::new(&mut self.config.infill_density, 0.0..=1.0).text("Infill density"),
+        );
 
         ui.separator();
         ui.heading("Order field");

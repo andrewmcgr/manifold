@@ -61,6 +61,7 @@ mod tests {
                 infill_pattern: Default::default(),
                 infill_line_width: 0.4,
                 infill_angle_deg: 45.0,
+                infill_density: 0.2,
                 top_layers: 3,
                 bottom_layers: 3,
                 order_field: Default::default(),

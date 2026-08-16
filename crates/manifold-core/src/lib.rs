@@ -63,6 +63,17 @@ pub struct SlicerConfig {
     /// `Transform::in_plane_rotation_angle`) so rotating an object
     /// rotates its infill with it. Defaults to `45.0`.
     pub infill_angle_deg: f64,
+    /// Fraction of the *sparse* infill region (i.e. the part of
+    /// `Layer::infill_boundary` that is not `Layer::solid_fill_boundary` —
+    /// interior fill that isn't closing a top/bottom surface) to
+    /// actually fill with material, in `0.0..=1.0`. Scales scan-line
+    /// spacing inversely (`infill_line_width / infill_density`), so `1.0`
+    /// packs lines at `infill_line_width` spacing (fully solid) and lower
+    /// values space them further apart. `0.0` omits sparse infill
+    /// entirely. Solid fill (`Layer::solid_fill_boundary`, e.g. top/bottom
+    /// surface layers) always prints at full density regardless of this
+    /// setting. Defaults to `0.2` (20%).
+    pub infill_density: f64,
     /// Number of fully solid layers to generate at the top of each
     /// object (adjacent to any facing-up exterior surface), replacing
     /// what would otherwise be sparse infill with a solid fill pattern.
@@ -126,6 +137,7 @@ impl Default for SlicerConfig {
             infill_pattern: infill::InfillPatternKind::default(),
             infill_line_width: nozzle_diameter,
             infill_angle_deg: 45.0,
+            infill_density: 0.2,
             top_layers: 3,
             bottom_layers: 3,
             order_field: order_field::OrderFieldKind::default(),

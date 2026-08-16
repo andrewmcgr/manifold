@@ -90,12 +90,20 @@ pub trait InfillGenerator {
     /// the fill angle fixed relative to the object's own orientation (see
     /// [`Transform::in_plane_rotation_angle`]) rather than to world space,
     /// so rotating an object in the workspace rotates its infill with it.
+    ///
+    /// `density` is the fraction of `region` to actually fill (`0.0..=1.0`;
+    /// see [`crate::SlicerConfig::infill_density`]) — callers pass `1.0`
+    /// for regions that must always print solid (e.g.
+    /// [`crate::slicing::Layer::solid_fill_boundary`]) regardless of
+    /// `config.infill_density`, and `config.infill_density` itself for the
+    /// sparse region.
     fn generate(
         &self,
         region: &InfillRegion,
         config: &SlicerConfig,
         layer: &Layer,
         object_transform: &Transform,
+        density: f64,
     ) -> Vec<Path>;
 }
 
@@ -133,8 +141,9 @@ impl InfillGenerator for MonotonicInfill {
         config: &SlicerConfig,
         layer: &Layer,
         object_transform: &Transform,
+        density: f64,
     ) -> Vec<Path> {
-        if region.is_empty() {
+        if region.is_empty() || density <= 0.0 {
             return Vec::new();
         }
 
@@ -153,7 +162,13 @@ impl InfillGenerator for MonotonicInfill {
         let u_dir = basis1 * cos + basis2 * sin;
         let v_dir = basis1 * -sin + basis2 * cos;
 
-        let spacing = config.infill_line_width.abs().max(f64::EPSILON);
+        // Sparsify by widening scan-line spacing inversely with density:
+        // `1.0` (fully solid) packs lines at `infill_line_width` spacing,
+        // lower density spaces them further apart so less of the region
+        // area is actually covered by a bead.
+        let clamped_density = density.min(1.0);
+        let spacing =
+            (config.infill_line_width.abs().max(f64::EPSILON)) / clamped_density.max(f64::EPSILON);
 
         // Project every loop's points into the rotated (u, v, w) frame,
         // keeping loops as closed edge lists (wrap-around to point 0).
@@ -391,12 +406,14 @@ mod tests {
         let solid_region = InfillRegion {
             loops: layer_for_solid.solid_fill_boundary.clone(),
         };
-        let sparse_paths = MonotonicInfill.generate(&region, &cfg, &layer, &Transform::identity());
+        let sparse_paths =
+            MonotonicInfill.generate(&region, &cfg, &layer, &Transform::identity(), 1.0);
         let solid_paths = MonotonicInfill.generate(
             &solid_region,
             &cfg,
             &layer_for_solid,
             &Transform::identity(),
+            1.0,
         );
         assert!(!sparse_paths.is_empty());
         assert!(!solid_paths.is_empty());
@@ -406,7 +423,8 @@ mod tests {
     fn monotonic_fill_produces_paths_covering_a_square() {
         let layer = square_layer(5.0);
         let region = InfillRegion::from_layer(&layer, &config());
-        let paths = MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity());
+        let paths =
+            MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
 
         assert_eq!(paths.len(), 1);
         let path = &paths[0];
@@ -422,6 +440,34 @@ mod tests {
     }
 
     #[test]
+    fn monotonic_fill_returns_no_paths_when_density_is_zero() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths =
+            MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.0);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn monotonic_fill_density_widens_scan_line_spacing_below_full_density() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+
+        let full_density_paths =
+            MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+        let half_density_paths =
+            MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.5);
+
+        // Halving density doubles scan-line spacing, so roughly half as
+        // many scan lines (and thus points) are produced across the same
+        // region -- proving `density` actually sparsifies the pattern
+        // rather than being ignored.
+        assert!(!full_density_paths.is_empty());
+        assert!(!half_density_paths.is_empty());
+        assert!(half_density_paths[0].points.len() < full_density_paths[0].points.len());
+    }
+
+    #[test]
     fn monotonic_fill_is_empty_for_empty_region() {
         let layer = Layer {
             index: 0,
@@ -432,7 +478,8 @@ mod tests {
             solid_fill_boundary: Vec::new(),
         };
         let region = InfillRegion::from_layer(&layer, &config());
-        let paths = MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity());
+        let paths =
+            MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
         assert!(paths.is_empty());
     }
 
@@ -446,10 +493,20 @@ mod tests {
 
         let region_even = InfillRegion::from_layer(&even_layer, &config());
         let region_odd = InfillRegion::from_layer(&odd_layer, &config());
-        let paths_even =
-            MonotonicInfill.generate(&region_even, &config(), &even_layer, &Transform::identity());
-        let paths_odd =
-            MonotonicInfill.generate(&region_odd, &config(), &odd_layer, &Transform::identity());
+        let paths_even = MonotonicInfill.generate(
+            &region_even,
+            &config(),
+            &even_layer,
+            &Transform::identity(),
+            1.0,
+        );
+        let paths_odd = MonotonicInfill.generate(
+            &region_odd,
+            &config(),
+            &odd_layer,
+            &Transform::identity(),
+            1.0,
+        );
 
         // Different angle sign should generally produce a different
         // number of scan-line points for a shape without diagonal
@@ -465,14 +522,14 @@ mod tests {
         let layer = square_layer(5.0);
         let region = InfillRegion::from_layer(&layer, &config());
         let identity_paths =
-            MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity());
+            MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
         let rotated_transform = Transform::from_scale_rotation_translation(
             DVec3::ONE,
             DQuat::from_axis_angle(DVec3::Z, std::f64::consts::FRAC_PI_2),
             DVec3::ZERO,
         );
         let rotated_paths =
-            MonotonicInfill.generate(&region, &config(), &layer, &rotated_transform);
+            MonotonicInfill.generate(&region, &config(), &layer, &rotated_transform, 1.0);
 
         assert_ne!(identity_paths[0].points, rotated_paths[0].points);
     }
@@ -519,7 +576,7 @@ mod tests {
             ..SlicerConfig::default()
         };
         let region = InfillRegion::from_layer(&layer, &config());
-        let paths = MonotonicInfill.generate(&region, &cfg, &layer, &Transform::identity());
+        let paths = MonotonicInfill.generate(&region, &cfg, &layer, &Transform::identity(), 1.0);
         assert_eq!(paths.len(), 1);
         let path = &paths[0];
         assert_eq!(path.points.len() - 1, path.segments.len());
