@@ -12,6 +12,7 @@
 
 use glam::DVec3;
 
+use crate::order::OrderField;
 use crate::slice::{grid_point, sample_plane};
 use crate::ScalarField;
 
@@ -436,6 +437,59 @@ pub fn extract_contours_at_order<F: ScalarField + ?Sized>(
     )
 }
 
+/// Extracts polylines (open or closed) at `order_field(p) == order_value`
+/// from a triangle soup (e.g. [`crate::marching_cubes::extract_isosurface`]'s
+/// output), by walking each triangle's edges for an `order_value` crossing
+/// and stitching the resulting segments the same way [`extract_contours`]
+/// stitches its marching-squares segments.
+///
+/// Unlike [`extract_contours_at_order`], this does not assume the contour
+/// lies in a single plane: `order_field` may be a curved (e.g.
+/// [`crate::order::ConicalOrderField`]) order field, so the extracted
+/// loops are *not* passed through [`canonicalize_orientation`] (which
+/// relies on a single 2D plane-projection containment test that is only
+/// valid for planar contours). Winding/nesting semantics for curved-order
+/// contours are an open concern left to callers for now.
+///
+/// `triangle_positions` is a flat slice where every 3 consecutive entries
+/// form one triangle (matching
+/// [`crate::marching_cubes::Vertex::position`](crate::marching_cubes::Vertex)'s
+/// layout — pass `.iter().map(|v| v.position).collect::<Vec<_>>()` when
+/// using `extract_isosurface`'s output directly).
+///
+/// Degenerate per-triangle cases (0, 1, or all 3 vertices exactly on the
+/// iso value) are rare for generically sampled fields and are skipped as a
+/// documented limitation of this MVP.
+pub fn extract_order_contours_on_mesh<O: OrderField + ?Sized>(
+    triangle_positions: &[DVec3],
+    order_field: &O,
+    order_value: f64,
+) -> Vec<Vec<DVec3>> {
+    let mut segments: Vec<(DVec3, DVec3)> = Vec::new();
+
+    for tri in triangle_positions.chunks_exact(3) {
+        let p = [tri[0], tri[1], tri[2]];
+        let v = [
+            order_field.order(p[0]),
+            order_field.order(p[1]),
+            order_field.order(p[2]),
+        ];
+
+        let mut crossing_points = Vec::with_capacity(2);
+        for &(i0, i1) in &[(0, 1), (1, 2), (2, 0)] {
+            let (v0, v1) = (v[i0], v[i1]);
+            if (v0 - order_value) * (v1 - order_value) < 0.0 {
+                crossing_points.push(lerp_crossing(p[i0], v0, p[i1], v1, order_value));
+            }
+        }
+        if crossing_points.len() == 2 {
+            segments.push((crossing_points[0], crossing_points[1]));
+        }
+    }
+
+    stitch_loops(segments)
+}
+
 /// Builds an orthonormal in-plane basis (`basis1`, `basis2`) perpendicular
 /// to `direction`, without hardcoding any particular world axis as "up" —
 /// picks whichever of world X/Z is least parallel to `direction` as a seed
@@ -718,5 +772,92 @@ mod tests {
             approx_eq(perimeter, 4.0, 0.1),
             "expected perimeter ~4.0, got {perimeter}"
         );
+    }
+
+    #[test]
+    fn extract_order_contours_on_mesh_finds_a_loop_on_a_sphere_isosurface_for_height_order() {
+        use crate::marching_cubes::extract_isosurface;
+        use crate::order::HeightOrderField;
+
+        let radius = 1.0;
+        let field = TreeField::new(sphere_tree(radius));
+        let resolution = 40;
+        let bound = radius * 1.5;
+        let min = DVec3::splat(-bound);
+        let max = DVec3::splat(bound);
+        let vertices = extract_isosurface(&field, min, max, resolution, 0.0);
+        assert!(!vertices.is_empty());
+        let triangle_positions: Vec<DVec3> = vertices.iter().map(|v| v.position).collect();
+
+        let z = 0.3;
+        let order_field = HeightOrderField::new(DVec3::Z);
+        let loops = extract_order_contours_on_mesh(&triangle_positions, &order_field, z);
+
+        assert!(
+            !loops.is_empty(),
+            "expected at least one loop at height {z} on the sphere isosurface"
+        );
+
+        let expected_radius = (radius * radius - z * z).sqrt();
+        let cell_size = 2.0 * bound / resolution as f64;
+        let tolerance = 3.0 * cell_size;
+        for loop_points in &loops {
+            for p in loop_points {
+                assert!(
+                    approx_eq(p.z, z, tolerance),
+                    "loop point {p:?} should lie near z = {z}"
+                );
+                let xy_radius = (p.x * p.x + p.y * p.y).sqrt();
+                assert!(
+                    approx_eq(xy_radius, expected_radius, tolerance),
+                    "loop point {p:?} should have xy-radius ~{expected_radius}, got {xy_radius}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extract_order_contours_on_mesh_finds_a_loop_on_a_sphere_isosurface_for_conical_order() {
+        use crate::marching_cubes::extract_isosurface;
+        use crate::order::ConicalOrderField;
+
+        let radius = 1.0;
+        let field = TreeField::new(sphere_tree(radius));
+        let resolution = 40;
+        let bound = radius * 1.5;
+        let min = DVec3::splat(-bound);
+        let max = DVec3::splat(bound);
+        let vertices = extract_isosurface(&field, min, max, resolution, 0.0);
+        assert!(!vertices.is_empty());
+        let triangle_positions: Vec<DVec3> = vertices.iter().map(|v| v.position).collect();
+
+        // A cone apexed at the origin, opening along +Z: curved order field,
+        // so the resulting contour on the sphere is not a flat plane slice.
+        let order_field = ConicalOrderField::new(DVec3::ZERO, DVec3::Z, 0.3);
+        let order_value = 0.5;
+        let loops = extract_order_contours_on_mesh(&triangle_positions, &order_field, order_value);
+
+        assert!(
+            !loops.is_empty(),
+            "expected at least one loop for the conical order field on the sphere isosurface"
+        );
+
+        // All loop points should be (approximately) on the sphere surface
+        // and hold the order field roughly constant at order_value.
+        let cell_size = 2.0 * bound / resolution as f64;
+        let tolerance = 3.0 * cell_size;
+        for loop_points in &loops {
+            for p in loop_points {
+                assert!(
+                    approx_eq(p.length(), radius, tolerance),
+                    "loop point {p:?} should lie near the sphere surface (radius {radius})"
+                );
+                let order = order_field.order(*p);
+                assert!(
+                    approx_eq(order, order_value, tolerance),
+                    "loop point {p:?} should have order ~{order_value}, got {order}"
+                );
+            }
+        }
     }
 }
