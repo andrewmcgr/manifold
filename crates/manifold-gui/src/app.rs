@@ -13,6 +13,7 @@ use eframe::egui;
 use manifold_core::bounds::BoundingVolume;
 use manifold_core::infill::InfillPatternKind;
 use manifold_core::machine::Machine;
+use manifold_core::order_field::OrderFieldKind;
 use manifold_core::tool::Tool;
 use manifold_core::transform::Transform;
 use manifold_core::{ids::ObjectId, ids::ToolId, mesh::Mesh, object, object::Object, stl, threemf};
@@ -531,6 +532,56 @@ impl ManifoldApp {
             egui::Slider::new(&mut self.config.infill_angle_deg, 0.0..=180.0)
                 .text("Infill angle (deg)"),
         );
+
+        ui.separator();
+        ui.heading("Order field");
+        let previous_order_field = self.config.order_field;
+        egui::ComboBox::from_label("Kind")
+            .selected_text(format!("{:?}", self.config.order_field))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.config.order_field,
+                    OrderFieldKind::Height,
+                    "Height",
+                );
+                ui.selectable_value(
+                    &mut self.config.order_field,
+                    OrderFieldKind::Conical,
+                    "Conical",
+                );
+            });
+        if previous_order_field != OrderFieldKind::Conical
+            && self.config.order_field == OrderFieldKind::Conical
+        {
+            // Default the apex to the selected (else first) object's world-
+            // space bounding-box center, and the axis to the same
+            // "vertically up" direction `SlicerConfig::default` already uses
+            // for `order_field_axis` (matching `Height`'s direction, so
+            // switching kinds is a smooth transition) — a reasonable
+            // starting cone for whatever is loaded, for now.
+            let object = self
+                .selected
+                .and_then(|index| self.objects.get(index))
+                .or_else(|| self.objects.first());
+            if let Some(object) = object {
+                if let Some((min, max)) = object.mesh.bounding_box() {
+                    let local_center = (min + max) * 0.5;
+                    self.config.order_field_apex = object.transform.transform_point(local_center);
+                }
+            }
+            self.config.order_field_axis = manifold_core::SlicerConfig::default().order_field_axis;
+        }
+        if self.config.order_field == OrderFieldKind::Conical {
+            ui.horizontal(|ui| {
+                ui.label("Apex");
+                ui.add(egui::DragValue::new(&mut self.config.order_field_apex.x).prefix("x: "));
+                ui.add(egui::DragValue::new(&mut self.config.order_field_apex.y).prefix("y: "));
+                ui.add(egui::DragValue::new(&mut self.config.order_field_apex.z).prefix("z: "));
+            });
+            ui.add(
+                egui::Slider::new(&mut self.config.order_field_slope, 0.0..=2.0).text("Cone slope"),
+            );
+        }
 
         ui.separator();
         ui.heading("Machine");
