@@ -241,24 +241,41 @@ pub fn slice_mesh_with_progress(
             // The infill boundary sits where wall pass `wall_count` would
             // be if one more wall were printed — one further
             // `wall_line_width` step inward from the innermost printed
-            // wall (`wall_index == wall_count - 1`). Kept out of `loops`
-            // so `toolpath::plan` never treats it as a printable wall.
+            // wall. Kept out of `loops` so `toolpath::plan` never treats it
+            // as a printable wall.
             //
-            // Computed as a 2D inward offset of the innermost wall loop(s)
-            // (rather than a further 3D SDF isosurface probe at
-            // `boundary_iso`): the SDF probe could come back empty even
-            // when the innermost wall itself is non-empty (e.g. thin
-            // features, or contour-extraction grid resolution missing the
-            // slightly-smaller isosurface), silently dropping infill on
-            // otherwise fillable layers. Offsetting the already-extracted
-            // wall loop in 2D instead guarantees a boundary whenever an
-            // innermost wall exists.
-            let innermost_wall_index = wall_count.saturating_sub(1);
-            let innermost_wall_loops: Vec<Vec<DVec3>> = loops
-                .iter()
-                .filter(|wall| wall.wall_index == innermost_wall_index)
-                .map(|wall| wall.points.clone())
-                .collect();
+            // The innermost *configured* pass (`wall_count - 1`) may have no
+            // geometry at all: a cross-section can be too small to fit every
+            // nested wall the configured `shell_thickness` calls for (e.g.
+            // near a tapered tip), while an outer pass still does. Using a
+            // hardcoded `wall_count - 1` in that case would silently zero
+            // out `infill_boundary` (and therefore `solid_fill_boundary`)
+            // even though the outer wall(s) that did extract still bound a
+            // real interior area. So walk backward from `wall_count - 1` to
+            // find the deepest wall pass that actually produced loops, and
+            // offset inward from there instead — the offset step still
+            // conceptually represents "one more `wall_line_width` inward
+            // from whatever the innermost printed wall turned out to be".
+            //
+            // Computed as a 2D inward offset of that wall loop (rather than
+            // a further 3D SDF isosurface probe at `boundary_iso`): the SDF
+            // probe could come back empty even when the innermost wall
+            // itself is non-empty (e.g. thin features, or contour-extraction
+            // grid resolution missing the slightly-smaller isosurface),
+            // silently dropping infill on otherwise fillable layers.
+            // Offsetting the already-extracted wall loop in 2D instead
+            // guarantees a boundary whenever any wall exists.
+            let innermost_wall_loops: Vec<Vec<DVec3>> = (0..wall_count)
+                .rev()
+                .map(|wall_index| {
+                    loops
+                        .iter()
+                        .filter(|wall| wall.wall_index == wall_index)
+                        .map(|wall| wall.points.clone())
+                        .collect::<Vec<_>>()
+                })
+                .find(|wall_loops| !wall_loops.is_empty())
+                .unwrap_or_default();
             let infill_boundary = if innermost_wall_loops.is_empty() {
                 Vec::new()
             } else {
@@ -290,17 +307,24 @@ pub fn slice_mesh_with_progress(
 /// concatenates each object's layer stack back-to-back).
 ///
 /// For each layer `i` in an object's stack (`n` layers total, `0..n`):
+/// note `index`/position `i` increases going *down* the print (see
+/// [`BUILD_DIRECTION`]: `i == 0` is the top of the object, `i == n - 1` the
+/// bottom), so the layer physically above `i` is `i - 1` and the layer
+/// physically below is `i + 1`.
 /// - `exposed_above(i)` is the part of `infill_boundary(i)` not covered by
-///   `infill_boundary(i + 1)` (the layer above) — i.e. a top-facing surface
+///   `infill_boundary(i - 1)` (the layer above) — i.e. a top-facing surface
 ///   at `i`. Treated as fully exposed (`= infill_boundary(i)`) when there
-///   is no layer `i + 1`.
-/// - `exposed_below(i)` is symmetric, using `infill_boundary(i - 1)` (the
-///   layer below); fully exposed at `i == 0`.
+///   is no layer `i - 1` (`i == 0`).
+/// - `exposed_below(i)` is symmetric, using `infill_boundary(i + 1)` (the
+///   layer below); fully exposed at `i == n - 1`.
 /// - `solid_fill_boundary(i)` is the union of `exposed_above(j)` for `j` in
-///   `i..=i + top_layers - 1` (clamped to the last layer) and
-///   `exposed_below(j)` for `j` in `i - bottom_layers + 1..=i` (clamped to
-///   the first layer), intersected with `infill_boundary(i)` so the result
-///   is always a subset of this layer's own fillable area.
+///   `i - top_layers + 1..=i` (clamped to the first layer, since a
+///   top-facing surface at `j` makes the `top_layers` layers *below* it
+///   solid) and `exposed_below(j)` for `j` in `i..=i + bottom_layers - 1`
+///   (clamped to the last layer, since a bottom-facing surface at `j` makes
+///   the `bottom_layers` layers *above* it solid), intersected with
+///   `infill_boundary(i)` so the result is always a subset of this layer's
+///   own fillable area.
 ///
 /// Pure 2D geometry composition via [`polygon2d`]; no SDF/3D queries.
 /// `basis1`/`basis2` are recomputed from [`BUILD_DIRECTION`] (matching what
@@ -339,7 +363,20 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             .collect();
         let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
 
+        // Index increases going *down* (see `BUILD_DIRECTION`: index 0 is
+        // the top of the object, index `n - 1` the bottom), so the layer
+        // physically above `k` is `k - 1` and the layer physically below is
+        // `k + 1`.
         let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
+            .map(|k| {
+                if k == 0 {
+                    boundaries_2d[k].clone()
+                } else {
+                    polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
+                }
+            })
+            .collect();
+        let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
             .map(|k| {
                 let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
                 if next.is_empty() {
@@ -349,27 +386,29 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                 }
             })
             .collect();
-        let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
-            .map(|k| {
-                if k == 0 {
-                    boundaries_2d[k].clone()
-                } else {
-                    polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
-                }
-            })
-            .collect();
 
         for k in 0..n {
             let mut regions: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
             if config.top_layers > 0 {
-                let end = (k + config.top_layers - 1).min(n - 1);
-                for exposed in exposed_above.iter().take(end + 1).skip(k) {
+                // A top-facing surface at layer `j` makes `top_layers` worth
+                // of layers *below* it (physically below = larger index,
+                // i.e. `j..=j+top_layers-1`) solid. So layer `k` picks up
+                // contributions from `exposed_above(j)` for `j` in
+                // `k-top_layers+1..=k` (backward from `k`, since index
+                // increases going down).
+                let start = k.saturating_sub(config.top_layers - 1);
+                for exposed in exposed_above.iter().take(k + 1).skip(start) {
                     regions.push(exposed.clone());
                 }
             }
             if config.bottom_layers > 0 {
-                let start = k.saturating_sub(config.bottom_layers - 1);
-                for exposed in exposed_below.iter().take(k + 1).skip(start) {
+                // Symmetric: a bottom-facing surface at `j` makes
+                // `bottom_layers` worth of layers *above* it (physically
+                // above = smaller index, i.e. `j-bottom_layers+1..=j`)
+                // solid, so layer `k` picks up `exposed_below(j)` for `j` in
+                // `k..=k+bottom_layers-1` (forward from `k`).
+                let end = (k + config.bottom_layers - 1).min(n - 1);
+                for exposed in exposed_below.iter().take(end + 1).skip(k) {
                     regions.push(exposed.clone());
                 }
             }
@@ -681,6 +720,107 @@ mod tests {
         Mesh::new(vertices, indices)
     }
 
+    /// Regression test for a direction bug: `Layer::index` increases going
+    /// *down* the print (see [`BUILD_DIRECTION`] — index 0 is the top of the
+    /// object), so `top_layers` must propagate solid fill toward *larger*
+    /// indices (downward from a top-facing surface) and `bottom_layers`
+    /// toward *smaller* indices (upward from a bottom-facing surface). An
+    /// earlier version of `compute_solid_fill_boundaries` had these
+    /// swapped, which a symmetric `top_layers == bottom_layers` config
+    /// (the default) could never expose. Uses an asymmetric
+    /// `top_layers = 1, bottom_layers = 2` on a unit cube (uniform
+    /// cross-section, so only the layers adjacent to the exposed top/bottom
+    /// caps get any solid fill contribution at all) to pin down the
+    /// direction unambiguously.
+    #[test]
+    fn compute_solid_fill_boundaries_propagates_top_and_bottom_in_the_correct_direction() {
+        let config = SlicerConfig {
+            layer_height: 0.625,
+            top_layers: 1,
+            bottom_layers: 2,
+            ..SlicerConfig::default()
+        };
+
+        let mut layers = slice_mesh(&big_cube_mesh(), &config).unwrap();
+        compute_solid_fill_boundaries(&mut layers, &config);
+
+        fn area(loops: &[Vec<DVec3>]) -> f64 {
+            loops
+                .iter()
+                .map(|pts| {
+                    let n = pts.len();
+                    if n < 3 {
+                        return 0.0;
+                    }
+                    (0..n)
+                        .map(|i| {
+                            let a = pts[i];
+                            let b = pts[(i + 1) % n];
+                            a.x * b.y - b.x * a.y
+                        })
+                        .sum::<f64>()
+                        * 0.5
+                })
+                .sum()
+        }
+
+        // Layers with a nonempty infill_boundary must be fully solid (ratio
+        // ~1) exactly where propagation should reach, and not otherwise.
+        let is_fully_solid = |layer: &Layer| -> Option<bool> {
+            let infill = area(&layer.infill_boundary).abs();
+            if infill < 1e-9 {
+                return None; // no fillable area on this layer at all
+            }
+            let solid = area(&layer.solid_fill_boundary).abs();
+            Some((solid / infill - 1.0).abs() < 1e-6)
+        };
+
+        let solid_flags: Vec<Option<bool>> = layers.iter().map(is_fully_solid).collect();
+        let first_real = solid_flags.iter().position(Option::is_some).unwrap();
+        let last_real = solid_flags.iter().rposition(Option::is_some).unwrap();
+        assert!(
+            last_real - first_real >= 3,
+            "fixture needs at least 4 layers with contours to distinguish top from bottom"
+        );
+
+        // top_layers = 1: only the layer right under the top cap is solid.
+        assert_eq!(
+            solid_flags[first_real],
+            Some(true),
+            "the layer nearest the top-facing surface must be fully solid"
+        );
+        assert_eq!(
+            solid_flags[first_real + 1],
+            Some(false),
+            "top_layers = 1 must not make the second layer down from the top fully solid"
+        );
+
+        // bottom_layers = 2: the two layers right above the bottom cap are solid.
+        assert_eq!(
+            solid_flags[last_real],
+            Some(true),
+            "the layer nearest the bottom-facing surface must be fully solid"
+        );
+        assert_eq!(
+            solid_flags[last_real - 1],
+            Some(true),
+            "bottom_layers = 2 must make the second layer up from the bottom fully solid"
+        );
+        assert_eq!(
+            solid_flags[last_real - 2],
+            Some(false),
+            "bottom_layers = 2 must not reach a third layer up from the bottom"
+        );
+    }
+
+    /// A cube scaled up (5x5x5) from [`cube_mesh`] so wall/infill offsets
+    /// leave a comfortably nonempty infill region (a unit cube's infill
+    /// boundary collapses to empty under the default wall settings).
+    fn big_cube_mesh() -> Mesh {
+        let Mesh { vertices, indices } = cube_mesh();
+        Mesh::new(vertices.into_iter().map(|v| v * 5.0).collect(), indices)
+    }
+
     #[test]
     fn slice_mesh_produces_nonempty_contour_loops_for_a_solid_cube() {
         let config = SlicerConfig {
@@ -866,6 +1006,52 @@ mod tests {
                  inward of the innermost wall ({wall_extent})"
             );
         }
+    }
+
+    /// Regression test: a cross-section can be too small to fit every
+    /// configured wall pass (e.g. near a tapered tip) while an outer pass
+    /// still extracts fine. `infill_boundary` must fall back to whatever
+    /// wall pass actually has geometry instead of going empty just because
+    /// the *innermost configured* pass (`wall_count - 1`) came back empty.
+    #[test]
+    fn slice_mesh_infill_boundary_falls_back_when_the_innermost_configured_wall_is_missing() {
+        let config = SlicerConfig {
+            layer_height: 0.5,
+            wall_line_width: 0.05,
+            shell_thickness: 0.1,
+            wall_offset: 0.02,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(config.wall_count(), 2);
+
+        let layers = slice_mesh(&tall_thin_pyramid_mesh(), &config).unwrap();
+
+        // Near the pyramid's tip the cross-section is too narrow to fit
+        // both configured wall passes: find a layer where some wall
+        // extracted (`loops` non-empty) but the innermost configured pass
+        // (`wall_count - 1`) did not, and assert `infill_boundary` is still
+        // non-empty there.
+        let short_of_innermost_wall = layers.iter().find(|layer| {
+            !layer.loops.is_empty()
+                && layer
+                    .loops
+                    .iter()
+                    .all(|w| w.wall_index != config.wall_count() - 1)
+        });
+        let layer = short_of_innermost_wall.unwrap_or_else(|| {
+            panic!(
+                "fixture/config didn't produce a layer with a missing innermost \
+                 wall pass — test can't exercise the fallback"
+            )
+        });
+        assert!(
+            !layer.infill_boundary.is_empty(),
+            "layer {} (order {}) has wall geometry but no innermost configured \
+             wall pass, and should have fallen back to the deepest wall that \
+             did extract instead of leaving infill_boundary empty",
+            layer.index,
+            layer.order
+        );
     }
 
     #[test]
