@@ -631,6 +631,10 @@ impl ManifoldApp {
                 egui::Slider::new(&mut tool.nozzle_diameter, 0.1..=1.5)
                     .text("Tool 0 nozzle diameter (mm)"),
             );
+            ui.add(
+                egui::Slider::new(&mut tool.extrusion_multiplier, 0.5..=1.5)
+                    .text("Tool 0 extrusion multiplier"),
+            );
         }
         if ui.button("Add tool").clicked() {
             self.machine
