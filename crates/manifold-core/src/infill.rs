@@ -6,6 +6,7 @@
 //! `strategy_for`: new patterns implement [`InfillGenerator`] and are
 //! wired into [`generator_for`] without touching `toolpath::plan`.
 
+use crate::order_field::OrderFieldKind;
 use crate::polygon2d;
 use crate::slicing::{Layer, BUILD_DIRECTION};
 use crate::toolpath::{MoveKind, Path, Segment};
@@ -13,6 +14,70 @@ use crate::transform::Transform;
 use crate::SlicerConfig;
 use glam::DVec3;
 use manifold_fidget::contour::plane_basis;
+
+/// Resolves `config.order_field`'s effective `(axis, apex, slope)` for
+/// order-field-aware plane-basis/reconstruction math (see
+/// [`reconstruct_on_order_field`]). `Height` is treated as a degenerate
+/// cone — `apex` at the origin, `slope` `0.0` — along
+/// `slicing::BUILD_DIRECTION` specifically (not `config.order_field_axis`,
+/// which is documented as inert unless `order_field` is `Conical`), so
+/// this always matches whatever `slicing::slice_mesh` actually used to
+/// produce `layer.order` in the first place.
+fn resolve_order_field(config: &SlicerConfig) -> (DVec3, DVec3, f64) {
+    match config.order_field {
+        OrderFieldKind::Height => (BUILD_DIRECTION, DVec3::ZERO, 0.0),
+        OrderFieldKind::Conical => (
+            config.order_field_axis,
+            config.order_field_apex,
+            config.order_field_slope,
+        ),
+    }
+}
+
+/// Order-field-aware inverse of [`polygon2d::from_2d`]: reconstructs each
+/// `(u, v)` point's true height along `axis` by solving
+/// `order(p) = along - slope * radial` for `along`, where
+/// `radial = sqrt(u*u + v*v)` is `(u, v)`'s distance from the axis line
+/// (exact when `origin` is `apex` and `basis1`/`basis2` are the orthonormal
+/// perpendicular-to-`axis` basis from `plane_basis(axis)` — see
+/// `ConicalOrderField`'s doc comment for the same `radial` identity).
+/// `slope == 0.0` (the `Height` case, see [`resolve_order_field`])
+/// degenerates `along` to exactly `order` for every point, matching
+/// `polygon2d::from_2d`'s flat reconstruction exactly.
+///
+/// This must be used instead of `polygon2d::from_2d` whenever `origin`
+/// is a genuinely curved field's apex — `from_2d` assumes one flat height
+/// for every point, which is wrong for `Conical` wherever `radial` varies
+/// across the loop (i.e. essentially always, since a cone's radius varies
+/// continuously along its surface). Previously used for exactly this
+/// (`InfillRegion::from_layer`'s solid/sparse difference reconstruction),
+/// flattening every resulting point — including new vertices introduced by
+/// the boolean clip itself — onto one wrong height, detaching infill from
+/// the actual curved wall surface for any layer with a non-empty
+/// `solid_fill_boundary` under a `Conical` order field.
+fn reconstruct_on_order_field(
+    contours: Vec<Vec<[f64; 2]>>,
+    basis1: DVec3,
+    basis2: DVec3,
+    axis: DVec3,
+    apex: DVec3,
+    order: f64,
+    slope: f64,
+) -> Vec<Vec<DVec3>> {
+    contours
+        .into_iter()
+        .map(|contour| {
+            contour
+                .into_iter()
+                .map(|[u, v]| {
+                    let radial = (u * u + v * v).sqrt();
+                    let along = order + slope * radial;
+                    apex + basis1 * u + basis2 * v + axis * along
+                })
+                .collect()
+        })
+        .collect()
+}
 
 /// Which built-in infill pattern to generate. New patterns are added as a
 /// new variant here plus a new `InfillGenerator` impl wired into
@@ -54,20 +119,27 @@ impl InfillRegion {
     /// region (no loops) for a layer with no infill boundary, and excludes
     /// the layer entirely if its whole infill boundary is solid.
     #[must_use]
-    pub fn from_layer(layer: &Layer) -> Self {
+    pub fn from_layer(layer: &Layer, config: &SlicerConfig) -> Self {
         if layer.solid_fill_boundary.is_empty() {
             return Self {
                 loops: layer.infill_boundary.clone(),
             };
         }
-        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
-        let origin = DVec3::ZERO;
-        let layer_origin = BUILD_DIRECTION * layer.order;
-        let infill_2d = polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, origin);
-        let solid_2d = polygon2d::to_2d(&layer.solid_fill_boundary, basis1, basis2, origin);
+        let (axis, apex, slope) = resolve_order_field(config);
+        let (basis1, basis2) = plane_basis(axis);
+        let infill_2d = polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, apex);
+        let solid_2d = polygon2d::to_2d(&layer.solid_fill_boundary, basis1, basis2, apex);
         let sparse_2d = polygon2d::difference(&infill_2d, &solid_2d);
         Self {
-            loops: polygon2d::from_2d(sparse_2d, basis1, basis2, layer_origin),
+            loops: reconstruct_on_order_field(
+                sparse_2d,
+                basis1,
+                basis2,
+                axis,
+                apex,
+                layer.order,
+                slope,
+            ),
         }
     }
 
@@ -130,7 +202,8 @@ impl InfillGenerator for MonotonicInfill {
             return Vec::new();
         }
 
-        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+        let (axis, _apex, _slope) = resolve_order_field(config);
+        let (basis1, basis2) = plane_basis(axis);
         let object_angle = object_transform.in_plane_rotation_angle(basis1, basis2);
         let alternation = if layer.index.is_multiple_of(2) {
             1.0
@@ -153,7 +226,7 @@ impl InfillGenerator for MonotonicInfill {
             .map(|points| {
                 points
                     .iter()
-                    .map(|p| (p.dot(u_dir), p.dot(v_dir), p.dot(BUILD_DIRECTION)))
+                    .map(|p| (p.dot(u_dir), p.dot(v_dir), p.dot(axis)))
                     .collect()
             })
             .collect();
@@ -244,7 +317,7 @@ impl InfillGenerator for MonotonicInfill {
                           v: f64,
                           kind: MoveKind| {
             let (u, w) = uw;
-            let world = u_dir * u + v_dir * v + BUILD_DIRECTION * w;
+            let world = u_dir * u + v_dir * v + axis * w;
             if !points.is_empty() {
                 segments.push(Segment {
                     kind,
@@ -330,7 +403,7 @@ mod tests {
             infill_boundary: vec![vec![DVec3::Y, DVec3::new(1.0, 1.0, 0.0)]],
             solid_fill_boundary: Vec::new(),
         };
-        let region = InfillRegion::from_layer(&layer);
+        let region = InfillRegion::from_layer(&layer, &config());
         assert_eq!(region.loops.len(), 1);
         assert_eq!(region.loops[0], vec![DVec3::Y, DVec3::new(1.0, 1.0, 0.0)]);
     }
@@ -345,14 +418,14 @@ mod tests {
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
         };
-        assert!(InfillRegion::from_layer(&layer).is_empty());
+        assert!(InfillRegion::from_layer(&layer, &config()).is_empty());
     }
 
     #[test]
     fn region_from_layer_is_empty_when_solid_fill_boundary_covers_the_whole_infill_boundary() {
         let mut layer = square_layer(5.0);
         layer.solid_fill_boundary = layer.infill_boundary.clone();
-        assert!(InfillRegion::from_layer(&layer).is_empty());
+        assert!(InfillRegion::from_layer(&layer, &config()).is_empty());
     }
 
     #[test]
@@ -367,7 +440,7 @@ mod tests {
             DVec3::new(5.0, 5.0, 0.0),
             DVec3::new(1.0, 5.0, 0.0),
         ]];
-        let region = InfillRegion::from_layer(&layer);
+        let region = InfillRegion::from_layer(&layer, &config());
         assert!(!region.is_empty());
         // The sparse region must not contain the fully-solid sub-square's
         // interior point.
@@ -394,7 +467,7 @@ mod tests {
     #[test]
     fn monotonic_fill_produces_paths_covering_a_square() {
         let layer = square_layer(5.0);
-        let region = InfillRegion::from_layer(&layer);
+        let region = InfillRegion::from_layer(&layer, &config());
         let paths = MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity());
 
         assert_eq!(paths.len(), 1);
@@ -420,7 +493,7 @@ mod tests {
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
         };
-        let region = InfillRegion::from_layer(&layer);
+        let region = InfillRegion::from_layer(&layer, &config());
         let paths = MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity());
         assert!(paths.is_empty());
     }
@@ -433,8 +506,8 @@ mod tests {
         let mut odd_layer = square;
         odd_layer.index = 1;
 
-        let region_even = InfillRegion::from_layer(&even_layer);
-        let region_odd = InfillRegion::from_layer(&odd_layer);
+        let region_even = InfillRegion::from_layer(&even_layer, &config());
+        let region_odd = InfillRegion::from_layer(&odd_layer, &config());
         let paths_even =
             MonotonicInfill.generate(&region_even, &config(), &even_layer, &Transform::identity());
         let paths_odd =
@@ -452,7 +525,7 @@ mod tests {
     fn monotonic_fill_rotates_with_object_transform() {
         use glam::DQuat;
         let layer = square_layer(5.0);
-        let region = InfillRegion::from_layer(&layer);
+        let region = InfillRegion::from_layer(&layer, &config());
         let identity_paths =
             MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity());
         let rotated_transform = Transform::from_scale_rotation_translation(
@@ -507,7 +580,7 @@ mod tests {
             infill_angle_deg: 0.0,
             ..SlicerConfig::default()
         };
-        let region = InfillRegion::from_layer(&layer);
+        let region = InfillRegion::from_layer(&layer, &config());
         let paths = MonotonicInfill.generate(&region, &cfg, &layer, &Transform::identity());
         assert_eq!(paths.len(), 1);
         let path = &paths[0];

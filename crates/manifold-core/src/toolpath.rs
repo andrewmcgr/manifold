@@ -118,7 +118,7 @@ pub fn plan(layers: &[Layer], objects: &[Object], config: &SlicerConfig) -> Resu
             });
         }
 
-        let region = InfillRegion::from_layer(layer);
+        let region = InfillRegion::from_layer(layer, config);
         for mut infill_path in generator.generate(&region, config, layer, &object.transform) {
             infill_path.tool = object.tool;
             paths.push(infill_path);
