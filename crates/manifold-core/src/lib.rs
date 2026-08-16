@@ -13,6 +13,7 @@ pub mod machine;
 pub mod material;
 pub mod mesh;
 pub mod object;
+pub mod order_field;
 pub mod ordering;
 pub mod polygon2d;
 pub mod slicing;
@@ -71,6 +72,23 @@ pub struct SlicerConfig {
     /// what would otherwise be sparse infill with a solid fill pattern.
     /// Defaults to `3`.
     pub bottom_layers: usize,
+    /// Which order field slicing walks isosurfaces of. See
+    /// `order_field::OrderFieldKind`. Defaults to `Height`, i.e. today's
+    /// exact flat planar slicing along `slicing::BUILD_DIRECTION`.
+    pub order_field: order_field::OrderFieldKind,
+    /// Apex point of the cone used when `order_field` is
+    /// `OrderFieldKind::Conical`. Inert (unused) otherwise. Defaults to
+    /// the origin.
+    pub order_field_apex: glam::DVec3,
+    /// Axis the cone opens along when `order_field` is
+    /// `OrderFieldKind::Conical`. Inert (unused) otherwise. Defaults to
+    /// `slicing::BUILD_DIRECTION`, matching the `Height` field's
+    /// direction so switching kinds is a smooth transition.
+    pub order_field_axis: glam::DVec3,
+    /// Cone steepness used when `order_field` is `OrderFieldKind::Conical`
+    /// (`0.0` degenerates to a flat height field). Inert (unused)
+    /// otherwise. Defaults to `0.0`.
+    pub order_field_slope: f64,
 }
 
 impl Default for SlicerConfig {
@@ -89,6 +107,10 @@ impl Default for SlicerConfig {
             infill_angle_deg: 45.0,
             top_layers: 3,
             bottom_layers: 3,
+            order_field: order_field::OrderFieldKind::default(),
+            order_field_apex: glam::DVec3::ZERO,
+            order_field_axis: slicing::BUILD_DIRECTION,
+            order_field_slope: 0.0,
         }
     }
 }

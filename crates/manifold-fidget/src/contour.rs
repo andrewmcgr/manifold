@@ -401,6 +401,126 @@ fn point_in_polygon(point: (f64, f64), polygon: &[(f64, f64)]) -> bool {
     inside
 }
 
+/// Estimates a closed loop's centroid (simple vertex average — sufficient
+/// as a local-basis origin, not intended to be the area centroid) and a
+/// best-fit normal via Newell's method (the standard robust way to get a
+/// consistent normal direction for a possibly-non-planar polygon: it's the
+/// exact face normal when the loop *is* planar, and a reasonable
+/// least-squares-ish approximation when it's only nearly planar, which is
+/// the case this is built for — a curved-order-field contour loop is
+/// exactly planar only for [`crate::order::HeightOrderField`]-style fields,
+/// but stays *locally* near-planar for the concentric/nested loops produced
+/// by fields like [`crate::order::ConicalOrderField`], since such loops are
+/// isosurface cross-sections at a single order value sharing a common
+/// apex/axis). Returns `(centroid, normal)`; `normal` is `DVec3::Z` as an
+/// arbitrary fallback for degenerate input (`< 3` points, or a normal too
+/// small to normalize, e.g. a collinear/zero-area loop).
+fn loop_centroid_and_normal(loop_points: &[DVec3]) -> (DVec3, DVec3) {
+    let n = loop_points.len();
+    if n < 3 {
+        let centroid = loop_points.iter().copied().sum::<DVec3>() / (n.max(1) as f64);
+        return (centroid, DVec3::Z);
+    }
+
+    let centroid = loop_points.iter().copied().sum::<DVec3>() / n as f64;
+
+    let mut normal = DVec3::ZERO;
+    for i in 0..n {
+        let current = loop_points[i];
+        let next = loop_points[(i + 1) % n];
+        normal.x += (current.y - next.y) * (current.z + next.z);
+        normal.y += (current.z - next.z) * (current.x + next.x);
+        normal.z += (current.x - next.x) * (current.y + next.y);
+    }
+
+    let normal = if normal.length_squared() > f64::EPSILON {
+        normal.normalize()
+    } else {
+        DVec3::Z
+    };
+
+    (centroid, normal)
+}
+
+/// 3D-aware analogue of [`canonicalize_orientation`] for loops that may not
+/// share a single common plane (e.g. contours from a curved
+/// [`crate::order::OrderField`] like [`crate::order::ConicalOrderField`],
+/// extracted by [`extract_order_contours_on_mesh`]).
+///
+/// Rather than projecting every loop into one shared `(basis1, basis2)`
+/// plane (which [`canonicalize_orientation`] does, and which is only valid
+/// when every loop in the layer is coplanar), each loop gets its *own*
+/// best-fit local origin/basis (see [`loop_centroid_and_normal`] +
+/// [`plane_basis`]). Nesting depth is decided by projecting a test point
+/// from loop `i` into loop `j`'s *own* local basis before running
+/// [`point_in_polygon`] against loop `j`'s own points (also projected into
+/// that same local basis) — i.e. every containment test is done in
+/// whichever loop's frame is being tested against, not in one global
+/// frame. This is exact for the concentric-nested-loops case this is built
+/// for (loops from the same isosurface at the same order value, nested
+/// around a common axis/apex — each individually near-planar even though
+/// the whole layer is not one shared plane), and degrades gracefully (not
+/// necessarily correctly) for a genuinely non-nested, wildly non-planar
+/// arrangement, which the order fields this codebase implements do not
+/// produce.
+fn canonicalize_orientation_per_loop_basis(loops: Vec<Vec<DVec3>>) -> Vec<Vec<DVec3>> {
+    if loops.len() <= 1 {
+        return loops;
+    }
+
+    // Each loop's own (centroid, basis1, basis2) frame, and its own points
+    // projected into that frame.
+    let frames: Vec<(DVec3, DVec3, DVec3)> = loops
+        .iter()
+        .map(|l| {
+            let (centroid, normal) = loop_centroid_and_normal(l);
+            let (basis1, basis2) = plane_basis(normal);
+            (centroid, basis1, basis2)
+        })
+        .collect();
+
+    let project = |p: DVec3, frame: &(DVec3, DVec3, DVec3)| -> (f64, f64) {
+        let (centroid, basis1, basis2) = *frame;
+        let d = p - centroid;
+        (d.dot(basis1), d.dot(basis2))
+    };
+
+    let self_projected: Vec<Vec<(f64, f64)>> = loops
+        .iter()
+        .zip(&frames)
+        .map(|(l, frame)| l.iter().map(|&p| project(p, frame)).collect())
+        .collect();
+
+    let depths: Vec<usize> = (0..loops.len())
+        .map(|i| {
+            if loops[i].is_empty() {
+                return 0;
+            }
+            let test_point = loops[i][0];
+            (0..loops.len())
+                .filter(|&j| {
+                    j != i && point_in_polygon(project(test_point, &frames[j]), &self_projected[j])
+                })
+                .count()
+        })
+        .collect();
+
+    loops
+        .into_iter()
+        .zip(self_projected)
+        .zip(depths)
+        .map(|((loop_points, poly2d), depth)| {
+            let want_ccw = depth % 2 == 0;
+            let is_ccw = signed_area(&poly2d) > 0.0;
+            if want_ccw == is_ccw {
+                loop_points
+            } else {
+                loop_points.into_iter().rev().collect()
+            }
+        })
+        .collect()
+}
+
 /// Extracts the contour of `field` at the plane `{ p : p.dot(direction) ==
 /// order_value }`, deriving the plane's origin and in-plane basis generally
 /// from `direction` (never hardcoded to a fixed axis), so a future
@@ -445,11 +565,13 @@ pub fn extract_contours_at_order<F: ScalarField + ?Sized>(
 ///
 /// Unlike [`extract_contours_at_order`], this does not assume the contour
 /// lies in a single plane: `order_field` may be a curved (e.g.
-/// [`crate::order::ConicalOrderField`]) order field, so the extracted
-/// loops are *not* passed through [`canonicalize_orientation`] (which
-/// relies on a single 2D plane-projection containment test that is only
-/// valid for planar contours). Winding/nesting semantics for curved-order
-/// contours are an open concern left to callers for now.
+/// [`crate::order::ConicalOrderField`]) order field, so winding/nesting is
+/// canonicalized via [`canonicalize_orientation_per_loop_basis`] rather
+/// than [`canonicalize_orientation`] — each loop gets its own best-fit
+/// local 2D projection (see that function's docs) instead of assuming one
+/// shared plane basis for the whole layer, which is exact for the
+/// concentric-nested-around-a-common-axis loops this codebase's order
+/// fields (`HeightOrderField`, `ConicalOrderField`) actually produce.
 ///
 /// `triangle_positions` is a flat slice where every 3 consecutive entries
 /// form one triangle (matching
@@ -487,7 +609,7 @@ pub fn extract_order_contours_on_mesh<O: OrderField + ?Sized>(
         }
     }
 
-    stitch_loops(segments)
+    canonicalize_orientation_per_loop_basis(stitch_loops(segments))
 }
 
 /// Builds an orthonormal in-plane basis (`basis1`, `basis2`) perpendicular
@@ -858,6 +980,113 @@ mod tests {
                     "loop point {p:?} should have order ~{order_value}, got {order}"
                 );
             }
+        }
+    }
+
+    /// A hollow-shell `ScalarField`: negative between `inner_radius` and
+    /// `outer_radius` (a spherical shell), positive elsewhere — same sign
+    /// convention as [`AnnulusField`] but isotropic in 3D (uses the full
+    /// `|p|` radius, not just an XY radius), so its isosurface is two
+    /// concentric sphere surfaces rather than one flat ring.
+    struct HollowSphereField {
+        inner_radius: f64,
+        outer_radius: f64,
+    }
+
+    impl ScalarField for HollowSphereField {
+        fn sample(&self, p: DVec3) -> crate::FieldSample {
+            let r = p.length();
+            let outer = r - self.outer_radius;
+            let inner = self.inner_radius - r;
+            let value = outer.max(inner);
+            let gradient = if r > f64::EPSILON {
+                p.normalize() * if outer > inner { 1.0 } else { -1.0 }
+            } else {
+                DVec3::X
+            };
+            crate::FieldSample { value, gradient }
+        }
+    }
+
+    #[test]
+    fn conical_order_field_hole_loop_winds_opposite_to_its_enclosing_outer_loop() {
+        use crate::marching_cubes::extract_isosurface;
+        use crate::order::ConicalOrderField;
+
+        // A hollow shell (solid between radius 0.5 and 1.0) sliced by a
+        // cone apexed at the origin, opening along +Z: the cone crosses
+        // both the outer and inner sphere surfaces, producing two loops on
+        // the same isosurface mesh that are *not* coplanar (this is the
+        // curved-order-field analogue of `annulus_hole_loop_winds_
+        // opposite_to_its_enclosing_outer_loop`, which uses a single flat
+        // plane instead).
+        let outer_radius = 1.0;
+        let inner_radius = 0.5;
+        let field = HollowSphereField {
+            inner_radius,
+            outer_radius,
+        };
+        let resolution = 64;
+        let bound = outer_radius * 1.5;
+        let min = DVec3::splat(-bound);
+        let max = DVec3::splat(bound);
+        let vertices = extract_isosurface(&field, min, max, resolution, 0.0);
+        assert!(!vertices.is_empty());
+        let triangle_positions: Vec<DVec3> = vertices.iter().map(|v| v.position).collect();
+
+        let order_field = ConicalOrderField::new(DVec3::ZERO, DVec3::Z, 0.3);
+        let order_value = 0.2;
+        let loops = extract_order_contours_on_mesh(&triangle_positions, &order_field, order_value);
+
+        assert_eq!(
+            loops.len(),
+            2,
+            "expected an outer loop (on the outer sphere) and a hole loop (on the inner sphere)"
+        );
+
+        let signed_area_3d = |points: &[DVec3]| -> f64 {
+            let n = points.len();
+            let mut area = 0.0;
+            for i in 0..n {
+                let a = points[i];
+                let b = points[(i + 1) % n];
+                area += a.x * b.y - b.x * a.y;
+            }
+            area * 0.5
+        };
+
+        let areas: Vec<f64> = loops.iter().map(|l| signed_area_3d(l)).collect();
+        let outer_idx = areas
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap())
+            .unwrap()
+            .0;
+        let hole_idx = 1 - outer_idx;
+
+        assert!(
+            areas[outer_idx].signum() != areas[hole_idx].signum(),
+            "expected outer loop ({}) and hole loop ({}) to wind oppositely",
+            areas[outer_idx],
+            areas[hole_idx]
+        );
+
+        // Sanity check: every point on the outer loop should be near the
+        // outer sphere's surface, every point on the hole loop near the
+        // inner sphere's surface.
+        let cell_size = 2.0 * bound / resolution as f64;
+        let tolerance = 3.0 * cell_size;
+        for &p in &loops[outer_idx] {
+            assert!(
+                approx_eq(p.length(), outer_radius, tolerance),
+                "outer loop point {p:?} should lie near the outer sphere (radius {outer_radius})"
+            );
+        }
+        for &p in &loops[hole_idx] {
+            assert!(
+                approx_eq(p.length(), inner_radius, tolerance),
+                "hole loop point {p:?} should lie near the inner sphere (radius {inner_radius})"
+            );
         }
     }
 }

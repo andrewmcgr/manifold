@@ -63,6 +63,10 @@ mod tests {
                 infill_angle_deg: 45.0,
                 top_layers: 3,
                 bottom_layers: 3,
+                order_field: Default::default(),
+                order_field_apex: glam::DVec3::ZERO,
+                order_field_axis: glam::DVec3::new(0.0, 0.0, 1.0),
+                order_field_slope: 0.0,
             },
         }
     }

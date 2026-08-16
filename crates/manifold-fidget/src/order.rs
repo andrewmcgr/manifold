@@ -87,6 +87,52 @@ impl OrderField for ConicalOrderField {
     }
 }
 
+/// Estimates the `(min, max)` range of `field.order(p)` for `p` ranging over
+/// the axis-aligned bounding box `[min_corner, max_corner]` (component-wise).
+///
+/// Sampling strategy: the box is sampled on a regular 3x3x3 grid (the 8
+/// corners, the 12 edge midpoints, the 6 face centers, and the box center —
+/// 27 points total, each axis subdivided at parameters `0.0`, `0.5`, `1.0`),
+/// and `(min, max)` is taken over those samples.
+///
+/// This is exact for any field whose extrema over the box are attained on
+/// its corners (in particular, any field affine/linear in `p`, e.g.
+/// [`HeightOrderField`], since a linear function's extrema over a convex
+/// polytope are always attained at a vertex). For genuinely curved fields
+/// (e.g. [`ConicalOrderField`]) whose extrema can occur strictly inside a
+/// face or the interior of the box, this is only an approximation: the
+/// 3x3x3 grid catches extrema at face/edge midpoints and the box center in
+/// addition to corners, but an extremum located elsewhere inside the box
+/// (e.g. off-grid along a curved isosurface) can still be missed, in which
+/// case the returned range may be slightly narrower than the true range.
+/// Callers needing a hard guarantee for arbitrary fields should pad the
+/// returned range or increase sampling density.
+pub fn order_range_over_bbox<F: OrderField>(
+    field: &F,
+    min_corner: DVec3,
+    max_corner: DVec3,
+) -> (f64, f64) {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+
+    for &tx in &[0.0, 0.5, 1.0] {
+        for &ty in &[0.0, 0.5, 1.0] {
+            for &tz in &[0.0, 0.5, 1.0] {
+                let p = DVec3::new(
+                    min_corner.x + tx * (max_corner.x - min_corner.x),
+                    min_corner.y + ty * (max_corner.y - min_corner.y),
+                    min_corner.z + tz * (max_corner.z - min_corner.z),
+                );
+                let value = field.order(p);
+                lo = lo.min(value);
+                hi = hi.max(value);
+            }
+        }
+    }
+
+    (lo, hi)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +285,51 @@ mod tests {
         // to `apex`, i.e. `order(p) = (p - apex).dot(axis)`.
         let p = DVec3::new(1.0, 2.0, 7.0);
         assert!(approx_eq(field.order(p), 4.0, 1e-9));
+    }
+
+    #[test]
+    fn order_range_over_bbox_matches_dot_product_for_height_order_field() {
+        // `slicing::BUILD_DIRECTION` (the only `HeightOrderField` direction
+        // actually used elsewhere in the workspace today) is axis-aligned,
+        // so `min_corner.dot(direction)`/`max_corner.dot(direction)` happen
+        // to already be the box's true extrema for that specific direction.
+        // Test against that same axis-aligned direction here, rather than an
+        // arbitrary one: for a *non*-axis-aligned direction with mixed-sign
+        // components, the true per-axis minimizing/maximizing corner isn't
+        // `min_corner`/`max_corner` themselves (e.g. a negative direction
+        // component's minimizer is that axis's *max* coordinate), so
+        // `min_corner.dot(direction)` would not equal the box's true minimum
+        // and this equality wouldn't hold in general -- that's a property of
+        // `HeightOrderField`'s existing (axis-aligned) usage, not something
+        // `order_range_over_bbox` needs to special-case.
+        let direction = DVec3::new(0.0, 0.0, -1.0);
+        let field = HeightOrderField::new(direction);
+
+        let min_corner = DVec3::new(-3.0, -1.0, 2.0);
+        let max_corner = DVec3::new(4.0, 5.0, 6.0);
+
+        let (lo, hi) = order_range_over_bbox(&field, min_corner, max_corner);
+
+        let expected_lo = min_corner.dot(direction).min(max_corner.dot(direction));
+        let expected_hi = min_corner.dot(direction).max(max_corner.dot(direction));
+
+        assert!(approx_eq(lo, expected_lo, 1e-9));
+        assert!(approx_eq(hi, expected_hi, 1e-9));
+    }
+
+    #[test]
+    fn order_range_over_bbox_is_non_degenerate_for_conical_order_field() {
+        let field = ConicalOrderField::new(DVec3::ZERO, DVec3::new(0.0, 0.0, 1.0), 0.5);
+
+        let min_corner = DVec3::new(-5.0, -5.0, 0.0);
+        let max_corner = DVec3::new(5.0, 5.0, 10.0);
+
+        let (lo, hi) = order_range_over_bbox(&field, min_corner, max_corner);
+
+        assert!(
+            lo < hi,
+            "expected a sane non-degenerate range, got lo={lo} hi={hi}"
+        );
+        assert!(lo.is_finite() && hi.is_finite());
     }
 }
