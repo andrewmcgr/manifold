@@ -1,6 +1,6 @@
 //! Non-planar slicing: mesh -> ordered layers of cross-section curves.
 
-use crate::{ids::ObjectId, mesh::Mesh, object::Object, Result, SlicerConfig};
+use crate::{ids::ObjectId, mesh::Mesh, object::Object, polygon2d, Result, SlicerConfig};
 use glam::DVec3;
 use manifold_fidget::contour::{extract_contours, plane_basis};
 use manifold_fidget::mesh_sdf::MeshSdf;
@@ -37,6 +37,17 @@ pub struct Layer {
     /// by `infill::InfillRegion::from_layer` as the fillable area. Empty
     /// for a layer with no contour.
     pub infill_boundary: Vec<Vec<DVec3>>,
+    /// The subset of [`Layer::infill_boundary`] that must print solid
+    /// (using the same infill pattern generator as sparse infill, just
+    /// run over this region too) rather than sparse infill, because it is
+    /// within [`SlicerConfig::top_layers`] of a facing-up exterior surface
+    /// or [`SlicerConfig::bottom_layers`] of a facing-down exterior
+    /// surface. Computed by [`compute_solid_fill_boundaries`] as a
+    /// post-pass once every layer of an object has been sliced (unlike
+    /// `infill_boundary`, which only needs this one layer's own contour).
+    /// Empty until that post-pass runs; always a subset of
+    /// `infill_boundary`.
+    pub solid_fill_boundary: Vec<Vec<DVec3>>,
 }
 
 /// One contour loop belonging to a specific wall/perimeter pass within a
@@ -232,29 +243,143 @@ pub fn slice_mesh_with_progress(
             // `wall_line_width` step inward from the innermost printed
             // wall (`wall_index == wall_count - 1`). Kept out of `loops`
             // so `toolpath::plan` never treats it as a printable wall.
-            let boundary_iso = -(config.wall_offset + wall_count as f64 * config.wall_line_width);
-            let infill_boundary = extract_contours(
-                &sdf,
-                origin,
-                basis1,
-                basis2,
-                extent,
-                extent,
-                resolution,
-                resolution,
-                boundary_iso,
-            );
+            //
+            // Computed as a 2D inward offset of the innermost wall loop(s)
+            // (rather than a further 3D SDF isosurface probe at
+            // `boundary_iso`): the SDF probe could come back empty even
+            // when the innermost wall itself is non-empty (e.g. thin
+            // features, or contour-extraction grid resolution missing the
+            // slightly-smaller isosurface), silently dropping infill on
+            // otherwise fillable layers. Offsetting the already-extracted
+            // wall loop in 2D instead guarantees a boundary whenever an
+            // innermost wall exists.
+            let innermost_wall_index = wall_count.saturating_sub(1);
+            let innermost_wall_loops: Vec<Vec<DVec3>> = loops
+                .iter()
+                .filter(|wall| wall.wall_index == innermost_wall_index)
+                .map(|wall| wall.points.clone())
+                .collect();
+            let infill_boundary = if innermost_wall_loops.is_empty() {
+                Vec::new()
+            } else {
+                let loops_2d = polygon2d::to_2d(&innermost_wall_loops, basis1, basis2, origin);
+                let offset_2d = polygon2d::inward_offset(&loops_2d, config.wall_line_width);
+                polygon2d::from_2d(offset_2d, basis1, basis2, origin)
+            };
             Layer {
                 index,
                 object: ObjectId::default(),
                 order: order_value,
                 loops,
                 infill_boundary,
+                solid_fill_boundary: Vec::new(),
             }
         })
         .collect();
 
     Ok(layers)
+}
+
+/// Post-pass computing every layer's [`Layer::solid_fill_boundary`] from
+/// its neighbors' [`Layer::infill_boundary`]s.
+///
+/// Runs once per object, over that object's full ordered layer stack, so
+/// one object's top/bottom detection never leaks into a neighboring
+/// object's layers (layers are grouped by [`Layer::object`], then ordered
+/// by [`Layer::index`] within each group — matching how [`slice_workspace`]
+/// concatenates each object's layer stack back-to-back).
+///
+/// For each layer `i` in an object's stack (`n` layers total, `0..n`):
+/// - `exposed_above(i)` is the part of `infill_boundary(i)` not covered by
+///   `infill_boundary(i + 1)` (the layer above) — i.e. a top-facing surface
+///   at `i`. Treated as fully exposed (`= infill_boundary(i)`) when there
+///   is no layer `i + 1`.
+/// - `exposed_below(i)` is symmetric, using `infill_boundary(i - 1)` (the
+///   layer below); fully exposed at `i == 0`.
+/// - `solid_fill_boundary(i)` is the union of `exposed_above(j)` for `j` in
+///   `i..=i + top_layers - 1` (clamped to the last layer) and
+///   `exposed_below(j)` for `j` in `i - bottom_layers + 1..=i` (clamped to
+///   the first layer), intersected with `infill_boundary(i)` so the result
+///   is always a subset of this layer's own fillable area.
+///
+/// Pure 2D geometry composition via [`polygon2d`]; no SDF/3D queries.
+/// `basis1`/`basis2` are recomputed from [`BUILD_DIRECTION`] (matching what
+/// [`slice_mesh_with_progress`] used to build every layer's
+/// `infill_boundary`) rather than passed in. Every layer is projected to
+/// 2D with the same fixed `origin` ([`DVec3::ZERO`]) so loops from
+/// different layers are directly comparable regardless of their differing
+/// `BUILD_DIRECTION` height — `to_2d`'s `(u, v)` output only depends on a
+/// point's `basis1`/`basis2` components, which fully capture its in-plane
+/// position independent of origin. Reconstructing back to 3D, however,
+/// uses each layer's own `origin_k = BUILD_DIRECTION * layer.order` (not
+/// the shared `DVec3::ZERO`), so the rebuilt points land back on that
+/// layer's actual height instead of collapsing onto the `BUILD_DIRECTION
+/// == 0` plane.
+pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig) {
+    use std::collections::BTreeMap;
+
+    let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+    let origin = DVec3::ZERO;
+
+    let mut groups: BTreeMap<ObjectId, Vec<usize>> = BTreeMap::new();
+    for (pos, layer) in layers.iter().enumerate() {
+        groups.entry(layer.object).or_default().push(pos);
+    }
+
+    for mut positions in groups.into_values() {
+        positions.sort_by_key(|&pos| layers[pos].index);
+        let n = positions.len();
+        if n == 0 {
+            continue;
+        }
+
+        let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
+            .iter()
+            .map(|&pos| polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin))
+            .collect();
+        let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+
+        let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
+            .map(|k| {
+                let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
+                if next.is_empty() {
+                    boundaries_2d[k].clone()
+                } else {
+                    polygon2d::difference(&boundaries_2d[k], next)
+                }
+            })
+            .collect();
+        let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
+            .map(|k| {
+                if k == 0 {
+                    boundaries_2d[k].clone()
+                } else {
+                    polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
+                }
+            })
+            .collect();
+
+        for k in 0..n {
+            let mut regions: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
+            if config.top_layers > 0 {
+                let end = (k + config.top_layers - 1).min(n - 1);
+                for exposed in exposed_above.iter().take(end + 1).skip(k) {
+                    regions.push(exposed.clone());
+                }
+            }
+            if config.bottom_layers > 0 {
+                let start = k.saturating_sub(config.bottom_layers - 1);
+                for exposed in exposed_below.iter().take(k + 1).skip(start) {
+                    regions.push(exposed.clone());
+                }
+            }
+            let exposed_union = polygon2d::union(&regions);
+            let solid_2d = polygon2d::intersection(&exposed_union, &boundaries_2d[k]);
+            let layer_origin = BUILD_DIRECTION * layers[positions[k]].order;
+            layers[positions[k]].solid_fill_boundary =
+                polygon2d::from_2d(solid_2d, basis1, basis2, layer_origin);
+        }
+    }
 }
 
 /// Computes a square in-plane sampling extent (see [`slice_mesh`]) large
@@ -302,7 +427,9 @@ pub fn slice_object(object: &Object, config: &SlicerConfig) -> Result<Vec<Layer>
     slice_object_with_progress(object, config, &mut |_| {})
 }
 
-/// Same as [`slice_object`], forwarding to [`slice_mesh_with_progress`].
+/// Same as [`slice_object`], forwarding to [`slice_mesh_with_progress`] and
+/// then running [`compute_solid_fill_boundaries`] as a post-pass over this
+/// object's own layer stack (never mixed with any other object's layers).
 pub fn slice_object_with_progress(
     object: &Object,
     config: &SlicerConfig,
@@ -322,6 +449,7 @@ pub fn slice_object_with_progress(
     for layer in &mut layers {
         layer.object = object.id;
     }
+    compute_solid_fill_boundaries(&mut layers, config);
     Ok(layers)
 }
 

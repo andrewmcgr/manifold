@@ -14,6 +14,7 @@ pub mod material;
 pub mod mesh;
 pub mod object;
 pub mod ordering;
+pub mod polygon2d;
 pub mod slicing;
 pub mod stl;
 pub mod threemf;
@@ -60,6 +61,16 @@ pub struct SlicerConfig {
     /// `Transform::in_plane_rotation_angle`) so rotating an object
     /// rotates its infill with it. Defaults to `45.0`.
     pub infill_angle_deg: f64,
+    /// Number of fully solid layers to generate at the top of each
+    /// object (adjacent to any facing-up exterior surface), replacing
+    /// what would otherwise be sparse infill with a solid fill pattern.
+    /// Defaults to `3`.
+    pub top_layers: usize,
+    /// Number of fully solid layers to generate at the bottom of each
+    /// object (adjacent to any facing-down exterior surface), replacing
+    /// what would otherwise be sparse infill with a solid fill pattern.
+    /// Defaults to `3`.
+    pub bottom_layers: usize,
 }
 
 impl Default for SlicerConfig {
@@ -76,6 +87,8 @@ impl Default for SlicerConfig {
             infill_pattern: infill::InfillPatternKind::default(),
             infill_line_width: nozzle_diameter,
             infill_angle_deg: 45.0,
+            top_layers: 3,
+            bottom_layers: 3,
         }
     }
 }

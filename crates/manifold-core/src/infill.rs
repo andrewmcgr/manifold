@@ -6,6 +6,7 @@
 //! `strategy_for`: new patterns implement [`InfillGenerator`] and are
 //! wired into [`generator_for`] without touching `toolpath::plan`.
 
+use crate::polygon2d;
 use crate::slicing::{Layer, BUILD_DIRECTION};
 use crate::toolpath::{MoveKind, Path, Segment};
 use crate::transform::Transform;
@@ -46,14 +47,27 @@ pub struct InfillRegion {
 }
 
 impl InfillRegion {
-    /// Build the fillable region for `layer`: its infill boundary, one
-    /// wall pass further inward than the innermost printed wall (see
-    /// [`crate::slicing::Layer::infill_boundary`]). Returns an empty
-    /// region (no loops) for a layer with no infill boundary.
+    /// Build the *sparse* fillable region for `layer`: its infill boundary
+    /// (see [`crate::slicing::Layer::infill_boundary`]) minus whatever part
+    /// of it must print solid (see
+    /// [`crate::slicing::Layer::solid_fill_boundary`]). Returns an empty
+    /// region (no loops) for a layer with no infill boundary, and excludes
+    /// the layer entirely if its whole infill boundary is solid.
     #[must_use]
     pub fn from_layer(layer: &Layer) -> Self {
+        if layer.solid_fill_boundary.is_empty() {
+            return Self {
+                loops: layer.infill_boundary.clone(),
+            };
+        }
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+        let origin = DVec3::ZERO;
+        let layer_origin = BUILD_DIRECTION * layer.order;
+        let infill_2d = polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, origin);
+        let solid_2d = polygon2d::to_2d(&layer.solid_fill_boundary, basis1, basis2, origin);
+        let sparse_2d = polygon2d::difference(&infill_2d, &solid_2d);
         Self {
-            loops: layer.infill_boundary.clone(),
+            loops: polygon2d::from_2d(sparse_2d, basis1, basis2, layer_origin),
         }
     }
 
@@ -294,6 +308,7 @@ mod tests {
                 DVec3::new(half_extent, half_extent, 0.0),
                 DVec3::new(-half_extent, half_extent, 0.0),
             ]],
+            solid_fill_boundary: Vec::new(),
         }
     }
 
@@ -313,6 +328,7 @@ mod tests {
             order: 0.0,
             loops: Vec::new(),
             infill_boundary: vec![vec![DVec3::Y, DVec3::new(1.0, 1.0, 0.0)]],
+            solid_fill_boundary: Vec::new(),
         };
         let region = InfillRegion::from_layer(&layer);
         assert_eq!(region.loops.len(), 1);
@@ -327,8 +343,52 @@ mod tests {
             order: 0.0,
             loops: Vec::new(),
             infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
         };
         assert!(InfillRegion::from_layer(&layer).is_empty());
+    }
+
+    #[test]
+    fn region_from_layer_is_empty_when_solid_fill_boundary_covers_the_whole_infill_boundary() {
+        let mut layer = square_layer(5.0);
+        layer.solid_fill_boundary = layer.infill_boundary.clone();
+        assert!(InfillRegion::from_layer(&layer).is_empty());
+    }
+
+    #[test]
+    fn region_from_layer_excludes_only_the_solid_fill_boundary_portion() {
+        // A 10x10 square infill boundary with a fully-solid 4x4 sub-square
+        // carved out of one corner: the sparse region should still cover
+        // the rest of the square, so it must not be empty.
+        let mut layer = square_layer(5.0);
+        layer.solid_fill_boundary = vec![vec![
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(5.0, 1.0, 0.0),
+            DVec3::new(5.0, 5.0, 0.0),
+            DVec3::new(1.0, 5.0, 0.0),
+        ]];
+        let region = InfillRegion::from_layer(&layer);
+        assert!(!region.is_empty());
+        // The sparse region must not contain the fully-solid sub-square's
+        // interior point.
+        let cfg = SlicerConfig {
+            infill_line_width: 0.5,
+            infill_angle_deg: 0.0,
+            ..SlicerConfig::default()
+        };
+        let layer_for_solid = layer.clone();
+        let solid_region = InfillRegion {
+            loops: layer_for_solid.solid_fill_boundary.clone(),
+        };
+        let sparse_paths = MonotonicInfill.generate(&region, &cfg, &layer, &Transform::identity());
+        let solid_paths = MonotonicInfill.generate(
+            &solid_region,
+            &cfg,
+            &layer_for_solid,
+            &Transform::identity(),
+        );
+        assert!(!sparse_paths.is_empty());
+        assert!(!solid_paths.is_empty());
     }
 
     #[test]
@@ -358,6 +418,7 @@ mod tests {
             order: 0.0,
             loops: Vec::new(),
             infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
         };
         let region = InfillRegion::from_layer(&layer);
         let paths = MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity());
@@ -439,6 +500,7 @@ mod tests {
                     DVec3::new(1.0, -1.0, 0.0),
                 ],
             ],
+            solid_fill_boundary: Vec::new(),
         };
         let cfg = SlicerConfig {
             infill_line_width: 0.5,

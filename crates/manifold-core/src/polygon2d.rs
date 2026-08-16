@@ -1,0 +1,296 @@
+//! 2D polygon helpers for slicer contour processing.
+//!
+//! Wraps the `i_overlay` crate (boolean ops + polygon offsetting) with
+//! `manifold-core`'s own `glam::DVec3` in-plane convention. Each per-layer
+//! cross-section is a set of closed loops lying in a plane defined by an
+//! `origin` and an orthonormal `(basis1, basis2)` pair, matching the
+//! convention `manifold_fidget::contour::plane_basis`/`extract_contours`
+//! already use: a 3D point `p` in the plane maps to 2D coordinates
+//! `(u, v) = ((p - origin).dot(basis1), (p - origin).dot(basis2))`, and back
+//! via `p = origin + u * basis1 + v * basis2`.
+//!
+//! `i_overlay`'s `[f64; 2]` point type is an internal implementation detail
+//! of this module only; nothing outside `polygon2d` should depend on it.
+
+use glam::DVec3;
+use i_overlay::core::fill_rule::FillRule;
+use i_overlay::core::overlay_rule::OverlayRule;
+use i_overlay::float::single::SingleFloatOverlay;
+use i_overlay::mesh::outline::offset::OutlineOffset;
+use i_overlay::mesh::style::OutlineStyle;
+
+/// The fill rule used for every boolean/offset operation in this module.
+///
+/// `NonZero` matches the winding convention produced by marching-squares
+/// contour extraction (single outer CCW loop + CW holes, no self-overlap),
+/// and is what `i_overlay`'s own offsetting/simplify docs assume.
+const FILL_RULE: FillRule = FillRule::NonZero;
+
+/// Projects a set of 3D loops lying in the plane `(origin, basis1, basis2)`
+/// down to 2D coordinates in that plane's basis.
+///
+/// `basis1`/`basis2` are assumed orthonormal (as produced by
+/// `manifold_fidget::contour::plane_basis`); this function does not
+/// normalize or orthogonalize them itself.
+pub fn to_2d(
+    loops: &[Vec<DVec3>],
+    basis1: DVec3,
+    basis2: DVec3,
+    origin: DVec3,
+) -> Vec<Vec<[f64; 2]>> {
+    loops
+        .iter()
+        .map(|loop_| {
+            loop_
+                .iter()
+                .map(|p| {
+                    let d = *p - origin;
+                    [d.dot(basis1), d.dot(basis2)]
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Inverse of [`to_2d`]: reconstructs 3D loops in the plane
+/// `(origin, basis1, basis2)` from 2D `(u, v)` coordinates in that basis.
+pub fn from_2d(
+    contours: Vec<Vec<[f64; 2]>>,
+    basis1: DVec3,
+    basis2: DVec3,
+    origin: DVec3,
+) -> Vec<Vec<DVec3>> {
+    contours
+        .into_iter()
+        .map(|contour| {
+            contour
+                .into_iter()
+                .map(|[u, v]| origin + basis1 * u + basis2 * v)
+                .collect()
+        })
+        .collect()
+}
+
+/// Normalizes a set of loops (fixes winding, removes self-intersections and
+/// degenerate/duplicate vertices) before feeding them into a boolean or
+/// offset operation, per `i_overlay`'s recommendation for raw
+/// marching-squares-style contour input.
+fn simplify(loops: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
+    use i_overlay::float::simplify::SimplifyShape;
+
+    loops
+        .simplify_shape(FILL_RULE)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Insets `loops2d` inward by `distance` (a positive value moves boundaries
+/// toward the interior of the shape, shrinking it — as used for wall-inset
+/// infill boundaries). `loops2d` is simplified first.
+pub fn inward_offset(loops2d: &[Vec<[f64; 2]>], distance: f64) -> Vec<Vec<[f64; 2]>> {
+    let simplified = simplify(loops2d);
+    let style = OutlineStyle::new(-distance.abs());
+    simplified.outline(&style).into_iter().flatten().collect()
+}
+
+/// Subtracts `clip` from `subj` (`subj - clip`). Both inputs are simplified
+/// first.
+pub fn difference(subj: &[Vec<[f64; 2]>], clip: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
+    let subj = simplify(subj);
+    let clip = simplify(clip);
+    subj.overlay(&clip, OverlayRule::Difference, FILL_RULE)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Unions all `regions` together into a single set of loops.
+pub fn union(regions: &[Vec<Vec<[f64; 2]>>]) -> Vec<Vec<[f64; 2]>> {
+    let mut regions = regions.iter();
+    let Some(first) = regions.next() else {
+        return Vec::new();
+    };
+    let mut acc = simplify(first);
+    for region in regions {
+        let region = simplify(region);
+        acc = acc
+            .overlay(&region, OverlayRule::Union, FILL_RULE)
+            .into_iter()
+            .flatten()
+            .collect();
+    }
+    acc
+}
+
+/// Intersects `subj` with `clip`. Both inputs are simplified first.
+pub fn intersection(subj: &[Vec<[f64; 2]>], clip: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
+    let subj = simplify(subj);
+    let clip = simplify(clip);
+    subj.overlay(&clip, OverlayRule::Intersect, FILL_RULE)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn square(x0: f64, y0: f64, side: f64) -> Vec<[f64; 2]> {
+        vec![
+            [x0, y0],
+            [x0, y0 + side],
+            [x0 + side, y0 + side],
+            [x0 + side, y0],
+        ]
+    }
+
+    fn approx_eq(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    /// Signed shoelace area of a single loop (positive for CCW, negative for CW).
+    fn signed_area(loop_: &[[f64; 2]]) -> f64 {
+        let mut area = 0.0;
+        for i in 0..loop_.len() {
+            let [x0, y0] = loop_[i];
+            let [x1, y1] = loop_[(i + 1) % loop_.len()];
+            area += x0 * y1 - x1 * y0;
+        }
+        area * 0.5
+    }
+
+    /// Total area of a shape (outer boundary minus holes), relying on
+    /// `i_overlay`'s convention that holes have the opposite winding to the
+    /// outer boundary (so summing signed areas across all loops in a shape
+    /// naturally subtracts hole area).
+    fn total_area(loops: &[Vec<[f64; 2]>]) -> f64 {
+        loops
+            .iter()
+            .map(|loop_| signed_area(loop_))
+            .sum::<f64>()
+            .abs()
+    }
+
+    #[test]
+    fn to_2d_from_2d_round_trip_axis_aligned() {
+        let basis1 = DVec3::X;
+        let basis2 = DVec3::Y;
+        let origin = DVec3::ZERO;
+        let loop_3d = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+        ];
+        let loops = vec![loop_3d.clone()];
+        let flat = to_2d(&loops, basis1, basis2, origin);
+        let back = from_2d(flat, basis1, basis2, origin);
+        assert_eq!(back.len(), 1);
+        for (a, b) in loop_3d.iter().zip(back[0].iter()) {
+            assert!(a.abs_diff_eq(*b, 1e-9), "expected {a:?}, got {b:?}");
+        }
+    }
+
+    #[test]
+    fn to_2d_from_2d_round_trip_non_trivial_plane() {
+        // A plane through a non-origin point, with a non-axis-aligned
+        // orthonormal basis (derived the same way plane_basis does: pick a
+        // direction, cross with a seed vector, cross again).
+        let direction = DVec3::new(1.0, 1.0, 1.0).normalize();
+        let seed = DVec3::X;
+        let basis1 = direction.cross(seed).normalize();
+        let basis2 = direction.cross(basis1).normalize();
+        let origin = DVec3::new(3.0, -2.0, 5.0);
+
+        // Build a loop that actually lies in this plane: origin plus
+        // offsets purely along basis1/basis2.
+        let loop_3d: Vec<DVec3> = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]
+            .iter()
+            .map(|(u, v)| origin + basis1 * *u + basis2 * *v)
+            .collect();
+
+        let loops = vec![loop_3d.clone()];
+        let flat = to_2d(&loops, basis1, basis2, origin);
+        let back = from_2d(flat, basis1, basis2, origin);
+        assert_eq!(back.len(), 1);
+        for (a, b) in loop_3d.iter().zip(back[0].iter()) {
+            assert!(a.abs_diff_eq(*b, 1e-9), "expected {a:?}, got {b:?}");
+        }
+    }
+
+    #[test]
+    fn inward_offset_shrinks_square() {
+        let sq = vec![square(0.0, 0.0, 10.0)];
+        let offset = inward_offset(&sq, 1.0);
+        assert!(!offset.is_empty());
+        // Inward offset of a 10x10 square by 1 should yield (roughly) an
+        // 8x8 square -> area 64, versus original area 100.
+        let area = total_area(&offset);
+        assert!(area < 100.0);
+        assert!(approx_eq(area, 64.0) || (area - 64.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn difference_removes_overlap() {
+        let subj = vec![square(0.0, 0.0, 10.0)];
+        let clip = vec![square(5.0, 0.0, 10.0)];
+        let result = difference(&subj, &clip);
+        let area = total_area(&result);
+        // subj area 100, overlap is 5x10=50, remainder should be ~50.
+        assert!(approx_eq(area, 50.0));
+    }
+
+    #[test]
+    fn union_combines_disjoint_and_overlapping() {
+        let a = square(0.0, 0.0, 10.0);
+        let b = square(5.0, 0.0, 10.0);
+        let result = union(&[vec![a], vec![b]]);
+        let area = total_area(&result);
+        // 100 + 100 - 50 overlap = 150.
+        assert!(approx_eq(area, 150.0));
+    }
+
+    #[test]
+    fn intersection_of_overlapping_squares() {
+        let a = vec![square(0.0, 0.0, 10.0)];
+        let b = vec![square(5.0, 0.0, 10.0)];
+        let result = intersection(&a, &b);
+        let area = total_area(&result);
+        assert!(approx_eq(area, 50.0));
+    }
+
+    #[test]
+    fn l_shape_boolean_ops() {
+        // L-shape: big square minus a corner square (represented directly
+        // as an outer loop + inner hole-like contour to feed the boolean
+        // op as a difference, since our contour convention is
+        // outer-CCW/hole-CW).
+        let big = square(0.0, 0.0, 10.0);
+        let corner = square(5.0, 5.0, 5.0);
+        let l_shape = difference(&[big], &[corner]);
+        let area = total_area(&l_shape);
+        // 100 - 25 = 75.
+        assert!(approx_eq(area, 75.0));
+
+        // Offsetting the L-shape inward should still produce a smaller,
+        // non-empty shape.
+        let offset = inward_offset(&l_shape, 0.5);
+        assert!(!offset.is_empty());
+        assert!(total_area(&offset) < area);
+    }
+
+    #[test]
+    fn square_with_hole_area() {
+        // Outer boundary CCW, hole CW (matches i_overlay's convention).
+        let outer = square(0.0, 0.0, 10.0);
+        let mut hole = square(3.0, 3.0, 2.0);
+        hole.reverse();
+        let shape = vec![outer, hole];
+        let simplified = simplify(&shape);
+        let area = total_area(&simplified);
+        // 100 - 4 = 96.
+        assert!(approx_eq(area, 96.0));
+    }
+}
