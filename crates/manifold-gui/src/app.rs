@@ -1310,7 +1310,11 @@ impl eframe::App for ManifoldApp {
 
         egui::SidePanel::left("settings_panel")
             .default_width(260.0)
-            .show(ctx, |ui| self.settings_panel(ui, frame));
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.settings_panel(ui, frame));
+            });
 
         if self.show_sdf_panel {
             egui::SidePanel::right("sdf_panel")
