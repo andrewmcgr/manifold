@@ -531,19 +531,43 @@ of silently falling back to flat slicing.
   bounds must be derived generically (sampling the field's range over the
   mesh's bounding box) rather than via `min.dot(direction)`/
   `max.dot(direction)`, which is `HeightOrderField`-specific.
-- **Contour extraction generalization (the hard part)**: today's
-  `extract_contours` (marching squares over a *flat* sampling plane
-  anchored at `origin`, spanned by `plane_basis(BUILD_DIRECTION)`) is only
-  correct when the order field's isosurface actually is that flat plane.
-  A curved field's isosurface (e.g. `ConicalOrderField`'s cone) needs a
-  genuine curved-surface walk — evaluating `order(p)` (not just the SDF)
-  over a curved sampling manifold, or marching-cubes-style extraction of
-  the 3D isosurface `order(p) == c` intersected with the mesh's SDF,
-  followed by projecting/parameterizing that curved patch into a walkable
-  toolpath curve. Needs its own design pass (open question, not resolved
-  by this roadmap entry) before implementation: whether to adapt
-  `manifold_fidget::marching_cubes` to walk `order` instead of the SDF, or
-  build a dedicated curved-contour walker.
+- **Contour extraction generalization, resolved design ("contour-on-mesh")**:
+  a layer's wall loop is the *intersection of two implicit surfaces* —
+  the wall's `MeshSdf` isosurface (`sdf(p) == wall_iso`) and the order
+  field's isosurface (`order(p) == c`). Today's `extract_contours` only
+  works because that intersection happens to be planar for
+  `HeightOrderField`; for a curved field (e.g. `ConicalOrderField`) it is
+  a genuine 3D space curve. Rather than inventing a bespoke dual-field
+  marching-cubes variant, reuse existing pieces:
+  1. Extract the wall surface **once per wall pass** (not once per
+     layer — an efficiency win over today's per-layer plane sampling) as
+     a triangle mesh via the already-generic
+     `manifold_fidget::marching_cubes::extract_isosurface::<MeshSdf>` at
+     the wall's SDF iso-value. No changes needed to that module; it
+     already works over any `ScalarField`.
+  2. Evaluate `order(p)` at every extracted vertex (one field evaluation
+     each, done once after step 1 — kept as a separate pass so
+     `marching_cubes` itself stays decoupled from `OrderField`).
+  3. For each target layer value `c`, walk the triangle mesh's edges for
+     `order`-crossings: per triangle, find edges whose endpoints straddle
+     `c` and linearly interpolate the crossing point (the same
+     `lerp_crossing` idea `contour.rs` already uses for marching
+     squares), producing loose line segments.
+  4. Stitch those segments into closed loops by generalizing
+     `contour.rs`'s existing `stitch_loops`/`point_key`/
+     `canonicalize_orientation` helpers (dedup-by-position-key,
+     walk-shared-endpoints, canonicalize winding) — that logic doesn't
+     appear to assume planarity anywhere, so it should adapt with
+     little change from the marching-squares segment-soup case to the
+     triangle-mesh-edge-crossing segment-soup case.
+  **Open risk to validate before implementing**: triangle-soup
+  degeneracies (T-junctions, near-tangent order-field crossings at edges
+  shared by non-adjacent-looking triangles, since `extract_isosurface`'s
+  output has no shared-vertex indexing) could produce gaps the same way
+  the existing marching-squares stitcher already has to guard against —
+  worth a stress test specifically against `ConicalOrderField`, whose
+  isosurfaces are provably non-planar, before trusting this on real
+  meshes.
 - `Layer.loops`/`infill_boundary`/`solid_fill_boundary` stay `Vec<DVec3>`-
   based polylines (no data-model change) — only *how* those points are
   generated changes, not what downstream (`toolpath::plan`, `gcode::emit`,
