@@ -552,6 +552,11 @@ impl ManifoldApp {
                     OrderFieldKind::Conical,
                     "Conical",
                 );
+                ui.selectable_value(
+                    &mut self.config.order_field,
+                    OrderFieldKind::Eikonal,
+                    "Eikonal",
+                );
             });
         if previous_order_field != OrderFieldKind::Conical
             && self.config.order_field == OrderFieldKind::Conical
