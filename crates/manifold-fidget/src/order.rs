@@ -14,7 +14,7 @@ use glam::DVec3;
 /// sequence of increasing `c`) define the slicing order — the simplest
 /// instance, [`HeightOrderField`], reduces this to conventional planar
 /// slicing along a build direction.
-pub trait OrderField {
+pub trait OrderField: Send + Sync {
     /// Evaluates the order field at `p`.
     fn order(&self, p: DVec3) -> f64;
 }
@@ -107,7 +107,7 @@ impl OrderField for ConicalOrderField {
 /// case the returned range may be slightly narrower than the true range.
 /// Callers needing a hard guarantee for arbitrary fields should pad the
 /// returned range or increase sampling density.
-pub fn order_range_over_bbox<F: OrderField>(
+pub fn order_range_over_bbox<F: OrderField + ?Sized>(
     field: &F,
     min_corner: DVec3,
     max_corner: DVec3,

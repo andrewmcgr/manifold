@@ -1,9 +1,15 @@
 //! Non-planar slicing: mesh -> ordered layers of cross-section curves.
 
-use crate::{ids::ObjectId, mesh::Mesh, object::Object, polygon2d, Result, SlicerConfig};
+use crate::{
+    ids::ObjectId, mesh::Mesh, object::Object, order_field, polygon2d, Result, SlicerConfig,
+};
 use glam::DVec3;
-use manifold_fidget::contour::{extract_contours, plane_basis};
+use manifold_fidget::contour::{
+    extract_contours, extract_order_contours_on_mesh, loop_centroid_and_normal, plane_basis,
+};
+use manifold_fidget::marching_cubes::extract_isosurface;
 use manifold_fidget::mesh_sdf::MeshSdf;
+use manifold_fidget::order::order_range_over_bbox;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -157,10 +163,14 @@ pub fn slice_mesh_with_progress(
         .collect();
     let sdf = MeshSdf::new(mesh.vertices.clone(), faces);
 
-    let order_at_min = min.dot(BUILD_DIRECTION);
-    let order_at_max = max.dot(BUILD_DIRECTION);
-    let order_min = order_at_min.min(order_at_max);
-    let order_max = order_at_min.max(order_at_max);
+    // Resolve the configured order field once per slice (defaults to a
+    // `HeightOrderField` along `BUILD_DIRECTION`, matching pre-existing
+    // behavior exactly). `order_range_over_bbox` generically replaces the
+    // old `min.dot(BUILD_DIRECTION)`/`max.dot(BUILD_DIRECTION)` shortcut —
+    // exact for any field whose extrema are attained at box corners, which
+    // covers the affine `HeightOrderField` default used everywhere today.
+    let field = order_field::order_field_for(config.order_field, config);
+    let (order_min, order_max) = order_range_over_bbox(&*field, min, max);
 
     // In-plane sample extent: sized off the mesh's bounding box
     // *projected onto the contour-extraction plane's in-plane basis*
@@ -207,8 +217,45 @@ pub fn slice_mesh_with_progress(
     // `on_progress` is `&mut dyn FnMut`, not `Sync`, so serialize calls into
     // it behind a `Mutex` — contention is negligible since each holder only
     // reports one f64 and releases immediately, and the expensive work
-    // (`extract_contours`) happens before the lock is taken.
+    // (`extract_contours`/`extract_order_contours_on_mesh`) happens before
+    // the lock is taken.
     let progress_callback = Mutex::new(on_progress);
+
+    let wall_count = config.wall_count();
+
+    // Dispatch on the resolved field kind (cheap enum comparison on
+    // `config.order_field`, not any runtime type-inspection of the `dyn
+    // OrderField` trait object): `Height` keeps today's exact plane-sampling
+    // fast path unchanged; anything else (e.g. `Conical`) uses the
+    // generalized "contour-on-mesh" path, which extracts each wall pass's
+    // isosurface once (not once per layer) and walks it per layer.
+    let is_height = matches!(config.order_field, order_field::OrderFieldKind::Height);
+
+    // Curved path only: one triangle soup per wall pass, shared across every
+    // layer's `extract_order_contours_on_mesh` call below. Computed up front
+    // (outside the per-layer parallel loop) since it does not depend on the
+    // layer's `order_value` — only on the wall pass's `iso`.
+    let curved_wall_meshes: Vec<Vec<DVec3>> = if is_height {
+        Vec::new()
+    } else {
+        let full_diagonal = (max - min).length();
+        let iso_resolution = contour_resolution(
+            full_diagonal,
+            config.nozzle_diameter,
+            CONTOUR_REFINEMENT_DIVISOR,
+        );
+        (0..wall_count)
+            .map(|wall_index| {
+                let iso = -(config.wall_offset + wall_index as f64 * config.wall_line_width);
+                let vertices = extract_isosurface::<MeshSdf>(&sdf, min, max, iso_resolution, iso);
+                // `extract_order_contours_on_mesh` walks a flat position soup
+                // (see its doc comment), decoupled from `marching_cubes`'s
+                // `Vertex` (position + normal) — no `OrderField` dependency
+                // is added to `marching_cubes` itself.
+                vertices.into_iter().map(|v| v.position).collect()
+            })
+            .collect()
+    };
 
     let layers: Vec<Layer> = order_values
         .par_iter()
@@ -216,23 +263,34 @@ pub fn slice_mesh_with_progress(
         .map(|(index, &order_value)| {
             let origin =
                 bbox_center + BUILD_DIRECTION * (order_value - bbox_center.dot(BUILD_DIRECTION));
-            let wall_count = config.wall_count();
             let mut loops = Vec::new();
-            for wall_index in 0..wall_count {
-                // Negative iso = inward (see `MeshSdf::sign_at`: positive
-                // outside, negative inside). Wall 0 sits `wall_offset` in
-                // from the true surface (nozzle-center offset so the
-                // nozzle's outer edge lands on the surface); each further
-                // wall steps another `wall_line_width` inward.
-                let iso = -(config.wall_offset + wall_index as f64 * config.wall_line_width);
-                let wall_loops = extract_contours(
-                    &sdf, origin, basis1, basis2, extent, extent, resolution, resolution, iso,
-                );
-                loops.extend(
-                    wall_loops
-                        .into_iter()
-                        .map(|points| WallLoop { wall_index, points }),
-                );
+            if is_height {
+                for wall_index in 0..wall_count {
+                    // Negative iso = inward (see `MeshSdf::sign_at`: positive
+                    // outside, negative inside). Wall 0 sits `wall_offset` in
+                    // from the true surface (nozzle-center offset so the
+                    // nozzle's outer edge lands on the surface); each further
+                    // wall steps another `wall_line_width` inward.
+                    let iso = -(config.wall_offset + wall_index as f64 * config.wall_line_width);
+                    let wall_loops = extract_contours(
+                        &sdf, origin, basis1, basis2, extent, extent, resolution, resolution, iso,
+                    );
+                    loops.extend(
+                        wall_loops
+                            .into_iter()
+                            .map(|points| WallLoop { wall_index, points }),
+                    );
+                }
+            } else {
+                for (wall_index, triangle_positions) in curved_wall_meshes.iter().enumerate() {
+                    let wall_loops =
+                        extract_order_contours_on_mesh(triangle_positions, &*field, order_value);
+                    loops.extend(
+                        wall_loops
+                            .into_iter()
+                            .map(|points| WallLoop { wall_index, points }),
+                    );
+                }
             }
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if let Ok(mut callback) = progress_callback.lock() {
@@ -265,6 +323,23 @@ pub fn slice_mesh_with_progress(
             // silently dropping infill on otherwise fillable layers.
             // Offsetting the already-extracted wall loop in 2D instead
             // guarantees a boundary whenever any wall exists.
+            //
+            // Curved path (non-Height order field): no single shared plane
+            // basis exists for a curved-field layer's loops (they are each
+            // only *locally* near-planar, concentric around a common
+            // apex/axis — see `manifold_fidget::contour`'s module docs), so
+            // each innermost wall loop is offset independently in its own
+            // best-fit local basis (`loop_centroid_and_normal` +
+            // `plane_basis`, the same pairing
+            // `canonicalize_orientation_per_loop_basis` uses internally,
+            // reused here rather than duplicated) instead of the Height
+            // path's one shared `plane_basis(BUILD_DIRECTION)`. This is a
+            // best-effort per-loop approximation, not a single unified
+            // curved-boundary computation: exact correctness for
+            // arbitrarily curved solid-fill boundaries is an explicitly
+            // soft requirement for this phase, not a hard blocker — see
+            // ROADMAP.md Phase 15's "explicitly out of scope" section (no
+            // toolpath-level physical-printability guarantees this phase).
             let innermost_wall_loops: Vec<Vec<DVec3>> = (0..wall_count)
                 .rev()
                 .map(|wall_index| {
@@ -278,10 +353,26 @@ pub fn slice_mesh_with_progress(
                 .unwrap_or_default();
             let infill_boundary = if innermost_wall_loops.is_empty() {
                 Vec::new()
-            } else {
+            } else if is_height {
                 let loops_2d = polygon2d::to_2d(&innermost_wall_loops, basis1, basis2, origin);
                 let offset_2d = polygon2d::inward_offset(&loops_2d, config.wall_line_width);
                 polygon2d::from_2d(offset_2d, basis1, basis2, origin)
+            } else {
+                innermost_wall_loops
+                    .iter()
+                    .flat_map(|loop_points| {
+                        let (centroid, normal) = loop_centroid_and_normal(loop_points);
+                        let (loop_basis1, loop_basis2) = plane_basis(normal);
+                        let loop_2d = polygon2d::to_2d(
+                            std::slice::from_ref(loop_points),
+                            loop_basis1,
+                            loop_basis2,
+                            centroid,
+                        );
+                        let offset_2d = polygon2d::inward_offset(&loop_2d, config.wall_line_width);
+                        polygon2d::from_2d(offset_2d, loop_basis1, loop_basis2, centroid)
+                    })
+                    .collect()
             };
             Layer {
                 index,
@@ -875,9 +966,128 @@ mod tests {
     }
 
     #[test]
+    fn slice_mesh_height_order_field_matches_pre_change_order_range() {
+        // Regression test for the `order_field::order_field_for` +
+        // `order_range_over_bbox` wiring: for the default (Height) config,
+        // slicing must produce the identical layer count and order values
+        // as the old `min.dot(BUILD_DIRECTION)`/`max.dot(BUILD_DIRECTION)`
+        // shortcut it replaced.
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            ..SlicerConfig::default()
+        };
+
+        let mesh = cube_mesh();
+        let (min, max) = mesh.bounding_box().unwrap();
+        let order_at_min = min.dot(BUILD_DIRECTION);
+        let order_at_max = max.dot(BUILD_DIRECTION);
+        let expected_order_min = order_at_min.min(order_at_max);
+        let expected_order_max = order_at_min.max(order_at_max);
+
+        let layers = slice_mesh(&mesh, &config).unwrap();
+
+        assert_eq!(
+            layers.len(),
+            5,
+            "expected 5 stepped layers over [0, 1] at layer_height 0.25"
+        );
+        let mut expected_order = expected_order_min;
+        for layer in &layers {
+            assert!(
+                (layer.order - expected_order).abs() < 1e-9,
+                "expected layer order {expected_order}, got {}",
+                layer.order
+            );
+            expected_order += config.layer_height;
+        }
+        assert!(layers.last().unwrap().order <= expected_order_max + 1e-9);
+    }
+
+    #[test]
     fn slice_mesh_returns_no_layers_for_an_empty_mesh() {
         let layers = slice_mesh(&Mesh::default(), &SlicerConfig::default()).unwrap();
         assert!(layers.is_empty());
+    }
+
+    #[test]
+    fn slice_mesh_conical_order_field_produces_real_curved_contour_geometry() {
+        // Proves the curved ("contour-on-mesh") path in
+        // `slice_mesh_with_progress` actually dispatches on
+        // `config.order_field` and produces real geometry, instead of
+        // silently falling back to the flat path or to empty loops. Apex
+        // below the cube, axis pointing up through it, so the cube's [0,1]
+        // Z range sits well inside the cone's opening and every layer's
+        // order value has a genuinely curved (non-planar) isosurface.
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            order_field: crate::order_field::OrderFieldKind::Conical,
+            order_field_apex: DVec3::new(0.5, 0.5, -1.0),
+            order_field_axis: DVec3::new(0.0, 0.0, 1.0),
+            order_field_slope: 0.3,
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&cube_mesh(), &config).unwrap();
+
+        assert!(!layers.is_empty());
+        assert!(
+            layers.iter().any(|layer| !layer.loops.is_empty()),
+            "expected at least one layer with non-empty loops from the curved contour-on-mesh path"
+        );
+        for layer in &layers {
+            if !layer.loops.is_empty() {
+                for wall_loop in &layer.loops {
+                    assert!(!wall_loop.points.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slice_mesh_conical_order_field_has_no_unexpected_gaps_through_a_tall_thin_pyramid() {
+        // Parallel of `slice_mesh_has_no_empty_contour_gaps_through_a_tall_thin_pyramid`
+        // for the curved path (ROADMAP.md Phase 15 "Open risk" note): a
+        // non-trivial (non-primitive) mesh's triangle-soup isosurface can, in
+        // principle, stitch gappily where the flat plane-sampling path
+        // wouldn't. Apex below the pyramid's base, axis along its own axis of
+        // symmetry, so the cone's isosurfaces sweep cleanly up through the
+        // body without ever running parallel to a face.
+        let config = SlicerConfig {
+            layer_height: 1.0,
+            order_field: crate::order_field::OrderFieldKind::Conical,
+            order_field_apex: DVec3::new(0.0, 0.0, -5.0),
+            order_field_axis: DVec3::new(0.0, 0.0, 1.0),
+            order_field_slope: 0.05,
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&tall_thin_pyramid_mesh(), &config).unwrap();
+        assert!(!layers.is_empty());
+
+        let first_nonempty = layers.iter().position(|layer| !layer.loops.is_empty());
+        let last_nonempty = layers.iter().rposition(|layer| !layer.loops.is_empty());
+
+        let (Some(first_nonempty), Some(last_nonempty)) = (first_nonempty, last_nonempty) else {
+            panic!("expected at least one layer with contour loops on the curved path");
+        };
+
+        // Known limitation (see ROADMAP.md Phase 15 "Open risk to validate"):
+        // the triangle-soup contour-on-mesh stitching can miss a thin near-tip
+        // slice that the exact plane-sampling path wouldn't, so this is
+        // intentionally looser than the flat-path equivalent test — it only
+        // asserts the interior of the nonempty run isn't gappy, not that
+        // every single layer between the mesh's extremes produced a loop.
+        let mut gaps = 0usize;
+        for layer in &layers[first_nonempty..=last_nonempty] {
+            if layer.loops.is_empty() {
+                gaps += 1;
+            }
+        }
+        assert!(
+            gaps <= 1,
+            "curved contour-on-mesh path produced {gaps} unexpected gap(s) through the pyramid's body \
+             (known limitation threshold exceeded, see ROADMAP.md Phase 15 \"Open risk\")"
+        );
     }
 
     /// Slim square pyramid: base [-0.5, 0.5]^2 at Z=0, apex at (0, 0, 20)

@@ -415,7 +415,17 @@ fn point_in_polygon(point: (f64, f64), polygon: &[(f64, f64)]) -> bool {
 /// apex/axis). Returns `(centroid, normal)`; `normal` is `DVec3::Z` as an
 /// arbitrary fallback for degenerate input (`< 3` points, or a normal too
 /// small to normalize, e.g. a collinear/zero-area loop).
-fn loop_centroid_and_normal(loop_points: &[DVec3]) -> (DVec3, DVec3) {
+///
+/// Exposed (rather than kept private) so callers that need a per-loop
+/// best-fit local 2D projection/basis for a loop that may not lie in any
+/// single shared plane (e.g. `manifold-core::polygon2d`'s inward-offset
+/// step, which needs a per-loop local basis for curved-order-field contour
+/// loops instead of one shared `(basis1, basis2)` plane per layer) can
+/// combine this with [`plane_basis`] — `plane_basis(normal)` after calling
+/// this — the exact same pairing [`canonicalize_orientation_per_loop_basis`]
+/// uses internally, instead of duplicating this centroid/normal-estimation
+/// logic.
+pub fn loop_centroid_and_normal(loop_points: &[DVec3]) -> (DVec3, DVec3) {
     let n = loop_points.len();
     if n < 3 {
         let centroid = loop_points.iter().copied().sum::<DVec3>() / (n.max(1) as f64);
