@@ -419,23 +419,25 @@ pub fn slice_mesh_with_progress(
 ///   own fillable area.
 ///
 /// Pure 2D geometry composition via [`polygon2d`]; no SDF/3D queries.
-/// `basis1`/`basis2` are recomputed from [`BUILD_DIRECTION`] (matching what
-/// [`slice_mesh_with_progress`] used to build every layer's
-/// `infill_boundary`) rather than passed in. Every layer is projected to
-/// 2D with the same fixed `origin` ([`DVec3::ZERO`]) so loops from
+/// `basis1`/`basis2`/`axis`/`apex`/`slope` are resolved from `config`'s
+/// order field (see [`order_field::resolve_axis_apex_slope`]) — matching
+/// whatever `slice_mesh_with_progress` actually used to build every
+/// layer's `infill_boundary` — rather than hardcoding [`BUILD_DIRECTION`],
+/// which is wrong for a curved (`Conical`) order field. Every layer is
+/// projected to 2D with the same fixed `origin` (`apex`) so loops from
 /// different layers are directly comparable regardless of their differing
-/// `BUILD_DIRECTION` height — `to_2d`'s `(u, v)` output only depends on a
+/// height along `axis` — `to_2d`'s `(u, v)` output only depends on a
 /// point's `basis1`/`basis2` components, which fully capture its in-plane
 /// position independent of origin. Reconstructing back to 3D, however,
-/// uses each layer's own `origin_k = BUILD_DIRECTION * layer.order` (not
-/// the shared `DVec3::ZERO`), so the rebuilt points land back on that
-/// layer's actual height instead of collapsing onto the `BUILD_DIRECTION
-/// == 0` plane.
+/// uses [`order_field::reconstruct_on_order_field`] with each layer's own
+/// `order`, so the rebuilt points land back on that layer's actual
+/// (possibly curved) surface instead of collapsing onto one flat plane.
 pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig) {
     use std::collections::BTreeMap;
 
-    let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
-    let origin = DVec3::ZERO;
+    let (axis, apex, slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
+    let (basis1, basis2) = plane_basis(axis);
+    let origin = apex;
 
     let mut groups: BTreeMap<ObjectId, Vec<usize>> = BTreeMap::new();
     for (pos, layer) in layers.iter().enumerate() {
@@ -514,9 +516,10 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             .collect();
 
         for (k, solid_2d) in solid_2d_per_k.into_iter().enumerate() {
-            let layer_origin = BUILD_DIRECTION * layers[positions[k]].order;
-            layers[positions[k]].solid_fill_boundary =
-                polygon2d::from_2d(solid_2d, basis1, basis2, layer_origin);
+            let order = layers[positions[k]].order;
+            layers[positions[k]].solid_fill_boundary = order_field::reconstruct_on_order_field(
+                solid_2d, basis1, basis2, axis, apex, order, slope,
+            );
         }
     }
 }

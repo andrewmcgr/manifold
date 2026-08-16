@@ -6,78 +6,14 @@
 //! `strategy_for`: new patterns implement [`InfillGenerator`] and are
 //! wired into [`generator_for`] without touching `toolpath::plan`.
 
-use crate::order_field::OrderFieldKind;
+use crate::order_field;
 use crate::polygon2d;
-use crate::slicing::{Layer, BUILD_DIRECTION};
+use crate::slicing::Layer;
 use crate::toolpath::{MoveKind, Path, Segment};
 use crate::transform::Transform;
 use crate::SlicerConfig;
 use glam::DVec3;
 use manifold_fidget::contour::plane_basis;
-
-/// Resolves `config.order_field`'s effective `(axis, apex, slope)` for
-/// order-field-aware plane-basis/reconstruction math (see
-/// [`reconstruct_on_order_field`]). `Height` is treated as a degenerate
-/// cone — `apex` at the origin, `slope` `0.0` — along
-/// `slicing::BUILD_DIRECTION` specifically (not `config.order_field_axis`,
-/// which is documented as inert unless `order_field` is `Conical`), so
-/// this always matches whatever `slicing::slice_mesh` actually used to
-/// produce `layer.order` in the first place.
-fn resolve_order_field(config: &SlicerConfig) -> (DVec3, DVec3, f64) {
-    match config.order_field {
-        OrderFieldKind::Height => (BUILD_DIRECTION, DVec3::ZERO, 0.0),
-        OrderFieldKind::Conical => (
-            config.order_field_axis,
-            config.order_field_apex,
-            config.order_field_slope,
-        ),
-    }
-}
-
-/// Order-field-aware inverse of [`polygon2d::from_2d`]: reconstructs each
-/// `(u, v)` point's true height along `axis` by solving
-/// `order(p) = along - slope * radial` for `along`, where
-/// `radial = sqrt(u*u + v*v)` is `(u, v)`'s distance from the axis line
-/// (exact when `origin` is `apex` and `basis1`/`basis2` are the orthonormal
-/// perpendicular-to-`axis` basis from `plane_basis(axis)` — see
-/// `ConicalOrderField`'s doc comment for the same `radial` identity).
-/// `slope == 0.0` (the `Height` case, see [`resolve_order_field`])
-/// degenerates `along` to exactly `order` for every point, matching
-/// `polygon2d::from_2d`'s flat reconstruction exactly.
-///
-/// This must be used instead of `polygon2d::from_2d` whenever `origin`
-/// is a genuinely curved field's apex — `from_2d` assumes one flat height
-/// for every point, which is wrong for `Conical` wherever `radial` varies
-/// across the loop (i.e. essentially always, since a cone's radius varies
-/// continuously along its surface). Previously used for exactly this
-/// (`InfillRegion::from_layer`'s solid/sparse difference reconstruction),
-/// flattening every resulting point — including new vertices introduced by
-/// the boolean clip itself — onto one wrong height, detaching infill from
-/// the actual curved wall surface for any layer with a non-empty
-/// `solid_fill_boundary` under a `Conical` order field.
-fn reconstruct_on_order_field(
-    contours: Vec<Vec<[f64; 2]>>,
-    basis1: DVec3,
-    basis2: DVec3,
-    axis: DVec3,
-    apex: DVec3,
-    order: f64,
-    slope: f64,
-) -> Vec<Vec<DVec3>> {
-    contours
-        .into_iter()
-        .map(|contour| {
-            contour
-                .into_iter()
-                .map(|[u, v]| {
-                    let radial = (u * u + v * v).sqrt();
-                    let along = order + slope * radial;
-                    apex + basis1 * u + basis2 * v + axis * along
-                })
-                .collect()
-        })
-        .collect()
-}
 
 /// Which built-in infill pattern to generate. New patterns are added as a
 /// new variant here plus a new `InfillGenerator` impl wired into
@@ -125,13 +61,13 @@ impl InfillRegion {
                 loops: layer.infill_boundary.clone(),
             };
         }
-        let (axis, apex, slope) = resolve_order_field(config);
+        let (axis, apex, slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
         let (basis1, basis2) = plane_basis(axis);
         let infill_2d = polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, apex);
         let solid_2d = polygon2d::to_2d(&layer.solid_fill_boundary, basis1, basis2, apex);
         let sparse_2d = polygon2d::difference(&infill_2d, &solid_2d);
         Self {
-            loops: reconstruct_on_order_field(
+            loops: order_field::reconstruct_on_order_field(
                 sparse_2d,
                 basis1,
                 basis2,
@@ -202,7 +138,8 @@ impl InfillGenerator for MonotonicInfill {
             return Vec::new();
         }
 
-        let (axis, _apex, _slope) = resolve_order_field(config);
+        let (axis, _apex, _slope) =
+            order_field::resolve_axis_apex_slope(config.order_field, config);
         let (basis1, basis2) = plane_basis(axis);
         let object_angle = object_transform.in_plane_rotation_angle(basis1, basis2);
         let alternation = if layer.index.is_multiple_of(2) {
