@@ -73,46 +73,65 @@ pub fn order_field_for(
 }
 
 /// Builds the [`OrderFieldKind::Eikonal`] field for `mesh`: seeds the FMM
-/// front from `mesh`'s base/contact surface with the build plate (vertices
-/// at or within a small tolerance of the mesh's minimum Z -- the "rests on
-/// floor" convention already used by `object::center_on_bed` and
-/// `manifold-gui`'s `scene::build_bed_quad`, both of which treat `min.z` as
-/// the build plate's height), and derives grid resolution from `mesh`'s
-/// bounding box and the finer of `config.layer_height`/`config.nozzle_diameter`
-/// (reusing those existing resolution-driving config fields rather than
-/// adding a new one). Using `layer_height` alone (0.2mm by default) produced
-/// a grid too coarse to resolve fine surface detail (e.g. helical/screw
-/// grooves) -- trilinear interpolation of an under-resolved distance field
-/// visibly facets the reconstructed contours -- so the cell size is halved
-/// again on top of the finer of the two dimensions for extra headroom. That
-/// resolution-driven cell size is then passed through
-/// [`clamp_cell_size_to_node_budget`], which coarsens it (grows it) as
-/// needed so the dense grid's total node count never exceeds
-/// [`MAX_EIKONAL_GRID_NODES`] -- without this, a large part sliced at a
-/// fine layer height/nozzle diameter (e.g. an 85mm-tall part at the 0.2mm
-/// default layer height, cell size 0.05mm) requests a `~1700^3` node grid,
-/// whose `Vec<f64>` distance buffer alone is tens of gigabytes and OOMs the
-/// process; the budget trades local resolution for a bounded, predictable
-/// memory footprint on large parts.
+/// front from `mesh`'s base/contact region with the build plate (every
+/// solid-classified grid node at or within a small tolerance of the mesh's
+/// minimum Z -- the "rests on floor" convention already used by
+/// `object::center_on_bed` and `manifold-gui`'s `scene::build_bed_quad`,
+/// both of which treat `min.z` as the build plate's height), and derives
+/// grid resolution from `mesh`'s bounding box and the finer of
+/// `config.layer_height`/`config.nozzle_diameter` (reusing those existing
+/// resolution-driving config fields rather than adding a new one). Using
+/// `layer_height` alone (0.2mm by default) produced a grid too coarse to
+/// resolve fine surface detail (e.g. helical/screw grooves) -- trilinear
+/// interpolation of an under-resolved distance field visibly facets the
+/// reconstructed contours -- so the cell size is halved again on top of the
+/// finer of the two dimensions for extra headroom. That resolution-driven
+/// cell size is then passed through [`clamp_cell_size_to_node_budget`],
+/// which coarsens it (grows it) as needed so the dense grid's total node
+/// count never exceeds [`MAX_EIKONAL_GRID_NODES`] -- without this, a large
+/// part sliced at a fine layer height/nozzle diameter (e.g. an 85mm-tall
+/// part at the 0.2mm default layer height, cell size 0.05mm) requests a
+/// `~1700^3` node grid, whose `Vec<f64>` distance buffer alone is tens of
+/// gigabytes and OOMs the process; the budget trades local resolution for
+/// a bounded, predictable memory footprint on large parts.
 ///
-/// The march is occupancy-aware (see
-/// [`manifold_fidget::eikonal::EikonalOrderField::new_with_occupancy`]):
-/// a grid node counts as solid when a fresh `MeshSdf` built from `mesh`
-/// reports it inside the mesh, or within `cell_size` of the surface (a
-/// tolerance covering the discretization gap between the grid and the true
-/// boundary -- without it, nodes exactly on a thin wall's surface could be
-/// spuriously excluded, breaking the march right where it matters most).
-/// This keeps the front from taking a straight-line shortcut through open
-/// air (e.g. across a gap between two close walls, or up the outside of a
-/// wall toward a nearby build-plate seed) -- without it, `order` reduces to
-/// plain Euclidean distance and can produce isosurfaces that climb outside
-/// the object along a path no real toolpath could follow.
+/// Seeding is by *region*
+/// ([`manifold_fidget::eikonal::EikonalOrderField::new_with_occupancy_and_seed_region`]),
+/// not by mesh vertex position: every solid grid node within one layer
+/// height of the mesh's minimum Z is frozen at distance `0.0` directly,
+/// rather than only the mesh's own vertices near that height. Seeding from
+/// vertices alone only seeds wherever those vertices happen to sit -- a
+/// flat base face triangulated with vertices solely along its silhouette
+/// (a quad base commonly has only 4 corner vertices) would seed just the
+/// footprint's *boundary* outline, leaving its interior to march in from
+/// that boundary and report a small but nonzero order there instead of the
+/// `0.0` a point already resting flat on the plate deserves -- the base
+/// layer would then read as an eroded/rounded version of the true
+/// footprint. Region seeding fills the interior of each connected
+/// component of the contact footprint uniformly, at the grid's own
+/// resolution, independent of the mesh's triangulation density.
+///
+/// The march is occupancy-aware: a grid node counts as solid when a fresh
+/// `MeshSdf` built from `mesh` reports it inside the mesh, or within
+/// `cell_size` of the surface (a tolerance covering the discretization gap
+/// between the grid and the true boundary -- without it, nodes exactly on
+/// a thin wall's surface could be spuriously excluded, breaking the march
+/// right where it matters most). This keeps the front from taking a
+/// straight-line shortcut through open air (e.g. across a gap between two
+/// close walls, or up the outside of a wall toward a nearby build-plate
+/// seed) -- without it, `order` reduces to plain Euclidean distance and
+/// can produce isosurfaces that climb outside the object along a path no
+/// real toolpath could follow.
 ///
 /// An empty mesh (no vertices, so no bounding box) is a documented
 /// best-effort fallback -- a degenerate unit-box field with no seeds, whose
 /// `order()` always returns `f64::INFINITY` (see
 /// [`manifold_fidget::eikonal::EikonalOrderField`]'s own documented
-/// behavior for an empty seed set) -- rather than a panic.
+/// behavior for an empty seed set) -- rather than a panic. A mesh with no
+/// triangles (nothing to classify solid/void against) falls back to
+/// treating every grid node as solid, so the region seeding and march are
+/// unconstrained (equivalent to plain Euclidean distance from the contact
+/// band) rather than leaving the whole grid unreachable.
 fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
     let Some((min, max)) = mesh.bounding_box() else {
         return EikonalOrderField::new(DVec3::ZERO, DVec3::ONE, &[], 1.0);
@@ -122,16 +141,11 @@ fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
     let nozzle_diameter = config.nozzle_diameter.abs().max(f64::EPSILON);
     let requested_cell_size = layer_height.min(nozzle_diameter) / 2.0;
     let cell_size = clamp_cell_size_to_node_budget(max - min, requested_cell_size);
-    // Contact-surface tolerance: within one layer height of the mesh's
-    // minimum Z counts as "touching" the build plate, generous enough to
-    // include a slightly-faceted/non-flat mesh base without pulling in
-    // vertices from well above the true contact surface.
-    let seeds: Vec<DVec3> = mesh
-        .vertices
-        .iter()
-        .copied()
-        .filter(|v| v.z <= min.z + layer_height)
-        .collect();
+    // Contact-region tolerance: every solid grid node within one layer
+    // height of the mesh's minimum Z counts as "touching" the build plate,
+    // generous enough to include a slightly-faceted/non-flat mesh base
+    // without pulling in nodes from well above the true contact surface.
+    let is_seed_region = |p: DVec3| p.z <= min.z + layer_height;
 
     let faces: Vec<[usize; 3]> = mesh
         .indices
@@ -139,15 +153,29 @@ fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
         .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
         .collect();
     if faces.is_empty() {
-        // No triangles to classify solid/void against: fall back to the
-        // unconstrained march rather than treating every node as void
-        // (which would leave the whole grid unreachable).
-        return EikonalOrderField::new(min, max, &seeds, cell_size);
+        // No triangles to classify solid/void against: fall back to an
+        // unconstrained march (every node solid) rather than treating
+        // every node as void, which would leave the whole grid
+        // unreachable.
+        let is_solid = |_p: DVec3| true;
+        return EikonalOrderField::new_with_occupancy_and_seed_region(
+            min,
+            max,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+        );
     }
     let sdf = MeshSdf::new(mesh.vertices.clone(), faces);
     let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
 
-    EikonalOrderField::new_with_occupancy(min, max, &seeds, cell_size, &is_solid)
+    EikonalOrderField::new_with_occupancy_and_seed_region(
+        min,
+        max,
+        cell_size,
+        &is_solid,
+        &is_seed_region,
+    )
 }
 
 /// Hard cap on the dense Eikonal grid's total node count (`dims[0] *

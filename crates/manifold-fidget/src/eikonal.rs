@@ -123,6 +123,61 @@ impl EikonalOrderField {
         requested_cell_size: f64,
         is_solid: &(dyn Fn(DVec3) -> bool + Sync),
     ) -> Self {
+        let (mut field, occupied) =
+            Self::build_grid(min_corner, max_corner, requested_cell_size, is_solid);
+        field.march_from_seeds(seeds, &occupied);
+        field
+    }
+
+    /// Like [`EikonalOrderField::new_with_occupancy`], but instead of
+    /// seeding from a caller-supplied list of points snapped to their
+    /// nearest grid node, freezes *every* solid-classified grid node for
+    /// which `is_seed_region(node_position)` returns `true` directly, at
+    /// exact distance `0.0`.
+    ///
+    /// This exists because seeding from a sparse point list only ever
+    /// seeds wherever those points happen to land — if the underlying
+    /// geometry's own vertices sit on the *boundary* of the region meant
+    /// to be the front's starting line (e.g. a flat base face
+    /// triangulated with vertices only along its silhouette, as CAD
+    /// exporters commonly do — a quad base has only 4 corner vertices),
+    /// the seeded front traces that boundary outline, not the region's
+    /// interior. The un-seeded interior nodes then have to march in from
+    /// that boundary like every other node, so a point already resting
+    /// flat on the build plate reports a small but nonzero order instead
+    /// of the `0.0` its already-in-contact geometry deserves — the base
+    /// layer then reads as an eroded/rounded version of the true
+    /// footprint. Seeding by region instead — marking every occupied node
+    /// within the contact band as a seed, independent of where the mesh's
+    /// own vertices happen to sit — fills the interior of each connected
+    /// component of that footprint uniformly, at the grid's own
+    /// resolution rather than the mesh's triangulation density.
+    pub fn new_with_occupancy_and_seed_region(
+        min_corner: DVec3,
+        max_corner: DVec3,
+        requested_cell_size: f64,
+        is_solid: &(dyn Fn(DVec3) -> bool + Sync),
+        is_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
+    ) -> Self {
+        let (mut field, occupied) =
+            Self::build_grid(min_corner, max_corner, requested_cell_size, is_solid);
+        field.march_from_region(is_seed_region, &occupied);
+        field
+    }
+
+    /// Shared grid construction + occupancy classification behind both
+    /// [`EikonalOrderField::new_with_occupancy`] and
+    /// [`EikonalOrderField::new_with_occupancy_and_seed_region`]: builds an
+    /// all-`f64::INFINITY` distance grid over `[min_corner, max_corner]`
+    /// and classifies every node's occupancy via `is_solid`, without
+    /// seeding a front yet — callers freeze their own initial seed
+    /// distances into the returned field before marching.
+    fn build_grid(
+        min_corner: DVec3,
+        max_corner: DVec3,
+        requested_cell_size: f64,
+        is_solid: &(dyn Fn(DVec3) -> bool + Sync),
+    ) -> (Self, Vec<bool>) {
         let lo = min_corner.min(max_corner);
         let hi = min_corner.max(max_corner);
         let extent = hi - lo;
@@ -167,9 +222,7 @@ impl EikonalOrderField {
             })
             .collect();
 
-        let mut field = field;
-        field.march_from_seeds(seeds, &occupied);
-        field
+        (field, occupied)
     }
 
     fn idx(&self, x: usize, y: usize, z: usize) -> usize {
@@ -182,7 +235,7 @@ impl EikonalOrderField {
 
     /// Seeds the front (nearest grid node to each seed point, frozen with
     /// its exact distance to that seed) and runs the heap-based narrow-band
-    /// FMM march, writing results into `self.distances`.
+    /// FMM march via [`EikonalOrderField::relax_from_frozen`].
     ///
     /// `occupied[idx]` (indexed via [`EikonalOrderField::idx`]) gates both
     /// seeding and relaxation: a seed snapping to a non-solid node is
@@ -200,8 +253,6 @@ impl EikonalOrderField {
         }
 
         let [nx, ny, nz] = self.dims;
-        let mut frozen = vec![false; self.distances.len()];
-        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
 
         // Seed initialization: snap each seed to its nearest grid node and
         // freeze that node with the exact seed-to-node distance (taking the
@@ -228,6 +279,62 @@ impl EikonalOrderField {
                 self.distances[idx] = dist;
             }
         }
+
+        self.relax_from_frozen(occupied);
+    }
+
+    /// Like [`EikonalOrderField::march_from_seeds`], but freezes every
+    /// occupied node matching `is_seed_region` directly at exact distance
+    /// `0.0` instead of snapping a sparse point list — see
+    /// [`EikonalOrderField::new_with_occupancy_and_seed_region`]'s doc for
+    /// why this fills a region's interior rather than just tracing its
+    /// boundary.
+    fn march_from_region(
+        &mut self,
+        is_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
+        occupied: &[bool],
+    ) {
+        if self.distances.is_empty() {
+            return;
+        }
+
+        let [nx, ny, _nz] = self.dims;
+        let total = self.distances.len();
+        // Classification is independent per node, same rationale as the
+        // occupancy pass in `EikonalOrderField::build_grid`.
+        let seeded: Vec<bool> = (0..total)
+            .into_par_iter()
+            .map(|idx| {
+                if !occupied[idx] {
+                    return false;
+                }
+                let z = idx / (nx * ny);
+                let y = (idx / nx) % ny;
+                let x = idx % nx;
+                is_seed_region(self.node_pos(x, y, z))
+            })
+            .collect();
+
+        for (idx, &is_seed) in seeded.iter().enumerate() {
+            if is_seed {
+                self.distances[idx] = 0.0;
+            }
+        }
+
+        self.relax_from_frozen(occupied);
+    }
+
+    /// Shared second half of the FMM march behind both
+    /// [`EikonalOrderField::march_from_seeds`] and
+    /// [`EikonalOrderField::march_from_region`]: given `self.distances`
+    /// already holding whatever initial seed distances the caller has
+    /// frozen in (everywhere else still `f64::INFINITY`), builds the
+    /// initial heap from those frozen nodes and runs the heap-based
+    /// narrow-band march to fill in the rest, gated by `occupied`.
+    fn relax_from_frozen(&mut self, occupied: &[bool]) {
+        let [nx, ny, nz] = self.dims;
+        let mut frozen = vec![false; self.distances.len()];
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
 
         for z in 0..nz {
             for y in 0..ny {
@@ -639,6 +746,60 @@ mod tests {
         assert!(
             !value.is_nan(),
             "order() at a reached/unreached grid boundary must never be NaN"
+        );
+    }
+
+    /// Regression test for "Eikonal seeds only the boundary of the contact
+    /// footprint, not its interior": seeding a flat square region from only
+    /// its four corner points (mimicking a CAD-triangulated quad base with
+    /// no interior vertices) leaves the center of that square with a
+    /// nonzero order (it has to march in from the corners), while seeding
+    /// the same region via [`EikonalOrderField::new_with_occupancy_and_seed_region`]
+    /// freezes every occupied node in the region — including its center —
+    /// at exact distance `0.0`.
+    #[test]
+    fn region_seeding_fills_the_interior_unlike_sparse_corner_point_seeding() {
+        let min_corner = DVec3::new(-5.0, -5.0, -5.0);
+        let max_corner = DVec3::new(5.0, 5.0, 5.0);
+        let cell_size = 0.5;
+        // The whole grid is "solid"/traversable; only the z <= -4.0 slab is
+        // the "contact region" a base footprint would occupy.
+        let is_solid = |_p: DVec3| true;
+        let is_seed_region = |p: DVec3| p.z <= -4.0;
+        let center = DVec3::new(0.0, 0.0, -4.5);
+
+        let corner_seeded = EikonalOrderField::new_with_occupancy(
+            min_corner,
+            max_corner,
+            &[
+                DVec3::new(-5.0, -5.0, -4.5),
+                DVec3::new(5.0, -5.0, -4.5),
+                DVec3::new(-5.0, 5.0, -4.5),
+                DVec3::new(5.0, 5.0, -4.5),
+            ],
+            cell_size,
+            &is_solid,
+        );
+        let region_seeded = EikonalOrderField::new_with_occupancy_and_seed_region(
+            min_corner,
+            max_corner,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+        );
+
+        let corner_center_order = corner_seeded.order(center);
+        let region_center_order = region_seeded.order(center);
+
+        assert!(
+            corner_center_order > 1.0,
+            "sparse corner-point seeding should leave the region's center a real distance \
+             from the nearest seed corner, got {corner_center_order}"
+        );
+        assert!(
+            approx_eq(region_center_order, 0.0, 1e-6),
+            "region seeding should freeze every occupied node in the seed region \
+             (including its center) at exact distance 0.0, got {region_center_order}"
         );
     }
 }

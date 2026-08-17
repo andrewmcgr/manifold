@@ -602,9 +602,22 @@ pub fn extract_contours_at_order<F: ScalarField + ?Sized>(
 /// layout — pass `.iter().map(|v| v.position).collect::<Vec<_>>()` when
 /// using `extract_isosurface`'s output directly).
 ///
-/// Degenerate per-triangle cases (0, 1, or all 3 vertices exactly on the
-/// iso value) are rare for generically sampled fields and are skipped as a
-/// documented limitation of this MVP.
+/// A vertex landing *exactly* on `order_value` is nudged onto the
+/// conventionally-"above" side by a tiny relative epsilon before crossing
+/// detection (a standard simulation-of-simplicity tie-break) rather than
+/// causing that vertex's edges to be silently skipped. This is not a rare
+/// theoretical corner case: an [`crate::eikonal::EikonalOrderField`] seeded
+/// over a broad flat region (see
+/// [`crate::eikonal::EikonalOrderField::new_with_occupancy_and_seed_region`])
+/// marches as a perfectly planar front through unobstructed flat geometry
+/// (e.g. a plain box), so its FMM-solved distances land on *exact*
+/// multiples of the grid cell size at grid nodes — and a triangle-soup
+/// vertex sampled at a grid-aligned position (not uncommon on axis-aligned
+/// test/production geometry) can then land exactly on a round-number
+/// `order_value` a caller happens to request (e.g. a `layer_height` that's
+/// an exact multiple of the field's cell size). Without the nudge, every
+/// triangle touching that vertex silently drops its crossing, which can
+/// (and did, before this fix) zero out an entire layer's contour.
 pub fn extract_order_contours_on_mesh<O: OrderField + ?Sized>(
     triangle_positions: &[DVec3],
     order_field: &O,
@@ -612,12 +625,26 @@ pub fn extract_order_contours_on_mesh<O: OrderField + ?Sized>(
 ) -> Vec<Vec<DVec3>> {
     let mut segments: Vec<(DVec3, DVec3)> = Vec::new();
 
+    // Nudges a value landing exactly on `order_value` onto the "above" side
+    // by a tiny relative epsilon, so an edge between an on-iso vertex and a
+    // below-iso vertex still registers as a crossing instead of being
+    // silently skipped. Only ever perturbs an exact match; every other
+    // value (including values merely close to `order_value`) passes
+    // through unchanged, so real crossings are never affected.
+    let nudge = |v: f64| -> f64 {
+        if v == order_value {
+            v + (v.abs().max(1.0) * 1e-9)
+        } else {
+            v
+        }
+    };
+
     for tri in triangle_positions.chunks_exact(3) {
         let p = [tri[0], tri[1], tri[2]];
         let v = [
-            order_field.order(p[0]),
-            order_field.order(p[1]),
-            order_field.order(p[2]),
+            nudge(order_field.order(p[0])),
+            nudge(order_field.order(p[1])),
+            nudge(order_field.order(p[2])),
         ];
 
         let mut crossing_points = Vec::with_capacity(2);
