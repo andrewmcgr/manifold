@@ -120,20 +120,27 @@ pub trait InfillGenerator {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MonotonicInfill;
 
-/// One (u, v, w) crossing of a scan line with a loop edge, in the rotated
-/// fill frame: `u`/`v` are in-plane fill-frame coordinates, `w` is the
-/// component along [`BUILD_DIRECTION`] (kept per-point rather than assumed
-/// constant across the layer, so reconstruction stays exact even for a
-/// not-perfectly-planar layer).
+/// One crossing of a scan line with a loop edge, in the rotated fill
+/// frame: `u` is the in-plane fill-frame coordinate (used only for sorting
+/// crossings left-to-right along the scan line), `point` is the actual
+/// reconstructed 3D world position for this crossing — re-solved against
+/// the layer's order field (see [`order_field::reconstruct_point_on_order_field`])
+/// rather than linearly interpolated between the crossed edge's two
+/// endpoint heights. Linear interpolation is only exact for a
+/// `HeightOrderField` (whose height is independent of `(u, v)`); for a
+/// curved field like `Eikonal`/`Conical`, the true height can vary sharply
+/// across a short edge near curved/threaded geometry, and interpolating it
+/// linearly previously sent infill points far off the actual surface (see
+/// the "screw-thread pug model produces wildly spiking Eikonal infill"
+/// bug this fixes).
 #[derive(Debug, Clone, Copy)]
 struct Crossing {
     u: f64,
-    w: f64,
+    point: DVec3,
 }
 
-/// One infill scan-line segment in the rotated `(u, w)` frame: `((u_start,
-/// w_start), (u_end, w_end))`.
-type ScanSegment = ((f64, f64), (f64, f64));
+/// One infill scan-line segment: `(start, end)` world points.
+type ScanSegment = (DVec3, DVec3);
 
 impl InfillGenerator for MonotonicInfill {
     fn generate(
@@ -171,15 +178,21 @@ impl InfillGenerator for MonotonicInfill {
         let spacing =
             (config.infill_line_width.abs().max(f64::EPSILON)) / clamped_density.max(f64::EPSILON);
 
-        // Project every loop's points into the rotated (u, v, w) frame,
+        // Max `along`-axis search radius for re-solving a crossing's true
+        // height against the order field (see `Crossing`'s doc) — the same
+        // bound `InfillRegion::from_layer` used to reconstruct each loop
+        // vertex in the first place.
+        let max_along = order_field::max_along_for(config);
+
+        // Project every loop's points into the rotated (u, v) frame,
         // keeping loops as closed edge lists (wrap-around to point 0).
-        let projected: Vec<Vec<(f64, f64, f64)>> = region
+        let projected: Vec<Vec<(f64, f64)>> = region
             .loops
             .iter()
             .map(|points| {
                 points
                     .iter()
-                    .map(|p| (p.dot(u_dir), p.dot(v_dir), p.dot(axis)))
+                    .map(|p| (p.dot(u_dir), p.dot(v_dir)))
                     .collect()
             })
             .collect();
@@ -187,7 +200,7 @@ impl InfillGenerator for MonotonicInfill {
         let Some(v_min) = projected
             .iter()
             .flatten()
-            .map(|&(_, v, _)| v)
+            .map(|&(_, v)| v)
             .fold(None, |acc, v| Some(acc.map_or(v, |m: f64| m.min(v))))
         else {
             return Vec::new();
@@ -195,7 +208,7 @@ impl InfillGenerator for MonotonicInfill {
         let v_max = projected
             .iter()
             .flatten()
-            .map(|&(_, v, _)| v)
+            .map(|&(_, v)| v)
             .fold(v_min, f64::max);
 
         // Scan-lines to draw, grouped scan-line by scan-line (ascending v).
@@ -219,17 +232,28 @@ impl InfillGenerator for MonotonicInfill {
                     continue;
                 }
                 for i in 0..n {
-                    let (u0, v0, w0) = loop_points[i];
-                    let (u1, v1, w1) = loop_points[(i + 1) % n];
+                    let (u0, v0) = loop_points[i];
+                    let (u1, v1) = loop_points[(i + 1) % n];
                     let crosses = (v0 <= v && v1 > v) || (v1 <= v && v0 > v);
                     if !crosses {
                         continue;
                     }
                     let t = (v - v0) / (v1 - v0);
-                    crossings.push(Crossing {
-                        u: u0 + t * (u1 - u0),
-                        w: w0 + t * (w1 - w0),
-                    });
+                    let u = u0 + t * (u1 - u0);
+                    // Re-solve this crossing's true world height against
+                    // the order field rather than interpolating between
+                    // the crossed edge's endpoint heights (see
+                    // `Crossing`'s doc for why linear interpolation is
+                    // wrong for a curved field).
+                    let planar = u_dir * u + v_dir * v;
+                    let point = order_field::reconstruct_point_on_order_field(
+                        planar,
+                        axis,
+                        layer.order,
+                        max_along,
+                        layer.order_field.as_ref(),
+                    );
+                    crossings.push(Crossing { u, point });
                 }
             }
             crossings.sort_by(|a, b| a.u.total_cmp(&b.u));
@@ -237,7 +261,7 @@ impl InfillGenerator for MonotonicInfill {
             let mut pairs: Vec<ScanSegment> = Vec::new();
             let mut pair_iter = crossings.chunks_exact(2);
             for pair in &mut pair_iter {
-                pairs.push(((pair[0].u, pair[0].w), (pair[1].u, pair[1].w)));
+                pairs.push((pair[0].point, pair[1].point));
             }
             if !pairs.is_empty() {
                 scanlines.push((scan_index, v, pairs));
@@ -252,7 +276,7 @@ impl InfillGenerator for MonotonicInfill {
 
         let mut points: Vec<DVec3> = Vec::new();
         let mut segments: Vec<Segment> = Vec::new();
-        let mut prev_end: Option<(f64, f64)> = None;
+        let mut prev_end: Option<DVec3> = None;
 
         // `Path`'s contract (see `toolpath::Path`) is `segments[i]` ==
         // the move `points[i] -> points[i + 1]`, i.e. `segments.len() ==
@@ -264,27 +288,22 @@ impl InfillGenerator for MonotonicInfill {
         // segment's `kind` by one slot, mislabeling each real infill
         // fill-line as `Travel` and each real travel jump (across a gap
         // or hole) as `Infill`.
-        let push_point = |points: &mut Vec<DVec3>,
-                          segments: &mut Vec<Segment>,
-                          uw: (f64, f64),
-                          v: f64,
-                          kind: MoveKind| {
-            let (u, w) = uw;
-            let world = u_dir * u + v_dir * v + axis * w;
-            if !points.is_empty() {
-                segments.push(Segment {
-                    kind,
-                    speed: 60.0,
-                    extrusion_rate: 1.0,
-                    support_fraction: 0.0,
-                    order: layer.order,
-                    extrusion_length: 0.0,
-                });
-            }
-            points.push(world);
-        };
+        let push_point =
+            |points: &mut Vec<DVec3>, segments: &mut Vec<Segment>, world: DVec3, kind: MoveKind| {
+                if !points.is_empty() {
+                    segments.push(Segment {
+                        kind,
+                        speed: 60.0,
+                        extrusion_rate: 1.0,
+                        support_fraction: 0.0,
+                        order: layer.order,
+                        extrusion_length: 0.0,
+                    });
+                }
+                points.push(world);
+            };
 
-        for (scan_index, v, pairs) in &scanlines {
+        for (scan_index, _v, pairs) in &scanlines {
             // Alternate traversal direction per scan line (boustrophedon)
             // so consecutive lines' endpoints stay close, minimizing
             // travel move length. Uses the scan-line's true ordinal (not
@@ -299,9 +318,9 @@ impl InfillGenerator for MonotonicInfill {
             for (start, end) in ordered {
                 let needs_travel = prev_end != Some(start);
                 if points.is_empty() || needs_travel {
-                    push_point(&mut points, &mut segments, start, *v, MoveKind::Travel);
+                    push_point(&mut points, &mut segments, start, MoveKind::Travel);
                 }
-                push_point(&mut points, &mut segments, end, *v, MoveKind::Infill);
+                push_point(&mut points, &mut segments, end, MoveKind::Infill);
                 prev_end = Some(end);
             }
         }
@@ -441,6 +460,95 @@ mod tests {
             assert!(p.x >= -5.001 && p.x <= 5.001, "x out of bounds: {p:?}");
             assert!(p.y >= -5.001 && p.y <= 5.001, "y out of bounds: {p:?}");
         }
+    }
+
+    #[test]
+    fn monotonic_fill_re_solves_each_scan_crossing_against_a_curved_order_field_instead_of_interpolating_linearly(
+    ) {
+        // Regression test for the "screw-thread pug model produces wildly
+        // spiking Eikonal infill" bug: `MonotonicInfill` previously computed
+        // a scan-line crossing's height by linearly blending the crossed
+        // loop edge's two endpoint heights. That's only exact for a flat
+        // `HeightOrderField`; for a curved field (using `ConicalOrderField`
+        // here as a deterministic, closed-form stand-in for `Eikonal`) the
+        // true height varies non-linearly across an edge, so linear
+        // interpolation produces points that don't actually sit on the
+        // order-field isosurface.
+        use manifold_fidget::order::{ConicalOrderField, OrderField};
+        use std::sync::Arc;
+
+        let slope = 1.0;
+        let field = ConicalOrderField::new(DVec3::ZERO, DVec3::Z, slope);
+        let z_on_cone = |x: f64, y: f64| slope * (x * x + y * y).sqrt();
+
+        // A square loop whose 4 corners all sit at the *same* height (they
+        // share the same radial distance from the cone's axis) but whose
+        // edges dip down toward the axis at their midpoints — exactly the
+        // shape that makes a buggy linear interpolation (which would just
+        // reproduce the shared corner height everywhere) visibly wrong.
+        let half_extent = 5.0;
+        let corners = [
+            (-half_extent, -half_extent),
+            (half_extent, -half_extent),
+            (half_extent, half_extent),
+            (-half_extent, half_extent),
+        ];
+        let loop_points: Vec<DVec3> = corners
+            .iter()
+            .map(|&(x, y)| DVec3::new(x, y, z_on_cone(x, y)))
+            .collect();
+        let corner_z = z_on_cone(half_extent, half_extent);
+
+        let layer = Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: Vec::new(),
+            infill_boundary: vec![loop_points],
+            solid_fill_boundary: Vec::new(),
+            order_field: Arc::new(field),
+        };
+
+        let cfg = SlicerConfig {
+            infill_line_width: 0.5,
+            infill_angle_deg: 0.0,
+            order_field: order_field::OrderFieldKind::Conical,
+            order_field_apex: DVec3::ZERO,
+            order_field_axis: DVec3::Z,
+            order_field_slope: slope,
+            ..SlicerConfig::default()
+        };
+
+        let region = InfillRegion::from_layer(&layer, &cfg);
+        assert!(!region.is_empty());
+
+        let paths = MonotonicInfill.generate(&region, &cfg, &layer, &Transform::identity(), 1.0);
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+        assert!(path.points.len() > 4, "expected multiple scan lines");
+
+        // Every emitted point must actually lie on the field's target
+        // isosurface (order == layer.order), not merely land near a
+        // linear-interpolation guess between edge endpoints.
+        for p in &path.points {
+            let order = field.order(*p);
+            assert!(
+                (order - layer.order).abs() < 1e-6,
+                "point {p:?} has order {order}, expected ~{} (crossings must be re-solved \
+                 against the order field, not linearly interpolated between edge endpoints)",
+                layer.order
+            );
+        }
+
+        // Sanity: at least one point must clearly diverge from what naive
+        // linear interpolation between the (identical) corner heights would
+        // have produced, so this test would actually have caught the bug.
+        assert!(
+            path.points.iter().any(|p| (p.z - corner_z).abs() > 0.5),
+            "expected at least one point whose z clearly diverges from naive corner-height \
+             interpolation ({corner_z}); got {:?}",
+            path.points
+        );
     }
 
     #[test]

@@ -316,12 +316,45 @@ pub fn reconstruct_on_order_field<F: OrderField + ?Sized>(
                 .into_iter()
                 .map(|[u, v]| {
                     let planar = apex + basis1 * u + basis2 * v;
-                    let along = solve_along(field, planar, axis, target_order, max_along);
-                    planar + axis * along
+                    reconstruct_point_on_order_field(planar, axis, target_order, max_along, field)
                 })
                 .collect()
         })
         .collect()
+}
+
+/// Single-point building block behind [`reconstruct_on_order_field`]: given
+/// a transverse (perpendicular-to-`axis`) reference position `planar`,
+/// solves for the `axis`-offset that lands on `field`'s `target_order`
+/// isosurface and returns the resulting 3D world point.
+///
+/// `planar` need not be `apex + basis1 * u + basis2 * v` specifically — any
+/// point with the desired transverse `(u, v)` location works, regardless of
+/// its own `axis` component, since [`solve_along`] searches `along` freely
+/// in either direction from `planar` and only the final `planar + axis *
+/// along` (not `planar` itself) needs to land on the isosurface. This lets
+/// callers reconstruct at points derived purely from an orthonormal
+/// `(u_dir, v_dir, axis)` frame (e.g. a rotated infill-scan frame) without
+/// re-deriving `apex`'s original `basis1`/`basis2` coordinates — see
+/// `infill::MonotonicInfill::generate`'s per-scan-crossing reconstruction,
+/// which needs this exact single-point form: unlike a loop's own vertices
+/// (already reconstructed once by `reconstruct_on_order_field`), a
+/// scan-line/loop-edge *crossing* is a new `(u, v)` location that does not
+/// coincide with any already-reconstructed vertex, so its true `axis`
+/// height must be re-solved from the field rather than linearly
+/// interpolated between the edge's two endpoint heights — linear
+/// interpolation is only exact for a `HeightOrderField` (`w` independent of
+/// `(u, v)`), not for a curved field like `Eikonal`/`Conical` where `w` can
+/// vary sharply across a short edge near curved/threaded geometry.
+pub(crate) fn reconstruct_point_on_order_field<F: OrderField + ?Sized>(
+    planar: DVec3,
+    axis: DVec3,
+    target_order: f64,
+    max_along: f64,
+    field: &F,
+) -> DVec3 {
+    let along = solve_along(field, planar, axis, target_order, max_along);
+    planar + axis * along
 }
 
 /// Solves `field.order(planar + axis * along) == target` for `along`
@@ -348,11 +381,22 @@ pub fn reconstruct_on_order_field<F: OrderField + ?Sized>(
 /// `Eikonal` near holes/overhangs, sending the doubling search toward
 /// `f64` extremes), then bisects (`MAX_BISECT_ITERS` iterations —
 /// comfortably enough for `f64` precision on any bracket reached by the
-/// doubling above). Returns the midpoint of the last bracket, clamped to
-/// the same range, if the search never finds a sign change or the
-/// residual never reaches tolerance, rather than panicking — a
+/// doubling above).
+///
+/// If a sign change is never actually bracketed within `max_along` (e.g.
+/// a straight ray along `axis` from `planar` never crosses `target` at
+/// all — common for a non-monotonic field like `Eikonal` on reentrant or
+/// threaded geometry, where the true isosurface for this `(u, v)` column
+/// simply isn't reachable by a vertical search), this returns the
+/// *closest-to-target* sample observed anywhere during the search
+/// (including the initial probes) rather than the outer edge of the
+/// failed bracket. Previously this fell through to the last bracket's
+/// midpoint, which for a failed search sits right at the `max_along`
+/// bound — up to 50 layer heights away — producing exactly the multi-mm
+/// vertical spikes seen on screw-thread geometry with an `Eikonal` order
+/// field; "closest real sample we actually saw" is a far tighter,
 /// caller-visible "best effort" position for a pathological/misbehaving
-/// field instead of a hard failure.
+/// field than "as far as the search was allowed to wander."
 fn solve_along<F: OrderField + ?Sized>(
     field: &F,
     planar: DVec3,
@@ -366,12 +410,26 @@ fn solve_along<F: OrderField + ?Sized>(
     let max_along = max_along.abs();
     let residual = |along: f64| field.order(planar + axis * along) - target;
 
+    // Best (lowest |residual|) sample seen anywhere during the search --
+    // the fallback returned if bracketing never finds a real sign change
+    // (see this function's doc).
+    let mut best_along = 0.0_f64;
+    let mut best_residual = residual(0.0).abs();
+    let mut consider = |along: f64, r: f64| {
+        if r.is_finite() && r.abs() < best_residual {
+            best_residual = r.abs();
+            best_along = along;
+        }
+    };
+
     // Probe the field's local direction of travel near `along == 0.0` to
     // pick the correct sign convention (see this function's doc) before
     // committing to an initial guess.
     let probe = (max_along * 1e-3).max(f64::EPSILON);
     let f_pos = residual(probe);
     let f_neg = residual(-probe);
+    consider(probe, f_pos);
+    consider(-probe, f_neg);
     let initial_guess = if f_pos.is_finite() && f_neg.is_finite() && f_pos < f_neg {
         -target
     } else {
@@ -383,18 +441,25 @@ fn solve_along<F: OrderField + ?Sized>(
     let mut lo = initial_guess;
     let mut hi = initial_guess;
     let mut f_lo = residual(lo);
+    consider(lo, f_lo);
     if f_lo.abs() <= TOLERANCE {
         return lo;
     }
 
     let mut step = 1.0_f64.min(max_along.max(f64::EPSILON));
+    let mut bracketed = false;
     if f_lo < 0.0 {
         // Need a larger `along`; grow `hi` until the residual turns
         // non-negative, never exceeding `max_bound`.
         loop {
             hi = (hi + step).min(max_bound);
             let f_hi = residual(hi);
-            if f_hi >= 0.0 || hi >= max_bound {
+            consider(hi, f_hi);
+            if f_hi >= 0.0 {
+                bracketed = true;
+                break;
+            }
+            if hi >= max_bound {
                 break;
             }
             step *= 2.0;
@@ -405,11 +470,26 @@ fn solve_along<F: OrderField + ?Sized>(
         loop {
             lo = (lo - step).max(min_bound);
             let f_lo_candidate = residual(lo);
-            if f_lo_candidate <= 0.0 || lo <= min_bound {
+            consider(lo, f_lo_candidate);
+            if f_lo_candidate <= 0.0 {
+                bracketed = true;
+                break;
+            }
+            if lo <= min_bound {
                 break;
             }
             step *= 2.0;
         }
+    }
+
+    if !bracketed {
+        // No sign change was ever found within `max_along` -- the true
+        // isosurface isn't reachable by a straight ray along `axis` from
+        // `planar` at all (common for a non-monotonic field like
+        // `Eikonal` on reentrant/threaded geometry). Fall back to the
+        // closest-to-target sample actually observed, not the outer edge
+        // of the failed bracket (see this function's doc).
+        return best_along;
     }
 
     f_lo = residual(lo);
@@ -521,6 +601,42 @@ mod tests {
             let expected = apex + basis1 * u + basis2 * v + axis * expected_along;
             assert!((*p - expected).length() < 1e-6);
         }
+    }
+
+    #[test]
+    fn solve_along_falls_back_to_the_closest_observed_sample_when_no_root_is_bracketed() {
+        // Regression test for the "screw-thread pug model produces wildly
+        // spiking Eikonal infill" bug: when a straight ray along `axis`
+        // from `planar` never actually crosses `target` (common for a
+        // non-monotonic field like `Eikonal` on reentrant/threaded
+        // geometry), `solve_along` must fall back to the closest-to-target
+        // sample it actually observed, not the outer edge of the failed
+        // bracket search (which previously produced points up to
+        // `max_along` away -- a multi-mm spike).
+        struct NeverReachesTarget;
+        impl OrderField for NeverReachesTarget {
+            fn order(&self, p: DVec3) -> f64 {
+                // Symmetric "bowl" in `along` with its minimum (5.0) right
+                // at `planar` itself: never reaches the target (0.0)
+                // anywhere along the ray, so bracketing must fail no
+                // matter how far the search doubles outward.
+                p.z * p.z + 5.0
+            }
+        }
+
+        let field = NeverReachesTarget;
+        let axis = DVec3::Z;
+        let planar = DVec3::new(3.0, -2.0, 0.0);
+        let max_along = 10.0;
+
+        let point = reconstruct_point_on_order_field(planar, axis, 0.0, max_along, &field);
+
+        assert!(
+            (point - planar).length() < 1e-6,
+            "expected the closest-observed fallback right at `planar` (along == 0.0), got {point:?} \
+             (drifted {} units away)",
+            (point - planar).length()
+        );
     }
 
     #[test]
