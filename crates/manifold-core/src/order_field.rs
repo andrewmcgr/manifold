@@ -12,7 +12,9 @@
 
 use glam::DVec3;
 use manifold_fidget::eikonal::EikonalOrderField;
+use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{ConicalOrderField, HeightOrderField, OrderField};
+use manifold_fidget::ScalarField;
 
 use crate::{mesh::Mesh, slicing::BUILD_DIRECTION, SlicerConfig};
 
@@ -76,8 +78,35 @@ pub fn order_field_for(
 /// floor" convention already used by `object::center_on_bed` and
 /// `manifold-gui`'s `scene::build_bed_quad`, both of which treat `min.z` as
 /// the build plate's height), and derives grid resolution from `mesh`'s
-/// bounding box and `config.layer_height` (reusing that existing
-/// resolution-driving config field rather than adding a new one).
+/// bounding box and the finer of `config.layer_height`/`config.nozzle_diameter`
+/// (reusing those existing resolution-driving config fields rather than
+/// adding a new one). Using `layer_height` alone (0.2mm by default) produced
+/// a grid too coarse to resolve fine surface detail (e.g. helical/screw
+/// grooves) -- trilinear interpolation of an under-resolved distance field
+/// visibly facets the reconstructed contours -- so the cell size is halved
+/// again on top of the finer of the two dimensions for extra headroom. That
+/// resolution-driven cell size is then passed through
+/// [`clamp_cell_size_to_node_budget`], which coarsens it (grows it) as
+/// needed so the dense grid's total node count never exceeds
+/// [`MAX_EIKONAL_GRID_NODES`] -- without this, a large part sliced at a
+/// fine layer height/nozzle diameter (e.g. an 85mm-tall part at the 0.2mm
+/// default layer height, cell size 0.05mm) requests a `~1700^3` node grid,
+/// whose `Vec<f64>` distance buffer alone is tens of gigabytes and OOMs the
+/// process; the budget trades local resolution for a bounded, predictable
+/// memory footprint on large parts.
+///
+/// The march is occupancy-aware (see
+/// [`manifold_fidget::eikonal::EikonalOrderField::new_with_occupancy`]):
+/// a grid node counts as solid when a fresh `MeshSdf` built from `mesh`
+/// reports it inside the mesh, or within `cell_size` of the surface (a
+/// tolerance covering the discretization gap between the grid and the true
+/// boundary -- without it, nodes exactly on a thin wall's surface could be
+/// spuriously excluded, breaking the march right where it matters most).
+/// This keeps the front from taking a straight-line shortcut through open
+/// air (e.g. across a gap between two close walls, or up the outside of a
+/// wall toward a nearby build-plate seed) -- without it, `order` reduces to
+/// plain Euclidean distance and can produce isosurfaces that climb outside
+/// the object along a path no real toolpath could follow.
 ///
 /// An empty mesh (no vertices, so no bounding box) is a documented
 /// best-effort fallback -- a degenerate unit-box field with no seeds, whose
@@ -90,6 +119,9 @@ fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
     };
 
     let layer_height = config.layer_height.abs().max(f64::EPSILON);
+    let nozzle_diameter = config.nozzle_diameter.abs().max(f64::EPSILON);
+    let requested_cell_size = layer_height.min(nozzle_diameter) / 2.0;
+    let cell_size = clamp_cell_size_to_node_budget(max - min, requested_cell_size);
     // Contact-surface tolerance: within one layer height of the mesh's
     // minimum Z counts as "touching" the build plate, generous enough to
     // include a slightly-faceted/non-flat mesh base without pulling in
@@ -101,7 +133,96 @@ fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
         .filter(|v| v.z <= min.z + layer_height)
         .collect();
 
-    EikonalOrderField::new(min, max, &seeds, layer_height)
+    let faces: Vec<[usize; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
+        .collect();
+    if faces.is_empty() {
+        // No triangles to classify solid/void against: fall back to the
+        // unconstrained march rather than treating every node as void
+        // (which would leave the whole grid unreachable).
+        return EikonalOrderField::new(min, max, &seeds, cell_size);
+    }
+    let sdf = MeshSdf::new(mesh.vertices.clone(), faces);
+    let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
+
+    EikonalOrderField::new_with_occupancy(min, max, &seeds, cell_size, &is_solid)
+}
+
+/// Hard cap on the dense Eikonal grid's total node count (`dims[0] *
+/// dims[1] * dims[2]`). At 8 bytes/node this bounds the `distances` buffer
+/// alone to ~8MB, but the real driver of this number is
+/// `march_from_seeds`'s narrow-band bookkeeping, not the distance buffer:
+/// its heap can hold up to ~6 (one per face-neighbor direction) stale
+/// entries per node before they are popped and discarded, and each
+/// `HeapEntry` is ~32 bytes, so worst case the march's `BinaryHeap` alone
+/// can reach roughly `6 * MAX_EIKONAL_GRID_NODES * 32` bytes -- at
+/// 8,000,000 nodes that is close to 1.5GB on top of the `occupied`/frozen
+/// bookkeeping and the mesh's own BVH, which is what produced the reported
+/// OOM even after the grid's distance buffer itself was bounded. Chosen
+/// empirically as "enough resolution to matter, not enough to OOM a real
+/// part" -- not derived from a hard per-machine memory budget. Revisit if
+/// this proves too coarse in practice.
+const MAX_EIKONAL_GRID_NODES: f64 = 1_000_000.0;
+
+/// Coarsens (grows) `requested_cell_size` as needed so that a dense grid
+/// covering `extent` at that cell size would not exceed
+/// [`MAX_EIKONAL_GRID_NODES`] total nodes -- see `eikonal_field_for`'s docs
+/// for why this guard exists (unbounded resolution on a large part is an
+/// OOM waiting to happen, since the grid is a dense `Vec<f64>`, not a
+/// sparse/adaptive structure). Never shrinks the requested cell size: a
+/// small part that would need few nodes at the requested resolution is
+/// returned unchanged. Non-finite/non-positive `requested_cell_size` is
+/// returned unchanged too -- `EikonalOrderField::new`/`new_with_occupancy`
+/// already document a resolution fallback for that case, so this helper
+/// only clamps well-formed requests.
+fn clamp_cell_size_to_node_budget(extent: DVec3, requested_cell_size: f64) -> f64 {
+    if !requested_cell_size.is_finite() || requested_cell_size <= 0.0 {
+        return requested_cell_size;
+    }
+    // +1 mirrors `grid_node_count`'s "at least one node per axis, plus one
+    // for the trailing edge" so this estimate matches the grid actually
+    // built downstream.
+    let estimated_nodes = |cell_size: f64| -> f64 {
+        (extent.x.max(0.0) / cell_size + 1.0).ceil()
+            * (extent.y.max(0.0) / cell_size + 1.0).ceil()
+            * (extent.z.max(0.0) / cell_size + 1.0).ceil()
+    };
+    let nodes = estimated_nodes(requested_cell_size);
+    if !nodes.is_finite() || nodes <= MAX_EIKONAL_GRID_NODES {
+        return requested_cell_size;
+    }
+    // Node count scales as ~1/cell_size^3 for a fixed extent, so scale the
+    // cell size by the cube root of the overshoot ratio to bring the
+    // estimate back within budget. Each axis's node count is a `ceil`, so a
+    // single cube-root scale can still overshoot the budget by up to one
+    // node per axis; a few correction passes (each nudging the scale up by
+    // the residual overshoot ratio) converge past that rounding slack
+    // without needing a closed-form inverse of `ceil`.
+    let mut cell_size = requested_cell_size * (nodes / MAX_EIKONAL_GRID_NODES).cbrt();
+    for _ in 0..8 {
+        let nodes = estimated_nodes(cell_size);
+        if !nodes.is_finite() || nodes <= MAX_EIKONAL_GRID_NODES {
+            break;
+        }
+        cell_size *= (nodes / MAX_EIKONAL_GRID_NODES).cbrt();
+    }
+    cell_size
+}
+
+/// Multiplier applied to `config.layer_height` to bound
+/// [`reconstruct_on_order_field`]'s numeric solve (see
+/// [`max_along_for`]) — generous enough to cover legitimate tall
+/// reconstructions for well-behaved (monotonic) fields, while still
+/// containing a non-monotonic field's (e.g. `Eikonal`'s) failure mode to a
+/// bounded region instead of an unbounded runaway.
+const MAX_ALONG_LAYER_HEIGHTS: f64 = 50.0;
+
+/// Bound passed as `reconstruct_on_order_field`'s `max_along` for a given
+/// `config`: `MAX_ALONG_LAYER_HEIGHTS` layer heights either side of zero.
+pub fn max_along_for(config: &SlicerConfig) -> f64 {
+    config.layer_height.abs().max(f64::EPSILON) * MAX_ALONG_LAYER_HEIGHTS
 }
 
 /// Resolves `kind`'s effective `(axis, apex, slope)` for order-field-aware
@@ -147,18 +268,37 @@ pub fn resolve_axis_apex_slope(kind: OrderFieldKind, config: &SlicerConfig) -> (
 /// adding another field kind later needs no change here at all.
 ///
 /// Relies on the documented well-posedness precondition that `field.order`
-/// is strictly monotonically increasing along `axis` at any fixed in-plane
-/// position (true of `Height`/`Conical` by construction, and required of
-/// any future field for slicing to make sense in the first place — see
-/// `NON_PLANAR_SLICING.md`'s well-posedness discussion). Bracket expansion
-/// assumes this monotonicity holds arbitrarily far from the initial guess;
-/// it is capped (see [`solve_along`]) rather than looping forever if that
-/// assumption is violated.
+/// is monotonic along `axis` at any fixed in-plane position (true of
+/// `Height`/`Conical` by construction, and required of any future field
+/// for slicing to make sense in the first place — see
+/// `NON_PLANAR_SLICING.md`'s well-posedness discussion), but **not**
+/// necessarily *increasing*: `Height`'s `order(p) == p.dot(axis)` moves in
+/// the same direction as `along`, while `Eikonal`'s `order(p)` is an
+/// unsigned front-propagation distance that *decreases* as `along`
+/// increases along `axis == BUILD_DIRECTION` (larger `along` means smaller
+/// `p.z`, i.e. closer to the seeded build-plate surface). Because of this,
+/// [`solve_along`] does not assume the sign of `target_order` maps
+/// directly onto `along` — it probes `field`'s *local* direction of travel
+/// near `along == 0` and mirrors `target_order` accordingly before
+/// centering the search there, so the bracket starts near the
+/// physically-plausible root for either sign convention instead of
+/// hardcoding one. This also does not hold exactly outside a small
+/// neighborhood for non-monotonic fields (e.g. `Eikonal` near
+/// holes/overhangs, where there can be more than one `along` solving the
+/// equation at a given `(u, v)`) — the probe only needs to get the right
+/// *side*, not the exact value; bisection finds the precise root within
+/// whatever bracket that side yields. Bracket expansion is additionally
+/// bounded to `max_along` either side of the initial guess (see
+/// [`solve_along`]) rather than doubling toward `f64` extremes — this
+/// keeps a non-monotonic field's failure to a locally-bounded,
+/// still-imperfect reconstruction instead of flinging points arbitrarily
+/// far along `axis`.
 ///
 /// `basis1`/`basis2` must be the orthonormal in-plane basis perpendicular
 /// to `axis` (e.g. from `manifold_fidget::contour::plane_basis(axis)`),
 /// matching whatever produced `contours`' `(u, v)` coordinates via
 /// `polygon2d::to_2d(.., basis1, basis2, apex)`.
+#[allow(clippy::too_many_arguments)] // one param per geometric input; a config struct would obscure the plane-basis/reconstruction math this directly mirrors
 pub fn reconstruct_on_order_field<F: OrderField + ?Sized>(
     contours: Vec<Vec<[f64; 2]>>,
     basis1: DVec3,
@@ -166,6 +306,7 @@ pub fn reconstruct_on_order_field<F: OrderField + ?Sized>(
     axis: DVec3,
     apex: DVec3,
     target_order: f64,
+    max_along: f64,
     field: &F,
 ) -> Vec<Vec<DVec3>> {
     contours
@@ -175,7 +316,7 @@ pub fn reconstruct_on_order_field<F: OrderField + ?Sized>(
                 .into_iter()
                 .map(|[u, v]| {
                     let planar = apex + basis1 * u + basis2 * v;
-                    let along = solve_along(field, planar, axis, target_order);
+                    let along = solve_along(field, planar, axis, target_order, max_along);
                     planar + axis * along
                 })
                 .collect()
@@ -183,51 +324,88 @@ pub fn reconstruct_on_order_field<F: OrderField + ?Sized>(
         .collect()
 }
 
-/// Solves `field.order(planar + axis * along) == target` for `along`,
-/// assuming `field.order` is strictly increasing along `axis` from
-/// `planar` (see [`reconstruct_on_order_field`]'s preconditions).
+/// Solves `field.order(planar + axis * along) == target` for `along`
+/// (see [`reconstruct_on_order_field`]'s preconditions on `field`).
 ///
-/// Expands a bracket `[lo, hi]` outward from `along == 0.0` by doubling
-/// steps until the target sign is bracketed (capped at `MAX_EXPAND_STEPS`
-/// doublings), then bisects (`MAX_BISECT_ITERS` iterations — comfortably
-/// enough for `f64` precision on any bracket reached by the doubling
-/// above). Returns the midpoint of the last bracket if the search never
-/// finds a sign change or the residual never reaches tolerance, rather
-/// than panicking — a caller-visible "best effort" position for a
-/// pathological/misbehaving field instead of a hard failure.
-fn solve_along<F: OrderField + ?Sized>(field: &F, planar: DVec3, axis: DVec3, target: f64) -> f64 {
+/// Different [`OrderField`]s use different sign conventions for how
+/// `order` relates to `along`: `HeightOrderField::order(p) == p.dot(axis)`
+/// moves in the *same* direction as `along`, while
+/// `EikonalOrderField::order(p)` is an unsigned distance that moves in the
+/// *opposite* direction along `axis == BUILD_DIRECTION` (see
+/// [`reconstruct_on_order_field`]'s doc). To center the search on the
+/// physically-plausible root regardless of which convention `field` uses,
+/// this first probes `residual` at a small `+epsilon`/`-epsilon` pair
+/// around `along == 0.0` and picks whichever of `target`/`-target` moves
+/// `along` in the direction the probe indicates `order` actually
+/// increases — falling back to `+target` if both probe samples are
+/// non-finite (e.g. a point the field's front never reached) since that
+/// matches every currently-known field's convention.
+///
+/// From that initial guess, expands a bracket outward by doubling steps
+/// until the target sign is bracketed, clamped to `max_along` either side
+/// of the initial guess (see [`reconstruct_on_order_field`]'s doc on why
+/// this bound exists — it protects against a non-monotonic field, e.g.
+/// `Eikonal` near holes/overhangs, sending the doubling search toward
+/// `f64` extremes), then bisects (`MAX_BISECT_ITERS` iterations —
+/// comfortably enough for `f64` precision on any bracket reached by the
+/// doubling above). Returns the midpoint of the last bracket, clamped to
+/// the same range, if the search never finds a sign change or the
+/// residual never reaches tolerance, rather than panicking — a
+/// caller-visible "best effort" position for a pathological/misbehaving
+/// field instead of a hard failure.
+fn solve_along<F: OrderField + ?Sized>(
+    field: &F,
+    planar: DVec3,
+    axis: DVec3,
+    target: f64,
+    max_along: f64,
+) -> f64 {
     const TOLERANCE: f64 = 1e-9;
-    const MAX_EXPAND_STEPS: u32 = 64;
     const MAX_BISECT_ITERS: u32 = 64;
 
+    let max_along = max_along.abs();
     let residual = |along: f64| field.order(planar + axis * along) - target;
 
-    let mut lo = 0.0_f64;
-    let mut hi = 0.0_f64;
+    // Probe the field's local direction of travel near `along == 0.0` to
+    // pick the correct sign convention (see this function's doc) before
+    // committing to an initial guess.
+    let probe = (max_along * 1e-3).max(f64::EPSILON);
+    let f_pos = residual(probe);
+    let f_neg = residual(-probe);
+    let initial_guess = if f_pos.is_finite() && f_neg.is_finite() && f_pos < f_neg {
+        -target
+    } else {
+        target
+    };
+    let min_bound = initial_guess - max_along;
+    let max_bound = initial_guess + max_along;
+
+    let mut lo = initial_guess;
+    let mut hi = initial_guess;
     let mut f_lo = residual(lo);
     if f_lo.abs() <= TOLERANCE {
         return lo;
     }
 
-    let mut step = 1.0_f64;
+    let mut step = 1.0_f64.min(max_along.max(f64::EPSILON));
     if f_lo < 0.0 {
         // Need a larger `along`; grow `hi` until the residual turns
-        // non-negative.
+        // non-negative, never exceeding `max_bound`.
         loop {
-            hi += step;
+            hi = (hi + step).min(max_bound);
             let f_hi = residual(hi);
-            if f_hi >= 0.0 || step >= f64::from(MAX_EXPAND_STEPS).exp2() {
+            if f_hi >= 0.0 || hi >= max_bound {
                 break;
             }
             step *= 2.0;
         }
     } else {
         // Need a smaller `along`; shrink `lo` until the residual turns
-        // non-positive.
+        // non-positive, never going below `min_bound`.
         loop {
-            lo -= step;
+            lo = (lo - step).max(min_bound);
             let f_lo_candidate = residual(lo);
-            if f_lo_candidate <= 0.0 || step >= f64::from(MAX_EXPAND_STEPS).exp2() {
+            if f_lo_candidate <= 0.0 || lo <= min_bound {
                 break;
             }
             step *= 2.0;
@@ -248,7 +426,7 @@ fn solve_along<F: OrderField + ?Sized>(field: &F, planar: DVec3, axis: DVec3, ta
             hi = mid;
         }
     }
-    0.5 * (lo + hi)
+    (0.5 * (lo + hi)).clamp(min_bound, max_bound)
 }
 
 #[cfg(test)]
@@ -299,8 +477,16 @@ mod tests {
 
         let target_order = 5.0;
         let contours = vec![vec![[1.0, -2.0], [3.0, 4.0]]];
-        let reconstructed =
-            reconstruct_on_order_field(contours, basis1, basis2, axis, apex, target_order, &field);
+        let reconstructed = reconstruct_on_order_field(
+            contours,
+            basis1,
+            basis2,
+            axis,
+            apex,
+            target_order,
+            1000.0,
+            &field,
+        );
 
         for p in &reconstructed[0] {
             assert!((field.order(*p) - target_order).abs() < 1e-6);
@@ -324,6 +510,7 @@ mod tests {
             axis,
             apex,
             target_order,
+            1000.0,
             &field,
         );
 
@@ -334,5 +521,42 @@ mod tests {
             let expected = apex + basis1 * u + basis2 * v + axis * expected_along;
             assert!((*p - expected).length() < 1e-6);
         }
+    }
+
+    #[test]
+    fn clamp_cell_size_to_node_budget_leaves_small_requests_unchanged() {
+        // A tiny part at a normal resolution is well under budget, so the
+        // requested cell size should come back exactly as given.
+        let extent = DVec3::splat(5.0);
+        let requested = 0.1;
+        assert_eq!(clamp_cell_size_to_node_budget(extent, requested), requested);
+    }
+
+    #[test]
+    fn clamp_cell_size_to_node_budget_coarsens_a_large_part_within_budget() {
+        // Mirrors the reported OOM: an 85mm-tall part at the default
+        // resolution-driven cell size (0.05mm) would request a ~1700^3
+        // node grid. The clamped cell size must bring the estimated node
+        // count back within `MAX_EIKONAL_GRID_NODES`.
+        let extent = DVec3::splat(85.0);
+        let requested = 0.05;
+        let clamped = clamp_cell_size_to_node_budget(extent, requested);
+        assert!(clamped > requested);
+
+        let dims_per_axis = (extent.x / clamped + 1.0).ceil();
+        let nodes = dims_per_axis.powi(3);
+        assert!(nodes <= MAX_EIKONAL_GRID_NODES);
+    }
+
+    #[test]
+    fn clamp_cell_size_to_node_budget_passes_through_non_finite_or_non_positive_input() {
+        let extent = DVec3::splat(85.0);
+        assert_eq!(clamp_cell_size_to_node_budget(extent, 0.0), 0.0);
+        assert_eq!(clamp_cell_size_to_node_budget(extent, -1.0), -1.0);
+        assert!(clamp_cell_size_to_node_budget(extent, f64::NAN).is_nan());
+        assert_eq!(
+            clamp_cell_size_to_node_budget(extent, f64::INFINITY),
+            f64::INFINITY
+        );
     }
 }

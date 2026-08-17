@@ -5,19 +5,27 @@
 //! approximation of) Euclidean/geodesic distance from the front.
 //!
 //! v1 uses a uniform propagation speed (`speed(p) == 1.0` everywhere), so
-//! this reduces to grid-discretized Euclidean distance from the seed set —
-//! the point of landing this now is the FMM machinery itself (grid
-//! construction, heap-based marching, front seeding) so a later phase can
-//! swap in genuine `speed(p)` shaping without re-architecting.
+//! [`EikonalOrderField::new`] reduces to grid-discretized Euclidean distance
+//! from the seed set. [`EikonalOrderField::new_with_occupancy`] additionally
+//! restricts the march to a caller-supplied solid region, so distance is
+//! measured *through material* rather than straight-line through free space
+//! — without that restriction, a point on a wall can look deceptively close
+//! to a seed across an open air gap, producing isosurfaces that climb the
+//! outside of the wall rather than following a printable in-material path.
+//! The point of landing the FMM machinery itself (grid construction,
+//! heap-based marching, front seeding, occupancy gating) now is so a later
+//! phase can swap in genuine non-uniform `speed(p)` shaping without
+//! re-architecting.
 //!
 //! This module is deliberately decoupled from any mesh type: callers supply
-//! a bounding box and a seed point set directly, so it can be reused for a
-//! mesh-derived contact-surface front (a later phase) or any other seed
+//! a bounding box, a seed point set, and (for the occupancy-aware
+//! constructor) an opaque `is_solid(p) -> bool` classifier directly, so it
+//! can be reused for a mesh-derived contact-surface front or any other seed
 //! source (e.g. a synthetic test geometry) without this module depending on
 //! `manifold-core`'s or even `manifold-fidget`'s own mesh types.
-
 use crate::order::OrderField;
 use glam::DVec3;
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -49,7 +57,9 @@ impl EikonalOrderField {
     /// swapped min/max components are tolerated rather than producing a
     /// degenerate/negative-extent grid), seeding the front from `seeds`
     /// (each snapped to its nearest grid node) and marching outward via
-    /// narrow-band FMM with uniform speed 1.0.
+    /// narrow-band FMM with uniform speed 1.0, with every grid node treated
+    /// as traversable (see [`EikonalOrderField::new_with_occupancy`] for a
+    /// version that restricts the march to a solid region).
     ///
     /// `requested_cell_size` drives grid resolution automatically (no
     /// separate hardcoded resolution constant): grid node counts along each
@@ -67,6 +77,51 @@ impl EikonalOrderField {
         max_corner: DVec3,
         seeds: &[DVec3],
         requested_cell_size: f64,
+    ) -> Self {
+        Self::new_with_occupancy(min_corner, max_corner, seeds, requested_cell_size, &|_| {
+            true
+        })
+    }
+
+    /// Like [`EikonalOrderField::new`], but restricts the march to grid
+    /// nodes for which `is_solid(node_position)` returns `true` — the front
+    /// can only propagate through solid material, never take a shortcut
+    /// through free space around/above the object.
+    ///
+    /// Without this restriction (i.e. [`EikonalOrderField::new`], which
+    /// passes `|_| true`), `order(p)` reduces to plain Euclidean distance
+    /// from the seed set, which can make a point high up on a thin wall
+    /// look *close* to a build-plate seed across an open air gap — the
+    /// resulting isosurface then climbs the outside of that wall, a path no
+    /// real toolpath can follow. Restricting relaxation to solid-classified
+    /// nodes forces the measured distance to be an in-material path length,
+    /// eliminating that shortcut and making `order` far closer to
+    /// monotonically increasing with build height within the object (see
+    /// [`crate::order::OrderField`]'s well-posedness discussion — this
+    /// remains a discretized approximation, not an exact guarantee, since
+    /// grid resolution and thin/non-manifold features can still admit
+    /// shortcuts one cell wide).
+    ///
+    /// Nodes classified non-solid never get a finite distance (they are
+    /// simply excluded from the march, including as seeds); trilinear
+    /// interpolation of [`EikonalOrderField::order`] at a query point whose
+    /// surrounding cell touches a non-solid node can therefore itself
+    /// return `f64::INFINITY` — expected right at/outside the solid
+    /// boundary, and a documented best-effort limitation for query points
+    /// inside material thinner than one grid cell.
+    ///
+    /// `is_solid` is called once per grid node (up to millions of times for
+    /// a large grid) and run in parallel via `rayon`, so it must be `Sync`
+    /// as well as `Fn` — a mesh-backed classifier (e.g. sampling a spatial
+    /// SDF/BVH per node) is exactly the case this matters for: run
+    /// single-threaded, that classification pass alone can dominate wall
+    /// time on a large grid.
+    pub fn new_with_occupancy(
+        min_corner: DVec3,
+        max_corner: DVec3,
+        seeds: &[DVec3],
+        requested_cell_size: f64,
+        is_solid: &(dyn Fn(DVec3) -> bool + Sync),
     ) -> Self {
         let lo = min_corner.min(max_corner);
         let hi = min_corner.max(max_corner);
@@ -90,14 +145,30 @@ impl EikonalOrderField {
         let total = dims[0] * dims[1] * dims[2];
         let distances = vec![f64::INFINITY; total];
 
-        let mut field = EikonalOrderField {
+        let field = EikonalOrderField {
             min_corner: lo,
             dims,
             h: cell_size,
             distances,
         };
 
-        field.march_from_seeds(seeds);
+        let [nx, ny, _nz] = dims;
+        // Classify every node in parallel: each node's position is
+        // independent of every other, so this is embarrassingly parallel
+        // and `is_solid` (often a mesh SDF/BVH query) is exactly the
+        // expensive-per-call case that benefits most.
+        let occupied: Vec<bool> = (0..total)
+            .into_par_iter()
+            .map(|idx| {
+                let z = idx / (nx * ny);
+                let y = (idx / nx) % ny;
+                let x = idx % nx;
+                is_solid(field.node_pos(x, y, z))
+            })
+            .collect();
+
+        let mut field = field;
+        field.march_from_seeds(seeds, &occupied);
         field
     }
 
@@ -112,7 +183,16 @@ impl EikonalOrderField {
     /// Seeds the front (nearest grid node to each seed point, frozen with
     /// its exact distance to that seed) and runs the heap-based narrow-band
     /// FMM march, writing results into `self.distances`.
-    fn march_from_seeds(&mut self, seeds: &[DVec3]) {
+    ///
+    /// `occupied[idx]` (indexed via [`EikonalOrderField::idx`]) gates both
+    /// seeding and relaxation: a seed snapping to a non-solid node is
+    /// dropped rather than frozen, and relaxation never assigns a finite
+    /// distance to a non-solid neighbor — so the front only ever
+    /// propagates through solid-classified nodes (see
+    /// [`EikonalOrderField::new_with_occupancy`]). Passing an all-`true`
+    /// mask (as [`EikonalOrderField::new`] does) recovers the original
+    /// unconstrained free-space march.
+    fn march_from_seeds(&mut self, seeds: &[DVec3], occupied: &[bool]) {
         if seeds.is_empty() || self.distances.is_empty() {
             // Documented best-effort fallback: no front to march from,
             // leave every node at its initial `f64::INFINITY`.
@@ -125,7 +205,8 @@ impl EikonalOrderField {
 
         // Seed initialization: snap each seed to its nearest grid node and
         // freeze that node with the exact seed-to-node distance (taking the
-        // min if multiple seeds map to the same node).
+        // min if multiple seeds map to the same node). A seed snapping to a
+        // non-solid node is dropped: it has nothing solid to seed from.
         for &seed in seeds {
             let fx = ((seed.x - self.min_corner.x) / self.h).round();
             let fy = ((seed.y - self.min_corner.y) / self.h).round();
@@ -139,6 +220,9 @@ impl EikonalOrderField {
             let y = clamp_index(fy, ny);
             let z = clamp_index(fz, nz);
             let idx = self.idx(x, y, z);
+            if !occupied[idx] {
+                continue;
+            }
             let dist = seed.distance(self.node_pos(x, y, z));
             if dist < self.distances[idx] {
                 self.distances[idx] = dist;
@@ -189,7 +273,7 @@ impl EikonalOrderField {
                 }
                 let (nxu, nyu, nzu) = (nxp as usize, nyp as usize, nzp as usize);
                 let nidx = self.idx(nxu, nyu, nzu);
-                if frozen[nidx] {
+                if frozen[nidx] || !occupied[nidx] {
                     continue;
                 }
 

@@ -74,6 +74,7 @@ impl InfillRegion {
                 axis,
                 apex,
                 layer.order,
+                order_field::max_along_for(config),
                 layer.order_field.as_ref(),
             ),
         }

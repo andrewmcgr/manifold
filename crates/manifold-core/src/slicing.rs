@@ -1,7 +1,7 @@
 //! Non-planar slicing: mesh -> ordered layers of cross-section curves.
 
 use crate::{
-    ids::ObjectId, mesh::Mesh, object::Object, order_field, polygon2d, Result, SlicerConfig,
+    ids::ObjectId, mesh::Mesh, object::Object, order_field, polygon2d, Error, Result, SlicerConfig,
 };
 use glam::DVec3;
 use manifold_fidget::contour::{
@@ -232,7 +232,41 @@ pub fn slice_mesh_with_progress(
         config,
         mesh,
     ));
-    let (order_min, order_max) = order_range_over_bbox(&*field, min, max);
+    // `order_range_over_bbox` samples 27 points on the mesh's axis-aligned
+    // bounding box (corners, edge midpoints, face center). That's exact for
+    // affine fields (`HeightOrderField`, `ConicalOrderField`) whose extrema
+    // sit on the box boundary, but for an occupancy-restricted field (e.g.
+    // `EikonalOrderField`) most/all of those 27 points typically fall
+    // *outside* the solid mesh, where `order()` returns `f64::INFINITY`.
+    // A non-finite bound here would make the `while` loop below (which
+    // steps `order_value` from `order_min` to `order_max` by
+    // `layer_height`) run unbounded, silently consuming memory until the
+    // process is OOM-killed. Guard against that by falling back to
+    // sampling the field at actual mesh vertices (which do lie on/near the
+    // solid) whenever the bbox-corner estimate isn't finite.
+    let (order_min, order_max) = {
+        let (lo, hi) = order_range_over_bbox(&*field, min, max);
+        if lo.is_finite() && hi.is_finite() {
+            (lo, hi)
+        } else {
+            let (mut vlo, mut vhi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for &v in &mesh.vertices {
+                let value = field.order(v);
+                if value.is_finite() {
+                    vlo = vlo.min(value);
+                    vhi = vhi.max(value);
+                }
+            }
+            if vlo.is_finite() && vhi.is_finite() {
+                (vlo, vhi)
+            } else {
+                return Err(Error::Slicing(
+                    "order field produced no finite values over the mesh's bounding box or vertices"
+                        .to_string(),
+                ));
+            }
+        }
+    };
 
     // In-plane sample extent: sized off the mesh's bounding box
     // *projected onto the contour-extraction plane's in-plane basis*
@@ -267,9 +301,23 @@ pub fn slice_mesh_with_progress(
     // only reads the shared, immutable `sdf` — see `MeshSdf`, whose query
     // methods all take `&self` — and writes its own independent `Layer`;
     // there's no cross-layer dependency to serialize on).
+    //
+    // Defensive cap: even with the finite `order_min`/`order_max` guaranteed
+    // above, guard the step count against any other future degenerate range
+    // (e.g. a bug producing `order_min > order_max` combined with a tiny
+    // `layer_height`) so a bad range fails fast with `Error::Slicing`
+    // instead of growing this `Vec` without bound until the process is
+    // killed for memory exhaustion.
+    const MAX_ORDER_STEPS: usize = 1_000_000;
     let mut order_values = Vec::new();
     let mut order_value = order_min;
     while order_value <= order_max {
+        if order_values.len() >= MAX_ORDER_STEPS {
+            return Err(Error::Slicing(format!(
+                "order range [{order_min}, {order_max}] with layer_height {layer_height} would \
+                 require more than {MAX_ORDER_STEPS} layers; refusing to continue"
+            )));
+        }
         order_values.push(order_value);
         order_value += layer_height;
     }
@@ -612,6 +660,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                 axis,
                 apex,
                 order,
+                order_field::max_along_for(config),
                 field.as_ref(),
             );
         }
@@ -1147,6 +1196,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn slice_mesh_eikonal_order_field_terminates_when_bbox_corners_fall_outside_the_solid() {
+        // Regression test: `order_range_over_bbox` samples 27 points on the
+        // mesh's *axis-aligned bounding box* (corners, edge midpoints, face
+        // centers). For a shape that doesn't fill its own bbox (e.g. a
+        // tetrahedron, unlike the axis-aligned `cube_mesh` above whose bbox
+        // corners coincide with its own vertices), most of those 27 sample
+        // points land outside the solid, where an occupancy-restricted field
+        // like `EikonalOrderField` returns `f64::INFINITY`. Before the
+        // mesh-vertex fallback in `slice_mesh_with_progress`, a non-finite
+        // `order_max` made the per-layer step loop run unbounded, silently
+        // consuming memory until the process was killed. This must still
+        // return promptly (not hang) with a finite, bounded layer count.
+        let tetrahedron = Mesh {
+            vertices: vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(0.0, 1.0, 0.0),
+                DVec3::new(0.0, 0.0, 1.0),
+            ],
+            indices: vec![
+                0, 2, 1, // base
+                0, 1, 3, // side
+                1, 2, 3, // side
+                2, 0, 3, // side
+            ],
+        };
+
+        let config = SlicerConfig {
+            layer_height: 0.1,
+            order_field: crate::order_field::OrderFieldKind::Eikonal,
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&tetrahedron, &config).unwrap();
+
+        // The bbox diagonal here is small (~1.7), so at layer_height 0.1 a
+        // correctly bounded slice produces well under a few hundred layers
+        // — nowhere near the `MAX_ORDER_STEPS` safety cap.
+        assert!(
+            layers.len() < 1_000,
+            "expected a small, finite layer count, got {}",
+            layers.len()
+        );
     }
 
     #[test]
