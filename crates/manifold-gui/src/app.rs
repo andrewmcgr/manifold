@@ -565,6 +565,11 @@ impl ManifoldApp {
                     InfillPatternKind::Monotonic,
                     "Monotonic",
                 );
+                ui.selectable_value(
+                    &mut self.config.infill_pattern,
+                    InfillPatternKind::Concentric,
+                    "Concentric",
+                );
             });
         ui.add(
             egui::Slider::new(&mut self.config.infill_line_width, 0.05..=1.5)

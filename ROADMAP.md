@@ -692,6 +692,37 @@ near overhangs) — v1 is uniform-speed only; any toolpath-level
 adaptation for genuinely non-planar printing (retraction/Z-hop,
 nozzle-collision with curved geometry) remains deferred per Phase 15.
 
+## Phase 18 — Concentric infill pattern (needs 12, second `InfillGenerator` impl) — ✅ done
+
+Adds `InfillPatternKind::Concentric` / `ConcentricInfill` as a second
+`InfillGenerator` alongside `MonotonicInfill` (Phase 12), proving out the
+pluggable-pattern design first laid down there: no changes were needed to
+`toolpath::plan`, `generator_for`, or the GUI's density/line-width
+controls -- only a new enum variant, a new generator impl, and one new
+`selectable_value` in the settings panel's pattern combo box.
+
+- `ConcentricInfill` fills a region with successive inward offsets of its
+  boundary (`polygon2d::inward_offset`, the same primitive
+  `infill_boundary`/wall-inset computation already uses), each printed as
+  its own closed-loop `Path` -- unlike `MonotonicInfill`'s single open
+  zig-zag `Path` per layer, concentric rings need no in-path travel
+  segment between rings since `toolpath::plan` already treats one `Path`
+  per closed loop as the normal convention (matching wall loops).
+- Ring spacing follows the same `infill_line_width`/`density` convention
+  as `MonotonicInfill`'s scan-line spacing (`spacing = infill_line_width /
+  density`), so both patterns respond identically to the density slider;
+  the first ring sits `spacing / 2` in from the boundary so its bead is
+  centered on the boundary edge.
+- Reconstruction for curved (`Conical`/`Eikonal`) order fields reuses
+  `order_field::reconstruct_on_order_field_near`, seeded from the
+  region's own already-reconstructed boundary loops -- the same
+  reference-seeding approach `InfillRegion::from_layer` uses, avoiding
+  the wrong-branch axis-ray spikes documented on Phase 17's Eikonal work.
+- A `MAX_CONCENTRIC_RINGS` cap (10,000) guards against a pathological
+  near-zero spacing turning ring generation into an unbounded loop,
+  mirroring other defensive step caps in the slicing pipeline (e.g.
+  `order_range_over_bbox`'s `MAX_ORDER_STEPS`).
+
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
 - **Multi-object collision avoidance**: toolhead-vs-already-printed-object

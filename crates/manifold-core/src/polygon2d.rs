@@ -293,4 +293,61 @@ mod tests {
         // 100 - 4 = 96.
         assert!(approx_eq(area, 96.0));
     }
+
+    #[test]
+    fn repeated_inward_offset_of_an_annulus_shrinks_the_ring_not_just_the_hole() {
+        // Outer boundary CCW, hole CW (matches i_overlay's convention) --
+        // mirrors ConcentricInfill::generate's repeated-offset loop on a
+        // donut shape (e.g. material surrounding a through-hole).
+        let outer = square(0.0, 0.0, 20.0);
+        let mut hole = square(8.0, 8.0, 4.0);
+        hole.reverse();
+        let shape = vec![outer, hole];
+
+        let mut current = inward_offset(&shape, 0.5);
+        let mut ring_bboxes = Vec::new();
+        let mut steps = 0;
+        while !current.is_empty() && steps < 20 {
+            // Bounding box across every loop in this ring generation.
+            let mut min = [f64::INFINITY, f64::INFINITY];
+            let mut max = [f64::NEG_INFINITY, f64::NEG_INFINITY];
+            for loop_ in &current {
+                for p in loop_ {
+                    min[0] = min[0].min(p[0]);
+                    min[1] = min[1].min(p[1]);
+                    max[0] = max[0].max(p[0]);
+                    max[1] = max[1].max(p[1]);
+                }
+            }
+            ring_bboxes.push((min, max));
+            current = inward_offset(&current, 1.0);
+            steps += 1;
+        }
+
+        // If the offset were wrongly collapsing toward the hole's own
+        // center (treating the hole loop as if it were a small solid
+        // outer boundary) every successive ring's bbox would shrink toward
+        // the hole's location (roughly centered at (10,10) within a
+        // ~4-unit box) instead of the whole annulus's outer footprint
+        // (roughly centered at (10,10) within a ~20-unit box, thinning
+        // from BOTH the outer edge and the hole edge). Assert the first
+        // ring's bbox still spans close to the *outer* square's extent,
+        // not the tiny hole's extent.
+        let (first_min, first_max) = ring_bboxes[0];
+        let span_x = first_max[0] - first_min[0];
+        let span_y = first_max[1] - first_min[1];
+        assert!(
+            span_x > 15.0 && span_y > 15.0,
+            "first ring bbox span ({span_x}, {span_y}) should track the ~20-unit outer \
+             boundary, not collapse toward the ~4-unit hole"
+        );
+
+        // And the ring sequence should actually terminate (annulus fully
+        // consumed) well before the material could plausibly still exist,
+        // not run away.
+        assert!(
+            steps < 20,
+            "ring offsetting should terminate for a bounded annulus"
+        );
+    }
 }

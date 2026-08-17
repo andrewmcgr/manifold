@@ -25,6 +25,11 @@ pub enum InfillPatternKind {
     /// [`MonotonicInfill`].
     #[default]
     Monotonic,
+    /// Concentric fill: repeated inward offsets of the region boundary,
+    /// each printed as its own closed loop, spaced `infill_line_width`
+    /// apart (widened by `density`, same convention as `Monotonic`). See
+    /// [`ConcentricInfill`].
+    Concentric,
 }
 
 /// Resolve an [`InfillPatternKind`] to its [`InfillGenerator`] implementation.
@@ -32,6 +37,7 @@ pub enum InfillPatternKind {
 pub fn generator_for(kind: InfillPatternKind) -> Box<dyn InfillGenerator + Sync> {
     match kind {
         InfillPatternKind::Monotonic => Box::new(MonotonicInfill),
+        InfillPatternKind::Concentric => Box::new(ConcentricInfill),
     }
 }
 
@@ -392,6 +398,111 @@ impl InfillGenerator for MonotonicInfill {
             segments,
             tool: crate::ids::ToolId::default(),
         }]
+    }
+}
+
+/// Safety cap on the number of successive inward offsets `ConcentricInfill`
+/// will take before giving up on a single region, guarding against a
+/// pathological input (e.g. `infill_line_width`/`density` combining to an
+/// almost-zero spacing) turning into an unbounded loop -- mirrors the
+/// defensive `MAX_ORDER_STEPS`-style caps used elsewhere in the slicing
+/// pipeline for the same reason.
+const MAX_CONCENTRIC_RINGS: usize = 10_000;
+
+/// Concentric fill: successive inward offsets of the region boundary
+/// (`SlicerConfig::infill_line_width` apart, widened by `density` the same
+/// way `MonotonicInfill` widens its scan-line spacing), each printed as its
+/// own closed loop -- unlike `MonotonicInfill`'s open zig-zag, there is no
+/// travel move needed *between* rings since each ring is emitted as its own
+/// [`Path`] (the same convention `toolpath::plan` already uses for wall
+/// loops: one closed `Path` per loop, with inter-`Path` travel handled by
+/// the Gcode emission stage rather than an explicit `Segment`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConcentricInfill;
+
+impl InfillGenerator for ConcentricInfill {
+    fn generate(
+        &self,
+        region: &InfillRegion,
+        config: &SlicerConfig,
+        layer: &Layer,
+        _object_transform: &Transform,
+        density: f64,
+    ) -> Vec<Path> {
+        if region.is_empty() || density <= 0.0 {
+            return Vec::new();
+        }
+
+        let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
+        let (basis1, basis2) = plane_basis(axis);
+
+        // Same density convention as `MonotonicInfill`: `1.0` packs rings
+        // at `infill_line_width` spacing, lower density spreads them
+        // further apart.
+        let clamped_density = density.min(1.0);
+        let spacing =
+            (config.infill_line_width.abs().max(f64::EPSILON)) / clamped_density.max(f64::EPSILON);
+
+        let boundary_2d = polygon2d::to_2d(&region.loops, basis1, basis2, apex);
+
+        // First ring sits half a line width in from the boundary (so its
+        // bead is centered on the boundary edge, matching how wall passes
+        // are offset from the object surface); each subsequent ring steps
+        // inward by a further full `spacing`, until an offset collapses to
+        // nothing.
+        let mut rings_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+        let mut current = polygon2d::inward_offset(&boundary_2d, spacing / 2.0);
+        let mut steps = 0usize;
+        while !current.is_empty() && steps < MAX_CONCENTRIC_RINGS {
+            rings_2d.extend(current.iter().cloned());
+            current = polygon2d::inward_offset(&current, spacing);
+            steps += 1;
+        }
+
+        if rings_2d.is_empty() {
+            return Vec::new();
+        }
+
+        // Reference-seeded reconstruction (see
+        // `InfillRegion::from_layer`'s identical use of
+        // `reconstruct_on_order_field_near`): every offset ring lies close
+        // to the region's own already-reconstructed boundary loops, so
+        // seeding from those avoids the wrong-branch axis-ray solves that
+        // previously spiked Eikonal infill.
+        let world_rings = order_field::reconstruct_on_order_field_near(
+            rings_2d,
+            &region.loops,
+            basis1,
+            basis2,
+            axis,
+            apex,
+            layer.order,
+            order_field::max_along_for(config),
+            layer.order_field.as_ref(),
+        );
+
+        world_rings
+            .into_iter()
+            .filter(|ring| ring.len() >= 3)
+            .map(|points| {
+                let segments = points
+                    .iter()
+                    .map(|_| Segment {
+                        kind: MoveKind::Infill,
+                        speed: 60.0,
+                        extrusion_rate: 1.0,
+                        support_fraction: 0.0,
+                        order: layer.order,
+                        extrusion_length: 0.0,
+                    })
+                    .collect();
+                Path {
+                    points,
+                    segments,
+                    tool: crate::ids::ToolId::default(),
+                }
+            })
+            .collect()
     }
 }
 
@@ -854,5 +965,115 @@ mod tests {
             saw_travel_across_hole,
             "expected at least one Travel-kind edge jumping across the hole"
         );
+    }
+
+    #[test]
+    fn concentric_fill_produces_multiple_closed_rings_covering_a_square() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths =
+            ConcentricInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+
+        assert!(
+            paths.len() > 1,
+            "expected several successively-inset rings, got {}",
+            paths.len()
+        );
+        for path in &paths {
+            // Each ring is its own closed loop: segments wrap all the way
+            // around back to the first point (see `Path`'s doc), unlike
+            // `MonotonicInfill`'s open zig-zag.
+            assert_eq!(path.points.len(), path.segments.len());
+            assert!(path.segments.iter().all(|s| s.kind == MoveKind::Infill));
+            for p in &path.points {
+                assert!(p.x >= -5.001 && p.x <= 5.001, "x out of bounds: {p:?}");
+                assert!(p.y >= -5.001 && p.y <= 5.001, "y out of bounds: {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn concentric_fill_returns_no_paths_when_density_is_zero() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths =
+            ConcentricInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.0);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn concentric_fill_is_empty_for_empty_region() {
+        let layer = Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: Vec::new(),
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            ..Layer::default()
+        };
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths =
+            ConcentricInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn concentric_fill_density_widens_ring_spacing_below_full_density() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+
+        let full_density_paths =
+            ConcentricInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+        let half_density_paths =
+            ConcentricInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.5);
+
+        // Halving density doubles ring spacing, so roughly half as many
+        // rings fit across the same region before offsetting collapses to
+        // nothing.
+        assert!(!full_density_paths.is_empty());
+        assert!(!half_density_paths.is_empty());
+        assert!(half_density_paths.len() < full_density_paths.len());
+    }
+
+    #[test]
+    fn concentric_fill_never_enters_a_hole() {
+        // Same square-with-hole shape as
+        // `monotonic_fill_segment_kinds_align_with_their_own_edge_around_a_hole`:
+        // concentric rings should stay in the annulus between the outer
+        // boundary and the hole, never crossing into the hole itself.
+        let layer = Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: Vec::new(),
+            infill_boundary: vec![
+                vec![
+                    DVec3::new(-5.0, -5.0, 0.0),
+                    DVec3::new(5.0, -5.0, 0.0),
+                    DVec3::new(5.0, 5.0, 0.0),
+                    DVec3::new(-5.0, 5.0, 0.0),
+                ],
+                vec![
+                    DVec3::new(-1.0, -1.0, 0.0),
+                    DVec3::new(-1.0, 1.0, 0.0),
+                    DVec3::new(1.0, 1.0, 0.0),
+                    DVec3::new(1.0, -1.0, 0.0),
+                ],
+            ],
+            solid_fill_boundary: Vec::new(),
+            ..Layer::default()
+        };
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths =
+            ConcentricInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+        assert!(!paths.is_empty());
+
+        for path in &paths {
+            for p in &path.points {
+                let inside_hole = p.x > -0.999 && p.x < 0.999 && p.y > -0.999 && p.y < 0.999;
+                assert!(!inside_hole, "ring point {p:?} fell inside the hole");
+            }
+        }
     }
 }
