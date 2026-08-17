@@ -493,7 +493,7 @@ pub fn slice_mesh_with_progress(
                 let offset_2d = polygon2d::inward_offset(&loops_2d, config.wall_line_width);
                 polygon2d::from_2d(offset_2d, basis1, basis2, origin)
             } else {
-                innermost_wall_loops
+                let offset_3d: Vec<Vec<DVec3>> = innermost_wall_loops
                     .iter()
                     .flat_map(|loop_points| {
                         let (centroid, normal) = loop_centroid_and_normal(loop_points);
@@ -507,7 +507,31 @@ pub fn slice_mesh_with_progress(
                         let offset_2d = polygon2d::inward_offset(&loop_2d, config.wall_line_width);
                         polygon2d::from_2d(offset_2d, loop_basis1, loop_basis2, centroid)
                     })
-                    .collect()
+                    .collect();
+                // The per-loop best-fit-plane lift above is only a local
+                // approximation: a small or noisy loop can yield a bad
+                // plane normal, sending its offset points well off the
+                // layer's actual isosurface (even below the build plate),
+                // and those points then poison every downstream consumer
+                // that uses `infill_boundary` as a same-branch height
+                // reference (`InfillRegion::from_layer`,
+                // `compute_solid_fill_boundaries`, infill crossing
+                // re-solves). Refine each offset point back onto the
+                // isosurface, seeded from the nearest innermost-wall point
+                // -- known-good geometry straight from contour extraction
+                // on the mesh (see `reconstruct_on_order_field_near`).
+                let offset_2d = polygon2d::to_2d(&offset_3d, basis1, basis2, origin);
+                order_field::reconstruct_on_order_field_near(
+                    offset_2d,
+                    &innermost_wall_loops,
+                    basis1,
+                    basis2,
+                    BUILD_DIRECTION,
+                    origin,
+                    order_value,
+                    order_field::max_along_for(config),
+                    &*field,
+                )
             };
             Layer {
                 index,
@@ -653,8 +677,17 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
         for (k, solid_2d) in solid_2d_per_k.into_iter().enumerate() {
             let order = layers[positions[k]].order;
             let field = Arc::clone(&layers[positions[k]].order_field);
-            layers[positions[k]].solid_fill_boundary = order_field::reconstruct_on_order_field(
+            // Reference-seeded reconstruction (see
+            // `reconstruct_on_order_field_near`): the solid region is a
+            // boolean composition of this layer's (and neighbors')
+            // infill boundaries, all projected at the same (u, v) --
+            // this layer's own 3D infill boundary gives every rebuilt
+            // point a same-branch height seed, avoiding the wrong-branch
+            // axis-ray solves that spiked Eikonal solid fill.
+            let references = layers[positions[k]].infill_boundary.clone();
+            layers[positions[k]].solid_fill_boundary = order_field::reconstruct_on_order_field_near(
                 solid_2d,
+                &references,
                 basis1,
                 basis2,
                 axis,

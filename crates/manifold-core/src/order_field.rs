@@ -316,7 +316,110 @@ pub fn reconstruct_on_order_field<F: OrderField + ?Sized>(
                 .into_iter()
                 .map(|[u, v]| {
                     let planar = apex + basis1 * u + basis2 * v;
+                    // Contour points come from real isosurface extraction
+                    // on the mesh (see `contour::extract_order_contours_on_mesh`),
+                    // so `reconstruct_point_on_order_field` (which now tries
+                    // both an axis-only search and, if that fails to
+                    // bracket -- e.g. a steep isosurface -- a full 3D
+                    // gradient projection) is expected to actually succeed.
+                    // Falling back to `planar` itself here would mean the
+                    // field has literally no information anywhere near a
+                    // point already known to sit on its own isosurface,
+                    // which should not happen in practice; kept only as a
+                    // best-effort last resort, not a proof obligation.
                     reconstruct_point_on_order_field(planar, axis, target_order, max_along, field)
+                        .unwrap_or(planar)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Like [`reconstruct_on_order_field`], but seeds every point's height
+/// from the nearest (in `(u, v)`) point of `references` -- 3D loops already
+/// known to lie on (or very near) the layer's `target_order` isosurface,
+/// e.g. the layer's own `infill_boundary` before a 2D boolean op -- and
+/// then refines with [`project_onto_isosurface`]'s local Newton descent
+/// instead of an axis-ray bracket search from the `along == 0` plane.
+///
+/// This exists because [`reconstruct_on_order_field`]'s axis-ray solve is
+/// launched from the world `axis == 0` plane with its initial bracket
+/// centered at `along ~= +-target_order`: for a *non-monotonic* field
+/// (`Eikonal` on reentrant/threaded geometry) the same vertical column can
+/// cross `order == target_order` at several heights, and that search can
+/// bracket and "exactly" solve a *different branch* many layer heights
+/// from the true one -- producing steep near-vertical spikes in
+/// infill/solid boundaries reconstructed after 2D boolean ops. Boolean-op
+/// output points always lie on (or at intersections of) input edges, so
+/// the nearest input point's height is a locally-correct same-branch seed;
+/// Newton descent from there inherently converges to the local branch.
+///
+/// Refinement acceptance is field-adaptive: a refined point that wandered
+/// farther from its seed than the seed's own |residual| justifies (slope
+/// slack factor 4, plus a small absolute slack) is rejected in favor of
+/// the seed itself. Empty `references` falls back to
+/// [`reconstruct_on_order_field`] wholesale.
+#[allow(clippy::too_many_arguments)] // one param per geometric input; see reconstruct_on_order_field
+pub fn reconstruct_on_order_field_near<F: OrderField + ?Sized>(
+    contours: Vec<Vec<[f64; 2]>>,
+    references: &[Vec<DVec3>],
+    basis1: DVec3,
+    basis2: DVec3,
+    axis: DVec3,
+    apex: DVec3,
+    target_order: f64,
+    max_along: f64,
+    field: &F,
+) -> Vec<Vec<DVec3>> {
+    // Project references once into (u, v, along) triples.
+    let refs: Vec<(f64, f64, f64)> = references
+        .iter()
+        .flatten()
+        .map(|&p| {
+            let rel = p - apex;
+            (rel.dot(basis1), rel.dot(basis2), rel.dot(axis))
+        })
+        .collect();
+    if refs.is_empty() {
+        return reconstruct_on_order_field(
+            contours,
+            basis1,
+            basis2,
+            axis,
+            apex,
+            target_order,
+            max_along,
+            field,
+        );
+    }
+
+    contours
+        .into_iter()
+        .map(|contour| {
+            contour
+                .into_iter()
+                .map(|[u, v]| {
+                    let nearest_along = refs
+                        .iter()
+                        .min_by(|a, b| {
+                            let da = (a.0 - u).powi(2) + (a.1 - v).powi(2);
+                            let db = (b.0 - u).powi(2) + (b.1 - v).powi(2);
+                            da.total_cmp(&db)
+                        })
+                        .map(|&(_, _, along)| along)
+                        .unwrap_or(0.0);
+                    let seed = apex + basis1 * u + basis2 * v + axis * nearest_along;
+                    let seed_residual = field.order(seed) - target_order;
+                    if !seed_residual.is_finite() {
+                        return seed;
+                    }
+                    // Small absolute slack on top of the residual-derived
+                    // bound: `max_along` is 50 layer heights (see
+                    // `max_along_for`), so 0.04x of it is ~2 layer heights.
+                    let accept = seed_residual.abs() * 4.0 + max_along * 0.04;
+                    project_onto_isosurface(field, seed, target_order, max_along)
+                        .filter(|p| (*p - seed).length() <= accept)
+                        .unwrap_or(seed)
                 })
                 .collect()
         })
@@ -326,7 +429,17 @@ pub fn reconstruct_on_order_field<F: OrderField + ?Sized>(
 /// Single-point building block behind [`reconstruct_on_order_field`]: given
 /// a transverse (perpendicular-to-`axis`) reference position `planar`,
 /// solves for the `axis`-offset that lands on `field`'s `target_order`
-/// isosurface and returns the resulting 3D world point.
+/// isosurface and returns the resulting 3D world point, or `None` if no
+/// finite `field.order` sample was ever observed anywhere along the search
+/// (see [`solve_along`]'s doc) -- i.e. `planar`'s whole column is outside
+/// the region `field` has any information about at all (e.g. a straight
+/// ray from a synthetic, not-necessarily-on-the-mesh `(u, v)` location,
+/// such as an infill scan-line/loop-edge crossing, that passes entirely
+/// through empty space next to reentrant/threaded geometry an `Eikonal`
+/// front never reached). Callers must not treat `None` as "assume
+/// `along == 0`" -- that previously produced exactly the flat, badly-wrong
+/// spike-plane bug this return type exists to prevent; see this function's
+/// callers for their fallback strategy when reconstruction fails.
 ///
 /// `planar` need not be `apex + basis1 * u + basis2 * v` specifically — any
 /// point with the desired transverse `(u, v)` location works, regardless of
@@ -352,9 +465,49 @@ pub(crate) fn reconstruct_point_on_order_field<F: OrderField + ?Sized>(
     target_order: f64,
     max_along: f64,
     field: &F,
-) -> DVec3 {
-    let along = solve_along(field, planar, axis, target_order, max_along);
-    planar + axis * along
+) -> Option<DVec3> {
+    match solve_along(field, planar, axis, target_order, max_along)? {
+        SolveAlong::Exact(along) => Some(planar + axis * along),
+        SolveAlong::ClosestObserved(along) => {
+            // The axis-only ray search never actually bracketed the
+            // target (see `solve_along`'s doc) -- this is typically a
+            // *steep* isosurface, where `order` changes fast in-plane but
+            // slowly along `axis`, so the true nearest isosurface point
+            // needs a lateral shift the axis-only search can never make
+            // no matter how far it travels along `axis` alone. Try a full
+            // 3D gradient projection from the same starting point first;
+            // only fall back to the cruder axis-only closest-observed
+            // sample if that also fails to converge.
+            project_onto_isosurface(field, planar, target_order, max_along)
+                .or(Some(planar + axis * along))
+        }
+    }
+}
+
+/// Refines an already-approximately-on-the-isosurface `seed` onto `field`'s
+/// exact `target_order` isosurface via [`project_onto_isosurface`]'s
+/// Newton-style 3D gradient descent (each step clamped to `max_step`).
+///
+/// This exists for callers that already hold a locally-sane starting point
+/// on the *correct branch* of the isosurface (e.g. an infill scan-line
+/// crossing lerped between two real, already-reconstructed boundary
+/// points) and only need the residual curvature error removed. Routing
+/// such a seed through [`reconstruct_point_on_order_field`] instead is
+/// actively dangerous for a non-monotonic field (`Eikonal` on
+/// reentrant/threaded geometry): its `solve_along` centers the bracketing
+/// search on `along ~= +-target` -- correct for a bare in-plane `planar`
+/// at `along == 0`, but far away from a seed that already sits at the
+/// right height -- so it can bracket and "exactly" solve a *different
+/// branch* of the isosurface many layer-heights away. Gradient descent
+/// from a near-surface seed, by contrast, inherently converges to the
+/// local branch.
+pub(crate) fn refine_point_onto_order_field<F: OrderField + ?Sized>(
+    seed: DVec3,
+    target_order: f64,
+    max_step: f64,
+    field: &F,
+) -> Option<DVec3> {
+    project_onto_isosurface(field, seed, target_order, max_step)
 }
 
 /// Solves `field.order(planar + axis * along) == target` for `along`
@@ -387,23 +540,42 @@ pub(crate) fn reconstruct_point_on_order_field<F: OrderField + ?Sized>(
 /// a straight ray along `axis` from `planar` never crosses `target` at
 /// all — common for a non-monotonic field like `Eikonal` on reentrant or
 /// threaded geometry, where the true isosurface for this `(u, v)` column
-/// simply isn't reachable by a vertical search), this returns the
-/// *closest-to-target* sample observed anywhere during the search
-/// (including the initial probes) rather than the outer edge of the
-/// failed bracket. Previously this fell through to the last bracket's
-/// midpoint, which for a failed search sits right at the `max_along`
-/// bound — up to 50 layer heights away — producing exactly the multi-mm
-/// vertical spikes seen on screw-thread geometry with an `Eikonal` order
-/// field; "closest real sample we actually saw" is a far tighter,
+/// simply isn't reachable by a vertical search), this falls back to a
+/// bounded, evenly-spaced scan of the whole `[min_bound, max_bound]`
+/// range and returns the *closest-to-target* sample found there (rather
+/// than just the handful of widely-spaced points visited by the
+/// exponential doubling above, which can skip straight over the region
+/// where the field's true closest approach to `target` actually lives),
+/// as long as at least one *finite* sample was actually observed
+/// somewhere along the ray. Previously this fell through to the last
+/// bracket's midpoint, which for a failed search sits right at the
+/// `max_along` bound — up to 50 layer heights away — producing exactly
+/// the multi-mm vertical spikes seen on screw-thread geometry with an
+/// `Eikonal` order field; a full bounded scan is a far tighter,
 /// caller-visible "best effort" position for a pathological/misbehaving
-/// field than "as far as the search was allowed to wander."
+/// field than either "as far as the search was allowed to wander" or a
+/// handful of sparse doubling-search samples.
+///
+/// If **no** finite sample was ever observed anywhere along the ray
+/// (`field.order` returns non-finite — e.g. `Eikonal`'s
+/// front-never-reached `f64::INFINITY` — at every probed `along`,
+/// including `along == 0.0` itself), this returns `None` rather than
+/// falling back to `along == 0.0`. Returning `0.0` here previously
+/// silently collapsed every such column onto the `axis == 0` plane (world
+/// `Z == 0` for the common `axis == BUILD_DIRECTION` case) — a
+/// caller-invisible wrong answer that reads as a real point, producing the
+/// flat "spike floor" seen when many infill scan-line crossings from
+/// reentrant/threaded geometry all land in a region the field's front
+/// never reached at all. `None` forces callers to make an explicit choice
+/// for a column with *zero* information instead of silently fabricating
+/// one.
 fn solve_along<F: OrderField + ?Sized>(
     field: &F,
     planar: DVec3,
     axis: DVec3,
     target: f64,
     max_along: f64,
-) -> f64 {
+) -> Option<SolveAlong> {
     const TOLERANCE: f64 = 1e-9;
     const MAX_BISECT_ITERS: u32 = 64;
 
@@ -412,13 +584,20 @@ fn solve_along<F: OrderField + ?Sized>(
 
     // Best (lowest |residual|) sample seen anywhere during the search --
     // the fallback returned if bracketing never finds a real sign change
-    // (see this function's doc).
+    // (see this function's doc). `found_any_finite` distinguishes "found
+    // some real information, just no exact bracket" (still worth using
+    // `best_along`) from "zero finite samples anywhere" (must return
+    // `None` -- see this function's doc).
     let mut best_along = 0.0_f64;
-    let mut best_residual = residual(0.0).abs();
+    let mut best_residual = f64::INFINITY;
+    let mut found_any_finite = false;
     let mut consider = |along: f64, r: f64| {
-        if r.is_finite() && r.abs() < best_residual {
-            best_residual = r.abs();
-            best_along = along;
+        if r.is_finite() {
+            found_any_finite = true;
+            if r.abs() < best_residual {
+                best_residual = r.abs();
+                best_along = along;
+            }
         }
     };
 
@@ -443,7 +622,7 @@ fn solve_along<F: OrderField + ?Sized>(
     let mut f_lo = residual(lo);
     consider(lo, f_lo);
     if f_lo.abs() <= TOLERANCE {
-        return lo;
+        return Some(SolveAlong::Exact(lo));
     }
 
     let mut step = 1.0_f64.min(max_along.max(f64::EPSILON));
@@ -486,10 +665,32 @@ fn solve_along<F: OrderField + ?Sized>(
         // No sign change was ever found within `max_along` -- the true
         // isosurface isn't reachable by a straight ray along `axis` from
         // `planar` at all (common for a non-monotonic field like
-        // `Eikonal` on reentrant/threaded geometry). Fall back to the
-        // closest-to-target sample actually observed, not the outer edge
-        // of the failed bracket (see this function's doc).
-        return best_along;
+        // `Eikonal` on reentrant/threaded geometry). The exponential
+        // doubling above only visited a handful of widely-spaced samples
+        // (each step roughly doubling the previous one), so "closest
+        // observed so far" from *those* alone can still be a poor,
+        // spurious guess -- e.g. it might have jumped straight from a
+        // sample near `along == 0` to one near `max_bound` without ever
+        // probing the region in between, which is exactly where the
+        // field's true closest approach to `target` usually lives. Do one
+        // bounded, evenly-spaced scan across the whole reachable range to
+        // find the actual closest-to-target sample before giving up --
+        // this only runs for the rare pathological columns that fail to
+        // bracket at all, so the extra field evaluations are not paid on
+        // the common path.
+        const FALLBACK_SCAN_STEPS: u32 = 256;
+        let span = max_bound - min_bound;
+        if span.is_finite() && span > 0.0 {
+            for i in 0..=FALLBACK_SCAN_STEPS {
+                let along = min_bound + span * (f64::from(i) / f64::from(FALLBACK_SCAN_STEPS));
+                consider(along, residual(along));
+            }
+        }
+        // Closest-to-target sample actually observed, not the outer edge
+        // of the failed bracket (see this function's doc) -- unless
+        // *nothing* finite was ever observed, in which case there is
+        // nothing to fall back to at all.
+        return found_any_finite.then_some(SolveAlong::ClosestObserved(best_along));
     }
 
     f_lo = residual(lo);
@@ -497,7 +698,7 @@ fn solve_along<F: OrderField + ?Sized>(
         let mid = 0.5 * (lo + hi);
         let f_mid = residual(mid);
         if f_mid.abs() <= TOLERANCE {
-            return mid;
+            return Some(SolveAlong::Exact(mid));
         }
         if (f_mid < 0.0) == (f_lo < 0.0) {
             lo = mid;
@@ -506,7 +707,98 @@ fn solve_along<F: OrderField + ?Sized>(
             hi = mid;
         }
     }
-    (0.5 * (lo + hi)).clamp(min_bound, max_bound)
+    Some(SolveAlong::Exact(
+        (0.5 * (lo + hi)).clamp(min_bound, max_bound),
+    ))
+}
+
+/// Distinguishes a genuinely-bracketed-and-bisected root from
+/// [`solve_along`]'s no-bracket "closest observed sample" fallback, so
+/// [`reconstruct_point_on_order_field`] can try a fuller 3D projection
+/// (see [`project_onto_isosurface`]) before accepting the cruder
+/// axis-only fallback.
+enum SolveAlong {
+    /// A real sign change was bracketed and refined by bisection; `along`
+    /// lands on the isosurface (within [`solve_along`]'s `TOLERANCE`).
+    Exact(f64),
+    /// No sign change was ever bracketed; `along` is merely the
+    /// closest-to-target sample observed during the search, not an actual
+    /// root.
+    ClosestObserved(f64),
+}
+
+/// Projects `start` onto `field`'s `target` isosurface by moving freely in
+/// full 3D (not constrained to a single `axis`), for cases where
+/// [`solve_along`]'s axis-only ray search never brackets the target at
+/// all. That axis-only search is exact and cheap for the common case, but
+/// fundamentally cannot succeed for a *steep* isosurface (`order` changes
+/// fast in-plane, slowly along `axis`) where the true nearest isosurface
+/// point requires a lateral shift, not just a different `along` -- exactly
+/// the geometry that produced `Eikonal`-driven infill points collapsing
+/// onto the flat `axis == 0` plane near steep threaded/reentrant
+/// features.
+///
+/// Uses a central-difference numeric gradient (`field` exposes only scalar
+/// `order`, no analytic gradient) and Newton-style steps `p -= grad *
+/// (residual / grad.length_squared())`, each step clamped to `max_step` so
+/// a near-zero or wildly large local gradient can't produce a nonsensical
+/// jump. Returns `None` if `field` is already non-finite at `start`
+/// (nothing to descend from), if the gradient ever degenerates (zero or
+/// non-finite -- no local direction of improvement), if a step lands
+/// somewhere `field` is non-finite (stepped outside the field's known
+/// region), or if the residual never converges within `MAX_ITERS` steps.
+fn project_onto_isosurface<F: OrderField + ?Sized>(
+    field: &F,
+    start: DVec3,
+    target: f64,
+    max_step: f64,
+) -> Option<DVec3> {
+    const TOLERANCE: f64 = 1e-6;
+    const MAX_ITERS: u32 = 64;
+    const GRAD_EPS: f64 = 1e-4;
+    let max_step = max_step.abs().max(f64::EPSILON);
+
+    let mut p = start;
+    let mut value = field.order(p);
+    if !value.is_finite() {
+        return None;
+    }
+
+    for _ in 0..MAX_ITERS {
+        let residual = value - target;
+        if residual.abs() <= TOLERANCE {
+            return Some(p);
+        }
+
+        let grad = DVec3::new(
+            (field.order(p + DVec3::X * GRAD_EPS) - field.order(p - DVec3::X * GRAD_EPS))
+                / (2.0 * GRAD_EPS),
+            (field.order(p + DVec3::Y * GRAD_EPS) - field.order(p - DVec3::Y * GRAD_EPS))
+                / (2.0 * GRAD_EPS),
+            (field.order(p + DVec3::Z * GRAD_EPS) - field.order(p - DVec3::Z * GRAD_EPS))
+                / (2.0 * GRAD_EPS),
+        );
+        let grad_len_sq = grad.length_squared();
+        if !grad_len_sq.is_finite() || grad_len_sq < 1e-12 {
+            return None;
+        }
+
+        let mut step = grad * (residual / grad_len_sq);
+        let step_len = step.length();
+        if step_len > max_step {
+            step *= max_step / step_len;
+        }
+
+        let next = p - step;
+        let next_value = field.order(next);
+        if !next_value.is_finite() {
+            return None;
+        }
+        p = next;
+        value = next_value;
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -629,13 +921,129 @@ mod tests {
         let planar = DVec3::new(3.0, -2.0, 0.0);
         let max_along = 10.0;
 
-        let point = reconstruct_point_on_order_field(planar, axis, 0.0, max_along, &field);
+        let point = reconstruct_point_on_order_field(planar, axis, 0.0, max_along, &field)
+            .expect("a finite sample was observed everywhere along this field, so reconstruction must succeed");
 
         assert!(
             (point - planar).length() < 1e-6,
             "expected the closest-observed fallback right at `planar` (along == 0.0), got {point:?} \
              (drifted {} units away)",
             (point - planar).length()
+        );
+    }
+
+    #[test]
+    fn solve_along_fallback_finds_a_narrow_near_root_the_doubling_probes_skip_over() {
+        // Regression test for "infill Z heights are still spiky/wrong even
+        // after the `None` fix": the exponential-doubling search only
+        // visits a handful of widely-spaced `along` samples (roughly
+        // 1, 3, 7, 15, ... units out from the initial guess here). A field
+        // whose true closest approach to `target` sits in a narrow region
+        // *between* two of those samples was previously invisible to the
+        // no-bracket fallback, which only remembered the best of the
+        // sparse doubling samples themselves -- e.g. it would report the
+        // residual at `along == 3` or `along == 7` (tied, both far from
+        // the root) instead of the true near-root minimum at `along == 5`
+        // sitting right between them. The bounded dense scan added to the
+        // no-bracket fallback must find that narrow near-root region
+        // instead.
+        struct NarrowBumpBetweenDoublingSamples;
+        impl OrderField for NarrowBumpBetweenDoublingSamples {
+            fn order(&self, p: DVec3) -> f64 {
+                // Always negative (so `residual = order - target` never
+                // changes sign and bracketing can never succeed), with its
+                // magnitude minimized in a narrow region right at
+                // `p.z == 5.0` -- a point the doubling search's sample
+                // sequence (1, 3, 7, 15, ...) straddles but never lands on.
+                -(p.z - 5.0).abs() - 0.001
+            }
+        }
+
+        let field = NarrowBumpBetweenDoublingSamples;
+        let axis = DVec3::Z;
+        let planar = DVec3::new(0.0, 0.0, 0.0);
+        let target = 0.0;
+        let max_along = 50.0;
+
+        let point = reconstruct_point_on_order_field(planar, axis, target, max_along, &field)
+            .expect("a finite sample was observed everywhere along this field");
+
+        assert!(
+            (point.z - 5.0).abs() < 0.5,
+            "expected the dense fallback scan to land near the true closest-approach at z == 5.0, \
+             got {point:?} -- a sparse-doubling-only fallback would have landed near z == 3.0 or \
+             z == 7.0 instead"
+        );
+    }
+
+    #[test]
+    fn solve_along_returns_none_when_no_finite_sample_is_ever_observed() {
+        // Regression test for the "infill scan-line crossings snap to a
+        // flat Z == 0 plane" bug: when *every* probed `along` (including
+        // `along == 0.0` itself) yields a non-finite `field.order` (e.g.
+        // an `EikonalOrderField` whose front never reached this column at
+        // all), `solve_along`/`reconstruct_point_on_order_field` must
+        // return `None` -- there is zero information to reconstruct a
+        // position from -- rather than silently defaulting to
+        // `along == 0.0`, which previously collapsed every such column
+        // onto the `axis == 0` world plane (a caller-invisible wrong
+        // answer masquerading as a real point).
+        struct NeverReached;
+        impl OrderField for NeverReached {
+            fn order(&self, _p: DVec3) -> f64 {
+                f64::INFINITY
+            }
+        }
+
+        let field = NeverReached;
+        let axis = DVec3::Z;
+        let planar = DVec3::new(1.0, 2.0, 0.0);
+        let max_along = 10.0;
+
+        assert!(reconstruct_point_on_order_field(planar, axis, 0.0, max_along, &field).is_none());
+    }
+
+    #[test]
+    fn reconstruct_projects_laterally_onto_a_steep_isosurface_the_axis_only_search_cannot_reach() {
+        // Regression test for "infill Z heights are still spiky/wrong even
+        // after the no-bracket dense-scan fix, specifically where the
+        // Eikonal isosurface is very steep": an axis-only ray search (fixed
+        // in-plane position, varying only `along` the build direction) can
+        // never reach the isosurface at all when `order` barely depends on
+        // `along` but depends steeply on the in-plane position -- the
+        // isosurface is nearly *parallel* to `axis`, so no amount of
+        // marching along `axis` alone changes the residual. This field is
+        // the extreme case: `order` doesn't depend on `along` (== world Z
+        // here) whatsoever, only on `x`, so `solve_along`'s axis-only search
+        // must fail to bracket no matter how far it searches -- exactly the
+        // steep-isosurface failure mode `project_onto_isosurface`'s lateral
+        // 3D movement exists to recover from.
+        struct SteepWallAlongX;
+        impl OrderField for SteepWallAlongX {
+            fn order(&self, p: DVec3) -> f64 {
+                1000.0 * p.x
+            }
+        }
+
+        let field = SteepWallAlongX;
+        let axis = DVec3::Z;
+        let planar = DVec3::new(5.0, 0.0, 0.0);
+        let target_order = 0.0;
+        let max_along = 10.0;
+
+        let point = reconstruct_point_on_order_field(planar, axis, target_order, max_along, &field)
+            .expect("a full 3D projection should recover this steep isosurface");
+
+        assert!(
+            (field.order(point) - target_order).abs() < 1e-6,
+            "point {point:?} does not actually lie on the target isosurface (order == \
+             {}, expected ~{target_order})",
+            field.order(point)
+        );
+        assert!(
+            point.x.abs() < 0.5,
+            "expected the lateral projection to move x toward 0 (the true isosurface location), \
+             but it stayed near the starting x == 5.0: {point:?}"
         );
     }
 

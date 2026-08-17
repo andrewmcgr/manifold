@@ -66,9 +66,22 @@ impl InfillRegion {
         let infill_2d = polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, apex);
         let solid_2d = polygon2d::to_2d(&layer.solid_fill_boundary, basis1, basis2, apex);
         let sparse_2d = polygon2d::difference(&infill_2d, &solid_2d);
+        // Reference-seeded reconstruction (see
+        // `reconstruct_on_order_field_near`): boolean-op output points lie
+        // on the input loops' edges, and the layer's own 3D boundaries are
+        // already on the correct branch of the isosurface, so seeding each
+        // rebuilt point from its nearest input point avoids the
+        // wrong-branch axis-ray solves that spiked Eikonal infill.
+        let references: Vec<Vec<DVec3>> = layer
+            .infill_boundary
+            .iter()
+            .chain(layer.solid_fill_boundary.iter())
+            .cloned()
+            .collect();
         Self {
-            loops: order_field::reconstruct_on_order_field(
+            loops: order_field::reconstruct_on_order_field_near(
                 sparse_2d,
+                &references,
                 basis1,
                 basis2,
                 axis,
@@ -186,13 +199,17 @@ impl InfillGenerator for MonotonicInfill {
 
         // Project every loop's points into the rotated (u, v) frame,
         // keeping loops as closed edge lists (wrap-around to point 0).
-        let projected: Vec<Vec<(f64, f64)>> = region
+        // The original 3D point travels alongside (u, v) so a failed
+        // order-field re-solve (see the crossing loop below) can fall back
+        // to interpolating real, already-known-good boundary points
+        // instead of fabricating a position.
+        let projected: Vec<Vec<(f64, f64, DVec3)>> = region
             .loops
             .iter()
             .map(|points| {
                 points
                     .iter()
-                    .map(|p| (p.dot(u_dir), p.dot(v_dir)))
+                    .map(|&p| (p.dot(u_dir), p.dot(v_dir), p))
                     .collect()
             })
             .collect();
@@ -200,7 +217,7 @@ impl InfillGenerator for MonotonicInfill {
         let Some(v_min) = projected
             .iter()
             .flatten()
-            .map(|&(_, v)| v)
+            .map(|&(_, v, _)| v)
             .fold(None, |acc, v| Some(acc.map_or(v, |m: f64| m.min(v))))
         else {
             return Vec::new();
@@ -208,7 +225,7 @@ impl InfillGenerator for MonotonicInfill {
         let v_max = projected
             .iter()
             .flatten()
-            .map(|&(_, v)| v)
+            .map(|&(_, v, _)| v)
             .fold(v_min, f64::max);
 
         // Scan-lines to draw, grouped scan-line by scan-line (ascending v).
@@ -232,8 +249,8 @@ impl InfillGenerator for MonotonicInfill {
                     continue;
                 }
                 for i in 0..n {
-                    let (u0, v0) = loop_points[i];
-                    let (u1, v1) = loop_points[(i + 1) % n];
+                    let (u0, v0, p0) = loop_points[i];
+                    let (u1, v1, p1) = loop_points[(i + 1) % n];
                     let crosses = (v0 <= v && v1 > v) || (v1 <= v && v0 > v);
                     if !crosses {
                         continue;
@@ -245,14 +262,55 @@ impl InfillGenerator for MonotonicInfill {
                     // the crossed edge's endpoint heights (see
                     // `Crossing`'s doc for why linear interpolation is
                     // wrong for a curved field).
-                    let planar = u_dir * u + v_dir * v;
-                    let point = order_field::reconstruct_point_on_order_field(
-                        planar,
-                        axis,
-                        layer.order,
-                        max_along,
-                        layer.order_field.as_ref(),
-                    );
+                    //
+                    // The refinement starts from the *lerped edge point*,
+                    // not from the bare in-plane column `u_dir * u +
+                    // v_dir * v` (which sits at `along == 0`, i.e. the
+                    // world `axis == 0` plane). Projection into the fill
+                    // frame is linear, so the lerp has exactly the same
+                    // `(u, v)` — and it already sits approximately at the
+                    // right height on the *correct branch* of the
+                    // isosurface. A non-monotonic field (`Eikonal` on
+                    // reentrant/threaded geometry) crosses `order ==
+                    // layer.order` at several heights along one vertical
+                    // column, and the previous axis-ray solve from the
+                    // `along == 0` plane could bracket a different, wrong
+                    // branch and return it as an "exact" root up to
+                    // `max_along_for` (50 layer heights) away — exactly
+                    // the steep near-vertical infill spikes anchored
+                    // around `Z ~= 0`. Newton-style gradient refinement
+                    // from the near-surface seed inherently converges to
+                    // the local branch instead (see
+                    // `refine_point_onto_order_field`'s doc).
+                    //
+                    // Acceptance is field-adaptive: the distance the seed
+                    // truly needs to move is roughly its own residual
+                    // over the local gradient magnitude (~1 for
+                    // distance-like fields such as `Eikonal`), so a
+                    // result that wandered much farther than the seed's
+                    // residual (slope slack factor of 4, plus a couple of
+                    // layer heights of absolute slack) is rejected in
+                    // favor of the lerp — a bounded, locally-sane
+                    // approximation built from two real,
+                    // already-reconstructed boundary points. Likewise if
+                    // the field has no information at the seed at all
+                    // (non-finite `order`, e.g. an `Eikonal` front that
+                    // never reached this column), keep the lerp.
+                    let seed = p0.lerp(p1, t);
+                    let seed_residual = layer.order_field.order(seed) - layer.order;
+                    let point = if seed_residual.is_finite() {
+                        let accept = seed_residual.abs() * 4.0 + 2.0 * config.layer_height.abs();
+                        order_field::refine_point_onto_order_field(
+                            seed,
+                            layer.order,
+                            max_along,
+                            layer.order_field.as_ref(),
+                        )
+                        .filter(|p| (*p - seed).length() <= accept)
+                        .unwrap_or(seed)
+                    } else {
+                        seed
+                    };
                     crossings.push(Crossing { u, point });
                 }
             }
@@ -549,6 +607,73 @@ mod tests {
              interpolation ({corner_z}); got {:?}",
             path.points
         );
+    }
+
+    #[test]
+    fn monotonic_fill_falls_back_to_lerping_real_boundary_points_when_the_order_field_has_no_information(
+    ) {
+        // Regression test: when the order field can't be re-solved anywhere
+        // along a scan-line crossing's column (e.g. an `Eikonal` front that
+        // never reached this region), `MonotonicInfill` must fall back to
+        // interpolating the crossed edge's two real, already-known-good 3D
+        // endpoints -- not silently default to `along == 0.0`, which would
+        // collapse every such crossing onto the flat `axis == 0` world
+        // plane (z == 0 here) regardless of the loop's actual geometry.
+        use manifold_fidget::order::OrderField;
+        use std::sync::Arc;
+
+        struct NeverReached;
+        impl OrderField for NeverReached {
+            fn order(&self, _p: DVec3) -> f64 {
+                f64::INFINITY
+            }
+        }
+
+        // A square loop whose corners sit well above the world's Z == 0
+        // plane, so a buggy `along == 0.0` fallback (which reconstructs a
+        // point at `planar + axis * 0.0`, i.e. z == 0) is trivially
+        // distinguishable from the correct lerp-between-real-points
+        // fallback (which must stay near the loop's actual height).
+        let half_extent = 5.0;
+        let z = 3.0;
+        let loop_points = vec![
+            DVec3::new(-half_extent, -half_extent, z),
+            DVec3::new(half_extent, -half_extent, z),
+            DVec3::new(half_extent, half_extent, z),
+            DVec3::new(-half_extent, half_extent, z),
+        ];
+
+        let layer = Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: Vec::new(),
+            infill_boundary: vec![loop_points],
+            solid_fill_boundary: Vec::new(),
+            order_field: Arc::new(NeverReached),
+        };
+
+        let cfg = SlicerConfig {
+            infill_line_width: 0.5,
+            infill_angle_deg: 0.0,
+            ..SlicerConfig::default()
+        };
+
+        let region = InfillRegion::from_layer(&layer, &cfg);
+        assert!(!region.is_empty());
+
+        let paths = MonotonicInfill.generate(&region, &cfg, &layer, &Transform::identity(), 1.0);
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+        assert!(path.points.len() > 4, "expected multiple scan lines");
+
+        for p in &path.points {
+            assert!(
+                (p.z - z).abs() < 1e-6,
+                "point {p:?} should have lerped back to the loop's real height ({z}), not \
+                 collapsed onto the world Z == 0 plane"
+            );
+        }
     }
 
     #[test]
