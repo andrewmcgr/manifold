@@ -111,6 +111,15 @@ pub struct ManifoldApp {
     /// polled once per frame in `update()` via `drain_slice_messages`.
     /// `None` when no slice is currently in progress.
     slicing: Option<std::sync::mpsc::Receiver<SliceMessage>>,
+    /// `JoinHandle` for the background slicing thread spawned by
+    /// `start_slice`, kept so `drain_slice_messages` can `join()` it and
+    /// recover the panic payload if the thread dies without ever sending
+    /// `SliceMessage::Done` (e.g. an `unwrap()`/`expect()`/indexing panic
+    /// somewhere in the slicing/toolpath pipeline) — otherwise a silently
+    /// dropped `Sender` leaves `self.slicing` stuck `Some` forever and the
+    /// UI spins indefinitely with no error surfaced. `None` when no slice
+    /// is currently in progress.
+    slicing_handle: Option<std::thread::JoinHandle<()>>,
     /// `0.0..=1.0` progress of the in-progress slice, reported by
     /// `manifold_core::plan_toolpaths_with_progress`. Only meaningful while
     /// `slicing` is `Some`.
@@ -209,6 +218,7 @@ impl ManifoldApp {
             toolpath_order_range: None,
             slice_error: None,
             slicing: None,
+            slicing_handle: None,
             slice_progress: 0.0,
             profile_error: None,
             next_tool_id: 1,
@@ -426,7 +436,7 @@ impl ManifoldApp {
         );
         let (tx, rx) = std::sync::mpsc::channel();
         let progress_tx = tx.clone();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let mut on_progress = move |fraction: f64| {
                 let _ = progress_tx.send(SliceMessage::Progress(fraction));
             };
@@ -435,6 +445,7 @@ impl ManifoldApp {
             let _ = tx.send(SliceMessage::Done(result));
         });
         self.slicing = Some(rx);
+        self.slicing_handle = Some(handle);
         self.slice_progress = 0.0;
         self.slice_error = None;
     }
@@ -445,24 +456,55 @@ impl ManifoldApp {
     /// slicing just finished this call (so the caller can perform any
     /// follow-up GPU work that needs a `wgpu::Device`, e.g.
     /// `reupload_toolpaths`).
+    ///
+    /// If the channel disconnects without ever sending `Done` (the
+    /// background thread panicked — an unhandled `unwrap()`/`expect()`/
+    /// index-out-of-bounds somewhere in the slicing/toolpath pipeline, most
+    /// likely triggered by degenerate/edge-case mesh geometry), this joins
+    /// the thread to recover the panic payload and surfaces it via
+    /// `slice_error` instead of leaving `self.slicing` stuck `Some` forever
+    /// (which would otherwise spin the progress bar/spinner indefinitely
+    /// with no feedback — see the "slice progress bar spins forever" bug).
     fn drain_slice_messages(&mut self) -> bool {
         let mut finished_result = None;
+        let mut disconnected = false;
         if let Some(rx) = &self.slicing {
-            while let Ok(message) = rx.try_recv() {
-                match message {
-                    SliceMessage::Progress(fraction) => self.slice_progress = fraction,
-                    SliceMessage::Done(result) => finished_result = Some(result),
+            loop {
+                match rx.try_recv() {
+                    Ok(SliceMessage::Progress(fraction)) => self.slice_progress = fraction,
+                    Ok(SliceMessage::Done(result)) => {
+                        finished_result = Some(result);
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
             }
         }
-        match finished_result {
-            Some(result) => {
-                self.slicing = None;
-                self.finish_slice(result);
-                true
-            }
-            None => false,
+        if let Some(result) = finished_result {
+            self.slicing = None;
+            self.slicing_handle = None;
+            self.finish_slice(result);
+            return true;
         }
+        if disconnected {
+            self.slicing = None;
+            let panic_message = self
+                .slicing_handle
+                .take()
+                .and_then(|handle| handle.join().err())
+                .map(|payload| panic_payload_message(&payload))
+                .unwrap_or_else(|| {
+                    "background slicing thread ended without a result (no panic \
+                     payload captured)"
+                        .to_string()
+                });
+            self.slice_error = Some(format!("slicing thread panicked: {panic_message}"));
+        }
+        false
     }
 
     /// Store the result of a finished slice (or error) for preview/export
@@ -1275,6 +1317,24 @@ fn slice_grid_to_color_image(grid: &manifold_fidget::slice::SliceGrid) -> egui::
     egui::ColorImage {
         size: [grid.width, grid.height],
         pixels,
+    }
+}
+
+/// Extracts a human-readable message from a thread panic payload (as
+/// returned by `std::thread::JoinHandle::join`'s `Err` variant), used by
+/// `ManifoldApp::drain_slice_messages` to surface *why* the background
+/// slicing thread died instead of just reporting that it did. Panic
+/// payloads are almost always a `&'static str` (from `panic!("literal")`)
+/// or a `String` (from `panic!("{}", ...)`/`.expect(...)`/`.unwrap()`'s
+/// formatted message) — anything else falls back to a generic message
+/// rather than failing to report at all.
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "<non-string panic payload>".to_string()
     }
 }
 
