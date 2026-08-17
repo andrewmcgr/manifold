@@ -168,6 +168,19 @@ pub fn extract_contours<F: ScalarField + ?Sized>(
 /// Linearly interpolates the position where the field crosses `iso` along
 /// the edge from `(p0, v0)` to `(p1, v1)`.
 fn lerp_crossing(p0: DVec3, v0: f64, p1: DVec3, v1: f64, iso: f64) -> DVec3 {
+    if !v0.is_finite() || !v1.is_finite() {
+        // One endpoint's field value is non-finite (e.g. an
+        // `EikonalOrderField` query landing outside the FMM front's
+        // reached/occupied region, where `order` returns `f64::INFINITY`
+        // by design — see `EikonalOrderField::order`). The two callers of
+        // this function only invoke it once they've already detected a
+        // sign change across `iso`, so there is a real crossing somewhere
+        // on this edge, but `(iso - v0) / (v1 - v0)` here would be an
+        // `inf/inf`- or `-inf/-inf`-shaped NaN, not a usable `t`. Fall back
+        // to the midpoint, the same "no better information" default the
+        // near-zero-denominator branch below already uses.
+        return p0.lerp(p1, 0.5);
+    }
     let denom = v1 - v0;
     let t = if denom.abs() <= f64::EPSILON {
         0.5
@@ -988,6 +1001,47 @@ mod tests {
                 assert!(
                     approx_eq(order, order_value, tolerance),
                     "loop point {p:?} should have order ~{order_value}, got {order}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extract_order_contours_on_mesh_produces_finite_points_when_an_edge_endpoint_order_is_infinite(
+    ) {
+        // Regression test: an `EikonalOrderField` returns `f64::INFINITY` for
+        // points the FMM front never reached (see `EikonalOrderField::order`).
+        // A triangle edge with one finite and one infinite order value can
+        // still register as an `order_value` crossing (the sign-change check
+        // in `extract_order_contours_on_mesh` treats "infinite and above
+        // order_value" as a valid sign), but naively lerping
+        // `(order_value - v0) / (v1 - v0)` across that infinite jump used to
+        // produce a NaN `t` (inf/inf or -inf/-inf) and thus a NaN crossing
+        // point. `lerp_crossing` now falls back to the edge midpoint whenever
+        // either endpoint is non-finite.
+        struct StepOrderField;
+        impl OrderField for StepOrderField {
+            fn order(&self, p: DVec3) -> f64 {
+                if p.x < 0.5 {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }
+            }
+        }
+
+        let p0 = DVec3::new(0.0, 0.0, 0.0);
+        let p1 = DVec3::new(1.0, 0.0, 0.0);
+        let p2 = DVec3::new(0.0, 1.0, 0.0);
+        let triangle_positions = [p0, p1, p2];
+
+        let loops = extract_order_contours_on_mesh(&triangle_positions, &StepOrderField, 0.5);
+
+        for loop_points in &loops {
+            for p in loop_points {
+                assert!(
+                    p.is_finite(),
+                    "crossing point {p:?} should be finite, not NaN/inf"
                 );
             }
         }
