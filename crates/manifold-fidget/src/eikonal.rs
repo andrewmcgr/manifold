@@ -412,11 +412,17 @@ fn axis_coords(local: f64, count: usize) -> (usize, f64) {
 }
 
 fn lerp(a: f64, b: f64, t: f64) -> f64 {
-    if a.is_infinite() && b.is_infinite() && a.signum() == b.signum() {
-        // Avoid `inf * 0.0` producing NaN when blending two infinities of
-        // the same sign (the common "front hasn't reached this region yet"
-        // case) — the interpolated result is still meaningfully "+inf".
-        return a;
+    if a.is_infinite() || b.is_infinite() {
+        // Avoid `inf + (-inf) * t` producing NaN whenever *either* corner
+        // is a grid node the FMM front never reached (`+inf`) — not just
+        // when *both* are, which was the original (insufficient) guard
+        // here. This is the common case at the edge of the marched
+        // narrow band: one corner reached, its neighbor not. Distances in
+        // this grid are unsigned front-arrival distances, so "unreached"
+        // is always `+inf` (never `-inf`); propagating `+inf` here keeps
+        // the same "front hasn't reached this region yet" semantics
+        // `order`'s doc already promises, instead of NaN.
+        return f64::INFINITY;
     }
     a + (b - a) * t
 }
@@ -605,5 +611,34 @@ mod tests {
         let field = EikonalOrderField::new(min_corner, max_corner, &seeds, 0.25);
         let value = field.order(DVec3::new(100.0, 100.0, 100.0));
         assert!(value.is_finite());
+    }
+
+    /// Regression test for a real bug: `order`'s trilinear interpolation
+    /// blends a reached (finite) grid node with an unreached (`+inf`)
+    /// neighbor at the edge of the marched/occupied region — the ordinary
+    /// case with `new_with_occupancy`, not a rare corner case. `lerp` used
+    /// to only guard against blending two infinities of the *same sign*,
+    /// so `inf + (finite - inf) * t` produced NaN here, which then flowed
+    /// into contour reconstruction and made `i_overlay` panic with "trying
+    /// to convert a point[NaN, NaN]". Querying right at that reached/
+    /// unreached boundary must return `+inf` ("front hasn't reached this
+    /// region"), never NaN.
+    #[test]
+    fn order_at_reached_unreached_boundary_is_infinite_not_nan() {
+        let min_corner = DVec3::new(-1.0, -1.0, -1.0);
+        let max_corner = DVec3::new(1.0, 1.0, 1.0);
+        let seeds = [DVec3::new(-1.0, -1.0, -1.0)];
+        // Only the half of the grid with x <= 0 is "solid"/traversable; the
+        // other half is never reached and stays at `f64::INFINITY`. A query
+        // point straddling that boundary is exactly the mixed
+        // finite/infinite trilinear-interpolation case.
+        let is_solid = |p: DVec3| p.x <= 0.0;
+        let field =
+            EikonalOrderField::new_with_occupancy(min_corner, max_corner, &seeds, 0.25, &is_solid);
+        let value = field.order(DVec3::new(0.0, -0.9, -0.9));
+        assert!(
+            !value.is_nan(),
+            "order() at a reached/unreached grid boundary must never be NaN"
+        );
     }
 }
