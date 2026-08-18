@@ -684,6 +684,24 @@ impl ManifoldApp {
         }
 
         ui.separator();
+        ui.heading("Speeds & Travel");
+        ui.add(
+            egui::Slider::new(&mut self.config.print_speed, 300.0..=12000.0)
+                .text("Print speed (mm/min)"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.config.travel_speed, 300.0..=18000.0)
+                .text("Travel speed (mm/min)"),
+        );
+        ui.checkbox(&mut self.config.z_hop_enabled, "Z-hop on travel");
+        if self.config.z_hop_enabled {
+            ui.add(
+                egui::Slider::new(&mut self.config.z_hop_height, 0.0..=2.0)
+                    .text("Z-hop height (mm)"),
+            );
+        }
+
+        ui.separator();
         ui.heading("Print Gcode");
         ui.label("Start Gcode");
         ui.add(
