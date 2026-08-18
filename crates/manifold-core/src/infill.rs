@@ -30,6 +30,16 @@ pub enum InfillPatternKind {
     /// apart (widened by `density`, same convention as `Monotonic`). See
     /// [`ConcentricInfill`].
     Concentric,
+    /// "Wall-style" fill: repeated inward offsets of the region boundary,
+    /// each printed as its own closed loop, same as [`ConcentricInfill`]
+    /// but always spaced exactly `infill_line_width` apart -- `density` is
+    /// ignored entirely rather than widening the spacing, so this always
+    /// fully fills the region regardless of the configured infill density.
+    /// See [`AllWallsInfill`].
+    AllWalls,
+    /// No sparse infill at all. Walls and solid-fill (top/bottom) regions
+    /// still print; sprarse infill between them is omitted.
+    None,
 }
 
 /// Resolve an [`InfillPatternKind`] to its [`InfillGenerator`] implementation.
@@ -38,6 +48,8 @@ pub fn generator_for(kind: InfillPatternKind) -> Box<dyn InfillGenerator + Sync>
     match kind {
         InfillPatternKind::Monotonic => Box::new(MonotonicInfill),
         InfillPatternKind::Concentric => Box::new(ConcentricInfill),
+        InfillPatternKind::AllWalls => Box::new(AllWallsInfill),
+        InfillPatternKind::None => Box::new(NoneInfill),
     }
 }
 
@@ -69,8 +81,18 @@ impl InfillRegion {
         }
         let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
         let (basis1, basis2) = plane_basis(axis);
-        let infill_2d = polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, apex);
-        let solid_2d = polygon2d::to_2d(&layer.solid_fill_boundary, basis1, basis2, apex);
+        let infill_2d = polygon2d::canonicalize(&polygon2d::to_2d(
+            &layer.infill_boundary,
+            basis1,
+            basis2,
+            apex,
+        ));
+        let solid_2d = polygon2d::canonicalize(&polygon2d::to_2d(
+            &layer.solid_fill_boundary,
+            basis1,
+            basis2,
+            apex,
+        ));
         let sparse_2d = polygon2d::difference(&infill_2d, &solid_2d);
         // Reference-seeded reconstruction (see
         // `reconstruct_on_order_field_near`): boolean-op output points lie
@@ -407,7 +429,7 @@ impl InfillGenerator for MonotonicInfill {
 /// almost-zero spacing) turning into an unbounded loop -- mirrors the
 /// defensive `MAX_ORDER_STEPS`-style caps used elsewhere in the slicing
 /// pipeline for the same reason.
-const MAX_CONCENTRIC_RINGS: usize = 10_000;
+const MAX_OFFSET_RINGS: usize = 10_000;
 
 /// Concentric fill: successive inward offsets of the region boundary
 /// (`SlicerConfig::infill_line_width` apart, widened by `density` the same
@@ -419,6 +441,25 @@ const MAX_CONCENTRIC_RINGS: usize = 10_000;
 /// the Gcode emission stage rather than an explicit `Segment`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConcentricInfill;
+
+/// No-op infill generator: emits no paths regardless of region or density.
+/// Used for `InfillPatternKind::None` so callers don't need special-case
+/// handling in `toolpath::plan`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoneInfill;
+
+impl InfillGenerator for NoneInfill {
+    fn generate(
+        &self,
+        _region: &InfillRegion,
+        _config: &SlicerConfig,
+        _layer: &Layer,
+        _object_transform: &Transform,
+        _density: f64,
+    ) -> Vec<Path> {
+        Vec::new()
+    }
+}
 
 impl InfillGenerator for ConcentricInfill {
     fn generate(
@@ -443,7 +484,8 @@ impl InfillGenerator for ConcentricInfill {
         let spacing =
             (config.infill_line_width.abs().max(f64::EPSILON)) / clamped_density.max(f64::EPSILON);
 
-        let boundary_2d = polygon2d::to_2d(&region.loops, basis1, basis2, apex);
+        let boundary_2d =
+            polygon2d::canonicalize(&polygon2d::to_2d(&region.loops, basis1, basis2, apex));
 
         // First ring sits half a line width in from the boundary (so its
         // bead is centered on the boundary edge, matching how wall passes
@@ -453,9 +495,14 @@ impl InfillGenerator for ConcentricInfill {
         let mut rings_2d: Vec<Vec<[f64; 2]>> = Vec::new();
         let mut current = polygon2d::inward_offset(&boundary_2d, spacing / 2.0);
         let mut steps = 0usize;
-        while !current.is_empty() && steps < MAX_CONCENTRIC_RINGS {
+        while !current.is_empty() && steps < MAX_OFFSET_RINGS {
             rings_2d.extend(current.iter().cloned());
-            current = polygon2d::inward_offset(&current, spacing);
+            // Every ring after the first is offsetting the direct output of
+            // a prior `inward_offset`/`inward_offset_unchecked` call --
+            // already-clean `i_overlay` output -- so the redundant
+            // whole-shape pre-simplify pass can be skipped (see
+            // `inward_offset_unchecked`'s doc comment).
+            current = polygon2d::inward_offset_unchecked(&current, spacing);
             steps += 1;
         }
 
@@ -469,6 +516,101 @@ impl InfillGenerator for ConcentricInfill {
         // to the region's own already-reconstructed boundary loops, so
         // seeding from those avoids the wrong-branch axis-ray solves that
         // previously spiked Eikonal infill.
+        let world_rings = order_field::reconstruct_on_order_field_near(
+            rings_2d,
+            &region.loops,
+            basis1,
+            basis2,
+            axis,
+            apex,
+            layer.order,
+            order_field::max_along_for(config),
+            layer.order_field.as_ref(),
+        );
+
+        world_rings
+            .into_iter()
+            .filter(|ring| ring.len() >= 3)
+            .map(|points| {
+                let segments = points
+                    .iter()
+                    .map(|_| Segment {
+                        kind: MoveKind::Infill,
+                        speed: 60.0,
+                        extrusion_rate: 1.0,
+                        support_fraction: 0.0,
+                        order: layer.order,
+                        extrusion_length: 0.0,
+                    })
+                    .collect();
+                Path {
+                    points,
+                    segments,
+                    tool: crate::ids::ToolId::default(),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Same as external wall generation: repeated inward offsets of the region
+/// boundary spaced exactly `infill_line_width` apart, each printed as its
+/// own closed loop -- but applied to `InfillRegion` (2D, already-extracted
+/// loops) rather than re-querying the mesh/SDF per pass the way real wall
+/// generation does (see `slicing::slice_mesh_with_progress`'s `wall_index`
+/// loop), since `InfillGenerator` only has access to a layer's already
+/// planar loops, not the source mesh.
+///
+/// Unlike [`ConcentricInfill`], `density` is ignored entirely: spacing is
+/// always the full `infill_line_width`, so this pattern always completely
+/// fills the region regardless of the configured infill density -- the
+/// point is "as many walls as it takes to fill the space", not a sparse
+/// pattern. The number of rings generated is implied purely by the
+/// geometry: offsetting continues until a pass produces no more loops (the
+/// loop already attempts one more offset before concluding the region is
+/// exhausted), capped by [`MAX_OFFSET_RINGS`] as a safety bound against
+/// runaway offsetting on degenerate geometry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllWallsInfill;
+
+impl InfillGenerator for AllWallsInfill {
+    fn generate(
+        &self,
+        region: &InfillRegion,
+        config: &SlicerConfig,
+        layer: &Layer,
+        _object_transform: &Transform,
+        _density: f64,
+    ) -> Vec<Path> {
+        if region.is_empty() {
+            return Vec::new();
+        }
+
+        let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
+        let (basis1, basis2) = plane_basis(axis);
+
+        // `density` is deliberately ignored -- always pack rings at full
+        // `infill_line_width` spacing (see doc comment above).
+        let spacing = config.infill_line_width.abs().max(f64::EPSILON);
+
+        let boundary_2d =
+            polygon2d::canonicalize(&polygon2d::to_2d(&region.loops, basis1, basis2, apex));
+
+        let mut rings_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+        let mut current = polygon2d::inward_offset(&boundary_2d, spacing / 2.0);
+        let mut steps = 0usize;
+        while !current.is_empty() && steps < MAX_OFFSET_RINGS {
+            rings_2d.extend(current.iter().cloned());
+            // See `ConcentricInfill::generate`'s identical comment above --
+            // `current` is already clean `i_overlay` output.
+            current = polygon2d::inward_offset_unchecked(&current, spacing);
+            steps += 1;
+        }
+
+        if rings_2d.is_empty() {
+            return Vec::new();
+        }
+
         let world_rings = order_field::reconstruct_on_order_field_near(
             rings_2d,
             &region.loops,
@@ -1075,5 +1217,128 @@ mod tests {
                 assert!(!inside_hole, "ring point {p:?} fell inside the hole");
             }
         }
+    }
+
+    /// Regression test: when an order-field projection inverts a hole loop's
+    /// winding in the global basis (so it appears to have the same winding as
+    /// the outer boundary), `ConcentricInfill` must still recognize it as a
+    /// hole and not print infill rings inside it. This was the Eikonal +
+    /// concentric-fill bug on the pug model: wall loops are canonicalized in
+    /// each loop's own local plane, but flattening into
+    /// `plane_basis(BUILD_DIRECTION)` for `i_overlay` can flip a hole
+    /// relative to the global basis.
+    #[test]
+    fn concentric_fill_does_not_infill_a_hole_that_is_wound_like_the_outer_loop() {
+        let outer = vec![
+            DVec3::new(-5.0, -5.0, 0.0),
+            DVec3::new(5.0, -5.0, 0.0),
+            DVec3::new(5.0, 5.0, 0.0),
+            DVec3::new(-5.0, 5.0, 0.0),
+        ];
+        // Same CCW winding as `outer`, not the usual CW hole convention.
+        let hole_wound_like_outer = vec![
+            DVec3::new(-1.0, -1.0, 0.0),
+            DVec3::new(1.0, -1.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(-1.0, 1.0, 0.0),
+        ];
+
+        let layer = Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: Vec::new(),
+            infill_boundary: vec![outer, hole_wound_like_outer],
+            solid_fill_boundary: Vec::new(),
+            ..Layer::default()
+        };
+
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths =
+            ConcentricInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+        assert!(
+            !paths.is_empty(),
+            "expected infill rings in the annulus, not an empty region"
+        );
+
+        for path in &paths {
+            for p in &path.points {
+                let inside_hole = p.x > -0.999 && p.x < 0.999 && p.y > -0.999 && p.y < 0.999;
+                assert!(
+                    !inside_hole,
+                    "concentric ring point {p:?} fell inside a hole that is wound like the outer loop"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn none_infill_emits_no_paths_even_for_a_nonempty_region() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+
+        let paths = NoneInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+        assert!(paths.is_empty());
+
+        // Sanity: the region itself is not empty, so a real pattern would
+        // have emitted something.
+        let monotonic_paths =
+            MonotonicInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+        assert!(!monotonic_paths.is_empty());
+    }
+
+    #[test]
+    fn all_walls_fill_produces_multiple_closed_rings_covering_a_square() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths =
+            AllWallsInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+
+        assert!(
+            paths.len() > 1,
+            "expected several successively-inset rings, got {}",
+            paths.len()
+        );
+        for path in &paths {
+            assert_eq!(path.points.len(), path.segments.len());
+            assert!(path.segments.iter().all(|s| s.kind == MoveKind::Infill));
+            for p in &path.points {
+                assert!(p.x >= -5.001 && p.x <= 5.001, "x out of bounds: {p:?}");
+                assert!(p.y >= -5.001 && p.y <= 5.001, "y out of bounds: {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn all_walls_fill_ignores_density_and_fills_fully_even_at_zero_density() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+
+        let full_density_paths =
+            AllWallsInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+        let zero_density_paths =
+            AllWallsInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.0);
+
+        // Unlike `ConcentricInfill`, density does not scale spacing or gate
+        // generation at all -- both calls should produce the same rings.
+        assert!(!zero_density_paths.is_empty());
+        assert_eq!(zero_density_paths.len(), full_density_paths.len());
+    }
+
+    #[test]
+    fn all_walls_fill_is_empty_for_empty_region() {
+        let layer = Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: Vec::new(),
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            ..Layer::default()
+        };
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths =
+            AllWallsInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+        assert!(paths.is_empty());
     }
 }

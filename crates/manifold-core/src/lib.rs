@@ -192,13 +192,19 @@ pub fn plan_toolpaths(workspace: &Workspace) -> Result<Vec<toolpath::Path>> {
 }
 
 /// Same as [`plan_toolpaths`], but calls `on_progress` with a `0.0..=1.0`
-/// fraction of how far through the order-field domain slicing currently
-/// is (see [`slicing::slice_workspace_with_progress`]), so a caller
-/// running this on a background thread (slicing can be slow) can show
-/// live progress without needing to know anything about layers or order
-/// fields. Toolpath planning itself is comparatively fast and is not
-/// separately reported — `on_progress` reaches `1.0` once slicing
-/// finishes, before toolpath planning runs.
+/// fraction of overall progress across both stages, so a caller running
+/// this on a background thread (slicing and toolpath planning can both be
+/// slow — e.g. `AllWallsInfill` on complex geometry) can show live progress
+/// without needing to know anything about layers, order fields, or infill.
+///
+/// The `0.0..=1.0` range is split evenly: order-field domain slicing (see
+/// [`slicing::slice_workspace_with_progress`]) reports into `0.0..=0.5`,
+/// then toolpath planning (see [`toolpath::plan_with_progress`]) reports
+/// into `0.5..=1.0`. This is a fixed 50/50 split, not a measured time
+/// estimate — for infill patterns/geometry where one stage dominates, the
+/// bar will move unevenly through each half, but it will keep moving
+/// throughout the whole call rather than stalling at `1.0` while
+/// toolpath planning (previously unreported) is still running.
 ///
 /// # Errors
 ///
@@ -219,13 +225,14 @@ pub fn plan_toolpaths_with_progress(
         &workspace.objects,
         &order,
         &workspace.config,
-        on_progress,
+        &mut |fraction: f64| on_progress(fraction * 0.5),
     )?;
-    toolpath::plan(
+    toolpath::plan_with_progress(
         &layers,
         &workspace.objects,
         &workspace.machine.tools,
         &workspace.config,
+        &mut |fraction: f64| on_progress(0.5 + fraction * 0.5),
     )
 }
 

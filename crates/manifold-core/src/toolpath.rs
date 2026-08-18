@@ -6,6 +6,8 @@ use crate::{
 };
 use glam::DVec3;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Classification of a single toolpath segment (the move from one point to
 /// the next along a [`Path`]). [`plan`] derives `WallOuter`/`WallInner`
@@ -112,8 +114,36 @@ pub fn plan(
     tools: &[Tool],
     config: &SlicerConfig,
 ) -> Result<Vec<Path>> {
+    plan_with_progress(layers, objects, tools, config, &mut |_| {})
+}
+
+/// Same as [`plan`], but calls `on_progress` with a `0.0..=1.0` fraction of
+/// how many of `layers` have finished planning so far.
+///
+/// Layers are planned in parallel (see [`plan`]'s docs), so completions can
+/// arrive from any worker thread in any order; `on_progress` is called once
+/// per completed layer, in completion order (not necessarily layer order),
+/// serialized behind a `Mutex` so callers don't need to worry about
+/// concurrent invocations. Reaches `1.0` once every layer is planned, right
+/// before the final extrusion-length pass (which is comparatively fast and
+/// not separately reported).
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidMesh`] if a layer references an object id
+/// not present in `objects`.
+pub fn plan_with_progress(
+    layers: &[Layer],
+    objects: &[Object],
+    tools: &[Tool],
+    config: &SlicerConfig,
+    on_progress: &mut (dyn FnMut(f64) + Send),
+) -> Result<Vec<Path>> {
     let generator = infill::generator_for(config.infill_pattern);
     let filament_area = extrusion::filament_cross_section_area(config.filament_diameter);
+    let total_layers = layers.len().max(1) as f64;
+    let completed = AtomicUsize::new(0);
+    let on_progress = Mutex::new(on_progress);
     let per_layer: Vec<Vec<Path>> = layers
         .par_iter()
         .map(|layer| -> Result<Vec<Path>> {
@@ -206,6 +236,11 @@ pub fn plan(
                             * segment.extrusion_rate
                             * extrusion_multiplier;
                 }
+            }
+
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Ok(mut on_progress) = on_progress.lock() {
+                on_progress(done as f64 / total_layers);
             }
 
             Ok(paths)

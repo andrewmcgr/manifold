@@ -570,6 +570,16 @@ impl ManifoldApp {
                     InfillPatternKind::Concentric,
                     "Concentric",
                 );
+                ui.selectable_value(
+                    &mut self.config.infill_pattern,
+                    InfillPatternKind::AllWalls,
+                    "All Walls",
+                );
+                ui.selectable_value(
+                    &mut self.config.infill_pattern,
+                    InfillPatternKind::None,
+                    "None",
+                );
             });
         ui.add(
             egui::Slider::new(&mut self.config.infill_line_width, 0.05..=1.5)
@@ -1046,9 +1056,19 @@ impl ManifoldApp {
             if slicing_in_progress {
                 ui.horizontal(|ui| {
                     ui.spinner();
+                    // `plan_toolpaths_with_progress` splits `0.0..=1.0` evenly
+                    // between slicing (first half) and toolpath planning
+                    // (second half, see `toolpath::plan_with_progress`) — swap
+                    // the label at the midpoint so the bar doesn't look stuck
+                    // once slicing itself finishes.
+                    let stage = if self.slice_progress < 0.5 {
+                        "Slicing"
+                    } else {
+                        "Planning toolpaths"
+                    };
                     ui.add(
                         egui::ProgressBar::new(self.slice_progress as f32)
-                            .text(format!("Slicing… {:.0}%", self.slice_progress * 100.0)),
+                            .text(format!("{stage}… {:.0}%", self.slice_progress * 100.0)),
                     );
                 });
             }

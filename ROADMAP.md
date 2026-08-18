@@ -718,10 +718,36 @@ controls -- only a new enum variant, a new generator impl, and one new
   region's own already-reconstructed boundary loops -- the same
   reference-seeding approach `InfillRegion::from_layer` uses, avoiding
   the wrong-branch axis-ray spikes documented on Phase 17's Eikonal work.
-- A `MAX_CONCENTRIC_RINGS` cap (10,000) guards against a pathological
-  near-zero spacing turning ring generation into an unbounded loop,
-  mirroring other defensive step caps in the slicing pipeline (e.g.
+- A ring-count cap (`MAX_OFFSET_RINGS`, 10,000 -- shared with Phase 19's
+  `AllWallsInfill`) guards against a pathological near-zero spacing
+  turning ring generation into an unbounded loop, mirroring other
+  defensive step caps in the slicing pipeline (e.g.
   `order_range_over_bbox`'s `MAX_ORDER_STEPS`).
+
+## Phase 19 — "All Walls" infill pattern (needs 18, third `InfillGenerator` impl) — ✅ done
+
+Adds `InfillPatternKind::AllWalls` / `AllWallsInfill`, a third
+`InfillGenerator` alongside `MonotonicInfill`/`ConcentricInfill`, for
+cases where both existing patterns have known issues -- no changes were
+needed to `toolpath::plan` or `generator_for` beyond one new match arm.
+
+- Structurally identical to `ConcentricInfill` (successive inward offsets
+  of the region boundary via `polygon2d::inward_offset`, each printed as
+  its own closed-loop `Path`) -- conceptually "generate enough walls to
+  fill the region, the same way external walls are generated", except
+  applied to the already-extracted 2D `InfillRegion` rather than
+  re-querying the mesh/SDF per pass (real wall generation's `wall_index`
+  loop in `slicing::slice_mesh_with_progress` isn't reachable from
+  `InfillGenerator`, which only sees a layer's already-planar loops).
+- Unlike `ConcentricInfill`, `density` is ignored entirely: spacing is
+  always the full `infill_line_width`, so this pattern always completely
+  fills the region regardless of the infill density slider. Ring count is
+  purely geometry-driven -- offsetting continues until a pass produces no
+  more loops.
+- Shares the same ring-count safety cap as `ConcentricInfill` (renamed
+  `MAX_OFFSET_RINGS`, still 10,000) and the same curved-field
+  reconstruction path (`order_field::reconstruct_on_order_field_near`,
+  reference-seeded from the region's own boundary loops).
 
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 

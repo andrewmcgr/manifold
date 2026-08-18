@@ -6,8 +6,9 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use glam::DVec3;
 use manifold_core::{
-    bounds::BoundingVolume, ids::ObjectId, ids::ToolId, machine::Machine, object::Object,
-    slice_to_gcode, stl, threemf, tool::Tool, SlicerConfig, Workspace,
+    bounds::BoundingVolume, ids::ObjectId, ids::ToolId, infill::InfillPatternKind,
+    machine::Machine, object::Object, order_field::OrderFieldKind, slice_to_gcode, stl, threemf,
+    tool::Tool, SlicerConfig, Workspace,
 };
 use std::fs::File;
 use std::io::BufReader;
@@ -35,6 +36,57 @@ struct Cli {
     /// `inputs`. Per-tool nozzle diameters are a future follow-up.
     #[arg(long, default_value_t = 0.4)]
     nozzle_diameter: f64,
+
+    /// Order field used to walk the slicing isosurfaces.
+    #[arg(long, value_enum, default_value_t = OrderFieldArg::Height)]
+    order_field: OrderFieldArg,
+
+    /// Infill pattern generated inside each layer.
+    #[arg(long, value_enum, default_value_t = InfillPatternArg::Monotonic)]
+    infill_pattern: InfillPatternArg,
+}
+
+/// CLI-mirror of `manifold_core::order_field::OrderFieldKind` so `clap` can
+/// derive argument parsing. Converted into the library enum when building
+/// `SlicerConfig`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum OrderFieldArg {
+    #[default]
+    Height,
+    Conical,
+    Eikonal,
+}
+
+impl From<OrderFieldArg> for OrderFieldKind {
+    fn from(arg: OrderFieldArg) -> Self {
+        match arg {
+            OrderFieldArg::Height => OrderFieldKind::Height,
+            OrderFieldArg::Conical => OrderFieldKind::Conical,
+            OrderFieldArg::Eikonal => OrderFieldKind::Eikonal,
+        }
+    }
+}
+
+/// CLI-mirror of `manifold_core::infill::InfillPatternKind` so `clap` can
+/// derive argument parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum InfillPatternArg {
+    #[default]
+    Monotonic,
+    Concentric,
+    AllWalls,
+    None,
+}
+
+impl From<InfillPatternArg> for InfillPatternKind {
+    fn from(arg: InfillPatternArg) -> Self {
+        match arg {
+            InfillPatternArg::Monotonic => InfillPatternKind::Monotonic,
+            InfillPatternArg::Concentric => InfillPatternKind::Concentric,
+            InfillPatternArg::AllWalls => InfillPatternKind::AllWalls,
+            InfillPatternArg::None => InfillPatternKind::None,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -52,6 +104,8 @@ fn main() -> Result<()> {
     let config = SlicerConfig {
         layer_height: cli.layer_height,
         nozzle_diameter: cli.nozzle_diameter,
+        order_field: cli.order_field.into(),
+        infill_pattern: cli.infill_pattern.into(),
         ..SlicerConfig::default()
     };
 

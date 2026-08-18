@@ -85,13 +85,125 @@ fn simplify(loops: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
         .collect()
 }
 
+/// Reorients a set of 2D loops so nesting parity determines winding: a loop
+/// at even containment depth (not inside any other loop, or inside an even
+/// number of them) winds counter-clockwise, and a loop at odd depth (a hole)
+/// winds clockwise.
+///
+/// This matches the `NonZero` fill rule that `i_overlay` expects. Raw loops
+/// from a curved order field are canonicalized in each loop's own local
+/// best-fit plane by `manifold_fidget::contour`, but once they are flattened
+/// into a *different* (global) basis for `i_overlay` boolean/offset
+/// operations, their winding in that basis may be inverted. Passing such
+/// loops to `i_overlay` without re-canonicalizing can cause holes to be
+/// treated as nested solids — concentric infill then prints rings inside the
+/// holes.
+///
+/// A degenerate loop with fewer than 3 points is left unchanged; it
+/// contributes no area and should not affect classification, but this
+/// function preserves it so callers can decide whether to drop it.
+pub fn canonicalize(loops2d: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
+    if loops2d.len() <= 1 {
+        return loops2d.to_vec();
+    }
+
+    let depths: Vec<usize> = loops2d
+        .iter()
+        .enumerate()
+        .map(|(i, loop_)| {
+            if loop_.len() < 3 {
+                return 0;
+            }
+            let test = loop_[0];
+            (0..loops2d.len())
+                .filter(|&j| j != i && loops2d[j].len() >= 3 && point_in_polygon(test, &loops2d[j]))
+                .count()
+        })
+        .collect();
+
+    loops2d
+        .iter()
+        .zip(depths)
+        .map(|(loop_, depth)| {
+            if loop_.len() < 3 {
+                return loop_.clone();
+            }
+            let want_ccw = depth % 2 == 0;
+            let is_ccw = signed_area(loop_) > 0.0;
+            if want_ccw == is_ccw {
+                loop_.clone()
+            } else {
+                loop_.iter().copied().rev().collect()
+            }
+        })
+        .collect()
+}
+
+/// Signed shoelace area of a closed 2D loop; positive for counter-clockwise
+/// winding and negative for clockwise. Fewer than 3 points yields `0.0`.
+fn signed_area(loop_: &[[f64; 2]]) -> f64 {
+    if loop_.len() < 3 {
+        return 0.0;
+    }
+    let mut area = 0.0;
+    for i in 0..loop_.len() {
+        let [x0, y0] = loop_[i];
+        let [x1, y1] = loop_[(i + 1) % loop_.len()];
+        area += x0 * y1 - x1 * y0;
+    }
+    area * 0.5
+}
+
+/// Standard even-odd point-in-polygon ray cast. `loop_` is treated as closed.
+fn point_in_polygon(point: [f64; 2], loop_: &[[f64; 2]]) -> bool {
+    if loop_.len() < 3 {
+        return false;
+    }
+    let [x, y] = point;
+    let mut inside = false;
+    let mut j = loop_.len() - 1;
+    for i in 0..loop_.len() {
+        let [xi, yi] = loop_[i];
+        let [xj, yj] = loop_[j];
+        let intersect = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+        if intersect {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 /// Insets `loops2d` inward by `distance` (a positive value moves boundaries
 /// toward the interior of the shape, shrinking it — as used for wall-inset
 /// infill boundaries). `loops2d` is simplified first.
+///
+/// Use this for input that hasn't already been through an `i_overlay`
+/// boolean/offset operation (e.g. a boundary freshly reconstructed from
+/// mesh/order-field data, which can carry self-intersections). For a
+/// *repeated*-offset loop (successive rings inward, as in
+/// `ConcentricInfill`/`AllWallsInfill`), only the first ring needs this —
+/// see [`inward_offset_unchecked`] for the rest.
 pub fn inward_offset(loops2d: &[Vec<[f64; 2]>], distance: f64) -> Vec<Vec<[f64; 2]>> {
     let simplified = simplify(loops2d);
     let style = OutlineStyle::new(-distance.abs());
     simplified.outline(&style).into_iter().flatten().collect()
+}
+
+/// Same as [`inward_offset`], but skips the input pre-simplify pass.
+///
+/// `i_overlay`'s offsetting (`OutlineOffset::outline`) already cleans its
+/// own output (de-spiking/simplifying collinear points) before returning
+/// it, so feeding that output straight back into another `outline()` call
+/// is already valid, correctly-wound input — re-running the much heavier
+/// whole-shape `simplify_shape` boolean pass on it again is pure redundant
+/// work. Intended for the *second and later* offset in a repeated-offset
+/// loop, where `loops2d` is guaranteed to be the direct output of a prior
+/// [`inward_offset`]/`inward_offset_unchecked` call rather than raw
+/// reconstructed geometry.
+pub fn inward_offset_unchecked(loops2d: &[Vec<[f64; 2]>], distance: f64) -> Vec<Vec<[f64; 2]>> {
+    let style = OutlineStyle::new(-distance.abs());
+    loops2d.outline(&style).into_iter().flatten().collect()
 }
 
 /// Subtracts `clip` from `subj` (`subj - clip`). Both inputs are simplified
@@ -309,8 +421,8 @@ mod tests {
         let mut steps = 0;
         while !current.is_empty() && steps < 20 {
             // Bounding box across every loop in this ring generation.
-            let mut min = [f64::INFINITY, f64::INFINITY];
-            let mut max = [f64::NEG_INFINITY, f64::NEG_INFINITY];
+            let mut min = [f64::INFINITY; 2];
+            let mut max = [f64::NEG_INFINITY; 2];
             for loop_ in &current {
                 for p in loop_ {
                     min[0] = min[0].min(p[0]);
@@ -349,5 +461,23 @@ mod tests {
             steps < 20,
             "ring offsetting should terminate for a bounded annulus"
         );
+    }
+
+    #[test]
+    fn canonicalize_makes_a_same_wound_loop_into_a_hole() {
+        let outer = square(0.0, 0.0, 10.0);
+        let same_wound_hole = square(3.0, 3.0, 2.0);
+        // Deliberately *not* reversed: the hole has the same winding as the outer,
+        // which can happen after flattening 3D loops into a global 2D basis.
+        let shape = vec![outer, same_wound_hole];
+        let canonical = canonicalize(&shape);
+        assert_eq!(canonical.len(), 2);
+
+        // Outer should stay CCW (positive signed area).
+        assert!(signed_area(&canonical[0]) > 0.0);
+        // Inner should be reversed to CW (negative signed area) so
+        // downstream offset/boolean ops treat it as a hole rather than a
+        // nested solid.
+        assert!(signed_area(&canonical[1]) < 0.0);
     }
 }
