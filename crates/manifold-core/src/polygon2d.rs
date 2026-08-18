@@ -26,6 +26,35 @@ use i_overlay::mesh::style::OutlineStyle;
 /// and is what `i_overlay`'s own offsetting/simplify docs assume.
 const FILL_RULE: FillRule = FillRule::NonZero;
 
+/// Absolute-area threshold (in the caller's 2D plane units, mm² for this
+/// codebase) below which a loop is treated as degenerate noise and dropped
+/// by [`canonicalize`] rather than passed to `i_overlay`. Chosen far above
+/// f64 rounding noise (observed spurious loops from curved-order-field
+/// contour extraction measure ~1e-11 or smaller) and far below any real
+/// printable feature (smallest sane feature is on the order of a nozzle
+/// diameter squared, i.e. >= ~0.01 for a 0.1mm nozzle).
+const DEGENERATE_AREA_EPSILON: f64 = 1e-6;
+
+/// Distance threshold (in mm) used by [`simplify_collinear`] to collapse
+/// vertices whose perpendicular deviation from the line through their
+/// neighbors is below this tolerance. 1 micron (1e-3 mm) is far below any
+/// printable feature (typical nozzle diameters 0.1–0.4mm, layer heights
+/// 0.1–0.3mm) so this cannot visibly change printed geometry, but far
+/// above the point spacing seen in pathological input.
+///
+/// Curved-order-field contour extraction (e.g. Eikonal) can emit
+/// thousands of points along what is geometrically a straight or gently
+/// curved run — a "staircase" of near-collinear points from a grid-aligned
+/// marching front, observed with median inter-point spacing on the order
+/// of nanometers to low microns. These aren't exact duplicates (so a
+/// simple distance-based dedup barely reduces them) but they are
+/// enormously redundant — a single real loop with a few thousand such
+/// points has been observed to turn a sub-second `i_overlay` boolean/offset
+/// call into one lasting tens of seconds to several minutes, because the
+/// segment-intersection solver's cost scales with point/segment count, not
+/// with the shape's actual geometric complexity.
+const COLLINEAR_EPSILON: f64 = 1e-3;
+
 /// Projects a set of 3D loops lying in the plane `(origin, basis1, basis2)`
 /// down to 2D coordinates in that plane's basis.
 ///
@@ -71,6 +100,87 @@ pub fn from_2d(
         .collect()
 }
 
+/// Perpendicular distance from `pt` to the (infinite) line through `a` and
+/// `c`. Falls back to plain point distance if `a` and `c` coincide.
+fn perpendicular_distance(pt: [f64; 2], a: [f64; 2], c: [f64; 2]) -> f64 {
+    let d = [c[0] - a[0], c[1] - a[1]];
+    let len = (d[0] * d[0] + d[1] * d[1]).sqrt();
+    if len < 1e-15 {
+        return dist_sq(pt, a).sqrt();
+    }
+    let cross = (pt[0] - a[0]) * d[1] - (pt[1] - a[1]) * d[0];
+    (cross / len).abs()
+}
+
+/// Collapses runs of near-collinear (or near-coincident) consecutive
+/// vertices in a closed loop, keeping only the vertices needed to
+/// represent its shape within [`COLLINEAR_EPSILON`]. This is a single
+/// forward pass (extend-the-line-while-collinear), not a full
+/// Douglas-Peucker recursion, followed by a few passes to clean up
+/// collinearity across the loop's start/end seam (since the loop is
+/// implicitly closed). A loop that collapses to fewer than 3 points is
+/// left as-is; the degenerate-loop filter in [`canonicalize`] handles
+/// dropping loops that carry no real area.
+fn simplify_collinear(loop_: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    if loop_.len() < 3 {
+        return loop_.to_vec();
+    }
+
+    let mut kept: Vec<[f64; 2]> = Vec::with_capacity(loop_.len());
+    for &p in loop_ {
+        while kept.len() >= 2 {
+            let a = kept[kept.len() - 2];
+            let b = kept[kept.len() - 1];
+            if perpendicular_distance(b, a, p) < COLLINEAR_EPSILON {
+                kept.pop();
+            } else {
+                break;
+            }
+        }
+        kept.push(p);
+    }
+
+    // Clean up collinearity across the closing seam (last->first->second and
+    // second-to-last->last->first), since the forward pass above only sees
+    // the loop as an open polyline.
+    for _ in 0..4 {
+        let mut changed = false;
+        if kept.len() >= 3 {
+            let a = kept[kept.len() - 2];
+            let b = kept[kept.len() - 1];
+            let p = kept[0];
+            if perpendicular_distance(b, a, p) < COLLINEAR_EPSILON {
+                kept.pop();
+                changed = true;
+            }
+        }
+        if kept.len() >= 3 {
+            let a = kept[kept.len() - 1];
+            let b = kept[0];
+            let p = kept[1];
+            if perpendicular_distance(b, a, p) < COLLINEAR_EPSILON {
+                kept.remove(0);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    if kept.len() >= 3 {
+        kept
+    } else {
+        loop_.to_vec()
+    }
+}
+
+fn dist_sq(a: [f64; 2], b: [f64; 2]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    dx * dx + dy * dy
+}
+
 /// Normalizes a set of loops (fixes winding, removes self-intersections and
 /// degenerate/duplicate vertices) before feeding them into a boolean or
 /// offset operation, per `i_overlay`'s recommendation for raw
@@ -78,7 +188,9 @@ pub fn from_2d(
 fn simplify(loops: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
     use i_overlay::float::simplify::SimplifyShape;
 
-    loops
+    let simplified: Vec<Vec<[f64; 2]>> = loops.iter().map(|l| simplify_collinear(l)).collect();
+
+    simplified
         .simplify_shape(FILL_RULE)
         .into_iter()
         .flatten()
@@ -99,24 +211,36 @@ fn simplify(loops: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
 /// treated as nested solids — concentric infill then prints rings inside the
 /// holes.
 ///
-/// A degenerate loop with fewer than 3 points is left unchanged; it
-/// contributes no area and should not affect classification, but this
-/// function preserves it so callers can decide whether to drop it.
+/// Loops with an absolute area below [`DEGENERATE_AREA_EPSILON`] are dropped
+/// entirely rather than preserved. Curved-order-field contour extraction can
+/// occasionally emit hundreds of these alongside the real boundary loops —
+/// float-noise artifacts (near-collinear/near-duplicate points from a grid-
+/// aligned marching front) with no meaningful area, several orders of
+/// magnitude smaller than any real printable feature. Left in, they don't
+/// change boolean/offset *results* (zero area contributes nothing under
+/// `NonZero`), but a boundary carrying hundreds of them is adversarial to
+/// `i_overlay`'s segment-intersection solver — this has been observed to
+/// turn a sub-second offset into a many-minute one. A degenerate loop with
+/// fewer than 3 points is also dropped for the same reason (it contributes
+/// no area either).
 pub fn canonicalize(loops2d: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
+    let loops2d: Vec<Vec<[f64; 2]>> = loops2d
+        .iter()
+        .filter(|loop_| loop_.len() >= 3 && signed_area(loop_).abs() > DEGENERATE_AREA_EPSILON)
+        .cloned()
+        .collect();
+
     if loops2d.len() <= 1 {
-        return loops2d.to_vec();
+        return loops2d;
     }
 
     let depths: Vec<usize> = loops2d
         .iter()
         .enumerate()
         .map(|(i, loop_)| {
-            if loop_.len() < 3 {
-                return 0;
-            }
             let test = loop_[0];
             (0..loops2d.len())
-                .filter(|&j| j != i && loops2d[j].len() >= 3 && point_in_polygon(test, &loops2d[j]))
+                .filter(|&j| j != i && point_in_polygon(test, &loops2d[j]))
                 .count()
         })
         .collect();
@@ -125,9 +249,6 @@ pub fn canonicalize(loops2d: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
         .iter()
         .zip(depths)
         .map(|(loop_, depth)| {
-            if loop_.len() < 3 {
-                return loop_.clone();
-            }
             let want_ccw = depth % 2 == 0;
             let is_ccw = signed_area(loop_) > 0.0;
             if want_ccw == is_ccw {
@@ -201,9 +322,17 @@ pub fn inward_offset(loops2d: &[Vec<[f64; 2]>], distance: f64) -> Vec<Vec<[f64; 
 /// loop, where `loops2d` is guaranteed to be the direct output of a prior
 /// [`inward_offset`]/`inward_offset_unchecked` call rather than raw
 /// reconstructed geometry.
+///
+/// Still applies the cheap [`simplify_collinear`] pass per-loop (a linear
+/// scan, unlike `simplify_shape`'s full boolean pass): `i_overlay`'s own
+/// output cleanup does not guarantee no near-collinear runs of points
+/// remain on pathological input, and even a few thousand surviving into a
+/// later ring can blow up that ring's own `outline()` call the same way
+/// raw reconstructed geometry can (see [`COLLINEAR_EPSILON`]).
 pub fn inward_offset_unchecked(loops2d: &[Vec<[f64; 2]>], distance: f64) -> Vec<Vec<[f64; 2]>> {
+    let simplified: Vec<Vec<[f64; 2]>> = loops2d.iter().map(|l| simplify_collinear(l)).collect();
     let style = OutlineStyle::new(-distance.abs());
-    loops2d.outline(&style).into_iter().flatten().collect()
+    simplified.outline(&style).into_iter().flatten().collect()
 }
 
 /// Subtracts `clip` from `subj` (`subj - clip`). Both inputs are simplified
