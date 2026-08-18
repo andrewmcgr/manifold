@@ -5,9 +5,90 @@ use crate::{
     extrusion, ids::ToolId, object::Object, slicing::Layer, tool::Tool, Result, SlicerConfig,
 };
 use glam::DVec3;
+use manifold_fidget::mesh_sdf::MeshSdf;
+use manifold_fidget::ScalarField;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+/// Signed-distance tolerance (mm) used by [`retain_contained_paths`] to
+/// decide whether a path point is "outside the solid": a point sampled via
+/// [`ScalarField::sample`] with a value beyond this threshold is genuinely
+/// outside real mesh material, not just float noise from a point that's
+/// meant to sit essentially on the surface. Deliberately far above f64
+/// rounding noise but far below any real printable feature (the smallest
+/// legitimate inward offset is on the order of a nozzle radius, i.e.
+/// several hundredths of a mm at minimum), so this cannot mask an actual
+/// containment failure while still tolerating numerical jitter.
+const CONTAINMENT_EPSILON: f64 = 1e-6;
+
+/// Drops any non-[`MoveKind::Travel`] path in `paths` that isn't fully
+/// contained in the real solid, using `mesh_sdf` (built directly from the
+/// mesh -- see [`Layer::mesh_sdf`]) as ground truth rather than trusting
+/// the 2D loop/boundary geometry `paths` were generated from.
+///
+/// This exists as a final safety net: wall/infill loop geometry is derived
+/// from contour extraction and polygon boolean ops on
+/// `infill_boundary`/`solid_fill_boundary`, which have (rarely) produced
+/// loops that don't correspond to real solid material -- e.g. infill
+/// printed inside a hole that isn't actually part of the object. Rather
+/// than only trying to prevent every possible source of that class of bug
+/// upstream, every extruding path is re-checked here against the mesh
+/// itself and dropped wholesale if any of its points land outside the
+/// solid (see [`CONTAINMENT_EPSILON`]) -- a partially-valid path is
+/// dropped entirely rather than clipped, since splitting it would risk
+/// producing a spurious partial loop/travel move that's arguably worse
+/// than simply omitting the whole (already-wrong) path.
+///
+/// No-op (returns `paths` unchanged) when `mesh_sdf` is `None` -- a
+/// synthetic/test [`Layer`] has no ground truth to check against, so
+/// containment is treated as unknown rather than enforced.
+fn retain_contained_paths(
+    paths: Vec<Path>,
+    mesh_sdf: Option<&Arc<MeshSdf>>,
+    order: f64,
+) -> Vec<Path> {
+    let Some(mesh_sdf) = mesh_sdf else {
+        return paths;
+    };
+
+    let total = paths.len();
+    let mut dropped_paths = 0usize;
+    let mut dropped_points = 0usize;
+    let retained: Vec<Path> = paths
+        .into_iter()
+        .filter(|path| {
+            if path
+                .segments
+                .iter()
+                .all(|segment| segment.kind == MoveKind::Travel)
+            {
+                return true;
+            }
+            let contained = path
+                .points
+                .iter()
+                .all(|&p| mesh_sdf.sample(p).value <= CONTAINMENT_EPSILON);
+            if !contained {
+                dropped_paths += 1;
+                dropped_points += path.points.len();
+            }
+            contained
+        })
+        .collect();
+
+    if dropped_paths > 0 {
+        tracing::warn!(
+            layer.order = order,
+            dropped_paths,
+            dropped_points,
+            total_paths = total,
+            "dropped extruding path(s) not contained in the solid mesh"
+        );
+    }
+
+    retained
+}
 
 /// Classification of a single toolpath segment (the move from one point to
 /// the next along a [`Path`]). [`plan`] derives `WallOuter`/`WallInner`
@@ -81,9 +162,13 @@ pub struct Path {
 /// `config.infill_density`, plus (when non-empty) a second pass with the
 /// same generator at full density (`1.0`) over
 /// `Layer::solid_fill_boundary` itself — there is no separate solid-fill
-/// pattern or `MoveKind`; both passes are tagged `MoveKind::Infill`. Real
-/// path planning beyond this (travel-move ordering/optimization across
-/// paths, non-planar toolpath deformation) is future work.
+/// pattern or `MoveKind`; both passes are tagged `MoveKind::Infill`. As a
+/// final safety net, every wall/infill path is then re-validated against
+/// the layer's real mesh containment query (`Layer::mesh_sdf`, when
+/// present) and dropped wholesale if any of its points fall outside the
+/// solid -- see [`retain_contained_paths`]. Real path planning beyond
+/// this (travel-move ordering/optimization across paths, non-planar
+/// toolpath deformation) is future work.
 /// Layers are planned in parallel across all available cores (via
 /// `rayon`): each layer only reads the shared, immutable `layers`/`objects`
 /// slices and produces its own independent `Vec<Path>` (the expensive part
@@ -213,6 +298,8 @@ pub fn plan_with_progress(
                 }
             }
 
+            let mut paths = retain_contained_paths(paths, layer.mesh_sdf.as_ref(), layer.order);
+
             let extrusion_multiplier = tools
                 .iter()
                 .find(|tool| tool.id == object.tool)
@@ -286,6 +373,7 @@ mod tests {
                 }],
                 infill_boundary: Vec::new(),
                 solid_fill_boundary: Vec::new(),
+                mesh_sdf: None,
                 order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
             },
             Layer {
@@ -298,6 +386,7 @@ mod tests {
                 }],
                 infill_boundary: Vec::new(),
                 solid_fill_boundary: Vec::new(),
+                mesh_sdf: None,
                 order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
             },
         ];
@@ -364,6 +453,7 @@ mod tests {
             }],
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
             order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 
@@ -396,6 +486,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
             order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 
@@ -426,6 +517,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: square.clone(),
             solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
             order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         };
         let layer_with_solid = Layer {
@@ -484,6 +576,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: square,
             solid_fill_boundary: solid_square,
+            mesh_sdf: None,
             order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         };
 
@@ -527,6 +620,7 @@ mod tests {
             ],
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
             order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 
@@ -568,6 +662,7 @@ mod tests {
             ],
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
             order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 
@@ -608,6 +703,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
             order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 

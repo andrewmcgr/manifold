@@ -817,6 +817,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: vec![loop_points],
             solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
             order_field: Arc::new(field),
         };
 
@@ -903,6 +904,7 @@ mod tests {
             loops: Vec::new(),
             infill_boundary: vec![loop_points],
             solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
             order_field: Arc::new(NeverReached),
         };
 

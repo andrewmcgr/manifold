@@ -54,6 +54,26 @@ pub struct Layer {
     /// Empty until that post-pass runs; always a subset of
     /// `infill_boundary`.
     pub solid_fill_boundary: Vec<Vec<DVec3>>,
+    /// Ground-truth mesh containment query for this layer's source object,
+    /// shared with (and built alongside) the `MeshSdf` used for contour
+    /// extraction in [`slice_mesh_with_progress`] -- the only site with
+    /// mesh access, so this is populated there rather than re-derived
+    /// downstream. `None` for a synthetic/test [`Layer`] not derived from
+    /// a real mesh (e.g. most unit-test fixtures); `toolpath::plan` treats
+    /// `None` as "containment unknown, don't enforce it" rather than
+    /// panicking or assuming failure, so existing hand-built `Layer`
+    /// fixtures keep working unchanged.
+    ///
+    /// Used by `toolpath::plan` as a final safety net: wall/infill loop
+    /// geometry is derived from contour extraction and 2D polygon boolean
+    /// ops on `infill_boundary`/`solid_fill_boundary`, which have (rarely)
+    /// produced loops that don't correspond to real solid material -- e.g.
+    /// infill printed inside a hole that isn't actually part of the
+    /// object. Rather than only trying to prevent every possible source of
+    /// that class of bug, `plan` re-checks every extruding path against
+    /// this real 3D mesh signed-distance field and drops any path that
+    /// isn't actually contained in the solid.
+    pub mesh_sdf: Option<Arc<MeshSdf>>,
     /// The resolved order field used to produce this layer, cached at
     /// construction time (see [`slice_mesh_with_progress`], the only site
     /// with mesh access) so downstream passes
@@ -83,6 +103,14 @@ impl std::fmt::Debug for Layer {
             .field("loops", &self.loops)
             .field("infill_boundary", &self.infill_boundary)
             .field("solid_fill_boundary", &self.solid_fill_boundary)
+            .field(
+                "mesh_sdf",
+                &self
+                    .mesh_sdf
+                    .as_ref()
+                    .map(|_| "<MeshSdf>")
+                    .unwrap_or("None"),
+            )
             .field("order_field", &"<dyn OrderField>")
             .finish()
     }
@@ -101,6 +129,7 @@ impl Default for Layer {
             loops: Vec::default(),
             infill_boundary: Vec::default(),
             solid_fill_boundary: Vec::default(),
+            mesh_sdf: None,
             order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }
     }
@@ -219,7 +248,7 @@ pub fn slice_mesh_with_progress(
         .chunks_exact(3)
         .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
         .collect();
-    let sdf = MeshSdf::new(mesh.vertices.clone(), faces);
+    let sdf = Arc::new(MeshSdf::new(mesh.vertices.clone(), faces));
 
     // Resolve the configured order field once per slice (defaults to a
     // `HeightOrderField` along `BUILD_DIRECTION`, matching pre-existing
@@ -377,7 +406,7 @@ pub fn slice_mesh_with_progress(
             .into_par_iter()
             .map(|wall_index| {
                 let iso = -(config.wall_offset + wall_index as f64 * config.wall_line_width);
-                let vertices = extract_isosurface::<MeshSdf>(&sdf, min, max, iso_resolution, iso);
+                let vertices = extract_isosurface::<MeshSdf>(&*sdf, min, max, iso_resolution, iso);
                 // `extract_order_contours_on_mesh` walks a flat position soup
                 // (see its doc comment), decoupled from `marching_cubes`'s
                 // `Vertex` (position + normal) — no `OrderField` dependency
@@ -408,7 +437,7 @@ pub fn slice_mesh_with_progress(
                     // wall steps another `wall_line_width` inward.
                     let iso = -(config.wall_offset + wall_index as f64 * config.wall_line_width);
                     let wall_loops = extract_contours(
-                        &sdf, origin, basis1, basis2, extent, extent, resolution, resolution, iso,
+                        &*sdf, origin, basis1, basis2, extent, extent, resolution, resolution, iso,
                     );
                     loops.extend(
                         wall_loops
@@ -540,6 +569,7 @@ pub fn slice_mesh_with_progress(
                 loops,
                 infill_boundary,
                 solid_fill_boundary: Vec::new(),
+                mesh_sdf: Some(Arc::clone(&sdf)),
                 order_field: Arc::clone(&field),
             }
         })
