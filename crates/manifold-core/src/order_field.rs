@@ -99,8 +99,9 @@ pub fn order_field_for(
 ///
 /// Seeding is by *region*
 /// ([`manifold_fidget::eikonal::EikonalOrderField::new_with_occupancy_and_seed_region`]),
-/// not by mesh vertex position: every solid grid node within one layer
-/// height of the mesh's minimum Z is frozen at distance `0.0` directly,
+/// not by mesh vertex position: every solid grid node within a small
+/// tolerance (half the grid's own cell size) of the mesh's minimum Z is
+/// frozen at distance `0.0` directly,
 /// rather than only the mesh's own vertices near that height. Seeding from
 /// vertices alone only seeds wherever those vertices happen to sit -- a
 /// flat base face triangulated with vertices solely along its silhouette
@@ -152,11 +153,28 @@ fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
     let nozzle_diameter = config.nozzle_diameter.abs().max(f64::EPSILON);
     let requested_cell_size = layer_height.min(nozzle_diameter) / 2.0;
     let cell_size = clamp_cell_size_to_node_budget(max - min, requested_cell_size);
-    // Contact-region tolerance: every solid grid node within one layer
-    // height of the mesh's minimum Z counts as "touching" the build plate,
+    // Contact-region tolerance: every solid grid node within *half a grid
+    // cell* of the mesh's minimum Z counts as "touching" the build plate --
     // generous enough to include a slightly-faceted/non-flat mesh base
-    // without pulling in nodes from well above the true contact surface.
-    let is_seed_region = |p: DVec3| p.z <= min.z + layer_height;
+    // (tessellation noise at that scale) without pulling in nodes from well
+    // above the true contact surface.
+    //
+    // This used to be a full `layer_height`, which froze an entire
+    // layer-height-thick *slab* of grid nodes to distance `0.0` instead of
+    // a thin band hugging the true contact plane. Since the FMM front then
+    // marches outward from the *far* edge of that frozen slab (at
+    // `min.z + layer_height`, not `min.z`), every order value effectively
+    // reported the distance from one layer height *above* the true base --
+    // shifting the entire reconstructed field (and therefore every printed
+    // layer's Z) up by a full `layer_height` relative to the `Height`
+    // order field's convention, so the first Gcode move landed at
+    // `2 * layer_height` instead of `layer_height`. Shrinking the tolerance
+    // to a fraction of the grid's own cell size keeps the frozen band thin
+    // enough that its far edge sits within one grid cell of `min.z`,
+    // matching `Height`'s convention that order `0` corresponds to the
+    // mesh's contact surface itself.
+    let seed_tolerance = cell_size / 2.0;
+    let is_seed_region = |p: DVec3| p.z <= min.z + seed_tolerance;
     let slope_profile = config.eikonal_slope_profile();
     let height_along = ConstantAxisHeight::new(BUILD_DIRECTION, min);
 

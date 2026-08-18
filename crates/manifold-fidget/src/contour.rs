@@ -602,56 +602,94 @@ pub fn extract_contours_at_order<F: ScalarField + ?Sized>(
 /// layout — pass `.iter().map(|v| v.position).collect::<Vec<_>>()` when
 /// using `extract_isosurface`'s output directly).
 ///
-/// A vertex landing *exactly* on `order_value` is nudged onto the
-/// conventionally-"above" side by a tiny relative epsilon before crossing
-/// detection (a standard simulation-of-simplicity tie-break) rather than
-/// causing that vertex's edges to be silently skipped. This is not a rare
-/// theoretical corner case: an [`crate::eikonal::EikonalOrderField`] seeded
-/// over a broad flat region (see
+/// A vertex within a small relative epsilon of `order_value` is treated as
+/// lying *on* the contour rather than strictly above or below it. This
+/// matters beyond the single-point "exact match" case: an
+/// [`crate::eikonal::EikonalOrderField`] seeded over a broad flat region
+/// (see
 /// [`crate::eikonal::EikonalOrderField::new_with_occupancy_and_seed_region`])
 /// marches as a perfectly planar front through unobstructed flat geometry
-/// (e.g. a plain box), so its FMM-solved distances land on *exact*
-/// multiples of the grid cell size at grid nodes — and a triangle-soup
-/// vertex sampled at a grid-aligned position (not uncommon on axis-aligned
-/// test/production geometry) can then land exactly on a round-number
-/// `order_value` a caller happens to request (e.g. a `layer_height` that's
-/// an exact multiple of the field's cell size). Without the nudge, every
-/// triangle touching that vertex silently drops its crossing, which can
-/// (and did, before this fix) zero out an entire layer's contour.
+/// (e.g. a flat plate-contact base), so an entire connected patch of the
+/// wall isosurface can sit almost exactly at `order_value` at once — not
+/// just an isolated vertex. A strict `(v0-order_value)*(v1-order_value) <
+/// 0.0` sign test never fires across such a patch (nothing is strictly on
+/// the other side), which used to silently drop the whole plateau's
+/// boundary and could zero out an entire layer's contour. Instead:
+///
+/// - An edge between two "on" vertices contributes no crossing point
+///   itself (it lies flat on the contour).
+/// - An edge between an "on" vertex and a strictly-above/below vertex
+///   contributes the "on" vertex's own position as the crossing point (no
+///   interpolation needed — it's already at the target value). A triangle
+///   with exactly two "on" vertices and one strictly-above/below vertex
+///   therefore yields those two "on" vertices as its crossing pair — the
+///   plateau's own edge, which is exactly the boundary the layer's contour
+///   needs there.
+/// - A triangle with all three vertices "on" is fully interior to the
+///   plateau and contributes nothing (matches the prior degenerate-case
+///   handling, just generalized from exact equality to a small epsilon).
+/// - An edge between two vertices strictly on the same side (both above or
+///   both below) contributes nothing, as before.
+///
+/// Duplicate crossing points from the same "on" vertex touching two edges
+/// of a triangle are deduplicated before deciding whether the triangle
+/// yields a usable segment.
 pub fn extract_order_contours_on_mesh<O: OrderField + ?Sized>(
     triangle_positions: &[DVec3],
     order_field: &O,
     order_value: f64,
 ) -> Vec<Vec<DVec3>> {
-    let mut segments: Vec<(DVec3, DVec3)> = Vec::new();
+    // Relative epsilon: generous enough to absorb floating-point noise from
+    // marching-cubes' isosurface interpolation landing a hair off an
+    // FMM-solved plateau value, but far smaller than any real layer/wall
+    // spacing this codebase produces.
+    let epsilon = order_value.abs().max(1.0) * 1e-6;
 
-    // Nudges a value landing exactly on `order_value` onto the "above" side
-    // by a tiny relative epsilon, so an edge between an on-iso vertex and a
-    // below-iso vertex still registers as a crossing instead of being
-    // silently skipped. Only ever perturbs an exact match; every other
-    // value (including values merely close to `order_value`) passes
-    // through unchanged, so real crossings are never affected.
-    let nudge = |v: f64| -> f64 {
-        if v == order_value {
-            v + (v.abs().max(1.0) * 1e-9)
+    #[derive(Clone, Copy, PartialEq)]
+    enum Side {
+        Below,
+        On,
+        Above,
+    }
+    let side = |v: f64| -> Side {
+        if (v - order_value).abs() <= epsilon {
+            Side::On
+        } else if v < order_value {
+            Side::Below
         } else {
-            v
+            Side::Above
         }
     };
+
+    let mut segments: Vec<(DVec3, DVec3)> = Vec::new();
 
     for tri in triangle_positions.chunks_exact(3) {
         let p = [tri[0], tri[1], tri[2]];
         let v = [
-            nudge(order_field.order(p[0])),
-            nudge(order_field.order(p[1])),
-            nudge(order_field.order(p[2])),
+            order_field.order(p[0]),
+            order_field.order(p[1]),
+            order_field.order(p[2]),
         ];
+        let s = [side(v[0]), side(v[1]), side(v[2])];
 
-        let mut crossing_points = Vec::with_capacity(2);
+        let mut crossing_points: Vec<DVec3> = Vec::with_capacity(2);
         for &(i0, i1) in &[(0, 1), (1, 2), (2, 0)] {
-            let (v0, v1) = (v[i0], v[i1]);
-            if (v0 - order_value) * (v1 - order_value) < 0.0 {
-                crossing_points.push(lerp_crossing(p[i0], v0, p[i1], v1, order_value));
+            let point = match (s[i0], s[i1]) {
+                (Side::On, Side::On) => None,
+                (Side::On, _) => Some(p[i0]),
+                (_, Side::On) => Some(p[i1]),
+                (Side::Below, Side::Above) | (Side::Above, Side::Below) => {
+                    Some(lerp_crossing(p[i0], v[i0], p[i1], v[i1], order_value))
+                }
+                _ => None,
+            };
+            if let Some(point) = point {
+                if !crossing_points
+                    .iter()
+                    .any(|&existing| point_key(existing) == point_key(point))
+                {
+                    crossing_points.push(point);
+                }
             }
         }
         if crossing_points.len() == 2 {
