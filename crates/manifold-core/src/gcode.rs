@@ -113,9 +113,11 @@ fn first_layer_xy_bounds(paths: &[Path]) -> Option<(f64, f64, f64, f64)> {
 /// filament position — each tool is tracked as its own independent
 /// extruder, so a fresh tool-select always restarts extrusion accounting
 /// from zero rather than carrying over the previous tool's total.
-/// Explicitly emits `M82` (absolute extrusion mode) at the very start of
-/// output, before any extrusion moves, rather than relying on the printer
-/// firmware's default: each extruding move's `E` value is
+/// Explicitly emits `M82` (absolute extrusion mode) immediately after
+/// `start_gcode` (not before it -- `start_gcode` may itself change the
+/// extrusion mode, so we can't assume it leaves the machine in relative
+/// mode), and always before any extrusion moves, rather than relying on
+/// the printer firmware's default: each extruding move's `E` value is
 /// `Segment::extrusion_length` accumulated
 /// onto a running per-tool total (see `toolpath::plan`, which finalizes
 /// `extrusion_length` from segment geometry, line width, and the tool's
@@ -132,11 +134,6 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
         out.push_str(&line);
         out.push('\n');
     }
-    // Explicitly set absolute extrusion mode -- don't rely on the printer
-    // firmware's default, since `emit`'s E values are always absolute
-    // per-tool running totals (see the doc comment below).
-    out.push_str("M82\n");
-
     let (min_x, min_y, max_x, max_y) = first_layer_xy_bounds(paths).unwrap_or((0.0, 0.0, 0.0, 0.0));
     if !config.start_gcode.is_empty() {
         out.push_str(&interpolate(
@@ -148,6 +145,16 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
         ));
         out.push('\n');
     }
+
+    // Explicitly set absolute extrusion mode -- don't rely on the printer
+    // firmware's default, since `emit`'s E values are always absolute
+    // per-tool running totals (see the doc comment below). Emitted *after*
+    // `start_gcode` rather than before it: `start_gcode` (e.g. a macro like
+    // `PRINT_START`) may itself change the extrusion mode (some do, to set
+    // up their own homing/priming sequence), so we can't assume it leaves
+    // the machine in relative mode -- M82 must be the last word on
+    // extrusion mode before the first extruding move.
+    out.push_str("M82\n");
 
     let mut current_tool = None;
     let mut current_e = 0.0;
