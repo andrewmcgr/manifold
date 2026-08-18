@@ -24,6 +24,16 @@ cargo run -p manifold-cli -- path/to/model.stl -o out.gcode
 cargo run -p manifold-gui
 ```
 
+For real/complex meshes, build and run in release mode — the debug
+profile can be many times slower for this CPU-heavy geometry pipeline
+(polygon offsetting, Eikonal fast-marching, parallel toolpath planning),
+which can look like a hang rather than a slow slice:
+
+```sh
+cargo run --release -p manifold-cli -- path/to/model.stl -o out.gcode
+cargo run --release -p manifold-gui
+```
+
 ### Automation (dev only)
 
 `manifold-gui` can optionally expose a local MCP automation server for
