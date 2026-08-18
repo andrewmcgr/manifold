@@ -10,3 +10,4 @@ description = "SDF/angle-field backend (fidget-based Tree fields plus mesh-deriv
 glam.workspace = true
 fidget = "0.5"
 rayon.workspace = true
+tracing.workspace = true

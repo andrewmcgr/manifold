@@ -72,6 +72,10 @@ mod tests {
                 start_gcode: String::new(),
                 end_gcode: String::new(),
                 eikonal_slope_profile: Vec::new(),
+                travel_speed: 9000.0,
+                print_speed: 3000.0,
+                z_hop_enabled: false,
+                z_hop_height: 0.4,
             },
         }
     }

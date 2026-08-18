@@ -137,6 +137,34 @@ pub struct SlicerConfig {
     /// until a user explicitly opts into a tighter profile.
     #[serde(default = "default_eikonal_slope_profile")]
     pub eikonal_slope_profile: Vec<(f64, f64)>,
+    /// Feedrate (Gcode `F`, mm/min) for non-extruding travel moves
+    /// (`toolpath::MoveKind::Travel`). Defaults to `9000.0` (150 mm/s), a
+    /// common consumer-FDM travel speed. `#[serde(default)]` so a saved
+    /// profile from before this field existed still deserializes.
+    #[serde(default = "default_travel_speed")]
+    pub travel_speed: f64,
+    /// Feedrate (Gcode `F`, mm/min) for extruding moves (walls/infill).
+    /// Defaults to `3000.0` (50 mm/s), a common consumer-FDM print speed.
+    /// `#[serde(default)]` so a saved profile from before this field
+    /// existed still deserializes.
+    #[serde(default = "default_print_speed")]
+    pub print_speed: f64,
+    /// Whether Z-hop (lift-before-travel / lower-after-arrival) is enabled.
+    /// When `false`, `plan`/`emit` behave exactly as before this field
+    /// existed: Z tracks `point.z` unmodified even across
+    /// `toolpath::MoveKind::Travel` segments. `#[serde(default)]` so a
+    /// saved profile from before this field existed still deserializes to
+    /// `false`, preserving prior behavior/output exactly.
+    #[serde(default)]
+    pub z_hop_enabled: bool,
+    /// Height (mm) to lift above the current print Z before a travel move,
+    /// and to lower back down by on arrival, when `z_hop_enabled` is
+    /// `true`. Ignored when `z_hop_enabled` is `false`. Defaults to `0.4`
+    /// (one common nozzle diameter's worth), though the value is inert
+    /// while disabled. `#[serde(default = "default_z_hop_height")]` so a
+    /// saved profile from before this field existed still deserializes.
+    #[serde(default = "default_z_hop_height")]
+    pub z_hop_height: f64,
 }
 
 /// Default value for [`SlicerConfig::eikonal_slope_profile`]: an empty set
@@ -154,6 +182,25 @@ pub struct SlicerConfig {
 /// tighter profile.
 fn default_eikonal_slope_profile() -> Vec<(f64, f64)> {
     Vec::new()
+}
+
+/// Default value for [`SlicerConfig::travel_speed`]: `9000.0` mm/min
+/// (150 mm/s), a common consumer-FDM travel speed.
+fn default_travel_speed() -> f64 {
+    9000.0
+}
+
+/// Default value for [`SlicerConfig::print_speed`]: `3000.0` mm/min
+/// (50 mm/s), a common consumer-FDM print speed.
+fn default_print_speed() -> f64 {
+    3000.0
+}
+
+/// Default value for [`SlicerConfig::z_hop_height`]: `0.4` mm, a common
+/// slicer convention (one nozzle diameter). Inert while `z_hop_enabled` is
+/// `false` (the default).
+fn default_z_hop_height() -> f64 {
+    0.4
 }
 
 impl Default for SlicerConfig {
@@ -181,6 +228,10 @@ impl Default for SlicerConfig {
             start_gcode: "PRINT_START T_TOOL=240 T_BED=105 T_CHAMBER=45 PRINT_MIN={print_min_x},{print_min_y} PRINT_MAX={print_max_x},{print_max_y}".to_string(),
             end_gcode: "PRINT_END".to_string(),
             eikonal_slope_profile: default_eikonal_slope_profile(),
+            travel_speed: default_travel_speed(),
+            print_speed: default_print_speed(),
+            z_hop_enabled: false,
+            z_hop_height: default_z_hop_height(),
         }
     }
 }

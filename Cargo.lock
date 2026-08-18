@@ -2489,6 +2489,7 @@ dependencies = [
  "fidget",
  "glam 0.29.3",
  "rayon",
+ "tracing",
 ]
 
 [[package]]

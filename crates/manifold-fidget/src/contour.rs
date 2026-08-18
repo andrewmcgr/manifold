@@ -250,6 +250,44 @@ fn point_key(p: DVec3) -> (i64, i64, i64) {
     )
 }
 
+/// Widened matching tolerance used only as a repair pass when the exact
+/// quantized-key stitch (`STITCH_EPSILON`, exact-match-only) fails to find
+/// a partner for the current chain endpoint. Floating-point drift between
+/// independently-lerped points on a shared edge (e.g. from
+/// `canonicalize_orientation_per_loop_basis`'s per-loop basis fitting, or
+/// the marching-squares saddle-case average-of-corners heuristic) can leave
+/// two endpoints that are geometrically the same point but a few ULPs
+/// apart -- far tighter than any real, distinct topological gap on typical
+/// mesh scales, so widening this far does not risk bridging a genuine
+/// stitching gap.
+const STITCH_REPAIR_TOLERANCE: f64 = 1e-3;
+
+/// Minimum point count for a stitched chain to be a plausible closed
+/// contour: a real closed polygon needs at least 3 distinct points/segments
+/// to bound any area (a triangle).
+const MIN_LOOP_POINTS: usize = 3;
+
+/// Finds the nearest not-yet-used segment with an endpoint within
+/// [`STITCH_REPAIR_TOLERANCE`] of `point`, used only after the exact-match
+/// lookup in [`stitch_loops`] fails.
+fn find_nearest_unused_endpoint(
+    segments: &[(DVec3, DVec3)],
+    used: &[bool],
+    point: DVec3,
+) -> Option<usize> {
+    let mut best: Option<(usize, f64)> = None;
+    for (i, &(a, b)) in segments.iter().enumerate() {
+        if used[i] {
+            continue;
+        }
+        let d = a.distance(point).min(b.distance(point));
+        if d <= STITCH_REPAIR_TOLERANCE && best.is_none_or(|(_, best_d)| d < best_d) {
+            best = Some((i, d));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 /// Stitches unordered line segments (from [`extract_contours`]'s
 /// marching-squares pass) into closed polylines.
 ///
@@ -258,6 +296,16 @@ fn point_key(p: DVec3) -> (i64, i64, i64) {
 /// (e.g. one cell's edge walk can produce a segment in the opposite
 /// direction from its neighbor's matching segment), so stitching matches
 /// on *either* endpoint of the next candidate segment, not just its start.
+///
+/// If the exact-match stitch cannot find a partner for the current chain
+/// endpoint, a widened-tolerance repair pass (see
+/// [`STITCH_REPAIR_TOLERANCE`]) is tried before giving up. Chains that
+/// still cannot be closed -- or that close with too few points to bound
+/// any area (see [`MIN_LOOP_POINTS`]) -- are dropped rather than emitted
+/// as printable geometry: a degenerate 1-3 point "loop" reaching
+/// `toolpath::plan` as a `WallLoop` produces a nonsensical G-code path,
+/// which is worse than an omission that is at least visible via the
+/// `tracing::warn!` below.
 fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
     use std::collections::HashMap;
 
@@ -272,6 +320,8 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
     let mut used = vec![false; segments.len()];
 
     let mut loops = Vec::new();
+    let mut dropped_fragments = 0usize;
+    let mut dropped_points = 0usize;
 
     for start_idx in 0..segments.len() {
         if used[start_idx] {
@@ -280,23 +330,28 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
         used[start_idx] = true;
         let (first_point, mut current_point) = segments[start_idx];
         let mut loop_points = vec![first_point];
+        let mut closed = false;
 
         loop {
             if point_key(current_point) == point_key(first_point) {
+                closed = true;
                 break;
             }
 
             let next = by_point
                 .get(&point_key(current_point))
-                .and_then(|candidates| candidates.iter().copied().find(|&i| !used[i]));
+                .and_then(|candidates| candidates.iter().copied().find(|&i| !used[i]))
+                .or_else(|| find_nearest_unused_endpoint(&segments, &used, current_point));
 
             match next {
                 Some(next_idx) => {
                     used[next_idx] = true;
                     let (a, b) = segments[next_idx];
                     // Continue from whichever endpoint of the matched
-                    // segment is *not* the one we arrived on.
-                    let other = if point_key(a) == point_key(current_point) {
+                    // segment is *not* the one we arrived on (nearest, so
+                    // this also works for widened-tolerance matches where
+                    // the arrival point isn't bit-exact).
+                    let other = if a.distance(current_point) <= b.distance(current_point) {
                         b
                     } else {
                         a
@@ -305,15 +360,32 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
                     current_point = other;
                 }
                 None => {
-                    // Open chain (clipped by plane extent, or a genuine
-                    // stitching gap): emit what was collected, best-effort.
+                    // Open chain even under the widened repair tolerance:
+                    // a genuine stitching gap, or a fragment clipped by
+                    // plane extent. Record it as unclosed and let the
+                    // post-loop check below decide whether to drop it.
                     loop_points.push(current_point);
                     break;
                 }
             }
         }
 
-        loops.push(loop_points);
+        if closed && loop_points.len() >= MIN_LOOP_POINTS {
+            loops.push(loop_points);
+        } else {
+            dropped_fragments += 1;
+            dropped_points += loop_points.len();
+        }
+    }
+
+    if dropped_fragments > 0 {
+        tracing::warn!(
+            dropped_fragments,
+            dropped_points,
+            "stitch_loops: discarded {dropped_fragments} open/degenerate contour \
+             fragment(s) ({dropped_points} points total) instead of emitting them \
+             as printable wall loops",
+        );
     }
 
     loops
@@ -1217,5 +1289,83 @@ mod tests {
                 "hole loop point {p:?} should lie near the inner sphere (radius {inner_radius})"
             );
         }
+    }
+
+    #[test]
+    fn stitch_loops_closes_a_well_formed_square() {
+        let segments = vec![
+            (DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(1.0, 1.0, 0.0)),
+            (DVec3::new(1.0, 1.0, 0.0), DVec3::new(0.0, 1.0, 0.0)),
+            (DVec3::new(0.0, 1.0, 0.0), DVec3::new(0.0, 0.0, 0.0)),
+        ];
+        let loops = stitch_loops(segments);
+        assert_eq!(loops.len(), 1, "expected exactly one closed loop");
+        assert!(loops[0].len() >= MIN_LOOP_POINTS);
+    }
+
+    #[test]
+    fn stitch_loops_drops_an_unmatched_open_fragment_instead_of_emitting_it() {
+        // A well-formed closed triangle, plus one isolated dangling segment
+        // whose endpoints don't match anything else (e.g. clipped by plane
+        // extent, or a genuine stitching gap) -- the dangling segment must
+        // not be emitted as a printable "loop".
+        let segments = vec![
+            (DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(0.5, 1.0, 0.0)),
+            (DVec3::new(0.5, 1.0, 0.0), DVec3::new(0.0, 0.0, 0.0)),
+            (DVec3::new(10.0, 10.0, 0.0), DVec3::new(11.0, 10.0, 0.0)),
+        ];
+        let loops = stitch_loops(segments);
+        assert_eq!(
+            loops.len(),
+            1,
+            "expected only the well-formed triangle, dangling fragment dropped"
+        );
+        assert!(loops[0].len() >= MIN_LOOP_POINTS);
+        for p in &loops[0] {
+            assert!(
+                p.x < 5.0 && p.y < 5.0,
+                "unexpected point from dangling fragment: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stitch_loops_drops_a_too_few_point_closed_fragment() {
+        // Two segments that happen to close on each other (a degenerate
+        // 2-point "loop") -- geometrically not a valid closed polygon, so
+        // it must be dropped rather than kept as a `MIN_LOOP_POINTS`-violating
+        // fragment.
+        let segments = vec![
+            (DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(0.0, 0.0, 0.0)),
+        ];
+        let loops = stitch_loops(segments);
+        assert!(
+            loops.is_empty(),
+            "expected the degenerate 2-point closed fragment to be dropped, got {loops:?}"
+        );
+    }
+
+    #[test]
+    fn stitch_loops_repairs_a_gap_within_the_widened_tolerance() {
+        // The second segment's start point is off by slightly more than
+        // `STITCH_EPSILON` from the first segment's end point (simulating
+        // floating-point drift between independently-lerped points on a
+        // shared edge), but well within `STITCH_REPAIR_TOLERANCE` -- the
+        // widened repair pass should still close this into one loop.
+        let drift = STITCH_REPAIR_TOLERANCE / 10.0;
+        let segments = vec![
+            (DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)),
+            (DVec3::new(1.0 + drift, 0.0, 0.0), DVec3::new(0.5, 1.0, 0.0)),
+            (DVec3::new(0.5, 1.0, 0.0), DVec3::new(0.0, 0.0, 0.0)),
+        ];
+        let loops = stitch_loops(segments);
+        assert_eq!(
+            loops.len(),
+            1,
+            "expected the small-drift gap to be repaired into one closed loop"
+        );
     }
 }

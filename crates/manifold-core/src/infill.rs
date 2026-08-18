@@ -9,7 +9,7 @@
 use crate::order_field;
 use crate::polygon2d;
 use crate::slicing::Layer;
-use crate::toolpath::{MoveKind, Path, Segment};
+use crate::toolpath::{speed_for_kind, MoveKind, Path, Segment};
 use crate::transform::Transform;
 use crate::SlicerConfig;
 use glam::DVec3;
@@ -379,7 +379,7 @@ impl InfillGenerator for MonotonicInfill {
                 if !points.is_empty() {
                     segments.push(Segment {
                         kind,
-                        speed: 60.0,
+                        speed: speed_for_kind(kind, config),
                         extrusion_rate: 1.0,
                         support_fraction: 0.0,
                         order: layer.order,
@@ -487,13 +487,14 @@ impl InfillGenerator for ConcentricInfill {
         let boundary_2d =
             polygon2d::canonicalize(&polygon2d::to_2d(&region.loops, basis1, basis2, apex));
 
-        // First ring sits half a line width in from the boundary (so its
-        // bead is centered on the boundary edge, matching how wall passes
-        // are offset from the object surface); each subsequent ring steps
-        // inward by a further full `spacing`, until an offset collapses to
-        // nothing.
+        // `boundary_2d` (== `region.loops`, i.e. `Layer::infill_boundary`)
+        // is already a bead centerline -- one `wall_line_width` in from the
+        // true mesh surface, per `Layer::infill_boundary`'s doc comment --
+        // not a free edge. So the first ring sits directly on it with zero
+        // extra inset; only subsequent rings step inward by a further full
+        // `spacing`, until an offset collapses to nothing.
         let mut rings_2d: Vec<Vec<[f64; 2]>> = Vec::new();
-        let mut current = polygon2d::inward_offset(&boundary_2d, spacing / 2.0);
+        let mut current = polygon2d::inward_offset(&boundary_2d, 0.0);
         let mut steps = 0usize;
         while !current.is_empty() && steps < MAX_OFFSET_RINGS {
             rings_2d.extend(current.iter().cloned());
@@ -536,7 +537,7 @@ impl InfillGenerator for ConcentricInfill {
                     .iter()
                     .map(|_| Segment {
                         kind: MoveKind::Infill,
-                        speed: 60.0,
+                        speed: speed_for_kind(MoveKind::Infill, config),
                         extrusion_rate: 1.0,
                         support_fraction: 0.0,
                         order: layer.order,
@@ -596,8 +597,11 @@ impl InfillGenerator for AllWallsInfill {
         let boundary_2d =
             polygon2d::canonicalize(&polygon2d::to_2d(&region.loops, basis1, basis2, apex));
 
+        // `boundary_2d` is already a bead centerline (see
+        // `ConcentricInfill::generate`'s identical comment above), so the
+        // first ring sits directly on it with zero extra inset.
         let mut rings_2d: Vec<Vec<[f64; 2]>> = Vec::new();
-        let mut current = polygon2d::inward_offset(&boundary_2d, spacing / 2.0);
+        let mut current = polygon2d::inward_offset(&boundary_2d, 0.0);
         let mut steps = 0usize;
         while !current.is_empty() && steps < MAX_OFFSET_RINGS {
             rings_2d.extend(current.iter().cloned());
@@ -631,7 +635,7 @@ impl InfillGenerator for AllWallsInfill {
                     .iter()
                     .map(|_| Segment {
                         kind: MoveKind::Infill,
-                        speed: 60.0,
+                        speed: speed_for_kind(MoveKind::Infill, config),
                         extrusion_rate: 1.0,
                         support_fraction: 0.0,
                         order: layer.order,
@@ -1342,5 +1346,60 @@ mod tests {
         let paths =
             AllWallsInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
         assert!(paths.is_empty());
+    }
+
+    /// Distance from `p` to the nearest edge of the axis-aligned square
+    /// boundary with the given half-extent (i.e. how far inward from the
+    /// `region.loops`/`infill_boundary` centerline the point sits).
+    fn distance_inward_from_square_boundary(p: DVec3, half_extent: f64) -> f64 {
+        (half_extent - p.x.abs()).min(half_extent - p.y.abs())
+    }
+
+    /// Regression test for the infill double-offset defect: the first ring
+    /// of `ConcentricInfill` must sit directly on `infill_boundary` (zero
+    /// extra inset), not a further `spacing / 2.0` in from it. Before the
+    /// fix this measured ~`infill_line_width` in from the boundary instead
+    /// of ~0.
+    #[test]
+    fn concentric_fill_first_ring_sits_directly_on_the_infill_boundary() {
+        let half_extent = 5.0;
+        let layer = square_layer(half_extent);
+        let cfg = config(); // infill_line_width = 0.5
+        let region = InfillRegion::from_layer(&layer, &cfg);
+        let paths = ConcentricInfill.generate(&region, &cfg, &layer, &Transform::identity(), 1.0);
+        assert!(!paths.is_empty());
+
+        // The first-generated ring is the outermost (closest to the
+        // boundary): its every point should be within a small tolerance of
+        // the boundary centerline, not offset a further half line-width in.
+        let first_ring = &paths[0].points;
+        for p in first_ring {
+            let d = distance_inward_from_square_boundary(*p, half_extent);
+            assert!(
+                d.abs() < 1e-3,
+                "expected first ring to sit on the boundary (distance ~0), got {d} at {p:?}"
+            );
+        }
+    }
+
+    /// Same regression as `concentric_fill_first_ring_sits_directly_on_the_infill_boundary`,
+    /// for `AllWallsInfill`'s independent first-ring offset.
+    #[test]
+    fn all_walls_fill_first_ring_sits_directly_on_the_infill_boundary() {
+        let half_extent = 5.0;
+        let layer = square_layer(half_extent);
+        let cfg = config(); // infill_line_width = 0.5
+        let region = InfillRegion::from_layer(&layer, &cfg);
+        let paths = AllWallsInfill.generate(&region, &cfg, &layer, &Transform::identity(), 1.0);
+        assert!(!paths.is_empty());
+
+        let first_ring = &paths[0].points;
+        for p in first_ring {
+            let d = distance_inward_from_square_boundary(*p, half_extent);
+            assert!(
+                d.abs() < 1e-3,
+                "expected first ring to sit on the boundary (distance ~0), got {d} at {p:?}"
+            );
+        }
     }
 }

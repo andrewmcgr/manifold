@@ -4,9 +4,7 @@ use crate::{
     ids::ObjectId, mesh::Mesh, object::Object, order_field, polygon2d, Error, Result, SlicerConfig,
 };
 use glam::DVec3;
-use manifold_fidget::contour::{
-    extract_contours, extract_order_contours_on_mesh, loop_centroid_and_normal, plane_basis,
-};
+use manifold_fidget::contour::{extract_contours, extract_order_contours_on_mesh, plane_basis};
 use manifold_fidget::marching_cubes::extract_isosurface;
 use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{order_range_over_bbox, HeightOrderField, OrderField};
@@ -488,17 +486,14 @@ pub fn slice_mesh_with_progress(
             // Offsetting the already-extracted wall loop in 2D instead
             // guarantees a boundary whenever any wall exists.
             //
-            // Curved path (non-Height order field): no single shared plane
-            // basis exists for a curved-field layer's loops (they are each
-            // only *locally* near-planar, concentric around a common
-            // apex/axis — see `manifold_fidget::contour`'s module docs), so
-            // each innermost wall loop is offset independently in its own
-            // best-fit local basis (`loop_centroid_and_normal` +
-            // `plane_basis`, the same pairing
-            // `canonicalize_orientation_per_loop_basis` uses internally,
-            // reused here rather than duplicated) instead of the Height
-            // path's one shared `plane_basis(BUILD_DIRECTION)`. This is a
-            // best-effort per-loop approximation, not a single unified
+            // Curved path (non-Height order field): uses the same shared
+            // `plane_basis(BUILD_DIRECTION)` basis as the Height path below
+            // (rather than a separate per-loop best-fit local basis) so the
+            // inward-offset step is consistent across all order field
+            // kinds. Each layer's loops are only *locally* near-planar
+            // (concentric around a common apex/axis — see
+            // `manifold_fidget::contour`'s module docs), so this is a
+            // best-effort approximation, not a single unified
             // curved-boundary computation: exact correctness for
             // arbitrarily curved solid-fill boundaries is an explicitly
             // soft requirement for this phase, not a hard blocker — see
@@ -522,33 +517,35 @@ pub fn slice_mesh_with_progress(
                 let offset_2d = polygon2d::inward_offset(&loops_2d, config.wall_line_width);
                 polygon2d::from_2d(offset_2d, basis1, basis2, origin)
             } else {
-                let offset_3d: Vec<Vec<DVec3>> = innermost_wall_loops
-                    .iter()
-                    .flat_map(|loop_points| {
-                        let (centroid, normal) = loop_centroid_and_normal(loop_points);
-                        let (loop_basis1, loop_basis2) = plane_basis(normal);
-                        let loop_2d = polygon2d::to_2d(
-                            std::slice::from_ref(loop_points),
-                            loop_basis1,
-                            loop_basis2,
-                            centroid,
-                        );
-                        let offset_2d = polygon2d::inward_offset(&loop_2d, config.wall_line_width);
-                        polygon2d::from_2d(offset_2d, loop_basis1, loop_basis2, centroid)
-                    })
-                    .collect();
-                // The per-loop best-fit-plane lift above is only a local
-                // approximation: a small or noisy loop can yield a bad
-                // plane normal, sending its offset points well off the
-                // layer's actual isosurface (even below the build plate),
-                // and those points then poison every downstream consumer
-                // that uses `infill_boundary` as a same-branch height
-                // reference (`InfillRegion::from_layer`,
-                // `compute_solid_fill_boundaries`, infill crossing
-                // re-solves). Refine each offset point back onto the
-                // isosurface, seeded from the nearest innermost-wall point
-                // -- known-good geometry straight from contour extraction
-                // on the mesh (see `reconstruct_on_order_field_near`).
+                // Uses the same global build-direction basis
+                // (`basis1`/`basis2` from `plane_basis(BUILD_DIRECTION)`) as
+                // the Height path above, applied uniformly across all
+                // innermost wall loops rather than a separate per-loop
+                // best-fit local basis — even though each loop is only
+                // *locally* near-planar (concentric around a common
+                // apex/axis, see `manifold_fidget::contour`'s module docs),
+                // a per-loop local basis let small/noisy loops yield a bad
+                // plane normal and send offset points well off the actual
+                // isosurface. Any 2D-projection distortion the shared
+                // global basis introduces on steeply-curved loops is
+                // corrected immediately below by reprojecting each offset
+                // point back onto the isosurface.
+                let loops_2d = polygon2d::to_2d(&innermost_wall_loops, basis1, basis2, origin);
+                let offset_2d_flat = polygon2d::inward_offset(&loops_2d, config.wall_line_width);
+                let offset_3d = polygon2d::from_2d(offset_2d_flat, basis1, basis2, origin);
+                // The shared-basis 2D offset above is only an
+                // approximation for curved layers: projecting non-planar
+                // loops into one flat basis before offsetting can send
+                // offset points somewhat off the layer's actual isosurface
+                // (even below the build plate), and those points then
+                // poison every downstream consumer that uses
+                // `infill_boundary` as a same-branch height reference
+                // (`InfillRegion::from_layer`, `compute_solid_fill_boundaries`,
+                // infill crossing re-solves). Refine each offset point back
+                // onto the isosurface, seeded from the nearest
+                // innermost-wall point -- known-good geometry straight from
+                // contour extraction on the mesh (see
+                // `reconstruct_on_order_field_near`).
                 let offset_2d = polygon2d::to_2d(&offset_3d, basis1, basis2, origin);
                 order_field::reconstruct_on_order_field_near(
                     offset_2d,

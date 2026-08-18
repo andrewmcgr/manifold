@@ -91,6 +91,148 @@ fn retain_contained_paths(
     retained
 }
 
+/// Applies configurable Z-hop (lift-before-travel / lower-after-arrival) to
+/// every [`Path`] in `paths`, when `config.z_hop_enabled`. No-op (returns
+/// `paths` unchanged, not even reallocated) when disabled -- the default --
+/// so existing behavior/output is completely unaffected unless a caller
+/// opts in. See `.tmp/tasks/slicer-fix-backlog/scoping-phase-d.md` for the
+/// full design rationale.
+///
+/// For each maximal run of consecutive [`MoveKind::Travel`] segments within
+/// a `Path` (i.e. `segments[run_start..=run_end]` all `Travel`), inserts:
+/// - a lift point immediately after the run's departure point (same XY,
+///   `Z + config.z_hop_height`);
+/// - every original travel point strictly inside the run, raised by the
+///   same `Z + config.z_hop_height` (so lateral travel happens entirely at
+///   hop height, not just at the endpoints);
+/// - a drop point immediately before the run's arrival point (arrival's
+///   XY, still at `Z + config.z_hop_height`), followed by the unmodified
+///   arrival point itself (its original, real Z) to lower back down.
+///
+/// All inserted points/segments are tagged [`MoveKind::Travel`] with
+/// `extrusion_length: 0.0`, matching how `gcode::emit` already renders
+/// existing travel points -- `emit` requires no changes for this feature
+/// (see scoping doc §3). Works uniformly for both closed loops
+/// (`segments.len() == points.len()`, with an unused-by-`emit` closing
+/// segment -- see that doc comment) and open paths (e.g. infill
+/// zig-zags, `segments.len() == points.len() - 1`, no closing edge): any
+/// closing segment present is left untouched at the end, preserving
+/// whichever parallel-array shape the path already had.
+fn insert_z_hops(paths: Vec<Path>, config: &SlicerConfig) -> Vec<Path> {
+    if !config.z_hop_enabled {
+        return paths;
+    }
+    paths
+        .into_iter()
+        .map(|path| insert_z_hops_into_path(path, config.z_hop_height))
+        .collect()
+}
+
+/// Rebuilds a single `path`'s `points`/`segments` with Z-hop lift/drop
+/// geometry inserted around every maximal run of consecutive
+/// [`MoveKind::Travel`] segments. See [`insert_z_hops`]'s doc comment for
+/// the exact point sequence.
+fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
+    let Path {
+        points,
+        segments,
+        tool,
+    } = path;
+    let point_count = points.len();
+    // Fewer than 2 points means no edges at all -- nothing to hop around.
+    if point_count < 2 {
+        return Path {
+            points,
+            segments,
+            tool,
+        };
+    }
+
+    let mut new_points = Vec::with_capacity(point_count);
+    let mut new_segments = Vec::with_capacity(point_count);
+
+    // Walk edges `e` in `0..point_count - 1` (`segments[e]` describes
+    // `points[e] -> points[e + 1]`); the closing edge
+    // `segments[point_count - 1]` (`points[point_count - 1] -> points[0]`)
+    // is handled separately below, unmodified (see this function's caller's
+    // doc comment).
+    let mut e = 0usize;
+    while e < point_count - 1 {
+        new_points.push(points[e]);
+        if segments[e].kind == MoveKind::Travel {
+            let run_start = e;
+            let mut run_end = e;
+            while run_end + 1 < point_count - 1 && segments[run_end + 1].kind == MoveKind::Travel {
+                run_end += 1;
+            }
+
+            let departure = points[run_start];
+            let arrival = points[run_end + 1];
+
+            // Lift straight up from the departure point.
+            new_points.push(DVec3::new(
+                departure.x,
+                departure.y,
+                departure.z + hop_height,
+            ));
+            new_segments.push(Segment {
+                kind: MoveKind::Travel,
+                extrusion_length: 0.0,
+                ..segments[run_start]
+            });
+
+            // Lateral travel at hop height through every original travel
+            // point strictly inside the run.
+            for k in (run_start + 1)..=run_end {
+                let p = points[k];
+                new_points.push(DVec3::new(p.x, p.y, p.z + hop_height));
+                new_segments.push(Segment {
+                    kind: MoveKind::Travel,
+                    extrusion_length: 0.0,
+                    ..segments[k - 1]
+                });
+            }
+
+            // Final lateral move to the arrival XY, still at hop height.
+            new_points.push(DVec3::new(arrival.x, arrival.y, arrival.z + hop_height));
+            new_segments.push(Segment {
+                kind: MoveKind::Travel,
+                extrusion_length: 0.0,
+                ..segments[run_end]
+            });
+
+            // Drop straight down onto the real (unmodified) arrival point,
+            // pushed on the next loop iteration (or after the loop, if the
+            // arrival point is the path's last point).
+            new_segments.push(Segment {
+                kind: MoveKind::Travel,
+                extrusion_length: 0.0,
+                ..segments[run_end]
+            });
+
+            e = run_end + 1;
+        } else {
+            new_segments.push(segments[e]);
+            e += 1;
+        }
+    }
+    // Push the final point unchanged. Only append the closing segment if
+    // one exists: closed loops carry `segments.len() == point_count` (see
+    // `Path`'s doc comment), but open paths (e.g. infill zig-zags, see
+    // `infill::MonotonicInfill::generate`) carry only `point_count - 1`
+    // segments and have no closing edge to preserve.
+    new_points.push(points[point_count - 1]);
+    if segments.len() == point_count {
+        new_segments.push(segments[point_count - 1]);
+    }
+
+    Path {
+        points: new_points,
+        segments: new_segments,
+        tool,
+    }
+}
+
 /// Validates that every point of every planned path in `paths` lies within
 /// `build_volume`, returning [`Error::MoveOutOfBounds`] naming the first
 /// offending point found (in `paths` order) if not.
@@ -115,6 +257,25 @@ pub fn validate_within_bounds(paths: &[Path], build_volume: &BoundingVolume) -> 
         }
     }
     Ok(())
+}
+
+/// Chooses the Gcode feedrate (`Segment::speed`, mm/min) for a segment of
+/// the given `kind`, from `config`. [`MoveKind::Travel`] uses
+/// `config.travel_speed`; every extruding kind (`WallOuter`/`WallInner`/
+/// `Infill`/`Bridge`/`Overhang`) uses `config.print_speed` -- there is no
+/// finer-grained per-extruding-kind speed yet (e.g. a separate bridge
+/// speed), so all of them share one "print speed" until that becomes
+/// configurable.
+#[must_use]
+pub fn speed_for_kind(kind: MoveKind, config: &SlicerConfig) -> f64 {
+    match kind {
+        MoveKind::Travel => config.travel_speed,
+        MoveKind::WallOuter
+        | MoveKind::WallInner
+        | MoveKind::Infill
+        | MoveKind::Bridge
+        | MoveKind::Overhang => config.print_speed,
+    }
 }
 
 /// Classification of a single toolpath segment (the move from one point to
@@ -287,7 +448,7 @@ pub fn plan_with_progress(
                     .iter()
                     .map(|_| Segment {
                         kind,
-                        speed: 60.0,
+                        speed: speed_for_kind(kind, config),
                         extrusion_rate: 1.0,
                         support_fraction: 0.0,
                         order: layer.order,
@@ -325,7 +486,8 @@ pub fn plan_with_progress(
                 }
             }
 
-            let mut paths = retain_contained_paths(paths, layer.mesh_sdf.as_ref(), layer.order);
+            let paths = retain_contained_paths(paths, layer.mesh_sdf.as_ref(), layer.order);
+            let mut paths = insert_z_hops(paths, config);
 
             let extrusion_multiplier = tools
                 .iter()
@@ -578,6 +740,55 @@ mod tests {
     }
 
     #[test]
+    fn speed_for_kind_uses_travel_speed_for_travel_and_print_speed_for_extruding_kinds() {
+        let config = SlicerConfig {
+            travel_speed: 9000.0,
+            print_speed: 3000.0,
+            ..SlicerConfig::default()
+        };
+
+        assert_eq!(speed_for_kind(MoveKind::Travel, &config), 9000.0);
+        assert_eq!(speed_for_kind(MoveKind::WallOuter, &config), 3000.0);
+        assert_eq!(speed_for_kind(MoveKind::WallInner, &config), 3000.0);
+        assert_eq!(speed_for_kind(MoveKind::Infill, &config), 3000.0);
+        assert_eq!(speed_for_kind(MoveKind::Bridge, &config), 3000.0);
+        assert_eq!(speed_for_kind(MoveKind::Overhang, &config), 3000.0);
+    }
+
+    #[test]
+    fn plan_assigns_wall_segments_the_configured_print_speed_not_a_hardcoded_value() {
+        let objects = vec![Object::new(ObjectId(0), Mesh::default(), ToolId(0))];
+        let layers = vec![Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: vec![WallLoop {
+                wall_index: 0,
+                points: vec![
+                    DVec3::ZERO,
+                    DVec3::new(1.0, 0.0, 0.0),
+                    DVec3::new(0.0, 1.0, 0.0),
+                ],
+            }],
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
+        }];
+        let config = SlicerConfig {
+            print_speed: 1234.0,
+            ..SlicerConfig::default()
+        };
+
+        let paths = plan(&layers, &objects, &[], &config).unwrap();
+
+        assert!(paths
+            .iter()
+            .flat_map(|p| p.segments.iter())
+            .all(|segment| segment.speed == 1234.0));
+    }
+
+    #[test]
     fn plan_emits_no_paths_for_layer_with_no_loops() {
         let objects = vec![Object::new(ObjectId(0), Mesh::default(), ToolId(0))];
         let layers = vec![Layer {
@@ -792,6 +1003,196 @@ mod tests {
             .segments
             .iter()
             .all(|segment| segment.kind == MoveKind::WallInner));
+    }
+
+    #[test]
+    fn insert_z_hops_inserts_lift_and_drop_points_around_a_travel_run_when_enabled() {
+        // p0 -(WallOuter)-> p1 -(Travel)-> p2 -(WallOuter)-> p3, closed by an
+        // (unused-by-emit) closing edge p3 -> p0.
+        let p0 = DVec3::new(0.0, 0.0, 0.0);
+        let p1 = DVec3::new(1.0, 0.0, 0.0);
+        let p2 = DVec3::new(5.0, 0.0, 0.0);
+        let p3 = DVec3::new(6.0, 0.0, 0.0);
+        let wall_segment = Segment {
+            kind: MoveKind::WallOuter,
+            speed: 60.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 1.23,
+        };
+        let travel_segment = Segment {
+            kind: MoveKind::Travel,
+            speed: 150.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 0.0,
+        };
+        let path = Path {
+            points: vec![p0, p1, p2, p3],
+            segments: vec![wall_segment, travel_segment, wall_segment, wall_segment],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            z_hop_enabled: true,
+            z_hop_height: 0.4,
+            ..SlicerConfig::default()
+        };
+
+        let hopped = insert_z_hops(vec![path], &config);
+        assert_eq!(hopped.len(), 1);
+        let hopped = &hopped[0];
+
+        // Exact point sequence: departure (p1) unchanged, a lift point at
+        // p1's XY raised by the hop height, a drop point at p2's XY still
+        // raised by the hop height, then the real arrival point (p2) at its
+        // original Z -- per the scoping doc's §2 point sequence.
+        assert_eq!(
+            hopped.points,
+            vec![
+                p0,
+                p1,
+                DVec3::new(1.0, 0.0, 0.4),
+                DVec3::new(5.0, 0.0, 0.4),
+                p2,
+                p3,
+            ]
+        );
+        assert_eq!(
+            hopped.segments.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![
+                MoveKind::WallOuter,
+                MoveKind::Travel,
+                MoveKind::Travel,
+                MoveKind::Travel,
+                MoveKind::WallOuter,
+                MoveKind::WallOuter,
+            ]
+        );
+        // Every inserted hop segment carries zero extrusion, matching
+        // ordinary `Travel` segments.
+        for kind_and_segment in hopped.segments.iter().zip(hopped.points.iter()) {
+            let (segment, _) = kind_and_segment;
+            if segment.kind == MoveKind::Travel {
+                assert_eq!(segment.extrusion_length, 0.0);
+            }
+        }
+        // Parallel-array invariant preserved.
+        assert_eq!(hopped.points.len(), hopped.segments.len());
+    }
+
+    #[test]
+    fn insert_z_hops_handles_open_paths_with_no_closing_segment() {
+        // Open (infill-style) path: `segments.len() == points.len() - 1`,
+        // no closing edge -- see `infill::MonotonicInfill::generate`'s doc
+        // comment. Regression test for a panic where the tail-append step
+        // assumed a closing segment always existed.
+        let p0 = DVec3::new(0.0, 0.0, 0.0);
+        let p1 = DVec3::new(1.0, 0.0, 0.0);
+        let p2 = DVec3::new(5.0, 0.0, 0.0);
+        let infill_segment = Segment {
+            kind: MoveKind::Infill,
+            speed: 60.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 1.23,
+        };
+        let travel_segment = Segment {
+            kind: MoveKind::Travel,
+            speed: 150.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 0.0,
+        };
+        // Only 2 segments for 3 points: no closing edge.
+        let path = Path {
+            points: vec![p0, p1, p2],
+            segments: vec![travel_segment, infill_segment],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            z_hop_enabled: true,
+            z_hop_height: 0.4,
+            ..SlicerConfig::default()
+        };
+
+        let hopped = insert_z_hops(vec![path], &config);
+        assert_eq!(hopped.len(), 1);
+        let hopped = &hopped[0];
+
+        assert_eq!(
+            hopped.points,
+            vec![
+                p0,
+                DVec3::new(0.0, 0.0, 0.4),
+                DVec3::new(1.0, 0.0, 0.4),
+                p1,
+                p2
+            ]
+        );
+        assert_eq!(
+            hopped.segments.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![
+                MoveKind::Travel,
+                MoveKind::Travel,
+                MoveKind::Travel,
+                MoveKind::Infill,
+            ]
+        );
+        // Open path: no closing segment appended, so `segments.len() ==
+        // points.len() - 1` is preserved.
+        assert_eq!(hopped.segments.len(), hopped.points.len() - 1);
+    }
+
+    #[test]
+    fn insert_z_hops_is_a_no_op_when_disabled() {
+        let p0 = DVec3::new(0.0, 0.0, 0.0);
+        let p1 = DVec3::new(1.0, 0.0, 0.0);
+        let p2 = DVec3::new(5.0, 0.0, 0.0);
+        let wall_segment = Segment {
+            kind: MoveKind::WallOuter,
+            speed: 60.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 1.23,
+        };
+        let travel_segment = Segment {
+            kind: MoveKind::Travel,
+            speed: 150.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 0.0,
+        };
+        let path = Path {
+            points: vec![p0, p1, p2],
+            segments: vec![wall_segment, travel_segment, wall_segment],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            z_hop_enabled: false,
+            z_hop_height: 0.4,
+            ..SlicerConfig::default()
+        };
+
+        let result = insert_z_hops(vec![path.clone()], &config);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].points, path.points);
+        assert_eq!(
+            result[0]
+                .segments
+                .iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>(),
+            path.segments.iter().map(|s| s.kind).collect::<Vec<_>>()
+        );
     }
 
     #[test]
