@@ -51,6 +51,11 @@ crates/
 - **`manifold-core`**: the only crate allowed to contain slicing domain
   logic. Structured as a pipeline:
   `Mesh -> slicing::slice_mesh -> Layer[] -> toolpath::plan -> Path[] -> gcode::emit -> String`.
+  `toolpath::plan` itself retains a wall-loop-only RDP-style simplification
+  pass (`simplify_paths`/`simplify_path`) between contained-path retention
+  and Z-hop insertion, reducing point count on curved/dense contours
+  (e.g. from `Eikonal` order fields) before Z-hops and extrusion lengths
+  are computed.
   `slice_mesh` builds a `manifold_fidget::mesh_sdf::MeshSdf` from the mesh
   and walks a `manifold_fidget::order::OrderField`/
   `manifold_fidget::contour::extract_contours_at_order` isosurface-walk to

@@ -794,6 +794,35 @@ both front-ends.
   verifying slicing fixes against the real test mesh, not just unit
   tests/reasoning).
 
+## Phase 21 — Toolpath simplification pass (RDP decimation) (needs 17) — ✅ done
+
+Adds an RDP/Douglas-Peucker-style perpendicular-distance simplification
+pass to `manifold-core::toolpath` that reduces the point count of planned
+wall-loop toolpaths, fixing pathological point density from curved-order-
+field contour extraction (e.g. `Eikonal`, per Phase 17) that can overflow
+the GUI's wgpu vertex buffer on large/curved objects and bloat Gcode size.
+
+- New `simplify_paths`/`simplify_path` functions in
+  `crates/manifold-core/src/toolpath.rs`, applied only to
+  `MoveKind::WallOuter`/`MoveKind::WallInner` paths (infill paths are
+  deliberately spaced for density guarantees and are left untouched).
+  Closed-loop-aware: a loop is split into two open chains at its two most
+  mutually distant points, each chain simplified independently, then
+  rejoined, so classic (open-polyline) Douglas-Peucker applies cleanly.
+- Wired into `plan_with_progress` between `retain_contained_paths` and
+  `insert_z_hops`, so Z-hop logic and the downstream extrusion-length pass
+  both operate on final, post-simplification geometry.
+- New `SlicerConfig` fields `path_simplify_enabled` (default `true`) and
+  `path_simplify_tolerance` (perpendicular-distance tolerance in mm,
+  defaulted from `nozzle_diameter` rather than a fixed constant), following
+  the existing `z_hop_enabled`/`z_hop_height` field pattern.
+- GUI: settings panel gains a checkbox + conditional tolerance slider,
+  mirroring the Z-hop controls.
+
+**Explicitly out of scope**: simplifying infill paths, and the GUI's wgpu
+vertex-buffer size limit itself (a separate follow-up if point-count
+reduction here doesn't fully resolve it in practice).
+
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
 - **Multi-object collision avoidance**: toolhead-vs-already-printed-object

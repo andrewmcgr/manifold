@@ -76,6 +76,8 @@ mod tests {
                 print_speed: 3000.0,
                 z_hop_enabled: false,
                 z_hop_height: 0.4,
+                path_simplify_enabled: true,
+                path_simplify_tolerance: 0.02,
             },
         }
     }

@@ -700,6 +700,16 @@ impl ManifoldApp {
                     .text("Z-hop height (mm)"),
             );
         }
+        ui.checkbox(
+            &mut self.config.path_simplify_enabled,
+            "Simplify wall toolpaths",
+        );
+        if self.config.path_simplify_enabled {
+            ui.add(
+                egui::Slider::new(&mut self.config.path_simplify_tolerance, 0.0..=0.5)
+                    .text("Simplification tolerance (mm)"),
+            );
+        }
 
         ui.separator();
         ui.heading("Print Gcode");

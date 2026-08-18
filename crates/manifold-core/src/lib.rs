@@ -165,6 +165,35 @@ pub struct SlicerConfig {
     /// saved profile from before this field existed still deserializes.
     #[serde(default = "default_z_hop_height")]
     pub z_hop_height: f64,
+    /// Whether the toolpath-simplification pass (`toolpath::simplify_paths`)
+    /// is enabled. When `true` (the default), wall-loop paths
+    /// (`toolpath::MoveKind::WallOuter`/`WallInner`) are run through an
+    /// RDP/Douglas-Peucker-style perpendicular-distance decimation after
+    /// planning, reducing point count from dense curved-order-field contour
+    /// extraction (e.g. `OrderFieldKind::Eikonal`) without materially
+    /// changing printed geometry. Infill paths are never touched by this
+    /// pass regardless of this setting. `#[serde(default = "...")]` so a
+    /// saved profile from before this field existed still deserializes to
+    /// `true`.
+    #[serde(default = "default_path_simplify_enabled")]
+    pub path_simplify_enabled: bool,
+    /// Perpendicular-distance tolerance (mm) for the toolpath-simplification
+    /// pass: a point is dropped only if the resulting simplified polyline
+    /// still passes within this distance of it. Ignored while
+    /// `path_simplify_enabled` is `false`. Defaults to `nozzle_diameter /
+    /// 20.0` (e.g. `0.02` mm for the default `0.4` mm nozzle) -- a
+    /// fraction small enough to be well under typical dimensional-accuracy
+    /// requirements (a twentieth of the nozzle diameter) while still
+    /// collapsing the near-collinear "staircase" point runs that curved
+    /// order fields produce. Because this default depends on
+    /// `nozzle_diameter`'s value rather than being a fixed constant, it
+    /// cannot be expressed as a `#[serde(default = "fn")]` static default
+    /// (that attribute only sees this field in isolation); the static
+    /// fallback below assumes the default `nozzle_diameter` of `0.4`, while
+    /// [`SlicerConfig::default`] derives the value directly from whatever
+    /// `nozzle_diameter` it constructs.
+    #[serde(default = "default_path_simplify_tolerance")]
+    pub path_simplify_tolerance: f64,
 }
 
 /// Default value for [`SlicerConfig::eikonal_slope_profile`]: an empty set
@@ -203,6 +232,22 @@ fn default_z_hop_height() -> f64 {
     0.4
 }
 
+/// Static serde-deserialize fallback for
+/// [`SlicerConfig::path_simplify_enabled`]: `true`.
+fn default_path_simplify_enabled() -> bool {
+    true
+}
+
+/// Static serde-deserialize fallback for
+/// [`SlicerConfig::path_simplify_tolerance`]: `0.02` mm, i.e.
+/// `nozzle_diameter / 20.0` evaluated at the default `nozzle_diameter` of
+/// `0.4` mm. Only used when deserializing a saved profile that predates
+/// this field; [`SlicerConfig::default`] instead derives the value from
+/// whatever `nozzle_diameter` it actually constructs.
+fn default_path_simplify_tolerance() -> f64 {
+    0.4 / 20.0
+}
+
 impl Default for SlicerConfig {
     fn default() -> Self {
         let nozzle_diameter = 0.4;
@@ -232,6 +277,8 @@ impl Default for SlicerConfig {
             print_speed: default_print_speed(),
             z_hop_enabled: false,
             z_hop_height: default_z_hop_height(),
+            path_simplify_enabled: true,
+            path_simplify_tolerance: nozzle_diameter / 20.0,
         }
     }
 }

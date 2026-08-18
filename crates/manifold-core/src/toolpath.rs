@@ -233,6 +233,238 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
     }
 }
 
+/// Applies Ramer-Douglas-Peucker (RDP) perpendicular-distance
+/// simplification to wall-loop paths (`MoveKind::WallOuter` /
+/// `MoveKind::WallInner`), reducing point count from pathological point
+/// density (e.g. curved-order-field contour extraction such as Eikonal,
+/// which can produce long "staircase" runs of near-collinear points) while
+/// staying within `config.path_simplify_tolerance` (mm) of the original
+/// geometry. No-op (returns `paths` unchanged, not even reallocated) when
+/// `config.path_simplify_enabled` is `false` -- mirrors [`insert_z_hops`]'s
+/// handling of `z_hop_enabled: false`.
+///
+/// Only wall-loop paths are simplified: infill paths are deliberately
+/// spaced for density guarantees (see `infill` generators), so simplifying
+/// them is explicitly out of scope for v1 -- future work. Every other path
+/// (infill, travel-only, etc.) is passed through completely untouched. A
+/// path's kind is read from its first segment, since `plan_with_progress`
+/// currently tags every segment of a given wall loop with the same
+/// `MoveKind` uniformly.
+///
+/// Does not recompute `Segment::extrusion_length` itself -- that is left
+/// to the existing downstream extrusion-length pass in
+/// `plan_with_progress`, which runs after this pass on the (possibly
+/// simplified) segment geometry.
+fn simplify_paths(paths: Vec<Path>, config: &SlicerConfig) -> Vec<Path> {
+    if !config.path_simplify_enabled {
+        return paths;
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let is_wall_loop = path.segments.first().is_some_and(|segment| {
+                matches!(segment.kind, MoveKind::WallOuter | MoveKind::WallInner)
+            });
+            if is_wall_loop {
+                simplify_path(path, config.path_simplify_tolerance)
+            } else {
+                path
+            }
+        })
+        .collect()
+}
+
+/// Simplifies a single wall-loop `path` via RDP, dispatching to the
+/// closed-loop-aware or open-path variant based on the parallel-array
+/// invariant (see [`Path`]'s doc comment). Degenerate inputs (fewer than 3
+/// points, or a non-positive `tolerance`) are returned unchanged rather
+/// than risking a panic or a meaningless simplification.
+fn simplify_path(path: Path, tolerance: f64) -> Path {
+    let Path {
+        points,
+        segments,
+        tool,
+    } = path;
+    let point_count = points.len();
+    if point_count < 3 || tolerance <= 0.0 {
+        return Path {
+            points,
+            segments,
+            tool,
+        };
+    }
+    if segments.len() == point_count {
+        simplify_closed_path(points, segments, tolerance, tool)
+    } else {
+        simplify_open_path(points, segments, tolerance, tool)
+    }
+}
+
+/// RDP-simplifies an open path (`segments.len() == points.len() - 1`, no
+/// closing edge): classic Douglas-Peucker over the single chain
+/// `0..points.len()`, always keeping the first and last point.
+fn simplify_open_path(
+    points: Vec<DVec3>,
+    segments: Vec<Segment>,
+    tolerance: f64,
+    tool: ToolId,
+) -> Path {
+    let point_count = points.len();
+    let chain: Vec<usize> = (0..point_count).collect();
+    let mut keep = vec![false; point_count];
+    keep[0] = true;
+    keep[point_count - 1] = true;
+    rdp_mark(&points, &chain, tolerance, &mut keep);
+
+    let kept_indices: Vec<usize> = chain.into_iter().filter(|&i| keep[i]).collect();
+    let new_points = kept_indices.iter().map(|&i| points[i]).collect();
+    // Every kept point except the last keeps its own original outgoing
+    // segment verbatim (no interpolation/averaging across dropped points).
+    let new_segments = kept_indices[..kept_indices.len() - 1]
+        .iter()
+        .map(|&i| segments[i])
+        .collect();
+
+    Path {
+        points: new_points,
+        segments: new_segments,
+        tool,
+    }
+}
+
+/// RDP-simplifies a closed loop (`segments.len() == points.len()`):
+/// classic Douglas-Peucker is defined on an open polyline, so the loop is
+/// split into two open chains at its two most mutually distant points (a
+/// standard technique for closed-loop RDP), each chain is simplified
+/// independently, and the surviving points are rejoined into a single
+/// closed loop, preserving the parallel-array invariant.
+fn simplify_closed_path(
+    points: Vec<DVec3>,
+    segments: Vec<Segment>,
+    tolerance: f64,
+    tool: ToolId,
+) -> Path {
+    let point_count = points.len();
+    let (a, b) = farthest_pair(&points);
+    if a == b {
+        // All points coincide (zero-length/degenerate loop) -- nothing
+        // meaningful to simplify.
+        return Path {
+            points,
+            segments,
+            tool,
+        };
+    }
+
+    let chain_ab = forward_chain(a, b, point_count);
+    let chain_ba = forward_chain(b, a, point_count);
+    let mut keep = vec![false; point_count];
+    keep[a] = true;
+    keep[b] = true;
+    rdp_mark(&points, &chain_ab, tolerance, &mut keep);
+    rdp_mark(&points, &chain_ba, tolerance, &mut keep);
+
+    // Rebuild in the loop's original index/orientation order (rather than
+    // starting at `a`, which the two chains above are anchored to) so a
+    // loop that survives simplification unchanged is *actually* returned
+    // unchanged -- same starting point and winding -- not just
+    // point-for-point equal under rotation.
+    let final_indices: Vec<usize> = (0..point_count).filter(|&i| keep[i]).collect();
+
+    // Each surviving point keeps its own original outgoing segment
+    // verbatim -- e.g. `[p0, p1, p2, p3]` simplifying to `[p0, p3]` keeps
+    // `segments[0]` (p0's original outgoing edge) for the new `p0`, not
+    // some blend of `segments[0..3]`.
+    let new_points = final_indices.iter().map(|&i| points[i]).collect();
+    let new_segments = final_indices.iter().map(|&i| segments[i]).collect();
+
+    Path {
+        points: new_points,
+        segments: new_segments,
+        tool,
+    }
+}
+
+/// Walks the cyclic index range `start..=end` (inclusive of both ends,
+/// wrapping modulo `len`), used to carve a closed loop's point indices
+/// into one of the two open chains RDP needs.
+fn forward_chain(start: usize, end: usize, len: usize) -> Vec<usize> {
+    let mut chain = Vec::new();
+    let mut i = start;
+    loop {
+        chain.push(i);
+        if i == end {
+            break;
+        }
+        i = (i + 1) % len;
+    }
+    chain
+}
+
+/// Returns the pair of point indices with the greatest Euclidean distance
+/// apart, used to pick the closed-loop split points for RDP. O(n^2); fine
+/// for the point counts wall loops carry in practice, but a candidate for
+/// optimization if extremely dense input loops ever make this pass show up
+/// in profiling.
+fn farthest_pair(points: &[DVec3]) -> (usize, usize) {
+    let len = points.len();
+    let mut best = (0usize, (len - 1).min(1));
+    let mut best_dist_sq = -1.0f64;
+    for i in 0..len {
+        for j in (i + 1)..len {
+            let dist_sq = points[i].distance_squared(points[j]);
+            if dist_sq > best_dist_sq {
+                best_dist_sq = dist_sq;
+                best = (i, j);
+            }
+        }
+    }
+    best
+}
+
+/// Recursively marks (in `keep`, indexed by global point index) which
+/// points along `chain` survive RDP simplification against `tolerance`
+/// (mm): finds the point in `chain`'s interior farthest (perpendicular
+/// distance) from the line through its endpoints; if that distance exceeds
+/// `tolerance`, keeps that point and recurses on both halves, otherwise
+/// drops the entire interior. `chain`'s first and last points are assumed
+/// already marked kept by the caller.
+fn rdp_mark(points: &[DVec3], chain: &[usize], tolerance: f64, keep: &mut [bool]) {
+    if chain.len() < 3 {
+        return;
+    }
+    let first = chain[0];
+    let last = chain[chain.len() - 1];
+    let mut max_dist = 0.0f64;
+    let mut max_pos = 0usize;
+    for (pos, &idx) in chain.iter().enumerate().take(chain.len() - 1).skip(1) {
+        let dist = perpendicular_distance(points[idx], points[first], points[last]);
+        if dist > max_dist {
+            max_dist = dist;
+            max_pos = pos;
+        }
+    }
+    if max_dist > tolerance {
+        keep[chain[max_pos]] = true;
+        rdp_mark(points, &chain[..=max_pos], tolerance, keep);
+        rdp_mark(points, &chain[max_pos..], tolerance, keep);
+    }
+}
+
+/// Perpendicular distance from `p` to the infinite line through `a` and
+/// `b` (classic Douglas-Peucker uses the line, not the segment). Falls
+/// back to plain point-to-point distance when `a`/`b` coincide, rather
+/// than dividing by (near-)zero.
+fn perpendicular_distance(p: DVec3, a: DVec3, b: DVec3) -> f64 {
+    let ab = b - a;
+    let ab_len_sq = ab.length_squared();
+    if ab_len_sq < f64::EPSILON {
+        return p.distance(a);
+    }
+    let ap = p - a;
+    ap.cross(ab).length() / ab_len_sq.sqrt()
+}
+
 /// Validates that every point of every planned path in `paths` lies within
 /// `build_volume`, returning [`Error::MoveOutOfBounds`] naming the first
 /// offending point found (in `paths` order) if not.
@@ -487,6 +719,7 @@ pub fn plan_with_progress(
             }
 
             let paths = retain_contained_paths(paths, layer.mesh_sdf.as_ref(), layer.order);
+            let paths = simplify_paths(paths, config);
             let mut paths = insert_z_hops(paths, config);
 
             let extrusion_multiplier = tools
@@ -1211,5 +1444,261 @@ mod tests {
 
         let err = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap_err();
         assert!(matches!(err, crate::Error::InvalidMesh(_)));
+    }
+
+    /// Shortest distance from `p` to the segment `a -> b` (clamped, unlike
+    /// [`perpendicular_distance`] which measures against the infinite
+    /// line) -- used to bound how far an RDP-dropped point can end up from
+    /// the simplified polyline that replaces it.
+    fn point_to_segment_distance(p: DVec3, a: DVec3, b: DVec3) -> f64 {
+        let ab = b - a;
+        let len_sq = ab.length_squared();
+        if len_sq < f64::EPSILON {
+            return p.distance(a);
+        }
+        let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+        p.distance(a + ab * t)
+    }
+
+    /// Builds a closed 'staircase' loop: one long near-collinear run of
+    /// `staircase_points` points along y = 0 (each nudged by a tiny
+    /// sub-tolerance jitter, mimicking the near-collinear point runs
+    /// curved-order-field contour extraction produces), closed off by two
+    /// short legs up to (span, span, 0) and back to (0, span, 0) so the
+    /// loop has a real 2D extent (and thus a well-defined farthest pair for
+    /// closed-loop RDP splitting) rather than degenerating to a line.
+    fn staircase_loop(staircase_points: usize, span: f64, jitter: f64) -> Path {
+        let mut points = Vec::with_capacity(staircase_points + 2);
+        for i in 0..staircase_points {
+            let t = i as f64 / (staircase_points - 1) as f64;
+            let x = t * span;
+            let y = if i % 2 == 0 { 0.0 } else { jitter };
+            points.push(DVec3::new(x, y, 0.0));
+        }
+        points.push(DVec3::new(span, span, 0.0));
+        points.push(DVec3::new(0.0, span, 0.0));
+        path_with_points(points)
+    }
+
+    #[test]
+    fn simplify_paths_reduces_a_staircase_loop_while_staying_within_tolerance() {
+        let tolerance = 0.05;
+        let staircase_points = 100;
+        let path = staircase_loop(staircase_points, 10.0, 0.01);
+        let original_points = path.points.clone();
+        let original_point_count = original_points.len();
+        assert_eq!(path.segments.len(), original_point_count);
+
+        let config = SlicerConfig {
+            path_simplify_enabled: true,
+            path_simplify_tolerance: tolerance,
+            ..SlicerConfig::default()
+        };
+        let simplified = simplify_paths(vec![path], &config);
+        assert_eq!(simplified.len(), 1);
+        let simplified = &simplified[0];
+
+        // Meaningfully fewer points: the 100-point near-collinear run
+        // should collapse to a small handful.
+        assert!(
+            simplified.points.len() < original_point_count / 2,
+            "expected meaningful reduction, got {} of {} points",
+            simplified.points.len(),
+            original_point_count
+        );
+
+        // Parallel-array invariant preserved (still a closed loop).
+        assert_eq!(simplified.segments.len(), simplified.points.len());
+
+        // Every original point (dropped or kept) lies within `tolerance`
+        // of the simplified polyline.
+        let simplified_point_count = simplified.points.len();
+        for &original_point in &original_points {
+            let min_dist = (0..simplified_point_count)
+                .map(|i| {
+                    let a = simplified.points[i];
+                    let b = simplified.points[(i + 1) % simplified_point_count];
+                    point_to_segment_distance(original_point, a, b)
+                })
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                min_dist <= tolerance + 1e-9,
+                "point {original_point:?} is {min_dist} from the simplified polyline, exceeding tolerance {tolerance}"
+            );
+        }
+    }
+
+    #[test]
+    fn simplify_paths_is_a_no_op_when_disabled() {
+        let path = staircase_loop(50, 10.0, 0.01);
+        let original = path.clone();
+
+        let config = SlicerConfig {
+            path_simplify_enabled: false,
+            path_simplify_tolerance: 0.05,
+            ..SlicerConfig::default()
+        };
+        let result = simplify_paths(vec![path], &config);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].points, original.points);
+        assert_eq!(
+            result[0]
+                .segments
+                .iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>(),
+            original.segments.iter().map(|s| s.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn simplify_paths_leaves_an_already_minimal_loop_unchanged_with_near_zero_tolerance() {
+        // Minimal 4-point square loop -- nothing to simplify even in
+        // principle (every chain between the two farthest-apart corners is
+        // just a single edge, too short to have an interior candidate).
+        let points = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+        ];
+        let path = path_with_points(points.clone());
+
+        let config = SlicerConfig {
+            path_simplify_enabled: true,
+            path_simplify_tolerance: 1e-9,
+            ..SlicerConfig::default()
+        };
+        let result = simplify_paths(vec![path], &config);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].points, points);
+        assert_eq!(result[0].segments.len(), points.len());
+    }
+
+    #[test]
+    fn simplify_paths_leaves_infill_paths_completely_untouched() {
+        // Same near-collinear staircase shape as the wall-loop test, but
+        // tagged `MoveKind::Infill` -- infill simplification is explicitly
+        // out of scope for v1, so this must pass through unchanged.
+        let mut path = staircase_loop(50, 10.0, 0.01);
+        for segment in &mut path.segments {
+            segment.kind = MoveKind::Infill;
+        }
+        let original = path.clone();
+
+        let config = SlicerConfig {
+            path_simplify_enabled: true,
+            path_simplify_tolerance: 0.05,
+            ..SlicerConfig::default()
+        };
+        let result = simplify_paths(vec![path], &config);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].points, original.points);
+        assert_eq!(
+            result[0]
+                .segments
+                .iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>(),
+            original.segments.iter().map(|s| s.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn simplify_path_preserves_the_parallel_array_invariant_for_closed_and_open_paths() {
+        let closed = staircase_loop(40, 10.0, 0.01);
+        assert_eq!(closed.segments.len(), closed.points.len());
+        let simplified_closed = simplify_path(closed, 0.05);
+        assert_eq!(
+            simplified_closed.segments.len(),
+            simplified_closed.points.len()
+        );
+
+        // Open (non-closed-loop) wall-style path: segments.len() ==
+        // points.len() - 1, no closing edge -- exercises
+        // `simplify_open_path` directly via `simplify_path`.
+        let mut open = staircase_loop(40, 10.0, 0.01);
+        open.segments.pop();
+        assert_eq!(open.segments.len(), open.points.len() - 1);
+        let simplified_open = simplify_path(open, 0.05);
+        assert_eq!(
+            simplified_open.segments.len(),
+            simplified_open.points.len() - 1
+        );
+    }
+
+    #[test]
+    fn plan_extrusion_length_reflects_simplified_segment_distances_not_pre_simplify_distances() {
+        // A wall loop with a long near-collinear staircase run -- with
+        // simplification enabled and a tolerance big enough to collapse
+        // it, the surviving segments span a different (larger) distance
+        // than any individual pre-simplify segment did, so
+        // `Segment::extrusion_length` must reflect the *post-simplify*
+        // geometry, not the original per-point-pair distances.
+        let objects = vec![Object::new(ObjectId(0), Mesh::default(), ToolId(0))];
+        let staircase_points = 60;
+        let span = 10.0;
+        let jitter = 0.01;
+        let mut loop_points = Vec::with_capacity(staircase_points + 2);
+        for i in 0..staircase_points {
+            let t = i as f64 / (staircase_points - 1) as f64;
+            let x = t * span;
+            let y = if i % 2 == 0 { 0.0 } else { jitter };
+            loop_points.push(DVec3::new(x, y, 0.0));
+        }
+        loop_points.push(DVec3::new(span, span, 0.0));
+        loop_points.push(DVec3::new(0.0, span, 0.0));
+
+        let layers = vec![Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: vec![WallLoop {
+                wall_index: 0,
+                points: loop_points,
+            }],
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
+        }];
+
+        let config = SlicerConfig {
+            path_simplify_enabled: true,
+            path_simplify_tolerance: 0.05,
+            ..SlicerConfig::default()
+        };
+
+        let paths = plan(&layers, &objects, &[], &config).unwrap();
+        let wall_paths: Vec<_> = paths
+            .iter()
+            .filter(|p| {
+                p.segments
+                    .iter()
+                    .all(|segment| segment.kind == MoveKind::WallOuter)
+            })
+            .collect();
+        assert_eq!(wall_paths.len(), 1);
+        let wall_path = wall_paths[0];
+
+        // Simplification actually happened (fewer points than the
+        // original 62-point loop) -- otherwise this test would not be
+        // exercising post-simplify extrusion lengths at all.
+        assert!(wall_path.points.len() < staircase_points + 2);
+
+        let filament_area = extrusion::filament_cross_section_area(config.filament_diameter);
+        let line_width = extrusion::line_width_for_kind(MoveKind::WallOuter, &config);
+        let bead_area = extrusion::bead_cross_section_area(line_width, config.layer_height);
+        let point_count = wall_path.points.len();
+        for (i, segment) in wall_path.segments.iter().enumerate() {
+            let distance = wall_path.points[i].distance(wall_path.points[(i + 1) % point_count]);
+            let expected = extrusion::segment_extrusion_length(distance, bead_area, filament_area)
+                * segment.extrusion_rate;
+            assert!(
+                (segment.extrusion_length - expected).abs() < 1e-9,
+                "segment {i}: extrusion_length {} did not match post-simplify distance-derived value {expected}",
+                segment.extrusion_length
+            );
+        }
     }
 }
