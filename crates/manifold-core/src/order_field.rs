@@ -16,6 +16,8 @@ use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{ConicalOrderField, HeightOrderField, OrderField};
 use manifold_fidget::ScalarField;
 
+use manifold_fidget::height_along::ConstantAxisHeight;
+
 use crate::{mesh::Mesh, slicing::BUILD_DIRECTION, SlicerConfig};
 
 /// Selects which [`OrderField`] `slice_mesh`/`slice_mesh_with_progress` use.
@@ -132,6 +134,15 @@ pub fn order_field_for(
 /// treating every grid node as solid, so the region seeding and march are
 /// unconstrained (equivalent to plain Euclidean distance from the contact
 /// band) rather than leaving the whole grid unreachable.
+///
+/// After the FMM march, `config.eikonal_slope_profile` is converted to a
+/// `manifold_fidget::slope_profile::SlopeProfile` and applied via a
+/// relaxation pass (see
+/// `EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit`),
+/// measuring height with a `ConstantAxisHeight` along the same
+/// `BUILD_DIRECTION`/`min`-anchored convention `is_seed_region` already
+/// uses. An empty/default slope profile is documented as unconstrained, so
+/// this is a no-op when no profile is configured.
 fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
     let Some((min, max)) = mesh.bounding_box() else {
         return EikonalOrderField::new(DVec3::ZERO, DVec3::ONE, &[], 1.0);
@@ -146,6 +157,8 @@ fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
     // generous enough to include a slightly-faceted/non-flat mesh base
     // without pulling in nodes from well above the true contact surface.
     let is_seed_region = |p: DVec3| p.z <= min.z + layer_height;
+    let slope_profile = config.eikonal_slope_profile();
+    let height_along = ConstantAxisHeight::new(BUILD_DIRECTION, min);
 
     let faces: Vec<[usize; 3]> = mesh
         .indices
@@ -158,23 +171,27 @@ fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
         // every node as void, which would leave the whole grid
         // unreachable.
         let is_solid = |_p: DVec3| true;
-        return EikonalOrderField::new_with_occupancy_and_seed_region(
+        return EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
             min,
             max,
             cell_size,
             &is_solid,
             &is_seed_region,
+            Some(&slope_profile),
+            Some(&height_along),
         );
     }
     let sdf = MeshSdf::new(mesh.vertices.clone(), faces);
     let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
 
-    EikonalOrderField::new_with_occupancy_and_seed_region(
+    EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
         min,
         max,
         cell_size,
         &is_solid,
         &is_seed_region,
+        Some(&slope_profile),
+        Some(&height_along),
     )
 }
 

@@ -44,6 +44,36 @@ struct Cli {
     /// Infill pattern generated inside each layer.
     #[arg(long, value_enum, default_value_t = InfillPatternArg::Monotonic)]
     infill_pattern: InfillPatternArg,
+
+    /// Slope-limit profile for the `eikonal` order field, as comma-separated
+    /// `height_mm:max_degrees` breakpoints (height measured above the
+    /// mesh's build-plate contact surface), e.g. `0:45,4:2` for a tight
+    /// 45deg limit near the build plate loosening to 2deg above 4mm.
+    /// Ignored unless `--order-field eikonal`. Defaults to no limit
+    /// (unconstrained) if omitted.
+    #[arg(long)]
+    eikonal_slope_profile: Option<String>,
+}
+
+/// Parses a `--eikonal-slope-profile` argument of comma-separated
+/// `height:degrees` pairs into breakpoints for `SlicerConfig::eikonal_slope_profile`.
+fn parse_slope_profile(s: &str) -> Result<Vec<(f64, f64)>, String> {
+    s.split(',')
+        .map(|pair| {
+            let (h, d) = pair
+                .split_once(':')
+                .ok_or_else(|| format!("expected `height:degrees`, got `{pair}`"))?;
+            let height: f64 = h
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid height `{h}` in `{pair}`"))?;
+            let degrees: f64 = d
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid degrees `{d}` in `{pair}`"))?;
+            Ok((height, degrees))
+        })
+        .collect()
 }
 
 /// CLI-mirror of `manifold_core::order_field::OrderFieldKind` so `clap` can
@@ -101,11 +131,17 @@ fn main() -> Result<()> {
         objects.extend(load_objects(&path, tool, &mut next_object_id)?);
     }
 
+    let eikonal_slope_profile = match &cli.eikonal_slope_profile {
+        Some(s) => parse_slope_profile(s).map_err(|e| anyhow::anyhow!(e))?,
+        None => Vec::new(),
+    };
+
     let config = SlicerConfig {
         layer_height: cli.layer_height,
         nozzle_diameter: cli.nozzle_diameter,
         order_field: cli.order_field.into(),
         infill_pattern: cli.infill_pattern.into(),
+        eikonal_slope_profile,
         ..SlicerConfig::default()
     };
 

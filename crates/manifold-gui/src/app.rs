@@ -647,6 +647,41 @@ impl ManifoldApp {
                 egui::Slider::new(&mut self.config.order_field_slope, 0.0..=2.0).text("Cone slope"),
             );
         }
+        if self.config.order_field == OrderFieldKind::Eikonal {
+            ui.label("Slope-limit profile (height above build plate -> max angle)");
+            let mut remove_index: Option<usize> = None;
+            for (i, (height, degrees)) in self.config.eikonal_slope_profile.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(height)
+                            .prefix("h: ")
+                            .suffix(" mm")
+                            .range(0.0..=1000.0),
+                    );
+                    ui.add(
+                        egui::DragValue::new(degrees)
+                            .prefix("max: ")
+                            .suffix(" deg")
+                            .range(0.0..=90.0),
+                    );
+                    if ui.button("Remove").clicked() {
+                        remove_index = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove_index {
+                self.config.eikonal_slope_profile.remove(i);
+            }
+            if ui.button("Add breakpoint").clicked() {
+                let next_height = self
+                    .config
+                    .eikonal_slope_profile
+                    .last()
+                    .map(|(h, _)| h + 1.0)
+                    .unwrap_or(0.0);
+                self.config.eikonal_slope_profile.push((next_height, 45.0));
+            }
+        }
 
         ui.separator();
         ui.heading("Print Gcode");

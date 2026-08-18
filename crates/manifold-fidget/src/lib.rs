@@ -15,10 +15,12 @@ use glam::DVec3;
 pub mod contour;
 pub mod eikonal;
 pub mod geometry;
+pub mod height_along;
 pub mod marching_cubes;
 pub mod mesh_sdf;
 pub mod order;
 pub mod slice;
+pub mod slope_profile;
 
 /// Builds a `fidget::context::Tree` for a sphere of the given `radius`
 /// centered at the origin: `f(p) = |p| - radius`.

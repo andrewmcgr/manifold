@@ -749,6 +749,51 @@ needed to `toolpath::plan` or `generator_for` beyond one new match arm.
   reconstruction path (`order_field::reconstruct_on_order_field_near`,
   reference-seeded from the region's own boundary loops).
 
+## Phase 20 — Slope-limited Eikonal order field (needs 17, double-cone/grade-limiting profile) — ✅ done
+
+Adds an optional grade-limiting (Lipschitz-extension-style) relaxation
+pass to `EikonalOrderField` so it respects a piecewise
+max-overhang-angle profile, wired end-to-end through `SlicerConfig` and
+both front-ends.
+
+- `crates/manifold-fidget/src/slope_profile.rs` — `SlopeProfile`: sorted
+  `(height, max_angle_deg)` breakpoints with `max_slope_at` (piecewise
+  interpolation, clamps degenerate/out-of-range inputs rather than
+  panicking, empty profile = unconstrained).
+- `crates/manifold-fidget/src/height_along.rs` — `HeightAlong` trait +
+  `ConstantAxisHeight` impl, reusing the existing axis/seed-reference
+  convention (`BUILD_DIRECTION`/mesh-min anchored).
+- `EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit`
+  (`crates/manifold-fidget/src/eikonal.rs`) runs an additional relaxation
+  pass after the FMM march, enforcing
+  `|T(p) - T(q)| <= max_slope_at(height_along(p)) * h` between
+  grid-adjacent nodes. Deliberately **excludes** the pure-vertical (Z)
+  neighbor from the cap -- a horizontal slope limit is vacuous for a pair
+  with zero horizontal displacement, and capping it anyway was a real bug
+  (throttled straight-up progression under tight profiles, collapsing a
+  tall column's true height into a tiny reachable order range; see
+  regression test
+  `pure_vertical_progression_is_not_throttled_by_a_tight_slope_profile`).
+  Passing `None`/`None` for profile/height is a purely additive,
+  behavior-preserving no-op, so `new_with_occupancy_and_seed_region`
+  (used elsewhere) is unaffected.
+- `SlicerConfig::eikonal_slope_profile: Vec<(f64, f64)>` (serde-friendly,
+  `#[serde(default)]` so pre-feature saved JSON profiles still
+  deserialize as unconstrained) + `SlicerConfig::eikonal_slope_profile()`
+  converts it to a real `SlopeProfile`. `order_field::eikonal_field_for`
+  wires it into Eikonal field construction alongside a
+  `ConstantAxisHeight` using the same `BUILD_DIRECTION`/`min` convention
+  as `is_seed_region`.
+- CLI: `--eikonal-slope-profile height:degrees[,height:degrees...]`
+  (ignored unless `--order-field eikonal`). GUI: an editable
+  height/max-angle breakpoint list shown only when the Eikonal order
+  field is selected, with add/remove controls.
+- Manually verified end-to-end against `pug_v4_l_sop_85mm.stl` with a
+  real multi-breakpoint profile; toolpaths inspected for the
+  previously-reported symptoms before declaring done (per project rule on
+  verifying slicing fixes against the real test mesh, not just unit
+  tests/reasoning).
+
 ## Deferred / future work (data model must not preclude these, but they are not being built now)
 
 - **Multi-object collision avoidance**: toolhead-vs-already-printed-object

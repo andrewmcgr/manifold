@@ -71,6 +71,7 @@ mod tests {
                 filament_diameter: 1.75,
                 start_gcode: String::new(),
                 end_gcode: String::new(),
+                eikonal_slope_profile: Vec::new(),
             },
         }
     }

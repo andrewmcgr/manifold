@@ -23,7 +23,9 @@
 //! can be reused for a mesh-derived contact-surface front or any other seed
 //! source (e.g. a synthetic test geometry) without this module depending on
 //! `manifold-core`'s or even `manifold-fidget`'s own mesh types.
+use crate::height_along::HeightAlong;
 use crate::order::OrderField;
+use crate::slope_profile::SlopeProfile;
 use glam::DVec3;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -159,9 +161,42 @@ impl EikonalOrderField {
         is_solid: &(dyn Fn(DVec3) -> bool + Sync),
         is_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
     ) -> Self {
+        Self::new_with_occupancy_and_seed_region_and_slope_limit(
+            min_corner,
+            max_corner,
+            requested_cell_size,
+            is_solid,
+            is_seed_region,
+            None,
+            None,
+        )
+    }
+
+    /// Like [`EikonalOrderField::new_with_occupancy_and_seed_region`], but
+    /// additionally accepts an optional `slope_profile` +
+    /// `height_along` pair: when both are `Some`, a grade-limiting
+    /// (Lipschitz-extension-style) relaxation pass runs after the FMM
+    /// march via [`EikonalOrderField::relax_with_slope_limit`], enforcing
+    /// `|T(p) - T(q)| <= max_slope_at(height_along(p)) * h` for every pair
+    /// of grid-adjacent nodes. Passing `None` for either argument is a
+    /// purely additive, behavior-preserving no-op — identical to
+    /// [`EikonalOrderField::new_with_occupancy_and_seed_region`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_occupancy_and_seed_region_and_slope_limit(
+        min_corner: DVec3,
+        max_corner: DVec3,
+        requested_cell_size: f64,
+        is_solid: &(dyn Fn(DVec3) -> bool + Sync),
+        is_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
+        slope_profile: Option<&SlopeProfile>,
+        height_along: Option<&dyn HeightAlong>,
+    ) -> Self {
         let (mut field, occupied) =
             Self::build_grid(min_corner, max_corner, requested_cell_size, is_solid);
         field.march_from_region(is_seed_region, &occupied);
+        if let (Some(profile), Some(height_along)) = (slope_profile, height_along) {
+            field.relax_with_slope_limit(profile, height_along, &occupied);
+        }
         field
     }
 
@@ -385,6 +420,147 @@ impl EikonalOrderField {
                 }
 
                 let candidate = self.solve_update(nxu, nyu, nzu, &frozen);
+                if candidate < self.distances[nidx] {
+                    self.distances[nidx] = candidate;
+                    heap.push(HeapEntry {
+                        value: candidate,
+                        x: nxu,
+                        y: nyu,
+                        z: nzu,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Grade-limiting (Lipschitz-extension-style) post-process, run after
+    /// the FMM march has already completed: enforces
+    /// `|T(p) - T(q)| <= max_slope_at(height_along(p)) * horizontal_distance(p, q)`
+    /// for every pair of grid-adjacent nodes `p`, `q` with nonzero
+    /// horizontal displacement (4-connectivity within the horizontal
+    /// plane, via [`NEIGHBOR_OFFSETS`] excluding its pure-Z pair;
+    /// `horizontal_distance` for these axis-neighbors is just `self.h`).
+    /// The pure-vertical neighbor pair is deliberately left unconstrained:
+    /// it has zero horizontal displacement, so a horizontal slope limit is
+    /// vacuous for it -- constraining it would throttle straight-up
+    /// progression even under a maximally tight (near-flat) profile,
+    /// starving reachable order values far below the mesh's true height.
+    ///
+    /// This is a second, independent heap-based label-correcting
+    /// relaxation pass over the *entire* finite-distance field (unlike
+    /// [`EikonalOrderField::relax_from_frozen`], which seeds only from
+    /// nodes frozen so far during the FMM march itself) — it does not call
+    /// [`EikonalOrderField::solve_update`]/[`solve_eikonal_quadratic`],
+    /// since this is a post-hoc clamp on an already-computed isotropic
+    /// distance field, not a re-solve of the Eikonal equation. Popping node
+    /// `p` with distance `T(p)`, each occupied grid-neighbor `q` is capped
+    /// at `T(p) + slope_multiplier * self.h`; if `q`'s current distance
+    /// exceeds that cap, it is lowered and `q` is pushed back onto the
+    /// heap. Repeated relaxation from both directions (each node acts as
+    /// `p` for its neighbors as it's popped) converges to a fixpoint that
+    /// respects the Lipschitz bound symmetrically.
+    ///
+    /// Degenerate `profile`/`height_along` input never corrupts
+    /// `self.distances` with NaN: a `NaN` height (via
+    /// [`HeightAlong::height`]) or a `max_slope_at` result within
+    /// floating-point epsilon of 90 degrees (near-vertical, i.e.
+    /// effectively unconstrained — see [`SlopeProfile`]'s
+    /// `UNCONSTRAINED_ANGLE_DEG`) skips relaxation from that node entirely,
+    /// rather than letting `tan(90 deg)` or a NaN slope multiplier flow
+    /// into the distance field.
+    fn relax_with_slope_limit(
+        &mut self,
+        profile: &SlopeProfile,
+        height_along: &dyn HeightAlong,
+        occupied: &[bool],
+    ) {
+        let [nx, ny, nz] = self.dims;
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let idx = self.idx(x, y, z);
+                    if occupied[idx] && self.distances[idx].is_finite() {
+                        heap.push(HeapEntry {
+                            value: self.distances[idx],
+                            x,
+                            y,
+                            z,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Angles at/above this threshold are treated as "no limit" to
+        // avoid wastefully large (but technically finite) `tan()` values
+        // near the 90-degree asymptote.
+        const NEAR_VERTICAL_ANGLE_DEG: f64 = 89.999;
+
+        while let Some(HeapEntry { value, x, y, z }) = heap.pop() {
+            let idx = self.idx(x, y, z);
+            if !occupied[idx] || self.distances[idx] < value {
+                // Stale heap entry superseded by a smaller value already
+                // recorded for this node; skip.
+                continue;
+            }
+            let t_p = self.distances[idx];
+
+            let height = height_along.height(self.node_pos(x, y, z));
+            if height.is_nan() {
+                // Degenerate height projection: treat as unconstrained
+                // (skip relaxation from this node) rather than letting NaN
+                // propagate into `max_slope_at`/the tan() computation.
+                continue;
+            }
+            let max_angle = profile.max_slope_at(height);
+            if !max_angle.is_finite() || max_angle >= NEAR_VERTICAL_ANGLE_DEG {
+                // Unconstrained (or empty-profile default): no cap to
+                // enforce from this node.
+                continue;
+            }
+            let slope_multiplier = max_angle.to_radians().tan();
+            if !slope_multiplier.is_finite() {
+                continue;
+            }
+
+            for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                if dx == 0 && dy == 0 {
+                    // Pure-vertical neighbor: zero horizontal displacement,
+                    // so a *horizontal* slope limit is vacuous for this
+                    // pair -- capping it here would throttle straight-up
+                    // progression even for a maximally tight (near-flat)
+                    // profile, starving reachable order values far below
+                    // the mesh's true height and collapsing most of the
+                    // object into a handful of widely-spaced layers with
+                    // near-vertical isosurface jumps to compensate. Leave
+                    // vertical progression unconstrained by this pass,
+                    // same as ordinary flat/planar slicing.
+                    continue;
+                }
+                let nxp = x as isize + dx;
+                let nyp = y as isize + dy;
+                let nzp = z as isize + dz;
+                if nxp < 0
+                    || nyp < 0
+                    || nzp < 0
+                    || nxp as usize >= nx
+                    || nyp as usize >= ny
+                    || nzp as usize >= nz
+                {
+                    continue;
+                }
+                let (nxu, nyu, nzu) = (nxp as usize, nyp as usize, nzp as usize);
+                let nidx = self.idx(nxu, nyu, nzu);
+                if !occupied[nidx] {
+                    continue;
+                }
+
+                let candidate = t_p + slope_multiplier * self.h;
+                if candidate.is_nan() {
+                    continue;
+                }
                 if candidate < self.distances[nidx] {
                     self.distances[nidx] = candidate;
                     heap.push(HeapEntry {
@@ -801,5 +977,354 @@ mod tests {
             "region seeding should freeze every occupied node in the seed region \
              (including its center) at exact distance 0.0, got {region_center_order}"
         );
+    }
+
+    /// A steep slope profile applied to a single-point seed should cap the
+    /// distance field far from the seed to the Lipschitz bound implied by
+    /// the profile's max angle, well below the unconstrained (isotropic)
+    /// Euclidean-ish distance the plain FMM march would otherwise produce.
+    #[test]
+    fn steep_slope_profile_caps_plateau_distance_from_seed() {
+        use crate::height_along::ConstantAxisHeight;
+        use crate::slope_profile::SlopeProfile;
+
+        let min_corner = DVec3::new(-5.0, -5.0, -5.0);
+        let max_corner = DVec3::new(5.0, 5.0, 5.0);
+        let cell_size = 0.25;
+        let is_solid = |_p: DVec3| true;
+        let is_seed_region = |p: DVec3| p == DVec3::ZERO;
+
+        // A tight 30-degree cap, constant everywhere.
+        let profile = SlopeProfile::new(vec![(f64::INFINITY, 30.0)]);
+        let height_along = ConstantAxisHeight::new(DVec3::Z, DVec3::ZERO);
+
+        let field = EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
+            min_corner,
+            max_corner,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+            Some(&profile),
+            Some(&height_along),
+        );
+
+        // A far point on the same z-plane as the seed: purely horizontal
+        // distance is large (many cells), but height along the axis from
+        // the seed is ~0, so the Lipschitz bound from the seed itself is
+        // tiny (slope_multiplier * horizontal_distance, with height delta
+        // ~0 contributing no extra allowance beyond the per-hop cap
+        // chaining outward from the seed). Since the cap chains hop by hop
+        // at `tan(30deg) * h` per hop regardless of height, the bound after
+        // `n` hops of horizontal distance `n * h` is `n * h * tan(30deg)`.
+        let far = DVec3::new(4.0, 0.0, 0.0);
+        let hops =
+            (far.x - min_corner.x).abs() / cell_size - (0.0 - min_corner.x).abs() / cell_size;
+        let n = (far.x / cell_size).round().abs();
+        let bound = n * cell_size * 30.0_f64.to_radians().tan() + 1e-6;
+        let got = field.order(far);
+
+        assert!(
+            got.is_finite(),
+            "expected finite capped distance, got {got}"
+        );
+        assert!(
+            got <= bound + cell_size, // small slack for grid snapping/interpolation
+            "expected distance <= slope-limited bound ~{bound}, got {got} (hops arg unused: {hops})"
+        );
+    }
+
+    /// Regression test for a bug where the slope-limit relaxation applied
+    /// its horizontal cap to the pure-vertical (Z) neighbor too, throttling
+    /// straight-up progression by the same tiny per-hop allowance as
+    /// horizontal movement. Under an extremely tight profile (near-flat,
+    /// e.g. a few degrees), that collapsed most of a tall column's true
+    /// height into a small reachable order range. A point directly above
+    /// the seed (zero horizontal displacement) must be able to reach a
+    /// distance approximately equal to its full Euclidean/axis distance
+    /// from the seed, unconstrained by the horizontal slope cap.
+    #[test]
+    fn pure_vertical_progression_is_not_throttled_by_a_tight_slope_profile() {
+        use crate::height_along::ConstantAxisHeight;
+        use crate::slope_profile::SlopeProfile;
+
+        let min_corner = DVec3::new(-1.0, -1.0, 0.0);
+        let max_corner = DVec3::new(1.0, 1.0, 20.0);
+        let cell_size = 0.5;
+        let is_solid = |_p: DVec3| true;
+        let is_seed_region = |p: DVec3| p == DVec3::new(0.0, 0.0, 0.0);
+
+        // An extremely tight 1-degree cap, constant everywhere -- the
+        // near-flat extreme that most aggressively exposed the bug.
+        let profile = SlopeProfile::new(vec![(f64::INFINITY, 1.0)]);
+        let height_along = ConstantAxisHeight::new(DVec3::Z, DVec3::ZERO);
+
+        let field = EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
+            min_corner,
+            max_corner,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+            Some(&profile),
+            Some(&height_along),
+        );
+
+        // Directly above the seed: zero horizontal displacement, so the
+        // pre-fix bug would have capped this to `tan(1deg) * (z / cell_size) * cell_size`
+        // (a tiny fraction of `z`), instead of the true ~z distance.
+        let above = DVec3::new(0.0, 0.0, 18.0);
+        let got = field.order(above);
+
+        assert!(
+            got.is_finite(),
+            "expected finite distance directly above the seed, got {got}"
+        );
+        assert!(
+            got > above.z - cell_size * 2.0,
+            "pure-vertical progression should reach ~its full axis distance ({}) from the seed \
+             unthrottled by the horizontal slope cap, got {got}",
+            above.z
+        );
+    }
+
+    /// Passing `None` for both `slope_profile` and `height_along` must
+    /// leave behavior identical to the existing unconstrained
+    /// `new_with_occupancy_and_seed_region` march (regression safety).
+    #[test]
+    fn no_slope_profile_matches_unconstrained_march() {
+        let min_corner = DVec3::new(-3.0, -3.0, -3.0);
+        let max_corner = DVec3::new(3.0, 3.0, 3.0);
+        let cell_size = 0.5;
+        let is_solid = |_p: DVec3| true;
+        let is_seed_region = |p: DVec3| p == DVec3::ZERO;
+
+        let baseline = EikonalOrderField::new_with_occupancy_and_seed_region(
+            min_corner,
+            max_corner,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+        );
+        let via_new_api = EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
+            min_corner,
+            max_corner,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+            None,
+            None,
+        );
+
+        for p in [
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+            DVec3::new(1.0, 1.0, 1.0),
+        ] {
+            assert!(approx_eq(baseline.order(p), via_new_api.order(p), 1e-9));
+        }
+    }
+
+    /// A `HeightAlong` implementation returning NaN must not panic and must
+    /// not introduce NaN into the distance field.
+    #[test]
+    fn nan_height_along_does_not_corrupt_distances() {
+        struct NanHeight;
+        impl HeightAlong for NanHeight {
+            fn height(&self, _p: DVec3) -> f64 {
+                f64::NAN
+            }
+        }
+
+        let min_corner = DVec3::new(-2.0, -2.0, -2.0);
+        let max_corner = DVec3::new(2.0, 2.0, 2.0);
+        let cell_size = 0.5;
+        let is_solid = |_p: DVec3| true;
+        let is_seed_region = |p: DVec3| p == DVec3::ZERO;
+        let profile = SlopeProfile::new(vec![(f64::INFINITY, 30.0)]);
+        let height_along = NanHeight;
+
+        let field = EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
+            min_corner,
+            max_corner,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+            Some(&profile),
+            Some(&height_along),
+        );
+
+        for p in [
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(0.0, 1.5, 0.0),
+            DVec3::new(-1.0, -1.0, -1.0),
+        ] {
+            let value = field.order(p);
+            assert!(
+                !value.is_nan(),
+                "expected no NaN in distance field, got NaN at {p:?}"
+            );
+        }
+    }
+
+    /// An empty-breakpoints profile is unconstrained per
+    /// `SlopeProfile::max_slope_at`, so it should be a no-op relative to
+    /// passing `None` (within float tolerance).
+    #[test]
+    fn empty_profile_is_a_no_op() {
+        use crate::height_along::ConstantAxisHeight;
+
+        let min_corner = DVec3::new(-2.0, -2.0, -2.0);
+        let max_corner = DVec3::new(2.0, 2.0, 2.0);
+        let cell_size = 0.5;
+        let is_solid = |_p: DVec3| true;
+        let is_seed_region = |p: DVec3| p == DVec3::ZERO;
+        let empty_profile = SlopeProfile::new(vec![]);
+        let height_along = ConstantAxisHeight::new(DVec3::Z, DVec3::ZERO);
+
+        let baseline = EikonalOrderField::new_with_occupancy_and_seed_region(
+            min_corner,
+            max_corner,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+        );
+        let with_empty_profile =
+            EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
+                min_corner,
+                max_corner,
+                cell_size,
+                &is_solid,
+                &is_seed_region,
+                Some(&empty_profile),
+                Some(&height_along),
+            );
+
+        for p in [
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(0.0, 1.5, 0.0),
+            DVec3::new(-1.0, -1.0, -1.0),
+        ] {
+            assert!(approx_eq(
+                baseline.order(p),
+                with_empty_profile.order(p),
+                1e-6
+            ));
+        }
+    }
+
+    /// End-to-end test: a single-point seed with a very tight (5-degree)
+    /// slope profile.
+    ///
+    /// First establishes the test isn't vacuous: the plain unconstrained
+    /// march (no slope-limiting pass) has an axis-neighbor delta right
+    /// next to the seed of ~`h` (isotropic speed 1.0), which trivially
+    /// exceeds the tight cap `tan(5deg) * h`. Then confirms that building
+    /// the *same* grid/seed/profile via
+    /// `new_with_occupancy_and_seed_region_and_slope_limit` makes every
+    /// grid-adjacent node pair *with nonzero horizontal displacement*
+    /// (x- and y-neighbors) in the whole field respect
+    /// `|T(p) - T(q)| <= max_slope_at(height_along(p)) * h`. The
+    /// pure-vertical (Z) neighbor is deliberately excluded from this check
+    /// -- it's intentionally left unconstrained by the relaxation (see
+    /// `pure_vertical_progression_is_not_throttled_by_a_tight_slope_profile`),
+    /// since a horizontal slope limit is vacuous for a pair with zero
+    /// horizontal displacement.
+    #[test]
+    fn steep_synthetic_field_is_clamped_by_slope_profile_relaxation() {
+        use crate::height_along::ConstantAxisHeight;
+        use crate::slope_profile::SlopeProfile;
+
+        let min_corner = DVec3::new(-3.0, -3.0, -3.0);
+        let max_corner = DVec3::new(3.0, 3.0, 3.0);
+        let cell_size = 0.5;
+        let is_solid = |_p: DVec3| true;
+        let is_seed_region = |p: DVec3| p == DVec3::ZERO;
+
+        // A very tight 5-degree cap, constant everywhere (so the bound is
+        // spatially uniform regardless of which of a pair's two nodes it's
+        // evaluated at).
+        let angle_deg = 5.0;
+        let profile = SlopeProfile::new(vec![(f64::INFINITY, angle_deg)]);
+        let height_along = ConstantAxisHeight::new(DVec3::Z, DVec3::ZERO);
+        let max_delta = angle_deg.to_radians().tan() * cell_size;
+
+        // Baseline: the plain unconstrained march, with no slope-limiting
+        // pass applied at all.
+        let baseline = EikonalOrderField::new_with_occupancy_and_seed_region(
+            min_corner,
+            max_corner,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+        );
+
+        // Establish the violation is real (not a vacuous pass): right next
+        // to the seed, the unconstrained march's axis-neighbor delta is
+        // ~`h` (isotropic speed 1.0), far exceeding the tight cap.
+        let seed = DVec3::ZERO;
+        let neighbor = DVec3::new(cell_size, 0.0, 0.0);
+        let baseline_delta = (baseline.order(neighbor) - baseline.order(seed)).abs();
+        assert!(
+            baseline_delta > max_delta,
+            "expected unconstrained march to violate the tight slope cap: delta {baseline_delta} > cap {max_delta} did not hold"
+        );
+
+        // Now build the same grid/seed/profile via the slope-limiting
+        // relaxation pass and confirm every grid-adjacent node pair in the
+        // field respects the Lipschitz bound.
+        let limited = EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
+            min_corner,
+            max_corner,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+            Some(&profile),
+            Some(&height_along),
+        );
+
+        let epsilon = 1e-6;
+        let [nx, ny, nz] = limited.dims;
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let idx = limited.idx(x, y, z);
+                    let t_p = limited.distances[idx];
+                    if !t_p.is_finite() {
+                        continue;
+                    }
+                    let p = limited.node_pos(x, y, z);
+                    let bound = profile
+                        .max_slope_at(height_along.height(p))
+                        .to_radians()
+                        .tan()
+                        * limited.h
+                        + epsilon;
+
+                    for (dx, dy, dz) in [(1isize, 0isize, 0isize), (0, 1, 0)] {
+                        let nxp = x as isize + dx;
+                        let nyp = y as isize + dy;
+                        let nzp = z as isize + dz;
+                        if nxp < 0
+                            || nyp < 0
+                            || nzp < 0
+                            || nxp as usize >= nx
+                            || nyp as usize >= ny
+                            || nzp as usize >= nz
+                        {
+                            continue;
+                        }
+                        let nidx = limited.idx(nxp as usize, nyp as usize, nzp as usize);
+                        let t_q = limited.distances[nidx];
+                        if !t_q.is_finite() {
+                            continue;
+                        }
+                        let delta = (t_p - t_q).abs();
+                        assert!(
+                            delta <= bound,
+                            "slope cap violated at {p:?}: delta {delta} > bound {bound}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
