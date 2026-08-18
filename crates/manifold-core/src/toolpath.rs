@@ -2,7 +2,8 @@
 
 use crate::infill::{self, InfillRegion};
 use crate::{
-    extrusion, ids::ToolId, object::Object, slicing::Layer, tool::Tool, Result, SlicerConfig,
+    bounds::BoundingVolume, extrusion, ids::ToolId, object::Object, slicing::Layer, tool::Tool,
+    Error, Result, SlicerConfig,
 };
 use glam::DVec3;
 use manifold_fidget::mesh_sdf::MeshSdf;
@@ -88,6 +89,32 @@ fn retain_contained_paths(
     }
 
     retained
+}
+
+/// Validates that every point of every planned path in `paths` lies within
+/// `build_volume`, returning [`Error::MoveOutOfBounds`] naming the first
+/// offending point found (in `paths` order) if not.
+///
+/// This is a last-resort safety net, checked once after planning
+/// completes (see `crate::plan_toolpaths_with_progress`) rather than
+/// silently dropped/clipped like [`retain_contained_paths`]: a move
+/// outside the machine's physical build volume means either a genuine
+/// geometry/config problem (e.g. object placement, or a slicing-pipeline
+/// bug producing a wild point far from the object -- see the Eikonal
+/// order field's seed-region/contour-plateau fixes this guards against a
+/// regression of) or a real out-of-range command that would otherwise
+/// only be discovered by the printer firmware refusing the move at print
+/// time. Either way, failing fast here with a clear error is preferable
+/// to reaching Gcode.
+pub fn validate_within_bounds(paths: &[Path], build_volume: &BoundingVolume) -> Result<()> {
+    for path in paths {
+        for &point in &path.points {
+            if !build_volume.contains(point) {
+                return Err(Error::MoveOutOfBounds { point });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Classification of a single toolpath segment (the move from one point to
@@ -345,6 +372,80 @@ mod tests {
     use std::sync::Arc;
 
     use crate::slicing::BUILD_DIRECTION;
+
+    fn path_with_points(points: Vec<DVec3>) -> Path {
+        let segments = points
+            .iter()
+            .map(|_| Segment {
+                kind: MoveKind::WallOuter,
+                speed: 60.0,
+                extrusion_rate: 1.0,
+                support_fraction: 0.0,
+                order: 0.0,
+                extrusion_length: 0.0,
+            })
+            .collect();
+        Path {
+            points,
+            segments,
+            tool: ToolId(0),
+        }
+    }
+
+    #[test]
+    fn validate_within_bounds_accepts_paths_entirely_inside_the_build_volume() {
+        let build_volume = BoundingVolume::Aabb {
+            min: DVec3::ZERO,
+            max: DVec3::new(200.0, 200.0, 200.0),
+        };
+        let paths = vec![path_with_points(vec![
+            DVec3::new(10.0, 10.0, 0.2),
+            DVec3::new(20.0, 10.0, 0.2),
+        ])];
+
+        assert!(validate_within_bounds(&paths, &build_volume).is_ok());
+    }
+
+    #[test]
+    fn validate_within_bounds_rejects_a_point_outside_the_build_volume() {
+        let build_volume = BoundingVolume::Aabb {
+            min: DVec3::ZERO,
+            max: DVec3::new(200.0, 200.0, 200.0),
+        };
+        let offending = DVec3::new(-0.036, 30.0, 0.46);
+        let paths = vec![path_with_points(vec![
+            DVec3::new(10.0, 10.0, 0.2),
+            offending,
+        ])];
+
+        let err = validate_within_bounds(&paths, &build_volume).unwrap_err();
+        match err {
+            Error::MoveOutOfBounds { point } => assert_eq!(point, offending),
+            other => panic!("expected MoveOutOfBounds, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_within_bounds_ignores_travel_only_paths_that_are_still_out_of_bounds() {
+        // Travel moves aren't checked by `retain_contained_paths` against the
+        // solid mesh, but `validate_within_bounds` is a machine-envelope
+        // check, not a solid-containment check -- a travel move outside the
+        // build volume is just as much a real problem for the machine, so
+        // it must still be caught.
+        let build_volume = BoundingVolume::Aabb {
+            min: DVec3::ZERO,
+            max: DVec3::new(200.0, 200.0, 200.0),
+        };
+        let mut path = path_with_points(vec![
+            DVec3::new(10.0, 10.0, 0.2),
+            DVec3::new(-5.0, 10.0, 0.2),
+        ]);
+        for segment in &mut path.segments {
+            segment.kind = MoveKind::Travel;
+        }
+
+        assert!(validate_within_bounds(&[path], &build_volume).is_err());
+    }
 
     #[test]
     fn plan_tags_paths_with_objects_assigned_tool() {

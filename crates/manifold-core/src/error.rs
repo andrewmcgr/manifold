@@ -13,6 +13,9 @@ pub enum Error {
     #[error("toolpath planning failed: {0}")]
     Toolpath(String),
 
+    #[error("planned move at {point} lies outside the machine's build volume")]
+    MoveOutOfBounds { point: glam::DVec3 },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -253,8 +253,10 @@ pub fn plan_toolpaths(workspace: &Workspace) -> Result<Vec<toolpath::Path>> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidMesh`] if `workspace` has no objects, or
-/// whatever error the ordering/slicing/toolpath stages produce.
+/// Returns [`Error::InvalidMesh`] if `workspace` has no objects,
+/// [`Error::MoveOutOfBounds`] if any planned move lies outside
+/// `workspace.machine.build_volume`, or whatever error the
+/// ordering/slicing/toolpath stages produce.
 pub fn plan_toolpaths_with_progress(
     workspace: &Workspace,
     on_progress: &mut (dyn FnMut(f64) + Send),
@@ -272,13 +274,17 @@ pub fn plan_toolpaths_with_progress(
         &workspace.config,
         &mut |fraction: f64| on_progress(fraction * 0.5),
     )?;
-    toolpath::plan_with_progress(
+    let paths = toolpath::plan_with_progress(
         &layers,
         &workspace.objects,
         &workspace.machine.tools,
         &workspace.config,
         &mut |fraction: f64| on_progress(0.5 + fraction * 0.5),
-    )
+    )?;
+
+    toolpath::validate_within_bounds(&paths, &workspace.machine.build_volume)?;
+
+    Ok(paths)
 }
 
 #[cfg(test)]
@@ -470,5 +476,37 @@ mod tests {
         assert_eq!(gcode.matches("T0\n").count(), 1);
         assert!(gcode.matches("G0 X").count() >= 3);
         assert!(gcode.matches("G1 X").count() > 0);
+    }
+
+    /// A build volume too small to contain the sliced object must fail the
+    /// pipeline with `Error::MoveOutOfBounds` (via `validate_within_bounds`)
+    /// rather than silently emitting Gcode with moves the machine can't
+    /// actually reach -- both `plan_toolpaths` and `slice_to_gcode` build
+    /// on the same validated path, so both must reject it.
+    #[test]
+    fn plan_toolpaths_rejects_geometry_outside_the_build_volume() {
+        // The cube spans Z in [0, 1]; a build volume capped at Z=0.5
+        // guarantees some planned point (at minimum the top layer's wall
+        // loop) lies outside it.
+        let machine = crate::machine::Machine::new(
+            crate::bounds::BoundingVolume::Aabb {
+                min: glam::DVec3::new(-10.0, -10.0, -10.0),
+                max: glam::DVec3::new(10.0, 10.0, 0.5),
+            },
+            Vec::new(),
+        );
+        let object =
+            crate::object::Object::new(crate::ids::ObjectId(0), cube_mesh(), crate::ids::ToolId(0));
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            ..SlicerConfig::default()
+        };
+        let workspace = Workspace::new(vec![object], machine, config);
+
+        let err = plan_toolpaths(&workspace).unwrap_err();
+        assert!(matches!(err, Error::MoveOutOfBounds { .. }));
+
+        let err = slice_to_gcode(&workspace).unwrap_err();
+        assert!(matches!(err, Error::MoveOutOfBounds { .. }));
     }
 }
