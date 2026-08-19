@@ -130,8 +130,17 @@ fn insert_z_hops(paths: Vec<Path>, config: &SlicerConfig) -> Vec<Path> {
 
 /// Rebuilds a single `path`'s `points`/`segments` with Z-hop lift/drop
 /// geometry inserted around every maximal run of consecutive
-/// [`MoveKind::Travel`] segments. See [`insert_z_hops`]'s doc comment for
-/// the exact point sequence.
+/// [`MoveKind::Travel`] segments -- except a run that both departs from
+/// and arrives at an [`MoveKind::Infill`] segment, which is left as a
+/// plain, un-hopped travel move. A single infill fill (e.g. one
+/// `MonotonicInfill::generate` call's boustrophedon zigzag, or multiple
+/// islands scanned together within one region) already emits its own
+/// internal travel jumps between scan-line segments as one continuous
+/// `Path`; those jumps stay at the same printed Z and don't need to clear
+/// already-extruded geometry the way a travel between *different* move
+/// kinds (e.g. wall-to-infill, or path-to-path) might, so hopping between
+/// them is pure wasted motion. See [`insert_z_hops`]'s doc comment for the
+/// exact point sequence when a hop *is* inserted.
 fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
     let Path {
         points,
@@ -164,6 +173,29 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
             let mut run_end = e;
             while run_end + 1 < point_count - 1 && segments[run_end + 1].kind == MoveKind::Travel {
                 run_end += 1;
+            }
+
+            // A run entirely surrounded by Infill segments (the move
+            // arriving at the departure point, and the move leaving the
+            // arrival point, both `MoveKind::Infill`) is an internal jump
+            // within the same infill patch -- skip the hop entirely and
+            // fall through to copying the run's original points/segments
+            // unmodified, exactly as the non-Travel branch below does. A
+            // run at either end of the whole path (no bounding segment on
+            // that side) is conservatively treated as needing a hop, since
+            // there's no infill segment to confirm it's an internal jump.
+            let departs_infill = run_start > 0 && segments[run_start - 1].kind == MoveKind::Infill;
+            let arrives_infill =
+                run_end + 1 < point_count - 1 && segments[run_end + 1].kind == MoveKind::Infill;
+            if departs_infill && arrives_infill {
+                for k in run_start..run_end {
+                    new_points.push(points[k + 1]);
+                }
+                for segment in segments.iter().take(run_end + 1).skip(run_start) {
+                    new_segments.push(*segment);
+                }
+                e = run_end + 1;
+                continue;
             }
 
             let departure = points[run_start];
@@ -1484,6 +1516,101 @@ mod tests {
         }
         // Parallel-array invariant preserved.
         assert_eq!(hopped.points.len(), hopped.segments.len());
+    }
+
+    #[test]
+    fn insert_z_hops_skips_the_hop_when_a_travel_run_is_bounded_by_infill_on_both_sides() {
+        // p0 -(Infill)-> p1 -(Travel)-> p2 -(Infill)-> p3: an internal jump
+        // within one infill patch's boustrophedon zigzag -- both the
+        // departing and arriving edges are Infill, so this travel run
+        // should be left completely unmodified (no lift/drop points), even
+        // though z-hop is enabled.
+        let p0 = DVec3::new(0.0, 0.0, 0.0);
+        let p1 = DVec3::new(1.0, 0.0, 0.0);
+        let p2 = DVec3::new(2.0, 0.0, 0.0);
+        let p3 = DVec3::new(3.0, 0.0, 0.0);
+        let infill_segment = Segment {
+            kind: MoveKind::Infill,
+            speed: 60.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 1.0,
+        };
+        let travel_segment = Segment {
+            kind: MoveKind::Travel,
+            speed: 150.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 0.0,
+        };
+        let path = Path {
+            points: vec![p0, p1, p2, p3],
+            segments: vec![infill_segment, travel_segment, infill_segment],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            z_hop_enabled: true,
+            z_hop_height: 0.4,
+            ..SlicerConfig::default()
+        };
+
+        let hopped = insert_z_hops(vec![path.clone()], &config);
+        assert_eq!(hopped.len(), 1);
+        assert_eq!(hopped[0].points, path.points);
+        assert_eq!(
+            hopped[0]
+                .segments
+                .iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>(),
+            vec![MoveKind::Infill, MoveKind::Travel, MoveKind::Infill]
+        );
+    }
+
+    #[test]
+    fn insert_z_hops_still_hops_a_travel_run_at_the_edge_of_the_path_even_next_to_infill() {
+        // A travel run at the very *start* of the path (no preceding
+        // segment at all) followed by Infill: there's no bounding segment
+        // on the departure side to confirm this is an internal infill
+        // jump, so it's conservatively still hopped.
+        let p0 = DVec3::new(0.0, 0.0, 0.0);
+        let p1 = DVec3::new(5.0, 0.0, 0.0);
+        let p2 = DVec3::new(6.0, 0.0, 0.0);
+        let travel_segment = Segment {
+            kind: MoveKind::Travel,
+            speed: 150.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 0.0,
+        };
+        let infill_segment = Segment {
+            kind: MoveKind::Infill,
+            speed: 60.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 1.0,
+        };
+        let path = Path {
+            points: vec![p0, p1, p2],
+            segments: vec![travel_segment, infill_segment],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            z_hop_enabled: true,
+            z_hop_height: 0.4,
+            ..SlicerConfig::default()
+        };
+
+        let hopped = insert_z_hops(vec![path], &config);
+        assert_eq!(hopped.len(), 1);
+        // Lift + drop points inserted -> more points than the original 3.
+        assert!(hopped[0].points.len() > 3);
     }
 
     #[test]
