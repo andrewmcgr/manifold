@@ -194,6 +194,20 @@ pub struct SlicerConfig {
     /// `nozzle_diameter` it constructs.
     #[serde(default = "default_path_simplify_tolerance")]
     pub path_simplify_tolerance: f64,
+    /// Diameter (mm) of the flat land around the nozzle tip's orifice --
+    /// the physical flat face that can contact an already-printed sloped
+    /// surface when the nozzle axis is tilted for non-planar printing
+    /// (see `toolpath::compensate_flat_nozzle`). `None` defers to twice
+    /// `nozzle_diameter` (see [`SlicerConfig::nozzle_flat_diameter`]) --
+    /// this can't be a `#[serde(default = "fn")]` static default since it
+    /// depends on another field's value, the same reason
+    /// `path_simplify_tolerance` documents its own static fallback above.
+    /// `#[serde(default)]` so a saved profile from before this field
+    /// existed still deserializes to `None` (i.e. the derived default),
+    /// not a hardcoded literal that could silently diverge from
+    /// `nozzle_diameter`.
+    #[serde(default)]
+    pub nozzle_flat_diameter: Option<f64>,
 }
 
 /// Default value for [`SlicerConfig::eikonal_slope_profile`]: an empty set
@@ -279,6 +293,7 @@ impl Default for SlicerConfig {
             z_hop_height: default_z_hop_height(),
             path_simplify_enabled: true,
             path_simplify_tolerance: nozzle_diameter / 20.0,
+            nozzle_flat_diameter: None,
         }
     }
 }
@@ -303,6 +318,16 @@ impl SlicerConfig {
     #[must_use]
     pub fn eikonal_slope_profile(&self) -> manifold_fidget::slope_profile::SlopeProfile {
         manifold_fidget::slope_profile::SlopeProfile::new(self.eikonal_slope_profile.clone())
+    }
+
+    /// Diameter (mm) of the nozzle tip's flat land, used by
+    /// `toolpath::compensate_flat_nozzle`. Defaults to twice
+    /// `nozzle_diameter` when [`SlicerConfig::nozzle_flat_diameter`] (the
+    /// field) is `None`.
+    #[must_use]
+    pub fn nozzle_flat_diameter(&self) -> f64 {
+        self.nozzle_flat_diameter
+            .unwrap_or(2.0 * self.nozzle_diameter)
     }
 }
 

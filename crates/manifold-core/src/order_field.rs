@@ -818,7 +818,6 @@ fn project_onto_isosurface<F: OrderField + ?Sized>(
 ) -> Option<DVec3> {
     const TOLERANCE: f64 = 1e-6;
     const MAX_ITERS: u32 = 64;
-    const GRAD_EPS: f64 = 1e-4;
     let max_step = max_step.abs().max(f64::EPSILON);
 
     let mut p = start;
@@ -833,14 +832,7 @@ fn project_onto_isosurface<F: OrderField + ?Sized>(
             return Some(p);
         }
 
-        let grad = DVec3::new(
-            (field.order(p + DVec3::X * GRAD_EPS) - field.order(p - DVec3::X * GRAD_EPS))
-                / (2.0 * GRAD_EPS),
-            (field.order(p + DVec3::Y * GRAD_EPS) - field.order(p - DVec3::Y * GRAD_EPS))
-                / (2.0 * GRAD_EPS),
-            (field.order(p + DVec3::Z * GRAD_EPS) - field.order(p - DVec3::Z * GRAD_EPS))
-                / (2.0 * GRAD_EPS),
-        );
+        let grad = numeric_gradient(field, p)?;
         let grad_len_sq = grad.length_squared();
         if !grad_len_sq.is_finite() || grad_len_sq < 1e-12 {
             return None;
@@ -862,6 +854,36 @@ fn project_onto_isosurface<F: OrderField + ?Sized>(
     }
 
     None
+}
+
+/// Central-difference numeric gradient of `field.order` at `p` (`field`
+/// exposes only a scalar `order`, no analytic gradient). Shared by
+/// [`project_onto_isosurface`] and `toolpath::compensate_flat_nozzle`,
+/// which both need a local surface-normal-like direction from an
+/// arbitrary [`OrderField`].
+///
+/// Returns `None` if `field.order` is non-finite at any of the six sample
+/// points (e.g. `p` is outside the region the field has information about
+/// at all) -- callers must not treat that as "assume zero gradient", which
+/// would silently fabricate a direction.
+pub(crate) fn numeric_gradient<F: OrderField + ?Sized>(field: &F, p: DVec3) -> Option<DVec3> {
+    const GRAD_EPS: f64 = 1e-4;
+
+    let sample = |offset: DVec3| -> Option<f64> {
+        let plus = field.order(p + offset);
+        let minus = field.order(p - offset);
+        if plus.is_finite() && minus.is_finite() {
+            Some((plus - minus) / (2.0 * GRAD_EPS))
+        } else {
+            None
+        }
+    };
+
+    Some(DVec3::new(
+        sample(DVec3::X * GRAD_EPS)?,
+        sample(DVec3::Y * GRAD_EPS)?,
+        sample(DVec3::Z * GRAD_EPS)?,
+    ))
 }
 
 #[cfg(test)]

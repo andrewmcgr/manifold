@@ -255,6 +255,175 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
 /// to the existing downstream extrusion-length pass in
 /// `plan_with_progress`, which runs after this pass on the (possibly
 /// simplified) segment geometry.
+/// Compensates wall-loop contours for the nozzle's flat tip land (see
+/// `SlicerConfig::nozzle_flat_diameter`) when the local nozzle axis tilts
+/// away from the layer's own "vertical" for non-planar printing.
+///
+/// The nozzle axis at a point `p` is modeled as the local surface normal
+/// of the layer's order-field isosurface: `-normalize(grad order(p))`
+/// (see `order_field::numeric_gradient`), which reduces to world-up for a
+/// flat `Height` field and tilts to follow the surface for `Conical`/
+/// `Eikonal`. The flat land (radius `flat_radius`) lies in the plane
+/// perpendicular to that axis, centered on the nozzle-center path -- for a
+/// perfectly flat/untilted layer this touches the true contour
+/// symmetrically all around and needs no correction (that's what
+/// `SlicerConfig::wall_offset` already handles for the isotropic case).
+///
+/// Correction is only needed where the axis itself is turning *along the
+/// direction of travel*, i.e. where the surface has curvature in the
+/// travel direction: the flat's trailing edge (the point flat_radius
+/// behind the center, against the just-extruded material) can end up off
+/// the true contour by the amount the surface tilts over that
+/// flat-radius span. For each point this is estimated by probing the
+/// nozzle axis a `flat_radius` step to either side of the point along the
+/// *radial* (meridian/cross-section) direction -- perpendicular to both
+/// the nozzle axis and the loop's own tangent (travel) direction:
+///
+/// - `radial_dir = normalize(axis.cross(tangent))`. This deliberately
+///   excludes the tangent direction itself: walking around an
+///   axisymmetric loop (e.g. a cone's constant-slope wall) rotates the
+///   axis vector purely as an artifact of going around the loop, without
+///   the surface's actual cross-sectional slope changing at all -- an
+///   earlier version of this function derived the shift direction from
+///   `axis_ahead - axis_behind` (probing along tangent) and it collapsed
+///   onto the tangent direction exactly for a cone, shifting points along
+///   their own contour instead of across it. Probing along `radial_dir`
+///   instead measures the surface's real slope profile (how the tilt
+///   changes moving toward/away from the object's core), which is the
+///   only direction the flat's footprint can actually mismatch the
+///   surface across.
+/// - `theta` = angle between the two radial-probe axes (the tilt swept
+///   over one flat-radius span in the radial direction).
+/// - the shift magnitude is `flat_radius * sin(theta / 2.0)`, the lateral
+///   displacement of a chord of length `flat_radius` swept through half
+///   that turn angle, applied along `radial_dir`.
+///
+/// Before applying, each point checks *which* radial side actually
+/// descends toward already-printed material by comparing `field.order`
+/// at each radial probe against `layer_order + layer_height` (the order
+/// value of the layer printed just before this one -- order decreases as
+/// printing proceeds, see `slicing::BUILD_DIRECTION`): only the side
+/// that's actually closer to already-solid material gets compensated.
+/// This is the "climbing" exemption: when neither probe is meaningfully
+/// closer to solid than the other (or the point is tilting away from
+/// solid on both sides, e.g. an overhang-like climb), there's no
+/// already-printed surface for the flat to (mis)contact, so the point is
+/// left unshifted.
+///
+/// Degenerate cases (missing/zero gradient, near-zero curvature, a loop
+/// too short to have neighbors, or `axis`/`tangent` too close to parallel
+/// to define a radial direction) fall through as a no-op for that point
+/// rather than injecting noise -- this is a best-effort geometric
+/// approximation, not an exact physical simulation.
+fn compensate_flat_nozzle(paths: Vec<Path>, layer: &Layer, config: &SlicerConfig) -> Vec<Path> {
+    let flat_radius = config.nozzle_flat_diameter() / 2.0;
+    if flat_radius <= f64::EPSILON {
+        return paths;
+    }
+    let field = layer.order_field.as_ref();
+
+    paths
+        .into_iter()
+        .map(|mut path| {
+            let is_wall_loop = path.segments.first().is_some_and(|segment| {
+                matches!(segment.kind, MoveKind::WallOuter | MoveKind::WallInner)
+            });
+            if is_wall_loop && path.points.len() >= 3 {
+                path.points = compensate_wall_loop_points(
+                    &path.points,
+                    field,
+                    flat_radius,
+                    config.layer_height,
+                    layer.order,
+                );
+            }
+            path
+        })
+        .collect()
+}
+
+/// Per-point worker behind [`compensate_flat_nozzle`]; see that function's
+/// doc for the geometric model. `points` is a closed loop (wraps like
+/// `Path`'s own contract).
+fn compensate_wall_loop_points(
+    points: &[DVec3],
+    field: &dyn manifold_fidget::order::OrderField,
+    flat_radius: f64,
+    layer_height: f64,
+    layer_order: f64,
+) -> Vec<DVec3> {
+    let len = points.len();
+    // Order value of the layer printed just before this one -- order
+    // decreases as printing proceeds (see `slicing::BUILD_DIRECTION`), so
+    // the already-solidified prior layer sits at a *higher* order value.
+    let prev_layer_order = layer_order + layer_height;
+
+    points
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            let Some(axis) = crate::order_field::numeric_gradient(field, p).map(|g| -g.normalize())
+            else {
+                return p;
+            };
+
+            let prev_point = points[(i + len - 1) % len];
+            let next_point = points[(i + 1) % len];
+            let tangent = next_point - prev_point;
+            if tangent.length_squared() < 1e-12 {
+                return p;
+            }
+            let tangent = tangent.normalize();
+
+            // Perpendicular to both the nozzle axis and the direction of
+            // travel: the meridian/cross-section direction, not the
+            // tangent -- see this function's doc for why tangent itself
+            // is the wrong probing direction.
+            let radial = axis.cross(tangent);
+            let radial_len = radial.length();
+            if radial_len < 1e-9 {
+                return p;
+            }
+            let radial_dir = radial / radial_len;
+
+            let probe_a = p + radial_dir * flat_radius;
+            let probe_b = p - radial_dir * flat_radius;
+            let (Some(axis_a), Some(axis_b)) = (
+                crate::order_field::numeric_gradient(field, probe_a).map(|g| -g.normalize()),
+                crate::order_field::numeric_gradient(field, probe_b).map(|g| -g.normalize()),
+            ) else {
+                return p;
+            };
+
+            let theta = axis_a.dot(axis_b).clamp(-1.0, 1.0).acos();
+            if theta < 1e-6 {
+                return p;
+            }
+
+            let order_a = field.order(probe_a);
+            let order_b = field.order(probe_b);
+            if !order_a.is_finite() || !order_b.is_finite() {
+                return p;
+            }
+            let score_a = -(order_a - prev_layer_order).abs();
+            let score_b = -(order_b - prev_layer_order).abs();
+
+            let shift_mag = flat_radius * (theta / 2.0).sin();
+            if score_b > score_a {
+                // Side `b` (`-radial_dir`) is the one closer to
+                // already-printed material: pull the center back toward
+                // `a` so the flat's trailing edge on the `b` side lands
+                // on the original contour.
+                p + radial_dir * shift_mag
+            } else if score_a > score_b {
+                p - radial_dir * shift_mag
+            } else {
+                p
+            }
+        })
+        .collect()
+}
+
 fn simplify_paths(paths: Vec<Path>, config: &SlicerConfig) -> Vec<Path> {
     if !config.path_simplify_enabled {
         return paths;
@@ -719,6 +888,7 @@ pub fn plan_with_progress(
             }
 
             let paths = retain_contained_paths(paths, layer.mesh_sdf.as_ref(), layer.order);
+            let paths = compensate_flat_nozzle(paths, layer, config);
             let paths = simplify_paths(paths, config);
             let mut paths = insert_z_hops(paths, config);
 

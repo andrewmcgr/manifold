@@ -78,6 +78,7 @@ mod tests {
                 z_hop_height: 0.4,
                 path_simplify_enabled: true,
                 path_simplify_tolerance: 0.02,
+                nozzle_flat_diameter: None,
             },
         }
     }
