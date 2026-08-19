@@ -124,6 +124,19 @@ fn first_layer_xy_bounds(paths: &[Path]) -> Option<(f64, f64, f64, f64)> {
 /// `extrusion_multiplier`), not emitted as a per-move delta. Prime/purge
 /// Gcode around tool changes is not implemented yet — follow-up work, see
 /// ROADMAP.md Phase 2.
+///
+/// Emits `G10` (retract) immediately before the first move of a travel run
+/// and `G11` (unretract) immediately before the first move resuming
+/// extrusion, tracked as a per-tool `retracted` flag rather than emitted
+/// unconditionally per move -- a run of consecutive travel or consecutive
+/// extruding segments only ever gets one `G10`/`G11` at the transition.
+/// `config.start_gcode` (e.g. `PRINT_START`) is assumed to already leave the
+/// printer retracted, so `retracted` starts `true` -- both at the very
+/// start of the program and again on every tool-select, matching a fresh
+/// tool having no primed filament either. Firmware `G10`/`G11` retract
+/// distance/speed (`M207`/`M208`) is assumed pre-configured on the printer
+/// for now; no explicit distance/speed parameters are emitted -- follow-up
+/// work if per-tool/per-config retract tuning is needed.
 pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -159,6 +172,14 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
     let mut current_tool = None;
     let mut current_e = 0.0;
     let mut current_f: Option<f64> = None;
+    // Whether the active tool's filament is currently retracted. `PRINT_START`
+    // (i.e. `config.start_gcode`) is assumed to leave the printer retracted --
+    // see this function's doc -- so a freshly selected tool (including the
+    // first one, before the loop's first iteration) starts out `true` rather
+    // than `false`. Tracked as a single flag rather than per-tool state: each
+    // tool-select block below resets it to `true` in lockstep with `current_e`,
+    // matching the same "fresh tool = fresh, unprimed state" assumption.
+    let mut retracted = true;
 
     for path in paths {
         if current_tool != Some(path.tool) {
@@ -166,6 +187,7 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
             out.push_str("G92 E0\n");
             current_tool = Some(path.tool);
             current_e = 0.0;
+            retracted = true;
         }
 
         for (i, p) in path.points.iter().enumerate() {
@@ -181,6 +203,28 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
             };
             let extruding =
                 incoming_segment.is_some_and(|segment| segment.kind != MoveKind::Travel);
+
+            // Retract (`G10`) right before a travel move if not already
+            // retracted, and unretract (`G11`) right before resuming an
+            // extruding move if currently retracted -- emitted ahead of the
+            // corresponding G0/G1 so the retract/unretract happens at the
+            // point the travel or extrusion move *starts from*, not mid-move.
+            // Only ever fires on a state *change* (travel-after-travel or
+            // extrude-after-extrude is a no-op), so a run of consecutive
+            // travel or extruding segments emits exactly one G10/G11, not one
+            // per segment.
+            if let Some(segment) = incoming_segment {
+                if segment.kind == MoveKind::Travel {
+                    if !retracted {
+                        out.push_str("G10\n");
+                        retracted = true;
+                    }
+                } else if retracted {
+                    out.push_str("G11\n");
+                    retracted = false;
+                }
+            }
+
             let cmd = if i == 0 || !extruding { "G0" } else { "G1" };
             out.push_str(&format!("{cmd} X{:.3} Y{:.3} Z{:.3}", p.x, p.y, p.z));
             if extruding {
@@ -297,11 +341,158 @@ mod tests {
         let out = emit(&paths, &config_without_print_gcode());
         let commands: Vec<&str> = out
             .lines()
-            .filter(|line| line.starts_with("G0") || line.starts_with("G1"))
+            .filter(|line| line.starts_with("G0 ") || line.starts_with("G1 "))
             .map(|line| &line[..2])
             .collect();
 
         assert_eq!(commands, vec!["G0", "G1", "G0"]);
+    }
+
+    #[test]
+    fn emit_retracts_before_travel_and_unretracts_before_resuming_extrusion() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        // Extrude -> travel -> extrude: expect exactly one G10 (before the
+        // travel move) and one G11 (before extrusion resumes), each on its
+        // own line ahead of the corresponding G0/G1.
+        let paths = vec![Path {
+            points: vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(2.0, 0.0, 0.0),
+                DVec3::new(3.0, 0.0, 0.0),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::Travel,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    ..Segment::default()
+                },
+            ],
+            tool: ToolId(0),
+        }];
+
+        // Started retracted (fresh tool), so the *first* extruding move
+        // (arriving at points[1]) must be preceded by an unretract.
+        let out = emit(&paths, &config_without_print_gcode());
+        let lines: Vec<&str> = out.lines().collect();
+        let g10_idx = lines.iter().position(|l| *l == "G10");
+        let g11_idx = lines.iter().position(|l| *l == "G11");
+        assert_eq!(out.matches("G10").count(), 1);
+        assert_eq!(
+            out.matches("G11").count(),
+            2,
+            "one before the first extruding move, one after the travel"
+        );
+
+        let g0_travel_idx = lines
+            .iter()
+            .position(|l| l.starts_with("G0 X2.000"))
+            .expect("travel move to points[2]");
+        let g1_first_idx = lines
+            .iter()
+            .position(|l| l.starts_with("G1 X1.000"))
+            .expect("first extruding move to points[1]");
+        let g1_second_idx = lines
+            .iter()
+            .position(|l| l.starts_with("G1 X3.000"))
+            .expect("second extruding move to points[3]");
+
+        // G11 immediately precedes the first extruding move.
+        assert_eq!(lines[g1_first_idx - 1], "G11");
+        // G10 immediately precedes the travel move.
+        assert_eq!(lines[g0_travel_idx - 1], "G10");
+        assert_eq!(g10_idx.unwrap(), g0_travel_idx - 1);
+        // G11 immediately precedes the second extruding move (resuming after
+        // travel).
+        assert_eq!(lines[g1_second_idx - 1], "G11");
+        assert_eq!(g11_idx.unwrap(), g1_first_idx - 1);
+    }
+
+    #[test]
+    fn emit_does_not_repeat_retract_or_unretract_across_consecutive_same_kind_segments() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        // Two consecutive travel segments followed by two consecutive
+        // extruding segments: only one G10 (at the first travel) and one
+        // G11 (at the first resumed extrusion) should be emitted, not one
+        // per segment.
+        let paths = vec![Path {
+            points: vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(2.0, 0.0, 0.0),
+                DVec3::new(3.0, 0.0, 0.0),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::Travel,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::Travel,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    ..Segment::default()
+                },
+            ],
+            tool: ToolId(0),
+        }];
+
+        let out = emit(&paths, &config_without_print_gcode());
+        // Already retracted from the start, so the leading travel run
+        // triggers no G10 at all; only the later switch to extrusion emits
+        // one G11.
+        assert_eq!(out.matches("G10").count(), 0);
+        assert_eq!(out.matches("G11").count(), 1);
+    }
+
+    #[test]
+    fn emit_resets_retracted_state_on_tool_change() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        // First tool ends up unretracted (mid-extrusion) when the path
+        // ends; the tool change to a fresh tool must not carry that state
+        // over, so the new tool's first extruding move still gets its own
+        // G11 rather than assuming it's already unretracted.
+        let paths = vec![
+            Path {
+                points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
+                segments: vec![Segment {
+                    kind: MoveKind::WallOuter,
+                    ..Segment::default()
+                }],
+                tool: ToolId(0),
+            },
+            Path {
+                points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
+                segments: vec![Segment {
+                    kind: MoveKind::WallOuter,
+                    ..Segment::default()
+                }],
+                tool: ToolId(1),
+            },
+        ];
+
+        let out = emit(&paths, &config_without_print_gcode());
+        assert_eq!(
+            out.matches("G11").count(),
+            2,
+            "each tool's first extruding move gets its own unretract"
+        );
+        assert_eq!(out.matches("G10").count(), 0);
     }
 
     #[test]
@@ -338,7 +529,7 @@ mod tests {
         let out = emit(&paths, &config_without_print_gcode());
         let move_lines: Vec<&str> = out
             .lines()
-            .filter(|line| line.starts_with("G0") || line.starts_with("G1"))
+            .filter(|line| line.starts_with("G0 ") || line.starts_with("G1 "))
             .collect();
 
         // The three point-moves, in order, regardless of how many header
@@ -545,7 +736,7 @@ mod tests {
         let out = emit(&paths, &config_without_print_gcode());
         let move_lines: Vec<&str> = out
             .lines()
-            .filter(|line| line.starts_with("G0") || line.starts_with("G1"))
+            .filter(|line| line.starts_with("G0 ") || line.starts_with("G1 "))
             .collect();
 
         // First move (i == 0) is a plain positioning move with no incoming
