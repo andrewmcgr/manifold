@@ -363,18 +363,18 @@ pub fn slice_mesh_with_progress(
 
     // Total units of reportable work: for `Height` this is just the
     // per-layer loop (unchanged from before). For a curved field, the
-    // `curved_wall_meshes` precompute below is itself an expensive
-    // whole-mesh isosurface extraction per wall pass — done once, before
-    // the per-layer loop, previously with *no* progress reporting at all,
-    // so `on_progress` sat frozen at its last value for however long that
-    // took (seconds, on a real mesh) even though the extraction itself is
-    // internally parallel. Counting each wall pass as one more reportable
-    // unit alongside the `total_steps` layers keeps the bar moving through
-    // that phase instead of appearing stalled.
+    // `outer_wall_mesh` precompute below is itself an expensive whole-mesh
+    // isosurface extraction — done once, before the per-layer loop,
+    // previously with *no* progress reporting at all, so `on_progress` sat
+    // frozen at its last value for however long that took (seconds, on a
+    // real mesh) even though the extraction itself is internally parallel.
+    // Only wall pass 0 needs this whole-mesh extraction (see
+    // `outer_wall_mesh`'s doc comment below for why inner walls are instead
+    // derived per-layer), so this is one reportable unit, not `wall_count`.
     let total_units = if is_height {
         total_steps
     } else {
-        wall_count + total_steps
+        1 + total_steps
     };
     let completed = AtomicUsize::new(0);
     // `on_progress` is `&mut dyn FnMut`, not `Sync`, so serialize calls into
@@ -384,14 +384,27 @@ pub fn slice_mesh_with_progress(
     // `extract_isosurface`) happens before the lock is taken.
     let progress_callback = Mutex::new(on_progress);
 
-    // Curved path only: one triangle soup per wall pass, shared across every
-    // layer's `extract_order_contours_on_mesh` call below. Computed up front
-    // (outside the per-layer parallel loop) since it does not depend on the
-    // layer's `order_value` — only on the wall pass's `iso`. Each wall's
-    // isosurface extraction reports one `total_units` step as it finishes,
-    // so `on_progress` keeps advancing through this whole-mesh precompute
-    // instead of only starting once the per-layer loop below begins.
-    let curved_wall_meshes: Vec<Vec<DVec3>> = if is_height {
+    // Curved path only: the *outer* (wall pass 0) wall's triangle soup,
+    // shared across every layer's `extract_order_contours_on_mesh` call
+    // below. Computed up front (outside the per-layer parallel loop) since
+    // it does not depend on the layer's `order_value` — only on wall 0's
+    // `iso`.
+    //
+    // Only wall 0 is extracted this way (a whole-mesh 3D SDF isosurface at
+    // `iso = -wall_offset`). Earlier versions extracted one such isosurface
+    // per wall pass (`iso = -(wall_offset + wall_index * wall_line_width)`),
+    // but that offsets the *entire 3D mesh* inward — including along
+    // `BUILD_DIRECTION` — so an inner wall's isosurface can retreat above
+    // the mesh's true base and simply not exist yet for the bottommost
+    // layers (any part whose base isn't vertical-walled reproducibly lost
+    // its inner wall(s) for the first several layers). Inner walls
+    // (`wall_index >= 1`) are instead derived per-layer in the loop below
+    // by 2D-offsetting the previous wall's *own already-extracted* loop
+    // in the layer's tangent plane and reprojecting onto the order field —
+    // the same technique already used for `infill_boundary` below — which
+    // stays anchored to this layer's real geometry and only ever
+    // offsets/reconstructs, never re-probes a separately-shrunk 3D mesh.
+    let outer_wall_mesh: Vec<DVec3> = if is_height {
         Vec::new()
     } else {
         let full_diagonal = (max - min).length();
@@ -400,23 +413,18 @@ pub fn slice_mesh_with_progress(
             config.nozzle_diameter,
             CONTOUR_REFINEMENT_DIVISOR,
         );
-        (0..wall_count)
-            .into_par_iter()
-            .map(|wall_index| {
-                let iso = -(config.wall_offset + wall_index as f64 * config.wall_line_width);
-                let vertices = extract_isosurface::<MeshSdf>(&*sdf, min, max, iso_resolution, iso);
-                // `extract_order_contours_on_mesh` walks a flat position soup
-                // (see its doc comment), decoupled from `marching_cubes`'s
-                // `Vertex` (position + normal) — no `OrderField` dependency
-                // is added to `marching_cubes` itself.
-                let positions: Vec<DVec3> = vertices.into_iter().map(|v| v.position).collect();
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Ok(mut callback) = progress_callback.lock() {
-                    callback(done as f64 / total_units as f64);
-                }
-                positions
-            })
-            .collect()
+        let iso = -config.wall_offset;
+        let vertices = extract_isosurface::<MeshSdf>(&*sdf, min, max, iso_resolution, iso);
+        // `extract_order_contours_on_mesh` walks a flat position soup (see
+        // its doc comment), decoupled from `marching_cubes`'s `Vertex`
+        // (position + normal) — no `OrderField` dependency is added to
+        // `marching_cubes` itself.
+        let positions: Vec<DVec3> = vertices.into_iter().map(|v| v.position).collect();
+        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut callback) = progress_callback.lock() {
+            callback(done as f64 / total_units as f64);
+        }
+        positions
     };
 
     let layers: Vec<Layer> = order_values
@@ -444,14 +452,52 @@ pub fn slice_mesh_with_progress(
                     );
                 }
             } else {
-                for (wall_index, triangle_positions) in curved_wall_meshes.iter().enumerate() {
-                    let wall_loops =
-                        extract_order_contours_on_mesh(triangle_positions, &*field, order_value);
+                // Wall 0: straight from the mesh's actual isosurface (see
+                // `outer_wall_mesh`'s doc comment above).
+                let wall0_loops =
+                    extract_order_contours_on_mesh(&outer_wall_mesh, &*field, order_value);
+                loops.extend(wall0_loops.iter().cloned().map(|points| WallLoop {
+                    wall_index: 0,
+                    points,
+                }));
+                // Walls 1..wall_count: each one `wall_line_width` step
+                // further inward than the previous, derived by offsetting
+                // the previous wall's own loop in the tangent plane and
+                // reconstructing onto this layer's order-field isosurface
+                // (see `outer_wall_mesh`'s doc comment for why, and
+                // `infill_boundary`'s curved-path computation below for the
+                // same technique applied one step further in). Stops early
+                // for a layer whose cross-section is too small to fit every
+                // configured wall (e.g. near a tapered tip) rather than
+                // producing garbage from an empty/degenerate offset.
+                let mut previous_loops = wall0_loops;
+                for wall_index in 1..wall_count {
+                    if previous_loops.is_empty() {
+                        break;
+                    }
+                    let loops_2d = polygon2d::to_2d(&previous_loops, basis1, basis2, origin);
+                    let offset_2d = polygon2d::inward_offset(&loops_2d, config.wall_line_width);
+                    if offset_2d.is_empty() {
+                        break;
+                    }
+                    let reconstructed = order_field::reconstruct_on_order_field_near(
+                        offset_2d,
+                        &previous_loops,
+                        basis1,
+                        basis2,
+                        BUILD_DIRECTION,
+                        origin,
+                        order_value,
+                        order_field::max_along_for(config),
+                        &*field,
+                    );
                     loops.extend(
-                        wall_loops
-                            .into_iter()
+                        reconstructed
+                            .iter()
+                            .cloned()
                             .map(|points| WallLoop { wall_index, points }),
                     );
+                    previous_loops = reconstructed;
                 }
             }
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
