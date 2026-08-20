@@ -34,6 +34,7 @@ const COLOR_WALL_INNER: [f32; 4] = [0.6, 0.8, 1.0, 1.0];
 const COLOR_INFILL: [f32; 4] = [0.95, 0.65, 0.15, 1.0];
 const COLOR_BRIDGE: [f32; 4] = [0.9, 0.2, 0.75, 1.0];
 const COLOR_OVERHANG: [f32; 4] = [0.9, 0.15, 0.15, 1.0];
+const COLOR_TOP_SURFACE: [f32; 4] = [0.2, 0.85, 0.4, 1.0];
 const COLOR_TRAVEL: [f32; 4] = [0.4, 0.4, 0.4, 0.4];
 
 /// Fixed `MoveKind` -> RGBA color palette used for toolpath preview
@@ -45,6 +46,7 @@ fn palette_color(kind: MoveKind) -> [f32; 4] {
         MoveKind::Infill => COLOR_INFILL,
         MoveKind::Bridge => COLOR_BRIDGE,
         MoveKind::Overhang => COLOR_OVERHANG,
+        MoveKind::TopSurface => COLOR_TOP_SURFACE,
         MoveKind::Travel => COLOR_TRAVEL,
     }
 }

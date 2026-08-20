@@ -1240,10 +1240,10 @@ pub fn validate_within_bounds(paths: &[Path], build_volume: &BoundingVolume) -> 
 /// Chooses the Gcode feedrate (`Segment::speed`, mm/min) for a segment of
 /// the given `kind`, from `config`. [`MoveKind::Travel`] uses
 /// `config.travel_speed`; every extruding kind (`WallOuter`/`WallInner`/
-/// `Infill`/`Bridge`/`Overhang`) uses `config.print_speed` -- there is no
-/// finer-grained per-extruding-kind speed yet (e.g. a separate bridge
-/// speed), so all of them share one "print speed" until that becomes
-/// configurable.
+/// `Infill`/`Bridge`/`Overhang`/`TopSurface`) uses `config.print_speed` --
+/// there is no finer-grained per-extruding-kind speed yet (e.g. a
+/// separate bridge speed), so all of them share one "print speed" until
+/// that becomes configurable.
 #[must_use]
 pub fn speed_for_kind(kind: MoveKind, config: &SlicerConfig) -> f64 {
     match kind {
@@ -1252,7 +1252,8 @@ pub fn speed_for_kind(kind: MoveKind, config: &SlicerConfig) -> f64 {
         | MoveKind::WallInner
         | MoveKind::Infill
         | MoveKind::Bridge
-        | MoveKind::Overhang => config.print_speed,
+        | MoveKind::Overhang
+        | MoveKind::TopSurface => config.print_speed,
     }
 }
 
@@ -1268,6 +1269,16 @@ pub enum MoveKind {
     Infill,
     Bridge,
     Overhang,
+    /// A wall-0 point with solid mesh material directly beneath it (real
+    /// support, per [`WallLoop::top_surface`]/[`WallLoop::unsupported`])
+    /// but nothing solid directly above it one nozzle-diameter along
+    /// `-BUILD_DIRECTION` -- i.e. the last printed point before open air
+    /// going forward, the roof of the part rather than an unsupported
+    /// gap. Distinct from `Overhang` (nothing solid *beneath*): a point
+    /// can be `TopSurface` while still fully supported from below, and
+    /// this classification never overrides a genuine `Overhang` -- see
+    /// `plan`'s segment-classification loop.
+    TopSurface,
     Travel,
 }
 
@@ -1469,6 +1480,8 @@ pub fn plan_with_progress(
                         let dest = (i + 1) % point_count.max(1);
                         let kind = if wall_loop.unsupported.get(dest).copied().unwrap_or(false) {
                             MoveKind::Overhang
+                        } else if wall_loop.top_surface.get(dest).copied().unwrap_or(false) {
+                            MoveKind::TopSurface
                         } else {
                             base_kind
                         };
@@ -1987,12 +2000,14 @@ mod tests {
                     wall_index: 0,
                     points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
                     wall_index: 1,
                     points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
             ],
@@ -2029,18 +2044,21 @@ mod tests {
                     wall_index: 0,
                     points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
                     wall_index: 1,
                     points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
                     wall_index: 2,
                     points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
             ],
@@ -2099,6 +2117,7 @@ mod tests {
                         DVec3::new(0.0, 1.0, 0.0),
                     ],
                     unsupported: vec![false, false, true, false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0, 0.25, 0.5, 0.75],
                 },
                 // wall_index 1: no unsupported points -- must be unaffected
@@ -2107,6 +2126,7 @@ mod tests {
                     wall_index: 1,
                     points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
             ],

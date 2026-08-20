@@ -111,14 +111,16 @@ pub fn segment_extrusion_length(distance: f64, bead_area: f64, filament_area: f6
 /// and is clamped to `config.wall_line_width.min(config.nozzle_diameter)`:
 /// an unsupported line must never be wider than the nozzle diameter,
 /// since there's no supporting surface underneath for the extra
-/// squish/spread a wider bead needs. `Bridge` remains a
-/// forward-compatible placeholder mapped to `config.infill_line_width`
-/// (no detection logic currently emits it -- see `toolpath::plan`).
-/// `Travel` is never extruded and returns `0.0`.
+/// squish/spread a wider bead needs. `TopSurface` is a fully-supported
+/// wall-0 point (see `MoveKind::TopSurface`'s docs), so it uses the
+/// ordinary `wall_line_width` like `WallOuter`/`WallInner`. `Bridge`
+/// remains a forward-compatible placeholder mapped to
+/// `config.infill_line_width` (no detection logic currently emits it --
+/// see `toolpath::plan`). `Travel` is never extruded and returns `0.0`.
 #[must_use]
 pub fn line_width_for_kind(kind: MoveKind, config: &SlicerConfig) -> f64 {
     match kind {
-        MoveKind::WallOuter | MoveKind::WallInner => config.wall_line_width,
+        MoveKind::WallOuter | MoveKind::WallInner | MoveKind::TopSurface => config.wall_line_width,
         MoveKind::Infill | MoveKind::Bridge => config.infill_line_width,
         MoveKind::Overhang => config.wall_line_width.min(config.nozzle_diameter),
         MoveKind::Travel => 0.0,

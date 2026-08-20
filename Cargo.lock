@@ -2463,6 +2463,7 @@ dependencies = [
  "glam 0.29.3",
  "manifold-core",
  "manifold-fidget",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

@@ -178,6 +178,30 @@ pub struct WallLoop {
     /// start/seam position around each wall loop across layers to avoid
     /// a visible seam ridge), so do not remove/recompute-and-discard it.
     pub arc_fraction: Vec<f64>,
+    /// Per-point flag marking wall-0 points with solid mesh material
+    /// directly beneath them (real support) but nothing solid one
+    /// nozzle-diameter along `-BUILD_DIRECTION` (i.e. "forward"/upward,
+    /// the not-yet-printed side) -- the last printed material before
+    /// open air going forward, i.e. the roof/top surface of the part at
+    /// this point, not a genuine unsupported overhang. Computed by
+    /// `stitch_wall_gaps` via `has_solid_material_in_direction` probed
+    /// with `-BUILD_DIRECTION` (the mirror image of the `BUILD_DIRECTION`
+    /// probe that produces `unsupported`/the wall-gap-stitch veto -- see
+    /// that function's docs for why the two probes must go in opposite,
+    /// not the same, direction). A point can be `top_surface == true` and
+    /// `unsupported[i] == false` at the same time: being the top of the
+    /// part does not mean it lacks support from below. `toolpath::plan`
+    /// maps segments touching a `true` point to `MoveKind::TopSurface`
+    /// unless that same point is also `unsupported`, in which case the
+    /// genuine-overhang classification wins (see `plan`'s docs). Another
+    /// parallel `Vec` sibling to `points`/`unsupported`/`arc_fraction`
+    /// (same invariant: `top_surface.len() == points.len()` for
+    /// wall-index-0 loops after `stitch_wall_gaps` runs; may be shorter
+    /// or empty for loops it never touches -- e.g. inner walls, or
+    /// hand-built loops in tests -- so readers use `.get(i)` rather than
+    /// direct indexing, mirroring `unsupported`'s existing read pattern
+    /// in `plan`).
+    pub top_surface: Vec<bool>,
 }
 
 /// Build/order direction for this MVP: conventional planar slicing along
@@ -620,6 +644,7 @@ pub fn slice_mesh_with_progress(
                         WallLoop {
                             wall_index,
                             unsupported: vec![false; points.len()],
+                            top_surface: Vec::new(),
                             arc_fraction,
                             points,
                         }
@@ -639,6 +664,7 @@ pub fn slice_mesh_with_progress(
                     WallLoop {
                         wall_index: 0,
                         unsupported: vec![false; points.len()],
+                        top_surface: Vec::new(),
                         arc_fraction,
                         points,
                     }
@@ -679,6 +705,7 @@ pub fn slice_mesh_with_progress(
                         WallLoop {
                             wall_index,
                             unsupported: vec![false; points.len()],
+                            top_surface: Vec::new(),
                             arc_fraction,
                             points,
                         }
@@ -1066,6 +1093,156 @@ fn chord_stays_in_solid(mesh_sdf: Option<&MeshSdf>, a: DVec3, b: DVec3, toleranc
     })
 }
 
+/// Whether solid mesh material genuinely exists one nozzle-diameter away
+/// from `point` along `probe_direction`, used both as the wall-gap-stitch
+/// support veto in [`stitch_wall_gaps`] (probed with [`BUILD_DIRECTION`],
+/// i.e. "backward"/already-printed) and as the [`WallLoop::top_surface`]
+/// tag (probed with `-BUILD_DIRECTION`, i.e. "forward"/not-yet-printed).
+/// True vertical, not the local order-field gradient -- see below for why.
+///
+/// The previous-wall-0-loop veto in `stitch_wall_gaps` assumes "no
+/// previous wall-0 point laterally nearby" implies "no material below" --
+/// true for a Height order field (the wall-0 contour is the mesh's true
+/// cross-section boundary at every layer), but not when the local surface
+/// is nearly (but not exactly) perpendicular to the build direction: a
+/// small deviation from perpendicular means the previous layer's wall-0
+/// contour, which tracks a curved order-field isosurface rather than a
+/// flat height plane, can sit noticeably farther away laterally than one
+/// nozzle radius even though the point sits on an ordinary near-vertical
+/// wall with solid material directly underneath it in the traditional
+/// vertical sense. Confirmed on `pug_v4_l_sop_85mm.stl` layer 2: a
+/// 131-point wall-0 run was flagged unsupported although every sampled
+/// point had mesh SDF around -0.2 to -0.3 (well inside solid) and the
+/// order field increased smoothly (0.2->0.4) with no void along the
+/// straight line to the nearest real previous-layer point -- ruling out
+/// a genuine geodesic detour and pointing at exactly this
+/// contour/volume mismatch instead.
+///
+/// Deliberately probes along `BUILD_DIRECTION`/`-BUILD_DIRECTION` rather
+/// than the local order-field gradient: a *genuine* overhang/bridge, by
+/// definition, has open air directly beneath it in the ordinary vertical
+/// sense (that is what makes it an overhang), so the support veto
+/// correctly does not fire there. An ordinary near-vertical wall that the
+/// curved order field simply traces along a different lateral path from
+/// one layer to the next always has solid material directly beneath it
+/// vertically, so the veto correctly does fire there. Probing along the
+/// local gradient instead (an earlier version of this fix) is too
+/// permissive: near any solid surface, "some solid exists somewhere back
+/// along the local climb direction" is close to always true, including
+/// for genuine overhangs, since the model itself is solid just off to
+/// the side of the void being bridged -- that version suppressed real
+/// stitching entirely on both `pug_v4_l_sop_85mm.stl` and
+/// `pug_v4_m_sop_85mm.stl`. `None` for `mesh_sdf` reports no material
+/// (nothing to check against), consistent with [`chord_stays_in_solid`]'s
+/// `None` handling.
+///
+/// IMPORTANT: `probe_direction` must be `BUILD_DIRECTION` for the
+/// support veto (checking the already-printed side) and `-BUILD_DIRECTION`
+/// for the `top_surface` tag (checking the not-yet-printed side) --
+/// passing `-BUILD_DIRECTION` for the support veto was an earlier bug in
+/// this function (it always probed forward/upward instead of
+/// backward/downward), which caused genuine top-of-part surfaces --
+/// correctly lacking material above them -- to be misread as lacking
+/// support *below* them and misclassified as `Overhang`. The two probes
+/// are deliberately independent (a point can read solid-below and
+/// void-above at the same time: that is exactly a top surface, not a
+/// contradiction), so this function does not try to combine them itself
+/// -- callers request exactly the side they need.
+///
+/// Both prior versions of the support veto (local-gradient-probe, then
+/// the original single-point `BUILD_DIRECTION`-probe-one-`layer_height`-
+/// back version) turned out to suppress essentially *all* wall-gap
+/// stitching on the real `pug_v4_m_sop_85mm.stl` mesh, not just false
+/// positives: with `layer_height` typically much smaller than a nozzle
+/// diameter, probing only `layer_height` straight back is too shallow to
+/// distinguish "thin near-vertical wall, just printed" from "genuine
+/// void" -- confirmed by an A/B diagnostic
+/// (`crates/manifold-cli/examples/diagnose_missing_overhang.rs`) showing
+/// 5000 Overhang segments before this veto existed and 0 after, in both
+/// tested configurations. This version instead probes a full
+/// `nozzle_diameter` back (deep enough to actually clear a thin wall),
+/// and at both edges of the bead's nominal footprint (`point ± tangent *
+/// wall_line_width/2`), not just its centerline, since a bead lays down
+/// material across its full width, not a zero-width line. If both edges
+/// read solid, the point reads supported (`true`). If both read void, it
+/// does not (`false`). If the two edges disagree, the point straddles a
+/// real solid/void boundary: the boundary is located by bisection along
+/// the straight line between the two edge probes (refined to within
+/// `wall_line_width / 8`), and the point is only treated as solid-backed
+/// if the solid side covers a majority of the bead's footprint width.
+fn has_solid_material_in_direction(
+    mesh_sdf: Option<&MeshSdf>,
+    point: DVec3,
+    tangent: DVec3,
+    nozzle_diameter: f64,
+    wall_line_width: f64,
+    probe_direction: DVec3,
+) -> bool {
+    let Some(sdf) = mesh_sdf else {
+        return false;
+    };
+    let tangent = if tangent.length_squared() > 1e-12 {
+        tangent.normalize()
+    } else {
+        return false;
+    };
+
+    // Probe a full nozzle diameter away (not just one layer height): a
+    // shallow one-layer-height probe sits too close to `point` itself to
+    // distinguish "just-printed thin near-vertical wall" from "genuine
+    // open void" -- on the real `pug_v4_m_sop_85mm.stl` mesh this shallow
+    // version vetoed 100% of wall-gap stitching (all 5000 previously
+    // generated Overhang segments vanished), including on true overhangs.
+    let depth = nozzle_diameter;
+    // ...and across the bead's full nominal footprint width (both edges,
+    // not just the centerline) -- a bead is not a zero-width line, so
+    // "supported" should mean the material it lays down actually has
+    // something solid beneath it, not just its centerline.
+    let half_width = wall_line_width * 0.5;
+    let tolerance = nozzle_diameter * 0.5;
+    let probe_at = |offset: f64| point + tangent * offset + probe_direction * depth;
+    let edge_a = probe_at(half_width);
+    let edge_b = probe_at(-half_width);
+    let inside = |p: DVec3| sdf.sample(p).value <= tolerance;
+    let a_inside = inside(edge_a);
+    let b_inside = inside(edge_b);
+    if a_inside && b_inside {
+        return true;
+    }
+    if !a_inside && !b_inside {
+        return false;
+    }
+
+    // Mixed: one edge sits over solid, the other over void -- this point
+    // is straddling a real solid/void boundary rather than being cleanly
+    // solid-backed or cleanly void. Bisect along the straight line
+    // between the two edge probes to locate that boundary to within an
+    // 1/8-line-width tolerance, then call it solid-backed only if the
+    // solid side covers a majority of the bead's footprint (the boundary
+    // sits past the bead's own centerline).
+    let bisect_tolerance = (wall_line_width / 8.0).max(1e-6);
+    let (mut inside_pt, outside_pt) = if a_inside {
+        (edge_a, edge_b)
+    } else {
+        (edge_b, edge_a)
+    };
+    let mut lo = inside_pt;
+    let mut hi = outside_pt;
+    while lo.distance(hi) > bisect_tolerance {
+        let mid = lo.lerp(hi, 0.5);
+        if inside(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    inside_pt = lo;
+
+    let known_inside_edge = if a_inside { edge_a } else { edge_b };
+    let supported_len = inside_pt.distance(known_inside_edge);
+    supported_len / wall_line_width.max(1e-9) >= 0.5
+}
+
 fn stitch_wall_gaps(layers: &mut [Layer], config: &SlicerConfig, basis1: DVec3, basis2: DVec3) {
     let hop_limit = WALL_GAP_HOP_FRACTION * (config.nozzle_diameter / 2.0);
     if !hop_limit.is_finite() || hop_limit <= 0.0 {
@@ -1324,8 +1501,9 @@ fn stitch_wall_gaps(layers: &mut [Layer], config: &SlicerConfig, basis1: DVec3, 
                 let needs_stitch: Vec<bool> = wall
                     .points
                     .iter()
+                    .enumerate()
                     .zip(correspondences.iter())
-                    .map(|(point, corresponding)| {
+                    .map(|((i, point), corresponding)| {
                         if lateral_gap(field.as_ref(), *corresponding, *point) <= hop_limit {
                             return false;
                         }
@@ -1353,7 +1531,14 @@ fn stitch_wall_gaps(layers: &mut [Layer], config: &SlicerConfig, basis1: DVec3, 
                             loop_points
                                 .iter()
                                 .any(|prev| lateral_gap(field.as_ref(), *prev, *point) <= hop_limit)
-                        }) && chord_stays_in_solid(
+                        }) && !has_solid_material_in_direction(
+                            mesh_sdf.as_deref(),
+                            *point,
+                            wall.points[(i + 1) % n] - wall.points[(i + n - 1) % n],
+                            config.nozzle_diameter,
+                            config.wall_line_width,
+                            BUILD_DIRECTION,
+                        ) && chord_stays_in_solid(
                             mesh_sdf.as_deref(),
                             *corresponding,
                             *point,
@@ -1419,6 +1604,34 @@ fn stitch_wall_gaps(layers: &mut [Layer], config: &SlicerConfig, basis1: DVec3, 
                 wall.unsupported = new_unsupported;
                 wall.arc_fraction = new_arc_fraction;
             }
+        }
+
+        // Tag every wall-0 point as `top_surface` when there is no solid
+        // mesh material a nozzle-diameter above it (probing
+        // `-BUILD_DIRECTION`, the not-yet-printed side) -- independent of
+        // the stitching/support logic above (which probes the opposite,
+        // already-printed side), and computed unconditionally (even on
+        // the very first layer, which has no `previous_wall0` to compare
+        // against) since it only depends on this layer's own mesh SDF and
+        // final (post-stitch) points.
+        let mesh_sdf = layer.mesh_sdf.clone();
+        for wall in layer.loops.iter_mut().filter(|wall| wall.wall_index == 0) {
+            let n = wall.points.len();
+            wall.top_surface = (0..n)
+                .map(|i| {
+                    let point = wall.points[i];
+                    let tangent = wall.points[(i + 1) % n] - wall.points[(i + n - 1) % n];
+                    has_solid_material_in_direction(
+                        mesh_sdf.as_deref(),
+                        point,
+                        tangent,
+                        config.nozzle_diameter,
+                        config.wall_line_width,
+                        -BUILD_DIRECTION,
+                    )
+                })
+                .map(|has_material_above| !has_material_above)
+                .collect();
         }
 
         previous_wall0 = Some((layer.order, current_wall0));
@@ -2027,10 +2240,10 @@ fn serpentine_stitch_block<F: OrderField + ?Sized>(
         // starting from `targets[0]` (`wall.points[i..=run_end]` in
         // arrival order) regardless of which column the last emitted row
         // happens to land on after duplicate-skipping.
-        let trailing_ok = sequence.last().is_none_or(|&(_, p)| chord_ok(p, targets[0]));
-        let interior_ok = sequence
-            .windows(2)
-            .all(|w| chord_ok(w[0].1, w[1].1));
+        let trailing_ok = sequence
+            .last()
+            .is_none_or(|&(_, p)| chord_ok(p, targets[0]));
+        let interior_ok = sequence.windows(2).all(|w| chord_ok(w[0].1, w[1].1));
         if !(leading_ok && trailing_ok && interior_ok) {
             return;
         }
@@ -3254,6 +3467,7 @@ mod tests {
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
+                    top_surface: Vec::new(),
                     arc_fraction: compute_arc_fractions(&[
                         DVec3::new(0.0, 0.0, 0.0),
                         DVec3::new(1.0, 0.0, 0.0),
@@ -3269,6 +3483,7 @@ mod tests {
                     wall_index: 0,
                     points: vec![DVec3::new(0.01, 0.0, -0.05), DVec3::new(1.01, 0.0, -0.05)],
                     unsupported: vec![false, false],
+                    top_surface: Vec::new(),
                     arc_fraction: compute_arc_fractions(&[
                         DVec3::new(0.01, 0.0, -0.05),
                         DVec3::new(1.01, 0.0, -0.05),
@@ -3307,6 +3522,7 @@ mod tests {
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
                     unsupported: vec![false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0],
                 }],
                 order_field: Arc::clone(&field),
@@ -3319,6 +3535,7 @@ mod tests {
                     wall_index: 0,
                     points: vec![DVec3::new(2.0, 0.0, -0.2)],
                     unsupported: vec![false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0],
                 }],
                 order_field: Arc::clone(&field),
@@ -3405,6 +3622,7 @@ mod tests {
                 loops: vec![WallLoop {
                     wall_index: 0,
                     unsupported: vec![false; prev_points.len()],
+                    top_surface: Vec::new(),
                     arc_fraction: compute_arc_fractions(&prev_points),
                     points: prev_points,
                 }],
@@ -3417,6 +3635,7 @@ mod tests {
                 loops: vec![WallLoop {
                     wall_index: 0,
                     unsupported: vec![false; cur_points.len()],
+                    top_surface: Vec::new(),
                     arc_fraction: compute_arc_fractions(&cur_points),
                     points: cur_points,
                 }],
@@ -3471,6 +3690,7 @@ mod tests {
                 loops: vec![WallLoop {
                     wall_index: 0,
                     unsupported: vec![false; prev_points.len()],
+                    top_surface: Vec::new(),
                     arc_fraction: compute_arc_fractions(&prev_points),
                     points: prev_points,
                 }],
@@ -3483,6 +3703,7 @@ mod tests {
                 loops: vec![WallLoop {
                     wall_index: 0,
                     unsupported: vec![false; cur_points.len()],
+                    top_surface: Vec::new(),
                     arc_fraction: compute_arc_fractions(&cur_points),
                     points: cur_points,
                 }],
@@ -3636,6 +3857,7 @@ mod tests {
                     wall_index: 0,
                     arc_fraction: compute_arc_fractions(&prev_points),
                     unsupported: vec![false; prev_points.len()],
+                    top_surface: Vec::new(),
                     points: prev_points,
                 }],
                 order_field: Arc::clone(&field),
@@ -3648,6 +3870,7 @@ mod tests {
                     wall_index: 0,
                     arc_fraction: compute_arc_fractions(&cur_points),
                     unsupported: vec![false; cur_points.len()],
+                    top_surface: Vec::new(),
                     points: cur_points,
                 }],
                 order_field: Arc::clone(&field),
@@ -3729,6 +3952,7 @@ mod tests {
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
                     unsupported: vec![false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0],
                 }],
                 order_field: Arc::clone(&field),
@@ -3741,6 +3965,7 @@ mod tests {
                     wall_index: 0,
                     points: vec![DVec3::new(7.0, 0.0, -0.2)],
                     unsupported: vec![false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0],
                 }],
                 order_field: Arc::clone(&field),
@@ -3928,12 +4153,14 @@ mod tests {
                         wall_index: 0,
                         points: vec![DVec3::new(0.0, 0.0, 0.0)],
                         unsupported: vec![false],
+                        top_surface: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
                         wall_index: 0,
                         points: vec![DVec3::new(100.0, 0.0, 0.0)],
                         unsupported: vec![false],
+                        top_surface: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                 ],
@@ -3948,12 +4175,14 @@ mod tests {
                         wall_index: 0,
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
                         unsupported: vec![false],
+                        top_surface: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
                         wall_index: 0,
                         points: vec![DVec3::new(102.0, 0.0, -0.2)],
                         unsupported: vec![false],
+                        top_surface: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                 ],
@@ -4006,12 +4235,14 @@ mod tests {
                         wall_index: 0,
                         points: vec![DVec3::new(0.0, 0.0, 0.0)],
                         unsupported: vec![false],
+                        top_surface: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
                         wall_index: 0,
                         points: vec![DVec3::new(100.0, 0.0, 0.0)],
                         unsupported: vec![false],
+                        top_surface: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                 ],
@@ -4029,12 +4260,14 @@ mod tests {
                         wall_index: 0,
                         points: vec![DVec3::new(102.0, 0.0, -0.2)],
                         unsupported: vec![false],
+                        top_surface: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
                         wall_index: 0,
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
                         unsupported: vec![false],
+                        top_surface: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                 ],
@@ -4098,6 +4331,7 @@ mod tests {
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
                     unsupported: vec![false],
+                    top_surface: Vec::new(),
                     arc_fraction: vec![0.0],
                 }],
                 order_field: Arc::clone(&field),
@@ -4111,12 +4345,14 @@ mod tests {
                         wall_index: 0,
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
                         unsupported: vec![false],
+                        top_surface: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
                         wall_index: 0,
                         points: vec![DVec3::new(1000.0, 0.0, -0.2)],
                         unsupported: vec![false],
+                        top_surface: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                 ],
@@ -4188,6 +4424,7 @@ mod tests {
                 loops: vec![WallLoop {
                     wall_index: 0,
                     unsupported: vec![false; big_square.len()],
+                    top_surface: Vec::new(),
                     arc_fraction: compute_arc_fractions(&big_square),
                     points: big_square,
                 }],
@@ -4200,6 +4437,7 @@ mod tests {
                 loops: vec![WallLoop {
                     wall_index: 0,
                     unsupported: vec![false; small_square.len()],
+                    top_surface: Vec::new(),
                     arc_fraction: compute_arc_fractions(&small_square),
                     points: small_square.clone(),
                 }],
@@ -4293,18 +4531,21 @@ mod tests {
                     WallLoop {
                         wall_index: 0,
                         unsupported: vec![false; prev_a.len()],
+                        top_surface: Vec::new(),
                         arc_fraction: compute_arc_fractions(&prev_a),
                         points: prev_a,
                     },
                     WallLoop {
                         wall_index: 0,
                         unsupported: vec![false; prev_b.len()],
+                        top_surface: Vec::new(),
                         arc_fraction: compute_arc_fractions(&prev_b),
                         points: prev_b,
                     },
                     WallLoop {
                         wall_index: 0,
                         unsupported: vec![false; prev_decoy.len()],
+                        top_surface: Vec::new(),
                         arc_fraction: compute_arc_fractions(&prev_decoy),
                         points: prev_decoy,
                     },
@@ -4318,6 +4559,7 @@ mod tests {
                 loops: vec![WallLoop {
                     wall_index: 0,
                     unsupported: vec![false; current.len()],
+                    top_surface: Vec::new(),
                     arc_fraction: compute_arc_fractions(&current),
                     points: current.clone(),
                 }],
