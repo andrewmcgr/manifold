@@ -546,7 +546,21 @@ pub fn loop_centroid_and_normal(loop_points: &[DVec3]) -> (DVec3, DVec3) {
 /// plane (which [`canonicalize_orientation`] does, and which is only valid
 /// when every loop in the layer is coplanar), each loop gets its *own*
 /// best-fit local origin/basis (see [`loop_centroid_and_normal`] +
-/// [`plane_basis`]). Nesting depth is decided by projecting a test point
+/// [`plane_basis`]) — with the Newell normal's sign first aligned against
+/// `reference` (flipped when `normal.dot(reference) < 0`). That alignment
+/// is what anchors the result to a *global* winding convention: Newell's
+/// normal follows the loop's (arbitrary, stitch-order-dependent) point
+/// order, so "CCW in the loop's own raw frame" is a tautology — without an
+/// external reference every loop would simply keep/flip relative to its
+/// own arbitrary orientation, and outer loops vs holes could come out with
+/// the *same* effective winding when later projected into a shared plane
+/// (which erases holes from any downstream NonZero-fill polygon boolean —
+/// exactly what happened on hole-through-the-base layers where the plateau
+/// edge path stitches the outer loop in the opposite direction).
+/// `reference` should be the direction downstream consumers project along
+/// (e.g. the build direction for slicing's shared-plane 2D offsets).
+///
+/// Nesting depth is decided by projecting a test point
 /// from loop `i` into loop `j`'s *own* local basis before running
 /// [`point_in_polygon`] against loop `j`'s own points (also projected into
 /// that same local basis) — i.e. every containment test is done in
@@ -558,18 +572,28 @@ pub fn loop_centroid_and_normal(loop_points: &[DVec3]) -> (DVec3, DVec3) {
 /// necessarily correctly) for a genuinely non-nested, wildly non-planar
 /// arrangement, which the order fields this codebase implements do not
 /// produce.
-fn canonicalize_orientation_per_loop_basis(loops: Vec<Vec<DVec3>>) -> Vec<Vec<DVec3>> {
-    if loops.len() <= 1 {
+fn canonicalize_orientation_per_loop_basis(
+    loops: Vec<Vec<DVec3>>,
+    reference: DVec3,
+) -> Vec<Vec<DVec3>> {
+    if loops.is_empty() {
         return loops;
     }
 
-    // Each loop's own (centroid, basis1, basis2) frame, and its own points
-    // projected into that frame.
+    // Each loop's own (centroid, basis1, basis2) frame — normal sign
+    // aligned with `reference` so "positive signed area" means the same
+    // global winding for every loop — and its own points projected into
+    // that frame.
     let frames: Vec<(DVec3, DVec3, DVec3)> = loops
         .iter()
         .map(|l| {
             let (centroid, normal) = loop_centroid_and_normal(l);
-            let (basis1, basis2) = plane_basis(normal);
+            let aligned = if normal.dot(reference) < 0.0 {
+                -normal
+            } else {
+                normal
+            };
+            let (basis1, basis2) = plane_basis(aligned);
             (centroid, basis1, basis2)
         })
         .collect();
@@ -667,6 +691,10 @@ pub fn extract_contours_at_order<F: ScalarField + ?Sized>(
 /// shared plane basis for the whole layer, which is exact for the
 /// concentric-nested-around-a-common-axis loops this codebase's order
 /// fields (`HeightOrderField`, `ConicalOrderField`) actually produce.
+/// `reference` anchors every loop's winding to a global convention (see
+/// that function's docs — pass the direction downstream consumers project
+/// along, e.g. the slicer's build direction): outer loops come back CCW
+/// and holes CW when viewed along `reference`.
 ///
 /// `triangle_positions` is a flat slice where every 3 consecutive entries
 /// form one triangle (matching
@@ -710,6 +738,7 @@ pub fn extract_order_contours_on_mesh<O: OrderField + ?Sized>(
     triangle_positions: &[DVec3],
     order_field: &O,
     order_value: f64,
+    reference: DVec3,
 ) -> Vec<Vec<DVec3>> {
     // Relative epsilon: generous enough to absorb floating-point noise from
     // marching-cubes' isosurface interpolation landing a hair off an
@@ -769,7 +798,7 @@ pub fn extract_order_contours_on_mesh<O: OrderField + ?Sized>(
         }
     }
 
-    canonicalize_orientation_per_loop_basis(stitch_loops(segments))
+    canonicalize_orientation_per_loop_basis(stitch_loops(segments), reference)
 }
 
 /// Builds an orthonormal in-plane basis (`basis1`, `basis2`) perpendicular
@@ -1073,7 +1102,7 @@ mod tests {
 
         let z = 0.3;
         let order_field = HeightOrderField::new(DVec3::Z);
-        let loops = extract_order_contours_on_mesh(&triangle_positions, &order_field, z);
+        let loops = extract_order_contours_on_mesh(&triangle_positions, &order_field, z, DVec3::Z);
 
         assert!(
             !loops.is_empty(),
@@ -1117,7 +1146,12 @@ mod tests {
         // so the resulting contour on the sphere is not a flat plane slice.
         let order_field = ConicalOrderField::new(DVec3::ZERO, DVec3::Z, 0.3);
         let order_value = 0.5;
-        let loops = extract_order_contours_on_mesh(&triangle_positions, &order_field, order_value);
+        let loops = extract_order_contours_on_mesh(
+            &triangle_positions,
+            &order_field,
+            order_value,
+            DVec3::Z,
+        );
 
         assert!(
             !loops.is_empty(),
@@ -1172,7 +1206,8 @@ mod tests {
         let p2 = DVec3::new(0.0, 1.0, 0.0);
         let triangle_positions = [p0, p1, p2];
 
-        let loops = extract_order_contours_on_mesh(&triangle_positions, &StepOrderField, 0.5);
+        let loops =
+            extract_order_contours_on_mesh(&triangle_positions, &StepOrderField, 0.5, DVec3::Z);
 
         for loop_points in &loops {
             for p in loop_points {
@@ -1237,7 +1272,12 @@ mod tests {
 
         let order_field = ConicalOrderField::new(DVec3::ZERO, DVec3::Z, 0.3);
         let order_value = 0.2;
-        let loops = extract_order_contours_on_mesh(&triangle_positions, &order_field, order_value);
+        let loops = extract_order_contours_on_mesh(
+            &triangle_positions,
+            &order_field,
+            order_value,
+            DVec3::Z,
+        );
 
         assert_eq!(
             loops.len(),

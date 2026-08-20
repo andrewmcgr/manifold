@@ -628,8 +628,12 @@ pub fn slice_mesh_with_progress(
             } else {
                 // Wall 0: straight from the mesh's actual isosurface (see
                 // `outer_wall_mesh`'s doc comment above).
-                let wall0_loops =
-                    extract_order_contours_on_mesh(&outer_wall_mesh, &*field, order_value);
+                let wall0_loops = extract_order_contours_on_mesh(
+                    &outer_wall_mesh,
+                    &*field,
+                    order_value,
+                    BUILD_DIRECTION,
+                );
                 loops.extend(wall0_loops.iter().cloned().map(|points| {
                     let arc_fraction = compute_arc_fractions(&points);
                     WallLoop {
