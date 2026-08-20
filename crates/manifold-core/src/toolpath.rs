@@ -321,64 +321,62 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
 /// `plan_with_progress`, which runs after this pass on the (possibly
 /// simplified) segment geometry.
 /// Compensates wall-loop contours for the nozzle's flat tip land (see
-/// `SlicerConfig::nozzle_flat_diameter`) when the local nozzle axis tilts
-/// away from the layer's own "vertical" for non-planar printing.
+/// `SlicerConfig::nozzle_flat_diameter`) when the local surface normal
+/// tilts away from the physical nozzle axis (`slicing::NOZZLE_DIRECTION`)
+/// for non-planar printing.
 ///
-/// The nozzle axis at a point `p` is modeled as the local surface normal
-/// of the layer's order-field isosurface: `-normalize(grad order(p))`
-/// (see `order_field::numeric_gradient`), which reduces to world-up for a
-/// flat `Height` field and tilts to follow the surface for `Conical`/
+/// The build surface's normal at a point `p` is modeled from the layer's
+/// order-field isosurface: `-normalize(grad order(p))` (see
+/// `order_field::numeric_gradient`), which reduces to world-up for a flat
+/// `Height` field and tilts to follow the surface for `Conical`/
 /// `Eikonal`. The flat land (radius `flat_radius`) lies in the plane
-/// perpendicular to that axis, centered on the nozzle-center path -- for a
-/// perfectly flat/untilted layer this touches the true contour
-/// symmetrically all around and needs no correction (that's what
-/// `SlicerConfig::wall_offset` already handles for the isotropic case).
+/// perpendicular to the *nozzle's* axis, centered on the nozzle-center
+/// path -- for a perfectly flat/untilted layer (surface normal parallel
+/// to the nozzle axis) this touches the true contour symmetrically all
+/// around and needs no correction (that's what `SlicerConfig::wall_offset`
+/// already handles for the isotropic case).
 ///
-/// Correction is only needed where the axis itself is turning *along the
-/// direction of travel*, i.e. where the surface has curvature in the
-/// travel direction: the flat's trailing edge (the point flat_radius
-/// behind the center, against the just-extruded material) can end up off
-/// the true contour by the amount the surface tilts over that
-/// flat-radius span. For each point this is estimated by probing the
-/// nozzle axis a `flat_radius` step to either side of the point along the
-/// *radial* (meridian/cross-section) direction -- perpendicular to both
-/// the nozzle axis and the loop's own tangent (travel) direction:
+/// Correction is only needed where the surface normal leans away from
+/// the nozzle axis: the flat's trailing edge (in the direction the
+/// surface tilts) can end up off the true contour. For each point this
+/// is estimated by projecting the (world-fixed) nozzle axis onto the
+/// tangent plane at `p`:
 ///
-/// - `radial_dir = normalize(axis.cross(tangent))`. This deliberately
-///   excludes the tangent direction itself: walking around an
-///   axisymmetric loop (e.g. a cone's constant-slope wall) rotates the
-///   axis vector purely as an artifact of going around the loop, without
-///   the surface's actual cross-sectional slope changing at all -- an
-///   earlier version of this function derived the shift direction from
-///   `axis_ahead - axis_behind` (probing along tangent) and it collapsed
-///   onto the tangent direction exactly for a cone, shifting points along
-///   their own contour instead of across it. Probing along `radial_dir`
-///   instead measures the surface's real slope profile (how the tilt
-///   changes moving toward/away from the object's core), which is the
-///   only direction the flat's footprint can actually mismatch the
-///   surface across.
-/// - `theta` = angle between the two radial-probe axes (the tilt swept
-///   over one flat-radius span in the radial direction).
+/// - `shift_dir = normalize(nozzle_dir - normal * nozzle_dir.dot(normal))`
+///   -- the component of the nozzle axis lying in `p`'s tangent plane,
+///   i.e. the direction the nozzle axis leans away from this point's own
+///   surface normal. This is deliberately *not* derived from the loop's
+///   own tangent/travel direction: walking around an axisymmetric loop
+///   (e.g. a cone's constant-slope wall) rotates the surface normal
+///   purely as an artifact of going around the loop, without the
+///   surface's actual cross-sectional slope (relative to the fixed
+///   nozzle axis) changing at all. Since `nozzle_dir` is the same fixed
+///   vector everywhere, its tangent-plane projection varies only with
+///   the local normal, not with position along the loop, so it
+///   naturally lands on the meridian/cross-section direction for such
+///   shapes without needing to reason about travel direction at all.
+/// - probing the surface normal a `flat_radius` step to either side of
+///   the point along `shift_dir` gives `theta`, the angle swept between
+///   the two probe normals over one flat-radius span.
 /// - the shift magnitude is `flat_radius * sin(theta / 2.0)`, the lateral
 ///   displacement of a chord of length `flat_radius` swept through half
-///   that turn angle, applied along `radial_dir`.
+///   that turn angle, applied along `shift_dir`.
 ///
-/// Before applying, each point checks *which* radial side actually
-/// descends toward already-printed material by comparing `field.order`
-/// at each radial probe against `layer_order + layer_height` (the order
-/// value of the layer printed just before this one -- order decreases as
-/// printing proceeds, see `slicing::BUILD_DIRECTION`): only the side
-/// that's actually closer to already-solid material gets compensated.
-/// This is the "climbing" exemption: when neither probe is meaningfully
-/// closer to solid than the other (or the point is tilting away from
-/// solid on both sides, e.g. an overhang-like climb), there's no
-/// already-printed surface for the flat to (mis)contact, so the point is
-/// left unshifted.
+/// Before applying, each point checks *which* side actually descends
+/// toward already-printed material by comparing `field.order` at each
+/// probe against `layer_order + layer_height` (the order value of the
+/// layer printed just before this one -- order decreases as printing
+/// proceeds, see `slicing::BUILD_DIRECTION`): only the side that's
+/// actually closer to already-solid material gets compensated. This is
+/// the "climbing" exemption: when neither probe is meaningfully closer to
+/// solid than the other (or the point is tilting away from solid on both
+/// sides, e.g. an overhang-like climb), there's no already-printed
+/// surface for the flat to (mis)contact, so the point is left unshifted.
 ///
-/// Degenerate cases (missing/zero gradient, near-zero curvature, a loop
-/// too short to have neighbors, or `axis`/`tangent` too close to parallel
-/// to define a radial direction) fall through as a no-op for that point
-/// rather than injecting noise -- this is a best-effort geometric
+/// Degenerate cases (missing/zero gradient, the nozzle axis parallel to
+/// the surface normal so no tangent-plane component exists, or near-zero
+/// curvature between the two probes) fall through as a no-op for that
+/// point rather than injecting noise -- this is a best-effort geometric
 /// approximation, not an exact physical simulation.
 /// Classifies how a bead extruded at `p` is supported, returning
 /// `(support_fraction, bed_fraction)` for
@@ -478,50 +476,53 @@ fn compensate_wall_loop_points(
     layer_height: f64,
     layer_order: f64,
 ) -> Vec<DVec3> {
-    let len = points.len();
     // Order value of the layer printed just before this one -- order
     // decreases as printing proceeds (see `slicing::BUILD_DIRECTION`), so
     // the already-solidified prior layer sits at a *higher* order value.
     let prev_layer_order = layer_order + layer_height;
+    let nozzle_dir = crate::slicing::NOZZLE_DIRECTION;
 
     points
         .iter()
-        .enumerate()
-        .map(|(i, &p)| {
-            let Some(axis) = crate::order_field::numeric_gradient(field, p).map(|g| -g.normalize())
+        .map(|&p| {
+            let Some(normal) =
+                crate::order_field::numeric_gradient(field, p).map(|g| -g.normalize())
             else {
                 return p;
             };
 
-            let prev_point = points[(i + len - 1) % len];
-            let next_point = points[(i + 1) % len];
-            let tangent = next_point - prev_point;
-            if tangent.length_squared() < 1e-12 {
+            // The component of the (world-fixed) nozzle axis lying in the
+            // tangent plane at `p` -- i.e. how far the nozzle axis leans
+            // away from this point's own surface normal, and in which
+            // direction. This is the only direction the flat tip's
+            // footprint can actually mismatch the surface across: probing
+            // along it (rather than along the loop's own travel/tangent
+            // direction) naturally excludes artifacts from walking around
+            // an axisymmetric loop (e.g. a cone's constant-slope wall),
+            // where the surface normal rotates purely because the loop
+            // goes around, without the true cross-sectional slope
+            // changing at all -- since `nozzle_dir` is the same fixed
+            // vector everywhere, its projection only varies with the
+            // local normal, not with loop-traversal position.
+            let projected = nozzle_dir - normal * nozzle_dir.dot(normal);
+            let shift_len = projected.length();
+            if shift_len < 1e-9 {
+                // Nozzle axis is parallel to the surface normal here (a
+                // flat tip lands flush): no correction needed.
                 return p;
             }
-            let tangent = tangent.normalize();
+            let shift_dir = projected / shift_len;
 
-            // Perpendicular to both the nozzle axis and the direction of
-            // travel: the meridian/cross-section direction, not the
-            // tangent -- see this function's doc for why tangent itself
-            // is the wrong probing direction.
-            let radial = axis.cross(tangent);
-            let radial_len = radial.length();
-            if radial_len < 1e-9 {
-                return p;
-            }
-            let radial_dir = radial / radial_len;
-
-            let probe_a = p + radial_dir * flat_radius;
-            let probe_b = p - radial_dir * flat_radius;
-            let (Some(axis_a), Some(axis_b)) = (
+            let probe_a = p + shift_dir * flat_radius;
+            let probe_b = p - shift_dir * flat_radius;
+            let (Some(normal_a), Some(normal_b)) = (
                 crate::order_field::numeric_gradient(field, probe_a).map(|g| -g.normalize()),
                 crate::order_field::numeric_gradient(field, probe_b).map(|g| -g.normalize()),
             ) else {
                 return p;
             };
 
-            let theta = axis_a.dot(axis_b).clamp(-1.0, 1.0).acos();
+            let theta = normal_a.dot(normal_b).clamp(-1.0, 1.0).acos();
             if theta < 1e-6 {
                 return p;
             }
@@ -536,13 +537,13 @@ fn compensate_wall_loop_points(
 
             let shift_mag = flat_radius * (theta / 2.0).sin();
             if score_b > score_a {
-                // Side `b` (`-radial_dir`) is the one closer to
+                // Side `b` (`-shift_dir`) is the one closer to
                 // already-printed material: pull the center back toward
                 // `a` so the flat's trailing edge on the `b` side lands
                 // on the original contour.
-                p + radial_dir * shift_mag
+                p + shift_dir * shift_mag
             } else if score_a > score_b {
-                p - radial_dir * shift_mag
+                p - shift_dir * shift_mag
             } else {
                 p
             }

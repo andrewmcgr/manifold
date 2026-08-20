@@ -211,6 +211,21 @@ pub struct WallLoop {
 /// will make this configurable.
 pub(crate) const BUILD_DIRECTION: DVec3 = DVec3::new(0.0, 0.0, -1.0);
 
+/// Physical orientation of the print head's nozzle axis, in world space.
+/// This is deliberately **not** the same thing as a layer's order-field
+/// gradient (the local build-surface normal): for a tilting/multi-axis
+/// print head the nozzle can point in a direction that differs from the
+/// surface normal at the point it is extruding, which is exactly the
+/// case flat-nozzle-tip contact compensation (`toolpath::compensate_flat_nozzle`)
+/// needs to reason about. Today every supported print head is a fixed
+/// vertical (3-axis) head, so this is always parallel to Z — but it is
+/// tracked as its own concept, independent of `BUILD_DIRECTION`/the order
+/// field, so a future tilting head only needs to supply a real per-point
+/// nozzle direction rather than requiring every call site that currently
+/// (incorrectly) assumes "nozzle axis == surface normal" to be found and
+/// fixed individually.
+pub(crate) const NOZZLE_DIRECTION: DVec3 = DVec3::new(0.0, 0.0, 1.0);
+
 /// Default divisor used to derive the marching-squares contour-extraction
 /// grid's target cell size from `SlicerConfig::nozzle_diameter` (cell_size
 /// = `nozzle_diameter / CONTOUR_REFINEMENT_DIVISOR`). `4.0` (a quarter of
