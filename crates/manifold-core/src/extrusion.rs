@@ -23,6 +23,67 @@ pub fn bead_cross_section_area(line_width: f64, layer_height: f64) -> f64 {
     height * (width - height) + std::f64::consts::PI * (height / 2.0).powi(2)
 }
 
+/// Cross-sectional area (mm^2) of a bead squished against the flat rigid
+/// build plate: a plain `width x height` rectangle with no rounded ends.
+/// The plate (unlike previously deposited, still-soft material) does not
+/// let the bead's ends curl under, so the full rectangular footprint is
+/// filled -- this is the same first-layer model planar slicers use, and
+/// under-feeding it with the stadium volume is a classic cause of
+/// first-layer underextrusion (~12% for a 0.4x0.2 bead). Width is clamped
+/// up to at least `layer_height` like [`bead_cross_section_area`].
+#[must_use]
+pub fn rectangular_bead_cross_section_area(line_width: f64, layer_height: f64) -> f64 {
+    let height = layer_height.abs().max(f64::EPSILON);
+    let width = line_width.abs().max(height);
+    width * height
+}
+
+/// Cross-sectional area (mm^2) of a bead extruded into free air (no
+/// supporting surface below at all -- a bridge/overhang): the filament
+/// keeps the nozzle bore's circular profile (die swell aside) instead of
+/// being squished into a stadium, so the full circle of `nozzle_diameter`
+/// must be fed. Note this is *more* volume per mm than the stadium for
+/// typical width/height ratios (0.1257 vs 0.0714 mm^2 at 0.4/0.2):
+/// unsupported lines underextruded at stadium flow come out as thin,
+/// saggy strands.
+#[must_use]
+pub fn circular_bead_cross_section_area(nozzle_diameter: f64) -> f64 {
+    let radius = nozzle_diameter.abs().max(f64::EPSILON) / 2.0;
+    std::f64::consts::PI * radius * radius
+}
+
+/// Support-aware bead cross-section area (mm^2): blends the three
+/// physical bead shapes by how the segment is supported.
+///
+/// - `support_fraction` (0..=1): how much previously deposited material
+///   sits directly under the bead (along the order-field's local "down").
+///   `1.0` is the fully supported stadium ([`bead_cross_section_area`],
+///   today's uniform model); `0.0` is free air
+///   ([`circular_bead_cross_section_area`]); linear blend between.
+/// - `bed_fraction` (0..=1): how much of the bead is squished directly
+///   against the build plate. Takes precedence over the
+///   stadium/circle blend ([`rectangular_bead_cross_section_area`] at
+///   `1.0`), since the plate is beneath whatever the SDF probe said.
+///
+/// Both fractions are clamped to `[0, 1]` here so callers can pass raw
+/// distance-derived ratios.
+#[must_use]
+pub fn blended_bead_cross_section_area(
+    line_width: f64,
+    layer_height: f64,
+    nozzle_diameter: f64,
+    support_fraction: f64,
+    bed_fraction: f64,
+) -> f64 {
+    let stadium = bead_cross_section_area(line_width, layer_height);
+    let circle = circular_bead_cross_section_area(nozzle_diameter);
+    let rectangle = rectangular_bead_cross_section_area(line_width, layer_height);
+    let support = support_fraction.clamp(0.0, 1.0);
+    let bed = bed_fraction.clamp(0.0, 1.0);
+    let airborne_blend = circle + (stadium - circle) * support;
+    airborne_blend + (rectangle - airborne_blend) * bed
+}
+
 /// Cross-sectional area (mm^2) of the filament being fed, treated as a
 /// perfect circle of `filament_diameter` mm (1.75mm by default -- see
 /// [`SlicerConfig::filament_diameter`]).

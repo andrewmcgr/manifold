@@ -380,6 +380,67 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
 /// to define a radial direction) fall through as a no-op for that point
 /// rather than injecting noise -- this is a best-effort geometric
 /// approximation, not an exact physical simulation.
+/// Classifies how a bead extruded at `p` is supported, returning
+/// `(support_fraction, bed_fraction)` for
+/// [`extrusion::blended_bead_cross_section_area`].
+///
+/// "Below" for a non-planar layer is along the order field's local
+/// gradient, not world-down: previously printed material lies at *lower*
+/// order values (layers are emitted in increasing `Layer::order` — see
+/// `slicing::slice_mesh_with_progress`'s order walk and
+/// `stitch_wall_gaps`' previous-layer convention), so the probe point is
+/// one layer height *against* the normalized gradient:
+/// `q = p - layer_height * normalize(grad order(p))`.
+///
+/// - **Bed contact** (`bed_fraction`): the build plate sits at `bed_z`
+///   (the print's lowest deposited point — the "rests on floor"
+///   convention). When the probe point dips below the plate, the bead is
+///   squished against it: `clamp((bed_z - q.z) / layer_height, 0, 1)`,
+///   i.e. `1.0` when `q` is a full layer below the plate (a true first
+///   layer directly on the bed) fading to `0.0` at the plate itself (a
+///   second layer sitting on the first).
+/// - **Material support** (`support_fraction`): sample the mesh SDF at
+///   `q`. Inside the mesh (`sdf <= 0`) an earlier layer deposited
+///   material there — fully supported. Fraction fades linearly to zero
+///   by one nozzle radius outside: `clamp(1 - sdf(q) / nozzle_radius,
+///   0, 1)`, giving overhang perimeters a smooth stadium->circle flow
+///   ramp instead of a binary jump. (The mesh SDF is a proxy for
+///   "printed material": exact for walls/solid regions; sparse-infill
+///   interiors read as supported, which matches the traditional slicer
+///   treatment of infill-on-infill.)
+///
+/// Degenerate cases fall back to fully-supported stadium flow (today's
+/// uniform model) rather than fabricating a bridge: missing/zero
+/// gradient uses `slicing::BUILD_DIRECTION` as the gradient direction
+/// (exact for `Height` fields), and a missing mesh SDF returns
+/// `support_fraction = 1.0`.
+fn support_fractions_at(
+    p: DVec3,
+    field: &dyn manifold_fidget::order::OrderField,
+    mesh_sdf: Option<&manifold_fidget::mesh_sdf::MeshSdf>,
+    bed_z: f64,
+    config: &SlicerConfig,
+) -> (f64, f64) {
+    let layer_height = config.layer_height.abs().max(f64::EPSILON);
+    let gradient_dir = crate::order_field::numeric_gradient(field, p)
+        .filter(|g| g.length_squared() > 1e-12 && g.is_finite())
+        .map_or(crate::slicing::BUILD_DIRECTION, |g| g.normalize());
+    let probe = p - layer_height * gradient_dir;
+
+    let bed_fraction = ((bed_z - probe.z) / layer_height).clamp(0.0, 1.0);
+
+    let support_fraction = match mesh_sdf {
+        Some(sdf) => {
+            let nozzle_radius = (config.nozzle_diameter / 2.0).max(f64::EPSILON);
+            let distance = sdf.sample(probe).value;
+            (1.0 - distance / nozzle_radius).clamp(0.0, 1.0)
+        }
+        None => 1.0,
+    };
+
+    (support_fraction, bed_fraction)
+}
+
 fn compensate_flat_nozzle(paths: Vec<Path>, layer: &Layer, config: &SlicerConfig) -> Vec<Path> {
     let flat_radius = config.nozzle_flat_diameter() / 2.0;
     if flat_radius <= f64::EPSILON {
@@ -1346,6 +1407,19 @@ pub fn plan_with_progress(
 ) -> Result<Vec<Path>> {
     let generator = infill::generator_for(config.infill_pattern);
     let filament_area = extrusion::filament_cross_section_area(config.filament_diameter);
+    // Build-plate height: the lowest wall-loop point across the whole
+    // print rests on the bed (the "rests on floor" convention shared with
+    // `object::center_on_bed` and the Eikonal seeding — the plate is at
+    // the part's minimum Z, not necessarily world z=0). Used by
+    // `support_fractions_at` to detect beads squished directly against
+    // the plate. `INFINITY` when there are no loops at all, which makes
+    // every bed test come back false.
+    let bed_z = layers
+        .iter()
+        .flat_map(|layer| &layer.loops)
+        .flat_map(|wall| &wall.points)
+        .map(|p| p.z)
+        .fold(f64::INFINITY, f64::min);
     let total_layers = layers.len().max(1) as f64;
     let completed = AtomicUsize::new(0);
     let on_progress = Mutex::new(on_progress);
@@ -1465,10 +1539,29 @@ pub fn plan_with_progress(
                         segment.extrusion_length = 0.0;
                         continue;
                     }
-                    let distance = path.points[i].distance(path.points[(i + 1) % point_count]);
+                    let start = path.points[i];
+                    let end = path.points[(i + 1) % point_count];
+                    let distance = start.distance(end);
                     let line_width = extrusion::line_width_for_kind(segment.kind, config);
-                    let bead_area =
-                        extrusion::bead_cross_section_area(line_width, config.layer_height);
+                    let (support_fraction, bed_fraction) = support_fractions_at(
+                        (start + end) * 0.5,
+                        layer.order_field.as_ref(),
+                        layer.mesh_sdf.as_deref(),
+                        bed_z,
+                        config,
+                    );
+                    // Stored for downstream consumers (flow visualization,
+                    // future speed planning): the effective "how supported is
+                    // this bead" figure actually used for its flow, with bed
+                    // contact counting as full support.
+                    segment.support_fraction = support_fraction.max(bed_fraction);
+                    let bead_area = extrusion::blended_bead_cross_section_area(
+                        line_width,
+                        config.layer_height,
+                        config.nozzle_diameter,
+                        support_fraction,
+                        bed_fraction,
+                    );
                     segment.extrusion_length =
                         extrusion::segment_extrusion_length(distance, bead_area, filament_area)
                             * segment.extrusion_rate
@@ -1642,10 +1735,13 @@ mod tests {
             .segments
             .iter()
             .all(|segment| segment.order == 0.0));
+        // Layers built without a `mesh_sdf` fall back to fully-supported
+        // flow (see `support_fractions_at`), so the extrusion pass stamps
+        // `support_fraction = 1.0` on every extruding segment.
         assert!(wall_paths[0]
             .segments
             .iter()
-            .all(|segment| segment.support_fraction == 0.0));
+            .all(|segment| segment.support_fraction == 1.0));
         assert_eq!(wall_paths[1].tool, ToolId(0));
         assert_eq!(wall_paths[1].points, loop_b);
         assert_eq!(wall_paths[1].segments.len(), wall_paths[1].points.len());
@@ -1660,7 +1756,7 @@ mod tests {
         assert!(wall_paths[1]
             .segments
             .iter()
-            .all(|segment| segment.support_fraction == 0.0));
+            .all(|segment| segment.support_fraction == 1.0));
     }
 
     #[test]
