@@ -1391,6 +1391,8 @@ fn stitch_wall_gaps(layers: &mut [Layer], config: &SlicerConfig, basis1: DVec3, 
                         field.as_ref(),
                         max_along,
                         hop_limit,
+                        mesh_sdf.as_deref(),
+                        config.nozzle_diameter / 2.0,
                         &mut new_points,
                         &mut new_unsupported,
                         &mut new_arc_fraction,
@@ -1816,6 +1818,23 @@ fn local_fallback_correspondence(
 /// to that target), keeping `out_arc_fraction` parallel to
 /// `out_points`/`out_unsupported`. Does not append the run's own target
 /// points; the caller pushes those itself.
+///
+/// Before emitting, every consecutive hop in the finished patch (anchor
+/// -> first interior point, interior point -> interior point, last
+/// interior point -> target, for every column) is checked against
+/// [`chord_stays_in_solid`] using `mesh_sdf`/`void_tolerance` (one bead
+/// radius). Unlike the initial anchor->target veto in `stitch_wall_gaps`
+/// (a single straight chord), the finished serpentine patch's own
+/// interior points follow the order field's isosurfaces and were never
+/// re-checked -- an interior point can still land on the far side of a
+/// void the straight-chord veto never had a reason to sample (confirmed
+/// on pug_v4_m: a stitched chain's interior segment crossed a void even
+/// though the run's anchor->target chord passed the initial veto). If
+/// any hop fails, the whole block is discarded exactly like a
+/// stalled/capped block whose worst residual hop didn't improve enough --
+/// the run is left unstitched (a single straight Overhang bridge)
+/// instead of printing lines through open air. `mesh_sdf = None` (layers
+/// built without one, e.g. unit-test fixtures) skips this check.
 #[allow(clippy::too_many_arguments)] // one param per geometric input/output; a config struct would obscure the patch construction this directly mirrors
 fn serpentine_stitch_block<F: OrderField + ?Sized>(
     anchors: &[DVec3],
@@ -1826,6 +1845,8 @@ fn serpentine_stitch_block<F: OrderField + ?Sized>(
     field: &F,
     max_along: f64,
     hop_limit: f64,
+    mesh_sdf: Option<&MeshSdf>,
+    void_tolerance: f64,
     out_points: &mut Vec<DVec3>,
     out_unsupported: &mut Vec<bool>,
     out_arc_fraction: &mut Vec<f64>,
@@ -1941,6 +1962,18 @@ fn serpentine_stitch_block<F: OrderField + ?Sized>(
         levels *= 2;
     };
 
+    // Build the actual printed emission sequence (row-major serpentine,
+    // duplicate-skipped) up front -- both to run the void veto over the
+    // path as it will really be printed, and to emit it once validated.
+    // This matters because the physically printed order connects
+    // `columns[i][j] -> columns[i+1][j]` (a HORIZONTAL, same-level, cross-
+    // column hop) at every row, not just the vertical anchor->...->target
+    // hops within one column: an earlier version of this veto checked
+    // only the vertical column hops and missed void crossings on these
+    // horizontal row transitions entirely (confirmed on pug_v4_m: a
+    // several-mm void-crossing hop between adjacent columns at the same
+    // row slipped through undetected).
+    let mut sequence: Vec<(usize, DVec3)> = Vec::with_capacity(cols * levels);
     #[allow(clippy::needless_range_loop)]
     // `j` indexes the ROW across every column (`columns[i][j]`); iterating `columns` directly would invert the serpentine's row-major emission order
     for j in 0..levels {
@@ -1958,13 +1991,43 @@ fn serpentine_stitch_block<F: OrderField + ?Sized>(
             // Degenerate runs (many run points sharing one previous-layer
             // anchor) make whole rows collapse to a single repeated
             // point; skip exact consecutive duplicates.
-            if out_points.last() == Some(&columns[i][j]) {
+            if sequence.last().is_some_and(|&(_, p)| p == columns[i][j]) {
                 continue;
             }
-            out_points.push(columns[i][j]);
-            out_unsupported.push(true);
-            out_arc_fraction.push(fractions[i]);
+            sequence.push((i, columns[i][j]));
         }
+    }
+
+    // Final void-crossing veto over the finished patch's own hops (see
+    // this function's docs above for why this is a separate check from
+    // the anchor->target veto already applied before this function was
+    // called): every consecutive hop in the actual printed sequence,
+    // plus its leading anchor->first-point and trailing
+    // last-point->target hops, must stay in (or hug) the solid.
+    if mesh_sdf.is_some() {
+        let chord_ok = |a: DVec3, b: DVec3| chord_stays_in_solid(mesh_sdf, a, b, void_tolerance);
+        let leading_ok = sequence
+            .first()
+            .is_none_or(|&(_, p)| chord_ok(anchors[0], p));
+        // Always `targets[0]`, not `targets[last emitted column]`: the
+        // backward-ends-at-column-0 rule normally makes them the same
+        // point, but the caller always appends the run's real points
+        // starting from `targets[0]` (`wall.points[i..=run_end]` in
+        // arrival order) regardless of which column the last emitted row
+        // happens to land on after duplicate-skipping.
+        let trailing_ok = sequence.last().is_none_or(|&(_, p)| chord_ok(p, targets[0]));
+        let interior_ok = sequence
+            .windows(2)
+            .all(|w| chord_ok(w[0].1, w[1].1));
+        if !(leading_ok && trailing_ok && interior_ok) {
+            return;
+        }
+    }
+
+    for (i, point) in sequence {
+        out_points.push(point);
+        out_unsupported.push(true);
+        out_arc_fraction.push(fractions[i]);
     }
 }
 
