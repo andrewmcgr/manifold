@@ -12,34 +12,51 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Signed-distance tolerance (mm) used by [`retain_contained_paths`] to
-/// decide whether a path point is "outside the solid": a point sampled via
-/// [`ScalarField::sample`] with a value beyond this threshold is genuinely
-/// outside real mesh material, not just float noise from a point that's
-/// meant to sit essentially on the surface. Deliberately far above f64
-/// rounding noise but far below any real printable feature (the smallest
-/// legitimate inward offset is on the order of a nozzle radius, i.e.
-/// several hundredths of a mm at minimum), so this cannot mask an actual
-/// containment failure while still tolerating numerical jitter.
-const CONTAINMENT_EPSILON: f64 = 1e-6;
+/// Signed-distance threshold (mm) beyond which a single path point counts
+/// as "outside the solid" for [`retain_contained_paths`]'s outside-point
+/// fraction rule: half a default nozzle diameter. Wall points produced by
+/// order-field reprojection near level-set topology changes (hole/bore
+/// junctions) legitimately wander a couple tenths of a millimetre off the
+/// exact surface, and inter-layer stitch points are deliberately allowed
+/// up to one bead radius outside (see `slicing::chord_stays_in_solid`) —
+/// neither must count as a containment violation.
+const CONTAINMENT_POINT_SLACK: f64 = 0.2;
 
-/// Drops any non-[`MoveKind::Travel`] path in `paths` that isn't fully
-/// contained in the real solid, using `mesh_sdf` (built directly from the
-/// mesh -- see [`Layer::mesh_sdf`]) as ground truth rather than trusting
-/// the 2D loop/boundary geometry `paths` were generated from.
+/// Fraction of a path's points that may sit beyond
+/// [`CONTAINMENT_POINT_SLACK`] before the whole path is treated as bogus
+/// geometry rather than a real path with local reprojection excursions. A
+/// genuine wall loop has thousands of points with at most a handful of
+/// outliers; the spurious fragment loops contour extraction shatters off
+/// near topology changes are small and mostly-outside.
+const CONTAINMENT_OUTSIDE_FRACTION: f64 = 0.2;
+
+/// Drops any non-[`MoveKind::Travel`] path in `paths` that isn't contained
+/// in the real solid, using `mesh_sdf` (built directly from the mesh --
+/// see [`Layer::mesh_sdf`]) as ground truth rather than trusting the 2D
+/// loop/boundary geometry `paths` were generated from.
 ///
 /// This exists as a final safety net: wall/infill loop geometry is derived
 /// from contour extraction and polygon boolean ops on
 /// `infill_boundary`/`solid_fill_boundary`, which have (rarely) produced
 /// loops that don't correspond to real solid material -- e.g. infill
-/// printed inside a hole that isn't actually part of the object. Rather
-/// than only trying to prevent every possible source of that class of bug
-/// upstream, every extruding path is re-checked here against the mesh
-/// itself and dropped wholesale if any of its points land outside the
-/// solid (see [`CONTAINMENT_EPSILON`]) -- a partially-valid path is
-/// dropped entirely rather than clipped, since splitting it would risk
-/// producing a spurious partial loop/travel move that's arguably worse
-/// than simply omitting the whole (already-wrong) path.
+/// printed inside a hole that isn't actually part of the object, or the
+/// small fragment loops contour extraction shatters off near level-set
+/// topology changes (a side hole meeting a bore), which stray millimetres
+/// outside the mesh.
+///
+/// The check is deliberately graded rather than exact: real wall loops
+/// near those same topology changes carry a few reprojection outliers up
+/// to a couple tenths of a millimetre outside the surface, and dropping a
+/// thousands-of-points wall loop for one such point visibly removes whole
+/// walls from the print (a far worse defect than the excursion itself). A
+/// path is dropped only when it is *grossly* wrong: some point further
+/// outside than `gross_tolerance` (one nozzle diameter -- more than a
+/// whole bead hanging in air), or more than
+/// [`CONTAINMENT_OUTSIDE_FRACTION`] of its points beyond
+/// [`CONTAINMENT_POINT_SLACK`]. A partially-valid path is dropped entirely
+/// rather than clipped, since splitting it would risk producing a spurious
+/// partial loop/travel move that's arguably worse than simply omitting the
+/// whole (already-wrong) path.
 ///
 /// No-op (returns `paths` unchanged) when `mesh_sdf` is `None` -- a
 /// synthetic/test [`Layer`] has no ground truth to check against, so
@@ -48,6 +65,7 @@ fn retain_contained_paths(
     paths: Vec<Path>,
     mesh_sdf: Option<&Arc<MeshSdf>>,
     order: f64,
+    gross_tolerance: f64,
 ) -> Vec<Path> {
     let Some(mesh_sdf) = mesh_sdf else {
         return paths;
@@ -66,13 +84,28 @@ fn retain_contained_paths(
             {
                 return true;
             }
-            let contained = path
-                .points
-                .iter()
-                .all(|&p| mesh_sdf.sample(p).value <= CONTAINMENT_EPSILON);
+            let mut max_distance = f64::NEG_INFINITY;
+            let mut outside_points = 0usize;
+            for &p in &path.points {
+                let d = mesh_sdf.sample(p).value;
+                max_distance = max_distance.max(d);
+                if d > CONTAINMENT_POINT_SLACK {
+                    outside_points += 1;
+                }
+            }
+            let outside_fraction = outside_points as f64 / path.points.len().max(1) as f64;
+            let contained =
+                max_distance <= gross_tolerance && outside_fraction <= CONTAINMENT_OUTSIDE_FRACTION;
             if !contained {
                 dropped_paths += 1;
                 dropped_points += path.points.len();
+                tracing::debug!(
+                    layer.order = order,
+                    points = path.points.len(),
+                    max_distance,
+                    outside_fraction,
+                    "dropping uncontained path"
+                );
             }
             contained
         })
@@ -1406,7 +1439,12 @@ pub fn plan_with_progress(
                 }
             }
 
-            let paths = retain_contained_paths(paths, layer.mesh_sdf.as_ref(), layer.order);
+            let paths = retain_contained_paths(
+                paths,
+                layer.mesh_sdf.as_ref(),
+                layer.order,
+                config.nozzle_diameter,
+            );
             let paths = compensate_flat_nozzle(paths, layer, config);
             let paths = simplify_paths(paths, config);
             let paths = optimize_travel_order(paths, config);
