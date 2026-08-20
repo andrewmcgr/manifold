@@ -1382,6 +1382,16 @@ fn stitch_wall_gaps(layers: &mut [Layer], config: &SlicerConfig, basis1: DVec3, 
                     while run_end + 1 < n && needs_stitch[run_end + 1] {
                         run_end += 1;
                     }
+                    // The real point immediately preceding this run in
+                    // the final wall (wraps for a run starting at index
+                    // 0) -- distinct from `correspondences[i]` (the
+                    // previous-LAYER anchor the block seeds from): this
+                    // is the current layer's own last non-stitch point,
+                    // and the "approach" hop from it to the block's
+                    // first emitted point is real printed geometry that
+                    // must also be checked for void crossings, not just
+                    // the anchor-seeded interior of the block.
+                    let run_predecessor = wall.points[(i + n - 1) % n];
                     serpentine_stitch_block(
                         &correspondences[i..=run_end],
                         &wall.points[i..=run_end],
@@ -1393,6 +1403,7 @@ fn stitch_wall_gaps(layers: &mut [Layer], config: &SlicerConfig, basis1: DVec3, 
                         hop_limit,
                         mesh_sdf.as_deref(),
                         config.nozzle_diameter / 2.0,
+                        run_predecessor,
                         &mut new_points,
                         &mut new_unsupported,
                         &mut new_arc_fraction,
@@ -1847,6 +1858,7 @@ fn serpentine_stitch_block<F: OrderField + ?Sized>(
     hop_limit: f64,
     mesh_sdf: Option<&MeshSdf>,
     void_tolerance: f64,
+    run_predecessor: DVec3,
     out_points: &mut Vec<DVec3>,
     out_unsupported: &mut Vec<bool>,
     out_arc_fraction: &mut Vec<f64>,
@@ -2008,7 +2020,7 @@ fn serpentine_stitch_block<F: OrderField + ?Sized>(
         let chord_ok = |a: DVec3, b: DVec3| chord_stays_in_solid(mesh_sdf, a, b, void_tolerance);
         let leading_ok = sequence
             .first()
-            .is_none_or(|&(_, p)| chord_ok(anchors[0], p));
+            .is_none_or(|&(_, p)| chord_ok(run_predecessor, p));
         // Always `targets[0]`, not `targets[last emitted column]`: the
         // backward-ends-at-column-0 rule normally makes them the same
         // point, but the caller always appends the run's real points
