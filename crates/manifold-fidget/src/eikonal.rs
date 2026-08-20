@@ -691,30 +691,36 @@ impl EikonalOrderField {
                         (occupied[nidx] && self.distances[nidx].is_finite())
                             .then(|| val_at(xm, y, z))
                     });
-                    let x_hi = (x + 1 < nx).then(|| self.idx(x + 1, y, z)).and_then(|nidx| {
-                        (occupied[nidx] && self.distances[nidx].is_finite())
-                            .then(|| val_at(x + 1, y, z))
-                    });
+                    let x_hi = (x + 1 < nx)
+                        .then(|| self.idx(x + 1, y, z))
+                        .and_then(|nidx| {
+                            (occupied[nidx] && self.distances[nidx].is_finite())
+                                .then(|| val_at(x + 1, y, z))
+                        });
 
                     let y_lo = y.checked_sub(1).and_then(|ym| {
                         let nidx = self.idx(x, ym, z);
                         (occupied[nidx] && self.distances[nidx].is_finite())
                             .then(|| val_at(x, ym, z))
                     });
-                    let y_hi = (y + 1 < ny).then(|| self.idx(x, y + 1, z)).and_then(|nidx| {
-                        (occupied[nidx] && self.distances[nidx].is_finite())
-                            .then(|| val_at(x, y + 1, z))
-                    });
+                    let y_hi = (y + 1 < ny)
+                        .then(|| self.idx(x, y + 1, z))
+                        .and_then(|nidx| {
+                            (occupied[nidx] && self.distances[nidx].is_finite())
+                                .then(|| val_at(x, y + 1, z))
+                        });
 
                     let z_lo = z.checked_sub(1).and_then(|zm| {
                         let nidx = self.idx(x, y, zm);
                         (occupied[nidx] && self.distances[nidx].is_finite())
                             .then(|| val_at(x, y, zm))
                     });
-                    let z_hi = (z + 1 < nz).then(|| self.idx(x, y, z + 1)).and_then(|nidx| {
-                        (occupied[nidx] && self.distances[nidx].is_finite())
-                            .then(|| val_at(x, y, z + 1))
-                    });
+                    let z_hi = (z + 1 < nz)
+                        .then(|| self.idx(x, y, z + 1))
+                        .and_then(|nidx| {
+                            (occupied[nidx] && self.distances[nidx].is_finite())
+                                .then(|| val_at(x, y, z + 1))
+                        });
 
                     gradients[idx] = DVec3::new(
                         axis_component(current, x_lo, x_hi),
@@ -729,7 +735,7 @@ impl EikonalOrderField {
 }
 
 impl OrderField for EikonalOrderField {
-        /// Interpolates the precomputed FMM distance grid at `p` (clamped into
+    /// Interpolates the precomputed FMM distance grid at `p` (clamped into
     /// the grid's bounding box). Nodes the front never reached remain
     /// `f64::INFINITY`.
     ///

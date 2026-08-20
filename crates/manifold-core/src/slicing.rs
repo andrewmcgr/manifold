@@ -1033,18 +1033,36 @@ fn smooth_wall_loop(wall: &mut WallLoop) {
 /// between the two layers' surfaces, so a candidate whose anchor->target
 /// chord passes through genuinely open air (a void between separate
 /// features, e.g. between the pug's ears) cannot be stitched -- inserting
-/// a serpentine there prints lines across the void. Sampled every half
-/// bead radius (capped at 64 intervals). `None` for `mesh_sdf` (layers
+/// a serpentine there prints lines across the void. Sampled every
+/// quarter bead radius (previously half), capped at 256 intervals
+/// (previously 64): the coarser half-bead-radius spacing let a narrow
+/// void spike between two in-tolerance samples go undetected on
+/// borderline chords (confirmed on both pug_v4_l and pug_v4_m -- a
+/// void-crossing stitch segment slipped through this veto with max_sdf
+/// only marginally above `tolerance`), so this veto was a false
+/// negative there, not a tolerance-strictness issue: the fix is denser
+/// sampling, not a looser or stricter threshold. A small safety margin
+/// (`CHORD_VOID_SAFETY_MARGIN_FRACTION` of `tolerance`) is subtracted
+/// from the effective threshold on top of the denser sampling: even at
+/// quarter-bead-radius spacing, a genuinely borderline chord can still
+/// land within a couple hundredths of a mm of `tolerance` (observed on
+/// pug_v4_m: max_sdf=0.2020 vs tolerance=0.2000, i.e. 0.002mm over --
+/// interpolation/sampling noise, not a real void), so this margin turns
+/// "just barely over" into a firm reject rather than requiring even more
+/// samples to chase diminishing precision. `None` for `mesh_sdf` (layers
 /// built without one, e.g. unit-test fixtures) skips the veto entirely
 /// and reports the chord as in-solid.
+const CHORD_VOID_SAFETY_MARGIN_FRACTION: f64 = 0.05;
+
 fn chord_stays_in_solid(mesh_sdf: Option<&MeshSdf>, a: DVec3, b: DVec3, tolerance: f64) -> bool {
     let Some(sdf) = mesh_sdf else {
         return true;
     };
-    let samples = ((a.distance(b) / (0.5 * tolerance).max(1e-9)).ceil() as usize).clamp(2, 64);
+    let effective_tolerance = tolerance * (1.0 - CHORD_VOID_SAFETY_MARGIN_FRACTION);
+    let samples = ((a.distance(b) / (0.25 * tolerance).max(1e-9)).ceil() as usize).clamp(2, 256);
     (0..=samples).all(|s| {
         let t = s as f64 / samples as f64;
-        sdf.sample(a.lerp(b, t)).value <= tolerance
+        sdf.sample(a.lerp(b, t)).value <= effective_tolerance
     })
 }
 
