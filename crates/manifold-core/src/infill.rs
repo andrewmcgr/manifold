@@ -360,10 +360,6 @@ impl InfillGenerator for MonotonicInfill {
             return Vec::new();
         }
 
-        let mut points: Vec<DVec3> = Vec::new();
-        let mut segments: Vec<Segment> = Vec::new();
-        let mut prev_end: Option<DVec3> = None;
-
         // `Path`'s contract (see `toolpath::Path`) is `segments[i]` ==
         // the move `points[i] -> points[i + 1]`, i.e. `segments.len() ==
         // points.len() - 1` for an open path like this boustrophedon
@@ -389,37 +385,146 @@ impl InfillGenerator for MonotonicInfill {
                 points.push(world);
             };
 
-        for (scan_index, _v, pairs) in &scanlines {
-            // Alternate traversal direction per scan line (boustrophedon)
-            // so consecutive lines' endpoints stay close, minimizing
-            // travel move length. Uses the scan-line's true ordinal (not
-            // its position within the compacted `scanlines` list) so
-            // alternation stays stable regardless of which scan-lines
-            // happened to have crossings.
-            let ordered: Vec<ScanSegment> = if scan_index.is_multiple_of(2) {
-                pairs.clone()
-            } else {
-                pairs.iter().rev().map(|&(a, b)| (b, a)).collect()
-            };
-            for (start, end) in ordered {
-                let needs_travel = prev_end != Some(start);
-                if points.is_empty() || needs_travel {
-                    push_point(&mut points, &mut segments, start, MoveKind::Travel);
-                }
-                push_point(&mut points, &mut segments, end, MoveKind::Infill);
-                prev_end = Some(end);
+        // Monotonic ordering only makes physical sense *within* a region
+        // of infill whose scan-line spans are actually part of the same
+        // physical shape — a single strictly-ascending path across the
+        // *whole* layer previously bridged genuinely disconnected runs
+        // (e.g. across a hole, a concavity, or a separate island elsewhere
+        // on the part) with an internal `MoveKind::Travel` segment fused
+        // inside one `Path`, which `toolpath::optimize_travel_order`'s
+        // greedy nearest-neighbor pass can never reconsider since it
+        // reorders whole `Path`s, not segments within one — the nozzle
+        // ended up travelling in forced scan order to a far,
+        // merely-colinear span instead of to the truly closest infill.
+        //
+        // So spans are first grouped into connected components via a
+        // row-by-row scan-line connected-component union-find (the same
+        // technique used for raster/image connected-component labeling):
+        // two spans in consecutive scanned rows belong to the same region
+        // iff their `u`-extents overlap *or nearly overlap*. A generous
+        // tolerance margin (not exact overlap) is required here: a
+        // region's boundary routinely drifts sideways by a non-trivial
+        // amount between adjacent rows for real, curved, or
+        // diagonally-scanned geometry (a slanted or Eikonal-curved edge, a
+        // diagonal 45° scan direction, ...), which an exact-overlap test
+        // misreads as a disconnection — verified against the real
+        // `pug_v4_l_sop_85mm.stl` mesh (project rule on verifying fixes
+        // against the real test mesh, not just unit tests), where exact
+        // overlap fragmented one part's infill from ~400 paths/layer into
+        // ~7,600, each just a few points long. The margin is generous
+        // (several scan-line spacings) since normal row-to-row boundary
+        // drift is on that order, while a jump between genuinely
+        // disconnected regions (this fix's motivating bug) is typically
+        // comparable to the part's own size — far larger.
+        //
+        // Each component then gets its own zigzag `Path`; ordering
+        // *between* components is deliberately left to
+        // `optimize_travel_order`/`route_travel_moves`, which already
+        // operate at `Path` granularity and can pick whichever component
+        // is truly nearest (and route around obstacles) rather than being
+        // forced to the next component in scan order.
+        let overlap_margin = (spacing * 8.0).max(config.infill_line_width.abs() * 8.0);
+
+        struct Span {
+            scan_index: usize,
+            u_min: f64,
+            u_max: f64,
+            pair: ScanSegment,
+        }
+
+        fn find(parent: &mut [usize], x: usize) -> usize {
+            if parent[x] != x {
+                parent[x] = find(parent, parent[x]);
+            }
+            parent[x]
+        }
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[ra] = rb;
             }
         }
 
-        if points.len() < 2 {
-            return Vec::new();
+        let mut parent: Vec<usize> = Vec::new();
+        let mut spans: Vec<Span> = Vec::new();
+        let mut prev_row_span_indices: Vec<usize> = Vec::new();
+        for (scan_index, _v, pairs) in &scanlines {
+            let mut row_span_indices: Vec<usize> = Vec::with_capacity(pairs.len());
+            for &pair in pairs {
+                let (u0, u1) = (pair.0.dot(u_dir), pair.1.dot(u_dir));
+                let (u_min, u_max) = if u0 <= u1 { (u0, u1) } else { (u1, u0) };
+                let id = parent.len();
+                parent.push(id);
+                spans.push(Span {
+                    scan_index: *scan_index,
+                    u_min,
+                    u_max,
+                    pair,
+                });
+                row_span_indices.push(id);
+            }
+            for &cur in &row_span_indices {
+                for &prev in &prev_row_span_indices {
+                    if spans[cur].u_min - overlap_margin <= spans[prev].u_max
+                        && spans[prev].u_min - overlap_margin <= spans[cur].u_max
+                    {
+                        union(&mut parent, cur, prev);
+                    }
+                }
+            }
+            prev_row_span_indices = row_span_indices;
         }
 
-        vec![Path {
-            points,
-            segments,
-            tool: crate::ids::ToolId::default(),
-        }]
+        // Group spans by resolved component root, preserving each
+        // component's first-appearance order so the emitted `Path`s land
+        // in a stable, natural sequence.
+        let mut order_of_root: Vec<usize> = Vec::new();
+        let mut groups: std::collections::HashMap<usize, Vec<(usize, ScanSegment)>> =
+            std::collections::HashMap::new();
+        for (i, span) in spans.iter().enumerate() {
+            let root = find(&mut parent, i);
+            let entry = groups.entry(root).or_insert_with(|| {
+                order_of_root.push(root);
+                Vec::new()
+            });
+            entry.push((span.scan_index, span.pair));
+        }
+
+        let mut all_paths: Vec<Path> = Vec::new();
+        for root in order_of_root {
+            let mut group = groups.remove(&root).expect("root was just recorded");
+            group.sort_by_key(|(scan_index, _)| *scan_index);
+
+            let mut points: Vec<DVec3> = Vec::new();
+            let mut segments: Vec<Segment> = Vec::new();
+
+            for (scan_index, pair) in group {
+                // Alternate traversal direction per scan line
+                // (boustrophedon) so consecutive lines' endpoints stay
+                // close, minimizing travel move length. Uses the
+                // scan-line's true ordinal so alternation stays stable
+                // regardless of which scan-lines happened to have
+                // crossings.
+                let (start, end) = if scan_index.is_multiple_of(2) {
+                    pair
+                } else {
+                    (pair.1, pair.0)
+                };
+                push_point(&mut points, &mut segments, start, MoveKind::Travel);
+                push_point(&mut points, &mut segments, end, MoveKind::Infill);
+            }
+
+            if points.len() >= 2 {
+                all_paths.push(Path {
+                    points,
+                    segments,
+                    tool: crate::ids::ToolId::default(),
+                });
+            }
+        }
+
+        all_paths
     }
 }
 
@@ -774,6 +879,66 @@ mod tests {
         for p in &path.points {
             assert!(p.x >= -5.001 && p.x <= 5.001, "x out of bounds: {p:?}");
             assert!(p.y >= -5.001 && p.y <= 5.001, "y out of bounds: {p:?}");
+        }
+    }
+
+    #[test]
+    fn monotonic_fill_keeps_disconnected_regions_as_separate_paths() {
+        // Two squares far apart along X, at the same Y range -- every
+        // scan row crosses both, but their spans never overlap in `u`.
+        // Monotonic ordering is only meaningful *within* each square; the
+        // fix under test is that they come back as two separate `Path`s
+        // (so `optimize_travel_order` can freely reorder/re-target them)
+        // instead of one fused zigzag `Path` that travels back and forth
+        // between the two squares on every row.
+        let layer = Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: Vec::new(),
+            infill_boundary: vec![
+                vec![
+                    DVec3::new(-5.0, -5.0, 0.0),
+                    DVec3::new(-3.0, -5.0, 0.0),
+                    DVec3::new(-3.0, 5.0, 0.0),
+                    DVec3::new(-5.0, 5.0, 0.0),
+                ],
+                vec![
+                    DVec3::new(3.0, -5.0, 0.0),
+                    DVec3::new(5.0, -5.0, 0.0),
+                    DVec3::new(5.0, 5.0, 0.0),
+                    DVec3::new(3.0, 5.0, 0.0),
+                ],
+            ],
+            solid_fill_boundary: Vec::new(),
+            ..Layer::default()
+        };
+        let config = SlicerConfig {
+            infill_line_width: 0.5,
+            infill_angle_deg: 90.0,
+            ..SlicerConfig::default()
+        };
+        let region = InfillRegion::from_layer(&layer, &config);
+        let paths = MonotonicInfill.generate(&region, &config, &layer, &Transform::identity(), 1.0);
+
+        assert_eq!(
+            paths.len(),
+            2,
+            "expected one path per disconnected square, got {}",
+            paths.len()
+        );
+        for path in &paths {
+            // Every point in a given path must stay within ONE square's
+            // bounds -- if the bug regresses, a path will contain points
+            // from both squares (and an internal travel jump between
+            // them).
+            let in_left = path.points.iter().all(|p| p.x >= -5.001 && p.x <= -2.999);
+            let in_right = path.points.iter().all(|p| p.x >= 2.999 && p.x <= 5.001);
+            assert!(
+                in_left || in_right,
+                "path mixed points from both disconnected squares: {:?}",
+                path.points
+            );
         }
     }
 
