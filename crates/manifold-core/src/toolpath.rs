@@ -548,6 +548,352 @@ fn optimize_travel_order(mut paths: Vec<Path>, config: &SlicerConfig) -> Vec<Pat
     ordered
 }
 
+/// Node budget for [`route_around_obstruction`]'s local grid search,
+/// mirroring `slicing`'s Eikonal grid node budget's role of bounding
+/// memory/compute for a dense grid, just scoped to the small local region
+/// around one blocked travel chord rather than a whole mesh.
+const MAX_TRAVEL_GRID_NODES: usize = 64_000;
+
+/// Returns whether the straight travel chord `a -> b` crosses solid
+/// material by more than `clearance` (typically one nozzle radius) at any
+/// sampled point -- the collision check [`route_travel_moves`] uses to
+/// decide whether a travel move needs routing at all. Unlike
+/// `slicing::chord_stays_in_solid` (which checks a chord *stays inside*
+/// solid, used by wall-gap stitching), this checks the opposite: whether
+/// a travel move -- which should stay in open air -- dips meaningfully
+/// *into* solid material.
+fn travel_chord_is_blocked(mesh_sdf: &MeshSdf, a: DVec3, b: DVec3, clearance: f64) -> bool {
+    let distance = a.distance(b);
+    if distance <= f64::EPSILON {
+        return false;
+    }
+    let samples = ((distance / clearance.max(1e-6)).ceil() as usize).clamp(2, 128);
+    (0..=samples).any(|s| {
+        let t = s as f64 / samples as f64;
+        mesh_sdf.sample(a.lerp(b, t)).value < -clearance
+    })
+}
+
+/// Searches a bounded local grid around the straight chord `start -> end`
+/// for a route that avoids solid material (queried via `mesh_sdf`) and
+/// respects `slope_profile`'s per-height overhang/climb limit, using
+/// Dijkstra/A*-style uniform-cost search (no heuristic -- the local grid
+/// is small enough that an admissible heuristic isn't needed for
+/// acceptable performance) over a 26-connected neighborhood.
+///
+/// The search region is `start`/`end`'s bounding box expanded by a margin
+/// (half their distance, or four grid cells, whichever is larger) so a
+/// genuine detour around an obstruction has room to be found. `cell_size`
+/// is coarsened (grown) as needed so the dense grid's total node count
+/// never exceeds [`MAX_TRAVEL_GRID_NODES`], the same node-budget technique
+/// `order_field::eikonal_field_for` uses for its whole-mesh grid, just
+/// scoped to this much smaller local region.
+///
+/// A candidate step is rejected outright (not merely penalized) if its
+/// grade -- the angle from horizontal implied by its vertical component
+/// over its horizontal run -- exceeds `slope_profile.max_slope_at` at the
+/// step's destination height: the same physical assumption already used
+/// to limit Eikonal wall steepness, since a travel move implies gantry/
+/// nozzle clearance no real geometry supports otherwise. Any accepted
+/// step with a nonzero Z component is additionally charged `z_penalty`
+/// (relative to a horizontal step of the same length), biasing the
+/// search toward horizontal detours while still allowing a genuinely
+/// necessary 3D diagonal route when it is cheaper than any
+/// horizontal-plus-vertical alternative.
+///
+/// Returns `None` if no route reaches `end`'s grid cell (e.g. it is fully
+/// enclosed by solid material within this local region) -- the caller
+/// falls back to the plain straight chord in that case.
+#[allow(clippy::too_many_arguments)]
+fn route_around_obstruction(
+    mesh_sdf: &MeshSdf,
+    slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
+    start: DVec3,
+    end: DVec3,
+    cell_size: f64,
+    z_penalty: f64,
+    clearance: f64,
+) -> Option<Vec<DVec3>> {
+    let base_cell = cell_size.max(1e-6);
+    let margin = (start.distance(end) * 0.5).max(base_cell * 4.0);
+    let min = DVec3::new(
+        start.x.min(end.x) - margin,
+        start.y.min(end.y) - margin,
+        start.z.min(end.z) - margin,
+    );
+    let max = DVec3::new(
+        start.x.max(end.x) + margin,
+        start.y.max(end.y) + margin,
+        start.z.max(end.z) + margin,
+    );
+    let extent = max - min;
+
+    let dims_for = |cell: f64| -> [usize; 3] {
+        [
+            ((extent.x / cell).ceil() as usize + 1).max(2),
+            ((extent.y / cell).ceil() as usize + 1).max(2),
+            ((extent.z / cell).ceil() as usize + 1).max(2),
+        ]
+    };
+    let mut cell = base_cell;
+    let mut dims = dims_for(cell);
+    while dims[0] * dims[1] * dims[2] > MAX_TRAVEL_GRID_NODES {
+        cell *= 1.5;
+        dims = dims_for(cell);
+    }
+
+    let index_of = |p: DVec3| -> [usize; 3] {
+        [
+            (((p.x - min.x) / cell).round() as isize).clamp(0, dims[0] as isize - 1) as usize,
+            (((p.y - min.y) / cell).round() as isize).clamp(0, dims[1] as isize - 1) as usize,
+            (((p.z - min.z) / cell).round() as isize).clamp(0, dims[2] as isize - 1) as usize,
+        ]
+    };
+    let point_of = |idx: [usize; 3]| -> DVec3 {
+        DVec3::new(
+            min.x + idx[0] as f64 * cell,
+            min.y + idx[1] as f64 * cell,
+            min.z + idx[2] as f64 * cell,
+        )
+    };
+    let flat = |idx: [usize; 3]| -> usize { (idx[2] * dims[1] + idx[1]) * dims[0] + idx[0] };
+    let coords_of = |flat_idx: usize| -> [usize; 3] {
+        [
+            flat_idx % dims[0],
+            (flat_idx / dims[0]) % dims[1],
+            flat_idx / (dims[0] * dims[1]),
+        ]
+    };
+
+    let start_idx = index_of(start);
+    let end_idx = index_of(end);
+    if start_idx == end_idx {
+        return None;
+    }
+
+    let total = dims[0] * dims[1] * dims[2];
+    let start_flat = flat(start_idx);
+    let end_flat = flat(end_idx);
+
+    #[derive(Copy, Clone, PartialEq)]
+    struct HeapEntry {
+        cost: f64,
+        idx: usize,
+    }
+    impl Eq for HeapEntry {}
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            // Reversed so `BinaryHeap` (a max-heap) pops the lowest cost
+            // first.
+            other
+                .cost
+                .partial_cmp(&self.cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    }
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut best_cost = vec![f64::INFINITY; total];
+    let mut came_from: Vec<Option<usize>> = vec![None; total];
+    best_cost[start_flat] = 0.0;
+    let mut heap = std::collections::BinaryHeap::new();
+    heap.push(HeapEntry {
+        cost: 0.0,
+        idx: start_flat,
+    });
+
+    let mut neighbor_offsets: Vec<(isize, isize, isize)> = Vec::with_capacity(26);
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                neighbor_offsets.push((dx, dy, dz));
+            }
+        }
+    }
+
+    while let Some(HeapEntry { cost, idx }) = heap.pop() {
+        if idx == end_flat {
+            break;
+        }
+        if cost > best_cost[idx] {
+            continue;
+        }
+        let cur = coords_of(idx);
+        let cur_point = point_of(cur);
+        for &(dx, dy, dz) in &neighbor_offsets {
+            let nx = cur[0] as isize + dx;
+            let ny = cur[1] as isize + dy;
+            let nz = cur[2] as isize + dz;
+            if nx < 0
+                || ny < 0
+                || nz < 0
+                || nx >= dims[0] as isize
+                || ny >= dims[1] as isize
+                || nz >= dims[2] as isize
+            {
+                continue;
+            }
+            let neighbor = [nx as usize, ny as usize, nz as usize];
+            let neighbor_point = point_of(neighbor);
+
+            if mesh_sdf.sample(neighbor_point).value < clearance {
+                continue;
+            }
+
+            let step = neighbor_point - cur_point;
+            let horizontal = (step.x * step.x + step.y * step.y).sqrt();
+            let has_z = step.z.abs() > 1e-9;
+            if has_z {
+                let angle_deg = step.z.abs().atan2(horizontal).to_degrees();
+                if angle_deg > slope_profile.max_slope_at(neighbor_point.z) {
+                    continue;
+                }
+            }
+            let step_len = step.length();
+            let step_cost = if has_z {
+                step_len * z_penalty
+            } else {
+                step_len
+            };
+            let next_cost = cost + step_cost;
+
+            let neighbor_flat = flat(neighbor);
+            if next_cost < best_cost[neighbor_flat] {
+                best_cost[neighbor_flat] = next_cost;
+                came_from[neighbor_flat] = Some(idx);
+                heap.push(HeapEntry {
+                    cost: next_cost,
+                    idx: neighbor_flat,
+                });
+            }
+        }
+    }
+
+    if !best_cost[end_flat].is_finite() {
+        return None;
+    }
+
+    let mut path_indices = vec![end_flat];
+    let mut cur = end_flat;
+    while cur != start_flat {
+        let Some(prev) = came_from[cur] else {
+            break;
+        };
+        path_indices.push(prev);
+        cur = prev;
+    }
+    path_indices.reverse();
+
+    let mut waypoints: Vec<DVec3> = vec![start];
+    for &idx in &path_indices {
+        waypoints.push(point_of(coords_of(idx)));
+    }
+    waypoints.push(end);
+    Some(waypoints)
+}
+
+/// Routes travel moves whose straight-line chord would cross solid
+/// material around it -- see ROADMAP.md's former "travel collision
+/// avoidance" open item.
+///
+/// Runs after [`optimize_travel_order`] (so it operates on the final path
+/// order) and before [`insert_z_hops`] (Z-hop still applies on top of any
+/// inserted routing waypoints). For each pair of consecutive paths,
+/// checks whether the straight travel chord connecting the first path's
+/// last point to the second path's first point stays clear of solid
+/// material (via [`travel_chord_is_blocked`] against `layer_mesh_sdf`);
+/// if it does not, searches a bounded local grid (via
+/// [`route_around_obstruction`], gated by `slope_profile`'s per-height
+/// climb limit) for a path around the obstruction and inserts it as a new
+/// all-[`MoveKind::Travel`] [`Path`] between the two, tagged with the
+/// preceding path's tool. Falls back to leaving the plain straight chord
+/// in place (today's behavior, i.e. no-op) when
+/// `config.travel_collision_avoidance_enabled` is `false`, when
+/// `layer_mesh_sdf` is `None` (e.g. a synthetic/test [`Layer`] with no
+/// real mesh), when no obstruction is detected, or when the search finds
+/// no feasible route.
+fn route_travel_moves(
+    paths: Vec<Path>,
+    layer_mesh_sdf: Option<&MeshSdf>,
+    slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
+    config: &SlicerConfig,
+) -> Vec<Path> {
+    if !config.travel_collision_avoidance_enabled || paths.len() < 2 {
+        return paths;
+    }
+    let Some(mesh_sdf) = layer_mesh_sdf else {
+        return paths;
+    };
+
+    let clearance = config.nozzle_diameter.abs().max(f64::EPSILON) / 2.0;
+    let cell_size = config
+        .layer_height
+        .abs()
+        .min(config.nozzle_diameter.abs())
+        .max(f64::EPSILON)
+        / 2.0;
+
+    let mut routed: Vec<Path> = Vec::with_capacity(paths.len());
+    let mut iter = paths.into_iter().peekable();
+    while let Some(path) = iter.next() {
+        let end = path.points.last().copied();
+        let tool = path.tool;
+        routed.push(path);
+
+        let (Some(a), Some(next)) = (end, iter.peek()) else {
+            continue;
+        };
+        let Some(&b) = next.points.first() else {
+            continue;
+        };
+        if a.distance(b) <= f64::EPSILON {
+            continue;
+        }
+        if !travel_chord_is_blocked(mesh_sdf, a, b, clearance) {
+            continue;
+        }
+        let Some(waypoints) = route_around_obstruction(
+            mesh_sdf,
+            slope_profile,
+            a,
+            b,
+            cell_size,
+            config.z_travel_penalty,
+            clearance,
+        ) else {
+            continue;
+        };
+        if waypoints.len() < 3 {
+            continue;
+        }
+        let segment_count = waypoints.len() - 1;
+        let segments = (0..segment_count)
+            .map(|_| Segment {
+                kind: MoveKind::Travel,
+                speed: speed_for_kind(MoveKind::Travel, config),
+                extrusion_rate: 0.0,
+                support_fraction: 0.0,
+                order: 0.0,
+                extrusion_length: 0.0,
+            })
+            .collect();
+        routed.push(Path {
+            points: waypoints,
+            segments,
+            tool,
+        });
+    }
+
+    routed
+}
+
 /// Reverses an open [`Path`]'s traversal direction in place: `points` and
 /// `segments` both reversed. Self-inverse and metadata-preserving -- see
 /// [`optimize_travel_order`]'s doc comment for why this works for the
@@ -932,7 +1278,14 @@ pub fn plan(
     tools: &[Tool],
     config: &SlicerConfig,
 ) -> Result<Vec<Path>> {
-    plan_with_progress(layers, objects, tools, config, &mut |_| {})
+    plan_with_progress(
+        layers,
+        objects,
+        tools,
+        config,
+        &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        &mut |_| {},
+    )
 }
 
 /// Same as [`plan`], but calls `on_progress` with a `0.0..=1.0` fraction of
@@ -955,6 +1308,7 @@ pub fn plan_with_progress(
     objects: &[Object],
     tools: &[Tool],
     config: &SlicerConfig,
+    slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     on_progress: &mut (dyn FnMut(f64) + Send),
 ) -> Result<Vec<Path>> {
     let generator = infill::generator_for(config.infill_pattern);
@@ -1056,6 +1410,7 @@ pub fn plan_with_progress(
             let paths = compensate_flat_nozzle(paths, layer, config);
             let paths = simplify_paths(paths, config);
             let paths = optimize_travel_order(paths, config);
+            let paths = route_travel_moves(paths, layer.mesh_sdf.as_deref(), slope_profile, config);
             let mut paths = insert_z_hops(paths, config);
 
             let extrusion_multiplier = tools
@@ -2374,5 +2729,114 @@ mod tests {
                 segment.extrusion_length
             );
         }
+    }
+
+    /// Unit cube spanning [0,1]^3, as a ready-to-use `MeshSdf` (same fixture
+    /// pattern as `slicing::tests::cube_mesh`).
+    fn cube_sdf_fixture() -> MeshSdf {
+        let vertices = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+            DVec3::new(0.0, 0.0, 1.0),
+            DVec3::new(1.0, 0.0, 1.0),
+            DVec3::new(1.0, 1.0, 1.0),
+            DVec3::new(0.0, 1.0, 1.0),
+        ];
+        let faces = vec![
+            [0, 2, 1],
+            [0, 3, 2], // -Z
+            [4, 5, 6],
+            [4, 6, 7], // +Z
+            [0, 1, 5],
+            [0, 5, 4], // -Y
+            [3, 7, 6],
+            [3, 6, 2], // +Y
+            [0, 4, 7],
+            [0, 7, 3], // -X
+            [1, 2, 6],
+            [1, 6, 5], // +X
+        ];
+        MeshSdf::new(vertices, faces)
+    }
+
+    #[test]
+    fn travel_chord_is_blocked_detects_a_chord_through_solid_material() {
+        let sdf = cube_sdf_fixture();
+        let clearance = 0.05;
+
+        // Straight through the cube along x at y = z = 0.5.
+        assert!(travel_chord_is_blocked(
+            &sdf,
+            DVec3::new(-1.0, 0.5, 0.5),
+            DVec3::new(2.0, 0.5, 0.5),
+            clearance,
+        ));
+
+        // Well clear of the cube.
+        assert!(!travel_chord_is_blocked(
+            &sdf,
+            DVec3::new(-1.0, 5.0, 5.0),
+            DVec3::new(2.0, 5.0, 5.0),
+            clearance,
+        ));
+    }
+
+    #[test]
+    fn route_travel_moves_replaces_a_blocked_travel_with_a_routed_path_around_solid_material() {
+        let sdf = Arc::new(cube_sdf_fixture());
+
+        let a = open_path(
+            vec![DVec3::new(-2.0, 0.5, 0.5), DVec3::new(-0.5, 0.5, 0.5)],
+            MoveKind::Infill,
+        );
+        let b = open_path(
+            vec![DVec3::new(1.5, 0.5, 0.5), DVec3::new(3.0, 0.5, 0.5)],
+            MoveKind::Infill,
+        );
+        let config = SlicerConfig::default();
+        let slope_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
+
+        let routed = route_travel_moves(vec![a, b], Some(&sdf), &slope_profile, &config);
+
+        assert_eq!(
+            routed.len(),
+            3,
+            "expected an inserted routing path between the two blocked paths"
+        );
+        let detour = &routed[1];
+        assert!(detour
+            .segments
+            .iter()
+            .all(|segment| segment.kind == MoveKind::Travel));
+
+        // Every step along the routed detour must stay clear of the solid
+        // cube (within the same clearance used to plan it).
+        let clearance = config.nozzle_diameter / 2.0;
+        for pair in detour.points.windows(2) {
+            assert!(!travel_chord_is_blocked(&sdf, pair[0], pair[1], clearance));
+        }
+    }
+
+    #[test]
+    fn route_travel_moves_is_a_no_op_when_disabled() {
+        let sdf = Arc::new(cube_sdf_fixture());
+        let a = open_path(
+            vec![DVec3::new(-2.0, 0.5, 0.5), DVec3::new(-0.5, 0.5, 0.5)],
+            MoveKind::Infill,
+        );
+        let b = open_path(
+            vec![DVec3::new(1.5, 0.5, 0.5), DVec3::new(3.0, 0.5, 0.5)],
+            MoveKind::Infill,
+        );
+        let config = SlicerConfig {
+            travel_collision_avoidance_enabled: false,
+            ..SlicerConfig::default()
+        };
+        let slope_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
+
+        let routed = route_travel_moves(vec![a, b], Some(&sdf), &slope_profile, &config);
+        assert_eq!(routed.len(), 2, "disabled pass must leave paths untouched");
     }
 }

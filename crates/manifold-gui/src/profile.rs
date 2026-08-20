@@ -80,6 +80,8 @@ mod tests {
                 path_simplify_tolerance: 0.02,
                 nozzle_flat_diameter: None,
                 travel_order_optimization_enabled: true,
+                travel_collision_avoidance_enabled: true,
+                z_travel_penalty: 8.0,
             },
         }
     }

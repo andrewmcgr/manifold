@@ -205,6 +205,29 @@ pub struct SlicerConfig {
     /// before this field existed still deserializes to `true`.
     #[serde(default = "default_travel_order_optimization_enabled")]
     pub travel_order_optimization_enabled: bool,
+    /// Whether travel-move collision avoidance
+    /// (`toolpath::route_travel_moves`) is enabled. When `true` (the
+    /// default), any inter-path travel move whose straight-line chord
+    /// would cross solid material (checked against `Layer::mesh_sdf`) is
+    /// replaced with a routed path found via a bounded local grid search,
+    /// gated by feasibility against [`Machine::slope_profile`]
+    /// (`crate::machine::Machine`) so a routed move never implies a
+    /// steeper local climb than the machine can physically clear.
+    /// `#[serde(default = "...")]` so a saved profile from before this
+    /// field existed still deserializes to `true`.
+    #[serde(default = "default_travel_collision_avoidance_enabled")]
+    pub travel_collision_avoidance_enabled: bool,
+    /// Cost multiplier applied to the vertical (Z) component of a routed
+    /// travel step in `toolpath::route_travel_moves`'s local grid search,
+    /// relative to a purely horizontal step of the same length. Larger
+    /// values bias the search toward horizontal detours over vertical
+    /// ones (lift-then-move-then-drop-shaped routes), while still
+    /// permitting a genuinely necessary 3D diagonal route when it is
+    /// cheaper than any horizontal-plus-vertical alternative. Defaults to
+    /// `8.0`. `#[serde(default = "...")]` so a saved profile from before
+    /// this field existed still deserializes to `8.0`.
+    #[serde(default = "default_z_travel_penalty")]
+    pub z_travel_penalty: f64,
 }
 
 /// Default value for [`SlicerConfig::travel_speed`]: `9000.0` mm/min
@@ -236,6 +259,18 @@ fn default_path_simplify_enabled() -> bool {
 /// [`SlicerConfig::travel_order_optimization_enabled`]: `true`.
 fn default_travel_order_optimization_enabled() -> bool {
     true
+}
+
+/// Static serde-deserialize fallback for
+/// [`SlicerConfig::travel_collision_avoidance_enabled`]: `true`.
+fn default_travel_collision_avoidance_enabled() -> bool {
+    true
+}
+
+/// Static serde-deserialize fallback for [`SlicerConfig::z_travel_penalty`]:
+/// `8.0`.
+fn default_z_travel_penalty() -> f64 {
+    8.0
 }
 
 /// Static serde-deserialize fallback for
@@ -280,6 +315,8 @@ impl Default for SlicerConfig {
             path_simplify_tolerance: nozzle_diameter / 20.0,
             nozzle_flat_diameter: None,
             travel_order_optimization_enabled: true,
+            travel_collision_avoidance_enabled: true,
+            z_travel_penalty: default_z_travel_penalty(),
         }
     }
 }
@@ -378,6 +415,7 @@ pub fn plan_toolpaths_with_progress(
         &workspace.objects,
         &workspace.machine.tools,
         &workspace.config,
+        &workspace.machine.slope_profile(),
         &mut |fraction: f64| on_progress(0.5 + fraction * 0.5),
     )?;
 
