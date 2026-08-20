@@ -361,6 +361,20 @@ impl MeshSdf {
     /// [`MeshSdf::sign_via_tie_break`], which considers every triangle
     /// whose closest point to `p` is within a tie tolerance of `closest`'s
     /// distance and picks whichever gives the most decisive alignment.
+    ///
+    /// `AMBIGUOUS_COS_THRESHOLD` is deliberately high (not just "clearly
+    /// nonzero"): confirmed on a real mesh (Voron_Design_Cube_v7.stl) that
+    /// a chosen feature's own alignment can look locally "decisive" (e.g.
+    /// `cos_angle ~= 0.35`) while still being the *wrong* feature, because
+    /// an entirely different, non-adjacent part of the surface happens to
+    /// be at a near-tied distance (differing only by float noise) and
+    /// gives the opposite sign. The chosen feature's own dot product
+    /// can't detect that kind of competing tie by construction -- it only
+    /// measures alignment with the feature the BVH happened to hand back,
+    /// not whether some unrelated feature is equally close. Erring toward
+    /// the (correct, if rarer) tie-break scan is worth the extra cost:
+    /// this safety net feeds `retain_contained_paths`, and a wrong sign
+    /// here silently drops otherwise-valid wall/infill paths wholesale.
     fn sign_at(&self, face_idx: usize, closest: DVec3, p: DVec3) -> f64 {
         match self.sign_method {
             SignMethod::Pseudonormal => {
@@ -378,7 +392,7 @@ impl MeshSdf {
                 // cos(angle between diff and normal).
                 let cos_angle = diff.dot(normal) / dist;
 
-                const AMBIGUOUS_COS_THRESHOLD: f64 = 0.2;
+                const AMBIGUOUS_COS_THRESHOLD: f64 = 0.7;
                 if cos_angle.abs() >= AMBIGUOUS_COS_THRESHOLD {
                     return if cos_angle < 0.0 { -1.0 } else { 1.0 };
                 }
