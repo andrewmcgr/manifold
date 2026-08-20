@@ -456,6 +456,111 @@ fn compensate_wall_loop_points(
         .collect()
 }
 
+/// Greedily reorders `paths` to reduce travel-move distance between them,
+/// controlled by `config.travel_order_optimization_enabled` (no-op,
+/// `paths` unchanged, when `false`).
+///
+/// Without this pass, `paths` are emitted in whatever order they were
+/// generated in (walls, then sparse infill, then solid fill, each in
+/// generation order) with no regard for where the nozzle physically ends
+/// up between them -- `gcode::emit` always starts a path with a plain
+/// `G0` from the previous path's last point, however far away that is.
+/// For patterns like scanline infill this routinely produces long travel
+/// moves that jump across the whole layer to print one short line, then
+/// jump straight back.
+///
+/// Uses a simple greedy nearest-neighbor heuristic (not an optimal
+/// TSP solve -- that's overkill for a per-layer path list and would cost
+/// far more than it saves): the first path in `paths` is kept as the
+/// fixed starting anchor (its own point order/direction is never
+/// touched, and there's no prior-layer nozzle position available here --
+/// layers are planned independently in parallel, see [`plan_with_progress`]'s
+/// docs), then each subsequent step picks whichever *remaining* path has
+/// an entry point closest to the current position and appends it,
+/// updating the current position to that path's exit point.
+///
+/// A path with no closing segment (`segments.len() + 1 == points.len()`,
+/// i.e. an open path such as an infill scan-line pass -- see [`Path`]'s
+/// doc comment on the parallel-array convention) may also be considered
+/// *reversed* (entering from its last point, exiting from its first) if
+/// that orientation is closer -- reversal is `points.reverse()` +
+/// `segments.reverse()`, which is exactly self-inverse for this
+/// convention (segment `i` describes `points[i] -> points[i + 1]`, so
+/// reversing both arrays turns segment `i` into the same edge walked
+/// backward at index `len - 2 - i`, preserving every segment's
+/// kind/speed/extrusion_length -- only the direction of travel along it
+/// changes). Closed loops (walls) are never reversed or start-rotated:
+/// their `points[0]` is meaningful (indexed by the upstream wall-gap
+/// stitching/arc-length-correspondence passes), so only their position in
+/// the overall path order is changed, never their internal orientation.
+///
+/// This is an O(n²) scan over the remaining paths at each step, which is
+/// fine for the tens-to-low-hundreds of paths typical of a single layer;
+/// it does not attempt any *routing* around obstacles (see ROADMAP.md's
+/// open item on travel collision avoidance) -- only which path to visit
+/// next and which end to enter it from.
+fn optimize_travel_order(mut paths: Vec<Path>, config: &SlicerConfig) -> Vec<Path> {
+    if !config.travel_order_optimization_enabled || paths.len() <= 1 {
+        return paths;
+    }
+
+    let mut ordered = Vec::with_capacity(paths.len());
+    ordered.push(paths.remove(0));
+    let mut current = ordered[0].points.last().copied().unwrap_or(DVec3::ZERO);
+
+    while !paths.is_empty() {
+        let mut best_idx = 0;
+        let mut best_reverse = false;
+        let mut best_dist = f64::INFINITY;
+
+        for (idx, path) in paths.iter().enumerate() {
+            let Some(&start) = path.points.first() else {
+                continue;
+            };
+            let forward_dist = current.distance(start);
+            if forward_dist < best_dist {
+                best_dist = forward_dist;
+                best_idx = idx;
+                best_reverse = false;
+            }
+
+            let is_open = path.segments.len() + 1 == path.points.len();
+            if is_open {
+                if let Some(&end) = path.points.last() {
+                    let reverse_dist = current.distance(end);
+                    if reverse_dist < best_dist {
+                        best_dist = reverse_dist;
+                        best_idx = idx;
+                        best_reverse = true;
+                    }
+                }
+            }
+        }
+
+        let mut next = paths.remove(best_idx);
+        if best_reverse {
+            next = reverse_open_path(next);
+        }
+        current = next.points.last().copied().unwrap_or(current);
+        ordered.push(next);
+    }
+
+    ordered
+}
+
+/// Reverses an open [`Path`]'s traversal direction in place: `points` and
+/// `segments` both reversed. Self-inverse and metadata-preserving -- see
+/// [`optimize_travel_order`]'s doc comment for why this works for the
+/// `segments[i]` describes `points[i] -> points[i + 1]` convention. Only
+/// valid for open paths (`segments.len() + 1 == points.len()`); callers
+/// must not use this on closed loops, where `points[0]` carries meaning
+/// from upstream passes.
+fn reverse_open_path(mut path: Path) -> Path {
+    path.points.reverse();
+    path.segments.reverse();
+    path
+}
+
 fn simplify_paths(paths: Vec<Path>, config: &SlicerConfig) -> Vec<Path> {
     if !config.path_simplify_enabled {
         return paths;
@@ -792,8 +897,11 @@ pub struct Path {
 /// the layer's real mesh containment query (`Layer::mesh_sdf`, when
 /// present) and dropped wholesale if any of its points fall outside the
 /// solid -- see [`retain_contained_paths`]. Real path planning beyond
-/// this (travel-move ordering/optimization across paths, non-planar
-/// toolpath deformation) is future work.
+/// this (non-planar toolpath deformation) is future work. Travel-move
+/// ordering IS optimized -- see [`optimize_travel_order`] -- but travel
+/// *routing*/collision avoidance around already-printed geometry is not
+/// yet implemented (travel moves are still straight lines between their
+/// endpoints).
 /// Layers are planned in parallel across all available cores (via
 /// `rayon`): each layer only reads the shared, immutable `layers`/`objects`
 /// slices and produces its own independent `Vec<Path>` (the expensive part
@@ -947,6 +1055,7 @@ pub fn plan_with_progress(
             let paths = retain_contained_paths(paths, layer.mesh_sdf.as_ref(), layer.order);
             let paths = compensate_flat_nozzle(paths, layer, config);
             let paths = simplify_paths(paths, config);
+            let paths = optimize_travel_order(paths, config);
             let mut paths = insert_z_hops(paths, config);
 
             let extrusion_multiplier = tools
@@ -1854,6 +1963,166 @@ mod tests {
     /// [`perpendicular_distance`] which measures against the infinite
     /// line) -- used to bound how far an RDP-dropped point can end up from
     /// the simplified polyline that replaces it.
+    fn open_path(points: Vec<DVec3>, kind: MoveKind) -> Path {
+        let segments = (0..points.len().saturating_sub(1))
+            .map(|_| Segment {
+                kind,
+                speed: 60.0,
+                extrusion_rate: 1.0,
+                support_fraction: 0.0,
+                order: 0.0,
+                extrusion_length: 0.0,
+            })
+            .collect();
+        Path {
+            points,
+            segments,
+            tool: ToolId::default(),
+        }
+    }
+
+    fn closed_path(points: Vec<DVec3>, kind: MoveKind) -> Path {
+        let segments = points
+            .iter()
+            .map(|_| Segment {
+                kind,
+                speed: 60.0,
+                extrusion_rate: 1.0,
+                support_fraction: 0.0,
+                order: 0.0,
+                extrusion_length: 0.0,
+            })
+            .collect();
+        Path {
+            points,
+            segments,
+            tool: ToolId::default(),
+        }
+    }
+
+    #[test]
+    fn optimize_travel_order_is_a_no_op_when_disabled() {
+        let paths = vec![
+            open_path(
+                vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
+                MoveKind::Infill,
+            ),
+            open_path(
+                vec![DVec3::new(100.0, 0.0, 0.0), DVec3::new(101.0, 0.0, 0.0)],
+                MoveKind::Infill,
+            ),
+        ];
+        let config = SlicerConfig {
+            travel_order_optimization_enabled: false,
+            ..SlicerConfig::default()
+        };
+        let original_starts: Vec<DVec3> = paths.iter().map(|p| p.points[0]).collect();
+        let result = optimize_travel_order(paths, &config);
+        let result_starts: Vec<DVec3> = result.iter().map(|p| p.points[0]).collect();
+        assert_eq!(result_starts, original_starts);
+    }
+
+    #[test]
+    fn optimize_travel_order_reorders_paths_to_minimize_total_travel_distance() {
+        // Three short open (infill-style) lines laid out so that
+        // generation order (near, far, near) would force a long jump out
+        // and back if left unreordered. Anchor stays first (its own
+        // fixed start), but the remaining two must be visited in
+        // nearest-first order: [0,1] segment, then [2,3] (right next to
+        // it), leaving the far-away [100,101] segment for last.
+        let anchor = open_path(
+            vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
+            MoveKind::Infill,
+        );
+        let far = open_path(
+            vec![DVec3::new(100.0, 0.0, 0.0), DVec3::new(101.0, 0.0, 0.0)],
+            MoveKind::Infill,
+        );
+        let near = open_path(
+            vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
+            MoveKind::Infill,
+        );
+        let config = SlicerConfig::default();
+        let result = optimize_travel_order(vec![anchor, far, near], &config);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].points[0], DVec3::new(0.0, 0.0, 0.0));
+        assert_eq!(result[1].points[0], DVec3::new(2.0, 0.0, 0.0));
+        assert_eq!(result[2].points[0], DVec3::new(100.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn optimize_travel_order_reverses_an_open_path_when_its_far_end_is_closer() {
+        // The remaining open path's *far* endpoint (10.0) is much closer
+        // to the anchor's exit point (1.0) than its *near* endpoint
+        // (9.0..10.0 span placed backwards) -- the optimizer should enter
+        // it from that closer end, i.e. reverse it.
+        let anchor = open_path(
+            vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
+            MoveKind::Infill,
+        );
+        let candidate = open_path(
+            vec![DVec3::new(9.0, 0.0, 0.0), DVec3::new(1.2, 0.0, 0.0)],
+            MoveKind::Infill,
+        );
+        let config = SlicerConfig::default();
+        let result = optimize_travel_order(vec![anchor, candidate], &config);
+
+        assert_eq!(result.len(), 2);
+        // Reversed: now starts at 1.2 (close to anchor's exit at 1.0) and
+        // ends at 9.0.
+        assert_eq!(result[1].points[0], DVec3::new(1.2, 0.0, 0.0));
+        assert_eq!(result[1].points[1], DVec3::new(9.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn optimize_travel_order_never_reverses_a_closed_wall_loop() {
+        // Closed loops (segments.len() == points.len()) must keep their
+        // own points[0] -- only their position in the overall order may
+        // change, never their internal start point/direction.
+        let anchor = open_path(
+            vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
+            MoveKind::Infill,
+        );
+        let wall = closed_path(
+            vec![
+                DVec3::new(9.0, 0.0, 0.0),
+                DVec3::new(9.0, 1.0, 0.0),
+                DVec3::new(1.1, 1.0, 0.0),
+                DVec3::new(1.1, 0.0, 0.0),
+            ],
+            MoveKind::WallOuter,
+        );
+        let original_points = wall.points.clone();
+        let config = SlicerConfig::default();
+        let result = optimize_travel_order(vec![anchor, wall], &config);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[1].points, original_points);
+    }
+
+    #[test]
+    fn reverse_open_path_preserves_segment_metadata_for_the_same_physical_edges() {
+        let path = open_path(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(3.0, 0.0, 0.0),
+            ],
+            MoveKind::Infill,
+        );
+        let reversed = reverse_open_path(path);
+        assert_eq!(
+            reversed.points,
+            vec![
+                DVec3::new(3.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(0.0, 0.0, 0.0),
+            ]
+        );
+        assert_eq!(reversed.segments.len(), 2);
+    }
+
     fn point_to_segment_distance(p: DVec3, a: DVec3, b: DVec3) -> f64 {
         let ab = b - a;
         let len_sq = ab.length_squared();

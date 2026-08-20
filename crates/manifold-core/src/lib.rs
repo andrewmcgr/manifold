@@ -208,6 +208,19 @@ pub struct SlicerConfig {
     /// `nozzle_diameter`.
     #[serde(default)]
     pub nozzle_flat_diameter: Option<f64>,
+    /// Whether the travel-order optimization pass
+    /// (`toolpath::optimize_travel_order`) is enabled. When `true` (the
+    /// default), the paths within each layer (walls, sparse infill, solid
+    /// fill) are greedily reordered -- and individually reversed where
+    /// beneficial -- by nearest-endpoint distance from wherever the
+    /// nozzle currently is, starting from the end of the previous layer's
+    /// last path. Reduces long travel moves (e.g. a scanline infill
+    /// pattern jumping across the whole layer and back) without changing
+    /// which geometry is printed, only the order/direction paths are
+    /// visited in. `#[serde(default = "...")]` so a saved profile from
+    /// before this field existed still deserializes to `true`.
+    #[serde(default = "default_travel_order_optimization_enabled")]
+    pub travel_order_optimization_enabled: bool,
 }
 
 /// Default value for [`SlicerConfig::eikonal_slope_profile`]: an empty set
@@ -253,6 +266,12 @@ fn default_path_simplify_enabled() -> bool {
 }
 
 /// Static serde-deserialize fallback for
+/// [`SlicerConfig::travel_order_optimization_enabled`]: `true`.
+fn default_travel_order_optimization_enabled() -> bool {
+    true
+}
+
+/// Static serde-deserialize fallback for
 /// [`SlicerConfig::path_simplify_tolerance`]: `0.02` mm, i.e.
 /// `nozzle_diameter / 20.0` evaluated at the default `nozzle_diameter` of
 /// `0.4` mm. Only used when deserializing a saved profile that predates
@@ -294,6 +313,7 @@ impl Default for SlicerConfig {
             path_simplify_enabled: true,
             path_simplify_tolerance: nozzle_diameter / 20.0,
             nozzle_flat_diameter: None,
+            travel_order_optimization_enabled: true,
         }
     }
 }
