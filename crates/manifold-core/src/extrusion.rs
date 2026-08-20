@@ -45,15 +45,21 @@ pub fn segment_extrusion_length(distance: f64, bead_area: f64, filament_area: f6
 
 /// Nozzle-center line width used for a segment of the given [`MoveKind`],
 /// looked up from `config`. `WallOuter`/`WallInner` use
-/// `config.wall_line_width`; `Infill`, `Bridge`, and `Overhang` use
-/// `config.infill_line_width` as a forward-compatible placeholder (no
-/// detection logic currently emits `Bridge`/`Overhang` -- see
-/// `toolpath::plan`). `Travel` is never extruded and returns `0.0`.
+/// `config.wall_line_width`; `Infill` uses `config.infill_line_width`.
+/// `Overhang` is emitted by `toolpath::plan` for stitched wall-gap points
+/// and is clamped to `config.wall_line_width.min(config.nozzle_diameter)`:
+/// an unsupported line must never be wider than the nozzle diameter,
+/// since there's no supporting surface underneath for the extra
+/// squish/spread a wider bead needs. `Bridge` remains a
+/// forward-compatible placeholder mapped to `config.infill_line_width`
+/// (no detection logic currently emits it -- see `toolpath::plan`).
+/// `Travel` is never extruded and returns `0.0`.
 #[must_use]
 pub fn line_width_for_kind(kind: MoveKind, config: &SlicerConfig) -> f64 {
     match kind {
         MoveKind::WallOuter | MoveKind::WallInner => config.wall_line_width,
-        MoveKind::Infill | MoveKind::Bridge | MoveKind::Overhang => config.infill_line_width,
+        MoveKind::Infill | MoveKind::Bridge => config.infill_line_width,
+        MoveKind::Overhang => config.wall_line_width.min(config.nozzle_diameter),
         MoveKind::Travel => 0.0,
     }
 }
@@ -122,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn line_width_for_kind_maps_infill_bridge_overhang_to_infill_line_width() {
+    fn line_width_for_kind_maps_infill_and_bridge_to_infill_line_width() {
         let config = SlicerConfig {
             wall_line_width: 0.5,
             infill_line_width: 0.3,
@@ -130,7 +136,26 @@ mod tests {
         };
         assert_eq!(line_width_for_kind(MoveKind::Infill, &config), 0.3);
         assert_eq!(line_width_for_kind(MoveKind::Bridge, &config), 0.3);
-        assert_eq!(line_width_for_kind(MoveKind::Overhang, &config), 0.3);
+    }
+
+    #[test]
+    fn line_width_for_kind_clamps_overhang_to_nozzle_diameter_when_wall_is_wider() {
+        let config = SlicerConfig {
+            wall_line_width: 0.8,
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(line_width_for_kind(MoveKind::Overhang, &config), 0.4);
+    }
+
+    #[test]
+    fn line_width_for_kind_leaves_overhang_unclamped_when_wall_is_not_wider_than_nozzle() {
+        let config = SlicerConfig {
+            wall_line_width: 0.35,
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(line_width_for_kind(MoveKind::Overhang, &config), 0.35);
     }
 
     #[test]

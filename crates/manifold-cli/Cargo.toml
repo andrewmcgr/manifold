@@ -17,3 +17,9 @@ clap.workspace = true
 glam.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Used only by scratch verification examples (e.g.
+# verify_wall_gap_stitching) that check slicing output directly against
+# the mesh SDF; the `manifold` binary itself never depends on it.
+manifold-fidget.workspace = true

@@ -14,6 +14,11 @@ use glam::DVec3;
 use manifold_fidget::eikonal::EikonalOrderField;
 use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{ConicalOrderField, HeightOrderField, OrderField};
+
+// Re-exported so downstream diagnostics (e.g. the manifold-cli
+// verification examples) can name the trait when calling helpers like
+// `slicing::lateral_gap` without depending on manifold-fidget directly.
+pub use manifold_fidget::order::OrderField as OrderFieldTrait;
 use manifold_fidget::ScalarField;
 
 use manifold_fidget::height_along::ConstantAxisHeight;
@@ -801,6 +806,20 @@ enum SolveAlong {
 /// onto the flat `axis == 0` plane near steep threaded/reentrant
 /// features.
 ///
+/// Also used directly (rather than through
+/// [`reconstruct_on_order_field_near`]'s single-nearest-reference seeding)
+/// by [`crate::slicing::serpentine_stitch_block`] to subdivide a genuinely large
+/// real wall-to-wall gap: that caller already has *two* known-correct
+/// points (the previous and current loop's own vertices) bracketing the
+/// target order, so it seeds from their true 3D midpoint instead of
+/// picking one endpoint's `along` at a new in-plane location -- avoiding
+/// both the plain axis-ray solve's risk of locking onto the wrong branch
+/// (that solve is centered on the world `axis == 0` plane, with no
+/// knowledge of which branch is correct) and `reconstruct_on_order_field_near`'s
+/// small-residual-only acceptance filter (built for boolean-op output
+/// already known to sit *near* the isosurface, which wrongly rejects a
+/// large-but-real displacement as noise).
+///
 /// Uses a central-difference numeric gradient (`field` exposes only scalar
 /// `order`, no analytic gradient) and Newton-style steps `p -= grad *
 /// (residual / grad.length_squared())`, each step clamped to `max_step` so
@@ -810,7 +829,7 @@ enum SolveAlong {
 /// non-finite -- no local direction of improvement), if a step lands
 /// somewhere `field` is non-finite (stepped outside the field's known
 /// region), or if the residual never converges within `MAX_ITERS` steps.
-fn project_onto_isosurface<F: OrderField + ?Sized>(
+pub(crate) fn project_onto_isosurface<F: OrderField + ?Sized>(
     field: &F,
     start: DVec3,
     target: f64,

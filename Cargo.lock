@@ -2462,6 +2462,7 @@ dependencies = [
  "clap",
  "glam 0.29.3",
  "manifold-core",
+ "manifold-fidget",
  "tracing",
  "tracing-subscriber",
 ]

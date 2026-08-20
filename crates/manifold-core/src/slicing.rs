@@ -8,6 +8,7 @@ use manifold_fidget::contour::{extract_contours, extract_order_contours_on_mesh,
 use manifold_fidget::marching_cubes::extract_isosurface;
 use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{order_range_over_bbox, HeightOrderField, OrderField};
+use manifold_fidget::ScalarField;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -142,6 +143,41 @@ pub struct WallLoop {
     pub wall_index: usize,
     /// Closed polyline in world space (see [`Layer::loops`]).
     pub points: Vec<DVec3>,
+    /// Per-point flag marking points inserted by the inter-layer wall-gap
+    /// stitching pass (see `slice_mesh_with_progress`) as unsupported
+    /// (printed over a gap with no solid/order-field surface directly
+    /// beneath, rather than derived from the mesh/order-field isosurface
+    /// like the rest of the loop). This is a sibling `Vec` to `points`:
+    /// `unsupported[i]` describes `points[i]`, so `unsupported.len() ==
+    /// points.len()` always holds, including through any later
+    /// insertion/removal of stitched points. Kept as a parallel `Vec`
+    /// (rather than pairing each point with its flag in a single
+    /// `Vec<(DVec3, bool)>`) so callers that only need geometry can read
+    /// `points` without also touching `unsupported`, mirroring
+    /// [`crate::toolpath::Path`]'s `points`/`segments` convention.
+    /// Defaults to all `false` (no stitched points) for loops produced
+    /// directly from mesh/order-field extraction; `toolpath::plan` maps
+    /// segments touching a `true` point to `MoveKind::Overhang`.
+    pub unsupported: Vec<bool>,
+    /// Per-point normalized cumulative arc-length position around this
+    /// closed polyline, in `[0, 1)`: `arc_fraction[0] == 0.0` and
+    /// `arc_fraction[i]` increases monotonically walking `points` in
+    /// order, wrapping back toward (but never reaching) `1.0` at the
+    /// closing segment back to `points[0]`. Another parallel `Vec`
+    /// sibling to `points`/`unsupported` (same invariant:
+    /// `arc_fraction.len() == points.len()` always, including through
+    /// stitch insertions — see `unsupported`'s doc comment for the
+    /// rationale for this convention). Populated for wall-index-0 loops
+    /// at minimum (see `slice_mesh_with_progress`'s wall-loop
+    /// construction and `stitch_wall_gaps`, which consumes it to build
+    /// an arc-length-fraction correspondence between a layer's wall-0
+    /// loop and the previous layer's, replacing raw nearest-point
+    /// matching). This is deliberately real, retained data rather than a
+    /// throwaway local — it is exactly the per-loop parameterization a
+    /// future seam-placement feature will need (choosing a consistent
+    /// start/seam position around each wall loop across layers to avoid
+    /// a visible seam ridge), so do not remove/recompute-and-discard it.
+    pub arc_fraction: Vec<f64>,
 }
 
 /// Build/order direction for this MVP: conventional planar slicing along
@@ -171,6 +207,133 @@ const CONTOUR_REFINEMENT_DIVISOR: f64 = 1.4;
 /// mesh).
 const MIN_CONTOUR_RESOLUTION: usize = 32;
 const MAX_CONTOUR_RESOLUTION: usize = 512;
+
+/// Fraction of nozzle radius (`config.nozzle_diameter / 2.0`) used as the
+/// max allowed inter-layer wall-0 hop distance before
+/// [`stitch_wall_gaps`] treats it as a gap requiring a stitch. 90% leaves
+/// a small margin below the nozzle's actual bonding radius rather than
+/// cutting it exactly at the limit.
+const WALL_GAP_HOP_FRACTION: f64 = 0.9;
+
+/// Multiplier on `config.nozzle_diameter` giving the max centroid
+/// distance at which [`stitch_wall_gaps`] considers a current-layer
+/// wall-0 loop to spatially correspond to a previous-layer wall-0 loop
+/// (see `loop_centroid` / the loop-matching step in `stitch_wall_gaps`).
+/// The same physical island's centroid shifts only a little between
+/// adjacent layers (bounded by the slope of that region times one layer
+/// height), while genuinely distinct islands/holes in a real
+/// cross-section are normally separated by a macroscopic distance --
+/// millimeters to centimeters, not fractions of a nozzle diameter. 20x
+/// nozzle diameter is a generous margin above plausible adjacent-layer
+/// centroid drift while still comfortably below typical inter-island
+/// separation, so it distinguishes "same feature, shifted a bit" from
+/// "unrelated feature" without needing per-model tuning.
+const WALL_GAP_LOOP_CENTROID_MATCH_FACTOR: f64 = 20.0;
+
+/// Second, shape-aware plausibility check on a current-loop/previous-loop
+/// match, applied alongside [`WALL_GAP_LOOP_CENTROID_MATCH_FACTOR`] (see
+/// `loop_perimeter`/`stitch_wall_gaps`): centroid distance alone is not
+/// sufficient to confirm two loops are the same physical feature --
+/// real-mesh verification (subtask 09 of the wall-gap-stitching feature)
+/// found a case where a 220-point current loop's centroid fell within the
+/// centroid threshold of an unrelated 722-point previous loop (a >3x
+/// perimeter mismatch), and arc-length-fraction correspondence between
+/// two loops of such different actual shape/size is meaningless -- equal
+/// fractions on a small, simple loop and a large, complex loop do not
+/// correspond to the same physical position, producing a legitimately
+/// huge (real, non-bisection-error) gap fed straight into
+/// [`serpentine_stitch_block`], which then faithfully (if uselessly)
+/// subdivides across
+/// that bogus gap. A previous loop is only accepted as a match if its
+/// perimeter is within this factor of the current loop's perimeter in
+/// *either* direction (`ratio = longer / shorter <=
+/// WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR`). 2x is a generous margin for a
+/// genuinely growing/shrinking feature between adjacent layers while
+/// still rejecting a same-centroid-but-different-feature mismatch like
+/// the 3.28x case found above.
+const WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR: f64 = 1.4;
+
+/// Guards against accepting a perimeter-and-centroid-threshold-passing
+/// previous loop when a *closer* previous loop exists that was rejected
+/// only by the perimeter check (see [`WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR`]).
+/// Real-mesh verification (subtask 12 of the wall-gap-stitching feature,
+/// layer 40/loop_idx 13 of `pug_v4_l_sop_85mm.stl`) found a genuine
+/// topology-merge event: two previous-layer loops (centroid distance
+/// ~0.92mm and ~1.15mm, each roughly half the current loop's perimeter --
+/// consistent with two islands merging into one wall on this layer) were
+/// both correctly rejected by the perimeter check, but the pairing step
+/// then fell through to a *different*, unrelated previous loop that only
+/// coincidentally has a near-identical perimeter to the (now-merged)
+/// current loop, at 7.86mm centroid distance -- 8x farther than the
+/// rejected-but-genuinely-nearby loops. Accepting that coincidental match
+/// produced a uniform ~7.7mm hop across the *entire* loop (686/686
+/// points), not an isolated single-point defect.
+///
+/// This is not fixable by relaxing the perimeter check (the rejected
+/// loops really are a different shape -- half the perimeter -- because
+/// they are pre-merge features, not tracking error), and full merge/split
+/// support (stitching a current loop against *multiple* previous loops)
+/// is out of scope here. The safe, conservative fix: after the
+/// perimeter+centroid-threshold filter picks its best candidate, compare
+/// that candidate's centroid distance against the *closest previous loop
+/// overall* (regardless of perimeter, i.e. an unfiltered nearest-centroid
+/// search across every previous loop). If the filtered candidate is more
+/// than this factor farther away than the true closest loop, the
+/// filtered candidate is almost certainly a coincidental false positive
+/// (as in the layer-40 case above) rather than a genuine match -- treat
+/// the current loop as having no correspondence (skip stitching) instead
+/// of forcing a match to a distant coincidence. A generous factor (not a
+/// tight one) is used since some genuine same-feature drift between the
+/// globally-nearest loop and the perimeter-passing candidate is expected
+/// on noisy/sampled contours; this only needs to catch orders-of-
+/// magnitude discrepancies like the 8x case found above.
+const WALL_GAP_LOOP_NEAREST_CENTROID_MARGIN_FACTOR: f64 = 4.0;
+
+/// Number of evenly-spaced sample points taken around the *current* loop
+/// (by index, not arc fraction, since sampling by index already spans the
+/// loop's parameterization uniformly) when [`best_rotation_offset`]
+/// searches for the rotational offset between a current/previous wall-0
+/// loop pair. A single nearest-point start alignment (the pre-subtask-10
+/// approach) validates the offset at only one point, so a decoy previous
+/// point that happens to be closer in raw 3D distance than the true
+/// corresponding point -- common on spiky/non-convex loops where
+/// unrelated parts of the contour pass close to each other in space, e.g.
+/// near a shared inner waist between spikes -- silently produces a wrong
+/// global offset with no way to detect it. Scoring candidate offsets
+/// against several spread-out samples instead means a wrong offset that
+/// happens to fit one point will typically disagree badly at the others,
+/// so the aggregate-error minimum reliably lands on the true offset. 12
+/// samples is enough to catch a wrong offset on typical wall-0 loop
+/// shapes without materially slowing down a search that already only
+/// runs once per current loop per layer-pair (not once per point).
+const WALL_GAP_ROTATION_SEARCH_SAMPLES: usize = 12;
+
+/// Half-width (in previous-loop point indices) of the bounded local
+/// search window used by [`local_fallback_correspondence`] when the
+/// best-rotation-offset correspondence for an individual point still
+/// exceeds `hop_limit`. This is deliberately a small, bounded window
+/// around the fraction-implied index -- not the unbounded whole-loop
+/// nearest-point search that produced the original perpendicular-zigzag
+/// defect (see the root-cause discussion on [`stitch_wall_gaps`] itself,
+/// "Addendum 2"). A wrong global offset is now rare (see
+/// [`WALL_GAP_ROTATION_SEARCH_SAMPLES`]), so this fallback only needs to
+/// correct small local warps in the fraction-to-position mapping caused
+/// by non-uniform point density near corners/spikes, which by
+/// construction can only shift the true correspondent a few points away
+/// from the fraction-implied index, not to an arbitrary position
+/// elsewhere on the loop.
+const WALL_GAP_LOCAL_FALLBACK_WINDOW: usize = 6;
+
+/// Hard cap on the number of intermediate order levels
+/// [`serpentine_stitch_block`] may subdivide a layer step into. Mirrors
+/// other pathological-loop guards already in this codebase (e.g.
+/// `MAX_ORDER_STEPS` above, `MAX_BISECT_ITERS` in `order_field.rs`): 4096
+/// levels is far more than any real gap should ever need to reach the hop
+/// limit (the largest genuine gap observed on the real test mesh needed
+/// 64), while still failing safe (bounded work) instead of doubling
+/// indefinitely for a pathological order field whose reprojected level
+/// points never converge toward closing the gap.
+const MAX_STITCH_LEVELS: usize = 4096;
 
 /// Derives the marching-squares contour-extraction grid resolution
 /// (samples per axis, see [`extract_contours`]) for an in-plane sampling
@@ -427,7 +590,7 @@ pub fn slice_mesh_with_progress(
         positions
     };
 
-    let layers: Vec<Layer> = order_values
+    let mut layers: Vec<Layer> = order_values
         .par_iter()
         .enumerate()
         .map(|(index, &order_value)| {
@@ -445,20 +608,29 @@ pub fn slice_mesh_with_progress(
                     let wall_loops = extract_contours(
                         &*sdf, origin, basis1, basis2, extent, extent, resolution, resolution, iso,
                     );
-                    loops.extend(
-                        wall_loops
-                            .into_iter()
-                            .map(|points| WallLoop { wall_index, points }),
-                    );
+                    loops.extend(wall_loops.into_iter().map(|points| {
+                        let arc_fraction = compute_arc_fractions(&points);
+                        WallLoop {
+                            wall_index,
+                            unsupported: vec![false; points.len()],
+                            arc_fraction,
+                            points,
+                        }
+                    }));
                 }
             } else {
                 // Wall 0: straight from the mesh's actual isosurface (see
                 // `outer_wall_mesh`'s doc comment above).
                 let wall0_loops =
                     extract_order_contours_on_mesh(&outer_wall_mesh, &*field, order_value);
-                loops.extend(wall0_loops.iter().cloned().map(|points| WallLoop {
-                    wall_index: 0,
-                    points,
+                loops.extend(wall0_loops.iter().cloned().map(|points| {
+                    let arc_fraction = compute_arc_fractions(&points);
+                    WallLoop {
+                        wall_index: 0,
+                        unsupported: vec![false; points.len()],
+                        arc_fraction,
+                        points,
+                    }
                 }));
                 // Walls 1..wall_count: each one `wall_line_width` step
                 // further inward than the previous, derived by offsetting
@@ -491,12 +663,15 @@ pub fn slice_mesh_with_progress(
                         order_field::max_along_for(config),
                         &*field,
                     );
-                    loops.extend(
-                        reconstructed
-                            .iter()
-                            .cloned()
-                            .map(|points| WallLoop { wall_index, points }),
-                    );
+                    loops.extend(reconstructed.iter().cloned().map(|points| {
+                        let arc_fraction = compute_arc_fractions(&points);
+                        WallLoop {
+                            wall_index,
+                            unsupported: vec![false; points.len()],
+                            arc_fraction,
+                            points,
+                        }
+                    }));
                     previous_loops = reconstructed;
                 }
             }
@@ -618,7 +793,1069 @@ pub fn slice_mesh_with_progress(
         })
         .collect();
 
+    // Inter-layer wall-0 gap stitching: only meaningful for the curved
+    // (non-Height) path, where wall 0 is reconstructed per-layer against
+    // `field` from `outer_wall_mesh` above and consecutive layers'
+    // wall-0 loops can drift laterally faster than the nozzle can bond
+    // across on a shallow slope (see this module's
+    // WALL_GAP_HOP_FRACTION/stitch_wall_gaps docs). The Height path
+    // reconstructs each layer's walls directly from a fixed 3D iso
+    // offset of the whole mesh with no comparable drift risk, so it is
+    // left untouched.
+    if !is_height {
+        stitch_wall_gaps(&mut layers, config, basis1, basis2);
+    }
+
     Ok(layers)
+}
+
+/// Detects and fixes inter-layer wall-0 (ear bridging) gaps: walks
+/// `layers` in order (already sorted by Layer::index/order value -- see
+/// slice_mesh_with_progress) and, for each layer after the first,
+/// finds each current-layer wall-0 point's corresponding previous-layer
+/// wall-0 position via **arc-length-fraction correspondence**, not
+/// nearest-point search of any kind (raw 3D or transverse `(u, v)`).
+///
+/// Nearest-point matching between two independently parameterized
+/// closed curves is inherently non-monotonic: each layer's wall-0 loop
+/// is extracted independently, with no guaranteed correspondence
+/// between vertex `i` of one layer's loop and vertex `i` of the next
+/// (different point counts, sampling density, and starting point around
+/// the loop). Matching each current-loop point to "whichever
+/// previous-loop point happens to be nearest" lets adjacent
+/// current-loop points map to non-adjacent (even backward-jumping)
+/// previous-loop points, producing a zigzag correspondence on
+/// essentially every contour -- not just genuine overhangs -- regardless
+/// of whether the nearest-point metric is raw 3D distance or transverse
+/// `(u, v)` position (a prior fix tried the latter; it did not help,
+/// because the metric was never the real problem for adjacent layers).
+///
+/// Arc-length-fraction correspondence fixes this by walking both loops'
+/// own shapes in lockstep instead of comparing raw positions:
+/// 1. Each wall-0 [`WallLoop`] already carries [`WallLoop::arc_fraction`]
+///    (populated at construction -- see `slice_mesh_with_progress`): a
+///    per-point normalized cumulative arc-length position around the
+///    closed polyline, in `[0, 1)`.
+/// 2. The two loops' start points are aligned *once* per layer-pair: a
+///    single nearest-point search (3D distance; this runs once, not once
+///    per point, so brute force is fine) matches the current loop's
+///    first point against the previous loop's points, giving a
+///    rotational offset (`prev_fractions[nearest_idx]`) between the two
+///    loops' independent parameterizations.
+/// 3. For each current-loop point at its own (already-computed) arc
+///    fraction `t`, the corresponding previous-loop position is `t_prev
+///    = (offset + t) mod 1.0`, found by interpolating along the previous
+///    loop's cumulative-arc-length table (see
+///    [`interpolate_on_loop_at_fraction`]): walk to the bracketing
+///    segment and lerp within it. This is monotonic and non-crossing by
+///    construction -- it cannot backward-jump the way nearest-point
+///    search can.
+///
+/// Current-layer and previous-layer wall-0 loops are paired by real
+/// spatial correspondence, not positional index in each layer's loop
+/// vector: a cross-section with holes/multiple islands can have its
+/// loop extraction order (and count) shift between adjacent layers, so
+/// the `n`th loop encountered in the current layer is not reliably the
+/// same physical feature as the `n`th loop encountered in the previous
+/// layer. Each current loop is matched to the previous loop with the
+/// nearest centroid (mean of `points`), subject to
+/// `WALL_GAP_LOOP_CENTROID_MATCH_FACTOR * nozzle_diameter`, *and* whose
+/// perimeter is within `WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR` of the
+/// current loop's own perimeter (see that constant's docs -- centroid
+/// distance alone can match a small, simple loop to an unrelated, much
+/// larger/more complex one whose centroid happens to land nearby,
+/// producing a meaningless arc-length correspondence): if no previous
+/// loop satisfies both (a genuinely new loop this layer, a vanished
+/// loop, or just too far/differently-shaped to plausibly be the same
+/// feature), the current loop is left unstitched rather than
+/// force-matched to an unrelated loop -- arc-length correspondence is
+/// only meaningful within a single correctly-matched pair of closed
+/// loops.
+///
+/// A shallow slope on the underside of an overhang can produce
+/// consecutive layers whose wall-0 loops are laterally far enough apart
+/// that the printed lines don't bond (see NON_PLANAR_SLICING.md's
+/// SlopeProfile docs for why this can happen even with an angle-limited
+/// order field: the slope limit only caps the maximum rate of rise, not
+/// a minimum). Whenever a point's **lateral** distance (perpendicular to
+/// the local climb direction -- see [`lateral_gap`] for why the raw 3D
+/// distance is the wrong metric here: it always contains ~one layer
+/// height of normal climb separation and therefore triggers on every
+/// point of every contour, including vertical walls) to its
+/// arc-length-fraction counterpart exceeds WALL_GAP_HOP_FRACTION *
+/// (nozzle radius) -- and no previous-layer wall-0 material lies
+/// laterally within that limit at all (the correspondence sanity veto;
+/// see the third pass in the body) -- the point genuinely needs stitch
+/// material. Maximal runs of consecutive such points are then each
+/// filled with ONE continuous serpentine block
+/// ([`serpentine_stitch_block`]): intermediate order levels between the
+/// two layers, each level walked as a continuous line across the whole
+/// run, alternating direction so consecutive rows connect at a shared
+/// column -- never one anchor-to-target ramp per point, which printed a
+/// physical zigzag (nozzle diving to the previous layer and back for
+/// every point of the run). Every level point is reprojected onto the
+/// order field's actual isosurface (never a straight 3D chord -- the
+/// true isosurface between two order values can be curved for a
+/// non-planar field), and the level count doubles until every
+/// consecutive hop along each column is within the hop limit. The
+/// resulting block is spliced into the current layer's wall-0 loop
+/// immediately before the run's first point, flagged unsupported = true
+/// (the points print over a gap with no solid/order-field surface
+/// directly beneath them, unlike the rest of the loop), and each given
+/// its own column's target-point arc_fraction (they don't add a new
+/// circumferential position, only intermediate order/height values on
+/// the way to it), keeping `arc_fraction` parallel to
+/// `points`/`unsupported` through the insertion.
+///
+/// Only wall_index == 0 loops are touched; inner walls (wall_index >= 1,
+/// already derived from wall 0 within the same layer) are out of scope
+/// for this pass (only wall 0 was reported as too far apart, and inner
+/// walls may inherit acceptable spacing once wall 0 is fixed).
+///
+/// Before bisecting, every current-loop point's raw fraction-based (plus
+/// bounded local-fallback) correspondence is computed up front for the
+/// whole loop, then checked against its immediate current-loop
+/// neighbors (the stored-order point before and after it): a real
+/// shallow-overhang region spans a *run* of consecutive points whose
+/// correspondence is far away, never a single point bracketed on both
+/// sides by points with perfectly good, close correspondences -- if
+/// exactly that isolated pattern is found (this point's hop exceeds
+/// `hop_limit` while both neighbors' hops do not), the outlier is
+/// replaced with the midpoint of its neighbors' own correspondences
+/// rather than trusting the raw fraction-based lookup. Even after the
+/// best global rotation offset (see [`best_rotation_offset`]) and the
+/// bounded local fallback (see [`local_fallback_correspondence`]), a
+/// single previous-loop sampling irregularity can still throw off one
+/// point's fraction-interpolated position while its neighbors -- who
+/// interpolate at nearby but different fractions, potentially bracketing
+/// a different, non-irregular segment of the previous loop -- land fine;
+/// this neighbor-consistency check catches that residual case without
+/// re-introducing the unbounded nearest-point search that caused the
+/// original zigzag defect (see this function's docs above).
+/// Returns whether the straight chord `a -> b` stays inside (or hugs) the
+/// mesh solid: every interior sample's signed distance must be at most
+/// `tolerance` (one bead radius) outside the surface.
+///
+/// Used by [`stitch_wall_gaps`] as the final needs-stitch veto: stitch
+/// material physically bonds a shallow-overhang gap *through the solid*
+/// between the two layers' surfaces, so a candidate whose anchor->target
+/// chord passes through genuinely open air (a void between separate
+/// features, e.g. between the pug's ears) cannot be stitched -- inserting
+/// a serpentine there prints lines across the void. Sampled every half
+/// bead radius (capped at 64 intervals). `None` for `mesh_sdf` (layers
+/// built without one, e.g. unit-test fixtures) skips the veto entirely
+/// and reports the chord as in-solid.
+fn chord_stays_in_solid(mesh_sdf: Option<&MeshSdf>, a: DVec3, b: DVec3, tolerance: f64) -> bool {
+    let Some(sdf) = mesh_sdf else {
+        return true;
+    };
+    let samples = ((a.distance(b) / (0.5 * tolerance).max(1e-9)).ceil() as usize).clamp(2, 64);
+    (0..=samples).all(|s| {
+        let t = s as f64 / samples as f64;
+        sdf.sample(a.lerp(b, t)).value <= tolerance
+    })
+}
+
+fn stitch_wall_gaps(layers: &mut [Layer], config: &SlicerConfig, basis1: DVec3, basis2: DVec3) {
+    let hop_limit = WALL_GAP_HOP_FRACTION * (config.nozzle_diameter / 2.0);
+    if !hop_limit.is_finite() || hop_limit <= 0.0 {
+        return;
+    }
+    let max_along = order_field::max_along_for(config);
+
+    // The previous layer's wall-0 loops (points + their arc-length
+    // fractions), retained across iterations for correspondence lookup,
+    // in the same order as they appear when filtering `layer.loops` for
+    // `wall_index == 0` -- `None` before the first layer, since there is
+    // nothing yet to compare against.
+    type Wall0Loop = (Vec<DVec3>, Vec<f64>);
+    let mut previous_wall0: Option<(f64, Vec<Wall0Loop>)> = None;
+
+    for layer in layers.iter_mut() {
+        // Captured before this layer's wall-0 loops are (possibly)
+        // mutated below, so the *next* iteration compares against this
+        // layer's real extracted geometry, not any stitch points just
+        // inserted into it.
+        let current_wall0: Vec<Wall0Loop> = layer
+            .loops
+            .iter()
+            .filter(|wall| wall.wall_index == 0)
+            .map(|wall| (wall.points.clone(), wall.arc_fraction.clone()))
+            .collect();
+
+        if let Some((prev_order, prev_loops)) = previous_wall0.as_ref() {
+            let field = Arc::clone(&layer.order_field);
+            let mesh_sdf = layer.mesh_sdf.clone();
+            let cur_order = layer.order;
+            let match_threshold = WALL_GAP_LOOP_CENTROID_MATCH_FACTOR * config.nozzle_diameter;
+            let prev_centroids: Vec<DVec3> = prev_loops
+                .iter()
+                .map(|(pts, _)| loop_centroid(pts))
+                .collect();
+            let prev_perimeters: Vec<f64> = prev_loops
+                .iter()
+                .map(|(pts, _)| loop_perimeter(pts))
+                .collect();
+            // Precomputed once per layer-pair (not per point): for each
+            // current wall-0 loop (in the same order the mutable filter
+            // below will visit them), which previous-layer loop -- if
+            // any -- is its nearest-centroid match within
+            // `match_threshold`, additionally requiring the two loops'
+            // perimeters to be within `WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR`
+            // of each other (see that constant's docs -- centroid distance
+            // alone can match a small loop to an unrelated, much larger
+            // one). `None` means no sufficiently-close *and*
+            // plausibly-same-shape previous loop was found, so this loop
+            // is left unstitched.
+            let loop_matches: Vec<Option<usize>> = current_wall0
+                .iter()
+                .map(|(pts, _)| {
+                    let centroid = loop_centroid(pts);
+                    let perimeter = loop_perimeter(pts);
+                    // Unfiltered nearest-centroid distance across every
+                    // previous loop, regardless of the perimeter check --
+                    // used below to detect the layer-40/loop-13 pattern
+                    // (a genuinely nearby loop rejected only by shape,
+                    // e.g. a pre-merge topology change, while a distant,
+                    // coincidentally-similar-perimeter loop passes both
+                    // filters). See
+                    // [`WALL_GAP_LOOP_NEAREST_CENTROID_MARGIN_FACTOR`]'s
+                    // docs.
+                    let global_nearest_dist = prev_centroids
+                        .iter()
+                        .map(|prev_centroid| (*prev_centroid - centroid).length())
+                        .fold(f64::INFINITY, f64::min);
+
+                    prev_centroids
+                        .iter()
+                        .zip(prev_perimeters.iter())
+                        .enumerate()
+                        .map(|(idx, (prev_centroid, &prev_perimeter))| {
+                            (idx, (*prev_centroid - centroid).length(), prev_perimeter)
+                        })
+                        .filter(|(_, dist, _)| *dist <= match_threshold)
+                        .filter(|(_, _, prev_perimeter)| {
+                            let (longer, shorter) = if *prev_perimeter >= perimeter {
+                                (*prev_perimeter, perimeter)
+                            } else {
+                                (perimeter, *prev_perimeter)
+                            };
+                            // Degenerate (near-zero-perimeter) loops -- e.g.
+                            // single-point placeholder loops used to
+                            // exercise the hop-limit/bisect path in
+                            // isolation -- carry no meaningful perimeter
+                            // ratio to compare. Treat "both degenerate" as a
+                            // trivial match (nothing to disprove), but a
+                            // degenerate loop can never plausibly match a
+                            // non-degenerate one, so that asymmetric case is
+                            // still a ratio-check failure rather than a
+                            // division by (near) zero.
+                            const DEGENERATE_PERIMETER: f64 = 1e-9;
+                            if longer <= DEGENERATE_PERIMETER {
+                                true
+                            } else {
+                                shorter > DEGENERATE_PERIMETER
+                                    && longer / shorter <= WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR
+                            }
+                        })
+                        // Reject a filtered candidate that is drastically
+                        // farther away than the true closest previous loop
+                        // overall -- see
+                        // [`WALL_GAP_LOOP_NEAREST_CENTROID_MARGIN_FACTOR`]'s
+                        // docs. `global_nearest_dist` is finite here
+                        // whenever any candidate survives the filters
+                        // above (there is at least one previous loop), so
+                        // this only excludes genuinely implausible
+                        // coincidental matches, never legitimate ones.
+                        .filter(|(_, dist, _)| {
+                            *dist
+                                <= global_nearest_dist
+                                    * WALL_GAP_LOOP_NEAREST_CENTROID_MARGIN_FACTOR
+                        })
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(idx, _, _)| idx)
+                })
+                .collect();
+
+            for (loop_idx, wall) in layer
+                .loops
+                .iter_mut()
+                .filter(|wall| wall.wall_index == 0)
+                .enumerate()
+            {
+                let Some(prev_loop_idx) = loop_matches[loop_idx] else {
+                    // No sufficiently-close previous loop (a topology
+                    // change, or a genuinely new loop this layer) --
+                    // leave this loop unstitched.
+                    continue;
+                };
+                let (prev_points, prev_fractions) = &prev_loops[prev_loop_idx];
+                if prev_points.is_empty() || wall.points.is_empty() {
+                    continue;
+                }
+
+                // The mesh's independently-extracted wall-0 contour can
+                // wind in either rotational sense from one layer to the
+                // next (this codebase's contour extraction does not
+                // guarantee a consistent winding direction layer to
+                // layer). Arc-length fraction is direction-sensitive --
+                // walking `points` in stored order always gives
+                // increasing fractions in *that* stored direction, so if
+                // the previous loop's stored direction is the opposite
+                // rotational sense from the current loop's, every
+                // fraction-based correspondence beyond the aligned start
+                // point would drift further wrong around the loop
+                // (worst near the far side). Detect this via the sign of
+                // each loop's shoelace-formula signed area in the
+                // transverse (u, v) plane (same `basis1`/`basis2`
+                // convention used elsewhere in this function): a
+                // reversed winding flips the sign. When they differ,
+                // walk the previous loop in reverse (and recompute its
+                // arc-length fractions from that reversed order) so both
+                // loops' fractions increase in the same rotational
+                // sense before correspondence is computed.
+                let signed_area = |pts: &[DVec3]| -> f64 {
+                    let n = pts.len();
+                    let mut area = 0.0;
+                    for i in 0..n {
+                        let (u0, v0) = (pts[i].dot(basis1), pts[i].dot(basis2));
+                        let (u1, v1) = (pts[(i + 1) % n].dot(basis1), pts[(i + 1) % n].dot(basis2));
+                        area += u0 * v1 - u1 * v0;
+                    }
+                    area
+                };
+                let reversed_prev_storage;
+                let (prev_points, prev_fractions): (&Vec<DVec3>, &Vec<f64>) =
+                    if signed_area(&wall.points).signum() != signed_area(prev_points).signum() {
+                        let rev_points: Vec<DVec3> = prev_points.iter().rev().copied().collect();
+                        let rev_fractions = compute_arc_fractions(&rev_points);
+                        reversed_prev_storage = (rev_points, rev_fractions);
+                        (&reversed_prev_storage.0, &reversed_prev_storage.1)
+                    } else {
+                        (prev_points, prev_fractions)
+                    };
+
+                // Establish the rotational offset between the two loops'
+                // independent parameterizations via a rotation search
+                // across several sample points (not a single nearest-point
+                // match at just `wall.points[0]` -- see
+                // `WALL_GAP_ROTATION_SEARCH_SAMPLES`'s docs for why a
+                // single-point alignment can silently lock onto the wrong
+                // offset on spiky/non-convex loops).
+                let offset = best_rotation_offset(
+                    &wall.points,
+                    &wall.arc_fraction,
+                    prev_points,
+                    prev_fractions,
+                );
+
+                // First pass: compute every point's raw correspondence
+                // (fraction-based, with bounded local fallback) before
+                // doing any bisecting. This is needed so the second pass
+                // below can compare a point's hop against its immediate
+                // current-loop neighbors' hops -- a comparison that is
+                // only meaningful once *all* of them are known, not just
+                // the ones processed so far in stored order.
+                let n = wall.points.len();
+                let mut correspondences: Vec<DVec3> = Vec::with_capacity(n);
+                for (point, &fraction) in wall.points.iter().zip(wall.arc_fraction.iter()) {
+                    let point = *point;
+                    let t_prev = (offset + fraction).rem_euclid(1.0);
+                    let fraction_based =
+                        interpolate_on_loop_at_fraction(prev_points, prev_fractions, t_prev);
+                    // Even with the best global offset, non-uniform point
+                    // density/sampling between the two loops can locally
+                    // warp the fraction-to-position mapping (worst near
+                    // corners/spikes). When the fraction-implied
+                    // correspondent is still further than the hop limit,
+                    // try a bounded local refinement scoped to a small
+                    // window of previous-loop indices around the
+                    // fraction-implied position -- never the whole
+                    // previous loop (that unbounded search is exactly what
+                    // caused the original zigzag defect).
+                    let corresponding =
+                        if lateral_gap(field.as_ref(), fraction_based, point) > hop_limit {
+                            local_fallback_correspondence(
+                                prev_points,
+                                prev_fractions,
+                                t_prev,
+                                point,
+                                fraction_based,
+                            )
+                        } else {
+                            fraction_based
+                        };
+                    correspondences.push(corresponding);
+                }
+
+                // Second pass: a single current-loop point whose own
+                // fraction-based correspondence lands far away, while both
+                // of its immediate current-loop neighbors (before/after in
+                // stored point order) have perfectly good, close
+                // correspondences, is not plausibly a genuine isolated gap
+                // -- see `correct_isolated_correspondence_outliers`'s docs.
+                correct_isolated_correspondence_outliers(
+                    &wall.points,
+                    &mut correspondences,
+                    hop_limit,
+                    &|point, corresponding| lateral_gap(field.as_ref(), corresponding, point),
+                );
+
+                // Third pass: decide, per point, whether it genuinely
+                // needs stitching (lateral gap over the limit AND no
+                // previous-layer material laterally nearby), then group
+                // consecutive needs-stitch points into maximal runs and
+                // emit ONE continuous serpentine block per run (see
+                // [`serpentine_stitch_block`]) instead of a separate
+                // anchor-to-target ramp per point -- the per-point ramps
+                // made the nozzle dive down to the previous layer and
+                // climb back up for EVERY point in a gap run, printing a
+                // sawtooth/zigzag instead of continuous stitch lines.
+                let needs_stitch: Vec<bool> = wall
+                    .points
+                    .iter()
+                    .zip(correspondences.iter())
+                    .map(|(point, corresponding)| {
+                        if lateral_gap(field.as_ref(), *corresponding, *point) <= hop_limit {
+                            return false;
+                        }
+                        // Correspondence sanity veto: arc-length-fraction
+                        // correspondence can fail systematically across a
+                        // whole region when the contour's shape changes
+                        // drastically between adjacent layers (e.g. two
+                        // lobes merging), sending `corresponding` to the
+                        // far side of the loop and bridging a many-mm
+                        // "gap" that does not physically exist. A
+                        // *genuine* gap means no previous-layer wall-0
+                        // material lies laterally near this point at all
+                        // -- so if ANY previous-loop point is within the
+                        // hop limit laterally, the point is actually
+                        // supported and needs no stitch. Scans EVERY
+                        // previous wall-0 loop, not just the matched one
+                        // -- in topology-change regions the supporting
+                        // material often belongs to a different previous
+                        // loop than the centroid/perimeter match picked.
+                        // This full scan is used strictly as a veto,
+                        // never as the correspondence itself, so it
+                        // cannot reintroduce the nearest-point zigzag
+                        // defect (see this function's docs).
+                        !prev_loops.iter().any(|(loop_points, _)| {
+                            loop_points
+                                .iter()
+                                .any(|prev| lateral_gap(field.as_ref(), *prev, *point) <= hop_limit)
+                        }) && chord_stays_in_solid(
+                            mesh_sdf.as_deref(),
+                            *corresponding,
+                            *point,
+                            config.nozzle_diameter / 2.0,
+                        )
+                    })
+                    .collect();
+
+                let mut new_points = Vec::with_capacity(wall.points.len());
+                let mut new_unsupported = Vec::with_capacity(wall.unsupported.len());
+                let mut new_arc_fraction = Vec::with_capacity(wall.arc_fraction.len());
+                let mut i = 0usize;
+                while i < n {
+                    if !needs_stitch[i] {
+                        new_points.push(wall.points[i]);
+                        new_unsupported.push(wall.unsupported[i]);
+                        new_arc_fraction.push(wall.arc_fraction[i]);
+                        i += 1;
+                        continue;
+                    }
+                    // Maximal run of consecutive needs-stitch points
+                    // [i..=run_end]. (A run split across the stored-order
+                    // wrap point becomes two separate blocks -- slightly
+                    // suboptimal, never incorrect.)
+                    let mut run_end = i;
+                    while run_end + 1 < n && needs_stitch[run_end + 1] {
+                        run_end += 1;
+                    }
+                    serpentine_stitch_block(
+                        &correspondences[i..=run_end],
+                        &wall.points[i..=run_end],
+                        &wall.arc_fraction[i..=run_end],
+                        *prev_order,
+                        cur_order,
+                        field.as_ref(),
+                        max_along,
+                        hop_limit,
+                        &mut new_points,
+                        &mut new_unsupported,
+                        &mut new_arc_fraction,
+                    );
+                    for k in i..=run_end {
+                        new_points.push(wall.points[k]);
+                        new_unsupported.push(wall.unsupported[k]);
+                        new_arc_fraction.push(wall.arc_fraction[k]);
+                    }
+                    i = run_end + 1;
+                }
+                wall.points = new_points;
+                wall.unsupported = new_unsupported;
+                wall.arc_fraction = new_arc_fraction;
+            }
+        }
+
+        previous_wall0 = Some((layer.order, current_wall0));
+    }
+}
+
+/// Computes the centroid (arithmetic mean of `points`) of a wall-0 loop,
+/// used by [`stitch_wall_gaps`] to establish spatial correspondence
+/// between a current-layer loop and a previous-layer loop before running
+/// arc-length-fraction correspondence within the matched pair. Returns
+/// `DVec3::ZERO` for an empty slice (callers already skip empty loops
+/// before stitching, so this is just a safe fallback, never load-bearing).
+fn loop_centroid(points: &[DVec3]) -> DVec3 {
+    if points.is_empty() {
+        return DVec3::ZERO;
+    }
+    let sum: DVec3 = points.iter().copied().fold(DVec3::ZERO, |acc, p| acc + p);
+    sum / (points.len() as f64)
+}
+
+/// Total perimeter (closed-polyline arc length, including the closing
+/// segment from the last point back to the first) of a wall-0 loop, used
+/// by [`stitch_wall_gaps`] as a second, shape-aware plausibility check on
+/// top of centroid distance before accepting a current-loop/previous-loop
+/// match (see `WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR`'s docs for why
+/// centroid distance alone is not sufficient). Returns `0.0` for fewer
+/// than 2 points (no meaningful perimeter).
+fn loop_perimeter(points: &[DVec3]) -> f64 {
+    let n = points.len();
+    if n < 2 {
+        return 0.0;
+    }
+    (0..n)
+        .map(|i| (points[(i + 1) % n] - points[i]).length())
+        .sum()
+}
+
+/// Computes each point's normalized cumulative arc-length position
+/// around a closed polyline (see [`WallLoop::arc_fraction`]):
+/// `result[0] == 0.0` and `result[i]` increases monotonically walking
+/// `points` in order, including the closing segment from the last point
+/// back to `points[0]` (which is what makes the loop's total perimeter
+/// the normalization denominator). Returns an all-zero `Vec` of the same
+/// length for fewer than 2 points or a degenerate (zero-perimeter) loop,
+/// since there is no meaningful arc-length position to compute.
+fn compute_arc_fractions(points: &[DVec3]) -> Vec<f64> {
+    let n = points.len();
+    if n < 2 {
+        return vec![0.0; n];
+    }
+    let mut cumulative = Vec::with_capacity(n);
+    let mut running = 0.0;
+    for i in 0..n {
+        cumulative.push(running);
+        running += (points[(i + 1) % n] - points[i]).length();
+    }
+    let total = running;
+    if total <= 0.0 {
+        return vec![0.0; n];
+    }
+    cumulative.into_iter().map(|c| c / total).collect()
+}
+
+/// Interpolates a position along a closed polyline at normalized
+/// arc-length fraction `t` (see [`WallLoop::arc_fraction`] /
+/// [`compute_arc_fractions`]), used by [`stitch_wall_gaps`] to find a
+/// current-loop point's corresponding position on the previous layer's
+/// wall-0 loop. `fractions` must be `points`'s own arc-length-fraction
+/// table (monotonically increasing, `fractions[0] == 0.0`). `t` is
+/// wrapped into `[0, 1)` first, so callers may pass an unwrapped
+/// `offset + fraction` sum directly. Falls back to `points[0]` (or
+/// `DVec3::ZERO` if `points` is empty) for a degenerate loop.
+fn interpolate_on_loop_at_fraction(points: &[DVec3], fractions: &[f64], t: f64) -> DVec3 {
+    let n = points.len();
+    if n == 0 {
+        return DVec3::ZERO;
+    }
+    if n == 1 {
+        return points[0];
+    }
+    let t = t.rem_euclid(1.0);
+    let i = bracketing_segment_index(fractions, t);
+    let seg_start = fractions[i];
+    let seg_end = if i + 1 < n { fractions[i + 1] } else { 1.0 };
+    let span = seg_end - seg_start;
+    let local_t = if span > 0.0 {
+        ((t - seg_start) / span).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let next = points[(i + 1) % n];
+    points[i] + (next - points[i]) * local_t
+}
+
+/// Finds the index `i` of the arc-length segment `[fractions[i],
+/// fractions[i + 1])` (with the last segment's upper bound implicitly
+/// `1.0`) bracketing normalized fraction `t`, shared by
+/// [`interpolate_on_loop_at_fraction`] and
+/// [`local_fallback_correspondence`] (the latter uses it to anchor its
+/// bounded local search window at the same position the fraction-based
+/// correspondence already landed on). `t` is wrapped into `[0, 1)`
+/// first. `fractions` must be non-empty, monotonically increasing, and
+/// start at `0.0` (a loop's own `arc_fraction`/[`compute_arc_fractions`]
+/// table). Returns `0` as an unreachable-in-practice fallback: `t <
+/// fractions[0] == 0.0` can only happen for `t == 0.0` exactly given the
+/// `rem_euclid` wrap, which the loop below already covers.
+fn bracketing_segment_index(fractions: &[f64], t: f64) -> usize {
+    let n = fractions.len();
+    if n <= 1 {
+        return 0;
+    }
+    let t = t.rem_euclid(1.0);
+    for i in 0..n {
+        let seg_start = fractions[i];
+        let seg_end = if i + 1 < n { fractions[i + 1] } else { 1.0 };
+        if t >= seg_start && (t < seg_end || i + 1 == n) {
+            return i;
+        }
+    }
+    0
+}
+
+/// Searches for the rotational offset between a current-layer wall-0
+/// loop and its matched previous-layer loop that best aligns their
+/// independent arc-length-fraction parameterizations, used by
+/// [`stitch_wall_gaps`] in place of a single nearest-point start-point
+/// alignment (see [`WALL_GAP_ROTATION_SEARCH_SAMPLES`]'s docs for why a
+/// single point is not reliable on spiky/non-convex loops).
+///
+/// Takes up to `WALL_GAP_ROTATION_SEARCH_SAMPLES` evenly-spaced samples
+/// (by point index, so they are spread around the *whole* current loop,
+/// not clustered near its start) and, for each candidate offset, scores
+/// it by the total squared distance between each sample point and the
+/// previous loop's fraction-interpolated position at that sample's own
+/// fraction plus the candidate offset. Candidate offsets are drawn from
+/// the previous loop's own point fractions (`prev_fractions[j] -
+/// <first sample's fraction>` for each `j`): this guarantees the true
+/// best alignment (if the first sample truly corresponds to some
+/// previous-loop point, however approximately) is always among the
+/// candidates, while keeping the search bounded to `O(samples *
+/// prev_points.len())` -- still just a per-loop-pair cost, not
+/// per-point. Returns `0.0` if either loop is empty.
+fn best_rotation_offset(
+    current_points: &[DVec3],
+    current_fractions: &[f64],
+    prev_points: &[DVec3],
+    prev_fractions: &[f64],
+) -> f64 {
+    let n_cur = current_points.len();
+    let n_prev = prev_points.len();
+    if n_cur == 0 || n_prev == 0 {
+        return 0.0;
+    }
+
+    let sample_count = WALL_GAP_ROTATION_SEARCH_SAMPLES.min(n_cur);
+    let step = n_cur as f64 / sample_count as f64;
+    let samples: Vec<(DVec3, f64)> = (0..sample_count)
+        .map(|i| {
+            let idx = ((i as f64 * step) as usize).min(n_cur - 1);
+            (current_points[idx], current_fractions[idx])
+        })
+        .collect();
+    let anchor_fraction = samples[0].1;
+
+    (0..n_prev)
+        .map(|j| {
+            let candidate = (prev_fractions[j] - anchor_fraction).rem_euclid(1.0);
+            let error: f64 = samples
+                .iter()
+                .map(|(sample_point, sample_fraction)| {
+                    let t_prev = (candidate + sample_fraction).rem_euclid(1.0);
+                    let corresponding =
+                        interpolate_on_loop_at_fraction(prev_points, prev_fractions, t_prev);
+                    (*sample_point - corresponding).length_squared()
+                })
+                .sum();
+            (candidate, error)
+        })
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(candidate, _)| candidate)
+        .expect("n_prev > 0 checked above")
+}
+
+/// Lateral (perpendicular to the local climb direction) component of
+/// the gap between a current-layer point and its previous-layer
+/// correspondent, used by [`stitch_wall_gaps`] and
+/// [`serpentine_stitch_block`] as
+/// the gap-detection metric in place of raw 3D distance.
+///
+/// Raw 3D distance between corresponding points on adjacent layers
+/// always includes the inter-layer climb separation itself (~= one
+/// layer height), so comparing it against `0.9 * nozzle_radius` triggers
+/// on essentially *every* point of *every* contour whenever
+/// `layer_height >= 0.9 * nozzle_radius` (e.g. 0.20mm layers with a
+/// 0.4mm nozzle) -- including perfectly vertical walls that need no
+/// stitching at all. What actually determines whether a freshly
+/// deposited bead bonds to the previous layer's bead is how far it sits
+/// *sideways* from it; the climb separation of one layer step is normal
+/// and expected. This computes that sideways component: `delta` minus
+/// its projection onto the local climb direction `n` (the normalized
+/// order-field gradient -- order increases along the climb, so its
+/// gradient is the direction consecutive layers separate in; for a
+/// `Height` field this is exactly the build direction).
+///
+/// The gradient is sampled at the midpoint of the two points: the metric
+/// is symmetric in its endpoints, and the midpoint best represents the
+/// climb direction *of the gap itself* rather than privileging either
+/// endpoint's local field value.
+///
+/// Degenerate gradients (non-finite anywhere in the central-difference
+/// stencil -- see [`order_field::numeric_gradient`] -- or (near-)zero
+/// length) fall back to the gradient at either endpoint, and finally to
+/// treating [`BUILD_DIRECTION`] as the climb direction. The old "fall
+/// back to the full 3D `delta` length" behavior is deliberately NOT
+/// used: with `layer_height >= hop_limit` (e.g. 0.20mm layers vs a
+/// 0.18mm limit) it classifies every perfectly-supported point in a
+/// degenerate-gradient region (common on Eikonal grid plateaus / near
+/// INFINITY cells) as a gap, flooding those regions with bogus stitch
+/// chains -- the exact failure this metric exists to prevent. Projecting
+/// out the build direction is a far better approximation of "sideways"
+/// than not projecting anything at all.
+pub fn lateral_gap<F: OrderField + ?Sized>(field: &F, from: DVec3, to: DVec3) -> f64 {
+    /// Below this squared length the gradient's direction is numeric
+    /// noise, not a meaningful climb direction.
+    const MIN_GRADIENT_LENGTH_SQ: f64 = 1e-12;
+
+    let delta = to - from;
+    let mid = 0.5 * (from + to);
+    let n = [mid, from, to]
+        .into_iter()
+        .find_map(|p| {
+            order_field::numeric_gradient(field, p)
+                .filter(|g| g.length_squared() > MIN_GRADIENT_LENGTH_SQ)
+        })
+        .map_or(BUILD_DIRECTION, |grad| grad / grad.length());
+    (delta - delta.dot(n) * n).length()
+}
+
+/// A single current-loop point whose raw fraction-based (plus bounded
+/// local-fallback) correspondence lands further than `hop_limit` from
+/// `points[i]`, while both of its immediate current-loop neighbors
+/// (`points[i-1]`/`points[i+1]`, wrapping around the closed loop) have
+/// correspondences within `hop_limit` of their own points, is not
+/// plausibly a genuine isolated gap: a real shallow-overhang region
+/// spans a *run* of consecutive points with a bad correspondence, never
+/// a single point bracketed on both sides by points with perfectly good,
+/// close correspondences. Even after the best global rotation offset
+/// (see [`best_rotation_offset`]) and the bounded local fallback (see
+/// [`local_fallback_correspondence`]), a single previous-loop sampling
+/// irregularity can still throw off one point's fraction-interpolated
+/// position while its neighbors -- who interpolate at nearby but
+/// different fractions, potentially bracketing a different, unaffected
+/// segment of the previous loop -- land fine.
+///
+/// When exactly this isolated pattern is detected, this replaces
+/// `correspondences[i]` in place with the midpoint of its neighbors' own
+/// (already-good) correspondences -- a locally-consistent estimate that
+/// follows the loop's real local shape -- rather than trusting the raw
+/// fraction-based lookup for that one point. All hop distances used for
+/// the decision are computed from `correspondences` *before* any
+/// correction in this pass (a fixed snapshot), so corrections do not
+/// cascade or depend on iteration order. Deliberately conservative: it
+/// never overrides a run of 2 or more consecutive bad points (both
+/// neighbors must individually already be good), matching the
+/// established pattern in this codebase of preferring bounded, local
+/// corrections over broader searches that previously caused zigzag
+/// defects (see `stitch_wall_gaps`'s docs). No-op for fewer than 3
+/// points (no distinct neighbor pair exists).
+///
+/// `gap` is the metric a hop is measured with (the same lateral-gap
+/// metric [`stitch_wall_gaps`] triggers on -- see [`lateral_gap`] --
+/// injected as a closure so this function stays a pure, field-free
+/// geometric pass that unit tests can drive with a plain 3D-distance
+/// metric), called as `gap(point, correspondence)`.
+fn correct_isolated_correspondence_outliers(
+    points: &[DVec3],
+    correspondences: &mut [DVec3],
+    hop_limit: f64,
+    gap: &dyn Fn(DVec3, DVec3) -> f64,
+) {
+    let n = points.len();
+    if n < 3 {
+        return;
+    }
+    debug_assert_eq!(points.len(), correspondences.len());
+
+    let hops: Vec<f64> = points
+        .iter()
+        .zip(correspondences.iter())
+        .map(|(point, corresponding)| gap(*point, *corresponding))
+        .collect();
+
+    for i in 0..n {
+        if hops[i] <= hop_limit {
+            continue;
+        }
+        let prev_i = (i + n - 1) % n;
+        let next_i = (i + 1) % n;
+        if hops[prev_i] <= hop_limit && hops[next_i] <= hop_limit {
+            let blended = (correspondences[prev_i] + correspondences[next_i]) * 0.5;
+            if gap(points[i], blended) < hops[i] {
+                correspondences[i] = blended;
+            }
+        }
+    }
+}
+
+/// Bounded local fallback for an individual point's fraction-based
+/// correspondence, used by [`stitch_wall_gaps`] when the point returned
+/// by [`interpolate_on_loop_at_fraction`] (via [`best_rotation_offset`]'s
+/// global offset) is still further than the hop limit from `point`.
+/// Non-uniform point density/sampling between the two loops can locally
+/// warp the fraction-to-position mapping even after the best global
+/// offset is found (worst around sharp corners/spikes, where nearby
+/// points can have very different local arc-length contributions) --
+/// this searches a small, bounded window of previous-loop *indices*
+/// (`+/- WALL_GAP_LOCAL_FALLBACK_WINDOW`, wrapping around the closed
+/// loop) centered on the segment `t_prev` already lands in, for a raw-3D
+/// nearest point to `point`. Deliberately bounded and local: an
+/// unconstrained whole-previous-loop nearest-point search is exactly
+/// what produced the original perpendicular-zigzag defect (see
+/// `stitch_wall_gaps`'s docs, "Addendum 2"), so this only ever looks a
+/// few points away from an already-plausible fraction-implied position,
+/// never anywhere else on the loop. Candidates within the window are
+/// deliberately compared by raw 3D distance, not [`lateral_gap`]: this
+/// is choosing the geometrically closest real previous-loop *point* to
+/// anchor the correspondence, not deciding whether a gap needs
+/// stitching -- the lateral criterion applies afterwards, to whatever
+/// correspondence this returns. Returns `fallback` (the original
+/// fraction-based correspondence) unchanged if `prev_points` is empty or
+/// no point in the window is closer than it.
+fn local_fallback_correspondence(
+    prev_points: &[DVec3],
+    prev_fractions: &[f64],
+    t_prev: f64,
+    point: DVec3,
+    fallback: DVec3,
+) -> DVec3 {
+    let n = prev_points.len();
+    if n == 0 {
+        return fallback;
+    }
+
+    let center = bracketing_segment_index(prev_fractions, t_prev) as isize;
+    let window = WALL_GAP_LOCAL_FALLBACK_WINDOW as isize;
+    let mut best = fallback;
+    let mut best_dist_sq = (point - fallback).length_squared();
+    for delta in -window..=window {
+        let idx = (center + delta).rem_euclid(n as isize) as usize;
+        let dist_sq = (point - prev_points[idx]).length_squared();
+        if dist_sq < best_dist_sq {
+            best_dist_sq = dist_sq;
+            best = prev_points[idx];
+        }
+    }
+    best
+}
+
+/// Continuous-serpentine building block behind [`stitch_wall_gaps`]:
+/// fills the gap under a maximal run of consecutive needs-stitch
+/// current-loop points with continuous intermediate contour LINES
+/// rather than one anchor-to-target ramp per point.
+///
+/// Per-point ramps produced a physical zigzag: for every point in a gap
+/// run the nozzle dove down to the previous layer's anchor and climbed
+/// back up to the current layer, over and over. Instead, this treats the
+/// run as a 2D patch spanned by `columns` (one per run point: its
+/// previous-layer anchor `anchors[i]` at `prev_order`, its current-layer
+/// target `targets[i]` at `cur_order`) and `levels` (intermediate order
+/// values between the two layers), and emits the patch points row by
+/// row in a serpentine order: walk one order level across the whole run,
+/// step up one level at the same column, walk back, and so on -- i.e.
+/// genuine continuous stitch lines. Row directions are chosen so the
+/// topmost inserted row ends at column 0, immediately adjacent (one
+/// level step below) to the run's first real point, so the loop then
+/// continues into the run's own points without a long backtrack hop.
+/// Consecutive emitted points are therefore always either horizontal
+/// neighbors within a row or a single-level vertical step at a row
+/// turnaround, keeping every hop within `hop_limit` (see below).
+///
+/// Each column's interior level points are built by walking up from the
+/// previous level's ACCEPTED point: the seed is one straight step from it,
+/// re-aimed at the target across the levels still remaining, then
+/// reprojected onto the field's isosurface at that level's order value via
+/// [`order_field::project_onto_isosurface`]. The refinement is accepted
+/// only within the column's own per-level scale (nominal step length plus
+/// `hop_limit`): for a non-monotonic field (`Eikonal` near
+/// reentrant/threaded geometry, which this stitching path exists to bridge
+/// in the first place) an unconstrained Newton descent can converge onto a
+/// *different, wrong* branch of the isosurface arbitrarily far away, while
+/// the re-aimed seed alone already guarantees geometric progress toward
+/// the target. A seed landing where the field is unreached (order = inf,
+/// e.g. an Eikonal FMM hole) never becomes an emitted point; the column
+/// repeats its last on-field point instead.
+///
+/// The level count starts at 1 and doubles until every column's
+/// consecutive LATERAL hops (see [`lateral_gap`]; the climb component of
+/// one level step is normal and expected) are within `hop_limit`, until
+/// doubling stops paying off (a column whose chord crosses a genuine field
+/// discontinuity has no intermediate isosurface to land on, so its worst
+/// hop stops shrinking -- doubling further would only multiply the point
+/// count), or until [`MAX_STITCH_LEVELS`] is reached.
+///
+/// Every emitted point is flagged `unsupported = true` (see
+/// [`WallLoop::unsupported`]) and carries its own column's target-point
+/// arc fraction (an inserted stitch point doesn't add a new
+/// circumferential position, only an intermediate order value on the way
+/// to that target), keeping `out_arc_fraction` parallel to
+/// `out_points`/`out_unsupported`. Does not append the run's own target
+/// points; the caller pushes those itself.
+#[allow(clippy::too_many_arguments)] // one param per geometric input/output; a config struct would obscure the patch construction this directly mirrors
+fn serpentine_stitch_block<F: OrderField + ?Sized>(
+    anchors: &[DVec3],
+    targets: &[DVec3],
+    fractions: &[f64],
+    prev_order: f64,
+    cur_order: f64,
+    field: &F,
+    max_along: f64,
+    hop_limit: f64,
+    out_points: &mut Vec<DVec3>,
+    out_unsupported: &mut Vec<bool>,
+    out_arc_fraction: &mut Vec<f64>,
+) {
+    let cols = anchors.len();
+    debug_assert_eq!(cols, targets.len());
+    debug_assert_eq!(cols, fractions.len());
+    if cols == 0 || !(hop_limit.is_finite() && hop_limit > 0.0) {
+        return;
+    }
+
+    let build_column = |anchor: DVec3, target: DVec3, levels: usize| -> Vec<DVec3> {
+        // Seed each level from the previous level's ACCEPTED point,
+        // re-aimed at the target across the levels still remaining, not
+        // from a direct anchor->target lerp: in strongly curved field
+        // regions (Eikonal around reentrant geometry) the straight chord
+        // between the layers can wander far off the intermediate
+        // isosurfaces -- lerp seeds there either fail projection outright
+        // (even landing where the FMM field is unreached, order = inf) or
+        // get rejected by the drift filter, leaving off-level points that
+        // physically zigzag. Walking up level by level keeps every seed
+        // one small step from a point already on the field, and re-aiming
+        // at the target each step keeps cumulative projection drift from
+        // carrying the column's top away from the run point it must meet.
+        let nominal_step = (target - anchor).length() / levels as f64;
+        let max_refinement_drift = nominal_step + hop_limit;
+        let mut column = Vec::with_capacity(levels);
+        column.push(anchor);
+        let mut prev = anchor;
+        for j in 1..levels {
+            let t = j as f64 / levels as f64;
+            let order = prev_order + (cur_order - prev_order) * t;
+            let remaining = (levels - j + 1) as f64;
+            let seed = prev + (target - prev) / remaining;
+            let point = order_field::project_onto_isosurface(field, seed, order, max_along)
+                .filter(|p| (*p - seed).length() <= max_refinement_drift)
+                .unwrap_or(if field.order(seed).is_finite() {
+                    seed
+                } else {
+                    // Seed fell where the field is unreached (e.g. an
+                    // Eikonal FMM hole outside occupancy, order = inf) --
+                    // never emit a point off the field entirely; repeat
+                    // the column's last on-field point instead (a
+                    // zero-length segment in the printed line).
+                    prev
+                });
+            column.push(point);
+            prev = point;
+        }
+        column
+    };
+
+    let mut levels = 1usize;
+    let mut previous_worst = f64::INFINITY;
+    let columns: Vec<Vec<DVec3>> = loop {
+        let candidate: Vec<Vec<DVec3>> = anchors
+            .iter()
+            .zip(targets.iter())
+            .map(|(&anchor, &target)| build_column(anchor, target, levels))
+            .collect();
+        let worst_hop = candidate
+            .iter()
+            .zip(targets.iter())
+            .map(|(column, &target)| {
+                let within = column
+                    .windows(2)
+                    .map(|w| lateral_gap(field, w[0], w[1]))
+                    .fold(0.0, f64::max);
+                let approach = column
+                    .last()
+                    .map_or(0.0, |&top| lateral_gap(field, top, target));
+                within.max(approach)
+            })
+            .fold(0.0, f64::max);
+        // Stop when converged -- or when doubling has stopped paying off:
+        // a column whose chord crosses a genuine field discontinuity (the
+        // very unreachable region this stitch is bridging, e.g. an ear
+        // tip) has no intermediate isosurface to land on, so its worst
+        // hop never shrinks and doubling to MAX_STITCH_LEVELS would only
+        // explode the point count for the whole run.
+        let stalled = worst_hop > 0.9 * previous_worst;
+        if worst_hop <= hop_limit || stalled || levels >= MAX_STITCH_LEVELS {
+            // A block that stalled (or capped out) without materially
+            // reducing the worst remaining hop is a net negative: it
+            // prints an excursion along intermediate rows and still ends
+            // with (nearly) the same unsupported jump the run had before
+            // stitching. Only emit the block when its worst residual
+            // top-row -> target hop is at most half the worst direct
+            // anchor -> target hop it replaces; otherwise leave the run
+            // unstitched (a single straight Overhang bridge).
+            if worst_hop > hop_limit {
+                let worst_unstitched = anchors
+                    .iter()
+                    .zip(targets.iter())
+                    .map(|(&anchor, &target)| lateral_gap(field, anchor, target))
+                    .fold(0.0, f64::max);
+                let worst_residual = candidate
+                    .iter()
+                    .zip(targets.iter())
+                    .map(|(column, &target)| {
+                        column
+                            .last()
+                            .map_or(0.0, |&top| lateral_gap(field, top, target))
+                    })
+                    .fold(0.0, f64::max);
+                if worst_residual > 0.5 * worst_unstitched {
+                    return;
+                }
+            }
+            break candidate;
+        }
+        previous_worst = worst_hop;
+        levels *= 2;
+    };
+
+    #[allow(clippy::needless_range_loop)]
+    // `j` indexes the ROW across every column (`columns[i][j]`); iterating `columns` directly would invert the serpentine's row-major emission order
+    for j in 0..levels {
+        // The topmost inserted row (j == levels - 1) must run backward so
+        // it ends at column 0, adjacent to the run's first real point;
+        // alternate direction downward from there so consecutive rows
+        // always turn around at a shared column.
+        let backward = (levels - 1 - j).is_multiple_of(2);
+        let column_indices: Box<dyn Iterator<Item = usize>> = if backward {
+            Box::new((0..cols).rev())
+        } else {
+            Box::new(0..cols)
+        };
+        for i in column_indices {
+            // Degenerate runs (many run points sharing one previous-layer
+            // anchor) make whole rows collapse to a single repeated
+            // point; skip exact consecutive duplicates.
+            if out_points.last() == Some(&columns[i][j]) {
+                continue;
+            }
+            out_points.push(columns[i][j]);
+            out_unsupported.push(true);
+            out_arc_fraction.push(fractions[i]);
+        }
+    }
 }
 
 /// Post-pass computing every layer's [`Layer::solid_fill_boundary`] from
@@ -1793,5 +3030,1277 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn stitch_wall_gaps_no_op_when_points_within_hop_limit() {
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        let field: Arc<dyn OrderField> = Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+
+        let mut layers = vec![
+            Layer {
+                index: 0,
+                order: 0.0,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
+                    unsupported: vec![false, false],
+                    arc_fraction: compute_arc_fractions(&[
+                        DVec3::new(0.0, 0.0, 0.0),
+                        DVec3::new(1.0, 0.0, 0.0),
+                    ]),
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+            Layer {
+                index: 1,
+                order: 0.05,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    points: vec![DVec3::new(0.01, 0.0, -0.05), DVec3::new(1.01, 0.0, -0.05)],
+                    unsupported: vec![false, false],
+                    arc_fraction: compute_arc_fractions(&[
+                        DVec3::new(0.01, 0.0, -0.05),
+                        DVec3::new(1.01, 0.0, -0.05),
+                    ]),
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+        ];
+
+        stitch_wall_gaps(&mut layers, &config, basis1, basis2);
+
+        assert_eq!(
+            layers[1].loops[0].points.len(),
+            2,
+            "points well within the hop limit should not be stitched"
+        );
+        assert_eq!(layers[1].loops[0].unsupported, vec![false, false]);
+    }
+
+    #[test]
+    fn stitch_wall_gaps_bisects_and_flags_unsupported_points_when_gap_exceeds_threshold() {
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        let hop_limit = WALL_GAP_HOP_FRACTION * (config.nozzle_diameter / 2.0);
+        let field: Arc<dyn OrderField> = Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+
+        let mut layers = vec![
+            Layer {
+                index: 0,
+                order: 0.0,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    points: vec![DVec3::new(0.0, 0.0, 0.0)],
+                    unsupported: vec![false],
+                    arc_fraction: vec![0.0],
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+            Layer {
+                index: 1,
+                order: 0.2,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    points: vec![DVec3::new(2.0, 0.0, -0.2)],
+                    unsupported: vec![false],
+                    arc_fraction: vec![0.0],
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+        ];
+
+        stitch_wall_gaps(&mut layers, &config, basis1, basis2);
+
+        let wall = &layers[1].loops[0];
+        assert!(
+            wall.points.len() > 1,
+            "a gap exceeding the hop limit should trigger stitching"
+        );
+        assert_eq!(
+            wall.unsupported.len(),
+            wall.points.len(),
+            "unsupported must stay parallel to points"
+        );
+        assert_eq!(
+            wall.arc_fraction.len(),
+            wall.points.len(),
+            "arc_fraction must stay parallel to points through stitch insertion"
+        );
+
+        // Every point but the last (the original, real point) should be
+        // flagged unsupported -- inserted by the stitch.
+        for &flag in &wall.unsupported[..wall.unsupported.len() - 1] {
+            assert!(flag, "inserted stitch points must be marked unsupported");
+        }
+        assert!(
+            !wall.unsupported[wall.unsupported.len() - 1],
+            "the original target point must stay unsupported = false"
+        );
+
+        // Every consecutive hop along the stitched loop, prepended with
+        // the previous layer's real point, must be within the hop limit
+        // measured LATERALLY (perpendicular to the local climb
+        // direction -- see `lateral_gap`'s docs): the climb component of
+        // a hop is a normal fraction of the layer step and is exactly
+        // what the criterion must not count.
+        let mut full_chain = vec![layers[0].loops[0].points[0]];
+        full_chain.extend(wall.points.iter().copied());
+        for pair in full_chain.windows(2) {
+            let dist = lateral_gap(field.as_ref(), pair[0], pair[1]);
+            assert!(
+                dist <= hop_limit + 1e-9,
+                "lateral hop {dist} exceeds hop_limit {hop_limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn stitch_wall_gaps_ignores_pure_climb_separation_on_vertical_walls() {
+        // A perfectly vertical wall: consecutive layers' wall-0 loops are
+        // identical in XY and separated purely along the climb (build)
+        // direction by one layer step. The raw 3D distance between
+        // corresponding points (0.2mm) exceeds the hop limit (0.9 *
+        // nozzle_radius = 0.18mm), which is exactly the flaw that made
+        // the old raw-3D criterion stitch ~every point of ~every contour;
+        // the lateral criterion must leave this loop completely alone.
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        let field: Arc<dyn OrderField> = Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+
+        let square = |z: f64| -> Vec<DVec3> {
+            vec![
+                DVec3::new(0.0, 0.0, z),
+                DVec3::new(5.0, 0.0, z),
+                DVec3::new(5.0, 5.0, z),
+                DVec3::new(0.0, 5.0, z),
+            ]
+        };
+        let prev_points = square(0.0);
+        let cur_points = square(-0.2);
+
+        let mut layers = vec![
+            Layer {
+                index: 0,
+                order: 0.0,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    unsupported: vec![false; prev_points.len()],
+                    arc_fraction: compute_arc_fractions(&prev_points),
+                    points: prev_points,
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+            Layer {
+                index: 1,
+                order: 0.2,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    unsupported: vec![false; cur_points.len()],
+                    arc_fraction: compute_arc_fractions(&cur_points),
+                    points: cur_points,
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+        ];
+
+        stitch_wall_gaps(&mut layers, &config, basis1, basis2);
+
+        assert_eq!(
+            layers[1].loops[0].points.len(),
+            4,
+            "a vertical wall separated purely along the climb direction \
+             must not be stitched -- its lateral gap is zero"
+        );
+        assert!(
+            layers[1].loops[0].unsupported.iter().all(|&flag| !flag),
+            "no point on a vertical wall should be flagged unsupported"
+        );
+    }
+
+    #[test]
+    fn stitch_wall_gaps_still_stitches_a_shallow_ramp_with_a_large_lateral_offset() {
+        // A genuinely shallow slope: the next layer's loop steps one
+        // layer height along the climb direction but also drifts 1mm
+        // sideways -- far beyond the 0.18mm lateral hop limit. This is
+        // the real "ear bridging" case the feature exists for and must
+        // keep triggering under the lateral criterion.
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        let field: Arc<dyn OrderField> = Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+
+        let square = |x0: f64, z: f64| -> Vec<DVec3> {
+            vec![
+                DVec3::new(x0, 0.0, z),
+                DVec3::new(x0 + 5.0, 0.0, z),
+                DVec3::new(x0 + 5.0, 5.0, z),
+                DVec3::new(x0, 5.0, z),
+            ]
+        };
+        let prev_points = square(0.0, 0.0);
+        let cur_points = square(1.0, -0.2);
+
+        let mut layers = vec![
+            Layer {
+                index: 0,
+                order: 0.0,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    unsupported: vec![false; prev_points.len()],
+                    arc_fraction: compute_arc_fractions(&prev_points),
+                    points: prev_points,
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+            Layer {
+                index: 1,
+                order: 0.2,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    unsupported: vec![false; cur_points.len()],
+                    arc_fraction: compute_arc_fractions(&cur_points),
+                    points: cur_points,
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+        ];
+
+        stitch_wall_gaps(&mut layers, &config, basis1, basis2);
+
+        let wall = &layers[1].loops[0];
+        assert!(
+            wall.points.len() > 4,
+            "a 1mm lateral drift per layer must still trigger stitching"
+        );
+        assert!(
+            wall.unsupported.iter().any(|&flag| flag),
+            "stitched points must be flagged unsupported"
+        );
+    }
+
+    #[test]
+    fn correct_isolated_correspondence_outliers_fixes_a_single_point_surrounded_by_good_matches() {
+        // Regression test for a real-mesh finding (layer 40 of
+        // pug_v4_l_sop_85mm.stl): a single current-loop point's raw
+        // fraction-based (+ bounded local-fallback) correspondence landed
+        // ~8mm away, even though its immediate current-loop neighbors --
+        // only ~0.017mm apart from it and each other, ordinary densely
+        // sampled contour spacing -- both had perfectly good, close
+        // correspondences. This is implausible as a genuine isolated gap
+        // (a real shallow-overhang region spans a run of points, not one
+        // point bracketed by normal support on both sides), and is fixed
+        // by blending the outlier's correspondence from its neighbors'.
+        let hop_limit = 0.18; // matches the real hop_limit magnitude at 0.4mm nozzle.
+
+        // 5 current-loop points, densely and evenly spaced (mirrors the
+        // real chain's before/after spacing of ~0.017mm).
+        let points = vec![
+            DVec3::new(27.500, -1.760, 7.017),
+            DVec3::new(27.558, -1.783, 7.025),
+            DVec3::new(27.544, -1.790, 7.029), // the isolated trigger point
+            DVec3::new(27.530, -1.797, 7.033),
+            DVec3::new(27.516, -1.804, 7.037),
+        ];
+
+        // Correspondences: every point's previous-loop match is close
+        // (well within hop_limit) except index 2, whose fraction-based
+        // lookup lands ~8mm away (the real observed failure mode).
+        let neighbor_before = DVec3::new(27.558, -1.783, 7.025 - 0.1);
+        let neighbor_after = DVec3::new(27.530, -1.797, 7.033 - 0.1);
+        let mut correspondences = vec![
+            DVec3::new(27.500, -1.760, 7.017 - 0.1),
+            neighbor_before,
+            DVec3::new(35.430, -1.699, 6.810), // wrong, ~8mm away
+            neighbor_after,
+            DVec3::new(27.516, -1.804, 7.037 - 0.1),
+        ];
+
+        correct_isolated_correspondence_outliers(
+            &points,
+            &mut correspondences,
+            hop_limit,
+            &|p, c| (p - c).length(),
+        );
+
+        // The outlier at index 2 must now be close to `points[2]` (within
+        // the hop limit), not the original ~8mm-away wrong match.
+        assert!(
+            (points[2] - correspondences[2]).length() <= hop_limit,
+            "isolated outlier at index 2 should have been corrected to a nearby estimate, got {:?}",
+            correspondences[2]
+        );
+        // It should be exactly the blended midpoint of its neighbors' own
+        // correspondences, not an arbitrary value.
+        let expected = (neighbor_before + neighbor_after) * 0.5;
+        assert!(
+            (correspondences[2] - expected).length() < 1e-9,
+            "expected midpoint blend of neighbors' correspondences, got {:?} vs expected {:?}",
+            correspondences[2],
+            expected
+        );
+
+        // Untouched points must remain exactly as they were.
+        assert_eq!(correspondences[0], DVec3::new(27.500, -1.760, 7.017 - 0.1));
+        assert_eq!(correspondences[1], neighbor_before);
+        assert_eq!(correspondences[3], neighbor_after);
+        assert_eq!(correspondences[4], DVec3::new(27.516, -1.804, 7.037 - 0.1));
+    }
+
+    #[test]
+    fn correct_isolated_correspondence_outliers_leaves_a_genuine_multi_point_gap_alone() {
+        // A *run* of 2+ consecutive bad correspondences must NOT be
+        // "corrected" -- that pattern is consistent with a genuine
+        // shallow-overhang gap (which stitch_wall_gaps's bisecting is
+        // meant to handle), not an isolated single-point artifact. Only an
+        // isolated single point flanked by two individually-good neighbors
+        // should ever be touched.
+        let hop_limit = 0.18;
+        let points = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(0.1, 0.0, 0.0),
+            DVec3::new(0.2, 0.0, 0.0),
+            DVec3::new(0.3, 0.0, 0.0),
+        ];
+        let mut correspondences = vec![
+            DVec3::new(0.0, 0.0, -0.1),   // good
+            DVec3::new(10.0, 10.0, 10.0), // bad (run start)
+            DVec3::new(10.0, 10.0, 10.0), // bad (run continues)
+            DVec3::new(0.3, 0.0, -0.1),   // good
+        ];
+        let before = correspondences.clone();
+
+        correct_isolated_correspondence_outliers(
+            &points,
+            &mut correspondences,
+            hop_limit,
+            &|p, c| (p - c).length(),
+        );
+
+        assert_eq!(
+            correspondences, before,
+            "a 2-point run of bad correspondences must be left untouched, not blended"
+        );
+    }
+
+    #[test]
+    fn stitch_block_for_a_run_is_a_continuous_serpentine_not_per_point_ramps() {
+        // Two adjacent current-layer points, both laterally ~7mm from
+        // their previous-layer counterparts: a single 2-column gap run.
+        // The old per-point implementation inserted one anchor-to-target
+        // ramp per point, so between the two run points the nozzle dove
+        // back down to the previous layer (z jumping from ~-0.2 back up
+        // to ~0.0) -- a physical zigzag. The serpentine block emits
+        // whole order levels across the run instead, so the inserted
+        // points' z values must be monotonically non-increasing (for
+        // this Height field, order increases as z decreases): each row
+        // is at one level and rows only ever step toward the current
+        // layer.
+        let config = SlicerConfig::default();
+        let hop_limit = WALL_GAP_HOP_FRACTION * (config.nozzle_diameter / 2.0);
+        let field: Arc<dyn OrderField> = Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+
+        let prev_points = vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.3, 0.0, 0.0)];
+        let cur_points = vec![DVec3::new(7.0, 0.0, -0.2), DVec3::new(7.3, 0.0, -0.2)];
+        let mut layers = vec![
+            Layer {
+                index: 0,
+                order: 0.0,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    arc_fraction: compute_arc_fractions(&prev_points),
+                    unsupported: vec![false; prev_points.len()],
+                    points: prev_points,
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+            Layer {
+                index: 1,
+                order: 0.2,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    arc_fraction: compute_arc_fractions(&cur_points),
+                    unsupported: vec![false; cur_points.len()],
+                    points: cur_points,
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+        ];
+
+        stitch_wall_gaps(&mut layers, &config, basis1, basis2);
+
+        let wall = &layers[1].loops[0];
+        let inserted: Vec<DVec3> = wall
+            .points
+            .iter()
+            .zip(wall.unsupported.iter())
+            .filter(|(_, &unsupported)| unsupported)
+            .map(|(p, _)| *p)
+            .collect();
+        assert!(
+            inserted.len() >= 4,
+            "a 7mm 2-column gap must insert multiple stitch rows, got {}",
+            inserted.len()
+        );
+        for pair in inserted.windows(2) {
+            assert!(
+                pair[1].z <= pair[0].z + 1e-9,
+                "inserted stitch points must climb monotonically toward the current layer \
+                 (z non-increasing), but z jumped {} -> {} -- per-point ramp zigzag",
+                pair[0].z,
+                pair[1].z
+            );
+            let hop = lateral_gap(field.as_ref(), pair[0], pair[1]);
+            // Lateral hops between consecutive inserted points: within a
+            // row this is the column spacing; at a row turnaround it is a
+            // pure vertical level step (~0 lateral). Both must stay small
+            // -- a per-point-ramp zigzag would show a ~7mm lateral jump
+            // back across the gap between the two ramps.
+            assert!(
+                hop <= hop_limit + 0.3 + 1e-9,
+                "consecutive inserted points must be adjacent in the serpentine, got lateral hop {hop}"
+            );
+        }
+    }
+
+    #[test]
+    fn stitching_closes_a_gap_many_times_larger_than_hop_limit_without_stalling() {
+        // Regression test for a real-mesh finding: the stitch subdivision used to
+        // seed its midpoint reconstruction via
+        // `reconstruct_on_order_field_near`, which picks whichever of the
+        // two endpoints is closest in-plane and reuses *that endpoint's*
+        // `along` value, then rejects any Newton refinement that wanders
+        // farther from that seed than the seed's own residual justifies.
+        // That heuristic is correct for its original use (refining
+        // boolean-op output already known to sit near the isosurface),
+        // but for a genuinely large real wall-to-wall gap (confirmed on a
+        // real mesh: brute-force nearest-neighbor search over an entire
+        // previous-layer loop still found nothing closer than several mm)
+        // it stalls: the rejection kept falling back to (approximately)
+        // one endpoint, so recursing on the far side never made real
+        // geometric progress, leaving one huge unbisected hop alongside
+        // units, ~97x the hop limit) is far larger than
+        // `stitch_wall_gaps_bisects_and_flags_unsupported_points_when_gap_exceeds_threshold`'s
+        // 2-unit gap specifically to exercise many recursive bisection
+        // levels, not just one or two (kept within
+        // `WALL_GAP_LOOP_CENTROID_MATCH_FACTOR * nozzle_diameter` = 8.0
+        // units so the loops still match at all).
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        let hop_limit = WALL_GAP_HOP_FRACTION * (config.nozzle_diameter / 2.0);
+        let field: Arc<dyn OrderField> = Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+
+        let mut layers = vec![
+            Layer {
+                index: 0,
+                order: 0.0,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    points: vec![DVec3::new(0.0, 0.0, 0.0)],
+                    unsupported: vec![false],
+                    arc_fraction: vec![0.0],
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+            Layer {
+                index: 1,
+                order: 0.2,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    points: vec![DVec3::new(7.0, 0.0, -0.2)],
+                    unsupported: vec![false],
+                    arc_fraction: vec![0.0],
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+        ];
+
+        stitch_wall_gaps(&mut layers, &config, basis1, basis2);
+
+        let wall = &layers[1].loops[0];
+        assert!(
+            wall.points.len() > 1,
+            "a gap this much larger than the hop limit must trigger stitching"
+        );
+
+        // Every consecutive LATERAL hop (see `lateral_gap` -- the climb
+        // component is a normal fraction of the layer step), prepended
+        // with the previous layer's real point, must be within the hop
+        // limit -- not just most of them, which is exactly what the
+        // stalling bug produced (many correct tiny hops plus one leftover
+        // huge one).
+        let mut full_chain = vec![layers[0].loops[0].points[0]];
+        full_chain.extend(wall.points.iter().copied());
+        for pair in full_chain.windows(2) {
+            let dist = lateral_gap(field.as_ref(), pair[0], pair[1]);
+            assert!(
+                dist <= hop_limit + 1e-6,
+                "lateral hop {dist} exceeds hop_limit {hop_limit} -- bisection stalled instead of closing the full gap"
+            );
+        }
+    }
+
+    #[test]
+    fn arc_length_correspondence_avoids_backward_jump_that_nearest_point_matching_would_produce() {
+        // A thin hairpin/rectangle loop (0.1 wide, 2.0 tall): the two long
+        // sides ("legs") run parallel and only 0.1 apart in 3D, but are far
+        // apart in arc-length parameterization (roughly opposite halves of
+        // the loop). This is exactly the shape where naive nearest-point
+        // matching (whether raw 3D distance or transverse (u, v) position)
+        // picks the wrong leg -- see Addendum 2 in the wall-gap stitching
+        // task context -- while arc-length-fraction correspondence does not.
+        // The previous loop is sampled coarsely (8 points) relative to the
+        // 0.1 leg separation, so consecutive same-leg samples are farther
+        // apart than the gap to the opposite leg -- the condition that
+        // actually produces a wrong-leg nearest-point match.
+        let corners = [
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+            DVec3::new(0.1, 2.0, 0.0),
+            DVec3::new(0.1, 0.0, 0.0),
+        ];
+        let corner_fractions = compute_arc_fractions(&corners);
+
+        // Sample the previous layer's loop (8 points) along this shape, and
+        // the current layer's loop (11 points -- a different point count/
+        // sampling density) along the *same* underlying path, raised
+        // slightly in Z (the inter-layer climb) -- mirroring two
+        // independently-extracted, differently-sampled wall-0 contours of
+        // the same real geometry.
+        let prev_points: Vec<DVec3> = (0..8)
+            .map(|i| interpolate_on_loop_at_fraction(&corners, &corner_fractions, i as f64 / 8.0))
+            .collect();
+        let z_offset = DVec3::new(0.0, 0.0, 0.05);
+        let cur_points: Vec<DVec3> = (0..11)
+            .map(|i| {
+                interpolate_on_loop_at_fraction(&corners, &corner_fractions, i as f64 / 11.0)
+                    + z_offset
+            })
+            .collect();
+
+        let prev_fractions = compute_arc_fractions(&prev_points);
+        let cur_fractions = compute_arc_fractions(&cur_points);
+
+        // Alignment step (mirrors stitch_wall_gaps): a single nearest-point
+        // match of the current loop's first point against the previous
+        // loop's points, run once per layer-pair.
+        let start = cur_points[0];
+        let nearest_idx = prev_points
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (**a - start)
+                    .length_squared()
+                    .total_cmp(&(**b - start).length_squared())
+            })
+            .map(|(idx, _)| idx)
+            .unwrap();
+        let offset = prev_fractions[nearest_idx];
+
+        // For every current-loop point, compare the old approach (naive
+        // nearest raw-3D-point search over the previous loop) against the
+        // new approach (arc-length-fraction correspondence), and find the
+        // point where the old approach's match is farthest (in arc-length
+        // terms) from where it should be -- i.e. the clearest wrong-leg,
+        // backward-jumping match.
+        let mut worst_naive_gap = 0.0_f64;
+        let mut worst_i = 0usize;
+        for (i, &point) in cur_points.iter().enumerate() {
+            let naive_nearest_idx = prev_points
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    (**a - point)
+                        .length_squared()
+                        .total_cmp(&(**b - point).length_squared())
+                })
+                .map(|(idx, _)| idx)
+                .unwrap();
+            let naive_fraction = prev_fractions[naive_nearest_idx];
+            let gap = (naive_fraction - cur_fractions[i]).abs();
+            let gap = gap.min(1.0 - gap); // account for wraparound near fraction 0/1
+            if gap > worst_naive_gap {
+                worst_naive_gap = gap;
+                worst_i = i;
+            }
+        }
+
+        // The naive match's arc-length position is far from this point's own
+        // arc-length position for at least one point -- i.e. it landed on
+        // the wrong leg (a "backward jump" in parameterization), confirming
+        // this loop reproduces the bug's failure mode.
+        assert!(
+            worst_naive_gap > 0.2,
+            "expected at least one naive nearest-3D-point match to land on the wrong leg \
+         (worst fraction gap {worst_naive_gap}), demonstrating the failure mode this fix avoids"
+        );
+
+        // New approach: arc-length-fraction correspondence, following the
+        // same steps as `stitch_wall_gaps`, applied to that same worst-case
+        // point.
+        let probe = cur_points[worst_i];
+        let probe_t = cur_fractions[worst_i];
+        let t_prev = (offset + probe_t).rem_euclid(1.0);
+        let corresponding = interpolate_on_loop_at_fraction(&prev_points, &prev_fractions, t_prev);
+
+        // The correspondence lands within the tiny Z-offset climb distance of
+        // the probe point -- i.e. on the *same* leg, not the wrong one.
+        assert!(
+            (probe - corresponding).length() < 0.1,
+            "arc-length correspondence should match the same leg the probe point is actually \
+         on, within the small inter-layer climb offset, got distance {}",
+            (probe - corresponding).length()
+        );
+
+        // Monotonicity across the whole loop: as the current point's own arc
+        // fraction increases, so must its computed previous-loop
+        // correspondence fraction (mod wraparound), with no backward jump --
+        // exactly what the old per-point nearest-point search could not
+        // guarantee.
+        let mut prev_t_prev = 0.0;
+        for (i, &t) in cur_fractions.iter().enumerate() {
+            let t_prev = (offset + t).rem_euclid(1.0);
+            if i > 0 {
+                assert!(
+                    t_prev >= prev_t_prev - 1e-9,
+                    "correspondence fraction must be monotonically non-decreasing (point {i})"
+                );
+            }
+            prev_t_prev = t_prev;
+        }
+    }
+
+    #[test]
+    fn stitch_wall_gaps_matches_multiple_loops_with_same_count_and_position_baseline() {
+        // Regression check: two wall-0 loops per layer, each layer's loops
+        // in the same order and each pair spatially close (centroids well
+        // within the match threshold) -- the common case this function
+        // already handled before spatial matching was introduced. Each pair
+        // is far enough apart in X to trigger a stitch, and each loop must
+        // be stitched against *its own* previous-layer counterpart, not the
+        // other one.
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        let field: Arc<dyn OrderField> = Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+
+        let mut layers = vec![
+            Layer {
+                index: 0,
+                order: 0.0,
+                loops: vec![
+                    WallLoop {
+                        wall_index: 0,
+                        points: vec![DVec3::new(0.0, 0.0, 0.0)],
+                        unsupported: vec![false],
+                        arc_fraction: vec![0.0],
+                    },
+                    WallLoop {
+                        wall_index: 0,
+                        points: vec![DVec3::new(100.0, 0.0, 0.0)],
+                        unsupported: vec![false],
+                        arc_fraction: vec![0.0],
+                    },
+                ],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+            Layer {
+                index: 1,
+                order: 0.2,
+                loops: vec![
+                    WallLoop {
+                        wall_index: 0,
+                        points: vec![DVec3::new(2.0, 0.0, -0.2)],
+                        unsupported: vec![false],
+                        arc_fraction: vec![0.0],
+                    },
+                    WallLoop {
+                        wall_index: 0,
+                        points: vec![DVec3::new(102.0, 0.0, -0.2)],
+                        unsupported: vec![false],
+                        arc_fraction: vec![0.0],
+                    },
+                ],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+        ];
+
+        stitch_wall_gaps(&mut layers, &config, basis1, basis2);
+
+        for (idx, expected_origin_x) in [(0, 0.0), (1, 100.0)] {
+            let wall = &layers[1].loops[idx];
+            assert!(
+                wall.points.len() > 1,
+                "loop {idx} gap exceeding the hop limit should trigger stitching"
+            );
+            // The stitch's first inserted point must climb from *this*
+            // loop's own previous-layer point, not the other loop's.
+            let first_x = wall.points[0].x;
+            assert!(
+                (first_x - expected_origin_x).abs() < 50.0,
+                "loop {idx} stitched from the wrong previous-layer loop: first inserted point x \
+             = {first_x}, expected near {expected_origin_x}"
+            );
+        }
+    }
+
+    #[test]
+    fn stitch_wall_gaps_matches_loops_by_centroid_despite_reordered_loop_vector() {
+        // Same two spatially-separated loop pairs as the baseline test, but
+        // the current layer's loop vector lists them in the *opposite*
+        // order from the previous layer's -- exactly the "loop extraction
+        // order shifts between adjacent layers" scenario from Addendum 3.
+        // Positional-index pairing would cross-match loop 0 against loop 1
+        // and vice versa; centroid-based matching must still pair each loop
+        // with its true spatial counterpart.
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        let field: Arc<dyn OrderField> = Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+
+        let mut layers = vec![
+            Layer {
+                index: 0,
+                order: 0.0,
+                loops: vec![
+                    WallLoop {
+                        wall_index: 0,
+                        points: vec![DVec3::new(0.0, 0.0, 0.0)],
+                        unsupported: vec![false],
+                        arc_fraction: vec![0.0],
+                    },
+                    WallLoop {
+                        wall_index: 0,
+                        points: vec![DVec3::new(100.0, 0.0, 0.0)],
+                        unsupported: vec![false],
+                        arc_fraction: vec![0.0],
+                    },
+                ],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+            Layer {
+                index: 1,
+                order: 0.2,
+                // Reordered relative to the previous layer: index 0 here
+                // spatially corresponds to index 1 in the previous layer,
+                // and vice versa.
+                loops: vec![
+                    WallLoop {
+                        wall_index: 0,
+                        points: vec![DVec3::new(102.0, 0.0, -0.2)],
+                        unsupported: vec![false],
+                        arc_fraction: vec![0.0],
+                    },
+                    WallLoop {
+                        wall_index: 0,
+                        points: vec![DVec3::new(2.0, 0.0, -0.2)],
+                        unsupported: vec![false],
+                        arc_fraction: vec![0.0],
+                    },
+                ],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+        ];
+
+        stitch_wall_gaps(&mut layers, &config, basis1, basis2);
+
+        // Current-layer index 0 (near x=102) must stitch from the
+        // previous-layer loop near x=100, NOT the one near x=0.
+        let wall0 = &layers[1].loops[0];
+        assert!(
+            wall0.points.len() > 1,
+            "current loop 0 (near x=102) should trigger stitching"
+        );
+        assert!(
+            (wall0.points[0].x - 100.0).abs() < 50.0,
+            "current loop 0 stitched from the wrong previous-layer loop by centroid: \
+         first inserted point x = {}, expected near 100.0",
+            wall0.points[0].x
+        );
+
+        // Current-layer index 1 (near x=2) must stitch from the
+        // previous-layer loop near x=0, NOT the one near x=100.
+        let wall1 = &layers[1].loops[1];
+        assert!(
+            wall1.points.len() > 1,
+            "current loop 1 (near x=2) should trigger stitching"
+        );
+        assert!(
+            (wall1.points[0].x - 0.0).abs() < 50.0,
+            "current loop 1 stitched from the wrong previous-layer loop by centroid: \
+         first inserted point x = {}, expected near 0.0",
+            wall1.points[0].x
+        );
+    }
+
+    #[test]
+    fn stitch_wall_gaps_skips_a_loop_with_no_close_previous_match() {
+        // The previous layer has a single loop; the current layer has two:
+        // one that spatially corresponds to the previous loop (small
+        // centroid shift, well within the match threshold) and one that
+        // appears out of nowhere far away (a genuinely new loop this
+        // layer, e.g. a new island). The new loop must be left unstitched
+        // rather than force-matched to the one previous loop that exists --
+        // the generalized "no reasonable previous-loop match -> skip" case.
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        let field: Arc<dyn OrderField> = Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+
+        let mut layers = vec![
+            Layer {
+                index: 0,
+                order: 0.0,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    points: vec![DVec3::new(0.0, 0.0, 0.0)],
+                    unsupported: vec![false],
+                    arc_fraction: vec![0.0],
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+            Layer {
+                index: 1,
+                order: 0.2,
+                loops: vec![
+                    WallLoop {
+                        wall_index: 0,
+                        points: vec![DVec3::new(2.0, 0.0, -0.2)],
+                        unsupported: vec![false],
+                        arc_fraction: vec![0.0],
+                    },
+                    WallLoop {
+                        wall_index: 0,
+                        points: vec![DVec3::new(1000.0, 0.0, -0.2)],
+                        unsupported: vec![false],
+                        arc_fraction: vec![0.0],
+                    },
+                ],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+        ];
+
+        stitch_wall_gaps(&mut layers, &config, basis1, basis2);
+
+        let matched = &layers[1].loops[0];
+        assert!(
+            matched.points.len() > 1,
+            "the loop with a close previous-layer match should still be stitched"
+        );
+
+        let new_loop = &layers[1].loops[1];
+        assert_eq!(
+            new_loop.points.len(),
+            1,
+            "a genuinely new loop with no close previous-layer centroid match must be left \
+         unstitched, not force-matched to the one existing previous loop"
+        );
+        assert_eq!(new_loop.unsupported, vec![false]);
+    }
+
+    #[test]
+    fn stitch_wall_gaps_leaves_loop_unstitched_when_centroid_is_close_but_perimeter_implausible() {
+        // Regression test for the loop-pairing bug: centroid distance alone can
+        // match a small, simple loop to an unrelated, much larger/more complex
+        // one whose centroid happens to land nearby, producing a meaningless
+        // arc-length correspondence (see `WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR`'s
+        // docs). Here the previous layer has one big square loop (perimeter 40)
+        // centered at the origin, and the current layer has one tiny square loop
+        // (perimeter 0.4) also centered at the origin -- centroids coincide (well
+        // within `WALL_GAP_LOOP_CENTROID_MATCH_FACTOR * nozzle_diameter`), but the
+        // perimeter ratio (100x) is far beyond `WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR`,
+        // so the current loop must be left unstitched rather than bisected toward
+        // a bogus far-away "corresponding" point on the big loop.
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        let field: Arc<dyn OrderField> = Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+
+        let big_square = vec![
+            DVec3::new(-5.0, -5.0, 0.0),
+            DVec3::new(5.0, -5.0, 0.0),
+            DVec3::new(5.0, 5.0, 0.0),
+            DVec3::new(-5.0, 5.0, 0.0),
+        ];
+        let small_square = vec![
+            DVec3::new(-0.05, -0.05, -0.2),
+            DVec3::new(0.05, -0.05, -0.2),
+            DVec3::new(0.05, 0.05, -0.2),
+            DVec3::new(-0.05, 0.05, -0.2),
+        ];
+        assert!(
+            (loop_perimeter(&big_square) / loop_perimeter(&small_square))
+                > WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR,
+            "test fixture must exceed the perimeter-match factor to exercise the rejection path"
+        );
+
+        let mut layers = vec![
+            Layer {
+                index: 0,
+                order: 0.0,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    unsupported: vec![false; big_square.len()],
+                    arc_fraction: compute_arc_fractions(&big_square),
+                    points: big_square,
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+            Layer {
+                index: 1,
+                order: 0.2,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    unsupported: vec![false; small_square.len()],
+                    arc_fraction: compute_arc_fractions(&small_square),
+                    points: small_square.clone(),
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+        ];
+
+        stitch_wall_gaps(&mut layers, &config, basis1, basis2);
+
+        let wall = &layers[1].loops[0];
+        assert_eq!(
+            wall.points, small_square,
+            "a centroid-close but perimeter-implausible previous loop must not be stitched \
+         to -- the current loop's points should be untouched"
+        );
+        assert_eq!(
+            wall.unsupported,
+            vec![false; small_square.len()],
+            "no points should be flagged unsupported when no plausible previous loop was found"
+        );
+    }
+
+    #[test]
+    fn stitch_wall_gaps_rejects_a_coincidentally_similar_perimeter_loop_when_a_much_closer_shape_mismatched_loop_exists(
+    ) {
+        // Regression test for the real-mesh layer-40/loop-13 finding (subtask 12
+        // of the wall-gap-stitching feature): a genuine topology-merge event
+        // (two small previous-layer loops sitting right next to the current
+        // loop's centroid, correctly rejected by the perimeter check because
+        // they are each roughly half its perimeter -- consistent with a
+        // pre-merge shape) must not fall through to a *different*, spatially
+        // distant previous loop purely because that distant loop's perimeter
+        // happens to coincidentally match the current loop's. Accepting that
+        // coincidence produced a uniform, whole-loop bad correspondence in the
+        // real mesh (686/686 points with a ~7.7mm hop), not an isolated
+        // single-point defect fixable by
+        // `correct_isolated_correspondence_outliers`.
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            ..SlicerConfig::default()
+        };
+        let field: Arc<dyn OrderField> = Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+
+        let square = |cx: f64, cy: f64, half: f64, z: f64| -> Vec<DVec3> {
+            vec![
+                DVec3::new(cx - half, cy - half, z),
+                DVec3::new(cx + half, cy - half, z),
+                DVec3::new(cx + half, cy + half, z),
+                DVec3::new(cx - half, cy + half, z),
+            ]
+        };
+
+        let prev_a = square(0.02, 0.0, 0.05, 0.0);
+        let prev_b = square(0.05, 0.03, 0.05, 0.0);
+        let prev_decoy = square(5.0, 0.0, 0.45, 0.0);
+        let current = square(0.0, 0.0, 0.5, -0.2);
+
+        assert!(
+            (loop_perimeter(&current) / loop_perimeter(&prev_a))
+                > WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR,
+            "fixture must reject prev_a by perimeter, like the real merge case"
+        );
+        assert!(
+            (loop_perimeter(&current) / loop_perimeter(&prev_b))
+                > WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR,
+            "fixture must reject prev_b by perimeter, like the real merge case"
+        );
+        let decoy_ratio = loop_perimeter(&current) / loop_perimeter(&prev_decoy);
+        let decoy_ratio = if decoy_ratio < 1.0 {
+            1.0 / decoy_ratio
+        } else {
+            decoy_ratio
+        };
+        assert!(
+            decoy_ratio <= WALL_GAP_LOOP_PERIMETER_MATCH_FACTOR,
+            "fixture's decoy loop must pass the perimeter check to exercise the margin-factor rejection"
+        );
+        let decoy_centroid_dist = (loop_centroid(&prev_decoy) - loop_centroid(&current)).length();
+        assert!(
+            decoy_centroid_dist <= WALL_GAP_LOOP_CENTROID_MATCH_FACTOR * config.nozzle_diameter,
+            "fixture's decoy loop must pass the absolute centroid threshold to exercise the margin-factor rejection"
+        );
+
+        let mut layers = vec![
+            Layer {
+                index: 0,
+                order: 0.0,
+                loops: vec![
+                    WallLoop {
+                        wall_index: 0,
+                        unsupported: vec![false; prev_a.len()],
+                        arc_fraction: compute_arc_fractions(&prev_a),
+                        points: prev_a,
+                    },
+                    WallLoop {
+                        wall_index: 0,
+                        unsupported: vec![false; prev_b.len()],
+                        arc_fraction: compute_arc_fractions(&prev_b),
+                        points: prev_b,
+                    },
+                    WallLoop {
+                        wall_index: 0,
+                        unsupported: vec![false; prev_decoy.len()],
+                        arc_fraction: compute_arc_fractions(&prev_decoy),
+                        points: prev_decoy,
+                    },
+                ],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+            Layer {
+                index: 1,
+                order: 0.2,
+                loops: vec![WallLoop {
+                    wall_index: 0,
+                    unsupported: vec![false; current.len()],
+                    arc_fraction: compute_arc_fractions(&current),
+                    points: current.clone(),
+                }],
+                order_field: Arc::clone(&field),
+                ..Layer::default()
+            },
+        ];
+
+        stitch_wall_gaps(&mut layers, &config, basis1, basis2);
+
+        let wall = &layers[1].loops[0];
+        assert_eq!(
+            wall.points, current,
+            "a distant, only-coincidentally-perimeter-matching previous loop must not be \
+             accepted when a much closer (but shape-mismatched) previous loop exists -- the \
+             current loop's points should be untouched"
+        );
+        assert_eq!(
+            wall.unsupported,
+            vec![false; current.len()],
+            "no points should be flagged unsupported when no plausible previous loop was found"
+        );
+    }
+
+    #[test]
+    fn compute_arc_fractions_starts_at_zero_and_increases_monotonically_around_the_loop() {
+        let points = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+        ];
+        let fractions = compute_arc_fractions(&points);
+        assert_eq!(fractions.len(), points.len());
+        assert_eq!(fractions[0], 0.0);
+        for pair in fractions.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "arc_fraction must increase monotonically"
+            );
+        }
+        for &f in &fractions {
+            assert!(
+                (0.0..1.0).contains(&f),
+                "arc_fraction must stay within [0, 1)"
+            );
+        }
+    }
+
+    /// Builds a 6-spike "zigzag star" polygon in the XY plane: vertices
+    /// alternate between an outer spike tip (radius `outer_r`) and an inner
+    /// waist vertex very close to the center (radius `inner_r`), 12 vertices
+    /// total, 30 degrees apart. Used by
+    /// `rotation_search_and_local_fallback_beat_single_point_alignment_on_a_spiky_loop`
+    /// to construct a loop where a single nearest-3D-point start alignment
+    /// is unreliable: all 6 inner-waist vertices sit within `inner_r` of the
+    /// origin regardless of which spike they belong to, so a raw-3D nearest
+    /// search from a point near the center can easily lock onto the *wrong*
+    /// spike's waist vertex -- a real instance of the "unrelated parts of a
+    /// spiky loop pass close to each other in space" failure mode described
+    /// in `stitch_wall_gaps`'s docs (Addendum 5).
+    fn zigzag_star_vertices(outer_r: f64, inner_r: f64) -> Vec<DVec3> {
+        (0..12)
+            .map(|i| {
+                let angle = (i as f64) * std::f64::consts::PI / 6.0;
+                let r = if i % 2 == 0 { outer_r } else { inner_r };
+                DVec3::new(r * angle.cos(), r * angle.sin(), 0.0)
+            })
+            .collect()
+    }
+
+    /// Resamples a closed polyline at `count` evenly-spaced arc-length
+    /// fractions of `base`, starting at fraction `start_offset`, using the
+    /// same [`compute_arc_fractions`]/[`interpolate_on_loop_at_fraction`]
+    /// machinery `stitch_wall_gaps` itself uses. Used by
+    /// `rotation_search_and_local_fallback_beat_single_point_alignment_on_a_spiky_loop`
+    /// to build two independently-sampled (different point count, different
+    /// starting position) loops from the same underlying shape -- exactly
+    /// the "different point counts, sampling density, and starting point"
+    /// scenario described in `stitch_wall_gaps`'s docs.
+    fn resample_closed_loop(
+        base: &[DVec3],
+        base_fractions: &[f64],
+        count: usize,
+        start_offset: f64,
+    ) -> Vec<DVec3> {
+        (0..count)
+            .map(|i| {
+                let t = ((i as f64) / (count as f64) + start_offset).rem_euclid(1.0);
+                interpolate_on_loop_at_fraction(base, base_fractions, t)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rotation_search_and_local_fallback_beat_single_point_alignment_on_a_spiky_loop() {
+        // A 6-spike zigzag star whose inner "waist" vertices all sit within
+        // 0.05 units of the origin -- close enough together that a single
+        // raw-3D nearest-point search from a point near the center cannot
+        // reliably tell which spike's waist it actually belongs to, while a
+        // multi-sample rotation search (scored across points spread all the
+        // way around the loop) can, because a wrong offset that happens to
+        // fit near the center disagrees badly with the outer spike tips
+        // elsewhere on the loop.
+        let base = zigzag_star_vertices(5.0, 0.05);
+        let base_fractions = compute_arc_fractions(&base);
+
+        // Two independently-sampled loops from the same underlying star:
+        // different point counts (53 vs 41) and a genuine rotational offset
+        // (0.37) between their starting positions -- mirroring real
+        // adjacent-layer wall-0 loops, which are extracted independently
+        // with no guaranteed shared parameterization.
+        const TRUE_OFFSET: f64 = 0.37;
+        let prev_points = resample_closed_loop(&base, &base_fractions, 53, 0.0);
+        let prev_fractions = compute_arc_fractions(&prev_points);
+        let current_points = resample_closed_loop(&base, &base_fractions, 41, TRUE_OFFSET);
+        let current_fractions = compute_arc_fractions(&current_points);
+
+        // The naive single-point alignment: nearest raw-3D-distance previous
+        // point to just the current loop's first point (mirrors the
+        // pre-subtask-10 `stitch_wall_gaps` code, inlined here since that
+        // code path no longer exists in production).
+        let start = current_points[0];
+        let naive_nearest_idx = prev_points
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (**a - start)
+                    .length_squared()
+                    .total_cmp(&(**b - start).length_squared())
+            })
+            .map(|(idx, _)| idx)
+            .unwrap();
+        let naive_offset = prev_fractions[naive_nearest_idx];
+
+        // The new rotation-search offset.
+        let best_offset = best_rotation_offset(
+            &current_points,
+            &current_fractions,
+            &prev_points,
+            &prev_fractions,
+        );
+
+        // Ground truth for any current-loop index `i`: since both loops were
+        // resampled from `base`, the physically-corresponding position is
+        // simply `base` evaluated at the same base-fraction the current
+        // point was sampled from -- independent of either loop's own
+        // (re-derived, potentially warped) arc-fraction table.
+        let true_position_for_index = |i: usize| -> DVec3 {
+            let true_base_fraction = ((i as f64) / 41.0 + TRUE_OFFSET).rem_euclid(1.0);
+            interpolate_on_loop_at_fraction(&base, &base_fractions, true_base_fraction)
+        };
+
+        // Check several sample indices spread around the loop.
+        let mut naive_worst_error: f64 = 0.0;
+        let mut rotation_search_worst_error: f64 = 0.0;
+        for i in (0..41).step_by(4) {
+            let truth = true_position_for_index(i);
+
+            let naive_t_prev = (naive_offset + current_fractions[i]).rem_euclid(1.0);
+            let naive_corresponding =
+                interpolate_on_loop_at_fraction(&prev_points, &prev_fractions, naive_t_prev);
+            naive_worst_error = naive_worst_error.max((naive_corresponding - truth).length());
+
+            let best_t_prev = (best_offset + current_fractions[i]).rem_euclid(1.0);
+            let fraction_based =
+                interpolate_on_loop_at_fraction(&prev_points, &prev_fractions, best_t_prev);
+            let refined = local_fallback_correspondence(
+                &prev_points,
+                &prev_fractions,
+                best_t_prev,
+                current_points[i],
+                fraction_based,
+            );
+            rotation_search_worst_error =
+                rotation_search_worst_error.max((refined - truth).length());
+        }
+
+        assert!(
+            naive_worst_error > 1.0,
+            "test fixture must actually fool the single-point alignment (worst error \
+         {naive_worst_error}) to be a meaningful regression test"
+        );
+        assert!(
+            rotation_search_worst_error < 0.5,
+            "rotation search + bounded local fallback should land close to the true corresponding \
+         position (worst error {rotation_search_worst_error}), unlike single-point alignment \
+         (worst error {naive_worst_error})"
+        );
     }
 }
