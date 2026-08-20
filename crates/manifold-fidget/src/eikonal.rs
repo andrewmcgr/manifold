@@ -51,6 +51,16 @@ pub struct EikonalOrderField {
     /// Distance value per grid node, row-major with x fastest, then y, then
     /// z: `index = x + y * dims[0] + z * dims[0] * dims[1]`.
     distances: Vec<f64>,
+    /// Per-node gradient estimate of `distances`, same indexing as
+    /// `distances`. Computed once in [`EikonalOrderField::compute_gradients`]
+    /// after every distance-modifying pass (FMM march, optional slope-limit
+    /// relaxation) has finished, from one-sided finite differences against
+    /// each axis's smaller-valued (upwind) frozen neighbor -- `0.0` on any
+    /// axis with no frozen neighbor on either side. Used by `order()`'s
+    /// Hermite interpolation path; left `DVec3::ZERO` at unreached nodes
+    /// (never read there, since `order()` falls back to trilinear whenever
+    /// any of its 8 corners is non-finite).
+    gradients: Vec<DVec3>,
 }
 
 impl EikonalOrderField {
@@ -128,6 +138,7 @@ impl EikonalOrderField {
         let (mut field, occupied) =
             Self::build_grid(min_corner, max_corner, requested_cell_size, is_solid);
         field.march_from_seeds(seeds, &occupied);
+        field.compute_gradients(&occupied);
         field
     }
 
@@ -197,6 +208,7 @@ impl EikonalOrderField {
         if let (Some(profile), Some(height_along)) = (slope_profile, height_along) {
             field.relax_with_slope_limit(profile, height_along, &occupied);
         }
+        field.compute_gradients(&occupied);
         field
     }
 
@@ -234,12 +246,14 @@ impl EikonalOrderField {
 
         let total = dims[0] * dims[1] * dims[2];
         let distances = vec![f64::INFINITY; total];
+        let gradients = vec![DVec3::ZERO; total];
 
         let field = EikonalOrderField {
             min_corner: lo,
             dims,
             h: cell_size,
             distances,
+            gradients,
         };
 
         let [nx, ny, _nz] = dims;
@@ -612,19 +626,128 @@ impl EikonalOrderField {
 
         solve_eikonal_quadratic(&axis_mins, self.h)
     }
+
+    /// Computes a per-node gradient estimate of `self.distances`, stored in
+    /// `self.gradients`, for use by `order()`'s Hermite interpolation path.
+    /// Must run *after* every distance-modifying pass (FMM march, and the
+    /// optional slope-limit relaxation) has finished -- it reads whatever
+    /// `self.distances` holds at call time, so it reflects the final field
+    /// rather than an intermediate march state.
+    ///
+    /// Per axis, uses a one-sided finite difference against whichever
+    /// axis-neighbor is finite and smaller (the upwind side, matching the
+    /// direction [`EikonalOrderField::solve_update`] itself propagates
+    /// from), with the difference's sign depending on which side that
+    /// neighbor is on: `(T_node - T_lo) / h` for a low-side neighbor,
+    /// `(T_hi - T_node) / h` for a high-side one -- using the unconditional
+    /// `(T_node - T_neighbor) / h` form regardless of side flips the
+    /// gradient's sign whenever the high side is chosen. `0.0` on an axis
+    /// where neither neighbor is finite. Only computed for occupied nodes
+    /// with a finite distance --
+    /// unreached nodes keep `DVec3::ZERO`, which is never read since
+    /// `order()` falls back to plain trilinear whenever any of its 8
+    /// corners is non-finite.
+    fn compute_gradients(&mut self, occupied: &[bool]) {
+        let [nx, ny, nz] = self.dims;
+        let h = self.h;
+
+        let val_at = |x: usize, y: usize, z: usize| -> f64 { self.distances[self.idx(x, y, z)] };
+
+        // Direction-aware one-sided difference: whichever side's neighbor is
+        // smaller (upwind) is used, but the formula's sign depends on which
+        // side that neighbor is actually on -- a low-side neighbor gives a
+        // forward estimate `(current - lo) / h`, while a high-side neighbor
+        // gives `(hi - current) / h`. Using `(current - neighbor) / h`
+        // unconditionally (regardless of side) silently flips the sign
+        // whenever the high side is chosen, corrupting the Hermite tangent
+        // direction for ~half of all nodes.
+        let axis_component = |current: f64, lo: Option<f64>, hi: Option<f64>| -> f64 {
+            match (lo, hi) {
+                (Some(a), Some(b)) => {
+                    if a <= b {
+                        (current - a) / h
+                    } else {
+                        (b - current) / h
+                    }
+                }
+                (Some(a), None) => (current - a) / h,
+                (None, Some(b)) => (b - current) / h,
+                (None, None) => 0.0,
+            }
+        };
+
+        let mut gradients = vec![DVec3::ZERO; self.gradients.len()];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let idx = self.idx(x, y, z);
+                    if !occupied[idx] || !self.distances[idx].is_finite() {
+                        continue;
+                    }
+                    let current = self.distances[idx];
+
+                    let x_lo = x.checked_sub(1).and_then(|xm| {
+                        let nidx = self.idx(xm, y, z);
+                        (occupied[nidx] && self.distances[nidx].is_finite())
+                            .then(|| val_at(xm, y, z))
+                    });
+                    let x_hi = (x + 1 < nx).then(|| self.idx(x + 1, y, z)).and_then(|nidx| {
+                        (occupied[nidx] && self.distances[nidx].is_finite())
+                            .then(|| val_at(x + 1, y, z))
+                    });
+
+                    let y_lo = y.checked_sub(1).and_then(|ym| {
+                        let nidx = self.idx(x, ym, z);
+                        (occupied[nidx] && self.distances[nidx].is_finite())
+                            .then(|| val_at(x, ym, z))
+                    });
+                    let y_hi = (y + 1 < ny).then(|| self.idx(x, y + 1, z)).and_then(|nidx| {
+                        (occupied[nidx] && self.distances[nidx].is_finite())
+                            .then(|| val_at(x, y + 1, z))
+                    });
+
+                    let z_lo = z.checked_sub(1).and_then(|zm| {
+                        let nidx = self.idx(x, y, zm);
+                        (occupied[nidx] && self.distances[nidx].is_finite())
+                            .then(|| val_at(x, y, zm))
+                    });
+                    let z_hi = (z + 1 < nz).then(|| self.idx(x, y, z + 1)).and_then(|nidx| {
+                        (occupied[nidx] && self.distances[nidx].is_finite())
+                            .then(|| val_at(x, y, z + 1))
+                    });
+
+                    gradients[idx] = DVec3::new(
+                        axis_component(current, x_lo, x_hi),
+                        axis_component(current, y_lo, y_hi),
+                        axis_component(current, z_lo, z_hi),
+                    );
+                }
+            }
+        }
+        self.gradients = gradients;
+    }
 }
 
 impl OrderField for EikonalOrderField {
-    /// Trilinearly interpolates the precomputed FMM distance grid at `p`
-    /// (clamped into the grid's bounding box). Nodes the front never
-    /// reached remain `f64::INFINITY`; those corners are *excluded* from
-    /// the interpolation (weights renormalized over the finite corners) so
-    /// a query point inside the reached solid isn't poisoned by a void
-    /// node just outside the surface — the common case for mesh-surface
-    /// queries, where up to half of a cell's corners sit in unmarched air.
-    /// Only when *every* corner of the containing cell is unreached (e.g.
-    /// an empty seed set, or a genuinely unreached region) does this
-    /// return `+inf` — the documented best-effort fallback for a query
+        /// Interpolates the precomputed FMM distance grid at `p` (clamped into
+    /// the grid's bounding box). Nodes the front never reached remain
+    /// `f64::INFINITY`.
+    ///
+    /// Uses a gradient-augmented (Hermite) blend over the containing cell's
+    /// 8 corners when every corner is finite: each corner carries both its
+    /// distance value and a per-axis gradient estimate computed once in
+    /// [`EikonalOrderField::compute_gradients`] from the FMM solve itself
+    /// (physically meaningful, magnitude ~1 for a unit-speed Eikonal field)
+    /// rather than inferred after the fact -- this is C1-continuous and, by
+    /// construction, bounded (unlike a wider finite-difference cubic
+    /// stencil, which can overshoot near thin features using only inferred
+    /// derivatives). Falls back to plain trilinear (dropping unreached
+    /// corners and renormalizing weights over the rest) whenever any of the
+    /// 8 corners is non-finite -- the common case for queries near the
+    /// surface, where up to half of a cell's corners sit in unmarched air.
+    /// Only when *every* corner with nonzero trilinear weight is unreached
+    /// (e.g. an empty seed set, or a genuinely unreached region) does this
+    /// return `+inf` -- the documented best-effort fallback for a query
     /// point the front cannot reach.
     fn order(&self, p: DVec3) -> f64 {
         let [nx, ny, nz] = self.dims;
@@ -642,18 +765,56 @@ impl OrderField for EikonalOrderField {
         let z1 = (z0 + 1).min(nz - 1);
 
         let g = |x: usize, y: usize, z: usize| self.distances[self.idx(x, y, z)];
+        let grad = |x: usize, y: usize, z: usize| self.gradients[self.idx(x, y, z)];
 
-        // Trilinear weights per corner; unreached (`+inf`) corners are
-        // dropped and the remaining weights renormalized. See doc comment.
+        let v000 = g(x0, y0, z0);
+        let v100 = g(x1, y0, z0);
+        let v010 = g(x0, y1, z0);
+        let v110 = g(x1, y1, z0);
+        let v001 = g(x0, y0, z1);
+        let v101 = g(x1, y0, z1);
+        let v011 = g(x0, y1, z1);
+        let v111 = g(x1, y1, z1);
+
+        if v000.is_finite()
+            && v100.is_finite()
+            && v010.is_finite()
+            && v110.is_finite()
+            && v001.is_finite()
+            && v101.is_finite()
+            && v011.is_finite()
+            && v111.is_finite()
+        {
+            return hermite_trilinear(
+                self.h,
+                tx,
+                ty,
+                tz,
+                [v000, v100, v010, v110, v001, v101, v011, v111],
+                [
+                    grad(x0, y0, z0),
+                    grad(x1, y0, z0),
+                    grad(x0, y1, z0),
+                    grad(x1, y1, z0),
+                    grad(x0, y0, z1),
+                    grad(x1, y0, z1),
+                    grad(x0, y1, z1),
+                    grad(x1, y1, z1),
+                ],
+            );
+        }
+
+        // Fallback: plain trilinear, dropping unreached (`+inf`) corners and
+        // renormalizing weights over the finite ones. See doc comment.
         let corners = [
-            (g(x0, y0, z0), (1.0 - tx) * (1.0 - ty) * (1.0 - tz)),
-            (g(x1, y0, z0), tx * (1.0 - ty) * (1.0 - tz)),
-            (g(x0, y1, z0), (1.0 - tx) * ty * (1.0 - tz)),
-            (g(x1, y1, z0), tx * ty * (1.0 - tz)),
-            (g(x0, y0, z1), (1.0 - tx) * (1.0 - ty) * tz),
-            (g(x1, y0, z1), tx * (1.0 - ty) * tz),
-            (g(x0, y1, z1), (1.0 - tx) * ty * tz),
-            (g(x1, y1, z1), tx * ty * tz),
+            (v000, (1.0 - tx) * (1.0 - ty) * (1.0 - tz)),
+            (v100, tx * (1.0 - ty) * (1.0 - tz)),
+            (v010, (1.0 - tx) * ty * (1.0 - tz)),
+            (v110, tx * ty * (1.0 - tz)),
+            (v001, (1.0 - tx) * (1.0 - ty) * tz),
+            (v101, tx * (1.0 - ty) * tz),
+            (v011, (1.0 - tx) * ty * tz),
+            (v111, tx * ty * tz),
         ];
 
         let mut weighted_sum = 0.0;
@@ -673,6 +834,89 @@ impl OrderField for EikonalOrderField {
             f64::INFINITY
         }
     }
+}
+
+/// Cubic Hermite basis functions `(h00, h10, h01, h11)` at `t in [0, 1]`.
+/// `h00 + h01 == 1` always (partition of unity for the value terms); `h10`,
+/// `h11` are bounded (peak magnitude ~0.1925 within `[0, 1]`), so a
+/// derivative term `h10(t) * h * gradient` or `h11(t) * h * gradient` can't
+/// blow up for a well-behaved (magnitude ~1) gradient -- unlike a
+/// finite-difference-inferred cubic weight, which has no such bound.
+fn hermite_weights(t: f64) -> (f64, f64, f64, f64) {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+    let h10 = t3 - 2.0 * t2 + t;
+    let h01 = -2.0 * t3 + 3.0 * t2;
+    let h11 = t3 - t2;
+    (h00, h10, h01, h11)
+}
+
+/// Gradient-augmented trilinear (Hermite) interpolation over a fully-finite
+/// 8-corner cell. Corners are ordered `[000, 100, 010, 110, 001, 101, 011,
+/// 111]` (x fastest, then y, then z), matching [`EikonalOrderField::order`]'s
+/// corner construction.
+///
+/// Blends along z first (Hermite, using each corner's `z`-gradient
+/// component as the paired derivative), then y (Hermite, using the
+/// `y`-gradient component), then x (Hermite, using the `x`-gradient
+/// component); the transverse gradient components not being blended at a
+/// given stage are carried through via plain linear interpolation, since we
+/// only have a directional derivative per axis, not the mixed partials a
+/// full tricubic Hermite patch would need. This simplified scheme is
+/// C1-continuous along axis-aligned directions and, since every stage's
+/// weights are individually bounded (see [`hermite_weights`]), cannot
+/// overshoot the way a finite-difference-derived cubic can.
+fn hermite_trilinear(
+    h: f64,
+    tx: f64,
+    ty: f64,
+    tz: f64,
+    values: [f64; 8],
+    gradients: [DVec3; 8],
+) -> f64 {
+    let [v000, v100, v010, v110, v001, v101, v011, v111] = values;
+    let [g000, g100, g010, g110, g001, g101, g011, g111] = gradients;
+
+    let (h00z, h10z, h01z, h11z) = hermite_weights(tz);
+    let hermite_z = |v0: f64, gz0: f64, v1: f64, gz1: f64| {
+        h00z * v0 + h10z * h * gz0 + h01z * v1 + h11z * h * gz1
+    };
+    let lerp_z = |a: f64, b: f64| a + (b - a) * tz;
+
+    // After the z-blend, each of the 4 (x, y) corner pairs carries a
+    // blended value plus the transverse (x, y) gradient components carried
+    // through via linear interpolation (see doc comment).
+    let v_x0y0 = hermite_z(v000, g000.z, v001, g001.z);
+    let gx_x0y0 = lerp_z(g000.x, g001.x);
+    let gy_x0y0 = lerp_z(g000.y, g001.y);
+
+    let v_x1y0 = hermite_z(v100, g100.z, v101, g101.z);
+    let gx_x1y0 = lerp_z(g100.x, g101.x);
+    let gy_x1y0 = lerp_z(g100.y, g101.y);
+
+    let v_x0y1 = hermite_z(v010, g010.z, v011, g011.z);
+    let gx_x0y1 = lerp_z(g010.x, g011.x);
+    let gy_x0y1 = lerp_z(g010.y, g011.y);
+
+    let v_x1y1 = hermite_z(v110, g110.z, v111, g111.z);
+    let gx_x1y1 = lerp_z(g110.x, g111.x);
+    let gy_x1y1 = lerp_z(g110.y, g111.y);
+
+    let (h00y, h10y, h01y, h11y) = hermite_weights(ty);
+    let hermite_y = |v0: f64, gy0: f64, v1: f64, gy1: f64| {
+        h00y * v0 + h10y * h * gy0 + h01y * v1 + h11y * h * gy1
+    };
+    let lerp_y = |a: f64, b: f64| a + (b - a) * ty;
+
+    let v_x0 = hermite_y(v_x0y0, gy_x0y0, v_x0y1, gy_x0y1);
+    let gx_x0 = lerp_y(gx_x0y0, gx_x0y1);
+
+    let v_x1 = hermite_y(v_x1y0, gy_x1y0, v_x1y1, gy_x1y1);
+    let gx_x1 = lerp_y(gx_x1y0, gx_x1y1);
+
+    let (h00x, h10x, h01x, h11x) = hermite_weights(tx);
+    h00x * v_x0 + h10x * h * gx_x0 + h01x * v_x1 + h11x * h * gx_x1
 }
 
 /// Number of grid nodes along one axis, given that axis's extent and the
@@ -823,6 +1067,60 @@ mod tests {
                 "expected ~{expected}, got {got} at {p:?}"
             );
         }
+    }
+
+    /// Regression test for a sign bug in `compute_gradients`'s one-sided
+    /// finite difference: seeding from the *high*-x end means every
+    /// interior node's smaller (upwind) neighbor sits on its `hi` side, the
+    /// exact branch that used to compute `(current - neighbor) / h`
+    /// unconditionally -- flipping the sign of the true gradient (which
+    /// should point in -x, toward decreasing distance-to-seed) to +x. A
+    /// wrong-signed tangent in `hermite_trilinear` bows the interpolated
+    /// value the wrong way inside a cell, producing a local overshoot/dip
+    /// on the order of one grid cell in size -- this asserts both the
+    /// gradient's raw sign and that `order()` stays monotonic (no such
+    /// overshoot) across a cell interior.
+    #[test]
+    fn gradient_sign_is_correct_when_upwind_neighbor_is_on_the_high_side() {
+        let min_corner = DVec3::new(0.0, 0.0, 0.0);
+        let max_corner = DVec3::new(1.0, 0.0, 0.0);
+        // Seed near the high-x end: every interior node's smaller-valued
+        // (upwind) axis-neighbor is therefore on its `hi` (x+1) side.
+        let seeds = [DVec3::new(0.95, 0.0, 0.0)];
+        let field = EikonalOrderField::new(min_corner, max_corner, &seeds, 0.1);
+
+        let [nx, _, _] = field.dims;
+        // Check an interior node (not the seed's own cell) directly: its raw
+        // gradient x-component must be negative (distance decreases toward
+        // the high-x seed), not positive as the sign-flipped bug produced.
+        let mid = nx / 2;
+        let idx = field.idx(mid, 0, 0);
+        assert!(
+            field.gradients[idx].x < 0.0,
+            "expected negative x-gradient (field decreases toward the high-x seed), got {:?}",
+            field.gradients[idx]
+        );
+
+        // Also check end-to-end: sampling densely across a cell interior
+        // must stay monotonically non-increasing as x increases toward the
+        // seed -- a wrong-signed tangent would bow the Hermite curve the
+        // wrong way, producing a local increase (overshoot) inside the
+        // cell.
+        let mut previous = field.order(DVec3::new(0.05, 0.0, 0.0));
+        let mut worst_increase = 0.0_f64;
+        let mut x = 0.05;
+        while x < 0.9 {
+            x += 0.01;
+            let value = field.order(DVec3::new(x, 0.0, 0.0));
+            if value.is_finite() && previous.is_finite() {
+                worst_increase = worst_increase.max(value - previous);
+            }
+            previous = value;
+        }
+        assert!(
+            worst_increase < 1e-6,
+            "order() increased by {worst_increase} while approaching the seed -- likely a wrong-signed gradient tangent"
+        );
     }
 
     #[test]
