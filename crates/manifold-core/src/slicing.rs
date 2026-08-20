@@ -804,6 +804,39 @@ pub fn slice_mesh_with_progress(
         })
         .collect();
 
+    // Curved-path wall-loop smoothing: `EikonalOrderField`/`ConicalOrderField`
+    // reconstruct geometry against an interpolated field (trilinear for
+    // Eikonal's FMM distance grid -- see `EikonalOrderField::order`'s doc
+    // comment), which is only C0. Every isosurface projection/offset step
+    // that walks such a field therefore lands on a faceted surface with
+    // facet width equal to the field's grid cell size, producing visible
+    // point-to-point zigzag along wall loops (confirmed on
+    // pug_v4_l_sop_85mm.stl with the manual `probe_wall_noise` example --
+    // see project memory: ~74% sign-alternation rate in the discrete
+    // second difference along Eikonal wall loops, vs ~46% i.e.
+    // no-zigzag for the analytic Height field). Smoothing here is
+    // deliberately light (small window, few iterations) and skips
+    // `unsupported` (stitched) points, so it damps sub-cell noise without
+    // eating real curvature (whose wavelength is normally many cells
+    // wide) or disturbing deliberately-placed bridge geometry. Run before
+    // `stitch_wall_gaps` so its arc-length correspondence matches against
+    // the smoothed geometry, not the raw faceted one. The Height path
+    // reconstructs directly from an exact analytic SDF isosurface with no
+    // comparable faceting, so it is left untouched (matches
+    // `stitch_wall_gaps`'s existing `!is_height` gate below).
+    if !is_height {
+        for layer in &mut layers {
+            for wall in &mut layer.loops {
+                smooth_wall_loop(wall);
+                // Recompute now that points moved -- arc_fraction is a
+                // per-point cumulative arc-length position (see
+                // `WallLoop::arc_fraction`'s doc comment), consumed by
+                // `stitch_wall_gaps` right below for its correspondence.
+                wall.arc_fraction = compute_arc_fractions(&wall.points);
+            }
+        }
+    }
+
     // Inter-layer wall-0 gap stitching: only meaningful for the curved
     // (non-Height) path, where wall 0 is reconstructed per-layer against
     // `field` from `outer_wall_mesh` above and consecutive layers'
@@ -818,6 +851,54 @@ pub fn slice_mesh_with_progress(
     }
 
     Ok(layers)
+}
+
+/// Number of neighbors averaged on each side of a wall-loop point by
+/// [`smooth_wall_loop`]. Kept small (window width 3) so only sub-cell
+/// grid-quantization noise is damped, not real curvature -- see
+/// `smooth_wall_loop`'s doc comment.
+const WALL_SMOOTH_HALF_WINDOW: usize = 1;
+
+/// Number of `smooth_wall_loop` passes applied to each wall loop. Two
+/// light passes measurably reduce zigzag (see `probe_wall_noise`) without
+/// visibly rounding real corners at this window size.
+const WALL_SMOOTH_ITERATIONS: usize = 2;
+
+/// Applies [`WALL_SMOOTH_ITERATIONS`] passes of a centered moving-average
+/// filter (window `2 * WALL_SMOOTH_HALF_WINDOW + 1`, wrapping around the
+/// closed loop) to `wall.points` in place, to damp the grid-quantization
+/// zigzag documented on this function's caller. Points flagged
+/// `unsupported` (inserted by wall-gap stitching -- not relevant here
+/// since this runs *before* stitching, but kept as a defensive guard
+/// against future reordering) and loops too short to have a meaningful
+/// neighborhood (`points.len() < 2 * WALL_SMOOTH_HALF_WINDOW + 3`) are
+/// left untouched.
+fn smooth_wall_loop(wall: &mut WallLoop) {
+    let n = wall.points.len();
+    if n < 2 * WALL_SMOOTH_HALF_WINDOW + 3 {
+        return;
+    }
+    for _ in 0..WALL_SMOOTH_ITERATIONS {
+        let original = wall.points.clone();
+        for i in 0..n {
+            if wall.unsupported.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut sum = DVec3::ZERO;
+            let mut count = 0.0;
+            for offset in -(WALL_SMOOTH_HALF_WINDOW as isize)..=(WALL_SMOOTH_HALF_WINDOW as isize) {
+                let j = (i as isize + offset).rem_euclid(n as isize) as usize;
+                if wall.unsupported.get(j).copied().unwrap_or(false) {
+                    continue;
+                }
+                sum += original[j];
+                count += 1.0;
+            }
+            if count > 0.0 {
+                wall.points[i] = sum / count;
+            }
+        }
+    }
 }
 
 /// Detects and fixes inter-layer wall-0 (ear bridging) gaps: walks

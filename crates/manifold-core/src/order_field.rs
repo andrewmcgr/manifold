@@ -161,7 +161,19 @@ fn eikonal_field_for(
 
     let layer_height = config.layer_height.abs().max(f64::EPSILON);
     let nozzle_diameter = config.nozzle_diameter.abs().max(f64::EPSILON);
-    let requested_cell_size = layer_height.min(nozzle_diameter) / 2.0;
+    // `/ 4.0` rather than the originally-tried `/ 2.0`: `EikonalOrderField`
+    // interpolates its FMM distance grid trilinearly (C0 only -- see
+    // `EikonalOrderField::order`'s doc comment), so every isosurface
+    // projection/reconstruction that walks this field (wall extraction,
+    // `reconstruct_on_order_field_near`, wall-gap stitching, ...) lands on
+    // a faceted surface with facet width == this cell size. Halving it
+    // again roughly halves that faceting amplitude (measured on
+    // pug_v4_l_sop_85mm.stl with the manual `probe_wall_noise` example --
+    // see project memory). `clamp_cell_size_to_node_budget` below still
+    // coarsens this back up for large parts rather than blowing the node
+    // budget, so this is a quality/perf trade only for parts small enough
+    // to afford the finer grid.
+    let requested_cell_size = layer_height.min(nozzle_diameter) / 4.0;
     let cell_size = clamp_cell_size_to_node_budget(max - min, requested_cell_size);
     // Contact-region tolerance: every solid grid node within *half a grid
     // cell* of the mesh's minimum Z counts as "touching" the build plate --
