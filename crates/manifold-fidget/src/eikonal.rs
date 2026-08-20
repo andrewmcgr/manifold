@@ -617,10 +617,15 @@ impl EikonalOrderField {
 impl OrderField for EikonalOrderField {
     /// Trilinearly interpolates the precomputed FMM distance grid at `p`
     /// (clamped into the grid's bounding box). Nodes the front never
-    /// reached remain `f64::INFINITY`; interpolating between such nodes (or
-    /// a fully-unreached region, e.g. an empty seed set) yields `+inf`
-    /// rather than panicking — this is the documented best-effort fallback
-    /// for a query point the front cannot reach.
+    /// reached remain `f64::INFINITY`; those corners are *excluded* from
+    /// the interpolation (weights renormalized over the finite corners) so
+    /// a query point inside the reached solid isn't poisoned by a void
+    /// node just outside the surface — the common case for mesh-surface
+    /// queries, where up to half of a cell's corners sit in unmarched air.
+    /// Only when *every* corner of the containing cell is unreached (e.g.
+    /// an empty seed set, or a genuinely unreached region) does this
+    /// return `+inf` — the documented best-effort fallback for a query
+    /// point the front cannot reach.
     fn order(&self, p: DVec3) -> f64 {
         let [nx, ny, nz] = self.dims;
         if nx == 0 || ny == 0 || nz == 0 {
@@ -638,24 +643,35 @@ impl OrderField for EikonalOrderField {
 
         let g = |x: usize, y: usize, z: usize| self.distances[self.idx(x, y, z)];
 
-        let c000 = g(x0, y0, z0);
-        let c100 = g(x1, y0, z0);
-        let c010 = g(x0, y1, z0);
-        let c110 = g(x1, y1, z0);
-        let c001 = g(x0, y0, z1);
-        let c101 = g(x1, y0, z1);
-        let c011 = g(x0, y1, z1);
-        let c111 = g(x1, y1, z1);
+        // Trilinear weights per corner; unreached (`+inf`) corners are
+        // dropped and the remaining weights renormalized. See doc comment.
+        let corners = [
+            (g(x0, y0, z0), (1.0 - tx) * (1.0 - ty) * (1.0 - tz)),
+            (g(x1, y0, z0), tx * (1.0 - ty) * (1.0 - tz)),
+            (g(x0, y1, z0), (1.0 - tx) * ty * (1.0 - tz)),
+            (g(x1, y1, z0), tx * ty * (1.0 - tz)),
+            (g(x0, y0, z1), (1.0 - tx) * (1.0 - ty) * tz),
+            (g(x1, y0, z1), tx * (1.0 - ty) * tz),
+            (g(x0, y1, z1), (1.0 - tx) * ty * tz),
+            (g(x1, y1, z1), tx * ty * tz),
+        ];
 
-        let c00 = lerp(c000, c100, tx);
-        let c10 = lerp(c010, c110, tx);
-        let c01 = lerp(c001, c101, tx);
-        let c11 = lerp(c011, c111, tx);
+        let mut weighted_sum = 0.0;
+        let mut weight_total = 0.0;
+        for (value, weight) in corners {
+            if value.is_finite() {
+                weighted_sum += value * weight;
+                weight_total += weight;
+            }
+        }
 
-        let c0 = lerp(c00, c10, ty);
-        let c1 = lerp(c01, c11, ty);
-
-        lerp(c0, c1, tz)
+        if weight_total > 0.0 {
+            weighted_sum / weight_total
+        } else {
+            // Every corner with any interpolation weight is unreached:
+            // the front genuinely never got here.
+            f64::INFINITY
+        }
     }
 }
 
@@ -692,22 +708,6 @@ fn axis_coords(local: f64, count: usize) -> (usize, f64) {
     let base_idx = (base as usize).min(count - 2);
     let frac = (clamped - base_idx as f64).clamp(0.0, 1.0);
     (base_idx, frac)
-}
-
-fn lerp(a: f64, b: f64, t: f64) -> f64 {
-    if a.is_infinite() || b.is_infinite() {
-        // Avoid `inf + (-inf) * t` producing NaN whenever *either* corner
-        // is a grid node the FMM front never reached (`+inf`) — not just
-        // when *both* are, which was the original (insufficient) guard
-        // here. This is the common case at the edge of the marched
-        // narrow band: one corner reached, its neighbor not. Distances in
-        // this grid are unsigned front-arrival distances, so "unreached"
-        // is always `+inf` (never `-inf`); propagating `+inf` here keeps
-        // the same "front hasn't reached this region yet" semantics
-        // `order`'s doc already promises, instead of NaN.
-        return f64::INFINITY;
-    }
-    a + (b - a) * t
 }
 
 /// Solves the standard Godunov upwind FMM quadratic update for uniform grid
@@ -899,13 +899,12 @@ mod tests {
     /// Regression test for a real bug: `order`'s trilinear interpolation
     /// blends a reached (finite) grid node with an unreached (`+inf`)
     /// neighbor at the edge of the marched/occupied region — the ordinary
-    /// case with `new_with_occupancy`, not a rare corner case. `lerp` used
-    /// to only guard against blending two infinities of the *same sign*,
-    /// so `inf + (finite - inf) * t` produced NaN here, which then flowed
-    /// into contour reconstruction and made `i_overlay` panic with "trying
-    /// to convert a point[NaN, NaN]". Querying right at that reached/
-    /// unreached boundary must return `+inf` ("front hasn't reached this
-    /// region"), never NaN.
+    /// case with `new_with_occupancy`, not a rare corner case. An early
+    /// version produced `inf + (finite - inf) * t` = NaN here, which then
+    /// flowed into contour reconstruction and made `i_overlay` panic with
+    /// "trying to convert a point[NaN, NaN]". Querying at that reached/
+    /// unreached boundary must return a usable value (now: the finite-
+    /// corner-weighted interpolation), never NaN.
     #[test]
     fn order_at_reached_unreached_boundary_is_infinite_not_nan() {
         let min_corner = DVec3::new(-1.0, -1.0, -1.0);
@@ -922,6 +921,42 @@ mod tests {
         assert!(
             !value.is_nan(),
             "order() at a reached/unreached grid boundary must never be NaN"
+        );
+    }
+
+    /// Regression test for missing walls on meshes with thin features
+    /// (reported on Voron_Design_Cube_v7.stl): a query point *inside* the
+    /// reached solid but within one cell of the surface has some of its
+    /// eight interpolation corners in unmarched air (`+inf`). The old
+    /// interpolation propagated `+inf` whenever *any* corner was
+    /// unreached, so large bands of real surface vertices got infinite
+    /// order and their walls were silently dropped. Finite corners must
+    /// win: only a cell whose corners are *all* unreached may return
+    /// `+inf`.
+    #[test]
+    fn order_near_surface_ignores_unreached_void_corners() {
+        let min_corner = DVec3::new(-1.0, -1.0, -1.0);
+        let max_corner = DVec3::new(1.0, 1.0, 1.0);
+        let seeds = [DVec3::new(-1.0, -1.0, -1.0)];
+        // Solid half-space x <= 0; everything x > 0 is unmarched air.
+        let is_solid = |p: DVec3| p.x <= 0.0;
+        let field =
+            EikonalOrderField::new_with_occupancy(min_corner, max_corner, &seeds, 0.25, &is_solid);
+
+        // Just inside the solid, but the containing cell straddles the
+        // surface so its x = 0.25 corners are unreached.
+        let near_surface = field.order(DVec3::new(-0.05, -0.9, -0.9));
+        assert!(
+            near_surface.is_finite(),
+            "query inside reached solid near the surface must be finite, got {near_surface}"
+        );
+
+        // Deep inside the unreached air, every corner is `+inf`: the
+        // documented "front cannot reach this point" fallback still holds.
+        let in_air = field.order(DVec3::new(0.75, 0.75, 0.75));
+        assert!(
+            in_air.is_infinite(),
+            "query in a fully-unreached region must stay +inf, got {in_air}"
         );
     }
 
