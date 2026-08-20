@@ -50,6 +50,7 @@ mod tests {
                 },
                 tools: vec![Tool::new(ToolId(0), 0.4)],
                 axis_count: 3,
+                eikonal_slope_profile: Vec::new(),
             },
             config: SlicerConfig {
                 layer_height: 0.2,
@@ -71,7 +72,6 @@ mod tests {
                 filament_diameter: 1.75,
                 start_gcode: String::new(),
                 end_gcode: String::new(),
-                eikonal_slope_profile: Vec::new(),
                 travel_speed: 9000.0,
                 print_speed: 3000.0,
                 z_hop_enabled: false,

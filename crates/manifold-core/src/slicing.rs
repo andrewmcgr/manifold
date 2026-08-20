@@ -366,7 +366,12 @@ fn contour_resolution(extent: f64, nozzle_diameter: f64, refinement_divisor: f64
 /// [`Object`] should go through [`slice_object`], which bakes the
 /// object's transform into world space first.
 pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
-    slice_mesh_with_progress(mesh, config, &mut |_| {})
+    slice_mesh_with_progress(
+        mesh,
+        config,
+        &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        &mut |_| {},
+    )
 }
 
 /// Same as [`slice_mesh`], but calls `on_progress` as work finishes with
@@ -394,6 +399,7 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
 pub fn slice_mesh_with_progress(
     mesh: &Mesh,
     config: &SlicerConfig,
+    slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     on_progress: &mut (dyn FnMut(f64) + Send),
 ) -> Result<Vec<Layer>> {
     let Some((min, max)) = mesh.bounding_box() else {
@@ -421,6 +427,7 @@ pub fn slice_mesh_with_progress(
         config.order_field,
         config,
         mesh,
+        slope_profile,
     ));
     // `order_range_over_bbox` samples 27 points on the mesh's axis-aligned
     // bounding box (corners, edge midpoints, face center). That's exact for
@@ -2052,7 +2059,12 @@ fn in_plane_extent(min: DVec3, max: DVec3, basis1: DVec3, basis2: DVec3) -> f64 
 /// vertices, then slices that with [`slice_mesh`], tagging every
 /// resulting layer with the object's id.
 pub fn slice_object(object: &Object, config: &SlicerConfig) -> Result<Vec<Layer>> {
-    slice_object_with_progress(object, config, &mut |_| {})
+    slice_object_with_progress(
+        object,
+        config,
+        &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        &mut |_| {},
+    )
 }
 
 /// Same as [`slice_object`], forwarding to [`slice_mesh_with_progress`] and
@@ -2061,6 +2073,7 @@ pub fn slice_object(object: &Object, config: &SlicerConfig) -> Result<Vec<Layer>
 pub fn slice_object_with_progress(
     object: &Object,
     config: &SlicerConfig,
+    slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     on_progress: &mut (dyn FnMut(f64) + Send),
 ) -> Result<Vec<Layer>> {
     let world_mesh = Mesh::new(
@@ -2073,7 +2086,7 @@ pub fn slice_object_with_progress(
         object.mesh.indices.clone(),
     );
 
-    let mut layers = slice_mesh_with_progress(&world_mesh, config, on_progress)?;
+    let mut layers = slice_mesh_with_progress(&world_mesh, config, slope_profile, on_progress)?;
     for layer in &mut layers {
         layer.object = object.id;
     }
@@ -2100,7 +2113,13 @@ pub fn slice_workspace(
     order: &[ObjectId],
     config: &SlicerConfig,
 ) -> Result<Vec<Layer>> {
-    slice_workspace_with_progress(objects, order, config, &mut |_| {})
+    slice_workspace_with_progress(
+        objects,
+        order,
+        config,
+        &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        &mut |_| {},
+    )
 }
 
 /// Same as [`slice_workspace`], reporting overall progress across every
@@ -2112,6 +2131,7 @@ pub fn slice_workspace_with_progress(
     objects: &[Object],
     order: &[ObjectId],
     config: &SlicerConfig,
+    slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     on_progress: &mut (dyn FnMut(f64) + Send),
 ) -> Result<Vec<Layer>> {
     let total = order.len().max(1) as f64;
@@ -2125,9 +2145,14 @@ pub fn slice_workspace_with_progress(
                     "print order references unknown object {object_id}"
                 ))
             })?;
-        layers.extend(slice_object_with_progress(object, config, &mut |local| {
-            on_progress(((object_index as f64) + local) / total);
-        })?);
+        layers.extend(slice_object_with_progress(
+            object,
+            config,
+            slope_profile,
+            &mut |local| {
+                on_progress(((object_index as f64) + local) / total);
+            },
+        )?);
     }
     Ok(layers)
 }
@@ -2205,7 +2230,8 @@ mod tests {
         };
 
         let mut reported = Vec::new();
-        slice_mesh_with_progress(&cube_mesh(), &config, &mut |fraction| {
+        let empty_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
+        slice_mesh_with_progress(&cube_mesh(), &config, &empty_profile, &mut |fraction| {
             reported.push(fraction);
         })
         .unwrap();
@@ -2228,7 +2254,8 @@ mod tests {
         let order = vec![ObjectId(0), ObjectId(1)];
 
         let mut reported = Vec::new();
-        slice_workspace_with_progress(&objects, &order, &config, &mut |fraction| {
+        let empty_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
+        slice_workspace_with_progress(&objects, &order, &config, &empty_profile, &mut |fraction| {
             reported.push(fraction);
         })
         .unwrap();

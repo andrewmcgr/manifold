@@ -141,17 +141,17 @@ fn main() -> Result<()> {
         nozzle_diameter: cli.nozzle_diameter,
         order_field: cli.order_field.into(),
         infill_pattern: cli.infill_pattern.into(),
-        eikonal_slope_profile,
         ..SlicerConfig::default()
     };
 
-    let machine = Machine::new(
+    let mut machine = Machine::new(
         BoundingVolume::Aabb {
             min: DVec3::ZERO,
             max: DVec3::new(200.0, 200.0, 200.0),
         },
         tools_for(&objects, cli.nozzle_diameter),
     );
+    machine.eikonal_slope_profile = eikonal_slope_profile;
     let workspace = Workspace::new(objects, machine, config);
 
     let gcode = slice_to_gcode(&workspace)?;

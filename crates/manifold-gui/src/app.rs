@@ -650,7 +650,8 @@ impl ManifoldApp {
         if self.config.order_field == OrderFieldKind::Eikonal {
             ui.label("Slope-limit profile (height above build plate -> max angle)");
             let mut remove_index: Option<usize> = None;
-            for (i, (height, degrees)) in self.config.eikonal_slope_profile.iter_mut().enumerate() {
+            for (i, (height, degrees)) in self.machine.eikonal_slope_profile.iter_mut().enumerate()
+            {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::DragValue::new(height)
@@ -670,16 +671,16 @@ impl ManifoldApp {
                 });
             }
             if let Some(i) = remove_index {
-                self.config.eikonal_slope_profile.remove(i);
+                self.machine.eikonal_slope_profile.remove(i);
             }
             if ui.button("Add breakpoint").clicked() {
                 let next_height = self
-                    .config
+                    .machine
                     .eikonal_slope_profile
                     .last()
                     .map(|(h, _)| h + 1.0)
                     .unwrap_or(0.0);
-                self.config.eikonal_slope_profile.push((next_height, 45.0));
+                self.machine.eikonal_slope_profile.push((next_height, 45.0));
             }
         }
 

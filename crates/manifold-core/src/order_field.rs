@@ -67,6 +67,7 @@ pub fn order_field_for(
     kind: OrderFieldKind,
     config: &SlicerConfig,
     mesh: &Mesh,
+    slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
 ) -> Box<dyn OrderField> {
     match kind {
         OrderFieldKind::Height => Box::new(HeightOrderField::new(BUILD_DIRECTION)),
@@ -75,7 +76,7 @@ pub fn order_field_for(
             config.order_field_axis,
             config.order_field_slope,
         )),
-        OrderFieldKind::Eikonal => Box::new(eikonal_field_for(config, mesh)),
+        OrderFieldKind::Eikonal => Box::new(eikonal_field_for(config, mesh, slope_profile)),
     }
 }
 
@@ -149,7 +150,11 @@ pub fn order_field_for(
 /// `BUILD_DIRECTION`/`min`-anchored convention `is_seed_region` already
 /// uses. An empty/default slope profile is documented as unconstrained, so
 /// this is a no-op when no profile is configured.
-fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
+fn eikonal_field_for(
+    config: &SlicerConfig,
+    mesh: &Mesh,
+    slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
+) -> EikonalOrderField {
     let Some((min, max)) = mesh.bounding_box() else {
         return EikonalOrderField::new(DVec3::ZERO, DVec3::ONE, &[], 1.0);
     };
@@ -180,7 +185,6 @@ fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
     // mesh's contact surface itself.
     let seed_tolerance = cell_size / 2.0;
     let is_seed_region = |p: DVec3| p.z <= min.z + seed_tolerance;
-    let slope_profile = config.eikonal_slope_profile();
     let height_along = ConstantAxisHeight::new(BUILD_DIRECTION, min);
 
     let faces: Vec<[usize; 3]> = mesh
@@ -200,7 +204,7 @@ fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
             cell_size,
             &is_solid,
             &is_seed_region,
-            Some(&slope_profile),
+            Some(slope_profile),
             Some(&height_along),
         );
     }
@@ -213,7 +217,7 @@ fn eikonal_field_for(config: &SlicerConfig, mesh: &Mesh) -> EikonalOrderField {
         cell_size,
         &is_solid,
         &is_seed_region,
-        Some(&slope_profile),
+        Some(slope_profile),
         Some(&height_along),
     )
 }
@@ -914,7 +918,12 @@ mod tests {
     fn default_config_resolves_to_height_field_matching_build_direction() {
         let config = SlicerConfig::default();
         let mesh = crate::mesh::Mesh::default();
-        let field = order_field_for(config.order_field, &config, &mesh);
+        let field = order_field_for(
+            config.order_field,
+            &config,
+            &mesh,
+            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        );
 
         let p = DVec3::new(1.0, 2.0, 3.0);
         let expected = HeightOrderField::new(BUILD_DIRECTION).order(p);
@@ -932,7 +941,12 @@ mod tests {
         config.order_field_slope = 0.5;
 
         let mesh = crate::mesh::Mesh::default();
-        let field = order_field_for(config.order_field, &config, &mesh);
+        let field = order_field_for(
+            config.order_field,
+            &config,
+            &mesh,
+            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        );
 
         let p = DVec3::new(4.0, 6.0, 10.0);
         let expected = ConicalOrderField::new(

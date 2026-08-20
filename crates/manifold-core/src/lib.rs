@@ -121,22 +121,6 @@ pub struct SlicerConfig {
     /// all path Gcode. No placeholders are substituted by default.
     /// Defaults to a bare `PRINT_END` macro invocation.
     pub end_gcode: String,
-    /// Piecewise `(height_along_axis_mm, max_angle_deg)` breakpoints
-    /// describing the maximum overhang angle the Eikonal order field may
-    /// produce at a given height, converted via
-    /// [`SlicerConfig::eikonal_slope_profile`] into a
-    /// `manifold_fidget::slope_profile::SlopeProfile`. Serde-friendly (a
-    /// plain `Vec` of tuples) so it round-trips through saved JSON
-    /// profiles (see `manifold-gui/src/profile.rs`).
-    ///
-    /// `#[serde(default = "default_eikonal_slope_profile")]` so a saved
-    /// profile from before this field existed still deserializes: a
-    /// missing field falls back to `default_eikonal_slope_profile()`,
-    /// which is empty and therefore unconstrained (see that function's
-    /// doc comment) -- existing profiles' resulting Gcode is unaffected
-    /// until a user explicitly opts into a tighter profile.
-    #[serde(default = "default_eikonal_slope_profile")]
-    pub eikonal_slope_profile: Vec<(f64, f64)>,
     /// Feedrate (Gcode `F`, mm/min) for non-extruding travel moves
     /// (`toolpath::MoveKind::Travel`). Defaults to `9000.0` (150 mm/s), a
     /// common consumer-FDM travel speed. `#[serde(default)]` so a saved
@@ -223,23 +207,6 @@ pub struct SlicerConfig {
     pub travel_order_optimization_enabled: bool,
 }
 
-/// Default value for [`SlicerConfig::eikonal_slope_profile`]: an empty set
-/// of breakpoints.
-///
-/// An empty `Vec` is what
-/// `manifold_fidget::slope_profile::SlopeProfile::max_slope_at` treats as
-/// unconstrained (returns
-/// `manifold_fidget::slope_profile::UNCONSTRAINED_ANGLE_DEG` for every
-/// height), which matches the pre-feature isotropic Eikonal behavior --
-/// i.e. no additional slope limit beyond what the order field already
-/// imposes. This is also what missing-field JSON deserialization falls
-/// back to via `#[serde(default = "...")]`, so existing saved profiles
-/// keep producing identical Gcode until a user explicitly configures a
-/// tighter profile.
-fn default_eikonal_slope_profile() -> Vec<(f64, f64)> {
-    Vec::new()
-}
-
 /// Default value for [`SlicerConfig::travel_speed`]: `9000.0` mm/min
 /// (150 mm/s), a common consumer-FDM travel speed.
 fn default_travel_speed() -> f64 {
@@ -305,7 +272,6 @@ impl Default for SlicerConfig {
             filament_diameter: 1.75,
             start_gcode: "PRINT_START T_TOOL=240 T_BED=105 T_CHAMBER=45 PRINT_MIN={print_min_x},{print_min_y} PRINT_MAX={print_max_x},{print_max_y}".to_string(),
             end_gcode: "PRINT_END".to_string(),
-            eikonal_slope_profile: default_eikonal_slope_profile(),
             travel_speed: default_travel_speed(),
             print_speed: default_print_speed(),
             z_hop_enabled: false,
@@ -327,17 +293,6 @@ impl SlicerConfig {
     pub fn wall_count(&self) -> usize {
         let line_width = self.wall_line_width.abs().max(f64::EPSILON);
         (self.shell_thickness / line_width).round().max(1.0) as usize
-    }
-
-    /// Converts the serde-friendly `eikonal_slope_profile` breakpoints into
-    /// a real `manifold_fidget::slope_profile::SlopeProfile`.
-    ///
-    /// Delegates entirely to `SlopeProfile::new`, which already sorts
-    /// non-ascending breakpoints and clamps degenerate angles rather than
-    /// panicking, so this adds no new panic path.
-    #[must_use]
-    pub fn eikonal_slope_profile(&self) -> manifold_fidget::slope_profile::SlopeProfile {
-        manifold_fidget::slope_profile::SlopeProfile::new(self.eikonal_slope_profile.clone())
     }
 
     /// Diameter (mm) of the nozzle tip's flat land, used by
@@ -415,6 +370,7 @@ pub fn plan_toolpaths_with_progress(
         &workspace.objects,
         &order,
         &workspace.config,
+        &workspace.machine.slope_profile(),
         &mut |fraction: f64| on_progress(fraction * 0.5),
     )?;
     let paths = toolpath::plan_with_progress(

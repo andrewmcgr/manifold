@@ -229,7 +229,6 @@ fn main() -> anyhow::Result<()> {
         // produced the same stitching pattern -- confirming the gap
         // here comes from the mesh's own geometry/Eikonal front shape,
         // not from an added slope constraint.
-        eikonal_slope_profile: Vec::new(),
         // Disable toolpath simplification so the reported per-segment
         // hop distances/Overhang tags reflect stitch_wall_gaps' direct
         // output, not a subsequent RDP decimation pass.
