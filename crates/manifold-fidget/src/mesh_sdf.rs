@@ -19,20 +19,16 @@ const DEGENERATE_EPSILON: f64 = 1e-12;
 /// Strategy used to determine the sign (inside/outside) of a [`MeshSdf`]
 /// sample.
 ///
-/// Only [`SignMethod::Pseudonormal`] is implemented in this pass.
-///
-/// `WindingNumber` is the designed next variant (see
-/// `MESH_SDF_VISUALIZATION.md` Phase A): a hierarchical solid-angle
-/// evaluation over the BVH that is robust to non-watertight / non-manifold
-/// meshes, unlike pseudonormals. It is deliberately **not implemented
-/// here** — it is omitted from this enum rather than added as an
-/// `unimplemented!()` stub, specifically so that adding it later is a pure
-/// enum-variant addition (plus a new match arm in [`MeshSdf::sign_at`]),
-/// not a breaking rename or restructuring of [`MeshSdf`]'s public shape.
-/// The BVH build and the pseudonormal precompute already live in their own
-/// method ([`MeshSdf::new`]'s helpers), isolated from the query path
-/// ([`MeshSdf::sample`]), so a winding-number variant that needs different
-/// (or no) precompute can be slotted in without touching either.
+/// [`SignMethod::Pseudonormal`] is the default, cheap fast path.
+/// [`SignMethod::WindingNumber`] is a slower, O(triangles)-per-query but
+/// robust alternative — see its doc comment. [`MeshSdf::sign_at`] also uses
+/// the winding-number computation internally as the fallback for
+/// [`SignMethod::Pseudonormal`]'s ambiguous-tie case (see `sign_at`'s doc
+/// comment and the `AMBIGUOUS_COS_THRESHOLD` note), since the plain
+/// most-decisive-tied-feature heuristic that previously lived there
+/// (`sign_via_tie_break`) could still pick the wrong feature when two
+/// non-adjacent, near-tied-distance features disagreed on sign — confirmed
+/// on Voron_Design_Cube_v7.stl at point (723.223, 314.132, 21.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SignMethod {
@@ -40,7 +36,20 @@ pub enum SignMethod {
     /// construction time. Sign at query time is
     /// `sign(dot(query - nearest_point, pseudonormal_at_nearest_feature))`.
     /// Cheap, but only correct on watertight, consistently-wound meshes.
+    /// Falls back to [`MeshSdf::winding_number_sign`] for ambiguous ties
+    /// (see [`MeshSdf::sign_at`]).
     Pseudonormal,
+    /// Generalized winding number (Jacobson, Kavan &amp; Sorkine-Hornung):
+    /// sums the signed solid angle every triangle in the mesh subtends at
+    /// the query point (`sum / (4*pi)`), which is exactly 1.0 inside and
+    /// 0.0 outside a closed, consistently-wound surface for *any* query
+    /// point, with no notion of "nearest feature" or ties to break —
+    /// robust to non-watertight / non-manifold meshes and immune to the
+    /// nearest-feature-tie failure mode that [`SignMethod::Pseudonormal`]
+    /// can hit. O(triangles) per query (no BVH acceleration), so it is
+    /// intended for the rare ambiguous case or for correctness-over-speed
+    /// use, not as the default for large meshes.
+    WindingNumber,
 }
 
 /// A [`ScalarField`] backed by a triangle mesh's signed distance: distance
@@ -342,25 +351,15 @@ impl MeshSdf {
         }
     }
 
-    /// Sign (+1.0 or -1.0) for a query point `p` whose nearest triangle is
-    /// `face_idx`, with closest surface point `closest`.
-    ///
-    /// The BVH's single nearest-triangle result is only reliable when it
-    /// is unambiguous: for a query point that is (numerically) equidistant
-    /// to two or more distinct mesh features — e.g. two edges that meet at
-    /// a shared vertex on a regularly-tessellated curved surface — the
-    /// arbitrarily-chosen "nearest" triangle can hand back a feature whose
-    /// pseudonormal is nearly perpendicular to `p - closest`, even though a
-    /// different, equally-close feature would give a confident, correct
-    /// answer. A small dot product is the symptom: it means the chosen
-    /// feature's normal barely distinguishes inside from outside for this
-    /// `diff`, so a tiny numerical perturbation in *which* triangle the BVH
-    /// preferred can flip the sign.
-    ///
     /// When that happens (see `AMBIGUOUS_COS_THRESHOLD`), fall back to
-    /// [`MeshSdf::sign_via_tie_break`], which considers every triangle
-    /// whose closest point to `p` is within a tie tolerance of `closest`'s
-    /// distance and picks whichever gives the most decisive alignment.
+    /// [`MeshSdf::winding_number_sign`], the generalized winding number (an
+    /// O(triangles) exact solid-angle sum, see [`SignMethod::WindingNumber`]'s
+    /// doc comment) — unlike the previous nearest-tied-feature heuristic
+    /// (`sign_via_tie_break`, removed), this has no notion of "which
+    /// feature is closest" to get wrong: it is a well-defined function of
+    /// every triangle in the mesh and the query point alone, so it cannot
+    /// be fooled by two near-tied, non-adjacent features disagreeing on
+    /// sign.
     ///
     /// `AMBIGUOUS_COS_THRESHOLD` is deliberately high (not just "clearly
     /// nonzero"): confirmed on a real mesh (Voron_Design_Cube_v7.stl) that
@@ -372,9 +371,10 @@ impl MeshSdf {
     /// can't detect that kind of competing tie by construction -- it only
     /// measures alignment with the feature the BVH happened to hand back,
     /// not whether some unrelated feature is equally close. Erring toward
-    /// the (correct, if rarer) tie-break scan is worth the extra cost:
-    /// this safety net feeds `retain_contained_paths`, and a wrong sign
-    /// here silently drops otherwise-valid wall/infill paths wholesale.
+    /// the (correct, if rarer) winding-number fallback is worth the extra
+    /// cost: this safety net feeds `retain_contained_paths`, and a wrong
+    /// sign here silently drops otherwise-valid wall/infill paths
+    /// wholesale.
     fn sign_at(&self, face_idx: usize, closest: DVec3, p: DVec3) -> f64 {
         match self.sign_method {
             SignMethod::Pseudonormal => {
@@ -397,53 +397,68 @@ impl MeshSdf {
                     return if cos_angle < 0.0 { -1.0 } else { 1.0 };
                 }
 
-                self.sign_via_tie_break(p, dist)
+                self.winding_number_sign(p)
             }
+            SignMethod::WindingNumber => self.winding_number_sign(p),
         }
     }
 
-    /// Fallback for [`MeshSdf::sign_at`] when the primary (BVH-chosen)
-    /// feature gives an ambiguous sign signal: re-examines every triangle
-    /// in the mesh, keeping only those whose closest point to `p` is
-    /// within `TIE_REL_EPSILON` of `dist` (the primary candidate's
-    /// distance), and returns the sign implied by whichever tied
-    /// candidate's feature normal gives the largest-magnitude (most
-    /// decisive) alignment with `p - candidate_closest`.
+    /// Generalized winding number sign for a query point `p`: sums the
+    /// signed solid angle every triangle in the mesh subtends at `p` (via
+    /// the Van Oosterom & Strackee tangent formula for a triangle's solid
+    /// angle, which is exact and avoids the branch-cut/atan2-per-edge
+    /// pitfalls of naive spherical-excess formulas) and normalizes by
+    /// `4*pi`. For a closed, consistently-wound surface this winding
+    /// number is exactly 1.0 for any point strictly inside and 0.0 for any
+    /// point strictly outside, regardless of how many features are
+    /// equidistant from `p` — unlike a nearest-feature approach, it never
+    /// needs to decide "which" feature to trust.
     ///
-    /// This is an O(triangles) scan, but it only runs for the rare
-    /// ambiguous case, so it does not affect the common-case cost of
-    /// [`MeshSdf::sample`].
-    fn sign_via_tie_break(&self, p: DVec3, dist: f64) -> f64 {
-        const TIE_REL_EPSILON: f64 = 1e-6;
-        let tie_dist = dist * (1.0 + TIE_REL_EPSILON) + TIE_REL_EPSILON;
-        let tie_dist_sq = tie_dist * tie_dist;
+    /// O(triangles): every triangle contributes regardless of distance to
+    /// `p`, so this is only used for [`SignMethod::WindingNumber`] itself
+    /// or as the rare ambiguous-tie fallback in [`MeshSdf::sign_at`], never
+    /// on the hot common-case path.
+    ///
+    /// Degenerate (zero-area) triangles contribute (numerically) zero
+    /// solid angle and are harmless to include unconditionally.
+    fn winding_number_sign(&self, p: DVec3) -> f64 {
+        let mut solid_angle_sum = 0.0f64;
+        for verts in &self.face_vertex_indices {
+            let a = self.vertex_positions[verts[0]] - p;
+            let b = self.vertex_positions[verts[1]] - p;
+            let c = self.vertex_positions[verts[2]] - p;
 
-        let mut best_abs_cos = -1.0f64;
-        let mut best_sign = 1.0;
-        for (face_idx, verts) in self.face_vertex_indices.iter().enumerate() {
-            let tri = Triangle::new(
-                self.vertex_positions[verts[0]],
-                self.vertex_positions[verts[1]],
-                self.vertex_positions[verts[2]],
-            );
-            let cand_closest = crate::geometry::closest_point_on_triangle(p, &tri);
-            if cand_closest.distance_squared(p) > tie_dist_sq {
+            let a_len = a.length();
+            let b_len = b.length();
+            let c_len = c.length();
+            if a_len <= DEGENERATE_EPSILON.sqrt()
+                || b_len <= DEGENERATE_EPSILON.sqrt()
+                || c_len <= DEGENERATE_EPSILON.sqrt()
+            {
+                // p coincides with a vertex: solid angle is ill-defined;
+                // this triangle's contribution is skipped (matches the
+                // "on the surface, sign is immaterial" handling
+                // elsewhere).
                 continue;
             }
 
-            let normal = self.feature_normal(face_idx, cand_closest);
-            let diff = p - cand_closest;
-            let dlen = diff.length();
-            if dlen <= DEGENERATE_EPSILON.sqrt() {
-                continue;
-            }
-            let cos_angle = diff.dot(normal) / dlen;
-            if cos_angle.abs() > best_abs_cos {
-                best_abs_cos = cos_angle.abs();
-                best_sign = if cos_angle < 0.0 { -1.0 } else { 1.0 };
-            }
+            // Van Oosterom & Strackee (1983): solid angle subtended by a
+            // triangle with vertices a, b, c (relative to the query
+            // point) is 2*atan2(numerator, denominator) where:
+            let numerator = a.dot(b.cross(c));
+            let denominator =
+                a_len * b_len * c_len + a.dot(b) * c_len + b.dot(c) * a_len + c.dot(a) * b_len;
+            solid_angle_sum += 2.0 * numerator.atan2(denominator);
         }
-        best_sign
+
+        let winding_number = solid_angle_sum / (4.0 * std::f64::consts::PI);
+        // Inside the mesh: winding_number ~= 1.0 -> sign = -1.0 (inside).
+        // Outside the mesh: winding_number ~= 0.0 -> sign = +1.0 (outside).
+        if winding_number >= 0.5 {
+            -1.0
+        } else {
+            1.0
+        }
     }
 }
 
