@@ -5,6 +5,12 @@
 //! mesh is expanded here (CPU-side, at upload time) into a non-indexed
 //! triangle list where every vertex is duplicated per-triangle and carries
 //! that triangle's flat face normal.
+//!
+//! Rendering uses an offscreen 4x MSAA depth+color target in `prepare` with
+//! full 32-bit hardware depth testing (`Depth32Float`), so multiple objects and
+//! concave features properly occlude one another in correct 3D depth order with
+//! smooth antialiasing on all lines and edges, before resolving and blitting
+//! into egui's frame pass in `paint`.
 
 use crate::scene::SceneVertex;
 use crate::toolpath_view::ToolpathVertex;
@@ -14,6 +20,9 @@ use egui_wgpu::wgpu::util::DeviceExt as _;
 use glam::Mat4;
 use manifold_core::mesh::Mesh;
 use manifold_fidget::marching_cubes::Vertex as FieldVertex;
+
+/// Number of multisample anti-aliasing samples used for 3D viewport rendering.
+const MSAA_SAMPLES: u32 = 4;
 
 /// One GPU vertex: position + flat face normal, both in world space.
 #[repr(C)]
@@ -149,20 +158,40 @@ impl UploadedToolpaths {
     }
 }
 
+struct OffscreenTarget {
+    _msaa_color_texture: wgpu::Texture,
+    msaa_color_view: wgpu::TextureView,
+    _color_texture: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    _depth_texture: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    blit_bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+}
+
 /// Resources kept alive alongside the egui render pass (installed into
 /// `egui_wgpu::CallbackResources`), shared across frames.
 pub struct MeshRenderResources {
     pipeline: wgpu::RenderPipeline,
+    mesh_transparent_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     scene_line_pipeline: wgpu::RenderPipeline,
     scene_tri_pipeline: wgpu::RenderPipeline,
     toolpath_line_pipeline: wgpu::RenderPipeline,
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    target_format: wgpu::TextureFormat,
+    offscreen: Option<OffscreenTarget>,
 }
 
 impl MeshRenderResources {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let depth_format = wgpu::TextureFormat::Depth32Float;
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("manifold mesh shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("mesh_shader.wgsl").into()),
@@ -195,6 +224,20 @@ impl MeshRenderResources {
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
         }];
 
+        let depth_stencil_state = |depth_write_enabled| wgpu::DepthStencilState {
+            format: depth_format,
+            depth_write_enabled,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        };
+
+        let multisample_state = wgpu::MultisampleState {
+            count: MSAA_SAMPLES,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        };
+
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("manifold mesh pipeline"),
             layout: Some(&pipeline_layout),
@@ -214,17 +257,48 @@ impl MeshRenderResources {
                 cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            depth_stencil: Some(depth_stencil_state(true)),
+            multisample: multisample_state,
             multiview: None,
             cache: None,
         });
 
+        // Semi-transparent mesh variant used when toolpath display is active,
+        // allowing internal toolpaths to remain visible through the model shell.
+        let mesh_transparent_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("manifold mesh transparent pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &vertex_buffers,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_transparent",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(depth_stencil_state(false)),
+                multisample: multisample_state,
+                multiview: None,
+                cache: None,
+            });
+
         // Semi-transparent overlay variant (SDF isosurface debug overlay,
         // see `MESH_SDF_VISUALIZATION.md` Phase D): same shader module,
-        // vertex layout, and pipeline layout as `pipeline` above \u2014 only the
-        // fragment entry point (alpha < 1) and blend/cull state differ, so
-        // this reuses rather than duplicates the mesh rendering setup.
+        // vertex layout, and pipeline layout as `pipeline` above — only the
+        // fragment entry point (alpha < 1) and blend/cull state differ.
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("manifold mesh overlay pipeline"),
             layout: Some(&pipeline_layout),
@@ -248,8 +322,8 @@ impl MeshRenderResources {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            depth_stencil: Some(depth_stencil_state(false)),
+            multisample: multisample_state,
             multiview: None,
             cache: None,
         });
@@ -300,8 +374,8 @@ impl MeshRenderResources {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            depth_stencil: Some(depth_stencil_state(true)),
+            multisample: multisample_state,
             multiview: None,
             cache: None,
         });
@@ -329,8 +403,8 @@ impl MeshRenderResources {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            depth_stencil: Some(depth_stencil_state(true)),
+            multisample: multisample_state,
             multiview: None,
             cache: None,
         });
@@ -371,137 +445,351 @@ impl MeshRenderResources {
                     cull_mode: None,
                     ..Default::default()
                 },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
+                depth_stencil: Some(depth_stencil_state(true)),
+                multisample: multisample_state,
                 multiview: None,
                 cache: None,
             });
 
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("manifold blit shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
+    var out: VertexOutput;
+    let x = f32(i32(in_vertex_index & 1u) * 4 - 1);
+    let y = f32(i32(in_vertex_index & 2u) * 2 - 1);
+    out.clip_position = vec4<f32>(x, y, 0.0, 1.0);
+    return out;
+}
+
+@group(0) @binding(0)
+var t_color: texture_2d<f32>;
+@group(0) @binding(1)
+var s_color: sampler;
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(t_color));
+    let uv = in.clip_position.xy / dims;
+    return textureSample(t_color, s_color, uv);
+}
+"#
+                .into(),
+            ),
+        });
+
+        let blit_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("manifold blit bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("manifold blit pipeline layout"),
+            bind_group_layouts: &[&blit_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("manifold blit pipeline"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: "vs_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: "fs_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("manifold blit sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         Self {
             pipeline,
+            mesh_transparent_pipeline,
             overlay_pipeline,
             scene_line_pipeline,
             scene_tri_pipeline,
             toolpath_line_pipeline,
+            blit_pipeline,
+            blit_bind_group_layout,
+            sampler,
             camera_buffer,
             camera_bind_group,
+            target_format,
+            offscreen: None,
         }
     }
 
-    fn write_camera(&self, queue: &wgpu::Queue, view_proj: Mat4) {
+    fn ensure_offscreen(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if let Some(target) = &self.offscreen {
+            if target.width == width && target.height == height {
+                return;
+            }
+        }
+
+        let width = width.max(1);
+        let height = height.max(1);
+
+        let msaa_color_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("manifold offscreen msaa color texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let msaa_color_view =
+            msaa_color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("manifold offscreen color texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("manifold offscreen depth texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("manifold blit bind group"),
+            layout: &self.blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+
+        self.offscreen = Some(OffscreenTarget {
+            _msaa_color_texture: msaa_color_texture,
+            msaa_color_view,
+            _color_texture: color_texture,
+            color_view,
+            _depth_texture: depth_texture,
+            depth_view,
+            blit_bind_group,
+            width,
+            height,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        egui_encoder: &mut wgpu::CommandEncoder,
+        view_proj: Mat4,
+        scene: &UploadedScene,
+        meshes: &[UploadedMesh],
+        overlay: Option<&UploadedMesh>,
+        toolpaths: Option<&UploadedToolpaths>,
+    ) {
+        self.ensure_offscreen(
+            device,
+            screen_descriptor.size_in_pixels[0],
+            screen_descriptor.size_in_pixels[1],
+        );
         queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&[view_proj.to_cols_array()]),
         );
-    }
 
-    fn paint(&self, render_pass: &mut wgpu::RenderPass<'_>, meshes: &[UploadedMesh]) {
-        render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        for mesh in meshes {
-            render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            render_pass.draw(0..mesh.vertex_count, 0..1);
+        let Some(target) = &self.offscreen else {
+            return;
+        };
+
+        let mut rpass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("manifold 3d offscreen render pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.msaa_color_view,
+                resolve_target: Some(&target.color_view),
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &target.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        // 1. Draw scene dressing (bed quad + origin/grid lines)
+        rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+
+        rpass.set_pipeline(&self.scene_tri_pipeline);
+        rpass.set_vertex_buffer(0, scene.tri_buffer.slice(..));
+        rpass.draw(0..scene.tri_vertex_count, 0..1);
+
+        rpass.set_pipeline(&self.scene_line_pipeline);
+        rpass.set_vertex_buffer(0, scene.line_buffer.slice(..));
+        rpass.draw(0..scene.line_vertex_count, 0..1);
+
+        if let Some(tp) = toolpaths {
+            // When toolpaths are visible: draw toolpaths first, then draw the
+            // mesh semi-transparently so internal toolpaths remain clearly visible.
+            rpass.set_pipeline(&self.toolpath_line_pipeline);
+            rpass.set_vertex_buffer(0, tp.line_buffer.slice(..));
+            rpass.draw(0..tp.line_vertex_count, 0..1);
+
+            rpass.set_pipeline(&self.mesh_transparent_pipeline);
+            for mesh in meshes {
+                rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                rpass.draw(0..mesh.vertex_count, 0..1);
+            }
+        } else {
+            // Normal mode: draw opaque meshes with depth testing & depth writing
+            rpass.set_pipeline(&self.pipeline);
+            for mesh in meshes {
+                rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                rpass.draw(0..mesh.vertex_count, 0..1);
+            }
+        }
+
+        // Draw semi-transparent overlay (if any)
+        if let Some(overlay_mesh) = overlay {
+            rpass.set_pipeline(&self.overlay_pipeline);
+            rpass.set_vertex_buffer(0, overlay_mesh.vertex_buffer.slice(..));
+            rpass.draw(0..overlay_mesh.vertex_count, 0..1);
         }
     }
 
-    /// Draws a single overlay mesh (e.g. the SDF isosurface debug overlay,
-    /// `MESH_SDF_VISUALIZATION.md` Phase D) with the semi-transparent
-    /// `overlay_pipeline` instead of the opaque `pipeline`, so it renders
-    /// visually distinct from the real mesh(es) drawn by [`Self::paint`].
-    fn paint_overlay(&self, render_pass: &mut wgpu::RenderPass<'_>, mesh: &UploadedMesh) {
-        render_pass.set_pipeline(&self.overlay_pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-        render_pass.draw(0..mesh.vertex_count, 0..1);
-    }
-
-    /// Draws toolpath preview line geometry (Phase 13, see ROADMAP.md)
-    /// with the dedicated `toolpath_line_pipeline`. Called after
-    /// `Self::paint`/`Self::paint_overlay` (via `ToolpathPaintCallback`
-    /// being pushed after `MeshPaintCallback`/`OverlayPaintCallback` in
-    /// `app.rs::viewport`) so toolpaths composite visibly on top given no
-    /// shared depth buffer exists inside the `egui_wgpu::Callback` render
-    /// pass.
-    fn paint_toolpaths(
-        &self,
-        render_pass: &mut wgpu::RenderPass<'_>,
-        toolpaths: &UploadedToolpaths,
-    ) {
-        render_pass.set_pipeline(&self.toolpath_line_pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, toolpaths.line_buffer.slice(..));
-        render_pass.draw(0..toolpaths.line_vertex_count, 0..1);
-    }
-
-    fn paint_scene(&self, render_pass: &mut wgpu::RenderPass<'_>, scene: &UploadedScene) {
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-
-        render_pass.set_pipeline(&self.scene_tri_pipeline);
-        render_pass.set_vertex_buffer(0, scene.tri_buffer.slice(..));
-        render_pass.draw(0..scene.tri_vertex_count, 0..1);
-
-        render_pass.set_pipeline(&self.scene_line_pipeline);
-        render_pass.set_vertex_buffer(0, scene.line_buffer.slice(..));
-        render_pass.draw(0..scene.line_vertex_count, 0..1);
+    pub fn paint_blit(&self, render_pass: &mut wgpu::RenderPass<'static>) {
+        let Some(target) = &self.offscreen else {
+            return;
+        };
+        render_pass.set_pipeline(&self.blit_pipeline);
+        render_pass.set_bind_group(0, &target.blit_bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
     }
 }
 
-/// The per-frame paint callback: carries the view-projection matrix and the
-/// already-uploaded meshes to draw this frame.
-pub struct MeshPaintCallback {
-    pub view_proj: Mat4,
-    pub meshes: std::sync::Arc<Vec<UploadedMesh>>,
-}
-
-impl egui_wgpu::CallbackTrait for MeshPaintCallback {
-    fn prepare(
-        &self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
-        callback_resources: &mut egui_wgpu::CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        let resources: &MeshRenderResources = callback_resources.get().unwrap();
-        resources.write_camera(queue, self.view_proj);
-        Vec::new()
-    }
-
-    fn paint(
-        &self,
-        _info: egui::PaintCallbackInfo,
-        render_pass: &mut wgpu::RenderPass<'static>,
-        callback_resources: &egui_wgpu::CallbackResources,
-    ) {
-        let resources: &MeshRenderResources = callback_resources.get().unwrap();
-        resources.paint(render_pass, &self.meshes);
-    }
-}
-
-/// The per-frame paint callback for scene dressing (origin axes, bed grid/
-/// quad, toolhead markers) — drawn before `MeshPaintCallback` so imported
-/// objects paint on top. There is no depth buffer available inside
-/// `egui_wgpu::Callback`'s shared render pass (a known limitation of this
-/// embedding approach, deferred rather than solved with a custom
-/// multi-pass setup — see ROADMAP.md Phase 6), so draw order stands in for
-/// depth testing.
-pub struct ScenePaintCallback {
+/// The unified per-frame paint callback: renders the 3D scene (scene dressing,
+/// meshes, SDF overlay, and toolpaths) with a 32-bit floating point depth buffer
+/// and 4x MSAA anti-aliasing offscreen in `prepare`, then blits the result into
+/// egui's frame pass in `paint`.
+pub struct Viewport3dCallback {
     pub view_proj: Mat4,
     pub scene: std::sync::Arc<UploadedScene>,
+    pub meshes: std::sync::Arc<Vec<UploadedMesh>>,
+    pub overlay: Option<std::sync::Arc<UploadedMesh>>,
+    pub toolpaths: Option<std::sync::Arc<UploadedToolpaths>>,
 }
 
-impl egui_wgpu::CallbackTrait for ScenePaintCallback {
+impl egui_wgpu::CallbackTrait for Viewport3dCallback {
     fn prepare(
         &self,
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let resources: &MeshRenderResources = callback_resources.get().unwrap();
-        resources.write_camera(queue, self.view_proj);
+        let resources: &mut MeshRenderResources = callback_resources.get_mut().unwrap();
+        resources.prepare(
+            device,
+            queue,
+            screen_descriptor,
+            egui_encoder,
+            self.view_proj,
+            &self.scene,
+            &self.meshes,
+            self.overlay.as_deref(),
+            self.toolpaths.as_deref(),
+        );
         Vec::new()
     }
 
@@ -512,81 +800,6 @@ impl egui_wgpu::CallbackTrait for ScenePaintCallback {
         callback_resources: &egui_wgpu::CallbackResources,
     ) {
         let resources: &MeshRenderResources = callback_resources.get().unwrap();
-        resources.paint_scene(render_pass, &self.scene);
-    }
-}
-
-/// The per-frame paint callback for a single semi-transparent overlay mesh
-/// (currently the SDF isosurface debug overlay, see
-/// `MESH_SDF_VISUALIZATION.md` Phase D). Drawn after `MeshPaintCallback` so
-/// it composites on top of the real mesh(es).
-pub struct OverlayPaintCallback {
-    pub view_proj: Mat4,
-    pub mesh: std::sync::Arc<UploadedMesh>,
-}
-
-impl egui_wgpu::CallbackTrait for OverlayPaintCallback {
-    fn prepare(
-        &self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
-        callback_resources: &mut egui_wgpu::CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        let resources: &MeshRenderResources = callback_resources.get().unwrap();
-        resources.write_camera(queue, self.view_proj);
-        Vec::new()
-    }
-
-    fn paint(
-        &self,
-        _info: egui::PaintCallbackInfo,
-        render_pass: &mut wgpu::RenderPass<'static>,
-        callback_resources: &egui_wgpu::CallbackResources,
-    ) {
-        let resources: &MeshRenderResources = callback_resources.get().unwrap();
-        resources.paint_overlay(render_pass, &self.mesh);
-    }
-}
-
-/// The per-frame paint callback for toolpath preview line geometry (Phase
-/// 13, see ROADMAP.md). Mirrors `ScenePaintCallback`/`OverlayPaintCallback`'s
-/// `prepare`/`paint` shape. Must be pushed *after*
-/// `MeshPaintCallback`/`OverlayPaintCallback` in `app.rs::viewport` so
-/// toolpaths composite visibly on top \u2014 there is no depth buffer available
-/// inside `egui_wgpu::Callback`'s shared render pass (see
-/// `ScenePaintCallback`'s doc comment / ROADMAP.md Phase 6), so draw order
-/// stands in for depth testing.
-///
-/// Not yet pushed from `app.rs::viewport` (that wiring is Phase 13 subtask
-/// 04) \u2014 this type is exercised only by its pipeline/buffer setup for now.
-pub struct ToolpathPaintCallback {
-    pub view_proj: Mat4,
-    pub toolpaths: std::sync::Arc<UploadedToolpaths>,
-}
-
-impl egui_wgpu::CallbackTrait for ToolpathPaintCallback {
-    fn prepare(
-        &self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
-        callback_resources: &mut egui_wgpu::CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        let resources: &MeshRenderResources = callback_resources.get().unwrap();
-        resources.write_camera(queue, self.view_proj);
-        Vec::new()
-    }
-
-    fn paint(
-        &self,
-        _info: egui::PaintCallbackInfo,
-        render_pass: &mut wgpu::RenderPass<'static>,
-        callback_resources: &egui_wgpu::CallbackResources,
-    ) {
-        let resources: &MeshRenderResources = callback_resources.get().unwrap();
-        resources.paint_toolpaths(render_pass, &self.toolpaths);
+        resources.paint_blit(render_pass);
     }
 }

@@ -4,8 +4,7 @@
 use crate::camera::OrbitCamera;
 use crate::profile::Profile;
 use crate::render::{
-    MeshPaintCallback, MeshRenderResources, OverlayPaintCallback, ScenePaintCallback,
-    ToolpathPaintCallback, UploadedMesh, UploadedScene, UploadedToolpaths,
+    MeshRenderResources, UploadedMesh, UploadedScene, UploadedToolpaths, Viewport3dCallback,
 };
 use crate::scene;
 use crate::toolpath_view;
@@ -1200,41 +1199,18 @@ impl ManifoldApp {
             ui.painter()
                 .add(eframe::egui_wgpu::Callback::new_paint_callback(
                     rect,
-                    ScenePaintCallback {
+                    Viewport3dCallback {
                         view_proj,
                         scene: self.uploaded_scene.clone(),
-                    },
-                ));
-            ui.painter()
-                .add(eframe::egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    MeshPaintCallback {
-                        view_proj,
                         meshes: self.uploaded_meshes.clone(),
+                        overlay: self.sdf_overlay_mesh.clone(),
+                        toolpaths: if self.show_toolpaths {
+                            self.uploaded_toolpaths.clone()
+                        } else {
+                            None
+                        },
                     },
                 ));
-            if let Some(overlay_mesh) = &self.sdf_overlay_mesh {
-                ui.painter()
-                    .add(eframe::egui_wgpu::Callback::new_paint_callback(
-                        rect,
-                        OverlayPaintCallback {
-                            view_proj,
-                            mesh: overlay_mesh.clone(),
-                        },
-                    ));
-            }
-            if self.show_toolpaths {
-                if let Some(toolpaths) = &self.uploaded_toolpaths {
-                    ui.painter()
-                        .add(eframe::egui_wgpu::Callback::new_paint_callback(
-                            rect,
-                            ToolpathPaintCallback {
-                                view_proj,
-                                toolpaths: toolpaths.clone(),
-                            },
-                        ));
-                }
-            }
 
             // Hover tooltip (Phase 13 subtask 06): CPU-side O(n) nearest-
             // segment picking over the currently visible (scrub-filtered)

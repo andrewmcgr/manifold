@@ -39,6 +39,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(base_color * intensity, 1.0);
 }
 
+// Semi-transparent variant for toolpath preview mode: renders the mesh
+// with low opacity so toolpath lines inside the model remain clearly visible.
+@fragment
+fn fs_transparent(in: VertexOutput) -> @location(0) vec4<f32> {
+    let light_dir = normalize(vec3<f32>(0.4, 0.6, 0.8));
+    let ambient = 0.4;
+    let diffuse = max(dot(normalize(in.normal), light_dir), 0.0);
+    let intensity = ambient + (1.0 - ambient) * diffuse;
+    let base_color = vec3<f32>(0.65, 0.68, 0.72);
+    return vec4<f32>(base_color * intensity, 0.25);
+}
+
 // Overlay variant: used for the SDF isosurface debug overlay
 // (`MESH_SDF_VISUALIZATION.md` Phase D) so it is visually distinguishable
 // from the real, opaque mesh render above — semi-transparent orange,
