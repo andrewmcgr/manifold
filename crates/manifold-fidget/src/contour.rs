@@ -336,15 +336,17 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
         by_point.entry(point_key(b)).or_default().push(i);
     }
     let mut used = vec![false; segments.len()];
+    let mut dead_start = vec![false; segments.len()];
 
     let mut loops = Vec::new();
     let mut dropped_fragments = 0usize;
     let mut dropped_points = 0usize;
 
     for start_idx in 0..segments.len() {
-        if used[start_idx] {
+        if used[start_idx] || dead_start[start_idx] {
             continue;
         }
+        let mut trail = vec![start_idx];
         used[start_idx] = true;
         let (first_point, mut current_point) = segments[start_idx];
         let mut loop_points = vec![first_point];
@@ -364,6 +366,7 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
             match next {
                 Some(next_idx) => {
                     used[next_idx] = true;
+                    trail.push(next_idx);
                     let (a, b) = segments[next_idx];
                     // Continue from whichever endpoint of the matched
                     // segment is *not* the one we arrived on (nearest, so
@@ -378,11 +381,13 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
                     current_point = other;
                 }
                 None => {
-                    // Open chain even under the widened repair tolerance:
-                    // a genuine stitching gap, or a fragment clipped by
-                    // plane extent. Record it as unclosed and let the
-                    // post-loop check below decide whether to drop it.
-                    loop_points.push(current_point);
+                    // Open chain under exact/unused search: check if the endpoint
+                    // lands within widened repair tolerance of the start point to close.
+                    if current_point.distance(first_point) <= STITCH_REPAIR_TOLERANCE {
+                        closed = true;
+                    } else {
+                        loop_points.push(current_point);
+                    }
                     break;
                 }
             }
@@ -391,6 +396,13 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
         if closed && loop_points.len() >= MIN_LOOP_POINTS {
             loops.push(loop_points);
         } else {
+            // Unclosed: un-mark all trail segments so a start index on the
+            // real closed cycle can use them, but mark start_idx as a dead start
+            // so we don't attempt to initiate another walk from it.
+            for &idx in &trail {
+                used[idx] = false;
+            }
+            dead_start[start_idx] = true;
             dropped_fragments += 1;
             dropped_points += loop_points.len();
         }
@@ -1452,5 +1464,26 @@ mod tests {
             "expected duplicate edge to be deduplicated and close the square"
         );
         assert_eq!(loops[0].len(), 4);
+    }
+
+    #[test]
+    fn stitch_loops_prunes_dangling_spurs_and_closes_attached_cycle() {
+        // A triangle loop with a dangling 2-segment tail attached at (1, 0).
+        // Starting at the dangling tail could greedily consume edges and hit a dead end,
+        // but spur pruning and backtracking ensure the true closed triangle is extracted.
+        let segments = vec![
+            (DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(2.0, 0.0, 0.0)),
+            (DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(0.5, 1.0, 0.0)),
+            (DVec3::new(0.5, 1.0, 0.0), DVec3::new(0.0, 0.0, 0.0)),
+        ];
+        let loops = stitch_loops(segments);
+        assert_eq!(
+            loops.len(),
+            1,
+            "expected the closed triangle to be preserved and spur pruned"
+        );
+        assert_eq!(loops[0].len(), 3);
     }
 }
