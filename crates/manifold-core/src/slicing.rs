@@ -465,7 +465,35 @@ pub fn slice_mesh_with_progress(
         .chunks_exact(3)
         .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
         .collect();
-    let sdf = Arc::new(MeshSdf::new(mesh.vertices.clone(), faces));
+    let sdf = Arc::new(MeshSdf::new(mesh.vertices.clone(), faces.clone()));
+
+    let non_bed_faces: Vec<[usize; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .filter_map(|chunk| {
+            let [i0, i1, i2] = [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
+            let v0 = mesh.vertices[i0];
+            let v1 = mesh.vertices[i1];
+            let v2 = mesh.vertices[i2];
+            // Downward-facing triangles sitting directly on the bed plane (min.z)
+            // represent the contact floor. Excluding them from the side-wall SDF
+            // prevents 3D Euclidean distance from treating the print bed as an obstacle
+            // that pushes walls upward/inward vertically on near-bed layers.
+            if v0.z <= min.z + 1e-4 && v1.z <= min.z + 1e-4 && v2.z <= min.z + 1e-4 {
+                let normal = (v1 - v0).cross(v2 - v0);
+                if normal.z <= 0.0 {
+                    return None;
+                }
+            }
+            Some([i0, i1, i2])
+        })
+        .collect();
+
+    let side_sdf = if non_bed_faces.len() == faces.len() {
+        Arc::clone(&sdf)
+    } else {
+        Arc::new(MeshSdf::new(mesh.vertices.clone(), non_bed_faces))
+    };
 
     // Resolve the configured order field once per slice (defaults to a
     // `HeightOrderField` along `BUILD_DIRECTION`, matching pre-existing
@@ -543,6 +571,7 @@ pub fn slice_mesh_with_progress(
     let bbox_center = (min + max) * 0.5;
 
     let layer_height = config.layer_height.abs().max(f64::EPSILON);
+    let first_layer_height = config.first_layer_height();
     let resolution = contour_resolution(extent, config.nozzle_diameter, CONTOUR_REFINEMENT_DIVISOR);
 
     // Precompute every order-field value this walk will sample, so the
@@ -559,8 +588,8 @@ pub fn slice_mesh_with_progress(
     // killed for memory exhaustion.
     const MAX_ORDER_STEPS: usize = 1_000_000;
     let mut order_values = Vec::new();
-    let mut order_value = order_min;
-    while order_value <= order_max {
+    let mut order_value = order_min + first_layer_height;
+    while order_value <= order_max + f64::EPSILON {
         if order_values.len() >= MAX_ORDER_STEPS {
             return Err(Error::Slicing(format!(
                 "order range [{order_min}, {order_max}] with layer_height {layer_height} would \
@@ -590,7 +619,7 @@ pub fn slice_mesh_with_progress(
         let iso_resolution = isosurface_resolution(full_diagonal, config.nozzle_diameter);
         let iso = -config.wall_offset;
         let positions =
-            extract_isosurface_positions::<MeshSdf>(&*sdf, min, max, iso_resolution, iso);
+            extract_isosurface_positions::<MeshSdf>(&*side_sdf, min, max, iso_resolution, iso);
         on_progress(0.10);
         positions
     };
@@ -2962,14 +2991,15 @@ mod tests {
 
         let layers = slice_mesh(&cube_mesh(), &config).unwrap();
 
-        // The cube spans Z in [0, 1] with layer_height 0.25: expect 5
-        // stepped layers (0.0, 0.25, 0.5, 0.75, 1.0). The interior layers
-        // (0.25, 0.5, 0.75) are clean square cross-sections; the exact
-        // boundary layers (Z=0, Z=1) sample directly on the mesh surface,
-        // where the sign/crossing is numerically ambiguous, so only the
-        // interior layers are asserted to have a contour loop.
-        assert_eq!(layers.len(), 5);
-        for layer in &layers[1..4] {
+        // The cube spans Z in [0, 1] with layer_height 0.25: expect 4
+        // stepped layers starting one layer height above the bed
+        // (0.25, 0.5, 0.75, 1.0). The interior layers (0.25, 0.5, 0.75) are
+        // clean square cross-sections; the exact top boundary layer (Z=1)
+        // samples directly on the mesh surface, where the sign/crossing is
+        // numerically ambiguous, so only the interior layers are asserted to
+        // have a contour loop.
+        assert_eq!(layers.len(), 4);
+        for layer in &layers[0..3] {
             assert_eq!(layer.loops.len(), 1, "expected exactly one contour loop");
             assert!(!layer.loops[0].points.is_empty());
         }
@@ -2999,8 +3029,8 @@ mod tests {
 
         let layers = slice_mesh(&translated, &config).unwrap();
 
-        assert_eq!(layers.len(), 5);
-        for layer in &layers[1..4] {
+        assert_eq!(layers.len(), 4);
+        for layer in &layers[0..3] {
             assert_eq!(layer.loops.len(), 1, "expected exactly one contour loop");
             assert!(!layer.loops[0].points.is_empty());
         }
@@ -3029,10 +3059,10 @@ mod tests {
 
         assert_eq!(
             layers.len(),
-            5,
-            "expected 5 stepped layers over [0, 1] at layer_height 0.25"
+            4,
+            "expected 4 stepped layers over [0, 1] at layer_height 0.25"
         );
-        let mut expected_order = expected_order_min;
+        let mut expected_order = expected_order_min + config.first_layer_height();
         for layer in &layers {
             assert!(
                 (layer.order - expected_order).abs() < 1e-9,
@@ -3274,7 +3304,7 @@ mod tests {
 
         let layers = slice_mesh(&cube_mesh(), &config).unwrap();
 
-        for layer in &layers[1..4] {
+        for layer in &layers[0..3] {
             assert_eq!(layer.loops.len(), 3, "expected one loop per wall pass");
             let mut indices: Vec<usize> = layer.loops.iter().map(|l| l.wall_index).collect();
             indices.sort_unstable();
@@ -3345,7 +3375,7 @@ mod tests {
                 .fold(0.0, f64::max)
         }
 
-        for layer in &layers[1..4] {
+        for layer in &layers[0..3] {
             assert!(
                 !layer.infill_boundary.is_empty(),
                 "expected a non-empty infill boundary"

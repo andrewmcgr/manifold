@@ -712,10 +712,14 @@ fn route_around_obstruction(
 ) -> Option<Vec<DVec3>> {
     let base_cell = cell_size.max(1e-6);
     let margin = (start.distance(end) * 0.5).max(base_cell * 4.0);
+    // Never allow the search grid to extend below the print bed (Z < 0): a
+    // physical 3D printer head cannot dive under the build plate to avoid an
+    // obstacle.
+    let min_z_floor = 0.0f64.min(start.z).min(end.z);
     let min = DVec3::new(
         start.x.min(end.x) - margin,
         start.y.min(end.y) - margin,
-        start.z.min(end.z) - margin,
+        (start.z.min(end.z) - margin).max(min_z_floor),
     );
     let max = DVec3::new(
         start.x.max(end.x) + margin,

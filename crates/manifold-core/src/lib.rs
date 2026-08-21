@@ -32,6 +32,10 @@ pub use workspace::Workspace;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SlicerConfig {
     pub layer_height: f64,
+    /// First layer height (mm) for the initial layer touching the print bed.
+    /// When `None` (the default), defaults to `layer_height`.
+    #[serde(default)]
+    pub first_layer_height: Option<f64>,
     pub nozzle_diameter: f64,
     /// Strategy used to decide the order objects are printed in. See
     /// `ordering` module and ROADMAP.md open decision #2.
@@ -289,6 +293,7 @@ impl Default for SlicerConfig {
         let wall_line_width = nozzle_diameter;
         Self {
             layer_height: 0.2,
+            first_layer_height: None,
             nozzle_diameter,
             object_ordering: ordering::ObjectOrderingKind::default(),
             wall_line_width,
@@ -330,6 +335,15 @@ impl SlicerConfig {
     pub fn wall_count(&self) -> usize {
         let line_width = self.wall_line_width.abs().max(f64::EPSILON);
         (self.shell_thickness / line_width).round().max(1.0) as usize
+    }
+
+    /// First layer height (mm), defaulting to [`SlicerConfig::layer_height`]
+    /// when [`SlicerConfig::first_layer_height`] (the field) is `None`.
+    #[must_use]
+    pub fn first_layer_height(&self) -> f64 {
+        self.first_layer_height
+            .map(|h| h.abs().max(f64::EPSILON))
+            .unwrap_or_else(|| self.layer_height.abs().max(f64::EPSILON))
     }
 
     /// Diameter (mm) of the nozzle tip's flat land, used by

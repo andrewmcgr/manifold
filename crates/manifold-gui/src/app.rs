@@ -540,6 +540,13 @@ impl ManifoldApp {
         ui.add(
             egui::Slider::new(&mut self.config.layer_height, 0.05..=1.0).text("Layer height (mm)"),
         );
+        let mut first_layer_h = self.config.first_layer_height();
+        if ui
+            .add(egui::Slider::new(&mut first_layer_h, 0.05..=1.0).text("First layer height (mm)"))
+            .changed()
+        {
+            self.config.first_layer_height = Some(first_layer_h);
+        }
         ui.add(
             egui::Slider::new(&mut self.config.nozzle_diameter, 0.1..=1.5)
                 .text("Nozzle diameter (mm)"),
