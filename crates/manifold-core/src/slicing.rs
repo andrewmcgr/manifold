@@ -5,7 +5,7 @@ use crate::{
 };
 use glam::DVec3;
 use manifold_fidget::contour::{extract_contours, extract_order_contours_on_mesh, plane_basis};
-use manifold_fidget::marching_cubes::extract_isosurface;
+use manifold_fidget::marching_cubes::extract_isosurface_positions;
 use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{order_range_over_bbox, HeightOrderField, OrderField};
 use manifold_fidget::ScalarField;
@@ -246,6 +246,17 @@ const CONTOUR_REFINEMENT_DIVISOR: f64 = 1.4;
 /// mesh).
 const MIN_CONTOUR_RESOLUTION: usize = 32;
 const MAX_CONTOUR_RESOLUTION: usize = 512;
+const MIN_ISOSURFACE_RESOLUTION: usize = 32;
+const MAX_ISOSURFACE_RESOLUTION: usize = 96;
+
+fn isosurface_resolution(extent: f64, nozzle_diameter: f64) -> usize {
+    let cell_size = (nozzle_diameter * 1.5).max(f64::EPSILON);
+    let raw = (extent / cell_size).ceil() as i64 + 1;
+    raw.clamp(
+        MIN_ISOSURFACE_RESOLUTION as i64,
+        MAX_ISOSURFACE_RESOLUTION as i64,
+    ) as usize
+}
 
 /// Fraction of nozzle radius (`config.nozzle_diameter / 2.0`) used as the
 /// max allowed inter-layer wall-0 hop distance before
@@ -462,12 +473,14 @@ pub fn slice_mesh_with_progress(
     // old `min.dot(BUILD_DIRECTION)`/`max.dot(BUILD_DIRECTION)` shortcut —
     // exact for any field whose extrema are attained at box corners, which
     // covers the affine `HeightOrderField` default used everywhere today.
-    let field: Arc<dyn OrderField> = Arc::from(order_field::order_field_for(
+    let field: Arc<dyn OrderField> = Arc::from(order_field::order_field_for_with_sdf(
         config.order_field,
         config,
         mesh,
         slope_profile,
+        Some(&*sdf),
     ));
+    on_progress(0.05);
     // `order_range_over_bbox` samples 27 points on the mesh's axis-aligned
     // bounding box (corners, edge midpoints, face center). That's exact for
     // affine fields (`HeightOrderField`, `ConicalOrderField`) whose extrema
@@ -570,71 +583,20 @@ pub fn slice_mesh_with_progress(
     // isosurface once (not once per layer) and walks it per layer.
     let is_height = matches!(config.order_field, order_field::OrderFieldKind::Height);
 
-    // Total units of reportable work: for `Height` this is just the
-    // per-layer loop (unchanged from before). For a curved field, the
-    // `outer_wall_mesh` precompute below is itself an expensive whole-mesh
-    // isosurface extraction — done once, before the per-layer loop,
-    // previously with *no* progress reporting at all, so `on_progress` sat
-    // frozen at its last value for however long that took (seconds, on a
-    // real mesh) even though the extraction itself is internally parallel.
-    // Only wall pass 0 needs this whole-mesh extraction (see
-    // `outer_wall_mesh`'s doc comment below for why inner walls are instead
-    // derived per-layer), so this is one reportable unit, not `wall_count`.
-    let total_units = if is_height {
-        total_steps
-    } else {
-        1 + total_steps
-    };
-    let completed = AtomicUsize::new(0);
-    // `on_progress` is `&mut dyn FnMut`, not `Sync`, so serialize calls into
-    // it behind a `Mutex` — contention is negligible since each holder only
-    // reports one f64 and releases immediately, and the expensive work
-    // (`extract_contours`/`extract_order_contours_on_mesh`/
-    // `extract_isosurface`) happens before the lock is taken.
-    let progress_callback = Mutex::new(on_progress);
-
-    // Curved path only: the *outer* (wall pass 0) wall's triangle soup,
-    // shared across every layer's `extract_order_contours_on_mesh` call
-    // below. Computed up front (outside the per-layer parallel loop) since
-    // it does not depend on the layer's `order_value` — only on wall 0's
-    // `iso`.
-    //
-    // Only wall 0 is extracted this way (a whole-mesh 3D SDF isosurface at
-    // `iso = -wall_offset`). Earlier versions extracted one such isosurface
-    // per wall pass (`iso = -(wall_offset + wall_index * wall_line_width)`),
-    // but that offsets the *entire 3D mesh* inward — including along
-    // `BUILD_DIRECTION` — so an inner wall's isosurface can retreat above
-    // the mesh's true base and simply not exist yet for the bottommost
-    // layers (any part whose base isn't vertical-walled reproducibly lost
-    // its inner wall(s) for the first several layers). Inner walls
-    // (`wall_index >= 1`) are instead derived per-layer in the loop below
-    // by 2D-offsetting the previous wall's *own already-extracted* loop
-    // in the layer's tangent plane and reprojecting onto the order field —
-    // the same technique already used for `infill_boundary` below — which
-    // stays anchored to this layer's real geometry and only ever
-    // offsets/reconstructs, never re-probes a separately-shrunk 3D mesh.
     let outer_wall_mesh: Vec<DVec3> = if is_height {
         Vec::new()
     } else {
         let full_diagonal = (max - min).length();
-        let iso_resolution = contour_resolution(
-            full_diagonal,
-            config.nozzle_diameter,
-            CONTOUR_REFINEMENT_DIVISOR,
-        );
+        let iso_resolution = isosurface_resolution(full_diagonal, config.nozzle_diameter);
         let iso = -config.wall_offset;
-        let vertices = extract_isosurface::<MeshSdf>(&*sdf, min, max, iso_resolution, iso);
-        // `extract_order_contours_on_mesh` walks a flat position soup (see
-        // its doc comment), decoupled from `marching_cubes`'s `Vertex`
-        // (position + normal) — no `OrderField` dependency is added to
-        // `marching_cubes` itself.
-        let positions: Vec<DVec3> = vertices.into_iter().map(|v| v.position).collect();
-        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Ok(mut callback) = progress_callback.lock() {
-            callback(done as f64 / total_units as f64);
-        }
+        let positions =
+            extract_isosurface_positions::<MeshSdf>(&*sdf, min, max, iso_resolution, iso);
+        on_progress(0.10);
         positions
     };
+
+    let completed = AtomicUsize::new(0);
+    let progress_callback = Mutex::new(on_progress);
 
     let mut layers: Vec<Layer> = order_values
         .par_iter()
@@ -730,7 +692,7 @@ pub fn slice_mesh_with_progress(
             }
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if let Ok(mut callback) = progress_callback.lock() {
-                callback(done as f64 / total_units as f64);
+                callback(0.10 + 0.85 * (done as f64 / total_steps as f64));
             }
             // The infill boundary sits where wall pass `wall_count` would
             // be if one more wall were printed — one further
@@ -894,6 +856,10 @@ pub fn slice_mesh_with_progress(
     // left untouched.
     if !is_height {
         stitch_wall_gaps(&mut layers, config, basis1, basis2);
+    }
+
+    if let Ok(mut callback) = progress_callback.lock() {
+        callback(1.0);
     }
 
     Ok(layers)

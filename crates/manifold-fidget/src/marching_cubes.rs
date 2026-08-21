@@ -50,6 +50,139 @@ pub struct Vertex {
 /// there's no cross-point/cross-cell dependency to serialize on. Output is a
 /// triangle soup with no ordering contract, so scrambled cell-completion
 /// order (inherent to parallel iteration) doesn't affect correctness.
+/// Extracts only the triangle positions `field(p) == iso` of `field` over
+/// `[min, max]`, without computing per-vertex normals.
+///
+/// Much faster than [`extract_isosurface`] when normals are not needed (e.g.
+/// for slicing contour walks in `manifold-core::slicing`), because it only
+/// samples `field` at the regular grid points and avoids secondary `sample()`
+/// queries on every interpolated surface vertex.
+pub fn extract_isosurface_positions<F: ScalarField + Sync>(
+    field: &F,
+    min: DVec3,
+    max: DVec3,
+    resolution: usize,
+    iso: f64,
+) -> Vec<DVec3> {
+    if resolution == 0 {
+        return Vec::new();
+    }
+
+    let dims = resolution + 1;
+    let cell_size = DVec3::new(
+        (max.x - min.x) / resolution as f64,
+        (max.y - min.y) / resolution as f64,
+        (max.z - min.z) / resolution as f64,
+    );
+
+    let idx = |xi: usize, yi: usize, zi: usize| -> usize { (zi * dims + yi) * dims + xi };
+    let values: Vec<f64> = (0..dims * dims * dims)
+        .into_par_iter()
+        .map(|flat| {
+            let xi = flat % dims;
+            let yi = (flat / dims) % dims;
+            let zi = flat / (dims * dims);
+            let p = min
+                + DVec3::new(
+                    xi as f64 * cell_size.x,
+                    yi as f64 * cell_size.y,
+                    zi as f64 * cell_size.z,
+                );
+            field.sample(p).value
+        })
+        .collect();
+
+    const CORNER_OFFSETS: [(usize, usize, usize); 8] = [
+        (0, 0, 0),
+        (1, 0, 0),
+        (1, 1, 0),
+        (0, 1, 0),
+        (0, 0, 1),
+        (1, 0, 1),
+        (1, 1, 1),
+        (0, 1, 1),
+    ];
+    const EDGE_CORNERS: [(usize, usize); 12] = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+
+    (0..resolution * resolution * resolution)
+        .into_par_iter()
+        .flat_map_iter(|flat| {
+            let xi = flat % resolution;
+            let yi = (flat / resolution) % resolution;
+            let zi = flat / (resolution * resolution);
+
+            let corner_pos: [DVec3; 8] = std::array::from_fn(|c| {
+                let (dx, dy, dz) = CORNER_OFFSETS[c];
+                min + DVec3::new(
+                    (xi + dx) as f64 * cell_size.x,
+                    (yi + dy) as f64 * cell_size.y,
+                    (zi + dz) as f64 * cell_size.z,
+                )
+            });
+            let corner_val: [f64; 8] = std::array::from_fn(|c| {
+                let (dx, dy, dz) = CORNER_OFFSETS[c];
+                values[idx(xi + dx, yi + dy, zi + dz)]
+            });
+
+            let mut cube_index = 0usize;
+            for (c, &v) in corner_val.iter().enumerate() {
+                if v < iso {
+                    cube_index |= 1 << c;
+                }
+            }
+
+            let edge_flags = EDGE_TABLE[cube_index];
+            let mut cell_positions = Vec::new();
+            if edge_flags == 0 {
+                return cell_positions;
+            }
+
+            let mut edge_vertex: [Option<DVec3>; 12] = [None; 12];
+            for (e, &(c0, c1)) in EDGE_CORNERS.iter().enumerate() {
+                if edge_flags & (1 << e) == 0 {
+                    continue;
+                }
+                let v0 = corner_val[c0];
+                let v1 = corner_val[c1];
+                let denom = v1 - v0;
+                let t = if denom.abs() <= f64::EPSILON {
+                    0.5
+                } else {
+                    (iso - v0) / denom
+                };
+                let t = t.clamp(0.0, 1.0);
+                edge_vertex[e] = Some(corner_pos[c0].lerp(corner_pos[c1], t));
+            }
+
+            for tri in TRI_TABLE[cube_index].chunks(3) {
+                if tri.len() < 3 || tri[0] < 0 {
+                    break;
+                }
+                for &e in tri {
+                    cell_positions.push(
+                        edge_vertex[e as usize]
+                            .expect("TRI_TABLE only references edges flagged in EDGE_TABLE"),
+                    );
+                }
+            }
+            cell_positions
+        })
+        .collect()
+}
+
 pub fn extract_isosurface<F: ScalarField + Sync>(
     field: &F,
     min: DVec3,

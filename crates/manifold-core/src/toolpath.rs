@@ -795,6 +795,7 @@ fn route_around_obstruction(
 
     let mut best_cost = vec![f64::INFINITY; total];
     let mut came_from: Vec<Option<usize>> = vec![None; total];
+    let mut clearance_memo: Vec<u8> = vec![0; total];
     best_cost[start_flat] = 0.0;
     let mut heap = std::collections::BinaryHeap::new();
     heap.push(HeapEntry {
@@ -837,9 +838,19 @@ fn route_around_obstruction(
                 continue;
             }
             let neighbor = [nx as usize, ny as usize, nz as usize];
+            let neighbor_flat = flat(neighbor);
             let neighbor_point = point_of(neighbor);
 
-            if mesh_sdf.sample(neighbor_point).value < clearance {
+            let status = clearance_memo[neighbor_flat];
+            let is_clear = if status == 0 {
+                let clear = mesh_sdf.sample(neighbor_point).value >= clearance;
+                clearance_memo[neighbor_flat] = if clear { 2 } else { 1 };
+                clear
+            } else {
+                status == 2
+            };
+
+            if !is_clear {
                 continue;
             }
 

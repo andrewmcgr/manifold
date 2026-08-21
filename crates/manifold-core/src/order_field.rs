@@ -69,6 +69,18 @@ pub fn order_field_for(
     mesh: &Mesh,
     slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
 ) -> Box<dyn OrderField> {
+    order_field_for_with_sdf(kind, config, mesh, slope_profile, None)
+}
+
+/// Same as [`order_field_for`], but allows passing an already-constructed
+/// [`MeshSdf`] to avoid redundant BVH and spatial-partitioning construction.
+pub fn order_field_for_with_sdf(
+    kind: OrderFieldKind,
+    config: &SlicerConfig,
+    mesh: &Mesh,
+    slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
+    sdf: Option<&MeshSdf>,
+) -> Box<dyn OrderField> {
     match kind {
         OrderFieldKind::Height => Box::new(HeightOrderField::new(BUILD_DIRECTION)),
         OrderFieldKind::Conical => Box::new(ConicalOrderField::new(
@@ -76,7 +88,7 @@ pub fn order_field_for(
             config.order_field_axis,
             config.order_field_slope,
         )),
-        OrderFieldKind::Eikonal => Box::new(eikonal_field_for(config, mesh, slope_profile)),
+        OrderFieldKind::Eikonal => Box::new(eikonal_field_for(config, mesh, slope_profile, sdf)),
     }
 }
 
@@ -154,6 +166,7 @@ fn eikonal_field_for(
     config: &SlicerConfig,
     mesh: &Mesh,
     slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
+    existing_sdf: Option<&MeshSdf>,
 ) -> EikonalOrderField {
     let Some((min, max)) = mesh.bounding_box() else {
         return EikonalOrderField::new(DVec3::ZERO, DVec3::ONE, &[], 1.0);
@@ -220,6 +233,19 @@ fn eikonal_field_for(
             Some(&height_along),
         );
     }
+    if let Some(sdf) = existing_sdf {
+        let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
+        return EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
+            min,
+            max,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+            Some(slope_profile),
+            Some(&height_along),
+        );
+    }
+
     let sdf = MeshSdf::new(mesh.vertices.clone(), faces);
     let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
 
