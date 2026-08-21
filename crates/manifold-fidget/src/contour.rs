@@ -10,6 +10,8 @@
 //! stitched into closed loops (see [`extract_contours`]'s doc for the
 //! stitching approach).
 
+use std::collections::{HashMap, HashSet};
+
 use glam::DVec3;
 
 use crate::order::OrderField;
@@ -307,7 +309,23 @@ fn find_nearest_unused_endpoint(
 /// which is worse than an omission that is at least visible via the
 /// `tracing::warn!` below.
 fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
-    use std::collections::HashMap;
+    // Deduplicate undirected segments and drop degenerate zero-length segments:
+    // duplicate edges (e.g. from adjacent triangles sharing an On-On plateau edge
+    // in `extract_order_contours_on_mesh`) create false degree-3+ vertices that
+    // cause loop-tracing to self-intersect or terminate prematurely.
+    let mut seen = HashSet::new();
+    let segments: Vec<(DVec3, DVec3)> = segments
+        .into_iter()
+        .filter(|&(a, b)| {
+            let ka = point_key(a);
+            let kb = point_key(b);
+            if ka == kb {
+                return false;
+            }
+            let seg_key = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            seen.insert(seg_key)
+        })
+        .collect();
 
     // Map from a (quantized) endpoint key to the indices of segments
     // touching that point (a segment appears under both of its endpoints'
@@ -794,7 +812,11 @@ pub fn extract_order_contours_on_mesh<O: OrderField + ?Sized>(
             }
         }
         if crossing_points.len() == 2 {
-            segments.push((crossing_points[0], crossing_points[1]));
+            let ka = point_key(crossing_points[0]);
+            let kb = point_key(crossing_points[1]);
+            if ka != kb {
+                segments.push((crossing_points[0], crossing_points[1]));
+            }
         }
     }
 
@@ -1407,5 +1429,28 @@ mod tests {
             1,
             "expected the small-drift gap to be repaired into one closed loop"
         );
+    }
+
+    #[test]
+    fn stitch_loops_deduplicates_identical_segments_and_closes_loop() {
+        // A square where one edge is duplicated (e.g. emitted by two adjacent
+        // triangles sharing an on-contour edge in `extract_order_contours_on_mesh`).
+        // Without deduplication, the duplicate edge creates degree-3 vertices and
+        // causes the loop to terminate prematurely or fail to close.
+        let segments = vec![
+            (DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)),
+            // Duplicate of edge (0,0) -> (1,0) in reverse order:
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(0.0, 0.0, 0.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(1.0, 1.0, 0.0)),
+            (DVec3::new(1.0, 1.0, 0.0), DVec3::new(0.0, 1.0, 0.0)),
+            (DVec3::new(0.0, 1.0, 0.0), DVec3::new(0.0, 0.0, 0.0)),
+        ];
+        let loops = stitch_loops(segments);
+        assert_eq!(
+            loops.len(),
+            1,
+            "expected duplicate edge to be deduplicated and close the square"
+        );
+        assert_eq!(loops[0].len(), 4);
     }
 }
