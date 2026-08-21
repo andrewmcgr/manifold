@@ -260,9 +260,18 @@ pub fn canonicalize(loops2d: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
         .collect()
 }
 
+/// Drops any loop whose absolute shoelace area is strictly less than `min_area`.
+pub fn filter_min_area(loops: &[Vec<[f64; 2]>], min_area: f64) -> Vec<Vec<[f64; 2]>> {
+    loops
+        .iter()
+        .filter(|loop_| loop_.len() >= 3 && signed_area(loop_).abs() >= min_area)
+        .cloned()
+        .collect()
+}
+
 /// Signed shoelace area of a closed 2D loop; positive for counter-clockwise
 /// winding and negative for clockwise. Fewer than 3 points yields `0.0`.
-fn signed_area(loop_: &[[f64; 2]]) -> f64 {
+pub fn signed_area(loop_: &[[f64; 2]]) -> f64 {
     if loop_.len() < 3 {
         return 0.0;
     }

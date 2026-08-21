@@ -2400,27 +2400,34 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             _ => false,
         };
 
+        // Minimum printable solid-fill area: 0.25 * nozzle_diameter^2 (~0.04 mm^2 for a 0.4mm nozzle).
+        // Discarding sub-bead microscopic slivers prevents exponential polygon fragmentation
+        // during multi-layer boolean differences and unions.
+        let min_solid_area = 0.25 * config.nozzle_diameter * config.nozzle_diameter;
+
         let solid_2d_per_k: Vec<Vec<Vec<[f64; 2]>>> = if z_increases {
             // Index increases with height: k + 1 is above k, k - 1 is below k.
             let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
                     let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
-                    if next.is_empty() {
+                    let exp = if next.is_empty() {
                         boundaries_2d[k].clone()
                     } else {
                         polygon2d::difference(&boundaries_2d[k], next)
-                    }
+                    };
+                    polygon2d::filter_min_area(&exp, min_solid_area)
                 })
                 .collect();
             let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
-                    if k == 0 {
+                    let exp = if k == 0 {
                         boundaries_2d[k].clone()
                     } else {
                         polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
-                    }
+                    };
+                    polygon2d::filter_min_area(&exp, min_solid_area)
                 })
                 .collect();
 
@@ -2444,8 +2451,10 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                             regions.push(exposed.clone());
                         }
                     }
-                    let exposed_union = polygon2d::union(&regions);
-                    polygon2d::intersection(&exposed_union, &boundaries_2d[k])
+                    let exposed_union =
+                        polygon2d::filter_min_area(&polygon2d::union(&regions), min_solid_area);
+                    let solid = polygon2d::intersection(&exposed_union, &boundaries_2d[k]);
+                    polygon2d::filter_min_area(&solid, min_solid_area)
                 })
                 .collect()
         } else {
@@ -2453,22 +2462,24 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
-                    if k == 0 {
+                    let exp = if k == 0 {
                         boundaries_2d[k].clone()
                     } else {
                         polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
-                    }
+                    };
+                    polygon2d::filter_min_area(&exp, min_solid_area)
                 })
                 .collect();
             let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
                     let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
-                    if next.is_empty() {
+                    let exp = if next.is_empty() {
                         boundaries_2d[k].clone()
                     } else {
                         polygon2d::difference(&boundaries_2d[k], next)
-                    }
+                    };
+                    polygon2d::filter_min_area(&exp, min_solid_area)
                 })
                 .collect();
 
@@ -2488,8 +2499,10 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                             regions.push(exposed.clone());
                         }
                     }
-                    let exposed_union = polygon2d::union(&regions);
-                    polygon2d::intersection(&exposed_union, &boundaries_2d[k])
+                    let exposed_union =
+                        polygon2d::filter_min_area(&polygon2d::union(&regions), min_solid_area);
+                    let solid = polygon2d::intersection(&exposed_union, &boundaries_2d[k]);
+                    polygon2d::filter_min_area(&solid, min_solid_area)
                 })
                 .collect()
         };
