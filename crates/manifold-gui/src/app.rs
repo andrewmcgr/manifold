@@ -702,6 +702,10 @@ impl ManifoldApp {
             );
         }
         if self.config.order_field == OrderFieldKind::Eikonal {
+            ui.checkbox(
+                &mut self.config.eikonal_conform_top_surfaces,
+                "Conform to top surfaces",
+            );
             ui.label("Slope-limit profile (height above build plate -> max angle)");
             let mut remove_index: Option<usize> = None;
             for (i, (height, degrees)) in self.machine.eikonal_slope_profile.iter_mut().enumerate()

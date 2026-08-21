@@ -460,6 +460,7 @@ fn compensate_flat_nozzle(paths: Vec<Path>, layer: &Layer, config: &SlicerConfig
                     flat_radius,
                     config.layer_height,
                     layer.order,
+                    0.5 * config.first_layer_height(),
                 );
             }
             path
@@ -476,6 +477,7 @@ fn compensate_wall_loop_points(
     flat_radius: f64,
     layer_height: f64,
     layer_order: f64,
+    min_extrusion_z: f64,
 ) -> Vec<DVec3> {
     // Order value of the layer printed just before this one -- order
     // increases as printing proceeds (see `slicing::BUILD_DIRECTION`), so
@@ -537,7 +539,7 @@ fn compensate_wall_loop_points(
             let score_b = -(order_b - prev_layer_order).abs();
 
             let shift_mag = flat_radius * (theta / 2.0).sin();
-            if score_b > score_a {
+            let mut shifted = if score_b > score_a {
                 // Side `b` (`-shift_dir`) is the one closer to
                 // already-printed material: pull the center back toward
                 // `a` so the flat's trailing edge on the `b` side lands
@@ -547,7 +549,15 @@ fn compensate_wall_loop_points(
                 p - shift_dir * shift_mag
             } else {
                 p
+            };
+            // Flat nozzle compensation must never push a toolpath into the bed
+            // floor or below the safe minimum extrusion height for the first layer.
+            if p.z >= min_extrusion_z && shifted.z < min_extrusion_z {
+                shifted.z = min_extrusion_z;
+            } else if shifted.z < 0.0 {
+                shifted.z = 0.0;
             }
+            shifted
         })
         .collect()
 }
@@ -3016,5 +3026,25 @@ mod tests {
 
         let routed = route_travel_moves(vec![a, b], Some(&sdf), &slope_profile, &config);
         assert_eq!(routed.len(), 2, "disabled pass must leave paths untouched");
+    }
+
+    #[test]
+    fn compensate_flat_nozzle_clamps_at_bed_floor() {
+        let field = HeightOrderField::new(BUILD_DIRECTION);
+        let points = vec![
+            DVec3::new(0.0, 0.0, 0.2),
+            DVec3::new(1.0, 0.0, 0.2),
+            DVec3::new(1.0, 1.0, 0.2),
+            DVec3::new(0.0, 1.0, 0.2),
+        ];
+        let min_extrusion_z = 0.1;
+        let compensated =
+            compensate_wall_loop_points(&points, &field, 0.4, 0.2, 0.2, min_extrusion_z);
+        for pt in compensated {
+            assert!(
+                pt.z >= min_extrusion_z,
+                "compensated point must not dip below min extrusion z: {pt:?}"
+            );
+        }
     }
 }

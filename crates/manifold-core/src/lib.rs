@@ -98,6 +98,11 @@ pub struct SlicerConfig {
     /// `order_field::OrderFieldKind`. Defaults to `Height`, i.e. today's
     /// exact flat planar slicing along `slicing::BUILD_DIRECTION`.
     pub order_field: order_field::OrderFieldKind,
+    /// Whether the `Eikonal` order field blends with the top surface to make
+    /// layers lie parallel to top surfaces and follow upper curvature.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub eikonal_conform_top_surfaces: bool,
     /// Apex point of the cone used when `order_field` is
     /// `OrderFieldKind::Conical`. Inert (unused) otherwise. Defaults to
     /// the origin.
@@ -314,6 +319,7 @@ impl Default for SlicerConfig {
             top_layers: 3,
             bottom_layers: 3,
             order_field: order_field::OrderFieldKind::default(),
+            eikonal_conform_top_surfaces: false,
             order_field_apex: glam::DVec3::ZERO,
             order_field_axis: slicing::BUILD_DIRECTION,
             order_field_slope: 0.0,

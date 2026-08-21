@@ -69,6 +69,7 @@ mod tests {
                 top_layers: 3,
                 bottom_layers: 3,
                 order_field: Default::default(),
+                eikonal_conform_top_surfaces: false,
                 order_field_apex: glam::DVec3::ZERO,
                 order_field_axis: glam::DVec3::new(0.0, 0.0, 1.0),
                 order_field_slope: 0.0,

@@ -212,6 +212,156 @@ impl EikonalOrderField {
         field
     }
 
+    /// Two-sided boundary-conforming Eikonal field: marches distances upward
+    /// from the bed contact region (`is_bed_seed_region`) and downward from
+    /// the top exterior surface (`is_top_seed_region`), and smoothly warps the
+    /// top skin layers so they lie parallel to and conform with sloped and curved
+    /// top surfaces, while keeping the bulk and base 100% strictly monotonic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
+        min_corner: DVec3,
+        max_corner: DVec3,
+        requested_cell_size: f64,
+        is_solid: &(dyn Fn(DVec3) -> bool + Sync),
+        is_bed_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
+        is_top_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
+        slope_profile: Option<&SlopeProfile>,
+        height_along: Option<&dyn HeightAlong>,
+    ) -> Self {
+        let (mut bed_field, occupied) =
+            Self::build_grid(min_corner, max_corner, requested_cell_size, is_solid);
+        bed_field.march_from_region(is_bed_seed_region, &occupied);
+
+        let (top_distances, nearest_surface_value) = bed_field.march_downward_with_surface_values(
+            is_top_seed_region,
+            &occupied,
+            &bed_field.distances,
+        );
+
+        // Skin thickness: top ~2.0mm or 6 grid cells
+        let skin_thickness = (bed_field.h * 6.0).max(1.0);
+
+        for (idx, &is_occ) in occupied.iter().enumerate() {
+            if !is_occ {
+                bed_field.distances[idx] = f64::INFINITY;
+                continue;
+            }
+            let d_top = top_distances[idx];
+            let d_bed = bed_field.distances[idx];
+            let surf_val = nearest_surface_value[idx];
+
+            if d_top < skin_thickness && surf_val.is_finite() && d_bed.is_finite() {
+                let skin_order = surf_val - d_top;
+                let t = (d_top / skin_thickness).clamp(0.0, 1.0);
+                let alpha = t * t * (3.0 - 2.0 * t);
+                bed_field.distances[idx] = (1.0 - alpha) * skin_order + alpha * d_bed;
+            }
+        }
+
+        if let (Some(profile), Some(height_along)) = (slope_profile, height_along) {
+            bed_field.relax_with_slope_limit(profile, height_along, &occupied);
+        }
+        bed_field.compute_gradients(&occupied);
+        bed_field
+    }
+
+    /// Helper for conformal top skin: marches downward from `is_top_seed_region`,
+    /// propagating both the distance to the top surface and the `surface_values`
+    /// of the nearest top seed.
+    fn march_downward_with_surface_values(
+        &self,
+        is_top_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
+        occupied: &[bool],
+        surface_values: &[f64],
+    ) -> (Vec<f64>, Vec<f64>) {
+        let total = self.distances.len();
+        let mut top_distances = vec![f64::INFINITY; total];
+        let mut nearest_surface_value = vec![f64::NAN; total];
+
+        let [nx, ny, nz] = self.dims;
+        let seeded: Vec<bool> = (0..total)
+            .into_par_iter()
+            .map(|idx| {
+                if !occupied[idx] {
+                    return false;
+                }
+                let z = idx / (nx * ny);
+                let y = (idx / nx) % ny;
+                let x = idx % nx;
+                is_top_seed_region(self.node_pos(x, y, z))
+            })
+            .collect();
+
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+        let mut frozen = vec![false; total];
+
+        for (idx, &is_seed) in seeded.iter().enumerate() {
+            if is_seed && surface_values[idx].is_finite() {
+                top_distances[idx] = 0.0;
+                nearest_surface_value[idx] = surface_values[idx];
+            }
+        }
+
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let idx = self.idx(x, y, z);
+                    if top_distances[idx].is_finite() {
+                        frozen[idx] = true;
+                        heap.push(HeapEntry {
+                            value: top_distances[idx],
+                            x,
+                            y,
+                            z,
+                        });
+                    }
+                }
+            }
+        }
+
+        while let Some(HeapEntry { value, x, y, z }) = heap.pop() {
+            let idx = self.idx(x, y, z);
+            if frozen[idx] && top_distances[idx] < value {
+                continue;
+            }
+            frozen[idx] = true;
+            let surf_val = nearest_surface_value[idx];
+
+            for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                let nxp = x as isize + dx;
+                let nyp = y as isize + dy;
+                let nzp = z as isize + dz;
+                if nxp < 0
+                    || nyp < 0
+                    || nzp < 0
+                    || nxp >= nx as isize
+                    || nyp >= ny as isize
+                    || nzp >= nz as isize
+                {
+                    continue;
+                }
+                let (nx_u, ny_u, nz_u) = (nxp as usize, nyp as usize, nzp as usize);
+                let n_idx = self.idx(nx_u, ny_u, nz_u);
+                if !occupied[n_idx] || frozen[n_idx] {
+                    continue;
+                }
+                let next_dist = value + self.h;
+                if next_dist < top_distances[n_idx] {
+                    top_distances[n_idx] = next_dist;
+                    nearest_surface_value[n_idx] = surf_val;
+                    heap.push(HeapEntry {
+                        value: next_dist,
+                        x: nx_u,
+                        y: ny_u,
+                        z: nz_u,
+                    });
+                }
+            }
+        }
+
+        (top_distances, nearest_surface_value)
+    }
+
     /// Shared grid construction + occupancy classification behind both
     /// [`EikonalOrderField::new_with_occupancy`] and
     /// [`EikonalOrderField::new_with_occupancy_and_seed_region`]: builds an
@@ -1261,6 +1411,60 @@ mod tests {
         assert!(
             in_air.is_infinite(),
             "query in a fully-unreached region must stay +inf, got {in_air}"
+        );
+    }
+
+    #[test]
+    fn conformal_eikonal_field_aligns_with_sloped_top_surface_and_flat_bottom() {
+        let min_corner = DVec3::new(0.0, 0.0, 0.0);
+        let max_corner = DVec3::new(10.0, 10.0, 10.0);
+        // Sloped wedge: z <= 5.0 + 0.5 * x
+        let is_solid = |p: DVec3| p.z <= 5.0 + 0.5 * p.x + 0.1 && p.x >= 0.0 && p.x <= 10.0;
+        let is_bed_seed = |p: DVec3| p.z <= 0.25;
+        let is_top_seed = |p: DVec3| (p.z - (5.0 + 0.5 * p.x)).abs() <= 0.5;
+
+        let field =
+            EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
+                min_corner,
+                max_corner,
+                0.5,
+                &is_solid,
+                &is_bed_seed,
+                &is_top_seed,
+                None,
+                None,
+            );
+
+        // Bed level should be flat ~0.0
+        let bed1 = field.order(DVec3::new(2.0, 5.0, 0.1));
+        let bed2 = field.order(DVec3::new(8.0, 5.0, 0.1));
+        assert!(
+            (bed1 - bed2).abs() < 0.2,
+            "bed order should be approximately flat"
+        );
+
+        // Points on the sloped top surface should match their local surface height
+        let top1 = field.order(DVec3::new(2.0, 5.0, 6.0));
+        let top2 = field.order(DVec3::new(8.0, 5.0, 9.0));
+        assert!(
+            (top1 - 6.0).abs() < 0.5,
+            "top point 1 order should be near 6.0: {top1}"
+        );
+        assert!(
+            (top2 - 9.0).abs() < 0.5,
+            "top point 2 order should be near 9.0: {top2}"
+        );
+
+        // Subsurface points 0.5mm below the top surface should be ~0.5mm lower in order
+        let sub1 = field.order(DVec3::new(2.0, 5.0, 5.5));
+        let sub2 = field.order(DVec3::new(8.0, 5.0, 8.5));
+        assert!(
+            (top1 - sub1 - 0.5).abs() < 0.3,
+            "subsurface 1 should be parallel to top surface"
+        );
+        assert!(
+            (top2 - sub2 - 0.5).abs() < 0.3,
+            "subsurface 2 should be parallel to top surface"
         );
     }
 

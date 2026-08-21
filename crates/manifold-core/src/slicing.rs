@@ -3161,6 +3161,23 @@ mod tests {
     }
 
     #[test]
+    fn slice_mesh_conformal_eikonal_order_field_produces_nonempty_layer_output() {
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            order_field: crate::order_field::OrderFieldKind::Eikonal,
+            eikonal_conform_top_surfaces: true,
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&cube_mesh(), &config).unwrap();
+        assert_eq!(layers.len(), 4);
+        for layer in &layers[0..3] {
+            assert_eq!(layer.loops.len(), 1, "expected exactly one contour loop");
+            assert!(!layer.loops[0].points.is_empty());
+        }
+    }
+
+    #[test]
     fn slice_mesh_eikonal_order_field_produces_nonempty_layer_output_for_a_simple_solid_cube() {
         // Proves `OrderFieldKind::Eikonal` is wired through `order_field_for`
         // and `slice_mesh_with_progress`'s curved ("contour-on-mesh") path

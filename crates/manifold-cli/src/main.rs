@@ -61,6 +61,10 @@ struct Cli {
     /// (unconstrained) if omitted.
     #[arg(long)]
     eikonal_slope_profile: Option<String>,
+
+    /// Whether the Eikonal order field blends with the top surface.
+    #[arg(long, default_value_t = false)]
+    eikonal_conform_top_surfaces: bool,
 }
 
 /// Parses a `--eikonal-slope-profile` argument of comma-separated
@@ -150,6 +154,7 @@ fn main() -> Result<()> {
         layer_height: cli.layer_height,
         nozzle_diameter: cli.nozzle_diameter,
         order_field: cli.order_field.into(),
+        eikonal_conform_top_surfaces: cli.eikonal_conform_top_surfaces,
         sparse_infill_pattern: cli.sparse_infill_pattern.map(Into::into),
         solid_infill_pattern: cli.solid_infill_pattern.map(Into::into),
         infill_pattern: cli.infill_pattern.into(),

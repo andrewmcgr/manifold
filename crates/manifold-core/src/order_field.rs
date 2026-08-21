@@ -233,6 +233,60 @@ fn eikonal_field_for(
             Some(&height_along),
         );
     }
+    if config.eikonal_conform_top_surfaces {
+        let top_faces: Vec<[usize; 3]> = mesh
+            .indices
+            .chunks_exact(3)
+            .filter_map(|chunk| {
+                let [i0, i1, i2] = [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
+                let v0 = mesh.vertices[i0];
+                let v1 = mesh.vertices[i1];
+                let v2 = mesh.vertices[i2];
+                let normal = (v1 - v0).cross(v2 - v0);
+                if normal.z > 0.1 * normal.length() {
+                    Some([i0, i1, i2])
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let top_sdf = if top_faces.is_empty() {
+            None
+        } else {
+            Some(MeshSdf::new(mesh.vertices.clone(), top_faces))
+        };
+
+        if let Some(top_sdf) = top_sdf {
+            let is_top_seed = |p: DVec3| top_sdf.sample(p).value.abs() <= cell_size;
+            if let Some(sdf) = existing_sdf {
+                let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
+                return EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
+                    min,
+                    max,
+                    cell_size,
+                    &is_solid,
+                    &is_seed_region,
+                    &is_top_seed,
+                    Some(slope_profile),
+                    Some(&height_along),
+                );
+            }
+            let sdf = MeshSdf::new(mesh.vertices.clone(), faces);
+            let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
+            return EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
+                min,
+                max,
+                cell_size,
+                &is_solid,
+                &is_seed_region,
+                &is_top_seed,
+                Some(slope_profile),
+                Some(&height_along),
+            );
+        }
+    }
+
     if let Some(sdf) = existing_sdf {
         let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
         return EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
