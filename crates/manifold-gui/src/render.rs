@@ -664,17 +664,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         queue: &wgpu::Queue,
         screen_descriptor: &egui_wgpu::ScreenDescriptor,
         egui_encoder: &mut wgpu::CommandEncoder,
+        rect: egui::Rect,
         view_proj: Mat4,
         scene: &UploadedScene,
         meshes: &[UploadedMesh],
         overlay: Option<&UploadedMesh>,
         toolpaths: Option<&UploadedToolpaths>,
     ) {
-        self.ensure_offscreen(
-            device,
-            screen_descriptor.size_in_pixels[0],
-            screen_descriptor.size_in_pixels[1],
-        );
+        let ppp = screen_descriptor.pixels_per_point;
+        let screen_w = screen_descriptor.size_in_pixels[0];
+        let screen_h = screen_descriptor.size_in_pixels[1];
+
+        let vp_x = (rect.min.x * ppp).max(0.0).round() as u32;
+        let vp_y = (rect.min.y * ppp).max(0.0).round() as u32;
+        let vp_w = ((rect.width() * ppp).round() as u32)
+            .min(screen_w.saturating_sub(vp_x))
+            .max(1);
+        let vp_h = ((rect.height() * ppp).round() as u32)
+            .min(screen_h.saturating_sub(vp_y))
+            .max(1);
+
+        self.ensure_offscreen(device, screen_w, screen_h);
         queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -706,6 +716,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+
+        rpass.set_viewport(vp_x as f32, vp_y as f32, vp_w as f32, vp_h as f32, 0.0, 1.0);
+        rpass.set_scissor_rect(vp_x, vp_y, vp_w, vp_h);
 
         // 1. Draw scene dressing (bed quad + origin/grid lines)
         rpass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -762,6 +775,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 /// and 4x MSAA anti-aliasing offscreen in `prepare`, then blits the result into
 /// egui's frame pass in `paint`.
 pub struct Viewport3dCallback {
+    pub rect: egui::Rect,
     pub view_proj: Mat4,
     pub scene: std::sync::Arc<UploadedScene>,
     pub meshes: std::sync::Arc<Vec<UploadedMesh>>,
@@ -784,6 +798,7 @@ impl egui_wgpu::CallbackTrait for Viewport3dCallback {
             queue,
             screen_descriptor,
             egui_encoder,
+            self.rect,
             self.view_proj,
             &self.scene,
             &self.meshes,

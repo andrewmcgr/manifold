@@ -873,8 +873,9 @@ impl ManifoldApp {
             ui.separator();
             ui.heading("Gcode");
             ui.label(format!("{} line(s) generated", gcode.lines().count()));
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::both()
                 .max_height(150.0)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.monospace(gcode);
                 });
@@ -1131,6 +1132,7 @@ impl ManifoldApp {
                     };
                     ui.add(
                         egui::ProgressBar::new(self.slice_progress as f32)
+                            .desired_width(120.0)
                             .text(format!("{stage}… {:.0}%", self.slice_progress * 100.0)),
                     );
                 });
@@ -1200,6 +1202,7 @@ impl ManifoldApp {
                 .add(eframe::egui_wgpu::Callback::new_paint_callback(
                     rect,
                     Viewport3dCallback {
+                        rect,
                         view_proj,
                         scene: self.uploaded_scene.clone(),
                         meshes: self.uploaded_meshes.clone(),
