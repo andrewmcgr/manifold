@@ -41,8 +41,16 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = OrderFieldArg::Height)]
     order_field: OrderFieldArg,
 
-    /// Infill pattern generated inside each layer.
-    #[arg(long, value_enum, default_value_t = InfillPatternArg::Monotonic)]
+    /// Infill pattern generated for sparse regions.
+    #[arg(long, value_enum)]
+    sparse_infill_pattern: Option<InfillPatternArg>,
+
+    /// Infill pattern generated for solid top/bottom layers.
+    #[arg(long, value_enum)]
+    solid_infill_pattern: Option<InfillPatternArg>,
+
+    /// Infill pattern generated inside each layer (legacy).
+    #[arg(long, value_enum, default_value_t = InfillPatternArg::Cubic)]
     infill_pattern: InfillPatternArg,
 
     /// Slope-limit profile for the `eikonal` order field, as comma-separated
@@ -101,10 +109,11 @@ impl From<OrderFieldArg> for OrderFieldKind {
 /// derive argument parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 enum InfillPatternArg {
-    #[default]
     Monotonic,
     Concentric,
     AllWalls,
+    #[default]
+    Cubic,
     None,
 }
 
@@ -114,6 +123,7 @@ impl From<InfillPatternArg> for InfillPatternKind {
             InfillPatternArg::Monotonic => InfillPatternKind::Monotonic,
             InfillPatternArg::Concentric => InfillPatternKind::Concentric,
             InfillPatternArg::AllWalls => InfillPatternKind::AllWalls,
+            InfillPatternArg::Cubic => InfillPatternKind::Cubic,
             InfillPatternArg::None => InfillPatternKind::None,
         }
     }
@@ -140,6 +150,8 @@ fn main() -> Result<()> {
         layer_height: cli.layer_height,
         nozzle_diameter: cli.nozzle_diameter,
         order_field: cli.order_field.into(),
+        sparse_infill_pattern: cli.sparse_infill_pattern.map(Into::into),
+        solid_infill_pattern: cli.solid_infill_pattern.map(Into::into),
         infill_pattern: cli.infill_pattern.into(),
         ..SlicerConfig::default()
     };

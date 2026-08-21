@@ -53,8 +53,14 @@ pub struct SlicerConfig {
     /// mesh surface, in mm. Defaults to half the nozzle diameter so the
     /// nozzle's outer edge (not its center) lands on the surface.
     pub wall_offset: f64,
-    /// Which infill pattern to generate inside each layer's innermost
-    /// wall loop(s). See `infill::InfillPatternKind`.
+    /// Infill pattern for sparse interior regions. Defaults to `InfillPatternKind::Cubic`.
+    #[serde(default)]
+    pub sparse_infill_pattern: Option<infill::InfillPatternKind>,
+    /// Infill pattern for solid top/bottom layers. Defaults to `InfillPatternKind::AllWalls`.
+    #[serde(default)]
+    pub solid_infill_pattern: Option<infill::InfillPatternKind>,
+    /// Legacy infill pattern field preserved for backwards compatibility.
+    #[serde(default)]
     pub infill_pattern: infill::InfillPatternKind,
     /// Nozzle-center line width for infill passes, in mm. Also the scan-
     /// line spacing for the `Monotonic` pattern. Defaults to
@@ -299,7 +305,9 @@ impl Default for SlicerConfig {
             wall_line_width,
             shell_thickness: wall_line_width,
             wall_offset: nozzle_diameter / 2.0,
-            infill_pattern: infill::InfillPatternKind::default(),
+            sparse_infill_pattern: Some(infill::InfillPatternKind::Cubic),
+            solid_infill_pattern: Some(infill::InfillPatternKind::AllWalls),
+            infill_pattern: infill::InfillPatternKind::Cubic,
             infill_line_width: nozzle_diameter,
             infill_angle_deg: 45.0,
             infill_density: 0.2,
@@ -327,6 +335,27 @@ impl Default for SlicerConfig {
 }
 
 impl SlicerConfig {
+    /// Infill pattern for sparse interior regions, defaulting to
+    /// [`infill::InfillPatternKind::Cubic`] when not set.
+    #[must_use]
+    pub fn sparse_infill_pattern(&self) -> infill::InfillPatternKind {
+        self.sparse_infill_pattern.unwrap_or(
+            if self.infill_pattern != infill::InfillPatternKind::default() {
+                self.infill_pattern
+            } else {
+                infill::InfillPatternKind::Cubic
+            },
+        )
+    }
+
+    /// Infill pattern for solid top/bottom layers, defaulting to
+    /// [`infill::InfillPatternKind::AllWalls`] when not set.
+    #[must_use]
+    pub fn solid_infill_pattern(&self) -> infill::InfillPatternKind {
+        self.solid_infill_pattern
+            .unwrap_or(infill::InfillPatternKind::AllWalls)
+    }
+
     /// Number of wall/perimeter passes derived from `shell_thickness` /
     /// `wall_line_width`, rounded to the nearest whole wall and clamped to
     /// a minimum of one (a `shell_thickness` smaller than `wall_line_width`

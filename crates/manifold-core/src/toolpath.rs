@@ -1433,7 +1433,8 @@ pub fn plan_with_progress(
     slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     on_progress: &mut (dyn FnMut(f64) + Send),
 ) -> Result<Vec<Path>> {
-    let generator = infill::generator_for(config.infill_pattern);
+    let sparse_generator = infill::generator_for(config.sparse_infill_pattern());
+    let solid_generator = infill::generator_for(config.solid_infill_pattern());
     let filament_area = extrusion::filament_cross_section_area(config.filament_diameter);
     // Build-plate height: the lowest wall-loop point across the whole
     // print rests on the bed (the "rests on floor" convention shared with
@@ -1520,7 +1521,7 @@ pub fn plan_with_progress(
             }
 
             let region = InfillRegion::from_layer(layer, config);
-            for mut infill_path in generator.generate(
+            for mut infill_path in sparse_generator.generate(
                 &region,
                 config,
                 layer,
@@ -1532,13 +1533,13 @@ pub fn plan_with_progress(
             }
 
             if !layer.solid_fill_boundary.is_empty()
-                && config.infill_pattern != infill::InfillPatternKind::AllWalls
+                && config.sparse_infill_pattern() != infill::InfillPatternKind::AllWalls
             {
                 let solid_region = InfillRegion {
                     loops: layer.solid_fill_boundary.clone(),
                 };
                 for mut infill_path in
-                    generator.generate(&solid_region, config, layer, &object.transform, 1.0)
+                    solid_generator.generate(&solid_region, config, layer, &object.transform, 1.0)
                 {
                     infill_path.tool = object.tool;
                     paths.push(infill_path);
@@ -1934,6 +1935,8 @@ mod tests {
         let cfg = SlicerConfig {
             infill_line_width: 0.5,
             infill_angle_deg: 0.0,
+            sparse_infill_pattern: Some(infill::InfillPatternKind::Monotonic),
+            solid_infill_pattern: Some(infill::InfillPatternKind::Monotonic),
             ..SlicerConfig::default()
         };
 
@@ -1990,6 +1993,8 @@ mod tests {
             infill_line_width: 0.5,
             infill_angle_deg: 0.0,
             infill_density: 0.0,
+            sparse_infill_pattern: Some(infill::InfillPatternKind::Monotonic),
+            solid_infill_pattern: Some(infill::InfillPatternKind::Monotonic),
             ..SlicerConfig::default()
         };
 

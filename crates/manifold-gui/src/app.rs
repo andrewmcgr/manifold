@@ -563,30 +563,78 @@ impl ManifoldApp {
 
         ui.separator();
         ui.heading("Infill");
-        egui::ComboBox::from_label("Pattern")
-            .selected_text(format!("{:?}", self.config.infill_pattern))
+        let mut sparse_pattern = self.config.sparse_infill_pattern();
+        if egui::ComboBox::from_label("Sparse pattern")
+            .selected_text(format!("{:?}", sparse_pattern))
             .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut self.config.infill_pattern,
-                    InfillPatternKind::Monotonic,
-                    "Monotonic",
-                );
-                ui.selectable_value(
-                    &mut self.config.infill_pattern,
-                    InfillPatternKind::Concentric,
-                    "Concentric",
-                );
-                ui.selectable_value(
-                    &mut self.config.infill_pattern,
-                    InfillPatternKind::AllWalls,
-                    "All Walls",
-                );
-                ui.selectable_value(
-                    &mut self.config.infill_pattern,
-                    InfillPatternKind::None,
-                    "None",
-                );
-            });
+                let mut changed = false;
+                changed |= ui
+                    .selectable_value(&mut sparse_pattern, InfillPatternKind::Cubic, "Cubic")
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut sparse_pattern,
+                        InfillPatternKind::Monotonic,
+                        "Monotonic",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut sparse_pattern,
+                        InfillPatternKind::Concentric,
+                        "Concentric",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut sparse_pattern,
+                        InfillPatternKind::AllWalls,
+                        "All Walls",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut sparse_pattern, InfillPatternKind::None, "None")
+                    .changed();
+                changed
+            })
+            .inner
+            .unwrap_or(false)
+        {
+            self.config.sparse_infill_pattern = Some(sparse_pattern);
+        }
+
+        let mut solid_pattern = self.config.solid_infill_pattern();
+        if egui::ComboBox::from_label("Solid pattern")
+            .selected_text(format!("{:?}", solid_pattern))
+            .show_ui(ui, |ui| {
+                let mut changed = false;
+                changed |= ui
+                    .selectable_value(&mut solid_pattern, InfillPatternKind::AllWalls, "All Walls")
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut solid_pattern,
+                        InfillPatternKind::Concentric,
+                        "Concentric",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut solid_pattern,
+                        InfillPatternKind::Monotonic,
+                        "Monotonic",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut solid_pattern, InfillPatternKind::None, "None")
+                    .changed();
+                changed
+            })
+            .inner
+            .unwrap_or(false)
+        {
+            self.config.solid_infill_pattern = Some(solid_pattern);
+        }
         ui.add(
             egui::Slider::new(&mut self.config.infill_line_width, 0.05..=1.5)
                 .text("Infill line width (mm)"),

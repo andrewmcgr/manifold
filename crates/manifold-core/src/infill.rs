@@ -37,6 +37,10 @@ pub enum InfillPatternKind {
     /// fully fills the region regardless of the configured infill density.
     /// See [`AllWallsInfill`].
     AllWalls,
+    /// 3D Cubic lattice infill: self-supporting 3D periodic cubic grid rotated
+    /// with space diagonals along the Cartesian axes (45-degree inclination to
+    /// the build plate), forming a 3D isotropic truss. See [`CubicInfill`].
+    Cubic,
     /// No sparse infill at all. Walls and solid-fill (top/bottom) regions
     /// still print; sprarse infill between them is omitted.
     None,
@@ -49,6 +53,7 @@ pub fn generator_for(kind: InfillPatternKind) -> Box<dyn InfillGenerator + Sync>
         InfillPatternKind::Monotonic => Box::new(MonotonicInfill),
         InfillPatternKind::Concentric => Box::new(ConcentricInfill),
         InfillPatternKind::AllWalls => Box::new(AllWallsInfill),
+        InfillPatternKind::Cubic => Box::new(CubicInfill),
         InfillPatternKind::None => Box::new(NoneInfill),
     }
 }
@@ -75,7 +80,7 @@ impl InfillRegion {
     #[must_use]
     pub fn from_layer(layer: &Layer, config: &SlicerConfig) -> Self {
         if layer.solid_fill_boundary.is_empty()
-            || config.infill_pattern == InfillPatternKind::AllWalls
+            || config.sparse_infill_pattern() == InfillPatternKind::AllWalls
         {
             return Self {
                 loops: layer.infill_boundary.clone(),
@@ -548,6 +553,186 @@ const MAX_OFFSET_RINGS: usize = 10_000;
 /// the Gcode emission stage rather than an explicit `Segment`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConcentricInfill;
+
+/// 3D Cubic lattice infill: self-supporting 3D periodic cubic grid rotated
+/// with space diagonals along the Cartesian axes (45-degree inclination to
+/// the build plate), forming a 3D isotropic truss.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CubicInfill;
+
+impl InfillGenerator for CubicInfill {
+    fn generate(
+        &self,
+        region: &InfillRegion,
+        config: &SlicerConfig,
+        layer: &Layer,
+        object_transform: &Transform,
+        density: f64,
+    ) -> Vec<Path> {
+        if region.is_empty() || density <= 0.0 {
+            return Vec::new();
+        }
+
+        let (axis, _apex, _slope) =
+            order_field::resolve_axis_apex_slope(config.order_field, config);
+        let (basis1, basis2) = plane_basis(axis);
+        let object_angle = object_transform.in_plane_rotation_angle(basis1, basis2);
+
+        let clamped_density = density.clamp(1e-4, 1.0);
+        let cell_size = (config.infill_line_width.abs().max(f64::EPSILON)) / clamped_density;
+        let spacing = cell_size * 2.0_f64.sqrt();
+
+        let z = layer.order;
+        let shift = z * 2.0_f64.sqrt();
+
+        let mut paths = Vec::new();
+        paths.extend(generate_scanlines_at_angle(
+            region,
+            config,
+            layer,
+            object_angle + 45.0f64.to_radians(),
+            spacing,
+            shift,
+        ));
+        paths.extend(generate_scanlines_at_angle(
+            region,
+            config,
+            layer,
+            object_angle - 45.0f64.to_radians(),
+            spacing,
+            -shift,
+        ));
+        paths.extend(generate_scanlines_at_angle(
+            region,
+            config,
+            layer,
+            object_angle + 45.0f64.to_radians(),
+            spacing,
+            -shift,
+        ));
+        paths.extend(generate_scanlines_at_angle(
+            region,
+            config,
+            layer,
+            object_angle - 45.0f64.to_radians(),
+            spacing,
+            shift,
+        ));
+
+        paths
+    }
+}
+
+fn generate_scanlines_at_angle(
+    region: &InfillRegion,
+    config: &SlicerConfig,
+    layer: &Layer,
+    angle: f64,
+    spacing: f64,
+    offset: f64,
+) -> Vec<Path> {
+    if region.is_empty() || spacing <= f64::EPSILON {
+        return Vec::new();
+    }
+
+    let (axis, _apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
+    let (basis1, basis2) = plane_basis(axis);
+    let (sin, cos) = angle.sin_cos();
+    let u_dir = basis1 * cos + basis2 * sin;
+    let v_dir = basis1 * -sin + basis2 * cos;
+
+    let max_along = order_field::max_along_for(config);
+
+    let projected: Vec<Vec<(f64, f64, DVec3)>> = region
+        .loops
+        .iter()
+        .map(|points| {
+            points
+                .iter()
+                .map(|&p| (p.dot(u_dir), p.dot(v_dir), p))
+                .collect()
+        })
+        .collect();
+
+    let Some(v_min) = projected
+        .iter()
+        .flatten()
+        .map(|&(_, v, _)| v)
+        .fold(None, |acc, v| Some(acc.map_or(v, |m: f64| m.min(v))))
+    else {
+        return Vec::new();
+    };
+    let v_max = projected
+        .iter()
+        .flatten()
+        .map(|&(_, v, _)| v)
+        .fold(v_min, f64::max);
+
+    let mut paths = Vec::new();
+    let norm_offset = ((offset % spacing) + spacing) % spacing;
+    let mut v = v_min + norm_offset;
+    if v < v_min {
+        v += spacing;
+    }
+
+    while v <= v_max {
+        let mut crossings: Vec<Crossing> = Vec::new();
+        for loop_points in &projected {
+            let n = loop_points.len();
+            if n < 2 {
+                continue;
+            }
+            for i in 0..n {
+                let (u0, v0, p0) = loop_points[i];
+                let (u1, v1, p1) = loop_points[(i + 1) % n];
+                let crosses = (v0 <= v && v1 > v) || (v1 <= v && v0 > v);
+                if !crosses {
+                    continue;
+                }
+                let t = (v - v0) / (v1 - v0);
+                let u = u0 + t * (u1 - u0);
+                let seed = p0.lerp(p1, t);
+                let seed_residual = layer.order_field.order(seed) - layer.order;
+                let point = if seed_residual.is_finite() {
+                    let accept = seed_residual.abs() * 4.0 + 2.0 * config.layer_height.abs();
+                    order_field::refine_point_onto_order_field(
+                        seed,
+                        layer.order,
+                        max_along,
+                        layer.order_field.as_ref(),
+                    )
+                    .filter(|p| (*p - seed).length() <= accept)
+                    .unwrap_or(seed)
+                } else {
+                    seed
+                };
+                crossings.push(Crossing { u, point });
+            }
+        }
+        crossings.sort_by(|a, b| a.u.total_cmp(&b.u));
+
+        for pair in crossings.chunks_exact(2) {
+            let start = pair[0].point;
+            let end = pair[1].point;
+            let segment = Segment {
+                kind: MoveKind::Infill,
+                speed: config.print_speed,
+                extrusion_rate: 1.0,
+                support_fraction: 0.0,
+                order: layer.order,
+                extrusion_length: 0.0,
+            };
+            paths.push(Path {
+                points: vec![start, end],
+                segments: vec![segment],
+                tool: crate::ids::ToolId::default(),
+            });
+        }
+        v += spacing;
+    }
+
+    paths
+}
 
 /// No-op infill generator: emits no paths regardless of region or density.
 /// Used for `InfillPatternKind::None` so callers don't need special-case
@@ -1514,6 +1699,81 @@ mod tests {
         let region = InfillRegion::from_layer(&layer, &config());
         let paths =
             AllWallsInfill.generate(&region, &config(), &layer, &Transform::identity(), 1.0);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn cubic_fill_produces_paths_covering_a_square() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths = CubicInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.2);
+
+        assert!(!paths.is_empty(), "expected cubic infill paths on a square");
+        for path in &paths {
+            assert!(path.points.len() >= 2);
+            assert!(path.segments.iter().all(|s| s.kind == MoveKind::Infill));
+            for p in &path.points {
+                assert!(p.x >= -5.001 && p.x <= 5.001, "x out of bounds: {p:?}");
+                assert!(p.y >= -5.001 && p.y <= 5.001, "y out of bounds: {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cubic_fill_shifts_across_layers() {
+        let mut layer1 = square_layer(5.0);
+        layer1.order = 0.2;
+        let mut layer2 = square_layer(5.0);
+        layer2.order = 0.4;
+
+        let region1 = InfillRegion::from_layer(&layer1, &config());
+        let region2 = InfillRegion::from_layer(&layer2, &config());
+
+        let paths1 =
+            CubicInfill.generate(&region1, &config(), &layer1, &Transform::identity(), 0.2);
+        let paths2 =
+            CubicInfill.generate(&region2, &config(), &layer2, &Transform::identity(), 0.2);
+
+        assert!(!paths1.is_empty());
+        assert!(!paths2.is_empty());
+
+        // Points across differing Z layers should differ in their in-plane line offsets
+        let pts1: Vec<DVec3> = paths1.iter().flat_map(|p| &p.points).copied().collect();
+        let pts2: Vec<DVec3> = paths2.iter().flat_map(|p| &p.points).copied().collect();
+        assert_ne!(pts1, pts2, "expected cubic infill lines to shift with Z");
+    }
+
+    #[test]
+    fn cubic_fill_density_widens_spacing() {
+        let layer = square_layer(10.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+
+        let dense_paths =
+            CubicInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.5);
+        let sparse_paths =
+            CubicInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.1);
+
+        assert!(
+            dense_paths.len() > sparse_paths.len(),
+            "expected higher density to produce more infill lines (dense={}, sparse={})",
+            dense_paths.len(),
+            sparse_paths.len()
+        );
+    }
+
+    #[test]
+    fn cubic_fill_is_empty_for_empty_region() {
+        let layer = Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: Vec::new(),
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            ..Layer::default()
+        };
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths = CubicInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.2);
         assert!(paths.is_empty());
     }
 
