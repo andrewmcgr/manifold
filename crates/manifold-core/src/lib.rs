@@ -36,6 +36,12 @@ pub struct SlicerConfig {
     /// When `None` (the default), defaults to `layer_height`.
     #[serde(default)]
     pub first_layer_height: Option<f64>,
+    /// First layer print speed (mm/min), defaulting to 40% of `print_speed` when `None`.
+    #[serde(default)]
+    pub first_layer_print_speed: Option<f64>,
+    /// First layer extrusion flow multiplier, defaulting to `1.0` when `None`.
+    #[serde(default)]
+    pub first_layer_extrusion_multiplier: Option<f64>,
     pub nozzle_diameter: f64,
     /// Strategy used to decide the order objects are printed in. See
     /// `ordering` module and ROADMAP.md open decision #2.
@@ -305,6 +311,8 @@ impl Default for SlicerConfig {
         Self {
             layer_height: 0.2,
             first_layer_height: None,
+            first_layer_print_speed: None,
+            first_layer_extrusion_multiplier: None,
             nozzle_diameter,
             object_ordering: ordering::ObjectOrderingKind::default(),
             wall_line_width,
@@ -379,6 +387,20 @@ impl SlicerConfig {
         self.first_layer_height
             .map(|h| h.abs().max(f64::EPSILON))
             .unwrap_or_else(|| self.layer_height.abs().max(f64::EPSILON))
+    }
+
+    /// First layer print speed (mm/min), defaulting to 40% of `print_speed`
+    /// when `first_layer_print_speed` is `None`.
+    #[must_use]
+    pub fn first_layer_print_speed(&self) -> f64 {
+        self.first_layer_print_speed
+            .unwrap_or_else(|| (self.print_speed * 0.4).min(self.print_speed))
+    }
+
+    /// First layer extrusion multiplier, defaulting to `1.0` when `None`.
+    #[must_use]
+    pub fn first_layer_extrusion_multiplier(&self) -> f64 {
+        self.first_layer_extrusion_multiplier.unwrap_or(1.0)
     }
 
     /// Diameter (mm) of the nozzle tip's flat land, used by

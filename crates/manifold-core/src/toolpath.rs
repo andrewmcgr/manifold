@@ -1459,6 +1459,10 @@ pub fn plan_with_progress(
         .flat_map(|wall| &wall.points)
         .map(|p| p.z)
         .fold(f64::INFINITY, f64::min);
+    let order_min = layers
+        .iter()
+        .map(|layer| layer.order)
+        .fold(f64::INFINITY, f64::min);
     let total_layers = layers.len().max(1) as f64;
     let completed = AtomicUsize::new(0);
     let on_progress = Mutex::new(on_progress);
@@ -1598,9 +1602,21 @@ pub fn plan_with_progress(
                     // this bead" figure actually used for its flow, with bed
                     // contact counting as full support.
                     segment.support_fraction = support_fraction.max(bed_fraction);
+                    let is_first_layer =
+                        bed_fraction > 0.0 || (layer.order - order_min).abs() < 1e-6;
+                    let effective_layer_height = if is_first_layer {
+                        config.first_layer_height()
+                    } else {
+                        config.layer_height
+                    };
+                    let first_layer_mult = if is_first_layer {
+                        config.first_layer_extrusion_multiplier()
+                    } else {
+                        1.0
+                    };
                     let bead_area = extrusion::blended_bead_cross_section_area(
                         line_width,
-                        config.layer_height,
+                        effective_layer_height,
                         config.nozzle_diameter,
                         support_fraction,
                         bed_fraction,
@@ -1608,7 +1624,13 @@ pub fn plan_with_progress(
                     segment.extrusion_length =
                         extrusion::segment_extrusion_length(distance, bead_area, filament_area)
                             * segment.extrusion_rate
-                            * extrusion_multiplier;
+                            * extrusion_multiplier
+                            * first_layer_mult;
+                    segment.speed = if is_first_layer {
+                        config.first_layer_print_speed()
+                    } else {
+                        speed_for_kind(segment.kind, config)
+                    };
                 }
             }
 
@@ -1882,6 +1904,7 @@ mod tests {
         }];
         let config = SlicerConfig {
             print_speed: 1234.0,
+            first_layer_print_speed: Some(1234.0),
             ..SlicerConfig::default()
         };
 
@@ -1891,6 +1914,73 @@ mod tests {
             .iter()
             .flat_map(|p| p.segments.iter())
             .all(|segment| segment.speed == 1234.0));
+    }
+
+    #[test]
+    fn plan_applies_first_layer_speed_and_extrusion_multiplier_to_first_layer_only() {
+        let objects = vec![Object::new(ObjectId(0), Mesh::default(), ToolId(0))];
+        let layer0 = Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.25,
+            loops: vec![WallLoop {
+                wall_index: 0,
+                points: vec![
+                    DVec3::new(0.0, 0.0, 0.25),
+                    DVec3::new(10.0, 0.0, 0.25),
+                    DVec3::new(10.0, 10.0, 0.25),
+                ],
+                ..Default::default()
+            }],
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
+        };
+        let layer1 = Layer {
+            index: 1,
+            object: ObjectId(0),
+            order: 0.50,
+            loops: vec![WallLoop {
+                wall_index: 0,
+                points: vec![
+                    DVec3::new(0.0, 0.0, 0.50),
+                    DVec3::new(10.0, 0.0, 0.50),
+                    DVec3::new(10.0, 10.0, 0.50),
+                ],
+                ..Default::default()
+            }],
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
+        };
+        let config = SlicerConfig {
+            layer_height: 0.20,
+            first_layer_height: Some(0.25),
+            print_speed: 3000.0,
+            first_layer_print_speed: Some(1200.0),
+            first_layer_extrusion_multiplier: Some(1.2),
+            ..SlicerConfig::default()
+        };
+
+        let paths = plan(&[layer0, layer1], &objects, &[], &config).unwrap();
+        let p0 = &paths[0];
+        let p1 = &paths[1];
+
+        // Layer 0 segments must use first_layer_print_speed (1200.0)
+        assert!(p0.segments.iter().all(|s| s.speed == 1200.0));
+        // Layer 1 segments must use standard print_speed (3000.0)
+        assert!(p1.segments.iter().all(|s| s.speed == 3000.0));
+
+        // Layer 0 has larger bead area (0.25 vs 0.20) and 1.2x multiplier,
+        // so its extrusion length must be strictly larger for equal distance segments
+        let e0: f64 = p0.segments.iter().map(|s| s.extrusion_length).sum();
+        let e1: f64 = p1.segments.iter().map(|s| s.extrusion_length).sum();
+        assert!(
+            e0 > e1 * 1.3,
+            "layer 0 extrusion ({e0}) should be significantly higher than layer 1 ({e1})"
+        );
     }
 
     #[test]

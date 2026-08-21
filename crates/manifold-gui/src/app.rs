@@ -547,6 +547,16 @@ impl ManifoldApp {
         {
             self.config.first_layer_height = Some(first_layer_h);
         }
+        let mut first_layer_mult = self.config.first_layer_extrusion_multiplier();
+        if ui
+            .add(
+                egui::Slider::new(&mut first_layer_mult, 0.5..=2.0)
+                    .text("First layer flow multiplier"),
+            )
+            .changed()
+        {
+            self.config.first_layer_extrusion_multiplier = Some(first_layer_mult);
+        }
         ui.add(
             egui::Slider::new(&mut self.config.nozzle_diameter, 0.1..=1.5)
                 .text("Nozzle diameter (mm)"),
@@ -744,14 +754,32 @@ impl ManifoldApp {
 
         ui.separator();
         ui.heading("Speeds & Travel");
-        ui.add(
-            egui::Slider::new(&mut self.config.print_speed, 300.0..=12000.0)
-                .text("Print speed (mm/min)"),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.config.travel_speed, 300.0..=18000.0)
-                .text("Travel speed (mm/min)"),
-        );
+        let mut print_speed_mms = (self.config.print_speed / 60.0).round();
+        if ui
+            .add(egui::Slider::new(&mut print_speed_mms, 20.0..=400.0).text("Print speed (mm/s)"))
+            .changed()
+        {
+            self.config.print_speed = print_speed_mms * 60.0;
+        }
+        let mut first_layer_speed_mms = (self.config.first_layer_print_speed() / 60.0).round();
+        if ui
+            .add(
+                egui::Slider::new(&mut first_layer_speed_mms, 20.0..=400.0)
+                    .text("First layer speed (mm/s)"),
+            )
+            .changed()
+        {
+            self.config.first_layer_print_speed = Some(first_layer_speed_mms * 60.0);
+        }
+        let mut travel_speed_mms = (self.config.travel_speed / 60.0).round();
+        if ui
+            .add(
+                egui::Slider::new(&mut travel_speed_mms, 100.0..=800.0).text("Travel speed (mm/s)"),
+            )
+            .changed()
+        {
+            self.config.travel_speed = travel_speed_mms * 60.0;
+        }
         ui.checkbox(&mut self.config.z_hop_enabled, "Z-hop on travel");
         if self.config.z_hop_enabled {
             ui.add(

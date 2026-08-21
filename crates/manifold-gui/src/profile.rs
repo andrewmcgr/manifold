@@ -55,6 +55,8 @@ mod tests {
             config: SlicerConfig {
                 layer_height: 0.2,
                 first_layer_height: None,
+                first_layer_print_speed: None,
+                first_layer_extrusion_multiplier: None,
                 nozzle_diameter: 0.4,
                 object_ordering: Default::default(),
                 wall_line_width: 0.4,
