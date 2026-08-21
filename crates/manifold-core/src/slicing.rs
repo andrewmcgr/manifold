@@ -867,14 +867,18 @@ pub fn slice_mesh_with_progress(
     // comparable faceting, so it is left untouched (matches
     // `stitch_wall_gaps`'s existing `!is_height` gate below).
     if !is_height {
+        let max_displacement = config.nozzle_diameter * 0.02;
         for layer in &mut layers {
             for wall in &mut layer.loops {
-                smooth_wall_loop(wall);
+                smooth_wall_loop(wall, max_displacement);
                 // Recompute now that points moved -- arc_fraction is a
                 // per-point cumulative arc-length position (see
                 // `WallLoop::arc_fraction`'s doc comment), consumed by
                 // `stitch_wall_gaps` right below for its correspondence.
                 wall.arc_fraction = compute_arc_fractions(&wall.points);
+            }
+            for bnd in &mut layer.infill_boundary {
+                smooth_closed_points(bnd, max_displacement);
             }
         }
     }
@@ -895,51 +899,102 @@ pub fn slice_mesh_with_progress(
     Ok(layers)
 }
 
-/// Number of neighbors averaged on each side of a wall-loop point by
-/// [`smooth_wall_loop`]. Kept small (window width 3) so only sub-cell
-/// grid-quantization noise is damped, not real curvature -- see
-/// `smooth_wall_loop`'s doc comment.
-const WALL_SMOOTH_HALF_WINDOW: usize = 1;
-
-/// Number of `smooth_wall_loop` passes applied to each wall loop. Two
-/// light passes measurably reduce zigzag (see `probe_wall_noise`) without
-/// visibly rounding real corners at this window size.
-const WALL_SMOOTH_ITERATIONS: usize = 2;
-
-/// Applies [`WALL_SMOOTH_ITERATIONS`] passes of a centered moving-average
-/// filter (window `2 * WALL_SMOOTH_HALF_WINDOW + 1`, wrapping around the
-/// closed loop) to `wall.points` in place, to damp the grid-quantization
-/// zigzag documented on this function's caller. Points flagged
-/// `unsupported` (inserted by wall-gap stitching -- not relevant here
-/// since this runs *before* stitching, but kept as a defensive guard
-/// against future reordering) and loops too short to have a meaningful
-/// neighborhood (`points.len() < 2 * WALL_SMOOTH_HALF_WINDOW + 3`) are
-/// left untouched.
-fn smooth_wall_loop(wall: &mut WallLoop) {
-    let n = wall.points.len();
-    if n < 2 * WALL_SMOOTH_HALF_WINDOW + 3 {
+/// Applies a feature-preserving moving-average filter to `points` in place:
+/// sharp corners (turn angle > 30°) are left untouched so CAD corners and sharp
+/// features are never rounded or shrunk away from the true surface, and any
+/// smoothed point's displacement is clamped to a tiny fraction of the nozzle
+/// diameter (`MAX_SMOOTH_DISPLACEMENT = 0.02 * nozzle_diameter`, ~0.008 mm)
+/// so it only damps sub-cell grid quantization noise without drifting from the
+/// true geometry.
+fn smooth_closed_points(points: &mut [DVec3], max_displacement: f64) {
+    let n = points.len();
+    if n < 5 {
         return;
     }
-    for _ in 0..WALL_SMOOTH_ITERATIONS {
+    // cos(30 degrees) ~= 0.866; turns sharper than 30 deg are preserved as sharp corners.
+    const CORNER_COS_THRESHOLD: f64 = 0.866;
+
+    let original = points.to_vec();
+    for (i, p) in points.iter_mut().enumerate() {
+        let prev = original[(i as isize - 1).rem_euclid(n as isize) as usize];
+        let cur = original[i];
+        let next = original[(i as isize + 1).rem_euclid(n as isize) as usize];
+
+        let Some(t_in) = (cur - prev).try_normalize() else {
+            continue;
+        };
+        let Some(t_out) = (next - cur).try_normalize() else {
+            continue;
+        };
+
+        if t_in.dot(t_out) < CORNER_COS_THRESHOLD {
+            // Sharp geometric corner: preserve exact position.
+            continue;
+        }
+
+        let target = (prev + cur + next) / 3.0;
+        let delta = target - cur;
+        let delta_len = delta.length();
+        if delta_len > 0.0 {
+            let clamped_delta = if delta_len > max_displacement {
+                delta * (max_displacement / delta_len)
+            } else {
+                delta
+            };
+            *p = cur + clamped_delta;
+        }
+    }
+}
+
+/// Applies feature-preserving smoothing to `wall.points` in place to damp
+/// Eikonal grid-quantization noise. Points flagged `unsupported` (stitched)
+/// and sharp geometric corners are left untouched.
+fn smooth_wall_loop(wall: &mut WallLoop, max_displacement: f64) {
+    let n = wall.points.len();
+    if n < 5 {
+        return;
+    }
+    if wall.unsupported.iter().any(|&u| u) {
+        const CORNER_COS_THRESHOLD: f64 = 0.866;
         let original = wall.points.clone();
         for i in 0..n {
             if wall.unsupported.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            let mut sum = DVec3::ZERO;
-            let mut count = 0.0;
-            for offset in -(WALL_SMOOTH_HALF_WINDOW as isize)..=(WALL_SMOOTH_HALF_WINDOW as isize) {
-                let j = (i as isize + offset).rem_euclid(n as isize) as usize;
-                if wall.unsupported.get(j).copied().unwrap_or(false) {
-                    continue;
-                }
-                sum += original[j];
-                count += 1.0;
+            let prev_idx = (i as isize - 1).rem_euclid(n as isize) as usize;
+            let next_idx = (i as isize + 1).rem_euclid(n as isize) as usize;
+            if wall.unsupported.get(prev_idx).copied().unwrap_or(false)
+                || wall.unsupported.get(next_idx).copied().unwrap_or(false)
+            {
+                continue;
             }
-            if count > 0.0 {
-                wall.points[i] = sum / count;
+            let prev = original[prev_idx];
+            let cur = original[i];
+            let next = original[next_idx];
+
+            let (Some(t_in), Some(t_out)) =
+                ((cur - prev).try_normalize(), (next - cur).try_normalize())
+            else {
+                continue;
+            };
+            if t_in.dot(t_out) < CORNER_COS_THRESHOLD {
+                continue;
+            }
+
+            let target = (prev + cur + next) / 3.0;
+            let delta = target - cur;
+            let delta_len = delta.length();
+            if delta_len > 0.0 {
+                let clamped_delta = if delta_len > max_displacement {
+                    delta * (max_displacement / delta_len)
+                } else {
+                    delta
+                };
+                wall.points[i] = cur + clamped_delta;
             }
         }
+    } else {
+        smooth_closed_points(&mut wall.points, max_displacement);
     }
 }
 
@@ -2339,63 +2394,139 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             .collect();
         let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
 
-        // Index increases going *down* (see `BUILD_DIRECTION`: index 0 is
-        // the top of the object, index `n - 1` the bottom), so the layer
-        // physically above `k` is `k - 1` and the layer physically below is
-        // `k + 1`.
-        let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
-            .into_par_iter()
-            .map(|k| {
-                if k == 0 {
-                    boundaries_2d[k].clone()
-                } else {
-                    polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
+        // Determine whether layer index `k` increases with physical height (Z)
+        // or decreases (HeightOrderField has `order = -z`, so index 0 is top;
+        // EikonalOrderField seeds from bed, so index 0 is bottom).
+        let z_at = |pos: usize| -> f64 {
+            let mut sum_z = 0.0;
+            let mut count = 0usize;
+            for pts in &layers[pos].infill_boundary {
+                for p in pts {
+                    sum_z += p.z;
+                    count += 1;
                 }
-            })
-            .collect();
-        let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
-            .into_par_iter()
-            .map(|k| {
-                let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
-                if next.is_empty() {
-                    boundaries_2d[k].clone()
-                } else {
-                    polygon2d::difference(&boundaries_2d[k], next)
+            }
+            if count == 0 {
+                for wall in &layers[pos].loops {
+                    for p in &wall.points {
+                        sum_z += p.z;
+                        count += 1;
+                    }
                 }
-            })
-            .collect();
+            }
+            if count > 0 {
+                sum_z / count as f64
+            } else {
+                0.0
+            }
+        };
 
-        let solid_2d_per_k: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
-            .into_par_iter()
-            .map(|k| {
-                let mut regions: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
-                if config.top_layers > 0 {
-                    // A top-facing surface at layer `j` makes `top_layers` worth
-                    // of layers *below* it (physically below = larger index,
-                    // i.e. `j..=j+top_layers-1`) solid. So layer `k` picks up
-                    // contributions from `exposed_above(j)` for `j` in
-                    // `k-top_layers+1..=k` (backward from `k`, since index
-                    // increases going down).
-                    let start = k.saturating_sub(config.top_layers - 1);
-                    for exposed in exposed_above.iter().take(k + 1).skip(start) {
-                        regions.push(exposed.clone());
+        let first_real_pos = positions
+            .iter()
+            .copied()
+            .find(|&p| !layers[p].infill_boundary.is_empty() || !layers[p].loops.is_empty());
+        let last_real_pos = positions
+            .iter()
+            .copied()
+            .rfind(|&p| !layers[p].infill_boundary.is_empty() || !layers[p].loops.is_empty());
+        let z_increases = match (first_real_pos, last_real_pos) {
+            (Some(f), Some(l)) if f != l => z_at(l) >= z_at(f),
+            _ => false,
+        };
+
+        let solid_2d_per_k: Vec<Vec<Vec<[f64; 2]>>> = if z_increases {
+            // Index increases with height: k + 1 is above k, k - 1 is below k.
+            let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
+                .into_par_iter()
+                .map(|k| {
+                    let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
+                    if next.is_empty() {
+                        boundaries_2d[k].clone()
+                    } else {
+                        polygon2d::difference(&boundaries_2d[k], next)
                     }
-                }
-                if config.bottom_layers > 0 {
-                    // Symmetric: a bottom-facing surface at `j` makes
-                    // `bottom_layers` worth of layers *above* it (physically
-                    // above = smaller index, i.e. `j-bottom_layers+1..=j`)
-                    // solid, so layer `k` picks up `exposed_below(j)` for `j` in
-                    // `k..=k+bottom_layers-1` (forward from `k`).
-                    let end = (k + config.bottom_layers - 1).min(n - 1);
-                    for exposed in exposed_below.iter().take(end + 1).skip(k) {
-                        regions.push(exposed.clone());
+                })
+                .collect();
+            let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
+                .into_par_iter()
+                .map(|k| {
+                    if k == 0 {
+                        boundaries_2d[k].clone()
+                    } else {
+                        polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
                     }
-                }
-                let exposed_union = polygon2d::union(&regions);
-                polygon2d::intersection(&exposed_union, &boundaries_2d[k])
-            })
-            .collect();
+                })
+                .collect();
+
+            (0..n)
+                .into_par_iter()
+                .map(|k| {
+                    let mut regions: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
+                    if config.top_layers > 0 {
+                        // Top surface at layer j makes `top_layers` layers below it (j - top_layers + 1..=j) solid.
+                        // Layer k gets contributions from j in k..=min(n - 1, k + top_layers - 1).
+                        let end = (k + config.top_layers - 1).min(n - 1);
+                        for exposed in exposed_above.iter().take(end + 1).skip(k) {
+                            regions.push(exposed.clone());
+                        }
+                    }
+                    if config.bottom_layers > 0 {
+                        // Bottom surface at layer j makes `bottom_layers` layers above it (j..=j + bottom_layers - 1) solid.
+                        // Layer k gets contributions from j in max(0, k - bottom_layers + 1)..=k.
+                        let start = k.saturating_sub(config.bottom_layers - 1);
+                        for exposed in exposed_below.iter().take(k + 1).skip(start) {
+                            regions.push(exposed.clone());
+                        }
+                    }
+                    let exposed_union = polygon2d::union(&regions);
+                    polygon2d::intersection(&exposed_union, &boundaries_2d[k])
+                })
+                .collect()
+        } else {
+            // Index decreases with height (HeightOrderField): k - 1 is above k, k + 1 is below k.
+            let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
+                .into_par_iter()
+                .map(|k| {
+                    if k == 0 {
+                        boundaries_2d[k].clone()
+                    } else {
+                        polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
+                    }
+                })
+                .collect();
+            let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
+                .into_par_iter()
+                .map(|k| {
+                    let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
+                    if next.is_empty() {
+                        boundaries_2d[k].clone()
+                    } else {
+                        polygon2d::difference(&boundaries_2d[k], next)
+                    }
+                })
+                .collect();
+
+            (0..n)
+                .into_par_iter()
+                .map(|k| {
+                    let mut regions: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
+                    if config.top_layers > 0 {
+                        let start = k.saturating_sub(config.top_layers - 1);
+                        for exposed in exposed_above.iter().take(k + 1).skip(start) {
+                            regions.push(exposed.clone());
+                        }
+                    }
+                    if config.bottom_layers > 0 {
+                        let end = (k + config.bottom_layers - 1).min(n - 1);
+                        for exposed in exposed_below.iter().take(end + 1).skip(k) {
+                            regions.push(exposed.clone());
+                        }
+                    }
+                    let exposed_union = polygon2d::union(&regions);
+                    polygon2d::intersection(&exposed_union, &boundaries_2d[k])
+                })
+                .collect()
+        };
 
         for (k, solid_2d) in solid_2d_per_k.into_iter().enumerate() {
             let order = layers[positions[k]].order;
@@ -3171,6 +3302,42 @@ mod tests {
             assert_eq!(indices, vec![0, 1, 2]);
             for wall_loop in &layer.loops {
                 assert!(!wall_loop.points.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn slice_mesh_curved_field_infill_boundary_is_smoothed_identically_to_inner_wall() {
+        let config_1wall = SlicerConfig {
+            layer_height: 0.25,
+            wall_line_width: 0.1,
+            shell_thickness: 0.1,
+            wall_offset: 0.05,
+            order_field: crate::order_field::OrderFieldKind::Conical,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(config_1wall.wall_count(), 1);
+
+        let mut config_2wall = config_1wall.clone();
+        config_2wall.shell_thickness = 0.2;
+        assert_eq!(config_2wall.wall_count(), 2);
+
+        let layers_1wall = slice_mesh(&big_cube_mesh(), &config_1wall).unwrap();
+        let layers_2wall = slice_mesh(&big_cube_mesh(), &config_2wall).unwrap();
+
+        for (l1, l2) in layers_1wall.iter().zip(layers_2wall.iter()) {
+            let wall1_loops: Vec<_> = l2.loops.iter().filter(|w| w.wall_index == 1).collect();
+            if !wall1_loops.is_empty() && !l1.infill_boundary.is_empty() {
+                assert_eq!(wall1_loops.len(), l1.infill_boundary.len());
+                for (w, b) in wall1_loops.iter().zip(l1.infill_boundary.iter()) {
+                    assert_eq!(w.points.len(), b.len());
+                    for (p, q) in w.points.iter().zip(b.iter()) {
+                        assert!(
+                            p.distance(*q) < 1e-6,
+                            "expected 2-wall Wall 1 point {p:?} to match 1-wall infill_boundary point {q:?}"
+                        );
+                    }
+                }
             }
         }
     }

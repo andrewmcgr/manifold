@@ -74,7 +74,9 @@ impl InfillRegion {
     /// the layer entirely if its whole infill boundary is solid.
     #[must_use]
     pub fn from_layer(layer: &Layer, config: &SlicerConfig) -> Self {
-        if layer.solid_fill_boundary.is_empty() {
+        if layer.solid_fill_boundary.is_empty()
+            || config.infill_pattern == InfillPatternKind::AllWalls
+        {
             return Self {
                 loops: layer.infill_boundary.clone(),
             };
@@ -599,7 +601,8 @@ impl InfillGenerator for ConcentricInfill {
         // extra inset; only subsequent rings step inward by a further full
         // `spacing`, until an offset collapses to nothing.
         let mut rings_2d: Vec<Vec<[f64; 2]>> = Vec::new();
-        let mut current = polygon2d::inward_offset(&boundary_2d, 0.0);
+        rings_2d.extend(boundary_2d.clone());
+        let mut current = polygon2d::inward_offset(&boundary_2d, spacing);
         let mut steps = 0usize;
         while !current.is_empty() && steps < MAX_OFFSET_RINGS {
             rings_2d.extend(current.iter().cloned());
@@ -706,7 +709,8 @@ impl InfillGenerator for AllWallsInfill {
         // `ConcentricInfill::generate`'s identical comment above), so the
         // first ring sits directly on it with zero extra inset.
         let mut rings_2d: Vec<Vec<[f64; 2]>> = Vec::new();
-        let mut current = polygon2d::inward_offset(&boundary_2d, 0.0);
+        rings_2d.extend(boundary_2d.clone());
+        let mut current = polygon2d::inward_offset(&boundary_2d, spacing);
         let mut steps = 0usize;
         while !current.is_empty() && steps < MAX_OFFSET_RINGS {
             rings_2d.extend(current.iter().cloned());

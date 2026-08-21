@@ -449,10 +449,11 @@ fn compensate_flat_nozzle(paths: Vec<Path>, layer: &Layer, config: &SlicerConfig
     paths
         .into_iter()
         .map(|mut path| {
-            let is_wall_loop = path.segments.first().is_some_and(|segment| {
-                matches!(segment.kind, MoveKind::WallOuter | MoveKind::WallInner)
-            });
-            if is_wall_loop && path.points.len() >= 3 {
+            let is_outer_wall = path
+                .segments
+                .first()
+                .is_some_and(|segment| matches!(segment.kind, MoveKind::WallOuter));
+            if is_outer_wall && path.points.len() >= 3 {
                 path.points = compensate_wall_loop_points(
                     &path.points,
                     field,
@@ -477,16 +478,16 @@ fn compensate_wall_loop_points(
     layer_order: f64,
 ) -> Vec<DVec3> {
     // Order value of the layer printed just before this one -- order
-    // decreases as printing proceeds (see `slicing::BUILD_DIRECTION`), so
-    // the already-solidified prior layer sits at a *higher* order value.
-    let prev_layer_order = layer_order + layer_height;
+    // increases as printing proceeds (see `slicing::BUILD_DIRECTION`), so
+    // the already-solidified prior layer sits at a *lower* order value.
+    let prev_layer_order = layer_order - layer_height;
     let nozzle_dir = crate::slicing::NOZZLE_DIRECTION;
 
     points
         .iter()
         .map(|&p| {
-            let Some(normal) =
-                crate::order_field::numeric_gradient(field, p).map(|g| -g.normalize())
+            let Some(normal) = crate::order_field::numeric_gradient(field, p)
+                .and_then(|g| g.try_normalize().map(|n| -n))
             else {
                 return p;
             };
@@ -505,19 +506,19 @@ fn compensate_wall_loop_points(
             // vector everywhere, its projection only varies with the
             // local normal, not with loop-traversal position.
             let projected = nozzle_dir - normal * nozzle_dir.dot(normal);
-            let shift_len = projected.length();
-            if shift_len < 1e-9 {
+            let Some(shift_dir) = projected.try_normalize() else {
                 // Nozzle axis is parallel to the surface normal here (a
                 // flat tip lands flush): no correction needed.
                 return p;
-            }
-            let shift_dir = projected / shift_len;
+            };
 
             let probe_a = p + shift_dir * flat_radius;
             let probe_b = p - shift_dir * flat_radius;
             let (Some(normal_a), Some(normal_b)) = (
-                crate::order_field::numeric_gradient(field, probe_a).map(|g| -g.normalize()),
-                crate::order_field::numeric_gradient(field, probe_b).map(|g| -g.normalize()),
+                crate::order_field::numeric_gradient(field, probe_a)
+                    .and_then(|g| g.try_normalize().map(|n| -n)),
+                crate::order_field::numeric_gradient(field, probe_b)
+                    .and_then(|g| g.try_normalize().map(|n| -n)),
             ) else {
                 return p;
             };
@@ -1515,7 +1516,9 @@ pub fn plan_with_progress(
                 paths.push(infill_path);
             }
 
-            if !layer.solid_fill_boundary.is_empty() {
+            if !layer.solid_fill_boundary.is_empty()
+                && config.infill_pattern != infill::InfillPatternKind::AllWalls
+            {
                 let solid_region = InfillRegion {
                     loops: layer.solid_fill_boundary.clone(),
                 };
