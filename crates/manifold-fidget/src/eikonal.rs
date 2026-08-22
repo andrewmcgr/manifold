@@ -205,8 +205,11 @@ impl EikonalOrderField {
         let (mut field, occupied) =
             Self::build_grid(min_corner, max_corner, requested_cell_size, is_solid);
         field.march_from_region(is_seed_region, &occupied);
-        if let (Some(profile), Some(height_along)) = (slope_profile, height_along) {
-            field.relax_with_slope_limit(profile, height_along, &occupied);
+        if let Some(profile) = slope_profile {
+            let default_height =
+                crate::height_along::ConstantAxisHeight::new(glam::DVec3::Z, min_corner);
+            let ha: &dyn HeightAlong = height_along.unwrap_or(&default_height);
+            field.relax_with_slope_limit(profile, ha, &occupied);
         }
         field.compute_gradients(&occupied);
         field
@@ -258,8 +261,11 @@ impl EikonalOrderField {
             }
         }
 
-        if let (Some(profile), Some(height_along)) = (slope_profile, height_along) {
-            bed_field.relax_with_slope_limit(profile, height_along, &occupied);
+        if let Some(profile) = slope_profile {
+            let default_height =
+                crate::height_along::ConstantAxisHeight::new(glam::DVec3::Z, min_corner);
+            let ha: &dyn HeightAlong = height_along.unwrap_or(&default_height);
+            bed_field.relax_with_slope_limit(profile, ha, &occupied);
         }
         bed_field.compute_gradients(&occupied);
         bed_field
@@ -636,7 +642,7 @@ impl EikonalOrderField {
         &mut self,
         profile: &SlopeProfile,
         height_along: &dyn HeightAlong,
-        occupied: &[bool],
+        _occupied: &[bool],
     ) {
         let [nx, ny, nz] = self.dims;
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
@@ -645,7 +651,7 @@ impl EikonalOrderField {
             for y in 0..ny {
                 for x in 0..nx {
                     let idx = self.idx(x, y, z);
-                    if occupied[idx] && self.distances[idx].is_finite() {
+                    if self.distances[idx].is_finite() {
                         heap.push(HeapEntry {
                             value: self.distances[idx],
                             x,
@@ -664,7 +670,7 @@ impl EikonalOrderField {
 
         while let Some(HeapEntry { value, x, y, z }) = heap.pop() {
             let idx = self.idx(x, y, z);
-            if !occupied[idx] || self.distances[idx] < value {
+            if self.distances[idx] < value {
                 // Stale heap entry superseded by a smaller value already
                 // recorded for this node; skip.
                 continue;
@@ -717,9 +723,6 @@ impl EikonalOrderField {
                 }
                 let (nxu, nyu, nzu) = (nxp as usize, nyp as usize, nzp as usize);
                 let nidx = self.idx(nxu, nyu, nzu);
-                if !occupied[nidx] {
-                    continue;
-                }
 
                 let candidate = t_p + slope_multiplier * self.h;
                 if candidate.is_nan() {
@@ -1869,5 +1872,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn slope_profile_relaxation_couples_features_across_open_air_gap() {
+        // Two vertical pillars separated by 10mm of open air.
+        // Pillar A at x in [0, 2], Pillar B at x in [12, 14].
+        // Pillar A is seeded at z=0, Pillar B is seeded at z=0 with a delayed offset.
+        let min_corner = DVec3::new(0.0, 0.0, 0.0);
+        let max_corner = DVec3::new(14.0, 2.0, 10.0);
+        let is_solid = |p: DVec3| (p.x <= 2.0 || p.x >= 12.0) && p.y <= 2.0 && p.z <= 10.0;
+        let is_seed = |p: DVec3| p.x <= 2.0 && p.z <= 0.5;
+
+        // With a 10-degree slope profile, the maximum order difference across the
+        // 10mm horizontal gap (dx = 10mm) is capped at 10 * tan(10 deg) ~ 1.76mm.
+        let profile = SlopeProfile::new(vec![(0.0, 10.0)]);
+
+        let field = EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
+            min_corner,
+            max_corner,
+            1.0,
+            &is_solid,
+            &is_seed,
+            Some(&profile),
+            None,
+        );
+
+        let order_a = field.order(DVec3::new(1.0, 1.0, 5.0));
+        let order_b = field.order(DVec3::new(13.0, 1.0, 5.0));
+
+        let max_allowed_delta = 12.0 * 10.0f64.to_radians().tan() + 1.0;
+        assert!(
+            (order_a - order_b).abs() <= max_allowed_delta,
+            "order difference across open air ({}) exceeded max slope limit bound ({})",
+            (order_a - order_b).abs(),
+            max_allowed_delta
+        );
     }
 }
