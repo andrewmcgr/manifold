@@ -42,6 +42,15 @@ pub struct SlicerConfig {
     /// First layer extrusion flow multiplier, defaulting to `1.0` when `None`.
     #[serde(default)]
     pub first_layer_extrusion_multiplier: Option<f64>,
+    /// First layer line width (mm), defaulting to 130% of `nozzle_diameter` (or `wall_line_width`) when `None`.
+    #[serde(default)]
+    pub first_layer_line_width: Option<f64>,
+    /// Part cooling fan speed percentage (0.0 to 100.0), defaulting to 100.0% when `None`.
+    #[serde(default)]
+    pub fan_speed_percent: Option<f64>,
+    /// Number of initial layers to keep part cooling fan disabled, defaulting to 1 (disabled on layer 0) when `None`.
+    #[serde(default)]
+    pub fan_layer_delay: Option<u32>,
     pub nozzle_diameter: f64,
     /// Strategy used to decide the order objects are printed in. See
     /// `ordering` module and ROADMAP.md open decision #2.
@@ -313,6 +322,9 @@ impl Default for SlicerConfig {
             first_layer_height: None,
             first_layer_print_speed: None,
             first_layer_extrusion_multiplier: None,
+            first_layer_line_width: None,
+            fan_speed_percent: None,
+            fan_layer_delay: None,
             nozzle_diameter,
             object_ordering: ordering::ObjectOrderingKind::default(),
             wall_line_width,
@@ -401,6 +413,26 @@ impl SlicerConfig {
     #[must_use]
     pub fn first_layer_extrusion_multiplier(&self) -> f64 {
         self.first_layer_extrusion_multiplier.unwrap_or(1.0)
+    }
+
+    /// First layer line width (mm), defaulting to `1.3 * nozzle_diameter`
+    /// (or `wall_line_width`, whichever is larger) when `None`.
+    #[must_use]
+    pub fn first_layer_line_width(&self) -> f64 {
+        self.first_layer_line_width
+            .unwrap_or_else(|| (self.nozzle_diameter * 1.3).max(self.wall_line_width))
+    }
+
+    /// Part cooling fan speed percentage (0.0 to 100.0), defaulting to `100.0` when `None`.
+    #[must_use]
+    pub fn fan_speed_percent(&self) -> f64 {
+        self.fan_speed_percent.unwrap_or(100.0).clamp(0.0, 100.0)
+    }
+
+    /// Number of initial layers to keep part cooling fan disabled, defaulting to `1` when `None`.
+    #[must_use]
+    pub fn fan_layer_delay(&self) -> u32 {
+        self.fan_layer_delay.unwrap_or(1)
     }
 
     /// Diameter (mm) of the nozzle tip's flat land, used by

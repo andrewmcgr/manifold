@@ -169,19 +169,33 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
     // extrusion mode before the first extruding move.
     out.push_str("M82\n");
 
+    let fan_pwm = (255.0 * (config.fan_speed_percent() / 100.0)).round() as u32;
+    let fan_delay = config.fan_layer_delay();
+    let mut fan_is_on = false;
+    let mut seen_orders: Vec<f64> = Vec::new();
+
+    if fan_delay > 0 && fan_pwm > 0 {
+        out.push_str("M106 S0\n");
+    } else if fan_delay == 0 && fan_pwm > 0 {
+        out.push_str(&format!("M106 S{fan_pwm}\n"));
+        fan_is_on = true;
+    }
+
     let mut current_tool = None;
     let mut current_e = 0.0;
     let mut current_f: Option<f64> = None;
-    // Whether the active tool's filament is currently retracted. `PRINT_START`
-    // (i.e. `config.start_gcode`) is assumed to leave the printer retracted --
-    // see this function's doc -- so a freshly selected tool (including the
-    // first one, before the loop's first iteration) starts out `true` rather
-    // than `false`. Tracked as a single flag rather than per-tool state: each
-    // tool-select block below resets it to `true` in lockstep with `current_e`,
-    // matching the same "fresh tool = fresh, unprimed state" assumption.
     let mut retracted = true;
 
     for path in paths {
+        let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
+        if !seen_orders.iter().any(|&o| (o - path_order).abs() < 1e-4) {
+            seen_orders.push(path_order);
+            let layer_idx = (seen_orders.len() - 1) as u32;
+            if !fan_is_on && layer_idx >= fan_delay && fan_pwm > 0 {
+                out.push_str(&format!("M106 S{fan_pwm}\n"));
+                fan_is_on = true;
+            }
+        }
         if current_tool != Some(path.tool) {
             out.push_str(&format!("T{}\n", path.tool));
             out.push_str("G92 E0\n");
@@ -763,5 +777,40 @@ mod tests {
         let out = emit(&[], &config);
 
         assert!(out.contains("PRINT_START PRINT_MIN=0.000,0.000"));
+    }
+
+    #[test]
+    fn emit_disables_fan_on_first_layer_and_enables_it_at_configured_layer_delay() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        let path0 = Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.2), DVec3::new(10.0, 0.0, 0.2)],
+            segments: vec![Segment {
+                kind: MoveKind::WallOuter,
+                order: 0.2,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+        };
+        let path1 = Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.4), DVec3::new(10.0, 0.0, 0.4)],
+            segments: vec![Segment {
+                kind: MoveKind::WallOuter,
+                order: 0.4,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            fan_speed_percent: Some(100.0),
+            fan_layer_delay: Some(1),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&[path0, path1], &config);
+        assert!(out.contains("M106 S0\n"), "must turn off fan at start");
+        assert!(out.contains("M106 S255\n"), "must turn on fan at layer 1");
     }
 }

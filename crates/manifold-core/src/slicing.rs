@@ -837,6 +837,12 @@ pub fn slice_mesh_with_progress(
         })
         .collect();
 
+    // Clean first-layer geometry: filter sub-bead noise and recessed micro-lettering
+    // so the initial layer prints with continuous solid perimeters and infill.
+    if let Some(first_layer) = layers.first_mut() {
+        clean_first_layer_geometry(first_layer, config);
+    }
+
     // Curved-path wall-loop smoothing: `EikonalOrderField`/`ConicalOrderField`
     // reconstruct geometry against an interpolated field (trilinear for
     // Eikonal's FMM distance grid -- see `EikonalOrderField::order`'s doc
@@ -892,6 +898,58 @@ pub fn slice_mesh_with_progress(
     }
 
     Ok(layers)
+}
+
+/// Cleans first-layer bed-contact geometry by discarding sub-bead micro-loops
+/// (e.g. tiny embossed lettering or discretization noise on the bed plane)
+/// and filtering infill slivers so the initial layer lays down clean, continuous
+/// perimeters and solid infill with steady extruder pressure.
+fn clean_first_layer_geometry(layer: &mut Layer, config: &SlicerConfig) {
+    if layer.loops.is_empty() {
+        return;
+    }
+    // Filter tiny micro-loops (< 4 * nozzle_diameter perimeter) on the bed layer unless it's the only loop.
+    if layer.loops.len() > 1 {
+        let min_perimeter = config.nozzle_diameter * 4.0;
+        let mut filtered_loops = Vec::new();
+        for wall in &layer.loops {
+            let mut perimeter = 0.0;
+            for i in 0..wall.points.len() {
+                let p0 = wall.points[i];
+                let p1 = wall.points[(i + 1) % wall.points.len()];
+                perimeter += (p1 - p0).length();
+            }
+            if wall.wall_index == 0 && perimeter < min_perimeter {
+                continue;
+            }
+            filtered_loops.push(wall.clone());
+        }
+        if !filtered_loops.is_empty() {
+            layer.loops = filtered_loops;
+        }
+    }
+
+    // In the infill boundary on the first layer, filter out sub-bead microscopic slivers
+    if !layer.infill_boundary.is_empty() {
+        let min_hole_area = config.nozzle_diameter * config.nozzle_diameter * 2.0;
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+        let b2d = polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, DVec3::ZERO);
+        let cleaned_2d = polygon2d::filter_min_area(&b2d, min_hole_area);
+        if !cleaned_2d.is_empty() {
+            let references = layer.infill_boundary.clone();
+            layer.infill_boundary = order_field::reconstruct_on_order_field_near(
+                cleaned_2d,
+                &references,
+                basis1,
+                basis2,
+                BUILD_DIRECTION,
+                DVec3::ZERO,
+                layer.order,
+                order_field::max_along_for(config),
+                layer.order_field.as_ref(),
+            );
+        }
+    }
 }
 
 /// Applies a feature-preserving moving-average filter to `points` in place:

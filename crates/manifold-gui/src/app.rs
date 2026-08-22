@@ -557,6 +557,16 @@ impl ManifoldApp {
         {
             self.config.first_layer_extrusion_multiplier = Some(first_layer_mult);
         }
+        let mut first_layer_w = self.config.first_layer_line_width();
+        if ui
+            .add(
+                egui::Slider::new(&mut first_layer_w, 0.1..=1.5)
+                    .text("First layer line width (mm)"),
+            )
+            .changed()
+        {
+            self.config.first_layer_line_width = Some(first_layer_w);
+        }
         ui.add(
             egui::Slider::new(&mut self.config.nozzle_diameter, 0.1..=1.5)
                 .text("Nozzle diameter (mm)"),
@@ -796,6 +806,23 @@ impl ManifoldApp {
                 egui::Slider::new(&mut self.config.path_simplify_tolerance, 0.0..=0.5)
                     .text("Simplification tolerance (mm)"),
             );
+        }
+
+        ui.separator();
+        ui.heading("Cooling & Fan");
+        let mut fan_pct = self.config.fan_speed_percent();
+        if ui
+            .add(egui::Slider::new(&mut fan_pct, 0.0..=100.0).text("Fan speed (%)"))
+            .changed()
+        {
+            self.config.fan_speed_percent = Some(fan_pct);
+        }
+        let mut fan_delay = self.config.fan_layer_delay();
+        if ui
+            .add(egui::Slider::new(&mut fan_delay, 0..=10).text("Fan disabled initial layers"))
+            .changed()
+        {
+            self.config.fan_layer_delay = Some(fan_delay);
         }
 
         ui.separator();

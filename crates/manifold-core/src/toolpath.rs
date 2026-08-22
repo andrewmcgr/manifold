@@ -1604,6 +1604,11 @@ pub fn plan_with_progress(
                     segment.support_fraction = support_fraction.max(bed_fraction);
                     let is_first_layer =
                         bed_fraction > 0.0 || (layer.order - order_min).abs() < 1e-6;
+                    let effective_line_width = if is_first_layer {
+                        config.first_layer_line_width()
+                    } else {
+                        line_width
+                    };
                     let effective_layer_height = if is_first_layer {
                         config.first_layer_height()
                     } else {
@@ -1615,7 +1620,7 @@ pub fn plan_with_progress(
                         1.0
                     };
                     let bead_area = extrusion::blended_bead_cross_section_area(
-                        line_width,
+                        effective_line_width,
                         effective_layer_height,
                         config.nozzle_diameter,
                         support_fraction,
@@ -2994,13 +2999,14 @@ mod tests {
         assert!(wall_path.points.len() < staircase_points + 2);
 
         let filament_area = extrusion::filament_cross_section_area(config.filament_diameter);
-        let line_width = extrusion::line_width_for_kind(MoveKind::WallOuter, &config);
-        let bead_area = extrusion::bead_cross_section_area(line_width, config.layer_height);
+        let line_width = config.first_layer_line_width();
+        let bead_area = extrusion::bead_cross_section_area(line_width, config.first_layer_height());
         let point_count = wall_path.points.len();
         for (i, segment) in wall_path.segments.iter().enumerate() {
             let distance = wall_path.points[i].distance(wall_path.points[(i + 1) % point_count]);
             let expected = extrusion::segment_extrusion_length(distance, bead_area, filament_area)
-                * segment.extrusion_rate;
+                * segment.extrusion_rate
+                * config.first_layer_extrusion_multiplier();
             assert!(
                 (segment.extrusion_length - expected).abs() < 1e-9,
                 "segment {i}: extrusion_length {} did not match post-simplify distance-derived value {expected}",
