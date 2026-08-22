@@ -34,6 +34,8 @@ pub const ADDR: &str = "127.0.0.1:8931";
 /// own tokio thread) to `ManifoldApp::update` (sync, on the UI thread).
 pub enum Command {
     SelectObject(usize),
+    RemoveObject(usize),
+    ClearObjects,
     SetTransform {
         index: usize,
         x: f64,
@@ -49,6 +51,11 @@ pub enum Command {
 
 #[derive(Deserialize, JsonSchema)]
 struct SelectObjectParams {
+    index: usize,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RemoveObjectParams {
     index: usize,
 }
 
@@ -110,6 +117,21 @@ impl SceneServer {
     ) -> String {
         let _ = self.tx.send(Command::SelectObject(index));
         format!("selected object {index}")
+    }
+
+    #[tool(description = "Remove an object by its index in the object list.")]
+    async fn remove_object(
+        &self,
+        Parameters(RemoveObjectParams { index }): Parameters<RemoveObjectParams>,
+    ) -> String {
+        let _ = self.tx.send(Command::RemoveObject(index));
+        format!("removed object {index}")
+    }
+
+    #[tool(description = "Remove all objects currently loaded in the scene.")]
+    async fn clear_objects(&self) -> String {
+        let _ = self.tx.send(Command::ClearObjects);
+        "cleared all objects".to_string()
     }
 
     #[tool(description = "Set an object's translation (position) by index.")]

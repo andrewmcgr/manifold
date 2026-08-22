@@ -522,20 +522,24 @@ pub fn slice_mesh_with_progress(
     // sampling the field at actual mesh vertices (which do lie on/near the
     // solid) whenever the bbox-corner estimate isn't finite.
     let (order_min, order_max) = {
-        let (lo, hi) = order_range_over_bbox(&*field, min, max);
-        if lo.is_finite() && hi.is_finite() {
-            (lo, hi)
-        } else {
-            let (mut vlo, mut vhi) = (f64::INFINITY, f64::NEG_INFINITY);
-            for &v in &mesh.vertices {
-                let value = field.order(v);
-                if value.is_finite() {
-                    vlo = vlo.min(value);
-                    vhi = vhi.max(value);
-                }
+        let mut vlo = f64::INFINITY;
+        let mut vhi = f64::NEG_INFINITY;
+        for &v in &mesh.vertices {
+            let value = field.order(v);
+            if value.is_finite() {
+                vlo = vlo.min(value);
+                vhi = vhi.max(value);
             }
-            if vlo.is_finite() && vhi.is_finite() {
-                (vlo, vhi)
+        }
+        if vlo.is_finite() && vhi.is_finite() {
+            let (lo, hi) = order_range_over_bbox(&*field, min, max);
+            let min_val = if lo.is_finite() { vlo.min(lo) } else { vlo };
+            let max_val = if hi.is_finite() { vhi.max(hi) } else { vhi };
+            (min_val, max_val)
+        } else {
+            let (lo, hi) = order_range_over_bbox(&*field, min, max);
+            if lo.is_finite() && hi.is_finite() {
+                (lo, hi)
             } else {
                 return Err(Error::Slicing(
                     "order field produced no finite values over the mesh's bounding box or vertices"

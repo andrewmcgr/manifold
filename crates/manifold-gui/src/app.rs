@@ -251,6 +251,22 @@ impl ManifoldApp {
                         None
                     };
                 }
+                crate::mcp::Command::RemoveObject(index) => {
+                    let device = frame
+                        .wgpu_render_state()
+                        .expect("wgpu renderer is required")
+                        .device
+                        .clone();
+                    self.remove_object(index, &device);
+                }
+                crate::mcp::Command::ClearObjects => {
+                    let device = frame
+                        .wgpu_render_state()
+                        .expect("wgpu renderer is required")
+                        .device
+                        .clone();
+                    self.clear_objects(&device);
+                }
                 crate::mcp::Command::SetTransform { index, x, y, z } => {
                     if let Some(object) = self.objects.get_mut(index) {
                         let (scale, rotation, _) =
@@ -325,6 +341,55 @@ impl ManifoldApp {
             }
             Err(err) => self.import_error = Some(err.to_string()),
         }
+    }
+
+    /// Removes the object at `index` from the scene and refreshes GPU buffers.
+    fn remove_object(&mut self, index: usize, device: &eframe::egui_wgpu::wgpu::Device) {
+        if index < self.objects.len() {
+            self.objects.remove(index);
+            if let Some(selected) = self.selected {
+                if selected == index {
+                    self.selected = None;
+                } else if selected > index {
+                    self.selected = Some(selected - 1);
+                }
+            }
+
+            // Invalidate slicing outputs since geometry changed
+            self.gcode = None;
+            self.toolpaths = None;
+            self.uploaded_toolpaths = None;
+            self.toolpath_order_range = None;
+            self.slice_error = None;
+
+            // Clear SDF previews if no object is selected
+            if self.selected.is_none() {
+                self.sdf_slice = None;
+                self.sdf_slice_texture = None;
+                self.sdf_isosurface = None;
+                self.sdf_overlay_mesh = None;
+                self.sdf_error = None;
+            }
+
+            self.reupload(device);
+        }
+    }
+
+    /// Removes all objects from the scene and resets selection.
+    fn clear_objects(&mut self, device: &eframe::egui_wgpu::wgpu::Device) {
+        self.objects.clear();
+        self.selected = None;
+        self.gcode = None;
+        self.toolpaths = None;
+        self.uploaded_toolpaths = None;
+        self.toolpath_order_range = None;
+        self.slice_error = None;
+        self.sdf_slice = None;
+        self.sdf_slice_texture = None;
+        self.sdf_isosurface = None;
+        self.sdf_overlay_mesh = None;
+        self.sdf_error = None;
+        self.reupload(device);
     }
 
     fn reupload(&mut self, device: &eframe::egui_wgpu::wgpu::Device) {
@@ -940,6 +1005,7 @@ impl ManifoldApp {
             ui.label("No objects loaded. Use Import to load an STL or 3MF file.");
         } else {
             let tool_ids: Vec<ToolId> = self.machine.tools.iter().map(|tool| tool.id).collect();
+            let mut remove_index = None;
             for (index, object) in self.objects.iter_mut().enumerate() {
                 let selected = self.selected == Some(index);
                 let label = format!(
@@ -962,7 +1028,26 @@ impl ManifoldApp {
                                 );
                             }
                         });
+                    if ui.button("Remove").clicked() {
+                        remove_index = Some(index);
+                    }
                 });
+            }
+            if let Some(index) = remove_index {
+                let device = frame
+                    .wgpu_render_state()
+                    .expect("wgpu renderer is required")
+                    .device
+                    .clone();
+                self.remove_object(index, &device);
+            }
+            if self.objects.len() > 1 && ui.button("Clear all objects").clicked() {
+                let device = frame
+                    .wgpu_render_state()
+                    .expect("wgpu renderer is required")
+                    .device
+                    .clone();
+                self.clear_objects(&device);
             }
         }
 
@@ -1218,6 +1303,20 @@ impl ManifoldApp {
                     self.import(&path, &device);
                 }
             }
+            if ui
+                .add_enabled(self.selected.is_some(), egui::Button::new("Remove"))
+                .on_hover_text("Remove selected object (or press Delete)")
+                .clicked()
+            {
+                if let Some(index) = self.selected {
+                    let device = frame
+                        .wgpu_render_state()
+                        .expect("wgpu renderer is required")
+                        .device
+                        .clone();
+                    self.remove_object(index, &device);
+                }
+            }
             ui.label(format!("{} object(s) loaded", self.objects.len()));
 
             ui.separator();
@@ -1291,6 +1390,19 @@ impl ManifoldApp {
                 self.reupload_toolpaths(&device);
             }
         });
+
+        if self.selected.is_some()
+            && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+        {
+            if let Some(index) = self.selected {
+                let device = frame
+                    .wgpu_render_state()
+                    .expect("wgpu renderer is required")
+                    .device
+                    .clone();
+                self.remove_object(index, &device);
+            }
+        }
 
         egui::Frame::canvas(ui.style()).show(ui, |ui| {
             let (rect, response) =
