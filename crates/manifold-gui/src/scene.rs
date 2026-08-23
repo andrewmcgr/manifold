@@ -8,16 +8,35 @@ use manifold_core::machine::Machine;
 
 /// One vertex for the unlit scene-dressing shader: position + RGBA color.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
 pub struct SceneVertex {
     position: [f32; 3],
     color: [f32; 4],
 }
 
 impl SceneVertex {
-    fn new(position: DVec3, color: [f32; 4]) -> Self {
+    pub fn new(position: DVec3, color: [f32; 4]) -> Self {
         Self {
             position: position.as_vec3().to_array(),
+            color,
+        }
+    }
+}
+
+/// One line segment instance for the unlit scene-dressing line shader.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+pub struct SceneLineInstance {
+    pub start: [f32; 3],
+    pub end: [f32; 3],
+    pub color: [f32; 4],
+}
+
+impl SceneLineInstance {
+    pub fn new(start: DVec3, end: DVec3, color: [f32; 4]) -> Self {
+        Self {
+            start: start.as_vec3().to_array(),
+            end: end.as_vec3().to_array(),
             color,
         }
     }
@@ -31,39 +50,42 @@ const BED_COLOR: [f32; 4] = [0.3, 0.3, 0.32, 0.35];
 const TOOLHEAD_COLOR: [f32; 4] = [0.95, 0.55, 0.1, 1.0];
 
 /// A fixed-size RGB axis triad at the world origin (X=red, Y=green,
-/// Z=blue), as a line-list vertex buffer.
-pub fn build_origin_axes(length: f64) -> Vec<SceneVertex> {
+/// Z=blue), as a line-instance buffer.
+pub fn build_origin_axes(length: f64) -> Vec<SceneLineInstance> {
     vec![
-        SceneVertex::new(DVec3::ZERO, AXIS_RED),
-        SceneVertex::new(DVec3::new(length, 0.0, 0.0), AXIS_RED),
-        SceneVertex::new(DVec3::ZERO, AXIS_GREEN),
-        SceneVertex::new(DVec3::new(0.0, length, 0.0), AXIS_GREEN),
-        SceneVertex::new(DVec3::ZERO, AXIS_BLUE),
-        SceneVertex::new(DVec3::new(0.0, 0.0, length), AXIS_BLUE),
+        SceneLineInstance::new(DVec3::ZERO, DVec3::new(length, 0.0, 0.0), AXIS_RED),
+        SceneLineInstance::new(DVec3::ZERO, DVec3::new(0.0, length, 0.0), AXIS_GREEN),
+        SceneLineInstance::new(DVec3::ZERO, DVec3::new(0.0, 0.0, length), AXIS_BLUE),
     ]
 }
 
 /// A ground-plane grid over the machine's build volume XY extent, at the
-/// substrate's Z, as a line-list vertex buffer.
-pub fn build_grid(machine: &Machine, spacing: f64) -> Vec<SceneVertex> {
+/// substrate's Z, as a line-instance buffer.
+pub fn build_grid(machine: &Machine, spacing: f64) -> Vec<SceneLineInstance> {
     let (min, max) = machine.build_volume.bounding_box();
     let z = min.z;
-    let mut vertices = Vec::new();
+    let mut lines = Vec::new();
 
     let mut x = min.x;
     while x <= max.x {
-        vertices.push(SceneVertex::new(DVec3::new(x, min.y, z), GRID_COLOR));
-        vertices.push(SceneVertex::new(DVec3::new(x, max.y, z), GRID_COLOR));
+        lines.push(SceneLineInstance::new(
+            DVec3::new(x, min.y, z),
+            DVec3::new(x, max.y, z),
+            GRID_COLOR,
+        ));
         x += spacing;
     }
     let mut y = min.y;
     while y <= max.y {
-        vertices.push(SceneVertex::new(DVec3::new(min.x, y, z), GRID_COLOR));
-        vertices.push(SceneVertex::new(DVec3::new(max.x, y, z), GRID_COLOR));
+        lines.push(SceneLineInstance::new(
+            DVec3::new(min.x, y, z),
+            DVec3::new(max.x, y, z),
+            GRID_COLOR,
+        ));
         y += spacing;
     }
 
-    vertices
+    lines
 }
 
 /// A translucent quad filling the machine's build volume XY extent, at

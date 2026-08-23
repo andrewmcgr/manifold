@@ -7,35 +7,218 @@
 
 use manifold_core::toolpath::{MoveKind, Path};
 
-/// One vertex for the unlit toolpath line shader: position + RGBA color +
-/// the source segment's `order` value (carried per-vertex so the scrub
-/// filter can operate either CPU-side, before upload, or shader-side, via
-/// a uniform threshold against this field).
+/// One line segment instance for the unlit toolpath line shader: start/end
+/// positions + RGBA color + the source segment's `order` value (carried
+/// per-instance so the scrub filter can operate either CPU-side, before
+/// upload, or shader-side, via a uniform threshold against this field).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct ToolpathVertex {
-    position: [f32; 3],
-    color: [f32; 4],
-    order: f32,
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+pub struct ToolpathLineInstance {
+    pub start: [f32; 3],
+    pub end: [f32; 3],
+    pub color: [f32; 4],
+    pub order: f32,
+    pub _pad: [f32; 3],
 }
 
-impl ToolpathVertex {
-    fn new(position: glam::DVec3, color: [f32; 4], order: f64) -> Self {
+impl ToolpathLineInstance {
+    pub fn new(start: glam::DVec3, end: glam::DVec3, color: [f32; 4], order: f64) -> Self {
         Self {
-            position: position.as_vec3().to_array(),
+            start: start.as_vec3().to_array(),
+            end: end.as_vec3().to_array(),
             color,
             order: order as f32,
+            _pad: [0.0; 3],
         }
     }
 }
 
-const COLOR_WALL_OUTER: [f32; 4] = [0.9, 0.9, 0.9, 1.0];
-const COLOR_WALL_INNER: [f32; 4] = [0.6, 0.8, 1.0, 1.0];
-const COLOR_INFILL: [f32; 4] = [0.95, 0.65, 0.15, 1.0];
-const COLOR_BRIDGE: [f32; 4] = [0.9, 0.2, 0.75, 1.0];
-const COLOR_OVERHANG: [f32; 4] = [0.9, 0.15, 0.15, 1.0];
-const COLOR_TOP_SURFACE: [f32; 4] = [0.2, 0.85, 0.4, 1.0];
-const COLOR_TRAVEL: [f32; 4] = [0.4, 0.4, 0.4, 0.4];
+pub const COLOR_WALL_OUTER: [f32; 4] = [0.9, 0.9, 0.9, 1.0];
+pub const COLOR_WALL_INNER: [f32; 4] = [0.6, 0.8, 1.0, 1.0];
+pub const COLOR_INFILL: [f32; 4] = [0.95, 0.65, 0.15, 1.0];
+pub const COLOR_BRIDGE: [f32; 4] = [0.9, 0.2, 0.75, 1.0];
+pub const COLOR_OVERHANG: [f32; 4] = [0.9, 0.15, 0.15, 1.0];
+pub const COLOR_TOP_SURFACE: [f32; 4] = [0.2, 0.85, 0.4, 1.0];
+pub const COLOR_TRAVEL: [f32; 4] = [0.4, 0.4, 0.4, 0.4];
+
+/// Available data view color-coding modes for the toolpath preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ToolpathDataView {
+    #[default]
+    LineType,
+    Speed,
+    FlowRate,
+    Acceleration,
+}
+
+impl ToolpathDataView {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::LineType => "Line Type",
+            Self::Speed => "Speed",
+            Self::FlowRate => "Flow Rate",
+            Self::Acceleration => "Acceleration",
+        }
+    }
+
+    pub fn unit(&self) -> &'static str {
+        match self {
+            Self::LineType => "",
+            Self::Speed => "mm/s",
+            Self::FlowRate => "mm³/s",
+            Self::Acceleration => "mm/s²",
+        }
+    }
+}
+
+/// Smooth 5-stop color gradient mapping (Blue -> Cyan -> Green -> Yellow -> Red) for normalized `t` in [0, 1].
+pub fn scalar_to_color(t: f64) -> [f32; 4] {
+    let t = t.clamp(0.0, 1.0) as f32;
+    let (c0, c1, local_t) = if t < 0.25 {
+        ([0.15f32, 0.20, 0.85], [0.00f32, 0.75, 0.90], t / 0.25)
+    } else if t < 0.50 {
+        (
+            [0.00f32, 0.75, 0.90],
+            [0.10f32, 0.85, 0.25],
+            (t - 0.25) / 0.25,
+        )
+    } else if t < 0.75 {
+        (
+            [0.10f32, 0.85, 0.25],
+            [0.98f32, 0.85, 0.10],
+            (t - 0.50) / 0.25,
+        )
+    } else {
+        (
+            [0.98f32, 0.85, 0.10],
+            [0.95f32, 0.15, 0.15],
+            (t - 0.75) / 0.25,
+        )
+    };
+
+    [
+        c0[0] + (c1[0] - c0[0]) * local_t,
+        c0[1] + (c1[1] - c0[1]) * local_t,
+        c0[2] + (c1[2] - c0[2]) * local_t,
+        1.0,
+    ]
+}
+
+/// Computes the scalar value for `segment` under `data_view`.
+pub fn segment_scalar_value(
+    segment: &manifold_core::toolpath::Segment,
+    start: glam::DVec3,
+    end: glam::DVec3,
+    data_view: ToolpathDataView,
+    config: &manifold_core::SlicerConfig,
+    machine: Option<&manifold_core::machine::Machine>,
+) -> f64 {
+    match data_view {
+        ToolpathDataView::LineType => 0.0,
+        ToolpathDataView::Speed => segment.speed / 60.0,
+        ToolpathDataView::FlowRate => {
+            if segment.kind == MoveKind::Travel || segment.extrusion_length <= 0.0 {
+                return 0.0;
+            }
+            let length = (end - start).length();
+            if length < 1e-6 {
+                return 0.0;
+            }
+            let speed_mm_s = segment.speed / 60.0;
+            if speed_mm_s <= 1e-6 {
+                return 0.0;
+            }
+            let duration = length / speed_mm_s;
+            let fil_radius = config.filament_diameter * 0.5;
+            let fil_area = std::f64::consts::PI * fil_radius * fil_radius;
+            let vol = segment.extrusion_length * fil_area;
+            vol / duration
+        }
+        ToolpathDataView::Acceleration => {
+            let model = config.resolved_motion_model(machine);
+            let is_first_layer = (segment.order - config.first_layer_height()).abs() < 1e-4
+                || segment.order <= config.first_layer_height();
+            model.available_acceleration(segment.kind, is_first_layer, segment.speed / 60.0)
+        }
+    }
+}
+
+/// The `(min, max)` scalar value range across all segments in `paths` for `data_view`.
+/// Returns `None` for [`ToolpathDataView::LineType`] or when no valid segments exist.
+pub fn data_view_range(
+    paths: &[Path],
+    data_view: ToolpathDataView,
+    config: &manifold_core::SlicerConfig,
+    machine: Option<&manifold_core::machine::Machine>,
+) -> Option<(f64, f64)> {
+    if data_view == ToolpathDataView::LineType {
+        return None;
+    }
+    let mut min_val = f64::INFINITY;
+    let mut max_val = f64::NEG_INFINITY;
+    let mut count = 0;
+
+    for path in paths {
+        let n = path.points.len();
+        for (i, segment) in path.segments.iter().enumerate() {
+            if data_view == ToolpathDataView::FlowRate && segment.kind == MoveKind::Travel {
+                continue;
+            }
+            let start = path.points[i];
+            let end = path.points[(i + 1) % n];
+            let val = segment_scalar_value(segment, start, end, data_view, config, machine);
+            min_val = min_val.min(val);
+            max_val = max_val.max(val);
+            count += 1;
+        }
+    }
+
+    if count > 0 && min_val.is_finite() && max_val.is_finite() {
+        Some((min_val, max_val))
+    } else {
+        None
+    }
+}
+
+/// An entry in a toolpath viewport legend (color badge + descriptive label).
+pub struct LegendEntry {
+    pub label: &'static str,
+    pub color: [f32; 4],
+}
+
+/// The set of color-coded legend entries for the [`ToolpathDataView::LineType`] view.
+pub fn line_type_legend() -> &'static [LegendEntry] {
+    &[
+        LegendEntry {
+            label: "Outer Wall",
+            color: COLOR_WALL_OUTER,
+        },
+        LegendEntry {
+            label: "Inner Wall",
+            color: COLOR_WALL_INNER,
+        },
+        LegendEntry {
+            label: "Infill",
+            color: COLOR_INFILL,
+        },
+        LegendEntry {
+            label: "Bridge",
+            color: COLOR_BRIDGE,
+        },
+        LegendEntry {
+            label: "Overhang",
+            color: COLOR_OVERHANG,
+        },
+        LegendEntry {
+            label: "Top Surface",
+            color: COLOR_TOP_SURFACE,
+        },
+        LegendEntry {
+            label: "Travel",
+            color: COLOR_TRAVEL,
+        },
+    ]
+}
 
 /// Fixed `MoveKind` -> RGBA color palette used for toolpath preview
 /// rendering.
@@ -51,10 +234,10 @@ fn palette_color(kind: MoveKind) -> [f32; 4] {
     }
 }
 
-/// Build a line-list vertex buffer from a set of planned toolpaths: one
-/// line segment per `Segment` (`points[i] -> points[(i + 1) %
-/// points.len()]`), colored by `segment.kind` via [`palette_color`], with
-/// `segment.order` carried on both endpoint vertices.
+/// Build a line-instance buffer from a set of planned toolpaths: one
+/// line instance per `Segment` (`points[i] -> points[(i + 1) % points.len()]`),
+/// colored by `segment.kind` via [`palette_color`], with `segment.order` carried
+/// on each instance.
 ///
 /// `scrub_order` implements the order-based scrub slider's "up to and
 /// including" semantics (Phase 13 subtask 05): only segments with
@@ -69,11 +252,19 @@ fn palette_color(kind: MoveKind) -> [f32; 4] {
 /// the cost of a full CPU rebuild + GPU re-upload per slider-drag frame
 /// instead of a single per-frame uniform write — acceptable at the MVP
 /// single-object scale this phase targets (see `toolpath_shader.wgsl`'s
-/// doc comment, which reserves the per-vertex `order` attribute for a
+/// doc comment, which reserves the per-instance `order` attribute for a
 /// possible future shader-side discard if drag interactivity ever becomes
 /// a problem).
-pub fn build_toolpath_lines(paths: &[Path], scrub_order: f64) -> Vec<ToolpathVertex> {
-    let mut vertices = Vec::new();
+pub fn build_toolpath_lines(
+    paths: &[Path],
+    scrub_order: f64,
+    data_view: ToolpathDataView,
+    config: &manifold_core::SlicerConfig,
+    machine: Option<&manifold_core::machine::Machine>,
+) -> Vec<ToolpathLineInstance> {
+    let scalar_range = data_view_range(paths, data_view, config, machine);
+    let mut instances = Vec::new();
+
     for path in paths {
         let count = path.points.len();
         for (index, segment) in path.segments.iter().enumerate() {
@@ -82,12 +273,29 @@ pub fn build_toolpath_lines(paths: &[Path], scrub_order: f64) -> Vec<ToolpathVer
             }
             let start = path.points[index];
             let end = path.points[(index + 1) % count];
-            let color = palette_color(segment.kind);
-            vertices.push(ToolpathVertex::new(start, color, segment.order));
-            vertices.push(ToolpathVertex::new(end, color, segment.order));
+
+            let color = match data_view {
+                ToolpathDataView::LineType => palette_color(segment.kind),
+                ToolpathDataView::FlowRate if segment.kind == MoveKind::Travel => COLOR_TRAVEL,
+                _ => {
+                    let val = segment_scalar_value(segment, start, end, data_view, config, machine);
+                    let t = if let Some((min, max)) = scalar_range {
+                        if max > min {
+                            (val - min) / (max - min)
+                        } else {
+                            0.5
+                        }
+                    } else {
+                        0.5
+                    };
+                    scalar_to_color(t)
+                }
+            };
+
+            instances.push(ToolpathLineInstance::new(start, end, color, segment.order));
         }
     }
-    vertices
+    instances
 }
 
 /// The `(min, max)` `order` value across all segments in `paths`, used to
@@ -135,34 +343,44 @@ mod tests {
         }
     }
 
+    fn build_lines_default(paths: &[Path], scrub: f64) -> Vec<ToolpathLineInstance> {
+        build_toolpath_lines(
+            paths,
+            scrub,
+            ToolpathDataView::LineType,
+            &manifold_core::SlicerConfig::default(),
+            None,
+        )
+    }
+
     #[test]
-    fn vertex_count_matches_two_per_segment() {
+    fn instance_count_matches_one_per_segment() {
         let path = path_with_kinds(
             &[MoveKind::WallOuter, MoveKind::WallInner, MoveKind::Infill],
             0.0,
         );
-        let vertices = build_toolpath_lines(&[path], f64::INFINITY);
-        assert_eq!(vertices.len(), 6);
+        let instances = build_lines_default(&[path], f64::INFINITY);
+        assert_eq!(instances.len(), 3);
     }
 
     #[test]
-    fn vertex_count_sums_across_multiple_paths() {
+    fn instance_count_sums_across_multiple_paths() {
         let path_a = path_with_kinds(&[MoveKind::WallOuter, MoveKind::WallOuter], 0.0);
         let path_b = path_with_kinds(
             &[MoveKind::Infill, MoveKind::Bridge, MoveKind::Overhang],
             0.0,
         );
-        let vertices = build_toolpath_lines(&[path_a, path_b], f64::INFINITY);
-        assert_eq!(vertices.len(), 2 * 2 + 3 * 2);
+        let instances = build_lines_default(&[path_a, path_b], f64::INFINITY);
+        assert_eq!(instances.len(), 2 + 3);
     }
 
     #[test]
     fn segment_endpoints_wrap_around_the_closing_edge() {
         let path = path_with_kinds(&[MoveKind::WallOuter, MoveKind::WallOuter], 0.0);
-        let vertices = build_toolpath_lines(&[path], f64::INFINITY);
+        let instances = build_lines_default(&[path], f64::INFINITY);
         // Second segment closes the loop: points[1] -> points[0].
-        assert_eq!(vertices[2].position, [1.0, 0.0, 0.0]);
-        assert_eq!(vertices[3].position, [0.0, 0.0, 0.0]);
+        assert_eq!(instances[1].start, [1.0, 0.0, 0.0]);
+        assert_eq!(instances[1].end, [0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -177,50 +395,47 @@ mod tests {
         ];
         for (kind, expected_color) in cases {
             let path = path_with_kinds(&[kind], 0.0);
-            let vertices = build_toolpath_lines(&[path], f64::INFINITY);
-            assert_eq!(vertices[0].color, expected_color);
-            assert_eq!(vertices[1].color, expected_color);
+            let instances = build_lines_default(&[path], f64::INFINITY);
+            assert_eq!(instances[0].color, expected_color);
         }
     }
 
     #[test]
-    fn order_is_propagated_to_both_endpoint_vertices() {
+    fn order_is_propagated_to_instance() {
         let path = path_with_kinds(&[MoveKind::WallOuter, MoveKind::Infill], 0.75);
-        let vertices = build_toolpath_lines(&[path], f64::INFINITY);
-        assert!(vertices.iter().all(|v| v.order == 0.75));
+        let instances = build_lines_default(&[path], f64::INFINITY);
+        assert!(instances.iter().all(|inst| inst.order == 0.75));
     }
 
     #[test]
     fn distinct_paths_can_carry_distinct_order_values() {
         let path_a = path_with_kinds(&[MoveKind::WallOuter], 0.0);
         let path_b = path_with_kinds(&[MoveKind::WallOuter], 1.0);
-        let vertices = build_toolpath_lines(&[path_a, path_b], f64::INFINITY);
-        assert_eq!(vertices[0].order, 0.0);
-        assert_eq!(vertices[1].order, 0.0);
-        assert_eq!(vertices[2].order, 1.0);
-        assert_eq!(vertices[3].order, 1.0);
+        let instances = build_lines_default(&[path_a, path_b], f64::INFINITY);
+        assert_eq!(instances[0].order, 0.0);
+        assert_eq!(instances[1].order, 1.0);
     }
 
     #[test]
-    fn empty_paths_produce_no_vertices() {
-        assert!(build_toolpath_lines(&[], f64::INFINITY).is_empty());
+    fn empty_paths_produce_no_instances() {
+        assert!(build_lines_default(&[], f64::INFINITY).is_empty());
     }
 
     #[test]
     fn scrub_order_excludes_segments_above_cutoff() {
         let path_a = path_with_kinds(&[MoveKind::WallOuter], 0.0);
         let path_b = path_with_kinds(&[MoveKind::Infill], 1.0);
-        let vertices = build_toolpath_lines(&[path_a, path_b], 0.0);
+        let instances = build_lines_default(&[path_a, path_b], 0.0);
         // Only path_a's segment (order 0.0) survives the <= 0.0 cutoff.
-        assert_eq!(vertices.len(), 2);
-        assert_eq!(vertices[0].order, 0.0);
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].order, 0.0);
     }
 
     #[test]
     fn scrub_order_is_inclusive_of_the_cutoff_value() {
         let path = path_with_kinds(&[MoveKind::WallOuter], 0.5);
-        let vertices = build_toolpath_lines(&[path], 0.5);
-        assert_eq!(vertices.len(), 2);
+        let instances = build_lines_default(&[path], 0.5);
+        assert_eq!(instances.len(), 1);
     }
 
     #[test]
@@ -235,5 +450,89 @@ mod tests {
     #[test]
     fn order_range_is_none_for_empty_paths() {
         assert!(order_range(&[]).is_none());
+    }
+
+    #[test]
+    fn line_type_legend_covers_all_line_types_and_has_valid_colors() {
+        let legend = line_type_legend();
+        assert_eq!(legend.len(), 7);
+        for entry in legend {
+            assert!(!entry.label.is_empty());
+            assert!(entry.color[3] > 0.0);
+        }
+    }
+
+    #[test]
+    fn scalar_gradient_colors_scale_with_speed_and_accel() {
+        let config = manifold_core::SlicerConfig::default();
+        let points = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 0.0),
+            DVec3::new(20.0, 0.0, 0.0),
+        ];
+        let segments = vec![
+            Segment {
+                kind: MoveKind::WallOuter,
+                speed: 1200.0, // 20 mm/s (low)
+                extrusion_rate: 1.0,
+                support_fraction: 0.0,
+                order: 0.2,
+                extrusion_length: 0.3,
+            },
+            Segment {
+                kind: MoveKind::Infill,
+                speed: 12000.0, // 200 mm/s (high)
+                extrusion_rate: 1.0,
+                support_fraction: 0.0,
+                order: 0.2,
+                extrusion_length: 0.3,
+            },
+            Segment {
+                kind: MoveKind::Travel,
+                speed: 18000.0, // 300 mm/s (travel)
+                extrusion_rate: 0.0,
+                support_fraction: 0.0,
+                order: 0.2,
+                extrusion_length: 0.0,
+            },
+        ];
+        let path = Path {
+            points,
+            segments,
+            tool: ToolId(0),
+        };
+
+        // Speed view: low speed gets blue (c[2] > c[0]), high speed gets red (c[0] > c[2])
+        let speed_lines = build_toolpath_lines(
+            std::slice::from_ref(&path),
+            f64::INFINITY,
+            ToolpathDataView::Speed,
+            &config,
+            None,
+        );
+        assert_eq!(speed_lines.len(), 3);
+        assert!(speed_lines[0].color[2] > speed_lines[0].color[0]); // Blue > Red for low
+        assert!(speed_lines[2].color[0] > speed_lines[2].color[2]); // Red > Blue for max
+
+        // Flow rate view: travel move gets grey COLOR_TRAVEL, extrusions get scalar colors
+        let flow_lines = build_toolpath_lines(
+            std::slice::from_ref(&path),
+            f64::INFINITY,
+            ToolpathDataView::FlowRate,
+            &config,
+            None,
+        );
+        assert_eq!(flow_lines.len(), 3);
+        assert_eq!(flow_lines[2].color, COLOR_TRAVEL);
+
+        // Acceleration view
+        let accel_lines = build_toolpath_lines(
+            std::slice::from_ref(&path),
+            f64::INFINITY,
+            ToolpathDataView::Acceleration,
+            &config,
+            None,
+        );
+        assert_eq!(accel_lines.len(), 3);
     }
 }

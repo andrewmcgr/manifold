@@ -12,8 +12,8 @@
 //! smooth antialiasing on all lines and edges, before resolving and blitting
 //! into egui's frame pass in `paint`.
 
-use crate::scene::SceneVertex;
-use crate::toolpath_view::ToolpathVertex;
+use crate::scene::{SceneLineInstance, SceneVertex};
+use crate::toolpath_view::ToolpathLineInstance;
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 use egui_wgpu::wgpu::util::DeviceExt as _;
@@ -23,6 +23,16 @@ use manifold_fidget::marching_cubes::Vertex as FieldVertex;
 
 /// Number of multisample anti-aliasing samples used for 3D viewport rendering.
 const MSAA_SAMPLES: u32 = 4;
+
+/// Camera and viewport uniform passed to all 3D shaders.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    view_proj: [f32; 16],
+    viewport_size: [f32; 2],
+    line_width: f32,
+    _pad: f32,
+}
 
 /// One GPU vertex: position + flat face normal, both in world space.
 #[repr(C)]
@@ -103,30 +113,47 @@ impl UploadedMesh {
 /// markers) already uploaded to the GPU — see `crate::scene`.
 pub struct UploadedScene {
     line_buffer: wgpu::Buffer,
-    line_vertex_count: u32,
+    line_instance_count: u32,
     tri_buffer: wgpu::Buffer,
     tri_vertex_count: u32,
 }
 
 impl UploadedScene {
-    /// Upload line-list geometry (origin axes + grid) and triangle-list
+    /// Upload line-instance geometry (origin axes + grid) and triangle-list
     /// geometry (bed quad + toolhead markers), already built by
     /// `crate::scene`'s builders.
-    pub fn upload(device: &wgpu::Device, lines: &[SceneVertex], triangles: &[SceneVertex]) -> Self {
+    pub fn upload(
+        device: &wgpu::Device,
+        lines: &[SceneLineInstance],
+        triangles: &[SceneVertex],
+    ) -> Self {
+        let fallback_line = [SceneLineInstance::default()];
+        let line_contents = if lines.is_empty() {
+            bytemuck::cast_slice(&fallback_line)
+        } else {
+            bytemuck::cast_slice(lines)
+        };
+        let fallback_tri = [SceneVertex::default()];
+        let tri_contents = if triangles.is_empty() {
+            bytemuck::cast_slice(&fallback_tri)
+        } else {
+            bytemuck::cast_slice(triangles)
+        };
+
         let line_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("manifold scene line buffer"),
-            contents: bytemuck::cast_slice(lines),
+            contents: line_contents,
             usage: wgpu::BufferUsages::VERTEX,
         });
         let tri_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("manifold scene triangle buffer"),
-            contents: bytemuck::cast_slice(triangles),
+            contents: tri_contents,
             usage: wgpu::BufferUsages::VERTEX,
         });
 
         Self {
             line_buffer,
-            line_vertex_count: lines.len() as u32,
+            line_instance_count: lines.len() as u32,
             tri_buffer,
             tri_vertex_count: triangles.len() as u32,
         }
@@ -134,26 +161,33 @@ impl UploadedScene {
 }
 
 /// Toolpath preview line geometry (Phase 13, see ROADMAP.md) already
-/// uploaded to the GPU as a non-indexed line-list vertex buffer — mirrors
+/// uploaded to the GPU as a line-instance buffer — mirrors
 /// `UploadedScene`'s line-buffer half.
 pub struct UploadedToolpaths {
     line_buffer: wgpu::Buffer,
-    line_vertex_count: u32,
+    line_instance_count: u32,
 }
 
 impl UploadedToolpaths {
-    /// Upload line-list geometry already built by
+    /// Upload line-instance geometry already built by
     /// `crate::toolpath_view::build_toolpath_lines`.
-    pub fn upload(device: &wgpu::Device, vertices: &[ToolpathVertex]) -> Self {
+    pub fn upload(device: &wgpu::Device, instances: &[ToolpathLineInstance]) -> Self {
+        let fallback = [ToolpathLineInstance::default()];
+        let line_contents = if instances.is_empty() {
+            bytemuck::cast_slice(&fallback)
+        } else {
+            bytemuck::cast_slice(instances)
+        };
+
         let line_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("manifold toolpath line buffer"),
-            contents: bytemuck::cast_slice(vertices),
+            contents: line_contents,
             usage: wgpu::BufferUsages::VERTEX,
         });
 
         Self {
             line_buffer,
-            line_vertex_count: vertices.len() as u32,
+            line_instance_count: instances.len() as u32,
         }
     }
 }
@@ -330,7 +364,12 @@ impl MeshRenderResources {
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("manifold camera uniform buffer"),
-            contents: bytemuck::cast_slice(&[Mat4::IDENTITY.to_cols_array()]),
+            contents: bytemuck::cast_slice(&[CameraUniform {
+                view_proj: Mat4::IDENTITY.to_cols_array(),
+                viewport_size: [1.0, 1.0],
+                line_width: 1.4,
+                _pad: 0.0,
+            }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -348,10 +387,16 @@ impl MeshRenderResources {
             source: wgpu::ShaderSource::Wgsl(include_str!("scene_shader.wgsl").into()),
         });
 
-        let scene_vertex_buffers = [wgpu::VertexBufferLayout {
+        let scene_tri_vertex_buffers = [wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<SceneVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+        }];
+
+        let scene_line_instance_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<SceneLineInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
         }];
 
         let scene_line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -359,9 +404,9 @@ impl MeshRenderResources {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &scene_shader,
-                entry_point: "vs_main",
+                entry_point: "vs_line",
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &scene_vertex_buffers,
+                buffers: &scene_line_instance_buffers,
             },
             fragment: Some(wgpu::FragmentState {
                 module: &scene_shader,
@@ -370,7 +415,7 @@ impl MeshRenderResources {
                 targets: &[Some(target_format.into())],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 cull_mode: None,
                 ..Default::default()
             },
@@ -385,9 +430,9 @@ impl MeshRenderResources {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &scene_shader,
-                entry_point: "vs_main",
+                entry_point: "vs_tri",
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &scene_vertex_buffers,
+                buffers: &scene_tri_vertex_buffers,
             },
             fragment: Some(wgpu::FragmentState {
                 module: &scene_shader,
@@ -414,10 +459,10 @@ impl MeshRenderResources {
             source: wgpu::ShaderSource::Wgsl(include_str!("toolpath_shader.wgsl").into()),
         });
 
-        let toolpath_vertex_buffers = [wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<ToolpathVertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32],
+        let toolpath_instance_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ToolpathLineInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32],
         }];
 
         let toolpath_line_pipeline =
@@ -428,7 +473,7 @@ impl MeshRenderResources {
                     module: &toolpath_shader,
                     entry_point: "vs_main",
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &toolpath_vertex_buffers,
+                    buffers: &toolpath_instance_buffers,
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &toolpath_shader,
@@ -441,7 +486,7 @@ impl MeshRenderResources {
                     })],
                 }),
                 primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::LineList,
+                    topology: wgpu::PrimitiveTopology::TriangleList,
                     cull_mode: None,
                     ..Default::default()
                 },
@@ -685,10 +730,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             .max(1);
 
         self.ensure_offscreen(device, screen_w, screen_h);
+        let line_width = 1.4 * ppp;
+        let camera_uniform = CameraUniform {
+            view_proj: view_proj.to_cols_array(),
+            viewport_size: [vp_w as f32, vp_h as f32],
+            line_width,
+            _pad: 0.0,
+        };
         queue.write_buffer(
             &self.camera_buffer,
             0,
-            bytemuck::cast_slice(&[view_proj.to_cols_array()]),
+            bytemuck::cast_slice(&[camera_uniform]),
         );
 
         let Some(target) = &self.offscreen else {
@@ -729,14 +781,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         rpass.set_pipeline(&self.scene_line_pipeline);
         rpass.set_vertex_buffer(0, scene.line_buffer.slice(..));
-        rpass.draw(0..scene.line_vertex_count, 0..1);
+        rpass.draw(0..6, 0..scene.line_instance_count);
 
         if let Some(tp) = toolpaths {
             // When toolpaths are visible: draw toolpaths first, then draw the
             // mesh semi-transparently so internal toolpaths remain clearly visible.
             rpass.set_pipeline(&self.toolpath_line_pipeline);
             rpass.set_vertex_buffer(0, tp.line_buffer.slice(..));
-            rpass.draw(0..tp.line_vertex_count, 0..1);
+            rpass.draw(0..6, 0..tp.line_instance_count);
 
             rpass.set_pipeline(&self.mesh_transparent_pipeline);
             for mesh in meshes {

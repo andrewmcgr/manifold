@@ -7,7 +7,7 @@ use crate::render::{
     MeshRenderResources, UploadedMesh, UploadedScene, UploadedToolpaths, Viewport3dCallback,
 };
 use crate::scene;
-use crate::toolpath_view;
+use crate::toolpath_view::{self, ToolpathDataView};
 use eframe::egui;
 use manifold_core::bounds::BoundingVolume;
 use manifold_core::infill::InfillPatternKind;
@@ -88,6 +88,8 @@ pub struct ManifoldApp {
     /// see ROADMAP.md), previewed in the 3D viewport when `show_toolpaths`
     /// is enabled.
     toolpaths: Option<Vec<manifold_core::toolpath::Path>>,
+    /// Selected data view color-coding mode for toolpath visualization (e.g. Line Type).
+    toolpath_data_view: ToolpathDataView,
     /// GPU-uploaded copy of `toolpaths`, rebuilt whenever `toolpaths`
     /// changes, same pattern as `uploaded_meshes`/`uploaded_scene`.
     uploaded_toolpaths: Option<Arc<UploadedToolpaths>>,
@@ -213,6 +215,7 @@ impl ManifoldApp {
             gizmo: Gizmo::default(),
             gcode: None,
             toolpaths: None,
+            toolpath_data_view: ToolpathDataView::default(),
             uploaded_toolpaths: None,
             show_toolpaths: true,
             scrub_order: f64::INFINITY,
@@ -417,8 +420,14 @@ impl ManifoldApp {
     /// changes.
     fn reupload_toolpaths(&mut self, device: &eframe::egui_wgpu::wgpu::Device) {
         self.uploaded_toolpaths = self.toolpaths.as_ref().map(|paths| {
-            let vertices = toolpath_view::build_toolpath_lines(paths, self.scrub_order);
-            Arc::new(UploadedToolpaths::upload(device, &vertices))
+            let instances = toolpath_view::build_toolpath_lines(
+                paths,
+                self.scrub_order,
+                self.toolpath_data_view,
+                &self.config,
+                Some(&self.machine),
+            );
+            Arc::new(UploadedToolpaths::upload(device, &instances))
         });
     }
 
@@ -1796,7 +1805,12 @@ impl ManifoldApp {
                 if let Some(toolpaths) = &self.toolpaths {
                     if let Some(hover_pos) = response.hover_pos() {
                         const PICK_THRESHOLD_PX: f32 = 8.0;
-                        let mut nearest: Option<(f32, &manifold_core::toolpath::Segment)> = None;
+                        let mut nearest: Option<(
+                            f32,
+                            &manifold_core::toolpath::Segment,
+                            glam::DVec3,
+                            glam::DVec3,
+                        )> = None;
                         for path in toolpaths {
                             let count = path.points.len();
                             for i in 0..path.segments.len() {
@@ -1813,23 +1827,42 @@ impl ManifoldApp {
                                     continue;
                                 };
                                 let dist = point_segment_distance(hover_pos, screen_a, screen_b);
-                                if nearest.is_none_or(|(best_dist, _)| dist < best_dist) {
-                                    nearest = Some((dist, segment));
+                                if nearest
+                                    .as_ref()
+                                    .is_none_or(|(best_dist, _, _, _)| dist < *best_dist)
+                                {
+                                    nearest = Some((dist, segment, a, b));
                                 }
                             }
                         }
-                        if let Some((dist, segment)) = nearest {
+                        if let Some((dist, segment, a, b)) = nearest {
                             if dist <= PICK_THRESHOLD_PX {
                                 response.clone().show_tooltip_ui(|ui| {
                                     ui.label(format!("kind: {:?}", segment.kind));
-                                    ui.label(format!("speed: {:.3}", segment.speed));
+                                    ui.label(format!("speed: {:.1} mm/s", segment.speed / 60.0));
+                                    let flow = toolpath_view::segment_scalar_value(
+                                        segment,
+                                        a,
+                                        b,
+                                        ToolpathDataView::FlowRate,
+                                        &self.config,
+                                        Some(&self.machine),
+                                    );
+                                    if segment.kind != manifold_core::toolpath::MoveKind::Travel {
+                                        ui.label(format!("flow rate: {:.2} mm³/s", flow));
+                                    }
+                                    let accel = toolpath_view::segment_scalar_value(
+                                        segment,
+                                        a,
+                                        b,
+                                        ToolpathDataView::Acceleration,
+                                        &self.config,
+                                        Some(&self.machine),
+                                    );
+                                    ui.label(format!("accel: {:.0} mm/s²", accel));
                                     ui.label(format!(
                                         "extrusion_rate: {:.3}",
                                         segment.extrusion_rate
-                                    ));
-                                    ui.label(format!(
-                                        "support_fraction: {:.3}",
-                                        segment.support_fraction
                                     ));
                                     ui.label(format!("order: {:.3}", segment.order));
                                 });
@@ -1884,6 +1917,142 @@ impl ManifoldApp {
                         }
                     }
                 }
+            }
+
+            // Floating top-right viewport legend overlay (extensible for future data views)
+            if self.show_toolpaths && self.toolpaths.is_some() {
+                let margin = 12.0;
+                let legend_width = 155.0;
+                let legend_pos =
+                    egui::pos2(rect.max.x - legend_width - margin, rect.min.y + margin);
+
+                egui::Area::new(egui::Id::new("toolpath_viewport_legend"))
+                    .fixed_pos(legend_pos)
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::window(ui.style())
+                            .fill(egui::Color32::from_black_alpha(205))
+                            .stroke(egui::Stroke::new(
+                                1.0_f32,
+                                egui::Color32::from_white_alpha(35),
+                            ))
+                            .rounding(egui::Rounding::same(6.0))
+                            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.set_width(legend_width - 16.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Data:").strong().size(11.0));
+                                    let prev_view = self.toolpath_data_view;
+                                    egui::ComboBox::from_id_salt("toolpath_data_view_combo")
+                                        .selected_text(
+                                            egui::RichText::new(self.toolpath_data_view.name())
+                                                .size(11.0),
+                                        )
+                                        .width(92.0)
+                                        .show_ui(ui, |ui| {
+                                            for view in [
+                                                ToolpathDataView::LineType,
+                                                ToolpathDataView::Speed,
+                                                ToolpathDataView::FlowRate,
+                                                ToolpathDataView::Acceleration,
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut self.toolpath_data_view,
+                                                    view,
+                                                    view.name(),
+                                                );
+                                            }
+                                        });
+                                    if self.toolpath_data_view != prev_view {
+                                        let device = frame
+                                            .wgpu_render_state()
+                                            .expect("wgpu renderer is required")
+                                            .device
+                                            .clone();
+                                        self.reupload_toolpaths(&device);
+                                    }
+                                });
+                                ui.add_space(3.0);
+                                match self.toolpath_data_view {
+                                    ToolpathDataView::LineType => {
+                                        for entry in toolpath_view::line_type_legend() {
+                                            ui.horizontal(|ui| {
+                                                let (badge_rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(10.0, 10.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                let [r, g, b, a] = entry.color;
+                                                let color = egui::Color32::from_rgba_unmultiplied(
+                                                    (r * 255.0).round() as u8,
+                                                    (g * 255.0).round() as u8,
+                                                    (b * 255.0).round() as u8,
+                                                    (a * 255.0).round() as u8,
+                                                );
+                                                ui.painter().rect_filled(badge_rect, 2.0, color);
+                                                ui.label(
+                                                    egui::RichText::new(entry.label).size(11.0),
+                                                );
+                                            });
+                                        }
+                                    }
+                                    view => {
+                                        let unit = view.unit();
+                                        let paths = self.toolpaths.as_deref().unwrap_or_default();
+                                        let (min_val, max_val) = toolpath_view::data_view_range(
+                                            paths,
+                                            view,
+                                            &self.config,
+                                            Some(&self.machine),
+                                        )
+                                        .unwrap_or((0.0, 1.0));
+
+                                        let stops = [1.00, 0.75, 0.50, 0.25, 0.00];
+                                        for &t in &stops {
+                                            let val = min_val + t * (max_val - min_val);
+                                            let [r, g, b, a] = toolpath_view::scalar_to_color(t);
+                                            let color = egui::Color32::from_rgba_unmultiplied(
+                                                (r * 255.0).round() as u8,
+                                                (g * 255.0).round() as u8,
+                                                (b * 255.0).round() as u8,
+                                                (a * 255.0).round() as u8,
+                                            );
+                                            ui.horizontal(|ui| {
+                                                let (badge_rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(10.0, 10.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(badge_rect, 2.0, color);
+                                                let label_str = if (max_val - min_val).abs() > 10.0
+                                                {
+                                                    format!("{val:.0} {unit}")
+                                                } else {
+                                                    format!("{val:.2} {unit}")
+                                                };
+                                                ui.label(egui::RichText::new(label_str).size(11.0));
+                                            });
+                                        }
+
+                                        if view == ToolpathDataView::FlowRate {
+                                            ui.horizontal(|ui| {
+                                                let (badge_rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(10.0, 10.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                let [r, g, b, a] = toolpath_view::COLOR_TRAVEL;
+                                                let color = egui::Color32::from_rgba_unmultiplied(
+                                                    (r * 255.0).round() as u8,
+                                                    (g * 255.0).round() as u8,
+                                                    (b * 255.0).round() as u8,
+                                                    (a * 255.0).round() as u8,
+                                                );
+                                                ui.painter().rect_filled(badge_rect, 2.0, color);
+                                                ui.label(egui::RichText::new("Travel").size(11.0));
+                                            });
+                                        }
+                                    }
+                                }
+                            });
+                    });
             }
         });
     }
