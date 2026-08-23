@@ -127,6 +127,8 @@ pub struct ManifoldApp {
     /// ROADMAP.md).
     profile_error: Option<String>,
     next_tool_id: u32,
+    /// Summary statistics for the last successful slice (estimated time, filament volume/mass).
+    print_statistics: Option<manifold_core::PrintStatistics>,
     /// Whether the SDF debug panel (Phase D, see MESH_SDF_VISUALIZATION.md)
     /// is shown as an additional right-hand side panel.
     show_sdf_panel: bool,
@@ -220,6 +222,7 @@ impl ManifoldApp {
             slicing_handle: None,
             slice_progress: 0.0,
             profile_error: None,
+            print_statistics: None,
             next_tool_id: 1,
             show_sdf_panel: false,
             sdf_sign_method: manifold_fidget::mesh_sdf::SignMethod::Pseudonormal,
@@ -360,6 +363,7 @@ impl ManifoldApp {
             self.toolpaths = None;
             self.uploaded_toolpaths = None;
             self.toolpath_order_range = None;
+            self.print_statistics = None;
             self.slice_error = None;
 
             // Clear SDF previews if no object is selected
@@ -383,6 +387,7 @@ impl ManifoldApp {
         self.toolpaths = None;
         self.uploaded_toolpaths = None;
         self.toolpath_order_range = None;
+        self.print_statistics = None;
         self.slice_error = None;
         self.sdf_slice = None;
         self.sdf_slice_texture = None;
@@ -577,6 +582,7 @@ impl ManifoldApp {
     fn finish_slice(&mut self, result: Result<Vec<manifold_core::toolpath::Path>, String>) {
         match result {
             Ok(paths) => {
+                let stats = manifold_core::compute_print_statistics(&paths, &self.config, None);
                 let gcode = manifold_core::gcode::emit(&paths, &self.config);
                 self.toolpath_order_range = toolpath_view::order_range(&paths);
                 // Default the scrub slider to the max order so a fresh
@@ -587,6 +593,7 @@ impl ManifoldApp {
                     .map_or(f64::INFINITY, |(_, max)| max);
                 self.uploaded_toolpaths = None;
                 self.toolpaths = Some(paths);
+                self.print_statistics = Some(stats);
                 self.gcode = Some(gcode);
                 self.slice_error = None;
             }
@@ -594,6 +601,7 @@ impl ManifoldApp {
                 self.toolpaths = None;
                 self.uploaded_toolpaths = None;
                 self.toolpath_order_range = None;
+                self.print_statistics = None;
                 self.gcode = None;
                 self.slice_error = Some(error);
             }
@@ -1236,6 +1244,15 @@ impl ManifoldApp {
         if let Some(gcode) = &self.gcode {
             ui.separator();
             ui.heading("Gcode");
+            if let Some(stats) = &self.print_statistics {
+                ui.label(format!("Estimated time: {}", stats.formatted_time()));
+                ui.label(format!(
+                    "Filament: {:.2} m ({:.1} g / {:.2} cm³)",
+                    stats.filament_length_meters,
+                    stats.filament_weight_grams,
+                    stats.filament_volume_cm3
+                ));
+            }
             ui.label(format!("{} line(s) generated", gcode.lines().count()));
             egui::ScrollArea::both()
                 .max_height(150.0)
@@ -1532,6 +1549,16 @@ impl ManifoldApp {
                 }
             }
             ui.checkbox(&mut self.show_toolpaths, "Show toolpaths");
+            if let Some(stats) = &self.print_statistics {
+                ui.separator();
+                ui.label(format!(
+                    "⏱ {}  |  🧵 {:.2} m ({:.1} g)  |  📦 {} layers",
+                    stats.formatted_time(),
+                    stats.filament_length_meters,
+                    stats.filament_weight_grams,
+                    stats.total_layers,
+                ));
+            }
 
             // Order-based scrub slider (Phase 13 subtask 05): ranged over
             // the min/max `order` value across all segments in the current

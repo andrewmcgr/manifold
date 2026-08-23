@@ -19,6 +19,7 @@ pub mod order_field;
 pub mod ordering;
 pub mod polygon2d;
 pub mod slicing;
+pub mod statistics;
 pub mod stl;
 pub mod threemf;
 pub mod tool;
@@ -27,6 +28,7 @@ pub mod transform;
 pub mod workspace;
 
 pub use error::{Error, Result};
+pub use statistics::{compute_print_statistics, PrintStatistics};
 pub use workspace::Workspace;
 
 /// Slicer configuration shared across the pipeline.

@@ -146,6 +146,17 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
         out.push('\n');
     }
     let (min_x, min_y, max_x, max_y) = first_layer_xy_bounds(paths).unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let stats = crate::statistics::compute_print_statistics(paths, config, None);
+    out.push_str(&format!("; estimated_time = {}\n", stats.formatted_time()));
+    out.push_str(&format!(
+        "; filament_used_m = {:.3}\n",
+        stats.filament_length_meters
+    ));
+    out.push_str(&format!(
+        "; filament_used_g = {:.2}\n",
+        stats.filament_weight_grams
+    ));
+    out.push_str(&format!("; total_layers = {}\n", stats.total_layers));
     if !config.start_gcode.is_empty() {
         out.push_str(&interpolate(
             &config.start_gcode,
