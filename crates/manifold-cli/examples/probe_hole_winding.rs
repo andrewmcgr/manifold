@@ -73,8 +73,8 @@ fn main() -> anyhow::Result<()> {
     )?;
     println!("sliced {} layer(s)", layers.len());
 
-    // Mirrors slicing::BUILD_DIRECTION (pub(crate)): (0, 0, -1).
-    let (basis1, basis2) = plane_basis(DVec3::new(0.0, 0.0, -1.0));
+    // Mirrors slicing::BUILD_DIRECTION (pub(crate)): (0, 0, 1).
+    let (basis1, basis2) = plane_basis(DVec3::new(0.0, 0.0, 1.0));
 
     for layer in layers.iter().take(4) {
         println!("\n=== layer {} order {:.3} ===", layer.index, layer.order);

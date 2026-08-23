@@ -168,6 +168,7 @@ fn main() -> Result<()> {
         },
         tools_for(&objects, cli.nozzle_diameter),
     );
+    manifold_core::object::center_on_bed(&mut objects, &machine.build_volume);
     machine.eikonal_slope_profile = eikonal_slope_profile;
     let workspace = Workspace::new(objects, machine, config);
 

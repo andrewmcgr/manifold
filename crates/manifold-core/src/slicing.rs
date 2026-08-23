@@ -204,12 +204,10 @@ pub struct WallLoop {
     pub top_surface: Vec<bool>,
 }
 
-/// Build/order direction for this MVP: conventional planar slicing along
-/// -Z (i.e. `order(p) = p.dot(direction)` decreases going up, matching a
-/// bottom-to-top print). Hardcoded per this task's scope — see
-/// `NON_PLANAR_SLICING.md` for the follow-up angle-driven order field that
-/// will make this configurable.
-pub(crate) const BUILD_DIRECTION: DVec3 = DVec3::new(0.0, 0.0, -1.0);
+/// Build/order direction: conventional planar slicing along
+/// +Z (i.e. `order(p) = p.dot(direction)` increases going up, matching a
+/// bottom-to-top print).
+pub(crate) const BUILD_DIRECTION: DVec3 = DVec3::new(0.0, 0.0, 1.0);
 
 /// Physical orientation of the print head's nozzle axis, in world space.
 /// This is deliberately **not** the same thing as a layer's order-field
@@ -1664,7 +1662,7 @@ fn stitch_wall_gaps(layers: &mut [Layer], config: &SlicerConfig, basis1: DVec3, 
                             wall.points[(i + 1) % n] - wall.points[(i + n - 1) % n],
                             config.nozzle_diameter,
                             config.wall_line_width,
-                            BUILD_DIRECTION,
+                            -BUILD_DIRECTION,
                         ) && chord_stays_in_solid(
                             mesh_sdf.as_deref(),
                             *corresponding,
@@ -1754,7 +1752,7 @@ fn stitch_wall_gaps(layers: &mut [Layer], config: &SlicerConfig, basis1: DVec3, 
                         tangent,
                         config.nozzle_diameter,
                         config.wall_line_width,
-                        -BUILD_DIRECTION,
+                        BUILD_DIRECTION,
                     )
                 })
                 .map(|has_material_above| !has_material_above)
@@ -3008,29 +3006,29 @@ mod tests {
 
         // top_layers = 1: only the layer right under the top cap is solid.
         assert_eq!(
-            solid_flags[first_real],
+            solid_flags[last_real],
             Some(true),
             "the layer nearest the top-facing surface must be fully solid"
         );
         assert_eq!(
-            solid_flags[first_real + 1],
+            solid_flags[last_real - 1],
             Some(false),
             "top_layers = 1 must not make the second layer down from the top fully solid"
         );
 
         // bottom_layers = 2: the two layers right above the bottom cap are solid.
         assert_eq!(
-            solid_flags[last_real],
+            solid_flags[first_real],
             Some(true),
             "the layer nearest the bottom-facing surface must be fully solid"
         );
         assert_eq!(
-            solid_flags[last_real - 1],
+            solid_flags[first_real + 1],
             Some(true),
             "bottom_layers = 2 must make the second layer up from the bottom fully solid"
         );
         assert_eq!(
-            solid_flags[last_real - 2],
+            solid_flags[first_real + 2],
             Some(false),
             "bottom_layers = 2 must not reach a third layer up from the bottom"
         );
@@ -4118,7 +4116,7 @@ mod tests {
         let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
 
         let prev_points = vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.3, 0.0, 0.0)];
-        let cur_points = vec![DVec3::new(7.0, 0.0, -0.2), DVec3::new(7.3, 0.0, -0.2)];
+        let cur_points = vec![DVec3::new(7.0, 0.0, 0.2), DVec3::new(7.3, 0.0, 0.2)];
         let mut layers = vec![
             Layer {
                 index: 0,
@@ -4165,9 +4163,9 @@ mod tests {
         );
         for pair in inserted.windows(2) {
             assert!(
-                pair[1].z <= pair[0].z + 1e-9,
+                pair[1].z >= pair[0].z - 1e-9,
                 "inserted stitch points must climb monotonically toward the current layer \
-                 (z non-increasing), but z jumped {} -> {} -- per-point ramp zigzag",
+                 (z non-decreasing), but z jumped {} -> {} -- per-point ramp zigzag",
                 pair[0].z,
                 pair[1].z
             );

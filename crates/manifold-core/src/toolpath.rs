@@ -3076,7 +3076,13 @@ mod tests {
 
         let filament_area = extrusion::filament_cross_section_area(config.filament_diameter);
         let line_width = config.first_layer_line_width();
-        let bead_area = extrusion::bead_cross_section_area(line_width, config.first_layer_height());
+        let bead_area = extrusion::blended_bead_cross_section_area(
+            line_width,
+            config.first_layer_height(),
+            config.nozzle_diameter,
+            1.0,
+            1.0,
+        );
         let point_count = wall_path.points.len();
         for (i, segment) in wall_path.segments.iter().enumerate() {
             let distance = wall_path.points[i].distance(wall_path.points[(i + 1) % point_count]);
