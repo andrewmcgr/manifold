@@ -610,56 +610,77 @@ impl ManifoldApp {
 
     fn settings_panel(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         ui.heading("Settings");
-        ui.add(
-            egui::Slider::new(&mut self.config.layer_height, 0.05..=1.0).text("Layer height (mm)"),
-        );
-        let mut first_layer_h = self.config.first_layer_height();
-        if ui
-            .add(egui::Slider::new(&mut first_layer_h, 0.05..=1.0).text("First layer height (mm)"))
-            .changed()
-        {
-            self.config.first_layer_height = Some(first_layer_h);
-        }
-        let mut first_layer_mult = self.config.first_layer_extrusion_multiplier();
-        if ui
-            .add(
-                egui::Slider::new(&mut first_layer_mult, 0.5..=2.0)
-                    .text("First layer flow multiplier"),
-            )
-            .changed()
-        {
-            self.config.first_layer_extrusion_multiplier = Some(first_layer_mult);
-        }
-        let mut first_layer_w = self.config.first_layer_line_width();
-        if ui
-            .add(
-                egui::Slider::new(&mut first_layer_w, 0.1..=1.5)
-                    .text("First layer line width (mm)"),
-            )
-            .changed()
-        {
-            self.config.first_layer_line_width = Some(first_layer_w);
-        }
-        ui.add(
-            egui::Slider::new(&mut self.config.nozzle_diameter, 0.1..=1.5)
-                .text("Nozzle diameter (mm)"),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.config.wall_line_width, 0.05..=1.5)
-                .text("Wall line width (mm)"),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.config.shell_thickness, 0.0..=5.0)
-                .text("Shell thickness (mm)"),
-        );
-        ui.add(egui::Slider::new(&mut self.config.wall_offset, 0.0..=1.0).text("Wall offset (mm)"));
-        let mut density = self.config.filament_density();
-        if ui
-            .add(egui::Slider::new(&mut density, 0.5..=2.5).text("Filament density (g/cm³)"))
-            .changed()
-        {
-            self.config.filament_density_g_cm3 = Some(density);
-        }
+
+        ui.collapsing("Layering", |ui| {
+            ui.add(
+                egui::Slider::new(&mut self.config.layer_height, 0.05..=1.0)
+                    .text("Layer height (mm)"),
+            );
+            let mut first_layer_h = self.config.first_layer_height();
+            if ui
+                .add(
+                    egui::Slider::new(&mut first_layer_h, 0.05..=1.0)
+                        .text("First layer height (mm)"),
+                )
+                .changed()
+            {
+                self.config.first_layer_height = Some(first_layer_h);
+            }
+            ui.add(egui::Slider::new(&mut self.config.top_layers, 0..=20).text("Top solid layers"));
+            ui.add(
+                egui::Slider::new(&mut self.config.bottom_layers, 0..=20)
+                    .text("Bottom solid layers"),
+            );
+        });
+
+        ui.collapsing("Extrusion & Walls", |ui| {
+            ui.add(
+                egui::Slider::new(&mut self.config.nozzle_diameter, 0.1..=1.5)
+                    .text("Nozzle diameter (mm)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.config.wall_line_width, 0.05..=1.5)
+                    .text("Wall line width (mm)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.config.shell_thickness, 0.0..=5.0)
+                    .text("Shell thickness (mm)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.config.wall_offset, 0.0..=1.0).text("Wall offset (mm)"),
+            );
+            let mut first_layer_w = self.config.first_layer_line_width();
+            if ui
+                .add(
+                    egui::Slider::new(&mut first_layer_w, 0.1..=1.5)
+                        .text("First layer line width (mm)"),
+                )
+                .changed()
+            {
+                self.config.first_layer_line_width = Some(first_layer_w);
+            }
+            let mut first_layer_mult = self.config.first_layer_extrusion_multiplier();
+            if ui
+                .add(
+                    egui::Slider::new(&mut first_layer_mult, 0.5..=2.0)
+                        .text("First layer flow multiplier"),
+                )
+                .changed()
+            {
+                self.config.first_layer_extrusion_multiplier = Some(first_layer_mult);
+            }
+            ui.add(
+                egui::Slider::new(&mut self.config.filament_diameter, 1.0..=3.5)
+                    .text("Filament diameter (mm)"),
+            );
+            let mut density = self.config.filament_density();
+            if ui
+                .add(egui::Slider::new(&mut density, 0.5..=2.5).text("Filament density (g/cm³)"))
+                .changed()
+            {
+                self.config.filament_density_g_cm3 = Some(density);
+            }
+        });
 
         ui.separator();
         ui.heading("Infill");
@@ -806,150 +827,163 @@ impl ManifoldApp {
                 &mut self.config.eikonal_conform_top_surfaces,
                 "Conform to top surfaces",
             );
-            ui.label("Slope-limit profile (height above build plate -> max angle)");
-            let mut remove_index: Option<usize> = None;
-            for (i, (height, degrees)) in self.machine.eikonal_slope_profile.iter_mut().enumerate()
-            {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::DragValue::new(height)
-                            .prefix("h: ")
-                            .suffix(" mm")
-                            .range(0.0..=1000.0),
-                    );
-                    ui.add(
-                        egui::DragValue::new(degrees)
-                            .prefix("max: ")
-                            .suffix(" deg")
-                            .range(0.0..=90.0),
-                    );
-                    if ui.button("Remove").clicked() {
-                        remove_index = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = remove_index {
-                self.machine.eikonal_slope_profile.remove(i);
-            }
-            if ui.button("Add breakpoint").clicked() {
-                let next_height = self
-                    .machine
-                    .eikonal_slope_profile
-                    .last()
-                    .map(|(h, _)| h + 1.0)
-                    .unwrap_or(0.0);
-                self.machine.eikonal_slope_profile.push((next_height, 45.0));
-            }
+            ui.collapsing("Slope-limit profile breakpoints", |ui| {
+                ui.label("Height above build plate -> max surface slope angle");
+                let mut remove_index: Option<usize> = None;
+                for (i, (height, degrees)) in
+                    self.machine.eikonal_slope_profile.iter_mut().enumerate()
+                {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(height)
+                                .prefix("h: ")
+                                .suffix(" mm")
+                                .range(0.0..=1000.0),
+                        );
+                        ui.add(
+                            egui::DragValue::new(degrees)
+                                .prefix("max: ")
+                                .suffix(" deg")
+                                .range(0.0..=90.0),
+                        );
+                        if ui.button("Remove").clicked() {
+                            remove_index = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove_index {
+                    self.machine.eikonal_slope_profile.remove(i);
+                }
+                if ui.button("Add breakpoint").clicked() {
+                    let next_height = self
+                        .machine
+                        .eikonal_slope_profile
+                        .last()
+                        .map(|(h, _)| h + 1.0)
+                        .unwrap_or(0.0);
+                    self.machine.eikonal_slope_profile.push((next_height, 45.0));
+                }
+            });
         }
 
         ui.separator();
         ui.heading("Speeds & Accelerations");
-        let mut print_speed_mms = (self.config.print_speed / 60.0).round();
-        if ui
-            .add(egui::Slider::new(&mut print_speed_mms, 20.0..=400.0).text("Print speed (mm/s)"))
-            .changed()
-        {
-            self.config.print_speed = print_speed_mms * 60.0;
-        }
-        let mut outer_wall_speed_mms = (self
-            .config
-            .outer_wall_speed
-            .unwrap_or_else(|| (self.config.print_speed * 0.6).min(self.config.print_speed))
-            / 60.0)
-            .round();
-        if ui
-            .add(
-                egui::Slider::new(&mut outer_wall_speed_mms, 10.0..=400.0)
-                    .text("Outer wall speed (mm/s)"),
-            )
-            .changed()
-        {
-            self.config.outer_wall_speed = Some(outer_wall_speed_mms * 60.0);
-        }
-        let mut inner_wall_speed_mms = (self
-            .config
-            .inner_wall_speed
-            .unwrap_or(self.config.print_speed)
-            / 60.0)
-            .round();
-        if ui
-            .add(
-                egui::Slider::new(&mut inner_wall_speed_mms, 20.0..=400.0)
-                    .text("Inner wall speed (mm/s)"),
-            )
-            .changed()
-        {
-            self.config.inner_wall_speed = Some(inner_wall_speed_mms * 60.0);
-        }
-        let mut infill_speed_mms =
-            (self.config.infill_speed.unwrap_or(self.config.print_speed) / 60.0).round();
-        if ui
-            .add(egui::Slider::new(&mut infill_speed_mms, 20.0..=500.0).text("Infill speed (mm/s)"))
-            .changed()
-        {
-            self.config.infill_speed = Some(infill_speed_mms * 60.0);
-        }
-        let mut solid_infill_speed_mms = (self
-            .config
-            .solid_infill_speed
-            .unwrap_or_else(|| (self.config.print_speed * 0.8).min(self.config.print_speed))
-            / 60.0)
-            .round();
-        if ui
-            .add(
-                egui::Slider::new(&mut solid_infill_speed_mms, 20.0..=400.0)
-                    .text("Solid infill speed (mm/s)"),
-            )
-            .changed()
-        {
-            self.config.solid_infill_speed = Some(solid_infill_speed_mms * 60.0);
-        }
-        let mut bridge_speed_mms = (self
-            .config
-            .bridge_speed
-            .unwrap_or_else(|| (self.config.print_speed * 0.5).min(self.config.print_speed))
-            / 60.0)
-            .round();
-        if ui
-            .add(egui::Slider::new(&mut bridge_speed_mms, 10.0..=200.0).text("Bridge speed (mm/s)"))
-            .changed()
-        {
-            self.config.bridge_speed = Some(bridge_speed_mms * 60.0);
-        }
-        let mut first_layer_speed_mms = (self.config.first_layer_print_speed() / 60.0).round();
-        if ui
-            .add(
-                egui::Slider::new(&mut first_layer_speed_mms, 10.0..=200.0)
-                    .text("First layer speed (mm/s)"),
-            )
-            .changed()
-        {
-            self.config.first_layer_print_speed = Some(first_layer_speed_mms * 60.0);
-        }
-        let mut travel_speed_mms = (self.config.travel_speed / 60.0).round();
-        if ui
-            .add(
-                egui::Slider::new(&mut travel_speed_mms, 50.0..=1000.0).text("Travel speed (mm/s)"),
-            )
-            .changed()
-        {
-            self.config.travel_speed = travel_speed_mms * 60.0;
-        }
 
-        let mut max_vol_speed = self.config.max_volumetric_speed.unwrap_or(0.0);
-        if ui
-            .add(
-                egui::Slider::new(&mut max_vol_speed, 0.0..=60.0)
-                    .text("Max volumetric speed (mm³/s) (0=off)"),
-            )
-            .changed()
-        {
-            self.config.max_volumetric_speed = if max_vol_speed > 0.0 {
-                Some(max_vol_speed)
-            } else {
-                None
-            };
-        }
+        ui.collapsing("Speeds (mm/s)", |ui| {
+            let mut print_speed_mms = (self.config.print_speed / 60.0).round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut print_speed_mms, 20.0..=400.0)
+                        .text("Print speed (mm/s)"),
+                )
+                .changed()
+            {
+                self.config.print_speed = print_speed_mms * 60.0;
+            }
+            let mut outer_wall_speed_mms =
+                (self.config.outer_wall_speed.unwrap_or_else(|| {
+                    (self.config.print_speed * 0.6).min(self.config.print_speed)
+                }) / 60.0)
+                    .round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut outer_wall_speed_mms, 10.0..=400.0)
+                        .text("Outer wall speed (mm/s)"),
+                )
+                .changed()
+            {
+                self.config.outer_wall_speed = Some(outer_wall_speed_mms * 60.0);
+            }
+            let mut inner_wall_speed_mms = (self
+                .config
+                .inner_wall_speed
+                .unwrap_or(self.config.print_speed)
+                / 60.0)
+                .round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut inner_wall_speed_mms, 20.0..=400.0)
+                        .text("Inner wall speed (mm/s)"),
+                )
+                .changed()
+            {
+                self.config.inner_wall_speed = Some(inner_wall_speed_mms * 60.0);
+            }
+            let mut infill_speed_mms =
+                (self.config.infill_speed.unwrap_or(self.config.print_speed) / 60.0).round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut infill_speed_mms, 20.0..=500.0)
+                        .text("Infill speed (mm/s)"),
+                )
+                .changed()
+            {
+                self.config.infill_speed = Some(infill_speed_mms * 60.0);
+            }
+            let mut solid_infill_speed_mms =
+                (self.config.solid_infill_speed.unwrap_or_else(|| {
+                    (self.config.print_speed * 0.8).min(self.config.print_speed)
+                }) / 60.0)
+                    .round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut solid_infill_speed_mms, 20.0..=400.0)
+                        .text("Solid infill speed (mm/s)"),
+                )
+                .changed()
+            {
+                self.config.solid_infill_speed = Some(solid_infill_speed_mms * 60.0);
+            }
+            let mut bridge_speed_mms =
+                (self.config.bridge_speed.unwrap_or_else(|| {
+                    (self.config.print_speed * 0.5).min(self.config.print_speed)
+                }) / 60.0)
+                    .round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut bridge_speed_mms, 10.0..=200.0)
+                        .text("Bridge speed (mm/s)"),
+                )
+                .changed()
+            {
+                self.config.bridge_speed = Some(bridge_speed_mms * 60.0);
+            }
+            let mut first_layer_speed_mms = (self.config.first_layer_print_speed() / 60.0).round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut first_layer_speed_mms, 10.0..=200.0)
+                        .text("First layer speed (mm/s)"),
+                )
+                .changed()
+            {
+                self.config.first_layer_print_speed = Some(first_layer_speed_mms * 60.0);
+            }
+            let mut travel_speed_mms = (self.config.travel_speed / 60.0).round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut travel_speed_mms, 50.0..=1000.0)
+                        .text("Travel speed (mm/s)"),
+                )
+                .changed()
+            {
+                self.config.travel_speed = travel_speed_mms * 60.0;
+            }
+
+            let mut max_vol_speed = self.config.max_volumetric_speed.unwrap_or(0.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut max_vol_speed, 0.0..=60.0)
+                        .text("Max volumetric speed (mm³/s) (0=off)"),
+                )
+                .changed()
+            {
+                self.config.max_volumetric_speed = if max_vol_speed > 0.0 {
+                    Some(max_vol_speed)
+                } else {
+                    None
+                };
+            }
+        });
 
         ui.collapsing("Accelerations (mm/s²)", |ui| {
             let mut def_accel = self.config.default_acceleration.unwrap_or(5000.0);
@@ -1013,29 +1047,7 @@ impl ManifoldApp {
             }
         });
 
-        let mut pa_val = self.config.pressure_advance.unwrap_or(0.0);
-        if ui
-            .add(egui::Slider::new(&mut pa_val, 0.0..=0.2).text("Pressure advance (s)"))
-            .changed()
-        {
-            self.config.pressure_advance = if pa_val > 0.0 { Some(pa_val) } else { None };
-        }
-
-        let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
-        if ui
-            .add(
-                egui::Slider::new(&mut taper_dist, 0.0..=10.0)
-                    .text("Pre-retract taper distance (mm)"),
-            )
-            .changed()
-        {
-            self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
-                Some(taper_dist)
-            } else {
-                None
-            };
-        }
-        ui.collapsing("Retraction & Wipe", |ui| {
+        ui.collapsing("Retraction & Seams", |ui| {
             let mut r_len = self.config.retraction_length();
             if ui
                 .add(egui::Slider::new(&mut r_len, 0.0..=10.0).text("Retraction distance (mm)"))
@@ -1058,6 +1070,27 @@ impl ManifoldApp {
                 .changed()
             {
                 self.config.unretract_extra_length = Some(u_extra);
+            }
+            let mut pa_val = self.config.pressure_advance.unwrap_or(0.0);
+            if ui
+                .add(egui::Slider::new(&mut pa_val, 0.0..=0.2).text("Pressure advance (s)"))
+                .changed()
+            {
+                self.config.pressure_advance = if pa_val > 0.0 { Some(pa_val) } else { None };
+            }
+            let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut taper_dist, 0.0..=10.0)
+                        .text("Pre-retract taper distance (mm)"),
+                )
+                .changed()
+            {
+                self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
+                    Some(taper_dist)
+                } else {
+                    None
+                };
             }
             ui.checkbox(&mut self.config.scarf_joint_enabled, "Scarf joint seams");
             if self.config.scarf_joint_enabled {
@@ -1088,23 +1121,25 @@ impl ManifoldApp {
             );
         });
 
-        ui.checkbox(&mut self.config.z_hop_enabled, "Z-hop on travel");
-        if self.config.z_hop_enabled {
-            ui.add(
-                egui::Slider::new(&mut self.config.z_hop_height, 0.0..=2.0)
-                    .text("Z-hop height (mm)"),
+        ui.collapsing("Travel & Simplification", |ui| {
+            ui.checkbox(&mut self.config.z_hop_enabled, "Z-hop on travel");
+            if self.config.z_hop_enabled {
+                ui.add(
+                    egui::Slider::new(&mut self.config.z_hop_height, 0.0..=2.0)
+                        .text("Z-hop height (mm)"),
+                );
+            }
+            ui.checkbox(
+                &mut self.config.path_simplify_enabled,
+                "Simplify wall toolpaths",
             );
-        }
-        ui.checkbox(
-            &mut self.config.path_simplify_enabled,
-            "Simplify wall toolpaths",
-        );
-        if self.config.path_simplify_enabled {
-            ui.add(
-                egui::Slider::new(&mut self.config.path_simplify_tolerance, 0.0..=0.5)
-                    .text("Simplification tolerance (mm)"),
-            );
-        }
+            if self.config.path_simplify_enabled {
+                ui.add(
+                    egui::Slider::new(&mut self.config.path_simplify_tolerance, 0.0..=0.5)
+                        .text("Simplification tolerance (mm)"),
+                );
+            }
+        });
 
         ui.separator();
         ui.heading("Cooling & Fan");
@@ -1122,27 +1157,6 @@ impl ManifoldApp {
         {
             self.config.fan_layer_delay = Some(fan_delay);
         }
-
-        ui.separator();
-        ui.heading("Print Gcode");
-        ui.label("Start Gcode");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.config.start_gcode)
-                .desired_rows(3)
-                .code_editor()
-                .hint_text("e.g. PRINT_START T_TOOL=240 T_BED=105 T_CHAMBER=45 PRINT_MIN={print_min_x},{print_min_y} PRINT_MAX={print_max_x},{print_max_y}"),
-        );
-        ui.label("End Gcode");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.config.end_gcode)
-                .desired_rows(2)
-                .code_editor()
-                .hint_text("e.g. PRINT_END"),
-        );
-        ui.label(
-            "Placeholders: {print_min_x} {print_min_y} {print_max_x} {print_max_y} \
-             (first layer's XY bounding box, substituted at slice time).",
-        );
 
         ui.separator();
         ui.heading("Machine");
@@ -1182,6 +1196,27 @@ impl ManifoldApp {
                 .push(Tool::new(ToolId(self.next_tool_id), 0.4));
             self.next_tool_id += 1;
         }
+
+        ui.collapsing("Custom Gcode Macros", |ui| {
+            ui.label("Start Gcode");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.config.start_gcode)
+                    .desired_rows(3)
+                    .code_editor()
+                    .hint_text("e.g. PRINT_START T_TOOL=240 T_BED=105 T_CHAMBER=45 PRINT_MIN={print_min_x},{print_min_y} PRINT_MAX={print_max_x},{print_max_y}"),
+            );
+            ui.label("End Gcode");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.config.end_gcode)
+                    .desired_rows(2)
+                    .code_editor()
+                    .hint_text("e.g. PRINT_END"),
+            );
+            ui.label(
+                "Placeholders: {print_min_x} {print_min_y} {print_max_x} {print_max_y} \
+                 (first layer's XY bounding box, substituted at slice time).",
+            );
+        });
 
         ui.horizontal(|ui| {
             if ui.button("Save Profile…").clicked() {
