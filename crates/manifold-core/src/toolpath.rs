@@ -1645,6 +1645,17 @@ pub fn plan_with_progress(
                 }
             }
 
+            if config.wipe_enabled {
+                let wipe_dist = config.wipe_distance();
+                for path in &mut paths {
+                    crate::kinematics::apply_wipe_moves(
+                        &mut path.points,
+                        &mut path.segments,
+                        wipe_dist,
+                    );
+                }
+            }
+
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if let Ok(mut on_progress) = on_progress.lock() {
                 on_progress(done as f64 / total_layers);

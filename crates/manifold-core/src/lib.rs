@@ -209,6 +209,27 @@ pub struct SlicerConfig {
     /// Distance (mm) before a retraction over which extrusion rate is tapered down.
     #[serde(default)]
     pub pre_retract_taper_distance: Option<f64>,
+    /// Retraction distance in mm (default 0.8 mm).
+    #[serde(default)]
+    pub retraction_length: Option<f64>,
+    /// Retraction speed in mm/min (default 3000.0 mm/min = 50 mm/s).
+    #[serde(default)]
+    pub retraction_speed: Option<f64>,
+    /// Unretract / prime speed in mm/min (defaulting to `retraction_speed`).
+    #[serde(default)]
+    pub unretract_speed: Option<f64>,
+    /// Extra length in mm to extrude upon unretract (default 0.0 mm).
+    #[serde(default)]
+    pub unretract_extra_length: Option<f64>,
+    /// Distance (mm) to wipe the nozzle along/inward during retraction (default 1.0 mm).
+    #[serde(default)]
+    pub wipe_distance: Option<f64>,
+    /// Whether nozzle wipe on retraction is enabled (default false).
+    #[serde(default)]
+    pub wipe_enabled: bool,
+    /// Whether to emit firmware G10/G11 retractions instead of explicit G1 E moves (default false).
+    #[serde(default)]
+    pub use_firmware_retraction: bool,
     /// Whether Z-hop (lift-before-travel / lower-after-arrival) is enabled.
     /// When `false`, `plan`/`emit` behave exactly as before this field
     /// existed: Z tracks `point.z` unmodified even across
@@ -408,6 +429,13 @@ impl Default for SlicerConfig {
             max_volumetric_speed: None,
             pressure_advance: None,
             pre_retract_taper_distance: None,
+            retraction_length: None,
+            retraction_speed: None,
+            unretract_speed: None,
+            unretract_extra_length: None,
+            wipe_distance: None,
+            wipe_enabled: false,
+            use_firmware_retraction: false,
             z_hop_enabled: false,
             z_hop_height: default_z_hop_height(),
             path_simplify_enabled: true,
@@ -500,6 +528,37 @@ impl SlicerConfig {
     #[must_use]
     pub fn first_layer_extrusion_multiplier(&self) -> f64 {
         self.first_layer_extrusion_multiplier.unwrap_or(1.0)
+    }
+
+    /// Retraction distance (mm), defaulting to `0.8` mm when `None`.
+    #[must_use]
+    pub fn retraction_length(&self) -> f64 {
+        self.retraction_length.unwrap_or(0.8)
+    }
+
+    /// Retraction speed (mm/min), defaulting to `3000.0` mm/min (50 mm/s) when `None`.
+    #[must_use]
+    pub fn retraction_speed(&self) -> f64 {
+        self.retraction_speed.unwrap_or(3000.0)
+    }
+
+    /// Unretract speed (mm/min), defaulting to [`SlicerConfig::retraction_speed`] when `None`.
+    #[must_use]
+    pub fn unretract_speed(&self) -> f64 {
+        self.unretract_speed
+            .unwrap_or_else(|| self.retraction_speed())
+    }
+
+    /// Extra unretract length (mm), defaulting to `0.0` mm when `None`.
+    #[must_use]
+    pub fn unretract_extra_length(&self) -> f64 {
+        self.unretract_extra_length.unwrap_or(0.0)
+    }
+
+    /// Wipe distance (mm), defaulting to `1.0` mm when `None`.
+    #[must_use]
+    pub fn wipe_distance(&self) -> f64 {
+        self.wipe_distance.unwrap_or(1.0)
     }
 
     /// First layer line width (mm), defaulting to `1.3 * nozzle_diameter`

@@ -1028,6 +1028,46 @@ impl ManifoldApp {
                 None
             };
         }
+        ui.collapsing("Retraction & Wipe", |ui| {
+            let mut r_len = self.config.retraction_length();
+            if ui
+                .add(egui::Slider::new(&mut r_len, 0.0..=10.0).text("Retraction distance (mm)"))
+                .changed()
+            {
+                self.config.retraction_length = Some(r_len);
+            }
+            let mut r_spd_mms = (self.config.retraction_speed() / 60.0).round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut r_spd_mms, 10.0..=150.0).text("Retraction speed (mm/s)"),
+                )
+                .changed()
+            {
+                self.config.retraction_speed = Some(r_spd_mms * 60.0);
+            }
+            let mut u_extra = self.config.unretract_extra_length();
+            if ui
+                .add(egui::Slider::new(&mut u_extra, 0.0..=2.0).text("Unretract extra length (mm)"))
+                .changed()
+            {
+                self.config.unretract_extra_length = Some(u_extra);
+            }
+            ui.checkbox(&mut self.config.wipe_enabled, "Wipe on retraction");
+            if self.config.wipe_enabled {
+                let mut wipe_dist = self.config.wipe_distance();
+                if ui
+                    .add(egui::Slider::new(&mut wipe_dist, 0.1..=10.0).text("Wipe distance (mm)"))
+                    .changed()
+                {
+                    self.config.wipe_distance = Some(wipe_dist);
+                }
+            }
+            ui.checkbox(
+                &mut self.config.use_firmware_retraction,
+                "Use firmware retraction (G10/G11)",
+            );
+        });
+
         ui.checkbox(&mut self.config.z_hop_enabled, "Z-hop on travel");
         if self.config.z_hop_enabled {
             ui.add(

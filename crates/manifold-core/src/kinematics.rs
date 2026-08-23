@@ -499,6 +499,48 @@ pub fn apply_pre_retract_taper(
     }
 }
 
+/// Inserts an unextruded wipe segment at the end of closed perimeter wall loops
+/// to wipe the nozzle tip along the loop before lifting for travel / retracting.
+pub fn apply_wipe_moves(
+    points: &mut Vec<DVec3>,
+    segments: &mut Vec<crate::toolpath::Segment>,
+    wipe_distance_mm: f64,
+) {
+    if wipe_distance_mm <= 1e-4 || points.len() < 3 || segments.is_empty() {
+        return;
+    }
+    // Only apply to paths that start and finish with extrusion (e.g. wall loops)
+    let is_extruding_loop = segments.first().is_some_and(|s| s.kind != MoveKind::Travel)
+        && segments.last().is_some_and(|s| s.kind != MoveKind::Travel);
+    if !is_extruding_loop {
+        return;
+    }
+
+    // Direction along the first segment of the loop (p0 -> p1)
+    let p0 = points[0];
+    let p1 = points[1];
+    let d = (p1 - p0).length();
+    if d <= 1e-4 {
+        return;
+    }
+    let wipe_dir = (p1 - p0) / d;
+    let actual_wipe_len = wipe_distance_mm.min(d);
+    let p_wipe = p0 + wipe_dir * actual_wipe_len;
+
+    let last_seg = *segments.last().unwrap();
+    let wipe_seg = crate::toolpath::Segment {
+        kind: MoveKind::Travel,
+        extrusion_rate: 0.0,
+        extrusion_length: 0.0,
+        speed: last_seg.speed,
+        order: last_seg.order,
+        support_fraction: last_seg.support_fraction,
+    };
+
+    points.push(p_wipe);
+    segments.push(wipe_seg);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,5 +705,49 @@ mod tests {
         // Tapered tail (20% length with average 0.6x flow) has 1.0 * 0.6 = 0.6mm extrusion
         assert!((segments[1].extrusion_length - 0.6).abs() < 1e-4);
         assert!((segments[1].extrusion_rate - 0.6).abs() < 1e-4);
+    }
+
+    #[test]
+    fn apply_wipe_moves_appends_unextruded_wipe_segment() {
+        use crate::toolpath::Segment;
+
+        let mut points = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 0.0),
+            DVec3::new(10.0, 10.0, 0.0),
+            DVec3::new(0.0, 10.0, 0.0),
+        ];
+        let mut segments = vec![
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 5.0,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 5.0,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 5.0,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 5.0,
+                ..Segment::default()
+            },
+        ];
+
+        apply_wipe_moves(&mut points, &mut segments, 2.0);
+
+        // 1 extra point and 1 extra unextruded travel segment
+        assert_eq!(points.len(), 5);
+        assert_eq!(segments.len(), 5);
+        assert_eq!(segments[4].kind, MoveKind::Travel);
+        assert_eq!(segments[4].extrusion_length, 0.0);
+        // Wipe vector extends 2.0mm along p0->p1 (X=2.0)
+        assert!((points[4].x - 2.0).abs() < 1e-4);
     }
 }

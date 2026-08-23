@@ -228,7 +228,7 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
             // (see `toolpath::Path`'s contract), so the move *arriving* at
             // `points[i]` (i >= 1) is `segments[i - 1]`, not `segments[i]`.
             // The very first point has no incoming edge - it's always a
-            // plain positioning move (G0).
+            // plain positioning travel move (G0).
             let incoming_segment = if i > 0 {
                 path.segments.get(i - 1)
             } else {
@@ -249,23 +249,44 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
                 }
             }
 
-            // Retract (`G10`) right before a travel move if not already
-            // retracted, and unretract (`G11`) right before resuming an
-            // extruding move if currently retracted -- emitted ahead of the
-            // corresponding G0/G1 so the retract/unretract happens at the
-            // point the travel or extrusion move *starts from*, not mid-move.
-            // Only ever fires on a state *change* (travel-after-travel or
-            // extrude-after-extrude is a no-op), so a run of consecutive
-            // travel or extruding segments emits exactly one G10/G11, not one
-            // per segment.
-            if let Some(segment) = incoming_segment {
+            // Retract before travel moves:
+            // 1. If starting a new path (i == 0) and currently unretracted, retract before the G0 positioning move.
+            // 2. If entering an in-path Travel segment, retract before the move.
+            // Unretract before resuming an extruding move.
+            if i == 0 {
+                if !retracted {
+                    if config.use_firmware_retraction {
+                        out.push_str("G10\n");
+                    } else {
+                        let r_len = config.retraction_length();
+                        let r_spd = config.retraction_speed();
+                        out.push_str(&format!("G1 E-{r_len:.5} F{r_spd:.0}\n"));
+                        current_f = Some(r_spd);
+                    }
+                    retracted = true;
+                }
+            } else if let Some(segment) = incoming_segment {
                 if segment.kind == MoveKind::Travel {
                     if !retracted {
-                        out.push_str("G10\n");
+                        if config.use_firmware_retraction {
+                            out.push_str("G10\n");
+                        } else {
+                            let r_len = config.retraction_length();
+                            let r_spd = config.retraction_speed();
+                            out.push_str(&format!("G1 E-{r_len:.5} F{r_spd:.0}\n"));
+                            current_f = Some(r_spd);
+                        }
                         retracted = true;
                     }
                 } else if retracted {
-                    out.push_str("G11\n");
+                    if config.use_firmware_retraction {
+                        out.push_str("G11\n");
+                    } else {
+                        let u_len = config.retraction_length() + config.unretract_extra_length();
+                        let u_spd = config.unretract_speed();
+                        out.push_str(&format!("G1 E{u_len:.5} F{u_spd:.0}\n"));
+                        current_f = Some(u_spd);
+                    }
                     retracted = false;
                 }
             }
@@ -292,6 +313,16 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
         }
     }
 
+    if !retracted {
+        if config.use_firmware_retraction {
+            out.push_str("G10\n");
+        } else {
+            let r_len = config.retraction_length();
+            let r_spd = config.retraction_speed();
+            out.push_str(&format!("G1 E-{r_len:.5} F{r_spd:.0}\n"));
+        }
+    }
+
     if !config.end_gcode.is_empty() {
         out.push_str(&interpolate(&config.end_gcode, min_x, min_y, max_x, max_y));
         out.push('\n');
@@ -312,6 +343,7 @@ mod tests {
         SlicerConfig {
             start_gcode: String::new(),
             end_gcode: String::new(),
+            use_firmware_retraction: true,
             ..SlicerConfig::default()
         }
     }
@@ -394,6 +426,56 @@ mod tests {
     }
 
     #[test]
+    fn emit_emits_explicit_retractions_when_firmware_retraction_is_disabled() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        let paths = vec![Path {
+            points: vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(2.0, 0.0, 0.0),
+                DVec3::new(3.0, 0.0, 0.0),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::Travel,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    ..Segment::default()
+                },
+            ],
+            tool: ToolId(0),
+        }];
+
+        let config = SlicerConfig {
+            use_firmware_retraction: false,
+            retraction_length: Some(0.8),
+            retraction_speed: Some(3000.0),
+            unretract_speed: Some(3000.0),
+            unretract_extra_length: Some(0.1),
+            start_gcode: String::new(),
+            end_gcode: String::new(),
+            ..SlicerConfig::default()
+        };
+
+        let out = emit(&paths, &config);
+
+        // Explicit unretract with extra length before first extrusion: E0.90000
+        assert!(out.contains("G1 E0.90000 F3000"));
+        // Explicit retract before travel: E-0.80000
+        assert!(out.contains("G1 E-0.80000 F3000"));
+        assert!(!out.contains("G10"));
+        assert!(!out.contains("G11"));
+    }
+
+    #[test]
     fn emit_retracts_before_travel_and_unretracts_before_resuming_extrusion() {
         use crate::toolpath::Segment;
         use glam::DVec3;
@@ -431,7 +513,11 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         let g10_idx = lines.iter().position(|l| *l == "G10");
         let g11_idx = lines.iter().position(|l| *l == "G11");
-        assert_eq!(out.matches("G10").count(), 1);
+        assert_eq!(
+            out.matches("G10").count(),
+            2,
+            "one before travel, one at end of program"
+        );
         assert_eq!(
             out.matches("G11").count(),
             2,
@@ -498,8 +584,12 @@ mod tests {
         let out = emit(&paths, &config_without_print_gcode());
         // Already retracted from the start, so the leading travel run
         // triggers no G10 at all; only the later switch to extrusion emits
-        // one G11.
-        assert_eq!(out.matches("G10").count(), 0);
+        // one G11, followed by a final G10 retract at program completion.
+        assert_eq!(
+            out.matches("G10").count(),
+            1,
+            "final retract at end of program"
+        );
         assert_eq!(out.matches("G11").count(), 1);
     }
 
@@ -537,7 +627,11 @@ mod tests {
             2,
             "each tool's first extruding move gets its own unretract"
         );
-        assert_eq!(out.matches("G10").count(), 0);
+        assert_eq!(
+            out.matches("G10").count(),
+            1,
+            "final retract at end of program"
+        );
     }
 
     #[test]
