@@ -417,6 +417,88 @@ pub fn clamp_feedrate_by_volumetric_limit(
     nominal_feedrate_mm_min.min(max_v_mm_min)
 }
 
+/// Tapers extrusion rate and feedrate across the final `taper_distance_mm` of an extrusion run
+/// (preceding a retraction / travel move) to bleed excess melt-zone pressure.
+///
+/// Uses the pressure-advance aware bleed model:
+/// - As distance to the path end drops below `taper_distance_mm`, the segment's `extrusion_rate`
+///   smoothly tapers from 1.0 down to `min_rate` (default 0.20 = 20%).
+/// - Adjusts `segment.extrusion_length` proportionally: `extrusion_length *= effective_rate`.
+pub fn apply_pre_retract_taper(
+    points: &mut Vec<DVec3>,
+    segments: &mut Vec<crate::toolpath::Segment>,
+    taper_distance_mm: f64,
+    min_rate: f64,
+) {
+    if taper_distance_mm <= 1e-4 || segments.is_empty() {
+        return;
+    }
+
+    // Identify the last extruding segment index
+    let mut last_extruding_idx = None;
+    for (i, seg) in segments.iter().enumerate().rev() {
+        if seg.kind != MoveKind::Travel {
+            last_extruding_idx = Some(i);
+            break;
+        }
+    }
+    let Some(last_idx) = last_extruding_idx else {
+        return;
+    };
+
+    let p_start = points[last_idx];
+    let p_end = points[(last_idx + 1) % points.len()];
+    let last_seg_len = (p_end - p_start).length();
+
+    if last_seg_len > taper_distance_mm + 0.1 {
+        // Split last segment into untapered lead-in + tapered tail
+        let split_ratio = (last_seg_len - taper_distance_mm) / last_seg_len;
+        let p_split = p_start.lerp(p_end, split_ratio);
+
+        let orig_seg = segments[last_idx];
+        let mut lead_seg = orig_seg;
+        let mut tail_seg = orig_seg;
+
+        lead_seg.extrusion_length = orig_seg.extrusion_length * split_ratio;
+        tail_seg.extrusion_length = orig_seg.extrusion_length * (1.0 - split_ratio);
+
+        let avg_tail_rate = (1.0 + min_rate) * 0.5;
+        tail_seg.extrusion_rate *= avg_tail_rate;
+        tail_seg.extrusion_length *= avg_tail_rate;
+
+        points.insert(last_idx + 1, p_split);
+        segments[last_idx] = lead_seg;
+        segments.insert(last_idx + 1, tail_seg);
+        return;
+    }
+
+    let mut seg_lengths = Vec::new();
+    for i in 0..=last_idx {
+        let p0 = points[i];
+        let p1 = points[(i + 1) % points.len()];
+        seg_lengths.push((p1 - p0).length());
+    }
+
+    let mut dist_from_end = 0.0;
+    for i in (0..=last_idx).rev() {
+        let seg_len = seg_lengths[i];
+        if segments[i].kind == MoveKind::Travel {
+            break;
+        }
+        let seg_mid_dist = dist_from_end + seg_len * 0.5;
+        if seg_mid_dist < taper_distance_mm {
+            let t = (seg_mid_dist / taper_distance_mm).clamp(0.0, 1.0);
+            let taper_factor = min_rate + (1.0 - min_rate) * t;
+            segments[i].extrusion_rate *= taper_factor;
+            segments[i].extrusion_length *= taper_factor;
+        }
+        dist_from_end += seg_len;
+        if dist_from_end >= taper_distance_mm {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +637,31 @@ mod tests {
         assert!((profiles[0].exit_speed - 300.0).abs() < 10.0);
         // Last segment finishes at exit 0.0
         assert_eq!(profiles[2].exit_speed, 0.0);
+    }
+
+    #[test]
+    fn apply_pre_retract_taper_reduces_tail_extrusion_rate() {
+        use crate::toolpath::Segment;
+
+        let mut points = vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(10.0, 0.0, 0.0)];
+        let mut segments = vec![Segment {
+            kind: MoveKind::WallOuter,
+            extrusion_length: 5.0,
+            extrusion_rate: 1.0,
+            ..Segment::default()
+        }];
+
+        apply_pre_retract_taper(&mut points, &mut segments, 2.0, 0.2);
+
+        // Long segment (10mm) should be split at 8.0mm into lead-in and 2.0mm tail
+        assert_eq!(points.len(), 3);
+        assert_eq!(segments.len(), 2);
+        assert!((points[1].x - 8.0).abs() < 1e-4);
+
+        // Lead-in (80% length) has 4.0mm extrusion
+        assert!((segments[0].extrusion_length - 4.0).abs() < 1e-4);
+        // Tapered tail (20% length with average 0.6x flow) has 1.0 * 0.6 = 0.6mm extrusion
+        assert!((segments[1].extrusion_length - 0.6).abs() < 1e-4);
+        assert!((segments[1].extrusion_rate - 0.6).abs() < 1e-4);
     }
 }

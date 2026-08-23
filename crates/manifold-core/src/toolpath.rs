@@ -1632,6 +1632,19 @@ pub fn plan_with_progress(
                 }
             }
 
+            if let Some(taper_dist) = config.pre_retract_taper_distance {
+                if taper_dist > 0.0 {
+                    for path in &mut paths {
+                        crate::kinematics::apply_pre_retract_taper(
+                            &mut path.points,
+                            &mut path.segments,
+                            taper_dist,
+                            0.20,
+                        );
+                    }
+                }
+            }
+
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if let Ok(mut on_progress) = on_progress.lock() {
                 on_progress(done as f64 / total_layers);
@@ -1993,6 +2006,38 @@ mod tests {
             e0 > e1 * 1.3,
             "layer 0 extrusion ({e0}) should be significantly higher than layer 1 ({e1})"
         );
+    }
+
+    #[test]
+    fn plan_applies_pre_retract_taper_when_configured() {
+        let objects = vec![Object::new(ObjectId(0), Mesh::default(), ToolId(0))];
+        let layer = Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.20,
+            loops: vec![WallLoop {
+                wall_index: 0,
+                points: vec![DVec3::new(0.0, 0.0, 0.20), DVec3::new(20.0, 0.0, 0.20)],
+                ..Default::default()
+            }],
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            mesh_sdf: None,
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
+        };
+        let config_taper = SlicerConfig {
+            pre_retract_taper_distance: Some(3.0),
+            path_simplify_enabled: false,
+            ..SlicerConfig::default()
+        };
+
+        let paths = plan(&[layer], &objects, &[], &config_taper).unwrap();
+        let path = &paths[0];
+
+        // The closing 20mm segment is split into a 17mm lead-in and 3mm tapered tail (3 segments total)
+        assert_eq!(path.segments.len(), 3);
+        // The tail segment's extrusion rate is tapered (0.6x average)
+        assert!((path.segments[2].extrusion_rate - 0.6).abs() < 1e-3);
     }
 
     #[test]
