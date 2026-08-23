@@ -104,7 +104,7 @@ fn main() -> anyhow::Result<()> {
     let slope_profile = if std::env::args().any(|a| a == "--no-slope-limit") {
         SlopeProfile::new(Vec::new())
     } else {
-        SlopeProfile::new(vec![(0.0, 15.0), (4.0, 2.0)])
+        SlopeProfile::from_angle(15.0)
     };
 
     println!("slicing {path} with Eikonal order field (slope profile: 0mm->15deg, 4mm->2deg)...");

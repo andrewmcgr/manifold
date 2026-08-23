@@ -62,7 +62,7 @@ fn main() -> anyhow::Result<()> {
         ..SlicerConfig::default()
     };
     println!("wall_count = {}", config.wall_count());
-    let slope_profile = SlopeProfile::new(vec![(0.0, degrees)]);
+    let slope_profile = SlopeProfile::from_angle(degrees);
 
     let layers = slicing::slice_workspace_with_progress(
         &objects,

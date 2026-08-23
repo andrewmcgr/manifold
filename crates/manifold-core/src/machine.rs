@@ -29,9 +29,8 @@ pub struct Machine {
     /// deferred multi-axis (tool-tilting / substrate-reorientation) work
     /// does not force a schema change later — see ROADMAP.md.
     pub axis_count: u8,
-    /// Piecewise `(height_along_axis_mm, max_angle_deg)` breakpoints
-    /// describing the maximum overhang/travel angle this machine can
-    /// physically clear at a given height, converted via
+    /// Series of `(x_mm, z_mm)` points describing the toolhead clearance
+    /// envelope from the nozzle tip (x=0, z=0), converted via
     /// [`Machine::slope_profile`] into a
     /// `manifold_fidget::slope_profile::SlopeProfile`. Lives on `Machine`
     /// (not `SlicerConfig`) because it describes a physical property of the

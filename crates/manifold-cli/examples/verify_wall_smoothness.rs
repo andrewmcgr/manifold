@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
         ..SlicerConfig::default()
     };
     let grid_h = config.layer_height.min(config.nozzle_diameter) / 2.0;
-    let slope_profile = SlopeProfile::new(vec![(0.0, 15.0)]);
+    let slope_profile = SlopeProfile::from_angle(15.0);
     let layers = slicing::slice_workspace_with_progress(
         &objects,
         &[ObjectId(0)],

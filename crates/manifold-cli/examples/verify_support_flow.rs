@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
         order_field: kind,
         ..SlicerConfig::default()
     };
-    let slope_profile = SlopeProfile::new(vec![(0.0, 15.0)]);
+    let slope_profile = SlopeProfile::from_angle(15.0);
     let layers = slicing::slice_workspace_with_progress(
         &objects,
         &[ObjectId(0)],

@@ -845,24 +845,34 @@ impl ManifoldApp {
                 &mut self.config.eikonal_conform_top_surfaces,
                 "Conform to top surfaces",
             );
-            ui.collapsing("Slope-limit profile breakpoints", |ui| {
-                ui.label("Height above build plate -> max surface slope angle");
+            ui.collapsing("Toolhead clearance profile (XZ)", |ui| {
+                ui.label("Radial distance (X) and height (Z) from nozzle tip");
                 let mut remove_index: Option<usize> = None;
-                for (i, (height, degrees)) in
-                    self.machine.eikonal_slope_profile.iter_mut().enumerate()
-                {
+                for (i, (x, z)) in self.machine.eikonal_slope_profile.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::DragValue::new(height)
-                                .prefix("h: ")
+                            egui::DragValue::new(x)
+                                .prefix("x: ")
                                 .suffix(" mm")
-                                .range(0.0..=1000.0),
+                                .range(0.001..=500.0)
+                                .speed(0.1),
                         );
                         ui.add(
-                            egui::DragValue::new(degrees)
-                                .prefix("max: ")
-                                .suffix(" deg")
-                                .range(0.0..=90.0),
+                            egui::DragValue::new(z)
+                                .prefix("z: ")
+                                .suffix(" mm")
+                                .range(0.0..=1000.0)
+                                .speed(0.1),
+                        );
+                        let angle = if *z > 0.0 && *x > 0.0 {
+                            (*z / *x).atan().to_degrees()
+                        } else {
+                            0.0
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("({angle:.1}°)"))
+                                .size(11.0)
+                                .color(egui::Color32::from_gray(160)),
                         );
                         if ui.button("Remove").clicked() {
                             remove_index = Some(i);
@@ -872,14 +882,14 @@ impl ManifoldApp {
                 if let Some(i) = remove_index {
                     self.machine.eikonal_slope_profile.remove(i);
                 }
-                if ui.button("Add breakpoint").clicked() {
-                    let next_height = self
+                if ui.button("Add point").clicked() {
+                    let (next_x, next_z) = self
                         .machine
                         .eikonal_slope_profile
                         .last()
-                        .map(|(h, _)| h + 1.0)
-                        .unwrap_or(0.0);
-                    self.machine.eikonal_slope_profile.push((next_height, 45.0));
+                        .map(|&(x, z)| (x + 5.0, z + 5.0))
+                        .unwrap_or((0.8, 0.0));
+                    self.machine.eikonal_slope_profile.push((next_x, next_z));
                 }
             });
         }

@@ -1541,7 +1541,7 @@ mod tests {
         let is_seed_region = |p: DVec3| p == DVec3::ZERO;
 
         // A tight 30-degree cap, constant everywhere.
-        let profile = SlopeProfile::new(vec![(f64::INFINITY, 30.0)]);
+        let profile = SlopeProfile::from_angle(30.0);
         let height_along = ConstantAxisHeight::new(DVec3::Z, DVec3::ZERO);
 
         let field = EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
@@ -1601,7 +1601,7 @@ mod tests {
 
         // An extremely tight 1-degree cap, constant everywhere -- the
         // near-flat extreme that most aggressively exposed the bug.
-        let profile = SlopeProfile::new(vec![(f64::INFINITY, 1.0)]);
+        let profile = SlopeProfile::from_angle(1.0);
         let height_along = ConstantAxisHeight::new(DVec3::Z, DVec3::ZERO);
 
         let field = EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
@@ -1685,7 +1685,7 @@ mod tests {
         let cell_size = 0.5;
         let is_solid = |_p: DVec3| true;
         let is_seed_region = |p: DVec3| p == DVec3::ZERO;
-        let profile = SlopeProfile::new(vec![(f64::INFINITY, 30.0)]);
+        let profile = SlopeProfile::from_angle(30.0);
         let height_along = NanHeight;
 
         let field = EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
@@ -1789,7 +1789,7 @@ mod tests {
         // spatially uniform regardless of which of a pair's two nodes it's
         // evaluated at).
         let angle_deg = 5.0;
-        let profile = SlopeProfile::new(vec![(f64::INFINITY, angle_deg)]);
+        let profile = SlopeProfile::from_angle(angle_deg);
         let height_along = ConstantAxisHeight::new(DVec3::Z, DVec3::ZERO);
         let max_delta = angle_deg.to_radians().tan() * cell_size;
 
@@ -1886,7 +1886,7 @@ mod tests {
 
         // With a 10-degree slope profile, the maximum order difference across the
         // 10mm horizontal gap (dx = 10mm) is capped at 10 * tan(10 deg) ~ 1.76mm.
-        let profile = SlopeProfile::new(vec![(0.0, 10.0)]);
+        let profile = SlopeProfile::from_angle(10.0);
 
         let field = EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
             min_corner,

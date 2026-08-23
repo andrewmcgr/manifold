@@ -68,22 +68,22 @@ struct Cli {
 }
 
 /// Parses a `--eikonal-slope-profile` argument of comma-separated
-/// `height:degrees` pairs into breakpoints for `SlicerConfig::eikonal_slope_profile`.
+/// `x:z` pairs into clearance points for `Machine::eikonal_slope_profile`.
 fn parse_slope_profile(s: &str) -> Result<Vec<(f64, f64)>, String> {
     s.split(',')
         .map(|pair| {
-            let (h, d) = pair
+            let (x_str, z_str) = pair
                 .split_once(':')
-                .ok_or_else(|| format!("expected `height:degrees`, got `{pair}`"))?;
-            let height: f64 = h
+                .ok_or_else(|| format!("expected `x:z`, got `{pair}`"))?;
+            let x: f64 = x_str
                 .trim()
                 .parse()
-                .map_err(|_| format!("invalid height `{h}` in `{pair}`"))?;
-            let degrees: f64 = d
+                .map_err(|_| format!("invalid x radius `{x_str}` in `{pair}`"))?;
+            let z: f64 = z_str
                 .trim()
                 .parse()
-                .map_err(|_| format!("invalid degrees `{d}` in `{pair}`"))?;
-            Ok((height, degrees))
+                .map_err(|_| format!("invalid z height `{z_str}` in `{pair}`"))?;
+            Ok((x, z))
         })
         .collect()
 }
