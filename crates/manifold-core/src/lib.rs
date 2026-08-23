@@ -10,6 +10,7 @@ pub mod extrusion;
 pub mod gcode;
 pub mod ids;
 pub mod infill;
+pub mod kinematics;
 pub mod machine;
 pub mod material;
 pub mod mesh;
@@ -163,6 +164,49 @@ pub struct SlicerConfig {
     /// existed still deserializes.
     #[serde(default = "default_print_speed")]
     pub print_speed: f64,
+    /// Outer wall print speed (mm/min), defaulting to 60% of `print_speed` when `None`.
+    #[serde(default)]
+    pub outer_wall_speed: Option<f64>,
+    /// Inner wall print speed (mm/min), defaulting to `print_speed` when `None`.
+    #[serde(default)]
+    pub inner_wall_speed: Option<f64>,
+    /// Sparse infill print speed (mm/min), defaulting to `print_speed` when `None`.
+    #[serde(default)]
+    pub infill_speed: Option<f64>,
+    /// Solid infill print speed (mm/min), defaulting to 80% of `print_speed` when `None`.
+    #[serde(default)]
+    pub solid_infill_speed: Option<f64>,
+    /// Bridge / overhang print speed (mm/min), defaulting to 50% of `print_speed` when `None`.
+    #[serde(default)]
+    pub bridge_speed: Option<f64>,
+    /// Default printing acceleration (mm/s²), defaulting to 5000.0 when `None`.
+    #[serde(default)]
+    pub default_acceleration: Option<f64>,
+    /// Outer wall acceleration (mm/s²), defaulting to 2500.0 when `None`.
+    #[serde(default)]
+    pub outer_wall_acceleration: Option<f64>,
+    /// Inner wall acceleration (mm/s²), defaulting to 5000.0 when `None`.
+    #[serde(default)]
+    pub inner_wall_acceleration: Option<f64>,
+    /// Infill acceleration (mm/s²), defaulting to 7000.0 when `None`.
+    #[serde(default)]
+    pub infill_acceleration: Option<f64>,
+    /// Travel acceleration (mm/s²), defaulting to 10000.0 when `None`.
+    #[serde(default)]
+    pub travel_acceleration: Option<f64>,
+    /// First layer acceleration (mm/s²), defaulting to 2000.0 when `None`.
+    #[serde(default)]
+    pub first_layer_acceleration: Option<f64>,
+    /// Maximum volumetric extrusion speed (mm³/s). When set and > 0, linear feedrates
+    /// are automatically capped per-segment based on bead cross-sectional area.
+    #[serde(default)]
+    pub max_volumetric_speed: Option<f64>,
+    /// Pressure advance value (seconds / k_pa).
+    #[serde(default)]
+    pub pressure_advance: Option<f64>,
+    /// Distance (mm) before a retraction over which extrusion rate is tapered down.
+    #[serde(default)]
+    pub pre_retract_taper_distance: Option<f64>,
     /// Whether Z-hop (lift-before-travel / lower-after-arrival) is enabled.
     /// When `false`, `plan`/`emit` behave exactly as before this field
     /// existed: Z tracks `point.z` unmodified even across
@@ -348,6 +392,20 @@ impl Default for SlicerConfig {
             end_gcode: "PRINT_END".to_string(),
             travel_speed: default_travel_speed(),
             print_speed: default_print_speed(),
+            outer_wall_speed: None,
+            inner_wall_speed: None,
+            infill_speed: None,
+            solid_infill_speed: None,
+            bridge_speed: None,
+            default_acceleration: None,
+            outer_wall_acceleration: None,
+            inner_wall_acceleration: None,
+            infill_acceleration: None,
+            travel_acceleration: None,
+            first_layer_acceleration: None,
+            max_volumetric_speed: None,
+            pressure_advance: None,
+            pre_retract_taper_distance: None,
             z_hop_enabled: false,
             z_hop_height: default_z_hop_height(),
             path_simplify_enabled: true,
@@ -407,6 +465,33 @@ impl SlicerConfig {
     pub fn first_layer_print_speed(&self) -> f64 {
         self.first_layer_print_speed
             .unwrap_or_else(|| (self.print_speed * 0.4).min(self.print_speed))
+    }
+
+    /// Returns the resolved [`kinematics::StandardMotionModel`] reflecting
+    /// the configured speeds and accelerations.
+    #[must_use]
+    pub fn motion_model(&self) -> kinematics::StandardMotionModel {
+        kinematics::StandardMotionModel {
+            outer_wall_speed: self
+                .outer_wall_speed
+                .unwrap_or_else(|| (self.print_speed * 0.6).min(self.print_speed)),
+            inner_wall_speed: self.inner_wall_speed.unwrap_or(self.print_speed),
+            infill_speed: self.infill_speed.unwrap_or(self.print_speed),
+            solid_infill_speed: self
+                .solid_infill_speed
+                .unwrap_or_else(|| (self.print_speed * 0.8).min(self.print_speed)),
+            bridge_speed: self
+                .bridge_speed
+                .unwrap_or_else(|| (self.print_speed * 0.5).min(self.print_speed)),
+            travel_speed: self.travel_speed,
+            first_layer_speed: self.first_layer_print_speed(),
+            default_acceleration: self.default_acceleration.unwrap_or(5000.0),
+            outer_wall_acceleration: self.outer_wall_acceleration.unwrap_or(2500.0),
+            inner_wall_acceleration: self.inner_wall_acceleration.unwrap_or(5000.0),
+            infill_acceleration: self.infill_acceleration.unwrap_or(7000.0),
+            travel_acceleration: self.travel_acceleration.unwrap_or(10000.0),
+            first_layer_acceleration: self.first_layer_acceleration.unwrap_or(2000.0),
+        }
     }
 
     /// First layer extrusion multiplier, defaulting to `1.0` when `None`.

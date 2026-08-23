@@ -1265,23 +1265,11 @@ pub fn validate_within_bounds(paths: &[Path], build_volume: &BoundingVolume) -> 
 }
 
 /// Chooses the Gcode feedrate (`Segment::speed`, mm/min) for a segment of
-/// the given `kind`, from `config`. [`MoveKind::Travel`] uses
-/// `config.travel_speed`; every extruding kind (`WallOuter`/`WallInner`/
-/// `Infill`/`Bridge`/`Overhang`/`TopSurface`) uses `config.print_speed` --
-/// there is no finer-grained per-extruding-kind speed yet (e.g. a
-/// separate bridge speed), so all of them share one "print speed" until
-/// that becomes configurable.
+/// the given `kind`, from `config` via its [`crate::kinematics::MotionModel`].
 #[must_use]
 pub fn speed_for_kind(kind: MoveKind, config: &SlicerConfig) -> f64 {
-    match kind {
-        MoveKind::Travel => config.travel_speed,
-        MoveKind::WallOuter
-        | MoveKind::WallInner
-        | MoveKind::Infill
-        | MoveKind::Bridge
-        | MoveKind::Overhang
-        | MoveKind::TopSurface => config.print_speed,
-    }
+    use crate::kinematics::MotionModel;
+    config.motion_model().max_feedrate(kind, false)
 }
 
 /// Classification of a single toolpath segment (the move from one point to
@@ -1631,11 +1619,16 @@ pub fn plan_with_progress(
                             * segment.extrusion_rate
                             * extrusion_multiplier
                             * first_layer_mult;
-                    segment.speed = if is_first_layer {
+                    let nominal_speed = if is_first_layer && segment.kind != MoveKind::Travel {
                         config.first_layer_print_speed()
                     } else {
                         speed_for_kind(segment.kind, config)
                     };
+                    segment.speed = crate::kinematics::clamp_feedrate_by_volumetric_limit(
+                        nominal_speed,
+                        bead_area,
+                        config.max_volumetric_speed,
+                    );
                 }
             }
 
@@ -1879,11 +1872,24 @@ mod tests {
         };
 
         assert_eq!(speed_for_kind(MoveKind::Travel, &config), 9000.0);
-        assert_eq!(speed_for_kind(MoveKind::WallOuter, &config), 3000.0);
+        assert_eq!(speed_for_kind(MoveKind::WallOuter, &config), 1800.0); // 60% of print_speed
         assert_eq!(speed_for_kind(MoveKind::WallInner, &config), 3000.0);
         assert_eq!(speed_for_kind(MoveKind::Infill, &config), 3000.0);
-        assert_eq!(speed_for_kind(MoveKind::Bridge, &config), 3000.0);
-        assert_eq!(speed_for_kind(MoveKind::Overhang, &config), 3000.0);
+        assert_eq!(speed_for_kind(MoveKind::Bridge, &config), 1500.0); // 50% of print_speed
+        assert_eq!(speed_for_kind(MoveKind::Overhang, &config), 1500.0);
+
+        let explicit_config = SlicerConfig {
+            travel_speed: 9000.0,
+            print_speed: 3000.0,
+            outer_wall_speed: Some(2400.0),
+            bridge_speed: Some(1200.0),
+            ..SlicerConfig::default()
+        };
+        assert_eq!(
+            speed_for_kind(MoveKind::WallOuter, &explicit_config),
+            2400.0
+        );
+        assert_eq!(speed_for_kind(MoveKind::Bridge, &explicit_config), 1200.0);
     }
 
     #[test]
@@ -1964,6 +1970,7 @@ mod tests {
             layer_height: 0.20,
             first_layer_height: Some(0.25),
             print_speed: 3000.0,
+            outer_wall_speed: Some(3000.0),
             first_layer_print_speed: Some(1200.0),
             first_layer_extrusion_multiplier: Some(1.2),
             ..SlicerConfig::default()

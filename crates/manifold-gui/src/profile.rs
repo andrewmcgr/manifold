@@ -91,6 +91,7 @@ mod tests {
                 travel_order_optimization_enabled: true,
                 travel_collision_avoidance_enabled: true,
                 z_travel_penalty: 8.0,
+                ..SlicerConfig::default()
             },
         }
     }

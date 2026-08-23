@@ -828,7 +828,7 @@ impl ManifoldApp {
         }
 
         ui.separator();
-        ui.heading("Speeds & Travel");
+        ui.heading("Speeds & Accelerations");
         let mut print_speed_mms = (self.config.print_speed / 60.0).round();
         if ui
             .add(egui::Slider::new(&mut print_speed_mms, 20.0..=400.0).text("Print speed (mm/s)"))
@@ -836,10 +836,75 @@ impl ManifoldApp {
         {
             self.config.print_speed = print_speed_mms * 60.0;
         }
+        let mut outer_wall_speed_mms = (self
+            .config
+            .outer_wall_speed
+            .unwrap_or_else(|| (self.config.print_speed * 0.6).min(self.config.print_speed))
+            / 60.0)
+            .round();
+        if ui
+            .add(
+                egui::Slider::new(&mut outer_wall_speed_mms, 10.0..=400.0)
+                    .text("Outer wall speed (mm/s)"),
+            )
+            .changed()
+        {
+            self.config.outer_wall_speed = Some(outer_wall_speed_mms * 60.0);
+        }
+        let mut inner_wall_speed_mms = (self
+            .config
+            .inner_wall_speed
+            .unwrap_or(self.config.print_speed)
+            / 60.0)
+            .round();
+        if ui
+            .add(
+                egui::Slider::new(&mut inner_wall_speed_mms, 20.0..=400.0)
+                    .text("Inner wall speed (mm/s)"),
+            )
+            .changed()
+        {
+            self.config.inner_wall_speed = Some(inner_wall_speed_mms * 60.0);
+        }
+        let mut infill_speed_mms =
+            (self.config.infill_speed.unwrap_or(self.config.print_speed) / 60.0).round();
+        if ui
+            .add(egui::Slider::new(&mut infill_speed_mms, 20.0..=500.0).text("Infill speed (mm/s)"))
+            .changed()
+        {
+            self.config.infill_speed = Some(infill_speed_mms * 60.0);
+        }
+        let mut solid_infill_speed_mms = (self
+            .config
+            .solid_infill_speed
+            .unwrap_or_else(|| (self.config.print_speed * 0.8).min(self.config.print_speed))
+            / 60.0)
+            .round();
+        if ui
+            .add(
+                egui::Slider::new(&mut solid_infill_speed_mms, 20.0..=400.0)
+                    .text("Solid infill speed (mm/s)"),
+            )
+            .changed()
+        {
+            self.config.solid_infill_speed = Some(solid_infill_speed_mms * 60.0);
+        }
+        let mut bridge_speed_mms = (self
+            .config
+            .bridge_speed
+            .unwrap_or_else(|| (self.config.print_speed * 0.5).min(self.config.print_speed))
+            / 60.0)
+            .round();
+        if ui
+            .add(egui::Slider::new(&mut bridge_speed_mms, 10.0..=200.0).text("Bridge speed (mm/s)"))
+            .changed()
+        {
+            self.config.bridge_speed = Some(bridge_speed_mms * 60.0);
+        }
         let mut first_layer_speed_mms = (self.config.first_layer_print_speed() / 60.0).round();
         if ui
             .add(
-                egui::Slider::new(&mut first_layer_speed_mms, 20.0..=400.0)
+                egui::Slider::new(&mut first_layer_speed_mms, 10.0..=200.0)
                     .text("First layer speed (mm/s)"),
             )
             .changed()
@@ -849,11 +914,111 @@ impl ManifoldApp {
         let mut travel_speed_mms = (self.config.travel_speed / 60.0).round();
         if ui
             .add(
-                egui::Slider::new(&mut travel_speed_mms, 100.0..=800.0).text("Travel speed (mm/s)"),
+                egui::Slider::new(&mut travel_speed_mms, 50.0..=1000.0).text("Travel speed (mm/s)"),
             )
             .changed()
         {
             self.config.travel_speed = travel_speed_mms * 60.0;
+        }
+
+        let mut max_vol_speed = self.config.max_volumetric_speed.unwrap_or(0.0);
+        if ui
+            .add(
+                egui::Slider::new(&mut max_vol_speed, 0.0..=60.0)
+                    .text("Max volumetric speed (mm³/s) (0=off)"),
+            )
+            .changed()
+        {
+            self.config.max_volumetric_speed = if max_vol_speed > 0.0 {
+                Some(max_vol_speed)
+            } else {
+                None
+            };
+        }
+
+        ui.collapsing("Accelerations (mm/s²)", |ui| {
+            let mut def_accel = self.config.default_acceleration.unwrap_or(5000.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut def_accel, 500.0..=30000.0).text("Default acceleration"),
+                )
+                .changed()
+            {
+                self.config.default_acceleration = Some(def_accel);
+            }
+            let mut outer_wall_accel = self.config.outer_wall_acceleration.unwrap_or(2500.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut outer_wall_accel, 500.0..=30000.0)
+                        .text("Outer wall acceleration"),
+                )
+                .changed()
+            {
+                self.config.outer_wall_acceleration = Some(outer_wall_accel);
+            }
+            let mut inner_wall_accel = self.config.inner_wall_acceleration.unwrap_or(5000.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut inner_wall_accel, 500.0..=30000.0)
+                        .text("Inner wall acceleration"),
+                )
+                .changed()
+            {
+                self.config.inner_wall_acceleration = Some(inner_wall_accel);
+            }
+            let mut infill_accel = self.config.infill_acceleration.unwrap_or(7000.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut infill_accel, 500.0..=30000.0)
+                        .text("Infill acceleration"),
+                )
+                .changed()
+            {
+                self.config.infill_acceleration = Some(infill_accel);
+            }
+            let mut travel_accel = self.config.travel_acceleration.unwrap_or(10000.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut travel_accel, 500.0..=40000.0)
+                        .text("Travel acceleration"),
+                )
+                .changed()
+            {
+                self.config.travel_acceleration = Some(travel_accel);
+            }
+            let mut first_layer_accel = self.config.first_layer_acceleration.unwrap_or(2000.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut first_layer_accel, 500.0..=10000.0)
+                        .text("First layer acceleration"),
+                )
+                .changed()
+            {
+                self.config.first_layer_acceleration = Some(first_layer_accel);
+            }
+        });
+
+        let mut pa_val = self.config.pressure_advance.unwrap_or(0.0);
+        if ui
+            .add(egui::Slider::new(&mut pa_val, 0.0..=0.2).text("Pressure advance (s)"))
+            .changed()
+        {
+            self.config.pressure_advance = if pa_val > 0.0 { Some(pa_val) } else { None };
+        }
+
+        let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
+        if ui
+            .add(
+                egui::Slider::new(&mut taper_dist, 0.0..=10.0)
+                    .text("Pre-retract taper distance (mm)"),
+            )
+            .changed()
+        {
+            self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
+                Some(taper_dist)
+            } else {
+                None
+            };
         }
         ui.checkbox(&mut self.config.z_hop_enabled, "Z-hop on travel");
         if self.config.z_hop_enabled {
