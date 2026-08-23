@@ -1632,6 +1632,17 @@ pub fn plan_with_progress(
                 }
             }
 
+            if config.scarf_joint_enabled {
+                let scarf_len = config.scarf_joint_length();
+                for path in &mut paths {
+                    crate::kinematics::apply_scarf_joint(
+                        &mut path.points,
+                        &mut path.segments,
+                        scarf_len,
+                    );
+                }
+            }
+
             if let Some(taper_dist) = config.pre_retract_taper_distance {
                 if taper_dist > 0.0 {
                     for path in &mut paths {
@@ -3041,6 +3052,7 @@ mod tests {
         let config = SlicerConfig {
             path_simplify_enabled: true,
             path_simplify_tolerance: 0.05,
+            scarf_joint_enabled: false,
             ..SlicerConfig::default()
         };
 

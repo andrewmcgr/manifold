@@ -230,6 +230,12 @@ pub struct SlicerConfig {
     /// Whether to emit firmware G10/G11 retractions instead of explicit G1 E moves (default false).
     #[serde(default)]
     pub use_firmware_retraction: bool,
+    /// Whether non-planar scarf joint perimeter seam ramping is enabled (default true).
+    #[serde(default = "default_scarf_joint_enabled")]
+    pub scarf_joint_enabled: bool,
+    /// Length (mm) over which closed wall loops ramp extrusion up on entry and down on overlap (default 3.0 mm).
+    #[serde(default)]
+    pub scarf_joint_length: Option<f64>,
     /// Whether Z-hop (lift-before-travel / lower-after-arrival) is enabled.
     /// When `false`, `plan`/`emit` behave exactly as before this field
     /// existed: Z tracks `point.z` unmodified even across
@@ -325,6 +331,11 @@ pub struct SlicerConfig {
     /// this field existed still deserializes to `8.0`.
     #[serde(default = "default_z_travel_penalty")]
     pub z_travel_penalty: f64,
+}
+
+/// Static serde-deserialize fallback for [`SlicerConfig::scarf_joint_enabled`]: `true`.
+fn default_scarf_joint_enabled() -> bool {
+    true
 }
 
 /// Default value for [`SlicerConfig::travel_speed`]: `9000.0` mm/min
@@ -436,6 +447,8 @@ impl Default for SlicerConfig {
             wipe_distance: None,
             wipe_enabled: false,
             use_firmware_retraction: false,
+            scarf_joint_enabled: true,
+            scarf_joint_length: None,
             z_hop_enabled: false,
             z_hop_height: default_z_hop_height(),
             path_simplify_enabled: true,
@@ -559,6 +572,12 @@ impl SlicerConfig {
     #[must_use]
     pub fn wipe_distance(&self) -> f64 {
         self.wipe_distance.unwrap_or(1.0)
+    }
+
+    /// Scarf joint overlap length (mm), defaulting to `3.0` mm when `None`.
+    #[must_use]
+    pub fn scarf_joint_length(&self) -> f64 {
+        self.scarf_joint_length.unwrap_or(3.0)
     }
 
     /// First layer line width (mm), defaulting to `1.3 * nozzle_diameter`

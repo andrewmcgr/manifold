@@ -541,6 +541,69 @@ pub fn apply_wipe_moves(
     segments.push(wipe_seg);
 }
 
+/// Applies non-planar scarf joint seam ramping to a closed perimeter wall loop:
+/// - Ramps extrusion flow linearly from 0 -> 100% over the initial `scarf_length_mm` (lead-in).
+/// - Overlaps the start of the loop by continuing past the start point for `scarf_length_mm`,
+///   ramping extrusion flow from 100% -> 0 (lead-out).
+/// - The sum of the complementary ramps is exactly 100% nominal bead everywhere across the joint,
+///   eliminating vertical seam lines on perimeters.
+pub fn apply_scarf_joint(
+    points: &mut Vec<DVec3>,
+    segments: &mut Vec<crate::toolpath::Segment>,
+    scarf_length_mm: f64,
+) {
+    if scarf_length_mm <= 1e-4 || points.len() < 3 || segments.is_empty() {
+        return;
+    }
+    // Only apply to closed extruding loops (points.len() == segments.len())
+    if points.len() != segments.len() {
+        return;
+    }
+    let is_wall_loop = segments
+        .first()
+        .is_some_and(|s| s.kind == MoveKind::WallOuter || s.kind == MoveKind::WallInner);
+    if !is_wall_loop {
+        return;
+    }
+
+    let p0 = points[0];
+    let p1 = points[1];
+    let first_seg_len = (p1 - p0).length();
+    if first_seg_len <= 1e-4 {
+        return;
+    }
+
+    if first_seg_len > scarf_length_mm + 0.1 {
+        let split_ratio = scarf_length_mm / first_seg_len;
+        let p_scarf_end = p0.lerp(p1, split_ratio);
+
+        let orig_first_seg = segments[0];
+        let mut lead_in_seg = orig_first_seg;
+        let mut rem_seg = orig_first_seg;
+
+        // Lead-in ramps 0 -> 1.0 (average flow 0.5)
+        lead_in_seg.extrusion_rate *= 0.5;
+        lead_in_seg.extrusion_length = orig_first_seg.extrusion_length * split_ratio * 0.5;
+
+        // Remainder has full 1.0 flow
+        rem_seg.extrusion_length = orig_first_seg.extrusion_length * (1.0 - split_ratio);
+
+        // Lead-out tail overlapping p0 -> p_scarf_end ramps 1.0 -> 0 (average flow 0.5)
+        let mut lead_out_seg = orig_first_seg;
+        lead_out_seg.extrusion_rate *= 0.5;
+        lead_out_seg.extrusion_length = orig_first_seg.extrusion_length * split_ratio * 0.5;
+
+        // Update initial segment and insert split point
+        segments[0] = lead_in_seg;
+        points.insert(1, p_scarf_end);
+        segments.insert(1, rem_seg);
+
+        // Append the overlapping scarf tail (from p0 -> p_scarf_end)
+        points.push(p_scarf_end);
+        segments.push(lead_out_seg);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,5 +812,62 @@ mod tests {
         assert_eq!(segments[4].extrusion_length, 0.0);
         // Wipe vector extends 2.0mm along p0->p1 (X=2.0)
         assert!((points[4].x - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn apply_scarf_joint_creates_overlapping_ramps_on_closed_wall_loop() {
+        use crate::toolpath::Segment;
+
+        let mut points = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(20.0, 0.0, 0.0),
+            DVec3::new(20.0, 20.0, 0.0),
+            DVec3::new(0.0, 20.0, 0.0),
+        ];
+        let mut segments = vec![
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 10.0,
+                extrusion_rate: 1.0,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 10.0,
+                extrusion_rate: 1.0,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 10.0,
+                extrusion_rate: 1.0,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 10.0,
+                extrusion_rate: 1.0,
+                ..Segment::default()
+            },
+        ];
+
+        apply_scarf_joint(&mut points, &mut segments, 3.0);
+
+        // Initial 20mm segment split at 3.0mm (lead-in) + remaining 17mm + 3 segments + 1 overlapping tail = 6 segments
+        assert_eq!(points.len(), 6);
+        assert_eq!(segments.len(), 6);
+
+        // Split point at 3.0mm
+        assert!((points[1].x - 3.0).abs() < 1e-4);
+        // Lead-in has 0.5x average flow
+        assert!((segments[0].extrusion_rate - 0.5).abs() < 1e-4);
+        // Remainder has 1.0x flow
+        assert_eq!(segments[1].extrusion_rate, 1.0);
+        // Tail overlap has 0.5x average flow
+        assert!((segments[5].extrusion_rate - 0.5).abs() < 1e-4);
+
+        // Overlap region total extrusion = 0.5 * 1.5 + 0.5 * 1.5 = 1.5mm (exact nominal amount for 3.0mm of 20mm/10.0E)
+        let overlap_e = segments[0].extrusion_length + segments[5].extrusion_length;
+        assert!((overlap_e - 1.5).abs() < 1e-4);
     }
 }

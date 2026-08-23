@@ -1052,6 +1052,19 @@ impl ManifoldApp {
             {
                 self.config.unretract_extra_length = Some(u_extra);
             }
+            ui.checkbox(&mut self.config.scarf_joint_enabled, "Scarf joint seams");
+            if self.config.scarf_joint_enabled {
+                let mut scarf_len = self.config.scarf_joint_length();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut scarf_len, 1.0..=10.0)
+                            .text("Scarf overlap length (mm)"),
+                    )
+                    .changed()
+                {
+                    self.config.scarf_joint_length = Some(scarf_len);
+                }
+            }
             ui.checkbox(&mut self.config.wipe_enabled, "Wipe on retraction");
             if self.config.wipe_enabled {
                 let mut wipe_dist = self.config.wipe_distance();
