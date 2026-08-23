@@ -653,6 +653,13 @@ impl ManifoldApp {
                 .text("Shell thickness (mm)"),
         );
         ui.add(egui::Slider::new(&mut self.config.wall_offset, 0.0..=1.0).text("Wall offset (mm)"));
+        let mut density = self.config.filament_density();
+        if ui
+            .add(egui::Slider::new(&mut density, 0.5..=2.5).text("Filament density (g/cm³)"))
+            .changed()
+        {
+            self.config.filament_density_g_cm3 = Some(density);
+        }
 
         ui.separator();
         ui.heading("Infill");

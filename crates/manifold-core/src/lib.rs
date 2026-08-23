@@ -134,6 +134,9 @@ pub struct SlicerConfig {
     /// (`0.0` degenerates to a flat height field). Inert (unused)
     /// otherwise. Defaults to `0.0`.
     pub order_field_slope: f64,
+    /// Density of the printing filament material in g/cm³ (default 1.24 g/cm³ for PLA/PETG/ASA).
+    #[serde(default)]
+    pub filament_density_g_cm3: Option<f64>,
     /// Diameter of the filament being fed into the extruder, in
     /// millimeters — the cross-section `crate::extrusion` divides a
     /// segment's deposited bead volume by to get linear filament feed
@@ -421,6 +424,7 @@ impl Default for SlicerConfig {
             order_field_apex: glam::DVec3::ZERO,
             order_field_axis: slicing::BUILD_DIRECTION,
             order_field_slope: 0.0,
+            filament_density_g_cm3: None,
             filament_diameter: 1.75,
             start_gcode: "PRINT_START T_TOOL=240 T_BED=105 T_CHAMBER=45 PRINT_MIN={print_min_x},{print_min_y} PRINT_MAX={print_max_x},{print_max_y}".to_string(),
             end_gcode: "PRINT_END".to_string(),
@@ -572,6 +576,12 @@ impl SlicerConfig {
     #[must_use]
     pub fn wipe_distance(&self) -> f64 {
         self.wipe_distance.unwrap_or(1.0)
+    }
+
+    /// Filament material density in g/cm³ (defaulting to `1.24` when `None`).
+    #[must_use]
+    pub fn filament_density(&self) -> f64 {
+        self.filament_density_g_cm3.unwrap_or(1.24)
     }
 
     /// Scarf joint overlap length (mm), defaulting to `3.0` mm when `None`.

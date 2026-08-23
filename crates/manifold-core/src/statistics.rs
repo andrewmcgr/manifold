@@ -80,7 +80,7 @@ pub fn compute_print_statistics(
     let mut total_travel_moves = 0;
     let mut seen_orders: Vec<f64> = Vec::new();
 
-    let density = material_density_g_cm3.unwrap_or(1.24); // default ~1.24 g/cm³ (PLA/PETG/ASA)
+    let density = material_density_g_cm3.unwrap_or_else(|| config.filament_density());
 
     for path in paths {
         let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
