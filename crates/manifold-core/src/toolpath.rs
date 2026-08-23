@@ -1403,6 +1403,7 @@ pub fn plan(
         objects,
         tools,
         config,
+        None,
         &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
         &mut |_| {},
     )
@@ -1428,6 +1429,7 @@ pub fn plan_with_progress(
     objects: &[Object],
     tools: &[Tool],
     config: &SlicerConfig,
+    machine: Option<&crate::machine::Machine>,
     slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     on_progress: &mut (dyn FnMut(f64) + Send),
 ) -> Result<Vec<Path>> {
@@ -1619,11 +1621,9 @@ pub fn plan_with_progress(
                             * segment.extrusion_rate
                             * extrusion_multiplier
                             * first_layer_mult;
-                    let nominal_speed = if is_first_layer && segment.kind != MoveKind::Travel {
-                        config.first_layer_print_speed()
-                    } else {
-                        speed_for_kind(segment.kind, config)
-                    };
+                    let nominal_speed = config
+                        .resolved_motion_model(machine)
+                        .max_feedrate(segment.kind, is_first_layer);
                     segment.speed = crate::kinematics::clamp_feedrate_by_volumetric_limit(
                         nominal_speed,
                         bead_area,
@@ -1950,6 +1950,7 @@ mod tests {
         }];
         let config = SlicerConfig {
             print_speed: 1234.0,
+            outer_wall_speed: Some(1234.0),
             first_layer_print_speed: Some(1234.0),
             ..SlicerConfig::default()
         };

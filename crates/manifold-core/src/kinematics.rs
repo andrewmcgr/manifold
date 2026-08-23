@@ -107,16 +107,18 @@ impl Default for StandardMotionModel {
 
 impl MotionModel for StandardMotionModel {
     fn max_feedrate(&self, kind: MoveKind, is_first_layer: bool) -> f64 {
-        if is_first_layer && kind != MoveKind::Travel {
-            return self.first_layer_speed;
-        }
-        match kind {
+        let nominal = match kind {
             MoveKind::WallOuter => self.outer_wall_speed,
             MoveKind::WallInner => self.inner_wall_speed,
             MoveKind::Infill => self.infill_speed,
             MoveKind::TopSurface => self.solid_infill_speed,
             MoveKind::Bridge | MoveKind::Overhang => self.bridge_speed,
             MoveKind::Travel => self.travel_speed,
+        };
+        if is_first_layer && kind != MoveKind::Travel {
+            nominal.min(self.first_layer_speed)
+        } else {
+            nominal
         }
     }
 
@@ -137,25 +139,65 @@ impl MotionModel for StandardMotionModel {
 /// Stepper motor dynamic performance model.
 ///
 /// Models the physical torque/back-EMF roll-off curve of stepper motors:
-/// - Maximum available acceleration `a_max_zero_v` (mm/s²) at zero velocity ($a_0$).
-/// - Maximum attainable velocity `v_max_zero_a` (mm/s) where torque/acceleration drops to zero ($v_{\text{max}}$).
+/// - Maximum available acceleration `zero_speed_accel` (mm/s²) at zero velocity ($a_0$, default 20,000 mm/s²).
+/// - Maximum attainable velocity `max_available_speed` (mm/s) where torque/acceleration drops to zero ($v_{\text{max}}$, default 1,000 mm/s).
 /// - Linearly interpolates available acceleration as:
 ///   $$a(v) = a_0 \cdot \max\left(0, 1 - \frac{v}{v_{\text{max}}}\right)$$
+/// - Bounds move acceleration by $\min(a_{\text{limit}}, a(v), a_{\text{kind}})$, where $a_{\text{limit}}$ defaults to $50\% \times a_0$.
+/// - Bounds move speed by $\min(v_{\text{limit}}, v_{\text{kind}}, v_{\text{volumetric}})$, where $v_{\text{limit}}$ defaults to $75\% \times v_{\text{max}}$.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepperDynamicModel {
     pub standard_model: StandardMotionModel,
     /// Maximum acceleration at zero velocity (mm/s²).
-    pub a_max_zero_v: f64,
+    pub zero_speed_accel: f64,
     /// Maximum velocity at zero acceleration (mm/s, due to back-EMF / torque limit).
-    pub v_max_zero_a: f64,
+    pub max_available_speed: f64,
+    /// Hard upper bound on acceleration (mm/s²).
+    pub acceleration_limit: f64,
+    /// Hard upper bound on speed (mm/s).
+    pub speed_limit: f64,
+}
+
+impl StepperDynamicModel {
+    #[must_use]
+    pub fn new(
+        standard_model: StandardMotionModel,
+        zero_speed_accel: f64,
+        max_available_speed: f64,
+        acceleration_limit: f64,
+        speed_limit: f64,
+    ) -> Self {
+        Self {
+            standard_model,
+            zero_speed_accel,
+            max_available_speed,
+            acceleration_limit,
+            speed_limit,
+        }
+    }
+
+    /// Available motor acceleration at linear speed `v_mm_s`.
+    /// Linearly rolls off from `zero_speed_accel` down to 0 at `max_available_speed`.
+    #[must_use]
+    pub fn motor_acceleration_at_speed(&self, v_mm_s: f64) -> f64 {
+        if self.max_available_speed <= 1e-6 {
+            return 0.0;
+        }
+        let factor = (1.0 - (v_mm_s / self.max_available_speed).clamp(0.0, 1.0)).max(0.0);
+        self.zero_speed_accel * factor
+    }
 }
 
 impl Default for StepperDynamicModel {
     fn default() -> Self {
+        let zero_speed_accel = 20000.0;
+        let max_available_speed = 1000.0;
         Self {
             standard_model: StandardMotionModel::default(),
-            a_max_zero_v: 15000.0,
-            v_max_zero_a: 500.0, // 500 mm/s (30,000 mm/min)
+            zero_speed_accel,
+            max_available_speed,
+            acceleration_limit: zero_speed_accel * 0.5, // 10,000 mm/s²
+            speed_limit: max_available_speed * 0.75,    // 750 mm/s
         }
     }
 }
@@ -163,18 +205,21 @@ impl Default for StepperDynamicModel {
 impl MotionModel for StepperDynamicModel {
     fn max_feedrate(&self, kind: MoveKind, is_first_layer: bool) -> f64 {
         let std_max = self.standard_model.max_feedrate(kind, is_first_layer);
-        let stepper_max = self.v_max_zero_a * 60.0;
-        std_max.min(stepper_max)
+        let hard_limit = if is_first_layer && kind != MoveKind::Travel {
+            self.standard_model.first_layer_speed
+        } else {
+            self.speed_limit * 60.0
+        };
+        std_max.min(hard_limit)
     }
 
     fn available_acceleration(&self, kind: MoveKind, is_first_layer: bool, v_mm_s: f64) -> f64 {
         let std_accel = self
             .standard_model
             .available_acceleration(kind, is_first_layer, v_mm_s);
-        let v_clamped = v_mm_s.clamp(0.0, self.v_max_zero_a);
-        let factor = (1.0 - (v_clamped / self.v_max_zero_a).clamp(0.0, 1.0)).max(0.0);
-        let stepper_accel = self.a_max_zero_v * factor;
-        std_accel.min(stepper_accel).max(100.0)
+        let motor_accel = self.motor_acceleration_at_speed(v_mm_s);
+        let dynamic_accel = motor_accel.min(self.acceleration_limit);
+        std_accel.min(dynamic_accel).max(100.0)
     }
 
     fn max_reachable_speed(
@@ -188,8 +233,8 @@ impl MotionModel for StepperDynamicModel {
         let v_stepper = stepper_max_reachable_velocity(
             v_entry_mm_s,
             distance_mm,
-            self.a_max_zero_v,
-            self.v_max_zero_a,
+            self.zero_speed_accel,
+            self.max_available_speed,
         );
         let v_std = self.standard_model.max_reachable_speed(
             kind,
@@ -633,25 +678,86 @@ mod tests {
     #[test]
     fn stepper_dynamic_model_interpolates_acceleration_with_velocity() {
         let model = StepperDynamicModel {
-            a_max_zero_v: 10000.0,
-            v_max_zero_a: 500.0,
+            zero_speed_accel: 10000.0,
+            max_available_speed: 500.0,
+            acceleration_limit: 8000.0,
+            speed_limit: 400.0,
             standard_model: StandardMotionModel {
                 outer_wall_acceleration: 20000.0,
+                outer_wall_speed: 600.0 * 60.0,
                 ..StandardMotionModel::default()
             },
         };
 
-        // At v = 0, full acceleration (10000)
+        // At v = 0, available motor accel is 10,000, clamped by acceleration_limit (8,000)
         let a_0 = model.available_acceleration(MoveKind::WallOuter, false, 0.0);
-        assert!((a_0 - 10000.0).abs() < 1e-3);
+        assert!((a_0 - 8000.0).abs() < 1e-3);
 
-        // At v = 250 mm/s (half speed), half acceleration (5000)
+        // At v = 250 mm/s (half max speed), motor accel is 5000, which is below limit (8000) -> 5000
         let a_half = model.available_acceleration(MoveKind::WallOuter, false, 250.0);
         assert!((a_half - 5000.0).abs() < 1e-3);
 
         // At v = 500 mm/s (max speed), acceleration clamped to minimum floor (100)
         let a_max = model.available_acceleration(MoveKind::WallOuter, false, 500.0);
         assert!((a_max - 100.0).abs() < 1e-3);
+
+        // Max feedrate is clamped by speed_limit (400 mm/s = 24,000 mm/min)
+        assert_eq!(model.max_feedrate(MoveKind::WallOuter, false), 24000.0);
+    }
+
+    #[test]
+    fn first_layer_speed_acts_as_speed_limit_for_first_layer_extrusions() {
+        let model = StandardMotionModel {
+            outer_wall_speed: 6000.0,  // 100 mm/s
+            inner_wall_speed: 9000.0,  // 150 mm/s
+            bridge_speed: 1200.0,      // 20 mm/s
+            travel_speed: 18000.0,     // 300 mm/s
+            first_layer_speed: 1800.0, // 30 mm/s limit
+            ..StandardMotionModel::default()
+        };
+
+        // On first layer: moves faster than first_layer_speed are clamped down to 1800
+        assert_eq!(model.max_feedrate(MoveKind::WallOuter, true), 1800.0);
+        assert_eq!(model.max_feedrate(MoveKind::WallInner, true), 1800.0);
+
+        // Moves already slower than first_layer_speed keep their lower speed
+        assert_eq!(model.max_feedrate(MoveKind::Bridge, true), 1200.0);
+
+        // Travel moves are not clamped by first_layer_speed
+        assert_eq!(model.max_feedrate(MoveKind::Travel, true), 18000.0);
+    }
+
+    #[test]
+    fn stepper_dynamic_model_respects_first_layer_speed_limit() {
+        let model = StepperDynamicModel {
+            zero_speed_accel: 20000.0,
+            max_available_speed: 1000.0,
+            acceleration_limit: 10000.0,
+            speed_limit: 750.0, // Global speed limit: 750 mm/s = 45,000 mm/min
+            standard_model: StandardMotionModel {
+                outer_wall_speed: 6000.0,  // 100 mm/s
+                inner_wall_speed: 9000.0,  // 150 mm/s
+                travel_speed: 18000.0,     // 300 mm/s
+                first_layer_speed: 1800.0, // 30 mm/s limit
+                first_layer_acceleration: 2000.0,
+                ..StandardMotionModel::default()
+            },
+        };
+
+        // Normal layer: outer wall runs at 6000 (below global 750mm/s limit)
+        assert_eq!(model.max_feedrate(MoveKind::WallOuter, false), 6000.0);
+
+        // First layer: extrusions are capped by first_layer_speed (1800 mm/min = 30 mm/s)
+        assert_eq!(model.max_feedrate(MoveKind::WallOuter, true), 1800.0);
+        assert_eq!(model.max_feedrate(MoveKind::WallInner, true), 1800.0);
+
+        // First layer: lookahead max reachable speed is strictly capped by first layer limit (30 mm/s)
+        let reachable = model.max_reachable_speed(MoveKind::WallOuter, true, 0.0, 100.0);
+        assert!((reachable - 30.0).abs() < 1e-4);
+
+        // First layer: available acceleration uses first_layer_acceleration (2000), bounded by motor curve and accel limit
+        let accel = model.available_acceleration(MoveKind::WallOuter, true, 30.0);
+        assert_eq!(accel, 2000.0);
     }
 
     #[test]

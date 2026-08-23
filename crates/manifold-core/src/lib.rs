@@ -28,7 +28,9 @@ pub mod transform;
 pub mod workspace;
 
 pub use error::{Error, Result};
-pub use statistics::{compute_print_statistics, PrintStatistics};
+pub use statistics::{
+    compute_print_statistics, compute_print_statistics_with_machine, PrintStatistics,
+};
 pub use workspace::Workspace;
 
 /// Slicer configuration shared across the pipeline.
@@ -541,6 +543,28 @@ impl SlicerConfig {
         }
     }
 
+    /// Returns a boxed dynamic [`kinematics::MotionModel`], selecting [`kinematics::StepperDynamicModel`]
+    /// when `use_stepper_dynamics` is enabled on `machine`, or [`kinematics::StandardMotionModel`] otherwise.
+    #[must_use]
+    pub fn resolved_motion_model(
+        &self,
+        machine: Option<&crate::machine::Machine>,
+    ) -> Box<dyn kinematics::MotionModel> {
+        let std_model = self.motion_model();
+        if let Some(m) = machine {
+            if m.use_stepper_dynamics {
+                return Box::new(kinematics::StepperDynamicModel::new(
+                    std_model,
+                    m.zero_speed_acceleration(),
+                    m.max_available_speed(),
+                    m.acceleration_limit(),
+                    m.speed_limit(),
+                ));
+            }
+        }
+        Box::new(std_model)
+    }
+
     /// First layer extrusion multiplier, defaulting to `1.0` when `None`.
     #[must_use]
     pub fn first_layer_extrusion_multiplier(&self) -> f64 {
@@ -630,7 +654,25 @@ impl SlicerConfig {
 /// whatever error the slicing/toolpath stages produce.
 pub fn slice_to_gcode(workspace: &Workspace) -> Result<String> {
     let paths = plan_toolpaths(workspace)?;
-    Ok(gcode::emit(&paths, &workspace.config))
+    Ok(gcode::emit_with_machine(
+        &paths,
+        &workspace.config,
+        Some(&workspace.machine),
+    ))
+}
+
+/// Same as [`slice_to_gcode`], but calls `on_progress` with a `0.0..=1.0`
+/// progress fraction across slicing and toolpath planning.
+pub fn slice_to_gcode_with_progress(
+    workspace: &Workspace,
+    on_progress: &mut (dyn FnMut(f64) + Send),
+) -> Result<String> {
+    let paths = plan_toolpaths_with_progress(workspace, on_progress)?;
+    Ok(gcode::emit_with_machine(
+        &paths,
+        &workspace.config,
+        Some(&workspace.machine),
+    ))
 }
 
 /// Run the pipeline up to (and including) toolpath planning, stopping short
@@ -693,6 +735,7 @@ pub fn plan_toolpaths_with_progress(
         &workspace.objects,
         &workspace.machine.tools,
         &workspace.config,
+        Some(&workspace.machine),
         &workspace.machine.slope_profile(),
         &mut |fraction: f64| on_progress(0.5 + fraction * 0.5),
     )?;

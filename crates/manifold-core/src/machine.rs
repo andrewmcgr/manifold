@@ -47,6 +47,21 @@ pub struct Machine {
     /// therefore unconstrained.
     #[serde(default = "default_slope_profile")]
     pub eikonal_slope_profile: Vec<(f64, f64)>,
+    /// Whether to use the stepper dynamic motor model for velocity and acceleration planning.
+    #[serde(default)]
+    pub use_stepper_dynamics: bool,
+    /// Maximum available acceleration at zero velocity (a0, mm/s²). Default 20,000 mm/s².
+    #[serde(default)]
+    pub zero_speed_acceleration: Option<f64>,
+    /// Theoretical maximum velocity where available motor torque/acceleration drops to zero (v_max, mm/s). Default 1,000 mm/s.
+    #[serde(default)]
+    pub max_available_speed: Option<f64>,
+    /// Hard upper bound on acceleration (mm/s²). Defaults to 50% of zero_speed_acceleration (10,000 mm/s²).
+    #[serde(default)]
+    pub acceleration_limit: Option<f64>,
+    /// Hard upper bound on velocity (mm/s). Defaults to 75% of max_available_speed (750 mm/s).
+    #[serde(default)]
+    pub speed_limit: Option<f64>,
 }
 
 impl Machine {
@@ -58,7 +73,34 @@ impl Machine {
             tools,
             axis_count: 3,
             eikonal_slope_profile: Vec::new(),
+            use_stepper_dynamics: false,
+            zero_speed_acceleration: None,
+            max_available_speed: None,
+            acceleration_limit: None,
+            speed_limit: None,
         }
+    }
+
+    /// Acceleration at zero velocity (a0, mm/s²). Default: 20,000 mm/s².
+    pub fn zero_speed_acceleration(&self) -> f64 {
+        self.zero_speed_acceleration.unwrap_or(20000.0)
+    }
+
+    /// Theoretical maximum velocity where motor torque reaches zero (v_max, mm/s). Default: 1,000 mm/s.
+    pub fn max_available_speed(&self) -> f64 {
+        self.max_available_speed.unwrap_or(1000.0)
+    }
+
+    /// Configured upper bound on acceleration (mm/s²). Defaults to 50% of `zero_speed_acceleration`.
+    pub fn acceleration_limit(&self) -> f64 {
+        self.acceleration_limit
+            .unwrap_or_else(|| self.zero_speed_acceleration() * 0.5)
+    }
+
+    /// Configured upper bound on velocity (mm/s). Defaults to 75% of `max_available_speed`.
+    pub fn speed_limit(&self) -> f64 {
+        self.speed_limit
+            .unwrap_or_else(|| self.max_available_speed() * 0.75)
     }
 
     /// Converts the serde-friendly `eikonal_slope_profile` breakpoints into
@@ -88,5 +130,36 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(machine.axis_count, 3);
+    }
+
+    #[test]
+    fn machine_stepper_dynamics_defaults_and_overrides() {
+        let mut machine = Machine::new(
+            BoundingVolume::Aabb {
+                min: DVec3::ZERO,
+                max: DVec3::new(200.0, 200.0, 200.0),
+            },
+            Vec::new(),
+        );
+
+        // Check defaults
+        assert_eq!(machine.zero_speed_acceleration(), 20000.0);
+        assert_eq!(machine.max_available_speed(), 1000.0);
+        assert_eq!(machine.acceleration_limit(), 10000.0);
+        assert_eq!(machine.speed_limit(), 750.0);
+
+        // Check overrides
+        machine.zero_speed_acceleration = Some(30000.0);
+        machine.max_available_speed = Some(1200.0);
+        // acceleration_limit defaults to 50% of updated zero_speed_acceleration
+        assert_eq!(machine.acceleration_limit(), 15000.0);
+        // speed_limit defaults to 75% of updated max_available_speed
+        assert_eq!(machine.speed_limit(), 900.0);
+
+        // Explicit limit overrides
+        machine.acceleration_limit = Some(12000.0);
+        machine.speed_limit = Some(800.0);
+        assert_eq!(machine.acceleration_limit(), 12000.0);
+        assert_eq!(machine.speed_limit(), 800.0);
     }
 }

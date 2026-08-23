@@ -582,8 +582,17 @@ impl ManifoldApp {
     fn finish_slice(&mut self, result: Result<Vec<manifold_core::toolpath::Path>, String>) {
         match result {
             Ok(paths) => {
-                let stats = manifold_core::compute_print_statistics(&paths, &self.config, None);
-                let gcode = manifold_core::gcode::emit(&paths, &self.config);
+                let stats = manifold_core::compute_print_statistics_with_machine(
+                    &paths,
+                    &self.config,
+                    Some(&self.machine),
+                    None,
+                );
+                let gcode = manifold_core::gcode::emit_with_machine(
+                    &paths,
+                    &self.config,
+                    Some(&self.machine),
+                );
                 self.toolpath_order_range = toolpath_view::order_range(&paths);
                 // Default the scrub slider to the max order so a fresh
                 // slice shows every segment ("up to and including" the
@@ -1195,6 +1204,55 @@ impl ManifoldApp {
                 .tools
                 .push(Tool::new(ToolId(self.next_tool_id), 0.4));
             self.next_tool_id += 1;
+        }
+
+        ui.checkbox(
+            &mut self.machine.use_stepper_dynamics,
+            "Use stepper dynamics model",
+        );
+        if self.machine.use_stepper_dynamics {
+            ui.collapsing("Stepper Motor Dynamics", |ui| {
+                let mut a0 = self.machine.zero_speed_acceleration();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut a0, 1000.0..=50000.0)
+                            .text("Zero-speed acceleration (a₀, mm/s²)"),
+                    )
+                    .changed()
+                {
+                    self.machine.zero_speed_acceleration = Some(a0);
+                }
+
+                let mut vmax = self.machine.max_available_speed();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut vmax, 100.0..=2000.0)
+                            .text("Max available speed (v_max, mm/s)"),
+                    )
+                    .changed()
+                {
+                    self.machine.max_available_speed = Some(vmax);
+                }
+
+                let mut a_limit = self.machine.acceleration_limit();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut a_limit, 500.0..=30000.0)
+                            .text("Acceleration limit (mm/s²)"),
+                    )
+                    .changed()
+                {
+                    self.machine.acceleration_limit = Some(a_limit);
+                }
+
+                let mut v_limit = self.machine.speed_limit();
+                if ui
+                    .add(egui::Slider::new(&mut v_limit, 50.0..=1500.0).text("Speed limit (mm/s)"))
+                    .changed()
+                {
+                    self.machine.speed_limit = Some(v_limit);
+                }
+            });
         }
 
         ui.collapsing("Custom Gcode Macros", |ui| {

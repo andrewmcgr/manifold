@@ -54,6 +54,18 @@ pub fn compute_print_statistics(
     config: &SlicerConfig,
     material_density_g_cm3: Option<f64>,
 ) -> PrintStatistics {
+    compute_print_statistics_with_machine(paths, config, None, material_density_g_cm3)
+}
+
+/// Computes print statistics from planned toolpaths, kinematics, and slicer configuration,
+/// taking into account the active machine motion model (e.g. stepper motor dynamics).
+#[must_use]
+pub fn compute_print_statistics_with_machine(
+    paths: &[Path],
+    config: &SlicerConfig,
+    machine: Option<&crate::machine::Machine>,
+    material_density_g_cm3: Option<f64>,
+) -> PrintStatistics {
     if paths.is_empty() {
         return PrintStatistics {
             estimated_time_seconds: 0.0,
@@ -67,7 +79,7 @@ pub fn compute_print_statistics(
         };
     }
 
-    let model = config.motion_model();
+    let model = config.resolved_motion_model(machine);
     let min_order = paths
         .iter()
         .filter_map(|p| p.segments.first())
@@ -92,7 +104,7 @@ pub fn compute_print_statistics(
         let profiles = plan_path_velocities(
             &path.points,
             &path.segments,
-            &model,
+            &*model,
             is_first_layer,
             5.0, // 5 mm/s Klipper default SCV
         );
@@ -189,5 +201,51 @@ mod tests {
         };
 
         assert_eq!(stats.formatted_time(), "1h 2m 3s");
+    }
+
+    #[test]
+    fn stepper_dynamics_affects_estimated_print_time() {
+        use crate::bounds::BoundingVolume;
+        use crate::machine::Machine;
+
+        let paths = vec![Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(200.0, 0.0, 0.0)],
+            segments: vec![Segment {
+                kind: MoveKind::WallOuter,
+                speed: 60000.0, // 1000 mm/s
+                extrusion_length: 10.0,
+                ..Segment::default()
+            }],
+            tool: crate::ids::ToolId(0),
+        }];
+        let config = SlicerConfig::default();
+
+        let mut machine = Machine::new(
+            BoundingVolume::Aabb {
+                min: DVec3::ZERO,
+                max: DVec3::new(300.0, 300.0, 300.0),
+            },
+            Vec::new(),
+        );
+
+        let stats_std =
+            compute_print_statistics_with_machine(&paths, &config, Some(&machine), None);
+
+        // Turn on stepper dynamics with severe speed and acceleration limits
+        machine.use_stepper_dynamics = true;
+        machine.zero_speed_acceleration = Some(1000.0);
+        machine.max_available_speed = Some(200.0);
+        machine.acceleration_limit = Some(500.0);
+        machine.speed_limit = Some(100.0);
+
+        let stats_dynamic =
+            compute_print_statistics_with_machine(&paths, &config, Some(&machine), None);
+
+        assert!(
+            stats_dynamic.estimated_time_seconds > stats_std.estimated_time_seconds,
+            "stepper dynamic limits should increase print time: {} vs {}",
+            stats_dynamic.estimated_time_seconds,
+            stats_std.estimated_time_seconds
+        );
     }
 }

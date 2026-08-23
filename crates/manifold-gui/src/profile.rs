@@ -37,21 +37,17 @@ mod tests {
     use manifold_core::bounds::BoundingVolume;
     use manifold_core::ids::ToolId;
     use manifold_core::tool::Tool;
-    use manifold_core::transform::Transform;
     use manifold_core::SlicerConfig;
 
     fn sample_profile() -> Profile {
         Profile {
-            machine: Machine {
-                substrate_transform: Transform::identity(),
-                build_volume: BoundingVolume::Aabb {
+            machine: Machine::new(
+                BoundingVolume::Aabb {
                     min: glam::DVec3::ZERO,
                     max: glam::DVec3::new(200.0, 200.0, 200.0),
                 },
-                tools: vec![Tool::new(ToolId(0), 0.4)],
-                axis_count: 3,
-                eikonal_slope_profile: Vec::new(),
-            },
+                vec![Tool::new(ToolId(0), 0.4)],
+            ),
             config: SlicerConfig {
                 layer_height: 0.2,
                 first_layer_height: None,

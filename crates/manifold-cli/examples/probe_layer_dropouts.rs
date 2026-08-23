@@ -118,6 +118,7 @@ fn main() -> anyhow::Result<()> {
         &objects,
         &tools,
         &config,
+        None,
         &slope_profile,
         &mut |_| {},
     )?;

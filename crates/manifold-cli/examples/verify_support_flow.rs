@@ -51,8 +51,15 @@ fn main() -> anyhow::Result<()> {
     )?;
     println!("{} layers ({kind:?})", layers.len());
 
-    let paths =
-        toolpath::plan_with_progress(&layers, &objects, &[], &config, &slope_profile, &mut |_| {})?;
+    let paths = toolpath::plan_with_progress(
+        &layers,
+        &objects,
+        &[],
+        &config,
+        None,
+        &slope_profile,
+        &mut |_| {},
+    )?;
 
     let mut bad = 0usize;
     let mut total_extrude = 0.0f64;
