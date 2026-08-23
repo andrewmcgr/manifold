@@ -39,7 +39,7 @@ pub const COLOR_INFILL: [f32; 4] = [0.95, 0.65, 0.15, 1.0];
 pub const COLOR_BRIDGE: [f32; 4] = [0.9, 0.2, 0.75, 1.0];
 pub const COLOR_OVERHANG: [f32; 4] = [0.9, 0.15, 0.15, 1.0];
 pub const COLOR_TOP_SURFACE: [f32; 4] = [0.2, 0.85, 0.4, 1.0];
-pub const COLOR_TRAVEL: [f32; 4] = [0.4, 0.4, 0.4, 0.4];
+pub const COLOR_TRAVEL: [f32; 4] = [0.35, 0.55, 0.75, 0.65];
 
 /// Available data view color-coding modes for the toolpath preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -158,8 +158,40 @@ pub fn data_view_range(
     let mut max_val = f64::NEG_INFINITY;
     let mut count = 0;
 
+    let mut prev_endpoint: Option<glam::DVec3> = None;
+
     for path in paths {
         let n = path.points.len();
+        if n == 0 {
+            continue;
+        }
+        let path_start = path.points[0];
+        let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
+
+        if let Some(prev_end) = prev_endpoint {
+            if prev_end.distance(path_start) > 1e-6 && data_view != ToolpathDataView::FlowRate {
+                let travel_segment = manifold_core::toolpath::Segment {
+                    kind: MoveKind::Travel,
+                    speed: config.travel_speed,
+                    extrusion_rate: 0.0,
+                    support_fraction: 0.0,
+                    order: path_order,
+                    extrusion_length: 0.0,
+                };
+                let val = segment_scalar_value(
+                    &travel_segment,
+                    prev_end,
+                    path_start,
+                    data_view,
+                    config,
+                    machine,
+                );
+                min_val = min_val.min(val);
+                max_val = max_val.max(val);
+                count += 1;
+            }
+        }
+
         for (i, segment) in path.segments.iter().enumerate() {
             if data_view == ToolpathDataView::FlowRate && segment.kind == MoveKind::Travel {
                 continue;
@@ -170,6 +202,12 @@ pub fn data_view_range(
             min_val = min_val.min(val);
             max_val = max_val.max(val);
             count += 1;
+        }
+
+        if path.segments.len() == n {
+            prev_endpoint = Some(path.points[0]);
+        } else {
+            prev_endpoint = path.points.last().copied();
         }
     }
 
@@ -264,9 +302,57 @@ pub fn build_toolpath_lines(
 ) -> Vec<ToolpathLineInstance> {
     let scalar_range = data_view_range(paths, data_view, config, machine);
     let mut instances = Vec::new();
+    let mut prev_endpoint: Option<glam::DVec3> = None;
 
     for path in paths {
         let count = path.points.len();
+        if count == 0 {
+            continue;
+        }
+
+        let path_start = path.points[0];
+        let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
+
+        // Inter-path travel move from previous path end to this path start
+        if let Some(prev_end) = prev_endpoint {
+            if prev_end.distance(path_start) > 1e-6 && path_order <= scrub_order {
+                let travel_segment = manifold_core::toolpath::Segment {
+                    kind: MoveKind::Travel,
+                    speed: config.travel_speed,
+                    extrusion_rate: 0.0,
+                    support_fraction: 0.0,
+                    order: path_order,
+                    extrusion_length: 0.0,
+                };
+                let color = match data_view {
+                    ToolpathDataView::LineType | ToolpathDataView::FlowRate => COLOR_TRAVEL,
+                    _ => {
+                        let val = segment_scalar_value(
+                            &travel_segment,
+                            prev_end,
+                            path_start,
+                            data_view,
+                            config,
+                            machine,
+                        );
+                        let t = if let Some((min, max)) = scalar_range {
+                            if max > min {
+                                (val - min) / (max - min)
+                            } else {
+                                0.5
+                            }
+                        } else {
+                            0.5
+                        };
+                        scalar_to_color(t)
+                    }
+                };
+                instances.push(ToolpathLineInstance::new(
+                    prev_end, path_start, color, path_order,
+                ));
+            }
+        }
+
         for (index, segment) in path.segments.iter().enumerate() {
             if segment.order > scrub_order {
                 continue;
@@ -293,6 +379,12 @@ pub fn build_toolpath_lines(
             };
 
             instances.push(ToolpathLineInstance::new(start, end, color, segment.order));
+        }
+
+        if path.segments.len() == count {
+            prev_endpoint = Some(path.points[0]);
+        } else {
+            prev_endpoint = path.points.last().copied();
         }
     }
     instances
@@ -414,6 +506,63 @@ mod tests {
         let instances = build_lines_default(&[path_a, path_b], f64::INFINITY);
         assert_eq!(instances[0].order, 0.0);
         assert_eq!(instances[1].order, 1.0);
+    }
+
+    #[test]
+    fn inter_path_travel_moves_are_emitted_between_disconnected_paths() {
+        let path_a = Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(10.0, 0.0, 0.0)],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 60.0,
+                    extrusion_rate: 1.0,
+                    support_fraction: 0.0,
+                    order: 0.0,
+                    extrusion_length: 1.0,
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 60.0,
+                    extrusion_rate: 1.0,
+                    support_fraction: 0.0,
+                    order: 0.0,
+                    extrusion_length: 1.0,
+                },
+            ],
+            tool: ToolId(0),
+        };
+        let path_b = Path {
+            points: vec![DVec3::new(20.0, 20.0, 0.2), DVec3::new(30.0, 20.0, 0.2)],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 60.0,
+                    extrusion_rate: 1.0,
+                    support_fraction: 0.0,
+                    order: 0.2,
+                    extrusion_length: 1.0,
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 60.0,
+                    extrusion_rate: 1.0,
+                    support_fraction: 0.0,
+                    order: 0.2,
+                    extrusion_length: 1.0,
+                },
+            ],
+            tool: ToolId(0),
+        };
+        let instances = build_lines_default(&[path_a, path_b], f64::INFINITY);
+        // path_a: 2 segments (ends at [0,0,0])
+        // travel: [0,0,0] -> [20,20,0.2] (1 segment)
+        // path_b: 2 segments
+        assert_eq!(instances.len(), 2 + 1 + 2);
+        assert_eq!(instances[2].start, [0.0, 0.0, 0.0]);
+        assert_eq!(instances[2].end, [20.0, 20.0, 0.2]);
+        assert_eq!(instances[2].color, COLOR_TRAVEL);
+        assert_eq!(instances[2].order, 0.2);
     }
 
     #[test]
