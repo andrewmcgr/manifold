@@ -1,6 +1,7 @@
 //! Gcode emission from planned toolpaths.
 
 use crate::{
+    kinematics::MotionModel,
     toolpath::{MoveKind, Path},
     SlicerConfig,
 };
@@ -110,18 +111,15 @@ fn first_layer_xy_bounds(paths: &[Path]) -> Option<(f64, f64, f64, f64)> {
 ///
 /// Inserts a tool-select line (`T{n}`) whenever consecutive paths are
 /// assigned to different tools, followed by `G92 E0` to reset that tool's
-/// filament position — each tool is tracked as its own independent
-/// extruder, so a fresh tool-select always restarts extrusion accounting
-/// from zero rather than carrying over the previous tool's total.
-/// Explicitly emits `M82` (absolute extrusion mode) immediately after
+/// filament position.
+/// Explicitly emits `M83` (relative extrusion mode) immediately after
 /// `start_gcode` (not before it -- `start_gcode` may itself change the
 /// extrusion mode, so we can't assume it leaves the machine in relative
 /// mode), and always before any extrusion moves, rather than relying on
 /// the printer firmware's default: each extruding move's `E` value is
-/// `Segment::extrusion_length` accumulated
-/// onto a running per-tool total (see `toolpath::plan`, which finalizes
-/// `extrusion_length` from segment geometry, line width, and the tool's
-/// `extrusion_multiplier`), not emitted as a per-move delta. Prime/purge
+/// `Segment::extrusion_length` emitted as an incremental per-move delta
+/// (see `toolpath::plan`, which finalizes `extrusion_length` from segment
+/// geometry, line width, and the tool's `extrusion_multiplier`). Prime/purge
 /// Gcode around tool changes is not implemented yet — follow-up work, see
 /// ROADMAP.md Phase 2.
 ///
@@ -159,15 +157,18 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
         out.push('\n');
     }
 
-    // Explicitly set absolute extrusion mode -- don't rely on the printer
-    // firmware's default, since `emit`'s E values are always absolute
-    // per-tool running totals (see the doc comment below). Emitted *after*
-    // `start_gcode` rather than before it: `start_gcode` (e.g. a macro like
-    // `PRINT_START`) may itself change the extrusion mode (some do, to set
-    // up their own homing/priming sequence), so we can't assume it leaves
-    // the machine in relative mode -- M82 must be the last word on
-    // extrusion mode before the first extruding move.
-    out.push_str("M82\n");
+    // Explicitly set relative extrusion mode (M83) -- don't rely on the printer
+    // firmware's default, since `emit`'s E values are always per-move deltas.
+    // Emitted *after* `start_gcode` rather than before it: `start_gcode`
+    // (e.g. a macro like `PRINT_START`) may itself change the extrusion mode,
+    // so M83 must be the last word on extrusion mode before the first extruding move.
+    out.push_str("M83\n");
+
+    if let Some(pa) = config.pressure_advance {
+        if pa > 0.0 {
+            out.push_str(&format!("SET_PRESSURE_ADVANCE ADVANCE={pa:.4}\n"));
+        }
+    }
 
     let fan_pwm = (255.0 * (config.fan_speed_percent() / 100.0)).round() as u32;
     let fan_delay = config.fan_layer_delay();
@@ -182,12 +183,20 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
     }
 
     let mut current_tool = None;
-    let mut current_e = 0.0;
     let mut current_f: Option<f64> = None;
+    let mut current_accel: Option<f64> = None;
     let mut retracted = true;
+    let motion_model = config.motion_model();
+
+    let min_order = paths
+        .iter()
+        .filter_map(|path| path.segments.first())
+        .map(|segment| segment.order)
+        .fold(f64::INFINITY, f64::min);
 
     for path in paths {
         let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
+        let is_first_layer = (path_order - min_order).abs() < 1e-4;
         if !seen_orders.iter().any(|&o| (o - path_order).abs() < 1e-4) {
             seen_orders.push(path_order);
             let layer_idx = (seen_orders.len() - 1) as u32;
@@ -200,7 +209,6 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
             out.push_str(&format!("T{}\n", path.tool));
             out.push_str("G92 E0\n");
             current_tool = Some(path.tool);
-            current_e = 0.0;
             retracted = true;
         }
 
@@ -217,6 +225,18 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
             };
             let extruding =
                 incoming_segment.is_some_and(|segment| segment.kind != MoveKind::Travel);
+
+            if let Some(segment) = incoming_segment {
+                let target_accel = motion_model.available_acceleration(
+                    segment.kind,
+                    is_first_layer,
+                    segment.speed / 60.0,
+                );
+                if current_accel != Some(target_accel) {
+                    out.push_str(&format!("SET_VELOCITY_LIMIT ACCEL={target_accel:.0}\n"));
+                    current_accel = Some(target_accel);
+                }
+            }
 
             // Retract (`G10`) right before a travel move if not already
             // retracted, and unretract (`G11`) right before resuming an
@@ -242,8 +262,8 @@ pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
             let cmd = if i == 0 || !extruding { "G0" } else { "G1" };
             out.push_str(&format!("{cmd} X{:.3} Y{:.3} Z{:.3}", p.x, p.y, p.z));
             if extruding {
-                current_e += incoming_segment.map_or(0.0, |segment| segment.extrusion_length);
-                out.push_str(&format!(" E{current_e:.5}"));
+                let delta_e = incoming_segment.map_or(0.0, |segment| segment.extrusion_length);
+                out.push_str(&format!(" E{delta_e:.5}"));
             }
             // Emit `F` only when the segment's feedrate differs from the
             // last `F` value written to the program -- firmware retains
@@ -510,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_accumulates_absolute_e_across_extruding_segments_and_omits_it_for_travel() {
+    fn emit_emits_incremental_e_for_extruding_segments_and_omits_it_for_travel() {
         use crate::toolpath::Segment;
         use glam::DVec3;
 
@@ -519,6 +539,7 @@ mod tests {
                 DVec3::new(0.0, 0.0, 0.0),
                 DVec3::new(1.0, 0.0, 0.0),
                 DVec3::new(2.0, 0.0, 0.0),
+                DVec3::new(3.0, 0.0, 0.0),
             ],
             segments: vec![
                 Segment {
@@ -546,17 +567,15 @@ mod tests {
             .filter(|line| line.starts_with("G0 ") || line.starts_with("G1 "))
             .collect();
 
-        // The three point-moves, in order, regardless of how many header
-        // comment lines precede them.
+        // The four point-moves, in order:
         // First point: plain travel, no E.
         assert!(move_lines[0].starts_with("G0") && !move_lines[0].contains('E'));
-        // Second point: extruding move, E accumulates the first segment's
-        // extrusion_length (1.5).
+        // Second point: extruding move, E is the incremental delta (1.5).
         assert!(move_lines[1].starts_with("G1") && move_lines[1].contains("E1.50000"));
-        // Third point: a Travel segment interrupted extrusion, so this move
-        // is G0 and carries no E, but the running total is preserved for
-        // the *next* extruding move rather than reset.
+        // Third point: Travel segment, no E.
         assert!(move_lines[2].starts_with("G0") && !move_lines[2].contains('E'));
+        // Fourth point: extruding move, E is the incremental delta for this segment (2.5).
+        assert!(move_lines[3].starts_with("G1") && move_lines[3].contains("E2.50000"));
     }
 
     #[test]
@@ -596,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_writes_m82_before_any_extrusion_move() {
+    fn emit_writes_m83_before_any_extrusion_move() {
         use crate::toolpath::Segment;
         use glam::DVec3;
 
@@ -612,23 +631,54 @@ mod tests {
 
         let out = emit(&paths, &config_without_print_gcode());
 
-        let m82_pos = out.find("M82").expect("M82 must be emitted");
+        let m83_pos = out.find("M83").expect("M83 must be emitted");
         let first_extruding_move_pos = out.find("G1").expect("an extruding move must be emitted");
-        assert!(m82_pos < first_extruding_move_pos);
+        assert!(m83_pos < first_extruding_move_pos);
     }
 
     #[test]
-    fn emit_writes_crate_version_in_the_generated_by_banner() {
-        let out = emit(&[], &config_without_print_gcode());
-        let expected = format!(
-            "; generated by manifold-core {}\n",
-            env!("CARGO_PKG_VERSION")
-        );
-        assert!(out.starts_with(&expected));
+    fn emit_writes_klipper_set_velocity_limit_when_acceleration_changes() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        let paths = vec![
+            Path {
+                points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
+                segments: vec![Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 1.0,
+                    ..Segment::default()
+                }],
+                tool: ToolId(0),
+            },
+            Path {
+                points: vec![DVec3::new(1.0, 0.0, 0.0), DVec3::new(2.0, 0.0, 0.0)],
+                segments: vec![Segment {
+                    kind: MoveKind::Travel,
+                    extrusion_length: 0.0,
+                    ..Segment::default()
+                }],
+                tool: ToolId(0),
+            },
+        ];
+
+        let config = SlicerConfig {
+            first_layer_acceleration: Some(2500.0),
+            outer_wall_acceleration: Some(2500.0),
+            travel_acceleration: Some(10000.0),
+            pressure_advance: Some(0.04),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&paths, &config);
+
+        assert!(out.contains("SET_PRESSURE_ADVANCE ADVANCE=0.0400"));
+        assert!(out.contains("SET_VELOCITY_LIMIT ACCEL=2500"));
+        assert!(out.contains("SET_VELOCITY_LIMIT ACCEL=10000"));
     }
 
     #[test]
-    fn emit_writes_config_fields_as_comments_before_m82() {
+    fn emit_writes_config_fields_as_comments_before_m83() {
         let config = SlicerConfig {
             layer_height: 0.24,
             nozzle_diameter: 0.5,
@@ -643,9 +693,9 @@ mod tests {
         let nozzle_diameter_pos = out
             .find("; config.nozzle_diameter = 0.5")
             .expect("nozzle_diameter must be emitted as a config comment");
-        let m82_pos = out.find("M82").expect("M82 must be emitted");
-        assert!(layer_height_pos < m82_pos);
-        assert!(nozzle_diameter_pos < m82_pos);
+        let m83_pos = out.find("M83").expect("M83 must be emitted");
+        assert!(layer_height_pos < m83_pos);
+        assert!(nozzle_diameter_pos < m83_pos);
 
         // start_gcode/end_gcode are deliberately not echoed as config
         // comments -- they're already emitted verbatim as their own

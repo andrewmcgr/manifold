@@ -5,6 +5,7 @@
 //! constraints.
 
 use crate::toolpath::MoveKind;
+use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
 /// Pluggable interface for motion kinematics and acceleration constraints.
@@ -14,6 +15,54 @@ pub trait MotionModel: Send + Sync {
 
     /// Available acceleration at current speed `v_mm_s` (in mm/s²).
     fn available_acceleration(&self, kind: MoveKind, is_first_layer: bool, v_mm_s: f64) -> f64;
+
+    /// Calculate the maximum reachable speed (in mm/s) over `distance_mm` starting from `v_entry_mm_s`.
+    fn max_reachable_speed(
+        &self,
+        kind: MoveKind,
+        is_first_layer: bool,
+        v_entry_mm_s: f64,
+        distance_mm: f64,
+    ) -> f64 {
+        let accel = self.available_acceleration(kind, is_first_layer, v_entry_mm_s);
+        let max_v = self.max_feedrate(kind, is_first_layer) / 60.0;
+        let reachable = (v_entry_mm_s * v_entry_mm_s + 2.0 * accel * distance_mm.max(0.0))
+            .max(0.0)
+            .sqrt();
+        reachable.min(max_v)
+    }
+
+    /// Calculate the time (in seconds) required to traverse `distance_mm` from `v_entry_mm_s` to `v_exit_mm_s`.
+    fn move_duration(
+        &self,
+        kind: MoveKind,
+        is_first_layer: bool,
+        distance_mm: f64,
+        v_entry_mm_s: f64,
+        v_exit_mm_s: f64,
+    ) -> f64 {
+        let avg_v = ((v_entry_mm_s + v_exit_mm_s) * 0.5).max(1.0);
+        let accel = self.available_acceleration(kind, is_first_layer, avg_v);
+        let max_v = self.max_feedrate(kind, is_first_layer) / 60.0;
+        let v_peak =
+            ((v_entry_mm_s * v_entry_mm_s + v_exit_mm_s * v_exit_mm_s + 2.0 * accel * distance_mm)
+                * 0.5)
+                .max(0.0)
+                .sqrt()
+                .min(max_v);
+
+        if v_peak > v_entry_mm_s && v_peak > v_exit_mm_s {
+            let t_acc = (v_peak - v_entry_mm_s) / accel;
+            let t_dec = (v_peak - v_exit_mm_s) / accel;
+            let d_acc = (v_entry_mm_s + v_peak) * 0.5 * t_acc;
+            let d_dec = (v_peak + v_exit_mm_s) * 0.5 * t_dec;
+            let d_cruise = (distance_mm - d_acc - d_dec).max(0.0);
+            let t_cruise = d_cruise / v_peak.max(1.0);
+            t_acc + t_dec + t_cruise
+        } else {
+            distance_mm / avg_v
+        }
+    }
 }
 
 /// Standard motion model using per-feature-type constant acceleration and speed limits.
@@ -127,6 +176,224 @@ impl MotionModel for StepperDynamicModel {
         let stepper_accel = self.a_max_zero_v * factor;
         std_accel.min(stepper_accel).max(100.0)
     }
+
+    fn max_reachable_speed(
+        &self,
+        kind: MoveKind,
+        is_first_layer: bool,
+        v_entry_mm_s: f64,
+        distance_mm: f64,
+    ) -> f64 {
+        let max_v = self.max_feedrate(kind, is_first_layer) / 60.0;
+        let v_stepper = stepper_max_reachable_velocity(
+            v_entry_mm_s,
+            distance_mm,
+            self.a_max_zero_v,
+            self.v_max_zero_a,
+        );
+        let v_std = self.standard_model.max_reachable_speed(
+            kind,
+            is_first_layer,
+            v_entry_mm_s,
+            distance_mm,
+        );
+        v_stepper.min(v_std).min(max_v)
+    }
+}
+
+/// Potential function for stepper equation of motion:
+/// $$F(v) = v_{\text{max}}^2 \left[\left(1 - \frac{v}{v_{\text{max}}}\right) - \ln\left(1 - \frac{v}{v_{\text{max}}}\right)\right]$$
+fn stepper_kinetic_potential(v: f64, v_max: f64) -> f64 {
+    let u = (1.0 - (v / v_max).clamp(0.0, 0.999999)).max(1e-6);
+    v_max * v_max * (u - u.ln())
+}
+
+/// Calculates maximum attainable exit velocity (mm/s) over distance `d` (mm) starting at `v_i` (mm/s),
+/// under stepper dynamic torque roll-off: a(v) = a_0 * (1 - v / v_max).
+#[must_use]
+pub fn stepper_max_reachable_velocity(
+    v_i: f64,
+    distance: f64,
+    a_max_zero_v: f64,
+    v_max_zero_a: f64,
+) -> f64 {
+    if distance <= 1e-6 || a_max_zero_v <= 1.0 {
+        return v_i;
+    }
+    let v_start = v_i.clamp(0.0, v_max_zero_a * 0.999);
+    let target_potential =
+        stepper_kinetic_potential(v_start, v_max_zero_a) + a_max_zero_v * distance;
+
+    // Standard constant-accel estimate as initial guess
+    let mut v = (v_start * v_start + 2.0 * a_max_zero_v * distance)
+        .sqrt()
+        .clamp(v_start + 1e-3, v_max_zero_a * 0.999);
+
+    // Newton-Raphson to solve for v where stepper_kinetic_potential(v) == target_potential
+    for _ in 0..8 {
+        let u = (1.0 - (v / v_max_zero_a).clamp(0.0, 0.999999)).max(1e-6);
+        let f_val = v_max_zero_a * v_max_zero_a * (u - u.ln()) - target_potential;
+        let f_prime = v / u; // derivative dF/dv = v / (1 - v/v_max)
+        if f_prime.abs() < 1e-6 {
+            break;
+        }
+        let delta = f_val / f_prime;
+        v = (v - delta).clamp(v_start, v_max_zero_a * 0.9999);
+        if delta.abs() < 1e-3 {
+            break;
+        }
+    }
+    v
+}
+
+/// Computes the maximum junction/cornering velocity (in mm/s) according to Klipper's
+/// Square Corner Velocity (SCV) model.
+///
+/// Given incoming unit vector `dir_in`, outgoing unit vector `dir_out`, square corner
+/// velocity `scv` (mm/s), and acceleration `accel` (mm/s²).
+#[must_use]
+pub fn klipper_corner_velocity(
+    dir_in: DVec3,
+    dir_out: DVec3,
+    square_corner_velocity: f64,
+    accel: f64,
+) -> f64 {
+    let cos_theta = dir_in.dot(dir_out).clamp(-1.0, 1.0);
+    if cos_theta >= 0.999999 {
+        return 10000.0; // Collinear / straight move
+    }
+    if cos_theta <= -0.999999 {
+        return 0.0; // 180° full reversal
+    }
+
+    // Klipper square corner velocity formula:
+    // sin(theta/2) = sqrt((1 - cos_theta) / 2)
+    // cos(theta/2) = sqrt((1 + cos_theta) / 2)
+    let sin_half = ((1.0 - cos_theta) * 0.5).max(0.0).sqrt();
+    let cos_half = ((1.0 + cos_theta) * 0.5).max(0.0).sqrt();
+
+    let scv_limit = if sin_half > 1e-6 {
+        square_corner_velocity * (cos_half / sin_half)
+    } else {
+        10000.0
+    };
+
+    // Centripetal acceleration limit over 0.04mm junction deviation
+    let junction_deviation = 0.04;
+    let centripetal_limit = if sin_half < 0.999 {
+        ((accel * junction_deviation * sin_half) / (1.0 - sin_half))
+            .max(0.0)
+            .sqrt()
+    } else {
+        0.0
+    };
+
+    scv_limit.min(centripetal_limit).max(0.0)
+}
+
+/// Kinematic motion profile for a single move segment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlannedMotionProfile {
+    pub entry_speed: f64,  // mm/min
+    pub cruise_speed: f64, // mm/min
+    pub exit_speed: f64,   // mm/min
+    pub duration_seconds: f64,
+}
+
+/// Plans time-optimal velocity profiles along a polyline path using forward and backward
+/// acceleration passes constrained by Klipper SCV and stepper torque limits.
+#[must_use]
+pub fn plan_path_velocities(
+    points: &[DVec3],
+    segments: &[crate::toolpath::Segment],
+    model: &dyn MotionModel,
+    is_first_layer: bool,
+    square_corner_velocity_mm_s: f64,
+) -> Vec<PlannedMotionProfile> {
+    let n = segments.len();
+    if n == 0 || points.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut nominal_speeds = Vec::with_capacity(n);
+    let mut distances = Vec::with_capacity(n);
+    let mut directions = Vec::with_capacity(n);
+
+    for (i, seg) in segments.iter().enumerate() {
+        let p0 = points[i];
+        let p1 = points[(i + 1) % points.len()];
+        let diff = p1 - p0;
+        let d = diff.length();
+        distances.push(d);
+        directions.push(if d > 1e-6 { diff / d } else { DVec3::ZERO });
+        nominal_speeds.push(seg.speed / 60.0); // mm/s
+    }
+
+    // 1. Compute junction speed limits between consecutive segments
+    let mut junction_speeds = vec![0.0; n + 1];
+    // Start of path starts from 0 (or low entry speed)
+    junction_speeds[0] = 0.0;
+    // End of path stops at 0 (before next travel / retract)
+    junction_speeds[n] = 0.0;
+
+    for i in 0..n.saturating_sub(1) {
+        let d0 = directions[i];
+        let d1 = directions[i + 1];
+        let accel =
+            model.available_acceleration(segments[i].kind, is_first_layer, nominal_speeds[i]);
+        let corner_v = klipper_corner_velocity(d0, d1, square_corner_velocity_mm_s, accel);
+        junction_speeds[i + 1] = corner_v.min(nominal_speeds[i]).min(nominal_speeds[i + 1]);
+    }
+
+    // 2. Forward pass: acceleration from entry speed
+    let mut entry_speeds = vec![0.0; n];
+    let mut exit_speeds = vec![0.0; n];
+
+    for i in 0..n {
+        let v_in = junction_speeds[i].min(nominal_speeds[i]);
+        entry_speeds[i] = v_in;
+        let v_reachable =
+            model.max_reachable_speed(segments[i].kind, is_first_layer, v_in, distances[i]);
+        exit_speeds[i] = v_reachable
+            .min(nominal_speeds[i])
+            .min(junction_speeds[i + 1]);
+        junction_speeds[i + 1] = exit_speeds[i];
+    }
+
+    // 3. Backward pass: deceleration to junction limits
+    for i in (0..n).rev() {
+        let v_out = junction_speeds[i + 1];
+        exit_speeds[i] = exit_speeds[i].min(v_out);
+        let accel = model.available_acceleration(segments[i].kind, is_first_layer, exit_speeds[i]);
+        let max_v_in = (exit_speeds[i] * exit_speeds[i] + 2.0 * accel * distances[i])
+            .max(0.0)
+            .sqrt();
+        entry_speeds[i] = entry_speeds[i].min(max_v_in);
+        junction_speeds[i] = entry_speeds[i];
+    }
+
+    // 4. Construct motion profiles
+    let mut profiles = Vec::with_capacity(n);
+    for i in 0..n {
+        let v_entry = entry_speeds[i];
+        let v_exit = exit_speeds[i];
+        let v_cruise = nominal_speeds[i].min(v_entry.max(v_exit));
+        let duration = model.move_duration(
+            segments[i].kind,
+            is_first_layer,
+            distances[i],
+            v_entry,
+            v_exit,
+        );
+        profiles.push(PlannedMotionProfile {
+            entry_speed: v_entry * 60.0,
+            cruise_speed: v_cruise * 60.0,
+            exit_speed: v_exit * 60.0,
+            duration_seconds: duration,
+        });
+    }
+
+    profiles
 }
 
 /// Computes maximum allowable linear feedrate (in mm/min) constrained by a volumetric flow limit.
@@ -212,5 +479,81 @@ mod tests {
             Some(max_volumetric_speed),
         );
         assert!((clamped - 3000.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn klipper_corner_velocity_calculates_exact_right_angle_scv() {
+        let d_in = DVec3::new(1.0, 0.0, 0.0);
+        let d_out = DVec3::new(0.0, 1.0, 0.0); // 90° right angle turn
+        let scv = 5.0; // 5 mm/s
+        let accel = 5000.0;
+
+        let v_corner = klipper_corner_velocity(d_in, d_out, scv, accel);
+        // At 90°, Klipper SCV evaluates to scv (5.0 mm/s)
+        assert!(
+            (v_corner - 5.0).abs() < 1e-2,
+            "90° corner velocity should match SCV: {v_corner}"
+        );
+
+        // Collinear straight line -> high corner velocity
+        let v_straight = klipper_corner_velocity(d_in, d_in, scv, accel);
+        assert!(v_straight > 1000.0);
+
+        // 180° reversal -> 0 corner velocity
+        let v_reverse = klipper_corner_velocity(d_in, -d_in, scv, accel);
+        assert_eq!(v_reverse, 0.0);
+    }
+
+    #[test]
+    fn stepper_max_reachable_velocity_converges_and_scales_with_distance() {
+        let v_0 = 0.0;
+        let a_0 = 10000.0;
+        let v_max = 500.0;
+
+        let v_short = stepper_max_reachable_velocity(v_0, 1.0, a_0, v_max);
+        let v_long = stepper_max_reachable_velocity(v_0, 50.0, a_0, v_max);
+
+        assert!(v_short > 0.0);
+        assert!(v_long > v_short);
+        assert!(v_long < v_max);
+    }
+
+    #[test]
+    fn plan_path_velocities_ramps_acceleration_and_deceleration_around_sharp_corners() {
+        use crate::toolpath::Segment;
+
+        let points = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(50.0, 0.0, 0.0),
+            DVec3::new(50.0, 50.0, 0.0), // 90° turn
+            DVec3::new(0.0, 50.0, 0.0),  // 90° turn
+        ];
+        let segments = vec![
+            Segment {
+                kind: MoveKind::WallOuter,
+                speed: 6000.0, // 100 mm/s
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                speed: 6000.0,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                speed: 6000.0,
+                ..Segment::default()
+            },
+        ];
+        let model = StandardMotionModel::default();
+        let profiles = plan_path_velocities(&points, &segments, &model, false, 5.0);
+
+        assert_eq!(profiles.len(), 3);
+        // First segment starts from entry 0.0
+        assert_eq!(profiles[0].entry_speed, 0.0);
+        // Exit speed at 90° corner is bounded by Klipper SCV (5 mm/s = 300 mm/min)
+        assert!((profiles[0].exit_speed - 300.0).abs() < 10.0);
+        // Last segment finishes at exit 0.0
+        assert_eq!(profiles[2].exit_speed, 0.0);
     }
 }
