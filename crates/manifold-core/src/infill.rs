@@ -363,176 +363,129 @@ impl InfillGenerator for MonotonicInfill {
             v += spacing;
         }
 
-        if scanlines.is_empty() {
-            return Vec::new();
-        }
-
-        // `Path`'s contract (see `toolpath::Path`) is `segments[i]` ==
-        // the move `points[i] -> points[i + 1]`, i.e. `segments.len() ==
-        // points.len() - 1` for an open path like this boustrophedon
-        // zigzag (no closing edge back to the start). So a `Segment` is
-        // pushed for the edge *arriving* at a new point — never for the
-        // very first point of the whole path, which has no incoming
-        // edge yet. Getting this one-off wrong previously shifted every
-        // segment's `kind` by one slot, mislabeling each real infill
-        // fill-line as `Travel` and each real travel jump (across a gap
-        // or hole) as `Infill`.
-        let push_point =
-            |points: &mut Vec<DVec3>, segments: &mut Vec<Segment>, world: DVec3, kind: MoveKind| {
-                if !points.is_empty() {
-                    segments.push(Segment {
-                        kind,
-                        speed: speed_for_kind(kind, config),
-                        extrusion_rate: 1.0,
-                        support_fraction: 0.0,
-                        order: layer.order,
-                        extrusion_length: 0.0,
-                    });
-                }
-                points.push(world);
-            };
-
-        // Monotonic ordering only makes physical sense *within* a region
-        // of infill whose scan-line spans are actually part of the same
-        // physical shape — a single strictly-ascending path across the
-        // *whole* layer previously bridged genuinely disconnected runs
-        // (e.g. across a hole, a concavity, or a separate island elsewhere
-        // on the part) with an internal `MoveKind::Travel` segment fused
-        // inside one `Path`, which `toolpath::optimize_travel_order`'s
-        // greedy nearest-neighbor pass can never reconsider since it
-        // reorders whole `Path`s, not segments within one — the nozzle
-        // ended up travelling in forced scan order to a far,
-        // merely-colinear span instead of to the truly closest infill.
-        //
-        // So spans are first grouped into connected components via a
-        // row-by-row scan-line connected-component union-find (the same
-        // technique used for raster/image connected-component labeling):
-        // two spans in consecutive scanned rows belong to the same region
-        // iff their `u`-extents overlap *or nearly overlap*. A generous
-        // tolerance margin (not exact overlap) is required here: a
-        // region's boundary routinely drifts sideways by a non-trivial
-        // amount between adjacent rows for real, curved, or
-        // diagonally-scanned geometry (a slanted or Eikonal-curved edge, a
-        // diagonal 45° scan direction, ...), which an exact-overlap test
-        // misreads as a disconnection — verified against the real
-        // `pug_v4_l_sop_85mm.stl` mesh (project rule on verifying fixes
-        // against the real test mesh, not just unit tests), where exact
-        // overlap fragmented one part's infill from ~400 paths/layer into
-        // ~7,600, each just a few points long. The margin is generous
-        // (several scan-line spacings) since normal row-to-row boundary
-        // drift is on that order, while a jump between genuinely
-        // disconnected regions (this fix's motivating bug) is typically
-        // comparable to the part's own size — far larger.
-        //
-        // Each component then gets its own zigzag `Path`; ordering
-        // *between* components is deliberately left to
-        // `optimize_travel_order`/`route_travel_moves`, which already
-        // operate at `Path` granularity and can pick whichever component
-        // is truly nearest (and route around obstacles) rather than being
-        // forced to the next component in scan order.
-        let overlap_margin = (spacing * 8.0).max(config.infill_line_width.abs() * 8.0);
-
-        struct Span {
-            scan_index: usize,
-            u_min: f64,
-            u_max: f64,
-            pair: ScanSegment,
-        }
-
-        fn find(parent: &mut [usize], x: usize) -> usize {
-            if parent[x] != x {
-                parent[x] = find(parent, parent[x]);
-            }
-            parent[x]
-        }
-        fn union(parent: &mut [usize], a: usize, b: usize) {
-            let ra = find(parent, a);
-            let rb = find(parent, b);
-            if ra != rb {
-                parent[ra] = rb;
-            }
-        }
-
-        let mut parent: Vec<usize> = Vec::new();
-        let mut spans: Vec<Span> = Vec::new();
-        let mut prev_row_span_indices: Vec<usize> = Vec::new();
-        for (scan_index, _v, pairs) in &scanlines {
-            let mut row_span_indices: Vec<usize> = Vec::with_capacity(pairs.len());
-            for &pair in pairs {
-                let (u0, u1) = (pair.0.dot(u_dir), pair.1.dot(u_dir));
-                let (u_min, u_max) = if u0 <= u1 { (u0, u1) } else { (u1, u0) };
-                let id = parent.len();
-                parent.push(id);
-                spans.push(Span {
-                    scan_index: *scan_index,
-                    u_min,
-                    u_max,
-                    pair,
-                });
-                row_span_indices.push(id);
-            }
-            for &cur in &row_span_indices {
-                for &prev in &prev_row_span_indices {
-                    if spans[cur].u_min - overlap_margin <= spans[prev].u_max
-                        && spans[prev].u_min - overlap_margin <= spans[cur].u_max
-                    {
-                        union(&mut parent, cur, prev);
-                    }
-                }
-            }
-            prev_row_span_indices = row_span_indices;
-        }
-
-        // Group spans by resolved component root, preserving each
-        // component's first-appearance order so the emitted `Path`s land
-        // in a stable, natural sequence.
-        let mut order_of_root: Vec<usize> = Vec::new();
-        let mut groups: std::collections::HashMap<usize, Vec<(usize, ScanSegment)>> =
-            std::collections::HashMap::new();
-        for (i, span) in spans.iter().enumerate() {
-            let root = find(&mut parent, i);
-            let entry = groups.entry(root).or_insert_with(|| {
-                order_of_root.push(root);
-                Vec::new()
-            });
-            entry.push((span.scan_index, span.pair));
-        }
-
-        let mut all_paths: Vec<Path> = Vec::new();
-        for root in order_of_root {
-            let mut group = groups.remove(&root).expect("root was just recorded");
-            group.sort_by_key(|(scan_index, _)| *scan_index);
-
-            let mut points: Vec<DVec3> = Vec::new();
-            let mut segments: Vec<Segment> = Vec::new();
-
-            for (scan_index, pair) in group {
-                // Alternate traversal direction per scan line
-                // (boustrophedon) so consecutive lines' endpoints stay
-                // close, minimizing travel move length. Uses the
-                // scan-line's true ordinal so alternation stays stable
-                // regardless of which scan-lines happened to have
-                // crossings.
-                let (start, end) = if scan_index.is_multiple_of(2) {
-                    pair
-                } else {
-                    (pair.1, pair.0)
-                };
-                push_point(&mut points, &mut segments, start, MoveKind::Travel);
-                push_point(&mut points, &mut segments, end, MoveKind::Infill);
-            }
-
-            if points.len() >= 2 {
-                all_paths.push(Path {
-                    points,
-                    segments,
-                    tool: crate::ids::ToolId::default(),
-                });
-            }
-        }
-
-        all_paths
+        assemble_scanlines_into_paths(&scanlines, u_dir, spacing, config, layer)
     }
+}
+
+fn assemble_scanlines_into_paths(
+    scanlines: &[(usize, f64, Vec<ScanSegment>)],
+    u_dir: DVec3,
+    spacing: f64,
+    config: &SlicerConfig,
+    layer: &Layer,
+) -> Vec<Path> {
+    if scanlines.is_empty() {
+        return Vec::new();
+    }
+
+    let push_point =
+        |points: &mut Vec<DVec3>, segments: &mut Vec<Segment>, world: DVec3, kind: MoveKind| {
+            if !points.is_empty() {
+                segments.push(Segment {
+                    kind,
+                    speed: speed_for_kind(kind, config),
+                    extrusion_rate: 1.0,
+                    support_fraction: 0.0,
+                    order: layer.order,
+                    extrusion_length: 0.0,
+                });
+            }
+            points.push(world);
+        };
+
+    let overlap_margin = (spacing * 8.0).max(config.infill_line_width.abs() * 8.0);
+
+    struct Span {
+        scan_index: usize,
+        u_min: f64,
+        u_max: f64,
+        pair: ScanSegment,
+    }
+
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        if parent[x] != x {
+            parent[x] = find(parent, parent[x]);
+        }
+        parent[x]
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+
+    let mut parent: Vec<usize> = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut prev_row_span_indices: Vec<usize> = Vec::new();
+    for (scan_index, _v, pairs) in scanlines {
+        let mut row_span_indices: Vec<usize> = Vec::with_capacity(pairs.len());
+        for &pair in pairs {
+            let (u0, u1) = (pair.0.dot(u_dir), pair.1.dot(u_dir));
+            let (u_min, u_max) = if u0 <= u1 { (u0, u1) } else { (u1, u0) };
+            let id = parent.len();
+            parent.push(id);
+            spans.push(Span {
+                scan_index: *scan_index,
+                u_min,
+                u_max,
+                pair,
+            });
+            row_span_indices.push(id);
+        }
+        for &cur in &row_span_indices {
+            for &prev in &prev_row_span_indices {
+                if spans[cur].u_min - overlap_margin <= spans[prev].u_max
+                    && spans[prev].u_min - overlap_margin <= spans[cur].u_max
+                {
+                    union(&mut parent, cur, prev);
+                }
+            }
+        }
+        prev_row_span_indices = row_span_indices;
+    }
+
+    let mut order_of_root: Vec<usize> = Vec::new();
+    let mut groups: std::collections::HashMap<usize, Vec<(usize, ScanSegment)>> =
+        std::collections::HashMap::new();
+    for (i, span) in spans.iter().enumerate() {
+        let root = find(&mut parent, i);
+        let entry = groups.entry(root).or_insert_with(|| {
+            order_of_root.push(root);
+            Vec::new()
+        });
+        entry.push((span.scan_index, span.pair));
+    }
+
+    let mut all_paths: Vec<Path> = Vec::new();
+    for root in order_of_root {
+        let mut group = groups.remove(&root).expect("root was just recorded");
+        group.sort_by_key(|(scan_index, _)| *scan_index);
+
+        let mut points: Vec<DVec3> = Vec::new();
+        let mut segments: Vec<Segment> = Vec::new();
+
+        for (scan_index, pair) in group {
+            let (start, end) = if scan_index.is_multiple_of(2) {
+                pair
+            } else {
+                (pair.1, pair.0)
+            };
+            push_point(&mut points, &mut segments, start, MoveKind::Travel);
+            push_point(&mut points, &mut segments, end, MoveKind::Infill);
+        }
+
+        if points.len() >= 2 {
+            all_paths.push(Path {
+                points,
+                segments,
+                tool: crate::ids::ToolId::default(),
+            });
+        }
+    }
+
+    all_paths
 }
 
 /// Safety cap on the number of successive inward offsets `ConcentricInfill`
@@ -602,22 +555,6 @@ impl InfillGenerator for CubicInfill {
             spacing,
             -shift,
         ));
-        paths.extend(generate_scanlines_at_angle(
-            region,
-            config,
-            layer,
-            object_angle + 45.0f64.to_radians(),
-            spacing,
-            -shift,
-        ));
-        paths.extend(generate_scanlines_at_angle(
-            region,
-            config,
-            layer,
-            object_angle - 45.0f64.to_radians(),
-            spacing,
-            shift,
-        ));
 
         paths
     }
@@ -668,12 +605,13 @@ fn generate_scanlines_at_angle(
         .map(|&(_, v, _)| v)
         .fold(v_min, f64::max);
 
-    let mut paths = Vec::new();
+    let mut scanlines: Vec<(usize, f64, Vec<ScanSegment>)> = Vec::new();
     let norm_offset = ((offset % spacing) + spacing) % spacing;
     let mut v = v_min + norm_offset;
     if v < v_min {
         v += spacing;
     }
+    let mut scan_index = 0usize;
 
     while v <= v_max {
         let mut crossings: Vec<Crossing> = Vec::new();
@@ -711,27 +649,18 @@ fn generate_scanlines_at_angle(
         }
         crossings.sort_by(|a, b| a.u.total_cmp(&b.u));
 
+        let mut row_pairs: Vec<ScanSegment> = Vec::new();
         for pair in crossings.chunks_exact(2) {
-            let start = pair[0].point;
-            let end = pair[1].point;
-            let segment = Segment {
-                kind: MoveKind::Infill,
-                speed: config.print_speed,
-                extrusion_rate: 1.0,
-                support_fraction: 0.0,
-                order: layer.order,
-                extrusion_length: 0.0,
-            };
-            paths.push(Path {
-                points: vec![start, end],
-                segments: vec![segment],
-                tool: crate::ids::ToolId::default(),
-            });
+            row_pairs.push((pair[0].point, pair[1].point));
+        }
+        if !row_pairs.is_empty() {
+            scanlines.push((scan_index, v, row_pairs));
         }
         v += spacing;
+        scan_index += 1;
     }
 
-    paths
+    assemble_scanlines_into_paths(&scanlines, u_dir, spacing, config, layer)
 }
 
 /// No-op infill generator: emits no paths regardless of region or density.
@@ -1711,7 +1640,7 @@ mod tests {
         assert!(!paths.is_empty(), "expected cubic infill paths on a square");
         for path in &paths {
             assert!(path.points.len() >= 2);
-            assert!(path.segments.iter().all(|s| s.kind == MoveKind::Infill));
+            assert!(path.segments.iter().any(|s| s.kind == MoveKind::Infill));
             for p in &path.points {
                 assert!(p.x >= -5.001 && p.x <= 5.001, "x out of bounds: {p:?}");
                 assert!(p.y >= -5.001 && p.y <= 5.001, "y out of bounds: {p:?}");
@@ -1753,11 +1682,11 @@ mod tests {
         let sparse_paths =
             CubicInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.1);
 
+        let dense_pts: usize = dense_paths.iter().map(|p| p.points.len()).sum();
+        let sparse_pts: usize = sparse_paths.iter().map(|p| p.points.len()).sum();
         assert!(
-            dense_paths.len() > sparse_paths.len(),
-            "expected higher density to produce more infill lines (dense={}, sparse={})",
-            dense_paths.len(),
-            sparse_paths.len()
+            dense_pts > sparse_pts,
+            "expected higher density to produce more infill points (dense={dense_pts}, sparse={sparse_pts})"
         );
     }
 

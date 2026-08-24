@@ -491,6 +491,21 @@ pub fn apply_pre_retract_taper(
         return;
     };
 
+    let total_extruding_len: f64 = (0..=last_idx)
+        .filter_map(|i| {
+            if segments[i].kind != MoveKind::Travel {
+                let p0 = points[i];
+                let p1 = points[(i + 1) % points.len()];
+                Some((p1 - p0).length())
+            } else {
+                None
+            }
+        })
+        .sum();
+    if total_extruding_len < taper_distance_mm * 1.5 {
+        return;
+    }
+
     let p_start = points[last_idx];
     let p_end = points[(last_idx + 1) % points.len()];
     let last_seg_len = (p_end - p_start).length();

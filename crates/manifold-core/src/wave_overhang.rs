@@ -388,7 +388,7 @@ pub fn generate_wave_overhang_paths_2d(
         for poly in polylines {
             if poly.len() >= 2 {
                 let simplified = simplify_polyline_collinear(&poly, 0.015);
-                if polyline_length(&simplified) >= config.nozzle_diameter * 0.3 {
+                if polyline_length(&simplified) >= config.nozzle_diameter * 0.75 {
                     wavefront_polylines_2d.push(simplified);
                 }
             }

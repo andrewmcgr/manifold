@@ -1698,6 +1698,29 @@ pub fn plan_with_progress(
                 }
             }
 
+            // Drop unprintable micro-paths whose total extruding length is negligible (< 0.5 * nozzle_diameter or total E < 0.0005 mm)
+            let min_extruding_distance = config.nozzle_diameter * 0.5;
+            let paths: Vec<Path> = paths
+                .into_iter()
+                .filter(|path| {
+                    let n = path.points.len();
+                    if n < 2 {
+                        return false;
+                    }
+                    let mut total_d = 0.0;
+                    let mut total_e = 0.0;
+                    for (i, segment) in path.segments.iter().enumerate() {
+                        if segment.kind != MoveKind::Travel {
+                            let p0 = path.points[i];
+                            let p1 = path.points[(i + 1) % n];
+                            total_d += p0.distance(p1);
+                            total_e += segment.extrusion_length;
+                        }
+                    }
+                    total_d >= min_extruding_distance && total_e >= 0.0005
+                })
+                .collect();
+
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if let Ok(mut on_progress) = on_progress.lock() {
                 on_progress(done as f64 / total_layers);
