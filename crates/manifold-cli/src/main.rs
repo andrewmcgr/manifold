@@ -65,6 +65,22 @@ struct Cli {
     /// Whether the Eikonal order field blends with the top surface.
     #[arg(long, default_value_t = false)]
     eikonal_conform_top_surfaces: bool,
+
+    /// Whether wave overhang toolpath generation is enabled (Huygens wave propagation).
+    #[arg(long, default_value_t = true)]
+    wave_overhangs: bool,
+
+    /// Overlap distance (mm) between adjacent wave overhang tracks.
+    #[arg(long)]
+    wave_overhang_overlap: Option<f64>,
+
+    /// Speed (mm/s) for wave overhang printing moves.
+    #[arg(long)]
+    wave_overhang_speed: Option<f64>,
+
+    /// Flow multiplier for wave overhang teardrop beads.
+    #[arg(long)]
+    wave_overhang_flow: Option<f64>,
 }
 
 /// Parses a `--eikonal-slope-profile` argument of comma-separated
@@ -155,6 +171,10 @@ fn main() -> Result<()> {
         nozzle_diameter: cli.nozzle_diameter,
         order_field: cli.order_field.into(),
         eikonal_conform_top_surfaces: cli.eikonal_conform_top_surfaces,
+        wave_overhangs_enabled: cli.wave_overhangs,
+        wave_overhang_overlap: cli.wave_overhang_overlap,
+        wave_overhang_speed: cli.wave_overhang_speed.map(|s| s * 60.0),
+        wave_overhang_flow: cli.wave_overhang_flow,
         sparse_infill_pattern: cli.sparse_infill_pattern.map(Into::into),
         solid_infill_pattern: cli.solid_infill_pattern.map(Into::into),
         infill_pattern: cli.infill_pattern.into(),

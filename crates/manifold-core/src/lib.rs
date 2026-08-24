@@ -25,6 +25,7 @@ pub mod threemf;
 pub mod tool;
 pub mod toolpath;
 pub mod transform;
+pub mod wave_overhang;
 pub mod workspace;
 
 pub use error::{Error, Result};
@@ -336,6 +337,23 @@ pub struct SlicerConfig {
     /// this field existed still deserializes to `8.0`.
     #[serde(default = "default_z_travel_penalty")]
     pub z_travel_penalty: f64,
+    /// Whether wave overhang path planning (Huygens-propagation support-free overhangs) is enabled.
+    #[serde(default = "default_wave_overhangs_enabled")]
+    pub wave_overhangs_enabled: bool,
+    /// Overlap distance (mm) between adjacent wave tracks, defaulting to 0.05 mm.
+    #[serde(default)]
+    pub wave_overhang_overlap: Option<f64>,
+    /// Wave overhang printing speed (mm/min), defaulting to 1500 mm/min (25 mm/s).
+    #[serde(default)]
+    pub wave_overhang_speed: Option<f64>,
+    /// Flow multiplier for wave overhang teardrop beads, defaulting to 1.05.
+    #[serde(default)]
+    pub wave_overhang_flow: Option<f64>,
+}
+
+/// Static serde-deserialize fallback for [`SlicerConfig::wave_overhangs_enabled`]: `true`.
+fn default_wave_overhangs_enabled() -> bool {
+    true
 }
 
 /// Static serde-deserialize fallback for [`SlicerConfig::scarf_joint_enabled`]: `true`.
@@ -463,6 +481,10 @@ impl Default for SlicerConfig {
             travel_order_optimization_enabled: true,
             travel_collision_avoidance_enabled: true,
             z_travel_penalty: default_z_travel_penalty(),
+            wave_overhangs_enabled: true,
+            wave_overhang_overlap: None,
+            wave_overhang_speed: None,
+            wave_overhang_flow: None,
         }
     }
 }
@@ -642,6 +664,30 @@ impl SlicerConfig {
     pub fn nozzle_flat_diameter(&self) -> f64 {
         self.nozzle_flat_diameter
             .unwrap_or(2.0 * self.nozzle_diameter)
+    }
+
+    /// Returns whether wave overhang toolpaths are enabled.
+    #[must_use]
+    pub fn wave_overhangs_enabled(&self) -> bool {
+        self.wave_overhangs_enabled
+    }
+
+    /// Returns the lateral overlap distance (mm) for wave overhangs, defaulting to 0.05 mm.
+    #[must_use]
+    pub fn wave_overhang_overlap(&self) -> f64 {
+        self.wave_overhang_overlap.unwrap_or(0.05)
+    }
+
+    /// Returns the printing speed (mm/min) for wave overhang moves, defaulting to 1500 mm/min (25 mm/s).
+    #[must_use]
+    pub fn wave_overhang_speed(&self) -> f64 {
+        self.wave_overhang_speed.unwrap_or(1500.0)
+    }
+
+    /// Returns the flow multiplier for wave overhang teardrop beads, defaulting to 1.05.
+    #[must_use]
+    pub fn wave_overhang_flow(&self) -> f64 {
+        self.wave_overhang_flow.unwrap_or(1.05)
     }
 }
 

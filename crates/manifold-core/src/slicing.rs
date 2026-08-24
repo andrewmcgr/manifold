@@ -883,15 +883,11 @@ pub fn slice_mesh_with_progress(
     }
 
     // Inter-layer wall-0 gap stitching: only meaningful for the curved
-    // (non-Height) path, where wall 0 is reconstructed per-layer against
-    // `field` from `outer_wall_mesh` above and consecutive layers'
-    // wall-0 loops can drift laterally faster than the nozzle can bond
-    // across on a shallow slope (see this module's
-    // WALL_GAP_HOP_FRACTION/stitch_wall_gaps docs). The Height path
-    // reconstructs each layer's walls directly from a fixed 3D iso
-    // offset of the whole mesh with no comparable drift risk, so it is
-    // left untouched.
-    if !is_height {
+    // (non-Height) path when wave overhangs are disabled. When wave
+    // overhangs are enabled, wave overhang path planning replaces wall gap
+    // stitching with continuous Huygens-diffraction wavefronts, keeping
+    // outer wall loops unbroken.
+    if !is_height && !config.wave_overhangs_enabled() {
         stitch_wall_gaps(&mut layers, config, basis1, basis2);
     }
 

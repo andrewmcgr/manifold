@@ -700,6 +700,133 @@ impl ManifoldApp {
             }
         });
 
+        ui.collapsing("Wave Overhangs", |ui| {
+            ui.checkbox(
+                &mut self.config.wave_overhangs_enabled,
+                "Enable wave overhangs",
+            );
+            if self.config.wave_overhangs_enabled {
+                let mut overlap = self.config.wave_overhang_overlap();
+                if ui
+                    .add(egui::Slider::new(&mut overlap, 0.01..=0.20).text("Track overlap (mm)"))
+                    .changed()
+                {
+                    self.config.wave_overhang_overlap = Some(overlap);
+                }
+                let mut speed_mms = (self.config.wave_overhang_speed() / 60.0).round();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut speed_mms, 5.0..=100.0)
+                            .text("Overhang speed (mm/s)"),
+                    )
+                    .changed()
+                {
+                    self.config.wave_overhang_speed = Some(speed_mms * 60.0);
+                }
+                let mut flow = self.config.wave_overhang_flow();
+                if ui
+                    .add(egui::Slider::new(&mut flow, 0.5..=2.0).text("Flow multiplier"))
+                    .changed()
+                {
+                    self.config.wave_overhang_flow = Some(flow);
+                }
+            }
+        });
+
+        ui.collapsing("Retraction & Seams", |ui| {
+            let mut r_len = self.config.retraction_length();
+            if ui
+                .add(egui::Slider::new(&mut r_len, 0.0..=10.0).text("Retraction distance (mm)"))
+                .changed()
+            {
+                self.config.retraction_length = Some(r_len);
+            }
+            let mut r_spd_mms = (self.config.retraction_speed() / 60.0).round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut r_spd_mms, 10.0..=150.0).text("Retraction speed (mm/s)"),
+                )
+                .changed()
+            {
+                self.config.retraction_speed = Some(r_spd_mms * 60.0);
+            }
+            let mut u_extra = self.config.unretract_extra_length();
+            if ui
+                .add(egui::Slider::new(&mut u_extra, 0.0..=2.0).text("Unretract extra length (mm)"))
+                .changed()
+            {
+                self.config.unretract_extra_length = Some(u_extra);
+            }
+            let mut pa_val = self.config.pressure_advance.unwrap_or(0.0);
+            if ui
+                .add(egui::Slider::new(&mut pa_val, 0.0..=0.2).text("Pressure advance (s)"))
+                .changed()
+            {
+                self.config.pressure_advance = if pa_val > 0.0 { Some(pa_val) } else { None };
+            }
+            let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut taper_dist, 0.0..=10.0)
+                        .text("Pre-retract taper distance (mm)"),
+                )
+                .changed()
+            {
+                self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
+                    Some(taper_dist)
+                } else {
+                    None
+                };
+            }
+            ui.checkbox(&mut self.config.scarf_joint_enabled, "Scarf joint seams");
+            if self.config.scarf_joint_enabled {
+                let mut scarf_len = self.config.scarf_joint_length();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut scarf_len, 1.0..=10.0)
+                            .text("Scarf overlap length (mm)"),
+                    )
+                    .changed()
+                {
+                    self.config.scarf_joint_length = Some(scarf_len);
+                }
+            }
+            ui.checkbox(&mut self.config.wipe_enabled, "Wipe on retraction");
+            if self.config.wipe_enabled {
+                let mut wipe_dist = self.config.wipe_distance();
+                if ui
+                    .add(egui::Slider::new(&mut wipe_dist, 0.1..=10.0).text("Wipe distance (mm)"))
+                    .changed()
+                {
+                    self.config.wipe_distance = Some(wipe_dist);
+                }
+            }
+            ui.checkbox(
+                &mut self.config.use_firmware_retraction,
+                "Use firmware retraction (G10/G11)",
+            );
+        });
+
+        ui.collapsing("Travel & Simplification", |ui| {
+            ui.checkbox(&mut self.config.z_hop_enabled, "Z-hop on travel");
+            if self.config.z_hop_enabled {
+                ui.add(
+                    egui::Slider::new(&mut self.config.z_hop_height, 0.0..=2.0)
+                        .text("Z-hop height (mm)"),
+                );
+            }
+            ui.checkbox(
+                &mut self.config.path_simplify_enabled,
+                "Simplify wall toolpaths",
+            );
+            if self.config.path_simplify_enabled {
+                ui.add(
+                    egui::Slider::new(&mut self.config.path_simplify_tolerance, 0.0..=0.5)
+                        .text("Simplification tolerance (mm)"),
+                );
+            }
+        });
+
         ui.separator();
         ui.heading("Infill");
         let mut sparse_pattern = self.config.sparse_infill_pattern();
@@ -1072,100 +1199,6 @@ impl ManifoldApp {
                 .changed()
             {
                 self.config.first_layer_acceleration = Some(first_layer_accel);
-            }
-        });
-
-        ui.collapsing("Retraction & Seams", |ui| {
-            let mut r_len = self.config.retraction_length();
-            if ui
-                .add(egui::Slider::new(&mut r_len, 0.0..=10.0).text("Retraction distance (mm)"))
-                .changed()
-            {
-                self.config.retraction_length = Some(r_len);
-            }
-            let mut r_spd_mms = (self.config.retraction_speed() / 60.0).round();
-            if ui
-                .add(
-                    egui::Slider::new(&mut r_spd_mms, 10.0..=150.0).text("Retraction speed (mm/s)"),
-                )
-                .changed()
-            {
-                self.config.retraction_speed = Some(r_spd_mms * 60.0);
-            }
-            let mut u_extra = self.config.unretract_extra_length();
-            if ui
-                .add(egui::Slider::new(&mut u_extra, 0.0..=2.0).text("Unretract extra length (mm)"))
-                .changed()
-            {
-                self.config.unretract_extra_length = Some(u_extra);
-            }
-            let mut pa_val = self.config.pressure_advance.unwrap_or(0.0);
-            if ui
-                .add(egui::Slider::new(&mut pa_val, 0.0..=0.2).text("Pressure advance (s)"))
-                .changed()
-            {
-                self.config.pressure_advance = if pa_val > 0.0 { Some(pa_val) } else { None };
-            }
-            let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
-            if ui
-                .add(
-                    egui::Slider::new(&mut taper_dist, 0.0..=10.0)
-                        .text("Pre-retract taper distance (mm)"),
-                )
-                .changed()
-            {
-                self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
-                    Some(taper_dist)
-                } else {
-                    None
-                };
-            }
-            ui.checkbox(&mut self.config.scarf_joint_enabled, "Scarf joint seams");
-            if self.config.scarf_joint_enabled {
-                let mut scarf_len = self.config.scarf_joint_length();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut scarf_len, 1.0..=10.0)
-                            .text("Scarf overlap length (mm)"),
-                    )
-                    .changed()
-                {
-                    self.config.scarf_joint_length = Some(scarf_len);
-                }
-            }
-            ui.checkbox(&mut self.config.wipe_enabled, "Wipe on retraction");
-            if self.config.wipe_enabled {
-                let mut wipe_dist = self.config.wipe_distance();
-                if ui
-                    .add(egui::Slider::new(&mut wipe_dist, 0.1..=10.0).text("Wipe distance (mm)"))
-                    .changed()
-                {
-                    self.config.wipe_distance = Some(wipe_dist);
-                }
-            }
-            ui.checkbox(
-                &mut self.config.use_firmware_retraction,
-                "Use firmware retraction (G10/G11)",
-            );
-        });
-
-        ui.collapsing("Travel & Simplification", |ui| {
-            ui.checkbox(&mut self.config.z_hop_enabled, "Z-hop on travel");
-            if self.config.z_hop_enabled {
-                ui.add(
-                    egui::Slider::new(&mut self.config.z_hop_height, 0.0..=2.0)
-                        .text("Z-hop height (mm)"),
-                );
-            }
-            ui.checkbox(
-                &mut self.config.path_simplify_enabled,
-                "Simplify wall toolpaths",
-            );
-            if self.config.path_simplify_enabled {
-                ui.add(
-                    egui::Slider::new(&mut self.config.path_simplify_tolerance, 0.0..=0.5)
-                        .text("Simplification tolerance (mm)"),
-                );
             }
         });
 

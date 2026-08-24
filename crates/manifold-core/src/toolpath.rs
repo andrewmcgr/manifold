@@ -1456,6 +1456,14 @@ pub fn plan_with_progress(
     let total_layers = layers.len().max(1) as f64;
     let completed = AtomicUsize::new(0);
     let on_progress = Mutex::new(on_progress);
+
+    let wave_overhang_paths_by_layer = if config.wave_overhangs_enabled() {
+        let default_tool = objects.first().map(|o| o.tool).unwrap_or(ToolId(0));
+        crate::wave_overhang::plan_wave_overhangs(layers, config, default_tool)
+    } else {
+        vec![Vec::new(); layers.len()]
+    };
+
     let per_layer: Vec<Vec<Path>> = layers
         .par_iter()
         .map(|layer| -> Result<Vec<Path>> {
@@ -1550,6 +1558,13 @@ pub fn plan_with_progress(
                 }
             }
 
+            if let Some(wave_paths) = wave_overhang_paths_by_layer.get(layer.index) {
+                for mut wp in wave_paths.clone() {
+                    wp.tool = object.tool;
+                    paths.push(wp);
+                }
+            }
+
             let paths = retain_contained_paths(
                 paths,
                 layer.mesh_sdf.as_ref(),
@@ -1609,21 +1624,31 @@ pub fn plan_with_progress(
                     } else {
                         1.0
                     };
-                    let bead_area = extrusion::blended_bead_cross_section_area(
-                        effective_line_width,
-                        effective_layer_height,
-                        config.nozzle_diameter,
-                        support_fraction,
-                        bed_fraction,
-                    );
+                    let is_overhang = segment.kind == MoveKind::Overhang;
+                    let bead_area = if is_overhang {
+                        let track_w = config.nozzle_diameter - config.wave_overhang_overlap();
+                        track_w * effective_layer_height * config.wave_overhang_flow()
+                    } else {
+                        extrusion::blended_bead_cross_section_area(
+                            effective_line_width,
+                            effective_layer_height,
+                            config.nozzle_diameter,
+                            support_fraction,
+                            bed_fraction,
+                        )
+                    };
                     segment.extrusion_length =
                         extrusion::segment_extrusion_length(distance, bead_area, filament_area)
                             * segment.extrusion_rate
                             * extrusion_multiplier
                             * first_layer_mult;
-                    let nominal_speed = config
-                        .resolved_motion_model(machine)
-                        .max_feedrate(segment.kind, is_first_layer);
+                    let nominal_speed = if is_overhang {
+                        config.wave_overhang_speed()
+                    } else {
+                        config
+                            .resolved_motion_model(machine)
+                            .max_feedrate(segment.kind, is_first_layer)
+                    };
                     segment.speed = crate::kinematics::clamp_feedrate_by_volumetric_limit(
                         nominal_speed,
                         bead_area,
