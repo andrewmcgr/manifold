@@ -239,8 +239,8 @@ pub fn emit_with_machine(
             // `segments[i]` describes the edge `points[i] -> points[i + 1]`
             // (see `toolpath::Path`'s contract), so the move *arriving* at
             // `points[i]` (i >= 1) is `segments[i - 1]`, not `segments[i]`.
-            // The very first point has no incoming edge - it's always a
-            // plain positioning travel move (G0).
+            // The very first point has no incoming edge in `path.segments` - it is
+            // an inter-path positioning travel move (G0) from the previous position.
             let incoming_segment = if i > 0 {
                 path.segments.get(i - 1)
             } else {
@@ -248,22 +248,22 @@ pub fn emit_with_machine(
             };
             let extruding =
                 incoming_segment.is_some_and(|segment| segment.kind != MoveKind::Travel);
+            let move_kind = incoming_segment.map_or(MoveKind::Travel, |s| s.kind);
+            let move_speed = incoming_segment.map_or_else(
+                || motion_model.max_feedrate(MoveKind::Travel, is_first_layer),
+                |s| s.speed,
+            );
 
-            if let Some(segment) = incoming_segment {
-                let target_accel = motion_model.available_acceleration(
-                    segment.kind,
-                    is_first_layer,
-                    segment.speed / 60.0,
-                );
-                if current_accel != Some(target_accel) {
-                    out.push_str(&format!("SET_VELOCITY_LIMIT ACCEL={target_accel:.0}\n"));
-                    current_accel = Some(target_accel);
-                }
+            // Update acceleration limit if changed for this move kind / speed
+            let target_accel =
+                motion_model.available_acceleration(move_kind, is_first_layer, move_speed / 60.0);
+            if current_accel != Some(target_accel) {
+                out.push_str(&format!("SET_VELOCITY_LIMIT ACCEL={target_accel:.0}\n"));
+                current_accel = Some(target_accel);
             }
 
-            let is_overhang_move = incoming_segment.is_some_and(|segment| {
-                segment.kind == MoveKind::Overhang || segment.kind == MoveKind::Bridge
-            });
+            // Fan speed control
+            let is_overhang_move = move_kind == MoveKind::Overhang || move_kind == MoveKind::Bridge;
             let target_fan_pwm = if is_overhang_move {
                 overhang_fan_pwm
             } else if fan_is_on {
@@ -281,7 +281,7 @@ pub fn emit_with_machine(
             // 1. If starting a new path (i == 0) and currently unretracted, retract before the G0 positioning move.
             // 2. If entering an in-path Travel segment, retract before the move.
             // Unretract before resuming an extruding move.
-            if i == 0 {
+            if !extruding {
                 if !retracted {
                     if config.use_firmware_retraction {
                         out.push_str("G10\n");
@@ -293,49 +293,27 @@ pub fn emit_with_machine(
                     }
                     retracted = true;
                 }
-            } else if let Some(segment) = incoming_segment {
-                if segment.kind == MoveKind::Travel {
-                    if !retracted {
-                        if config.use_firmware_retraction {
-                            out.push_str("G10\n");
-                        } else {
-                            let r_len = config.retraction_length();
-                            let r_spd = config.retraction_speed();
-                            out.push_str(&format!("G1 E-{r_len:.5} F{r_spd:.0}\n"));
-                            current_f = Some(r_spd);
-                        }
-                        retracted = true;
-                    }
-                } else if retracted {
-                    if config.use_firmware_retraction {
-                        out.push_str("G11\n");
-                    } else {
-                        let u_len = config.retraction_length() + config.unretract_extra_length();
-                        let u_spd = config.unretract_speed();
-                        out.push_str(&format!("G1 E{u_len:.5} F{u_spd:.0}\n"));
-                        current_f = Some(u_spd);
-                    }
-                    retracted = false;
+            } else if retracted {
+                if config.use_firmware_retraction {
+                    out.push_str("G11\n");
+                } else {
+                    let u_len = config.retraction_length() + config.unretract_extra_length();
+                    let u_spd = config.unretract_speed();
+                    out.push_str(&format!("G1 E{u_len:.5} F{u_spd:.0}\n"));
+                    current_f = Some(u_spd);
                 }
+                retracted = false;
             }
 
-            let cmd = if i == 0 || !extruding { "G0" } else { "G1" };
+            let cmd = if !extruding { "G0" } else { "G1" };
             out.push_str(&format!("{cmd} X{:.3} Y{:.3} Z{:.3}", p.x, p.y, p.z));
             if extruding {
                 let delta_e = incoming_segment.map_or(0.0, |segment| segment.extrusion_length);
                 out.push_str(&format!(" E{delta_e:.5}"));
             }
-            // Emit `F` only when the segment's feedrate differs from the
-            // last `F` value written to the program -- firmware retains
-            // the last commanded feedrate across moves, so repeating an
-            // unchanged `F` on every line is redundant noise the printer
-            // ignores anyway. The very first move (no `incoming_segment`)
-            // has no configured speed to report, so it never emits `F`.
-            if let Some(segment) = incoming_segment {
-                if current_f != Some(segment.speed) {
-                    out.push_str(&format!(" F{:.3}", segment.speed));
-                    current_f = Some(segment.speed);
-                }
+            if current_f != Some(move_speed) {
+                out.push_str(&format!(" F{move_speed:.3}"));
+                current_f = Some(move_speed);
             }
             out.push('\n');
         }
@@ -936,11 +914,11 @@ mod tests {
             .filter(|line| line.starts_with("G0 ") || line.starts_with("G1 "))
             .collect();
 
-        // First move (i == 0) is a plain positioning move with no incoming
-        // segment, so it never carries an F.
-        assert!(!move_lines[0].contains('F'));
-        // Second move's incoming segment (speed 3000.0) has no prior F to
-        // compare against, so F is emitted.
+        // First move (i == 0) is a positioning travel move, so it carries
+        // the travel speed F9000.
+        assert!(move_lines[0].contains("F9000.000"));
+        // Second move's incoming segment (speed 3000.0) has a different speed from
+        // the prior emitted F9000, so F3000 is emitted.
         assert!(move_lines[1].contains("F3000.000"));
         // Third move's incoming segment shares the same speed (3000.0) as
         // the previous emitted F, so F must be omitted entirely.
@@ -1043,5 +1021,50 @@ mod tests {
             out.contains("M106 S255\n"),
             "must ramp to 100% fan on overhang move"
         );
+    }
+
+    #[test]
+    fn emit_sets_travel_feedrate_and_acceleration_on_inter_path_travel_moves() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        let path1 = Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(10.0, 0.0, 0.0)],
+            segments: vec![Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 0.5,
+                speed: 3000.0,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+        };
+        let path2 = Path {
+            points: vec![DVec3::new(50.0, 50.0, 0.0), DVec3::new(60.0, 50.0, 0.0)],
+            segments: vec![Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 0.5,
+                speed: 3000.0,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            use_firmware_retraction: false,
+            travel_speed: 12000.0,
+            retraction_speed: Some(900.0),
+            retraction_length: Some(0.5),
+            travel_acceleration: Some(8000.0),
+            outer_wall_acceleration: Some(2000.0),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&[path1, path2], &config);
+
+        // Retraction happens at 900 mm/min
+        assert!(out.contains("G1 E-0.50000 F900\n"));
+        // Inter-path travel move to (50, 50, 0) must set travel acceleration and travel speed F12000
+        assert!(out.contains("SET_VELOCITY_LIMIT ACCEL=8000\n"));
+        assert!(out.contains("G0 X50.000 Y50.000 Z0.000 F12000.000\n"));
     }
 }
