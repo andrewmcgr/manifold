@@ -4,6 +4,7 @@ use crate::{
     toolpath::{MoveKind, Path},
     SlicerConfig,
 };
+use glam::DVec3;
 
 /// Substitute `{print_min_x}`, `{print_min_y}`, `{print_max_x}`,
 /// `{print_max_y}` placeholders in a Gcode template with the given first-
@@ -235,6 +236,7 @@ pub fn emit_with_machine(
             retracted = true;
         }
 
+        let mut last_pos: Option<DVec3> = None;
         for (i, p) in path.points.iter().enumerate() {
             // `segments[i]` describes the edge `points[i] -> points[i + 1]`
             // (see `toolpath::Path`'s contract), so the move *arriving* at
@@ -253,6 +255,13 @@ pub fn emit_with_machine(
                 || motion_model.max_feedrate(MoveKind::Travel, is_first_layer),
                 |s| s.speed,
             );
+
+            // Skip zero-length moves to the exact same position
+            if let Some(prev) = last_pos {
+                if i > 0 && prev.distance(*p) < 1e-4 {
+                    continue;
+                }
+            }
 
             // Update acceleration limit if changed for this move kind / speed
             let target_accel =
@@ -316,6 +325,7 @@ pub fn emit_with_machine(
                 current_f = Some(move_speed);
             }
             out.push('\n');
+            last_pos = Some(*p);
         }
     }
 
@@ -1066,5 +1076,46 @@ mod tests {
         // Inter-path travel move to (50, 50, 0) must set travel acceleration and travel speed F12000
         assert!(out.contains("SET_VELOCITY_LIMIT ACCEL=8000\n"));
         assert!(out.contains("G0 X50.000 Y50.000 Z0.000 F12000.000\n"));
+    }
+
+    #[test]
+    fn emit_omits_zero_length_non_extruding_moves_and_zero_delta_e() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        let path = Path {
+            points: vec![
+                DVec3::new(10.0, 10.0, 0.2),
+                DVec3::new(10.0, 10.0, 0.2), // duplicate zero-length point
+                DVec3::new(20.0, 10.0, 0.2),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 0.0, // zero extrusion
+                    speed: 3000.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 0.5,
+                    speed: 3000.0,
+                    ..Segment::default()
+                },
+            ],
+            tool: ToolId(0),
+        };
+
+        let config = config_without_print_gcode();
+        let out = emit(&[path], &config);
+
+        // Never emit E0.00000
+        assert!(!out.contains("E0.00000"));
+        // Never emit duplicate move to (10, 10, 0.2)
+        let count_p0 = out.matches("X10.000 Y10.000").count();
+        assert_eq!(
+            count_p0, 1,
+            "only the initial G0 positioning move is emitted"
+        );
     }
 }
