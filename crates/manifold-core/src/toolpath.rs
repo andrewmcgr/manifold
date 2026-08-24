@@ -660,23 +660,27 @@ fn optimize_travel_order(mut paths: Vec<Path>, config: &SlicerConfig) -> Vec<Pat
 /// around one blocked travel chord rather than a whole mesh.
 const MAX_TRAVEL_GRID_NODES: usize = 64_000;
 
-/// Returns whether the straight travel chord `a -> b` crosses solid
-/// material by more than `clearance` (typically one nozzle radius) at any
-/// sampled point -- the collision check [`route_travel_moves`] uses to
-/// decide whether a travel move needs routing at all. Unlike
-/// `slicing::chord_stays_in_solid` (which checks a chord *stays inside*
-/// solid, used by wall-gap stitching), this checks the opposite: whether
-/// a travel move -- which should stay in open air -- dips meaningfully
-/// *into* solid material.
+/// Returns whether the straight travel chord `a -> b` crosses solid material or violates
+/// `clearance` from existing printed material at any sampled point.
+///
+/// Near the endpoints `a` (departure) and `b` (arrival), the required clearance ramps from 0
+/// at the contact boundary up to the full `clearance` distance, allowing departures and arrivals
+/// while ensuring the travel transit maintains full clearance in open space.
 fn travel_chord_is_blocked(mesh_sdf: &MeshSdf, a: DVec3, b: DVec3, clearance: f64) -> bool {
     let distance = a.distance(b);
     if distance <= f64::EPSILON {
         return false;
     }
-    let samples = ((distance / clearance.max(1e-6)).ceil() as usize).clamp(2, 128);
+    let step = (clearance * 0.5).max(0.05);
+    let samples = ((distance / step).ceil() as usize).clamp(4, 128);
     (0..=samples).any(|s| {
         let t = s as f64 / samples as f64;
-        mesh_sdf.sample(a.lerp(b, t)).value < -clearance
+        let p = a.lerp(b, t);
+        let dist_from_start = t * distance;
+        let dist_from_end = (1.0 - t) * distance;
+        let required_clearance = clearance.min(dist_from_start).min(dist_from_end);
+        let sample = mesh_sdf.sample(p);
+        sample.value < required_clearance
     })
 }
 
@@ -720,21 +724,32 @@ fn route_around_obstruction(
     z_penalty: f64,
     clearance: f64,
 ) -> Option<Vec<DVec3>> {
+    let start_sample = mesh_sdf.sample(start);
+    let start_normal = start_sample.gradient.try_normalize();
+    let start_clear = start_normal.map_or(start, |n| start + n * clearance);
+
+    let end_sample = mesh_sdf.sample(end);
+    let end_normal = end_sample.gradient.try_normalize();
+    let end_clear = end_normal.map_or(end, |n| end + n * clearance);
+
+    let search_start = start_clear;
+    let search_end = end_clear;
+
     let base_cell = cell_size.max(1e-6);
-    let margin = (start.distance(end) * 0.5).max(base_cell * 4.0);
+    let margin = (search_start.distance(search_end) * 0.5).max(base_cell * 4.0) + clearance;
     // Never allow the search grid to extend below the print bed (Z < 0): a
     // physical 3D printer head cannot dive under the build plate to avoid an
     // obstacle.
-    let min_z_floor = 0.0f64.min(start.z).min(end.z);
+    let min_z_floor = 0.0f64.min(search_start.z).min(search_end.z);
     let min = DVec3::new(
-        start.x.min(end.x) - margin,
-        start.y.min(end.y) - margin,
-        (start.z.min(end.z) - margin).max(min_z_floor),
+        search_start.x.min(search_end.x) - margin,
+        search_start.y.min(search_end.y) - margin,
+        (search_start.z.min(search_end.z) - margin).max(min_z_floor),
     );
     let max = DVec3::new(
-        start.x.max(end.x) + margin,
-        start.y.max(end.y) + margin,
-        start.z.max(end.z) + margin,
+        search_start.x.max(search_end.x) + margin,
+        search_start.y.max(search_end.y) + margin,
+        search_start.z.max(search_end.z) + margin,
     );
     let extent = max - min;
 
@@ -775,8 +790,8 @@ fn route_around_obstruction(
         ]
     };
 
-    let start_idx = index_of(start);
-    let end_idx = index_of(end);
+    let start_idx = index_of(search_start);
+    let end_idx = index_of(search_end);
     if start_idx == end_idx {
         return None;
     }
@@ -856,8 +871,10 @@ fn route_around_obstruction(
             let neighbor_point = point_of(neighbor);
 
             let status = clearance_memo[neighbor_flat];
-            let is_clear = if status == 0 {
-                let clear = mesh_sdf.sample(neighbor_point).value >= clearance;
+            let is_clear = if neighbor_flat == end_flat || neighbor_flat == start_flat {
+                true
+            } else if status == 0 {
+                let clear = mesh_sdf.sample(neighbor_point).value >= clearance * 0.5;
                 clearance_memo[neighbor_flat] = if clear { 2 } else { 1 };
                 clear
             } else {
@@ -913,8 +930,21 @@ fn route_around_obstruction(
     path_indices.reverse();
 
     let mut waypoints: Vec<DVec3> = vec![start];
+    if start_clear.distance(start) > 1e-4 {
+        waypoints.push(start_clear);
+    }
     for &idx in &path_indices {
-        waypoints.push(point_of(coords_of(idx)));
+        let p = point_of(coords_of(idx));
+        if waypoints.last().is_none_or(|last| last.distance(p) > 1e-4) {
+            waypoints.push(p);
+        }
+    }
+    if end_clear.distance(end) > 1e-4
+        && waypoints
+            .last()
+            .is_none_or(|last| last.distance(end_clear) > 1e-4)
+    {
+        waypoints.push(end_clear);
     }
     waypoints.push(end);
     Some(waypoints)
@@ -953,7 +983,11 @@ fn route_travel_moves(
         return paths;
     };
 
-    let clearance = config.nozzle_diameter.abs().max(f64::EPSILON) / 2.0;
+    let clearance = 2.0
+        * config
+            .wall_line_width
+            .abs()
+            .max(config.nozzle_diameter.abs());
     let cell_size = config
         .layer_height
         .abs()
@@ -3233,10 +3267,42 @@ mod tests {
 
         // Every step along the routed detour must stay clear of the solid
         // cube (within the same clearance used to plan it).
-        let clearance = config.nozzle_diameter / 2.0;
+        let clearance = 2.0 * config.wall_line_width;
         for pair in detour.points.windows(2) {
             assert!(!travel_chord_is_blocked(&sdf, pair[0], pair[1], clearance));
         }
+    }
+
+    #[test]
+    fn travel_move_departs_and_arrives_maintaining_clearance() {
+        let sdf = Arc::new(cube_sdf_fixture());
+
+        let a = open_path(
+            vec![DVec3::new(-2.0, 0.5, 0.5), DVec3::new(0.0, 0.5, 0.5)],
+            MoveKind::Infill,
+        );
+        let b = open_path(
+            vec![DVec3::new(1.0, 0.5, 0.5), DVec3::new(3.0, 0.5, 0.5)],
+            MoveKind::Infill,
+        );
+        let config = SlicerConfig::default();
+        let slope_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
+
+        let routed = route_travel_moves(vec![a, b], Some(&sdf), &slope_profile, &config);
+        assert_eq!(routed.len(), 3);
+        let detour = &routed[1];
+
+        assert!(detour.points.len() >= 4);
+        let p_dep = detour.points[1];
+        assert!(
+            sdf.sample(p_dep).value >= 0.5,
+            "departure waypoint must be in open air"
+        );
+        let p_arr = detour.points[detour.points.len() - 2];
+        assert!(
+            sdf.sample(p_arr).value >= 0.5,
+            "arrival waypoint must be in open air"
+        );
     }
 
     #[test]
