@@ -1147,6 +1147,13 @@ impl ManifoldApp {
                     None
                 };
             }
+            let mut spd_deadband = self.config.speed_deadband_percent();
+            if ui
+                .add(egui::Slider::new(&mut spd_deadband, 0.0..=30.0).text("Speed deadband (%)"))
+                .changed()
+            {
+                self.config.speed_deadband_percent = Some(spd_deadband);
+            }
         });
 
         ui.collapsing("Accelerations (mm/s²)", |ui| {
@@ -1208,6 +1215,23 @@ impl ManifoldApp {
                 .changed()
             {
                 self.config.first_layer_acceleration = Some(first_layer_accel);
+            }
+            let mut scv = self.config.square_corner_velocity();
+            if ui
+                .add(egui::Slider::new(&mut scv, 1.0..=30.0).text("Square corner velocity (mm/s)"))
+                .changed()
+            {
+                self.config.square_corner_velocity = Some(scv);
+            }
+            let mut accel_deadband = self.config.acceleration_deadband_percent();
+            if ui
+                .add(
+                    egui::Slider::new(&mut accel_deadband, 0.0..=50.0)
+                        .text("Acceleration deadband (%)"),
+                )
+                .changed()
+            {
+                self.config.acceleration_deadband_percent = Some(accel_deadband);
             }
         });
 

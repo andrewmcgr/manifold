@@ -93,6 +93,18 @@ struct Cli {
     /// Number of initial layers to keep part cooling fan disabled.
     #[arg(long)]
     fan_layer_delay: Option<u32>,
+
+    /// Speed deadband percentage (e.g. 10.0%) for compacting G-code feedrate commands.
+    #[arg(long)]
+    speed_deadband: Option<f64>,
+
+    /// Acceleration deadband percentage (e.g. 20.0%) for compacting acceleration commands.
+    #[arg(long)]
+    acceleration_deadband: Option<f64>,
+
+    /// Klipper square corner velocity limit (mm/s).
+    #[arg(long)]
+    square_corner_velocity: Option<f64>,
 }
 
 /// Parses a `--eikonal-slope-profile` argument of comma-separated
@@ -190,6 +202,9 @@ fn main() -> Result<()> {
         fan_speed_percent: cli.fan_speed,
         overhang_fan_speed_percent: cli.overhang_fan_speed,
         fan_layer_delay: cli.fan_layer_delay,
+        speed_deadband_percent: cli.speed_deadband,
+        acceleration_deadband_percent: cli.acceleration_deadband,
+        square_corner_velocity: cli.square_corner_velocity,
         sparse_infill_pattern: cli.sparse_infill_pattern.map(Into::into),
         solid_infill_pattern: cli.solid_infill_pattern.map(Into::into),
         infill_pattern: cli.infill_pattern.into(),

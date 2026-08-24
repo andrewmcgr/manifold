@@ -191,6 +191,11 @@ pub fn emit_with_machine(
         }
     }
 
+    let scv = config.square_corner_velocity();
+    out.push_str(&format!(
+        "SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY={scv:.1}\n"
+    ));
+
     let fan_pwm = (255.0 * (config.fan_speed_percent() / 100.0)).round() as u32;
     let overhang_fan_pwm = (255.0 * (config.overhang_fan_speed_percent() / 100.0)).round() as u32;
     let fan_delay = config.fan_layer_delay();
@@ -210,8 +215,11 @@ pub fn emit_with_machine(
     let mut current_tool = None;
     let mut current_f: Option<f64> = None;
     let mut current_accel: Option<f64> = None;
+    let mut last_move_kind: Option<MoveKind> = None;
     let mut retracted = true;
     let motion_model = config.resolved_motion_model(machine);
+    let speed_deadband = config.speed_deadband_percent() / 100.0;
+    let accel_deadband = config.acceleration_deadband_percent() / 100.0;
 
     let min_order = paths
         .iter()
@@ -236,6 +244,14 @@ pub fn emit_with_machine(
             retracted = true;
         }
 
+        let profiles = crate::kinematics::plan_path_velocities(
+            &path.points,
+            &path.segments,
+            motion_model.as_ref(),
+            is_first_layer,
+            config.square_corner_velocity(),
+        );
+
         let mut last_pos: Option<DVec3> = None;
         for (i, p) in path.points.iter().enumerate() {
             // `segments[i]` describes the edge `points[i] -> points[i + 1]`
@@ -255,6 +271,13 @@ pub fn emit_with_machine(
                 || motion_model.max_feedrate(MoveKind::Travel, is_first_layer),
                 |s| s.speed,
             );
+            let actual_speed_mm_s = if i > 0 {
+                profiles.get(i - 1).map_or(move_speed / 60.0, |prof| {
+                    (prof.entry_speed.max(prof.cruise_speed).max(prof.exit_speed)) / 60.0
+                })
+            } else {
+                move_speed / 60.0
+            };
 
             // Skip zero-length moves to the exact same position
             if let Some(prev) = last_pos {
@@ -263,10 +286,14 @@ pub fn emit_with_machine(
                 }
             }
 
-            // Update acceleration limit if changed for this move kind / speed
+            // Update acceleration limit with deadband filtering
             let target_accel =
-                motion_model.available_acceleration(move_kind, is_first_layer, move_speed / 60.0);
-            if current_accel != Some(target_accel) {
+                motion_model.available_acceleration(move_kind, is_first_layer, actual_speed_mm_s);
+            let should_emit_accel = current_accel.is_none_or(|active| {
+                last_move_kind != Some(move_kind)
+                    || (target_accel - active).abs() / active.max(1.0) >= accel_deadband
+            });
+            if should_emit_accel {
                 out.push_str(&format!("SET_VELOCITY_LIMIT ACCEL={target_accel:.0}\n"));
                 current_accel = Some(target_accel);
             }
@@ -320,12 +347,18 @@ pub fn emit_with_machine(
                 let delta_e = incoming_segment.map_or(0.0, |segment| segment.extrusion_length);
                 out.push_str(&format!(" E{delta_e:.5}"));
             }
-            if current_f != Some(move_speed) {
+
+            let should_emit_f = current_f.is_none_or(|active| {
+                last_move_kind != Some(move_kind)
+                    || (move_speed - active).abs() / active.max(1.0) >= speed_deadband
+            });
+            if should_emit_f {
                 out.push_str(&format!(" F{move_speed:.3}"));
                 current_f = Some(move_speed);
             }
             out.push('\n');
             last_pos = Some(*p);
+            last_move_kind = Some(move_kind);
         }
     }
 
@@ -393,7 +426,7 @@ mod tests {
     #[test]
     fn emit_omits_tool_line_when_no_paths() {
         let out = emit(&[], &config_without_print_gcode());
-        assert!(!out.contains('T'));
+        assert!(!out.lines().any(|l| l.starts_with('T')));
     }
 
     #[test]
@@ -1117,5 +1150,66 @@ mod tests {
             count_p0, 1,
             "only the initial G0 positioning move is emitted"
         );
+    }
+
+    #[test]
+    fn emit_emits_klipper_square_corner_velocity_in_header() {
+        let config = SlicerConfig {
+            square_corner_velocity: Some(8.5),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&[], &config);
+
+        assert!(out.contains("SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=8.5\n"));
+    }
+
+    #[test]
+    fn emit_applies_deadband_to_acceleration_commands() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        let path = Path {
+            points: vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(10.0, 0.0, 0.0),
+                DVec3::new(20.0, 0.0, 0.0),
+                DVec3::new(30.0, 0.0, 0.0),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 0.5,
+                    speed: 3000.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 0.5,
+                    speed: 3100.0, // minor speed variation (~3%)
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 0.5,
+                    speed: 3050.0,
+                    ..Segment::default()
+                },
+            ],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            outer_wall_acceleration: Some(2500.0),
+            first_layer_acceleration: Some(2500.0),
+            acceleration_deadband_percent: Some(20.0),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&[path], &config);
+
+        // Only one SET_VELOCITY_LIMIT ACCEL=2500 for the outer wall pass, not 3
+        let accel_count = out.matches("SET_VELOCITY_LIMIT ACCEL=2500").count();
+        assert_eq!(accel_count, 1);
     }
 }

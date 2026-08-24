@@ -352,6 +352,15 @@ pub struct SlicerConfig {
     /// Flow multiplier for wave overhang teardrop beads, defaulting to 1.05.
     #[serde(default)]
     pub wave_overhang_flow: Option<f64>,
+    /// Speed deadband percentage (e.g. 10.0%) for compacting G-code feedrate commands.
+    #[serde(default)]
+    pub speed_deadband_percent: Option<f64>,
+    /// Acceleration deadband percentage (e.g. 20.0%) for compacting Klipper acceleration commands.
+    #[serde(default)]
+    pub acceleration_deadband_percent: Option<f64>,
+    /// Klipper square corner velocity limit (mm/s), defaulting to 5.0 mm/s.
+    #[serde(default)]
+    pub square_corner_velocity: Option<f64>,
 }
 
 /// Static serde-deserialize fallback for [`SlicerConfig::wave_overhangs_enabled`]: `true`.
@@ -489,6 +498,9 @@ impl Default for SlicerConfig {
             wave_overhang_overlap: None,
             wave_overhang_speed: None,
             wave_overhang_flow: None,
+            speed_deadband_percent: None,
+            acceleration_deadband_percent: None,
+            square_corner_velocity: None,
         }
     }
 }
@@ -700,6 +712,28 @@ impl SlicerConfig {
     #[must_use]
     pub fn wave_overhang_flow(&self) -> f64 {
         self.wave_overhang_flow.unwrap_or(1.05)
+    }
+
+    /// Returns the speed deadband percentage for G-code feedrate compaction, defaulting to 10.0%.
+    #[must_use]
+    pub fn speed_deadband_percent(&self) -> f64 {
+        self.speed_deadband_percent
+            .unwrap_or(10.0)
+            .clamp(0.0, 100.0)
+    }
+
+    /// Returns the acceleration deadband percentage for acceleration command compaction, defaulting to 20.0%.
+    #[must_use]
+    pub fn acceleration_deadband_percent(&self) -> f64 {
+        self.acceleration_deadband_percent
+            .unwrap_or(20.0)
+            .clamp(0.0, 100.0)
+    }
+
+    /// Returns the Klipper square corner velocity (mm/s), defaulting to 5.0 mm/s.
+    #[must_use]
+    pub fn square_corner_velocity(&self) -> f64 {
+        self.square_corner_velocity.unwrap_or(5.0).max(0.1)
     }
 }
 
