@@ -81,6 +81,18 @@ struct Cli {
     /// Flow multiplier for wave overhang teardrop beads.
     #[arg(long)]
     wave_overhang_flow: Option<f64>,
+
+    /// Part cooling fan speed percentage (0 to 100).
+    #[arg(long)]
+    fan_speed: Option<f64>,
+
+    /// Overhang part cooling fan speed percentage (0 to 100).
+    #[arg(long)]
+    overhang_fan_speed: Option<f64>,
+
+    /// Number of initial layers to keep part cooling fan disabled.
+    #[arg(long)]
+    fan_layer_delay: Option<u32>,
 }
 
 /// Parses a `--eikonal-slope-profile` argument of comma-separated
@@ -175,6 +187,9 @@ fn main() -> Result<()> {
         wave_overhang_overlap: cli.wave_overhang_overlap,
         wave_overhang_speed: cli.wave_overhang_speed.map(|s| s * 60.0),
         wave_overhang_flow: cli.wave_overhang_flow,
+        fan_speed_percent: cli.fan_speed,
+        overhang_fan_speed_percent: cli.overhang_fan_speed,
+        fan_layer_delay: cli.fan_layer_delay,
         sparse_infill_pattern: cli.sparse_infill_pattern.map(Into::into),
         solid_infill_pattern: cli.solid_infill_pattern.map(Into::into),
         infill_pattern: cli.infill_pattern.into(),

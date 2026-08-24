@@ -730,6 +730,15 @@ impl ManifoldApp {
                 {
                     self.config.wave_overhang_flow = Some(flow);
                 }
+                let mut fan_pct = self.config.overhang_fan_speed_percent();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut fan_pct, 0.0..=100.0).text("Overhang fan speed (%)"),
+                    )
+                    .changed()
+                {
+                    self.config.overhang_fan_speed_percent = Some(fan_pct);
+                }
             }
         });
 
@@ -1210,6 +1219,16 @@ impl ManifoldApp {
             .changed()
         {
             self.config.fan_speed_percent = Some(fan_pct);
+        }
+        let mut overhang_fan_pct = self.config.overhang_fan_speed_percent();
+        if ui
+            .add(
+                egui::Slider::new(&mut overhang_fan_pct, 0.0..=100.0)
+                    .text("Overhang fan speed (%)"),
+            )
+            .changed()
+        {
+            self.config.overhang_fan_speed_percent = Some(overhang_fan_pct);
         }
         let mut fan_delay = self.config.fan_layer_delay();
         if ui

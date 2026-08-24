@@ -54,6 +54,9 @@ pub struct SlicerConfig {
     /// Part cooling fan speed percentage (0.0 to 100.0), defaulting to 100.0% when `None`.
     #[serde(default)]
     pub fan_speed_percent: Option<f64>,
+    /// Part cooling fan speed percentage (0.0 to 100.0) for overhang/bridge moves, defaulting to 100.0% when `None`.
+    #[serde(default)]
+    pub overhang_fan_speed_percent: Option<f64>,
     /// Number of initial layers to keep part cooling fan disabled, defaulting to 1 (disabled on layer 0) when `None`.
     #[serde(default)]
     pub fan_layer_delay: Option<u32>,
@@ -425,6 +428,7 @@ impl Default for SlicerConfig {
             first_layer_extrusion_multiplier: None,
             first_layer_line_width: None,
             fan_speed_percent: None,
+            overhang_fan_speed_percent: None,
             fan_layer_delay: None,
             nozzle_diameter,
             object_ordering: ordering::ObjectOrderingKind::default(),
@@ -648,6 +652,14 @@ impl SlicerConfig {
     #[must_use]
     pub fn fan_speed_percent(&self) -> f64 {
         self.fan_speed_percent.unwrap_or(100.0).clamp(0.0, 100.0)
+    }
+
+    /// Part cooling fan speed percentage (0.0 to 100.0) for overhang moves, defaulting to `100.0` when `None`.
+    #[must_use]
+    pub fn overhang_fan_speed_percent(&self) -> f64 {
+        self.overhang_fan_speed_percent
+            .unwrap_or(100.0)
+            .clamp(0.0, 100.0)
     }
 
     /// Number of initial layers to keep part cooling fan disabled, defaulting to `1` when `None`.

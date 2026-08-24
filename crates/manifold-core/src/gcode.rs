@@ -191,14 +191,18 @@ pub fn emit_with_machine(
     }
 
     let fan_pwm = (255.0 * (config.fan_speed_percent() / 100.0)).round() as u32;
+    let overhang_fan_pwm = (255.0 * (config.overhang_fan_speed_percent() / 100.0)).round() as u32;
     let fan_delay = config.fan_layer_delay();
     let mut fan_is_on = false;
+    let mut current_fan_pwm: Option<u32> = None;
     let mut seen_orders: Vec<f64> = Vec::new();
 
-    if fan_delay > 0 && fan_pwm > 0 {
+    if fan_delay > 0 {
         out.push_str("M106 S0\n");
+        current_fan_pwm = Some(0);
     } else if fan_delay == 0 && fan_pwm > 0 {
         out.push_str(&format!("M106 S{fan_pwm}\n"));
+        current_fan_pwm = Some(fan_pwm);
         fan_is_on = true;
     }
 
@@ -220,8 +224,7 @@ pub fn emit_with_machine(
         if !seen_orders.iter().any(|&o| (o - path_order).abs() < 1e-4) {
             seen_orders.push(path_order);
             let layer_idx = (seen_orders.len() - 1) as u32;
-            if !fan_is_on && layer_idx >= fan_delay && fan_pwm > 0 {
-                out.push_str(&format!("M106 S{fan_pwm}\n"));
+            if !fan_is_on && layer_idx >= fan_delay {
                 fan_is_on = true;
             }
         }
@@ -256,6 +259,22 @@ pub fn emit_with_machine(
                     out.push_str(&format!("SET_VELOCITY_LIMIT ACCEL={target_accel:.0}\n"));
                     current_accel = Some(target_accel);
                 }
+            }
+
+            let is_overhang_move = incoming_segment.is_some_and(|segment| {
+                segment.kind == MoveKind::Overhang || segment.kind == MoveKind::Bridge
+            });
+            let target_fan_pwm = if is_overhang_move {
+                overhang_fan_pwm
+            } else if fan_is_on {
+                fan_pwm
+            } else {
+                0
+            };
+
+            if current_fan_pwm != Some(target_fan_pwm) {
+                out.push_str(&format!("M106 S{target_fan_pwm}\n"));
+                current_fan_pwm = Some(target_fan_pwm);
             }
 
             // Retract before travel moves:
@@ -976,5 +995,53 @@ mod tests {
         let out = emit(&[path0, path1], &config);
         assert!(out.contains("M106 S0\n"), "must turn off fan at start");
         assert!(out.contains("M106 S255\n"), "must turn on fan at layer 1");
+    }
+
+    #[test]
+    fn emit_sets_overhang_fan_speed_for_overhang_moves_and_restores_normal() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        let path = Path {
+            points: vec![
+                DVec3::new(0.0, 0.0, 0.4),
+                DVec3::new(10.0, 0.0, 0.4),
+                DVec3::new(20.0, 0.0, 0.4),
+                DVec3::new(30.0, 0.0, 0.4),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    order: 0.4,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::Overhang,
+                    order: 0.4,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    order: 0.4,
+                    ..Segment::default()
+                },
+            ],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            fan_speed_percent: Some(50.0),           // PWM ~ 128
+            overhang_fan_speed_percent: Some(100.0), // PWM = 255
+            fan_layer_delay: Some(0),
+            ..SlicerConfig::default()
+        };
+
+        let out = emit(&[path], &config);
+
+        assert!(out.contains("M106 S128\n"), "must set 50% fan initially");
+        assert!(
+            out.contains("M106 S255\n"),
+            "must ramp to 100% fan on overhang move"
+        );
     }
 }
