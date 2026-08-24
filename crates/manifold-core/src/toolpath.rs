@@ -1457,11 +1457,11 @@ pub fn plan_with_progress(
     let completed = AtomicUsize::new(0);
     let on_progress = Mutex::new(on_progress);
 
-    let wave_overhang_paths_by_layer = if config.wave_overhangs_enabled() {
+    let wave_overhang_plan = if config.wave_overhangs_enabled() {
         let default_tool = objects.first().map(|o| o.tool).unwrap_or(ToolId(0));
         crate::wave_overhang::plan_wave_overhangs(layers, config, default_tool)
     } else {
-        vec![Vec::new(); layers.len()]
+        crate::wave_overhang::WaveOverhangPlan::default()
     };
 
     let per_layer: Vec<Vec<Path>> = layers
@@ -1478,7 +1478,7 @@ pub fn plan_with_progress(
                 })?;
 
             let mut paths = Vec::new();
-            for wall_loop in &layer.loops {
+            for (w_idx, wall_loop) in layer.loops.iter().enumerate() {
                 // Placeholder metadata: real support/bridge/overhang
                 // classification and speed/extrusion-rate planning is future
                 // work (see toolpath-metadata-phase12 subtask 03). Wall
@@ -1499,16 +1499,22 @@ pub fn plan_with_progress(
                         // also applies here to `WallLoop::points`/`unsupported`).
                         // We classify a segment as `Overhang` when its
                         // *destination* point is `unsupported == true`, rather
-                        // than either endpoint: a stitched point is unsupported
-                        // because there's no order-field/mesh surface directly
-                        // beneath it, and that lack of support applies to the
-                        // bead being laid down as the nozzle arrives at (i.e.
-                        // extrudes into) that point -- not to the bead leaving
-                        // an already-supported point behind. Destination-only
-                        // is also simpler to reason about: it needs only the
-                        // wrap-around index, not a two-sided OR.
+                        // than either endpoint: a stitched or wave-overhang
+                        // point is unsupported because there's no order-field/mesh
+                        // surface directly beneath it, and that lack of support
+                        // applies to the bead being laid down as the nozzle
+                        // arrives at (i.e. extrudes into) that point.
                         let dest = (i + 1) % point_count.max(1);
-                        let kind = if wall_loop.unsupported.get(dest).copied().unwrap_or(false) {
+                        let is_unsupported =
+                            wall_loop.unsupported.get(dest).copied().unwrap_or(false)
+                                || wave_overhang_plan
+                                    .wall_overhang_tags_by_layer
+                                    .get(layer.index)
+                                    .and_then(|l| l.get(w_idx))
+                                    .and_then(|w| w.get(dest))
+                                    .copied()
+                                    .unwrap_or(false);
+                        let kind = if is_unsupported {
                             MoveKind::Overhang
                         } else if wall_loop.top_surface.get(dest).copied().unwrap_or(false) {
                             MoveKind::TopSurface
@@ -1558,7 +1564,7 @@ pub fn plan_with_progress(
                 }
             }
 
-            if let Some(wave_paths) = wave_overhang_paths_by_layer.get(layer.index) {
+            if let Some(wave_paths) = wave_overhang_plan.paths_by_layer.get(layer.index) {
                 for mut wp in wave_paths.clone() {
                     wp.tool = object.tool;
                     paths.push(wp);

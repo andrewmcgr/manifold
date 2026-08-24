@@ -584,16 +584,27 @@ fn simplify_polyline_collinear(pts: &[[f64; 2]], eps: f64) -> Vec<[f64; 2]> {
     out
 }
 
+/// Result of wave overhang path planning, containing both wave fill paths
+/// and per-wall-point overhang classification tags.
+#[derive(Clone, Debug, Default)]
+pub struct WaveOverhangPlan {
+    pub paths_by_layer: Vec<Vec<Path>>,
+    pub wall_overhang_tags_by_layer: Vec<Vec<Vec<bool>>>,
+}
+
 /// Detects unsupported overhang regions across layers and generates
-/// wave overhang toolpaths for each layer.
+/// wave overhang toolpaths for each layer, along with wall contour overhang tags.
 #[must_use]
 pub fn plan_wave_overhangs(
     layers: &[Layer],
     config: &SlicerConfig,
     tool: ToolId,
-) -> Vec<Vec<Path>> {
+) -> WaveOverhangPlan {
     if !config.wave_overhangs_enabled() || layers.len() < 2 {
-        return vec![Vec::new(); layers.len()];
+        return WaveOverhangPlan {
+            paths_by_layer: vec![Vec::new(); layers.len()],
+            wall_overhang_tags_by_layer: vec![Vec::new(); layers.len()],
+        };
     }
 
     let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
@@ -641,7 +652,8 @@ pub fn plan_wave_overhangs(
         _ => true,
     };
 
-    let mut result = vec![Vec::new(); layers.len()];
+    let mut paths_result = vec![Vec::new(); layers.len()];
+    let mut wall_tags_result = vec![Vec::new(); layers.len()];
 
     // Compute 2D outer wall boundaries for all layers
     let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = layers
@@ -675,6 +687,25 @@ pub fn plan_wave_overhangs(
         } else {
             None
         };
+
+        // Tag wall loops for layer k: points not supported by previous layer are Overhang
+        let mut layer_wall_tags = Vec::new();
+        for wall in &layers[k].loops {
+            let mut tags = vec![false; wall.points.len()];
+            if let Some(prev_k) = prev_idx {
+                let prev_b = &boundaries_2d[prev_k];
+                if !prev_b.is_empty() {
+                    for (i, p) in wall.points.iter().enumerate() {
+                        let p_2d = [(p - origin).dot(basis1), (p - origin).dot(basis2)];
+                        if !polygon2d_contains_or_near(p_2d, prev_b, config.nozzle_diameter * 0.4) {
+                            tags[i] = true;
+                        }
+                    }
+                }
+            }
+            layer_wall_tags.push(tags);
+        }
+        wall_tags_result[k] = layer_wall_tags;
 
         let Some(prev_k) = prev_idx else {
             // First layer resting on bed -- fully supported by print bed
@@ -780,10 +811,13 @@ pub fn plan_wave_overhangs(
             }
         }
 
-        result[k] = paths;
+        paths_result[k] = paths;
     }
 
-    result
+    WaveOverhangPlan {
+        paths_by_layer: paths_result,
+        wall_overhang_tags_by_layer: wall_tags_result,
+    }
 }
 
 fn polygon2d_contains_or_near(pt: [f64; 2], loops: &[Vec<[f64; 2]>], eps: f64) -> bool {
@@ -935,21 +969,24 @@ mod tests {
         l1.index = 1;
 
         let layers = vec![l0, l1];
-        let overhang_paths = plan_wave_overhangs(&layers, &config, ToolId(0));
+        let overhang_plan = plan_wave_overhangs(&layers, &config, ToolId(0));
 
-        assert_eq!(overhang_paths.len(), 2);
-        assert!(overhang_paths[0].is_empty(), "layer 0 has no overhang");
+        assert_eq!(overhang_plan.paths_by_layer.len(), 2);
         assert!(
-            !overhang_paths[1].is_empty(),
+            overhang_plan.paths_by_layer[0].is_empty(),
+            "layer 0 has no overhang"
+        );
+        assert!(
+            !overhang_plan.paths_by_layer[1].is_empty(),
             "layer 1 should have wave overhang paths"
         );
 
-        let min_x = overhang_paths[1]
+        let min_x = overhang_plan.paths_by_layer[1]
             .iter()
             .flat_map(|p| &p.points)
             .map(|pt| pt.x)
             .fold(f64::INFINITY, f64::min);
-        let max_x = overhang_paths[1]
+        let max_x = overhang_plan.paths_by_layer[1]
             .iter()
             .flat_map(|p| &p.points)
             .map(|pt| pt.x)
@@ -957,5 +994,55 @@ mod tests {
 
         assert!(min_x >= 9.5, "overhang should start near x=10, got {min_x}");
         assert!(max_x <= 20.1, "overhang should end at x=20, got {max_x}");
+    }
+
+    #[test]
+    fn plan_wave_overhangs_tags_contour_boundary_overhang_segments() {
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            layer_height: 0.2,
+            wave_overhangs_enabled: true,
+            ..SlicerConfig::default()
+        };
+
+        // Layer 0: 10x10 square (x: 0..10, y: 0..10)
+        let l0 = mock_layer(
+            0.0,
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(10.0, 0.0, 0.0),
+                DVec3::new(10.0, 10.0, 0.0),
+                DVec3::new(0.0, 10.0, 0.0),
+            ],
+        );
+
+        // Layer 1: 20x10 rectangle (x: 0..20, y: 0..10)
+        // Vertices at x=0, x=10, x=20
+        let mut l1 = mock_layer(
+            0.2,
+            vec![
+                DVec3::new(0.0, 0.0, 0.2),
+                DVec3::new(10.0, 0.0, 0.2),
+                DVec3::new(20.0, 0.0, 0.2),
+                DVec3::new(20.0, 10.0, 0.2),
+                DVec3::new(10.0, 10.0, 0.2),
+                DVec3::new(0.0, 10.0, 0.2),
+            ],
+        );
+        l1.index = 1;
+
+        let layers = vec![l0, l1];
+        let plan = plan_wave_overhangs(&layers, &config, ToolId(0));
+
+        assert_eq!(plan.wall_overhang_tags_by_layer.len(), 2);
+        let tags_l1 = &plan.wall_overhang_tags_by_layer[1][0];
+
+        // Points at x <= 10 (supported) should be false, points at x > 10 (overhang) should be true
+        assert!(!tags_l1[0], "p(0, 0) is supported");
+        assert!(!tags_l1[1], "p(10, 0) is supported");
+        assert!(tags_l1[2], "p(20, 0) is unsupported overhang");
+        assert!(tags_l1[3], "p(20, 10) is unsupported overhang");
+        assert!(!tags_l1[4], "p(10, 10) is supported");
+        assert!(!tags_l1[5], "p(0, 10) is supported");
     }
 }
