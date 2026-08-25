@@ -1,0 +1,92 @@
+# Configuration & Profile Reference
+
+Manifold encapsulates complete printer, material, and slicing configurations into a JSON structure (`Profile`), saved and loaded via `.json` profile files.
+
+---
+
+## Profile JSON Structure
+
+A `Profile` JSON bundles two top-level objects:
+1. **`machine`**: Physical printer kinematics, build envelope, toolhead clearance envelope, tools, and stepper motor limits.
+2. **`config`**: Slicing parameters, layer heights, infill patterns, wave overhang settings, speeds, accelerations, and fluid dynamics properties.
+
+```json
+{
+  "machine": {
+    "substrate_transform": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    "build_volume": {
+      "Aabb": {
+        "min": [0.0, 0.0, 0.0],
+        "max": [300.0, 300.0, 300.0]
+      }
+    },
+    "tools": [
+      {
+        "id": 0,
+        "nozzle_diameter": 0.4,
+        "mount": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        "collision_envelope": {
+          "Sphere": { "center": [0.0, 0.0, 0.0], "radius": 0.0 }
+        },
+        "extrusion_multiplier": 1.0,
+        "nozzle_temperature": 245.0
+      }
+    ],
+    "axis_count": 3,
+    "eikonal_slope_profile": [
+      [0.0, 0.0],
+      [15.0, 5.0],
+      [35.0, 20.0]
+    ],
+    "use_stepper_dynamics": true,
+    "zero_speed_acceleration": 20000.0,
+    "max_available_speed": 1000.0,
+    "acceleration_limit": 10000.0,
+    "speed_limit": 750.0
+  },
+  "config": {
+    "layer_height": 0.20,
+    "first_layer_height": 0.25,
+    "first_layer_line_width": 0.52,
+    "nozzle_diameter": 0.4,
+    "wall_line_width": 0.4,
+    "shell_thickness": 0.8,
+    "wall_offset": 0.2,
+    "solid_layers_top": 3,
+    "solid_layers_bottom": 3,
+    "sparse_infill_pattern": "Cubic",
+    "solid_infill_pattern": "AllWalls",
+    "infill_density": 0.20,
+    "wave_overhangs_enabled": true,
+    "wave_overhang_overlap": 0.05,
+    "wave_overhang_speed": 1500.0,
+    "wave_overhang_flow": 1.05,
+    "scarf_joint_enabled": true,
+    "scarf_joint_length": 3.0,
+    "fluid_dynamics": {
+      "pa_calibration_low": [0.045, 2.0],
+      "pa_calibration_high": [0.030, 15.0],
+      "heater_block_temp_c": 245.0,
+      "reference_temp_c": 240.0,
+      "max_fan_temp_drop_c": 8.0,
+      "ooze_time_constant_ref_s": 1.5,
+      "ooze_max_length_ref_mm": 0.30,
+      "static_retraction_mm": 0.25,
+      "max_retraction_mm": 1.5,
+      "pa_deadband": 0.10
+    }
+  }
+}
+```
+
+---
+
+## Configuration Modules
+
+- [Layering & Extrusion](layering-extrusion.md) — Layer heights, first layer squish, wall counts, and filament properties.
+- [Order Fields & Clearance Envelopes](order-fields.md) — Slicing surfaces and physical toolhead clearance cones.
+- [Infill Patterns](infill.md) — AllWalls, Concentric, and 3D Cubic Lattice infill.
+- [Wave Overhangs](wave-overhangs.md) — 2D Huygens wave-propagation theory (LaSO) and teardrop bead math.
+- [Kinematics & Stepper Dynamics](kinematics.md) — Per-feature speeds, SCV, deadbands, and motor ODE modeling.
+- [Retraction & Fluid Dynamics](retraction-fluid.md) — Scarf joints, wipe moves, and non-Newtonian pressure advance.
+- [Machine & Tools](machine-tools.md) — Printer build volume, multi-tool setups, and temperatures.
