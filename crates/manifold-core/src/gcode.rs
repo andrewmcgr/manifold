@@ -6,19 +6,97 @@ use crate::{
 };
 use glam::DVec3;
 
-/// Substitute `{print_min_x}`, `{print_min_y}`, `{print_max_x}`,
-/// `{print_max_y}` placeholders in a Gcode template with the given first-
-/// layer XY bounding box, formatted to 3 decimal places (matching the
-/// coordinate precision `emit` uses for move lines). Any other `{...}`
-/// text in the template (e.g. a Klipper macro's other named parameters
-/// like `T_TOOL=240`) is left untouched -- this only recognizes the four
-/// bounding-box tokens above.
-fn interpolate(template: &str, min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> String {
-    template
+fn format_temp(temp: f64) -> String {
+    if (temp - temp.round()).abs() < 1e-4 {
+        format!("{:.0}", temp.round())
+    } else {
+        format!("{temp:.1}")
+    }
+}
+
+/// Substitute template placeholders in start/end G-code:
+/// - `{print_min_x}`, `{print_min_y}`, `{print_max_x}`, `{print_max_y}`
+/// - `{bed_temperature}`, `{bed_temp}`, `{first_layer_bed_temperature}`
+/// - `{chamber_temperature}`, `{chamber_temp}`
+/// - `{first_used_tool}`, `{initial_tool}`, `{initial_extruder}`, `{first_used_extruder}`
+/// - `{first_used_tool_temperature}`, `{initial_tool_temperature}`, `{initial_extruder_temperature}`,
+///   `{nozzle_temperature}`, `{nozzle_temp}`, `{temperature}`, `{first_layer_temperature}`
+/// - Per-tool temperatures: `{temperature_0}`, `{temperature_1}`, `{temperature[0]}`, `{nozzle_temperature_0}`, ...
+fn interpolate(
+    template: &str,
+    bounds: (f64, f64, f64, f64),
+    config: &SlicerConfig,
+    machine: Option<&crate::machine::Machine>,
+    first_tool_id: crate::ids::ToolId,
+) -> String {
+    let (min_x, min_y, max_x, max_y) = bounds;
+    let mut res = template
         .replace("{print_min_x}", &format!("{min_x:.3}"))
         .replace("{print_min_y}", &format!("{min_y:.3}"))
         .replace("{print_max_x}", &format!("{max_x:.3}"))
-        .replace("{print_max_y}", &format!("{max_y:.3}"))
+        .replace("{print_max_y}", &format!("{max_y:.3}"));
+
+    let bed_temp_str = format_temp(config.bed_temperature());
+    res = res
+        .replace("{bed_temperature}", &bed_temp_str)
+        .replace("{bed_temp}", &bed_temp_str)
+        .replace("{first_layer_bed_temperature}", &bed_temp_str);
+
+    let chamber_temp_str = format_temp(config.chamber_temperature());
+    res = res
+        .replace("{chamber_temperature}", &chamber_temp_str)
+        .replace("{chamber_temp}", &chamber_temp_str);
+
+    let first_tool_id_str = first_tool_id.0.to_string();
+    res = res
+        .replace("{first_used_tool}", &first_tool_id_str)
+        .replace("{initial_tool}", &first_tool_id_str)
+        .replace("{first_used_extruder}", &first_tool_id_str)
+        .replace("{initial_extruder}", &first_tool_id_str);
+
+    let first_tool_temp = machine
+        .and_then(|m| m.tools.iter().find(|t| t.id == first_tool_id))
+        .map_or_else(
+            || config.default_nozzle_temperature(),
+            |t| t.nozzle_temperature(),
+        );
+    let first_tool_temp_str = format_temp(first_tool_temp);
+
+    res = res
+        .replace("{first_used_tool_temperature}", &first_tool_temp_str)
+        .replace("{initial_tool_temperature}", &first_tool_temp_str)
+        .replace("{initial_extruder_temperature}", &first_tool_temp_str)
+        .replace("{nozzle_temperature}", &first_tool_temp_str)
+        .replace("{nozzle_temp}", &first_tool_temp_str)
+        .replace("{temperature}", &first_tool_temp_str)
+        .replace("{first_layer_temperature}", &first_tool_temp_str);
+
+    if let Some(m) = machine {
+        for tool in &m.tools {
+            let idx = tool.id.0;
+            let temp_str = format_temp(tool.nozzle_temperature());
+            res = res
+                .replace(&format!("{{temperature_{idx}}}"), &temp_str)
+                .replace(&format!("{{temperature[{idx}]}}"), &temp_str)
+                .replace(&format!("{{nozzle_temperature_{idx}}}"), &temp_str)
+                .replace(&format!("{{nozzle_temperature[{idx}]}}"), &temp_str)
+                .replace(&format!("{{nozzle_temp_{idx}}}"), &temp_str)
+                .replace(&format!("{{nozzle_temp[{idx}]}}"), &temp_str);
+        }
+    } else {
+        let def_str = format_temp(config.default_nozzle_temperature());
+        for idx in 0..16 {
+            res = res
+                .replace(&format!("{{temperature_{idx}}}"), &def_str)
+                .replace(&format!("{{temperature[{idx}]}}"), &def_str)
+                .replace(&format!("{{nozzle_temperature_{idx}}}"), &def_str)
+                .replace(&format!("{{nozzle_temperature[{idx}]}}"), &def_str)
+                .replace(&format!("{{nozzle_temp_{idx}}}"), &def_str)
+                .replace(&format!("{{nozzle_temp[{idx}]}}"), &def_str);
+        }
+    }
+
+    res
 }
 
 /// XY bounding box of the first printed layer, identified by the minimum
@@ -155,7 +233,8 @@ pub fn emit_with_machine(
         out.push_str(&line);
         out.push('\n');
     }
-    let (min_x, min_y, max_x, max_y) = first_layer_xy_bounds(paths).unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let bounds = first_layer_xy_bounds(paths).unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let first_tool_id = paths.first().map_or(crate::ids::ToolId(0), |p| p.tool);
     let stats = crate::statistics::compute_print_statistics(paths, config, None);
     out.push_str(&format!("; estimated_time = {}\n", stats.formatted_time()));
     out.push_str(&format!(
@@ -170,10 +249,10 @@ pub fn emit_with_machine(
     if !config.start_gcode.is_empty() {
         out.push_str(&interpolate(
             &config.start_gcode,
-            min_x,
-            min_y,
-            max_x,
-            max_y,
+            bounds,
+            config,
+            machine,
+            first_tool_id,
         ));
         out.push('\n');
     }
@@ -451,7 +530,13 @@ pub fn emit_with_machine(
     }
 
     if !config.end_gcode.is_empty() {
-        out.push_str(&interpolate(&config.end_gcode, min_x, min_y, max_x, max_y));
+        out.push_str(&interpolate(
+            &config.end_gcode,
+            bounds,
+            config,
+            machine,
+            first_tool_id,
+        ));
         out.push('\n');
     }
 
@@ -940,14 +1025,54 @@ mod tests {
     fn interpolate_substitutes_all_four_bounding_box_placeholders() {
         let template =
             "PRINT_MIN={print_min_x},{print_min_y} PRINT_MAX={print_max_x},{print_max_y}";
-        let out = interpolate(template, 1.0, 2.5, 10.0, 20.25);
+        let config = SlicerConfig::default();
+        let out = interpolate(template, (1.0, 2.5, 10.0, 20.25), &config, None, ToolId(0));
         assert_eq!(out, "PRINT_MIN=1.000,2.500 PRINT_MAX=10.000,20.250");
     }
 
     #[test]
     fn interpolate_leaves_unrelated_braces_untouched() {
-        let out = interpolate("T_TOOL=240 T_BED=105", 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(out, "T_TOOL=240 T_BED=105");
+        let config = SlicerConfig::default();
+        let out = interpolate(
+            "CUSTOM_PARAM={my_custom_var}",
+            (0.0, 0.0, 0.0, 0.0),
+            &config,
+            None,
+            ToolId(0),
+        );
+        assert_eq!(out, "CUSTOM_PARAM={my_custom_var}");
+    }
+
+    #[test]
+    fn interpolate_substitutes_temperature_and_tool_placeholders() {
+        use crate::tool::Tool;
+        let config = SlicerConfig {
+            bed_temperature: Some(105.0),
+            chamber_temperature: Some(50.0),
+            default_nozzle_temperature: Some(250.0),
+            ..SlicerConfig::default()
+        };
+        let mut tool0 = Tool::new(ToolId(0), 0.4);
+        tool0.nozzle_temperature = Some(245.0);
+        let mut tool1 = Tool::new(ToolId(1), 0.6);
+        tool1.nozzle_temperature = Some(260.0);
+        let machine = crate::machine::Machine {
+            tools: vec![tool0, tool1],
+            ..crate::machine::Machine::default()
+        };
+
+        let template = "M190 S{bed_temperature}\nM141 S{chamber_temp}\nM109 T{first_used_tool} S{first_used_tool_temperature}\nM104 T0 S{temperature_0}\nM104 T1 S{temperature_1}";
+        let out = interpolate(
+            template,
+            (0.0, 0.0, 0.0, 0.0),
+            &config,
+            Some(&machine),
+            ToolId(1),
+        );
+        assert_eq!(
+            out,
+            "M190 S105\nM141 S50\nM109 T1 S260\nM104 T0 S245\nM104 T1 S260"
+        );
     }
 
     #[test]

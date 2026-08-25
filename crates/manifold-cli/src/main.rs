@@ -106,6 +106,18 @@ struct Cli {
     #[arg(long)]
     square_corner_velocity: Option<f64>,
 
+    /// Target nozzle temperature in °C.
+    #[arg(long)]
+    nozzle_temp: Option<f64>,
+
+    /// Target heated bed temperature in °C.
+    #[arg(long)]
+    bed_temp: Option<f64>,
+
+    /// Target heated chamber temperature in °C.
+    #[arg(long)]
+    chamber_temp: Option<f64>,
+
     /// Enable unified thermodynamic and non-Newtonian fluid dynamics model.
     #[arg(long)]
     fluid_dynamics: bool,
@@ -213,6 +225,9 @@ fn main() -> Result<()> {
         speed_deadband_percent: cli.speed_deadband,
         acceleration_deadband_percent: cli.acceleration_deadband,
         square_corner_velocity: cli.square_corner_velocity,
+        default_nozzle_temperature: cli.nozzle_temp,
+        bed_temperature: cli.bed_temp,
+        chamber_temperature: cli.chamber_temp,
         fluid_dynamics: if cli.fluid_dynamics || cli.static_retraction.is_some() {
             let mut cfg = manifold_core::fluid_dynamics::FluidDynamicsConfig::default();
             if let Some(sr) = cli.static_retraction {
@@ -233,7 +248,7 @@ fn main() -> Result<()> {
             min: DVec3::ZERO,
             max: DVec3::new(200.0, 200.0, 200.0),
         },
-        tools_for(&objects, cli.nozzle_diameter),
+        tools_for(&objects, cli.nozzle_diameter, cli.nozzle_temp),
     );
     manifold_core::object::center_on_bed(&mut objects, &machine.build_volume);
     machine.eikonal_slope_profile = eikonal_slope_profile;
@@ -263,13 +278,17 @@ fn parse_input_entry(entry: &str) -> Result<(std::path::PathBuf, ToolId)> {
 /// One `Tool` per distinct tool id referenced by `objects`, sorted by id,
 /// all sharing `nozzle_diameter` (per-tool nozzle diameters are a future
 /// follow-up — see `Cli::nozzle_diameter`).
-fn tools_for(objects: &[Object], nozzle_diameter: f64) -> Vec<Tool> {
+fn tools_for(objects: &[Object], nozzle_diameter: f64, nozzle_temp: Option<f64>) -> Vec<Tool> {
     let mut tool_ids: Vec<ToolId> = objects.iter().map(|object| object.tool).collect();
     tool_ids.sort();
     tool_ids.dedup();
     tool_ids
         .into_iter()
-        .map(|id| Tool::new(id, nozzle_diameter))
+        .map(|id| {
+            let mut tool = Tool::new(id, nozzle_diameter);
+            tool.nozzle_temperature = nozzle_temp;
+            tool
+        })
         .collect()
 }
 
@@ -341,13 +360,14 @@ mod tests {
             Object::new(ObjectId(2), manifold_core::mesh::Mesh::default(), ToolId(2)),
         ];
 
-        let tools = tools_for(&objects, 0.4);
+        let tools = tools_for(&objects, 0.4, Some(230.0));
 
         assert_eq!(
             tools.iter().map(|tool| tool.id).collect::<Vec<_>>(),
             vec![ToolId(0), ToolId(2)]
         );
         assert!(tools.iter().all(|tool| tool.nozzle_diameter == 0.4));
+        assert!(tools.iter().all(|tool| tool.nozzle_temperature() == 230.0));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! kinematics capability.
 
 use crate::{bounds::BoundingVolume, tool::Tool, transform::Transform};
+use glam::DVec3;
 
 /// Empty (unconstrained) default for [`Machine::eikonal_slope_profile`], used
 /// by `#[serde(default = ...)]` so machine profiles saved before this field
@@ -61,6 +62,18 @@ pub struct Machine {
     /// Hard upper bound on velocity (mm/s). Defaults to 75% of max_available_speed (750 mm/s).
     #[serde(default)]
     pub speed_limit: Option<f64>,
+}
+
+impl Default for Machine {
+    fn default() -> Self {
+        Self::new(
+            BoundingVolume::Aabb {
+                min: DVec3::ZERO,
+                max: DVec3::new(200.0, 200.0, 200.0),
+            },
+            vec![Tool::new(crate::ids::ToolId(0), 0.4)],
+        )
+    }
 }
 
 impl Machine {

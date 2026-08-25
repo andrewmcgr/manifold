@@ -26,6 +26,10 @@ pub struct Tool {
     /// than nominal when extruded) be tuned without touching the shared
     /// bead-area math. Defaults to `1.0` (no adjustment).
     pub extrusion_multiplier: f64,
+    /// Target nozzle/hotend temperature for this tool in °C.
+    /// Default: `240.0°C` when `None`.
+    #[serde(default)]
+    pub nozzle_temperature: Option<f64>,
 }
 
 impl Tool {
@@ -41,7 +45,14 @@ impl Tool {
                 radius: 0.0,
             },
             extrusion_multiplier: 1.0,
+            nozzle_temperature: None,
         }
+    }
+
+    /// Returns the target nozzle temperature in °C, defaulting to 240.0°C if unset.
+    #[must_use]
+    pub fn nozzle_temperature(&self) -> f64 {
+        self.nozzle_temperature.unwrap_or(240.0)
     }
 }
 

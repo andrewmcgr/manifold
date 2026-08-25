@@ -362,6 +362,15 @@ pub struct SlicerConfig {
     /// Klipper square corner velocity limit (mm/s), defaulting to 5.0 mm/s.
     #[serde(default)]
     pub square_corner_velocity: Option<f64>,
+    /// Default nozzle temperature (°C) when per-tool temperature is not set. Default: 240.0°C.
+    #[serde(default)]
+    pub default_nozzle_temperature: Option<f64>,
+    /// Heated bed target temperature (°C). Default: 60.0°C.
+    #[serde(default)]
+    pub bed_temperature: Option<f64>,
+    /// Heated chamber target temperature (°C). Default: 0.0°C (unheated).
+    #[serde(default)]
+    pub chamber_temperature: Option<f64>,
     /// Thermodynamic and non-Newtonian fluid dynamics configuration for dynamic pressure advance
     /// and adaptive retraction. When present, enables dynamic fluid state modeling.
     #[serde(default)]
@@ -506,6 +515,9 @@ impl Default for SlicerConfig {
             speed_deadband_percent: None,
             acceleration_deadband_percent: None,
             square_corner_velocity: None,
+            default_nozzle_temperature: None,
+            bed_temperature: None,
+            chamber_temperature: None,
             fluid_dynamics: None,
         }
     }
@@ -742,6 +754,24 @@ impl SlicerConfig {
         self.square_corner_velocity.unwrap_or(5.0).max(0.1)
     }
 
+    /// Returns the default nozzle temperature in °C, defaulting to 240.0°C.
+    #[must_use]
+    pub fn default_nozzle_temperature(&self) -> f64 {
+        self.default_nozzle_temperature.unwrap_or(240.0)
+    }
+
+    /// Returns the heated bed target temperature in °C, defaulting to 60.0°C.
+    #[must_use]
+    pub fn bed_temperature(&self) -> f64 {
+        self.bed_temperature.unwrap_or(60.0)
+    }
+
+    /// Returns the heated chamber target temperature in °C, defaulting to 0.0°C.
+    #[must_use]
+    pub fn chamber_temperature(&self) -> f64 {
+        self.chamber_temperature.unwrap_or(0.0)
+    }
+
     /// Returns whether the dynamic thermodynamic and non-Newtonian fluid dynamics model is enabled.
     #[must_use]
     pub fn use_fluid_dynamics(&self) -> bool {
@@ -751,8 +781,10 @@ impl SlicerConfig {
     /// Returns the resolved fluid dynamics engine, if configured.
     #[must_use]
     pub fn fluid_dynamics_engine(&self) -> Option<fluid_dynamics::FluidDynamicsEngine> {
-        self.fluid_dynamics
-            .map(fluid_dynamics::FluidDynamicsEngine::new)
+        self.fluid_dynamics.map(|mut cfg| {
+            cfg.heater_block_temp_c = self.default_nozzle_temperature();
+            fluid_dynamics::FluidDynamicsEngine::new(cfg)
+        })
     }
 }
 

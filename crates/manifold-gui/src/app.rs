@@ -700,6 +700,36 @@ impl ManifoldApp {
             }
         });
 
+        ui.collapsing("Temperatures", |ui| {
+            let mut def_nozzle = self.config.default_nozzle_temperature();
+            if ui
+                .add(
+                    egui::Slider::new(&mut def_nozzle, 150.0..=350.0)
+                        .text("Default nozzle temp (°C)"),
+                )
+                .changed()
+            {
+                self.config.default_nozzle_temperature = Some(def_nozzle);
+            }
+            let mut bed_temp = self.config.bed_temperature();
+            if ui
+                .add(egui::Slider::new(&mut bed_temp, 0.0..=150.0).text("Bed temperature (°C)"))
+                .changed()
+            {
+                self.config.bed_temperature = Some(bed_temp);
+            }
+            let mut chamber_temp = self.config.chamber_temperature();
+            if ui
+                .add(
+                    egui::Slider::new(&mut chamber_temp, 0.0..=100.0)
+                        .text("Chamber temperature (°C)"),
+                )
+                .changed()
+            {
+                self.config.chamber_temperature = Some(chamber_temp);
+            }
+        });
+
         ui.collapsing("Wave Overhangs", |ui| {
             ui.checkbox(
                 &mut self.config.wave_overhangs_enabled,
@@ -798,10 +828,6 @@ impl ManifoldApp {
                     ui.add(
                         egui::Slider::new(&mut fluid_cfg.static_retraction_mm, 0.05..=1.0)
                             .text("Static break distance (mm)"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut fluid_cfg.heater_block_temp_c, 170.0..=350.0)
-                            .text("Hotend temp (°C)"),
                     );
                     ui.add(
                         egui::Slider::new(&mut fluid_cfg.max_fan_temp_drop_c, 0.0..=25.0)
@@ -1367,22 +1393,44 @@ impl ManifoldApp {
                 .clone();
             self.uploaded_scene = Arc::new(Self::build_scene(&device, &self.machine));
         }
-        if let Some(tool) = self.machine.tools.first_mut() {
-            ui.add(
-                egui::Slider::new(&mut tool.nozzle_diameter, 0.1..=1.5)
-                    .text("Tool 0 nozzle diameter (mm)"),
-            );
-            ui.add(
-                egui::Slider::new(&mut tool.extrusion_multiplier, 0.5..=1.5)
-                    .text("Tool 0 extrusion multiplier"),
-            );
-        }
-        if ui.button("Add tool").clicked() {
-            self.machine
-                .tools
-                .push(Tool::new(ToolId(self.next_tool_id), 0.4));
-            self.next_tool_id += 1;
-        }
+        ui.collapsing("Tools & Nozzles", |ui| {
+            let mut remove_idx = None;
+            let num_tools = self.machine.tools.len();
+            for (i, tool) in self.machine.tools.iter_mut().enumerate() {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Tool {}", tool.id.0));
+                        if num_tools > 1 && ui.button("Remove").clicked() {
+                            remove_idx = Some(i);
+                        }
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut tool.nozzle_diameter, 0.1..=1.5)
+                            .text("Nozzle diameter (mm)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut tool.extrusion_multiplier, 0.5..=1.5)
+                            .text("Extrusion multiplier"),
+                    );
+                    let mut temp = tool.nozzle_temperature();
+                    if ui
+                        .add(egui::Slider::new(&mut temp, 150.0..=350.0).text("Nozzle temp (°C)"))
+                        .changed()
+                    {
+                        tool.nozzle_temperature = Some(temp);
+                    }
+                });
+            }
+            if let Some(idx) = remove_idx {
+                self.machine.tools.remove(idx);
+            }
+            if ui.button("Add tool").clicked() {
+                let mut new_tool = Tool::new(ToolId(self.next_tool_id), 0.4);
+                new_tool.nozzle_temperature = Some(self.config.default_nozzle_temperature());
+                self.machine.tools.push(new_tool);
+                self.next_tool_id += 1;
+            }
+        });
 
         ui.checkbox(
             &mut self.machine.use_stepper_dynamics,
@@ -1439,7 +1487,7 @@ impl ManifoldApp {
                 egui::TextEdit::multiline(&mut self.config.start_gcode)
                     .desired_rows(3)
                     .code_editor()
-                    .hint_text("e.g. PRINT_START T_TOOL=240 T_BED=105 T_CHAMBER=45 PRINT_MIN={print_min_x},{print_min_y} PRINT_MAX={print_max_x},{print_max_y}"),
+                    .hint_text("e.g. PRINT_START EXTRUDER={first_used_tool_temperature} BED={bed_temperature} CHAMBER={chamber_temperature} PRINT_MIN={print_min_x},{print_min_y} PRINT_MAX={print_max_x},{print_max_y}"),
             );
             ui.label("End Gcode");
             ui.add(
@@ -1449,8 +1497,11 @@ impl ManifoldApp {
                     .hint_text("e.g. PRINT_END"),
             );
             ui.label(
-                "Placeholders: {print_min_x} {print_min_y} {print_max_x} {print_max_y} \
-                 (first layer's XY bounding box, substituted at slice time).",
+                "Placeholders:\n\
+                 • Bounding Box: {print_min_x} {print_min_y} {print_max_x} {print_max_y}\n\
+                 • Temperatures: {bed_temperature} {chamber_temperature}\n\
+                 • First Tool: {first_used_tool} {first_used_tool_temperature} (or {nozzle_temperature})\n\
+                 • Per-Tool: {temperature_0} {temperature_1} {nozzle_temperature_0}",
             );
         });
 
