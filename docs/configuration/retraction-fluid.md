@@ -25,7 +25,7 @@ Manifold provides advanced extrusion control including perimeter wipe moves, non
 
 - **Non-Planar Scarf Joint Seams (`scarf_joint_enabled`)**: Over the configured `scarf_joint_length` ($3.0\text{ mm}$), the lead-in segment ramps extrusion flow from $0 \to 100\%$. After traversing the closed loop, the nozzle continues for an overlapping $3.0\text{ mm}$ tail ramping flow from $100\% \to 0$, eliminating vertical seam lines.
 - **Wipe Moves (`wipe_enabled`)**: Appends an unextruded nozzle move along the perimeter/interior before travel lifts to break the capillary droplet bridge.
-- **Two-Line-Width Travel Clearance**: Travel moves automatically enforce $2 \times \text{line\_width}$ ($0.8\text{ mm}$) clearance from printed material, departing and arriving along surface normals into open air.
+- **Two-Line-Width Travel Clearance**: Travel moves automatically enforce $2 \times \text{line width}$ ($0.8\text{ mm}$) clearance from printed material, departing and arriving along surface normals into open air.
 
 ---
 
@@ -51,12 +51,12 @@ Manifold provides advanced extrusion control including perimeter wipe moves, non
 ### 1. 2-Point Power-Law Calibration (Shear Thinning)
 Non-Newtonian polymer melt viscosity drops under higher shear strain rates:
 
-$$\alpha = -\frac{\ln(C_{\text{PA\_high}}) - \ln(C_{\text{PA\_low}})}{\ln(Q_{\text{high}}) - \ln(Q_{\text{low}})}, \quad C_{\text{PA}}(Q) = C_{\text{PA\_zero}} \cdot Q^{-\alpha}$$
+$$\alpha = -\frac{\ln(C_{\text{PA,high}}) - \ln(C_{\text{PA,low}})}{\ln(Q_{\text{high}}) - \ln(Q_{\text{low}})}, \quad C_{\text{PA}}(Q) = C_{\text{PA,zero}} \cdot Q^{-\alpha}$$
 
 ### 2. Forced Convective Tip Cooling & Arrhenius Viscosity
 Cooling fan air stream drops effective polymer tip temperature:
 
-$$T_{\text{effective}} = T_{\text{block}} - \Delta T_{\text{max\_fan}} \cdot F^{0.6}, \quad C_{\text{PA\_dynamic}} = C_{\text{PA}}(Q) \cdot e^{-0.02 \cdot (T_{\text{effective}} - T_{\text{ref}})}$$
+$$T_{\text{effective}} = T_{\text{block}} - \Delta T_{\text{max,fan}} \cdot F^{0.6}, \quad C_{\text{PA,dynamic}} = C_{\text{PA}}(Q) \cdot e^{-0.02 \cdot (T_{\text{effective}} - T_{\text{ref}})}$$
 
 ### 3. Adaptive Junction-Velocity Retraction ($L_{\text{retract}}$)
 Elastic melt-zone pressure is relieved using filament feed velocity:
@@ -66,4 +66,4 @@ $$L_{\text{retract}} = C_{\text{PA}} \cdot \left(\frac{Q_{\text{exit}}}{A_{\text
 ### 4. Time-Dependent Thermal Ooze Recovery ($L_{\text{unretract}}$)
 Over travel duration $t_{\text{travel}}$, re-primes oozed polymer:
 
-$$L_{\text{unretract}} = L_{\text{retract}} + L_{\text{max\_ooze}} \cdot \left(1 - e^{-t_{\text{travel}} / \tau}\right)$$
+$$L_{\text{unretract}} = L_{\text{retract}} + L_{\text{max,ooze}} \cdot \left(1 - e^{-t_{\text{travel}} / \tau}\right)$$

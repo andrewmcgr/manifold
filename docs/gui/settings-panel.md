@@ -50,8 +50,8 @@ The left sidebar in `manifold-gui` organizes slicing and machine parameters into
 ## 6. Retraction & Seams
 - **Use Dynamic Fluid Model**: Toggles the 2-point power-law non-Newtonian pressure advance and adaptive fluid retraction engine.
   - *When enabled*:
-    - **Low-Flow PA & Q**: Calibration point $(C_{\text{PA\_low}}, Q_{\text{low}})$.
-    - **High-Flow PA & Q**: Calibration point $(C_{\text{PA\_high}}, Q_{\text{high}})$.
+    - **Low-Flow PA & Q**: Calibration point $(C_{\text{PA,low}}, Q_{\text{low}})$.
+    - **High-Flow PA & Q**: Calibration point $(C_{\text{PA,high}}, Q_{\text{high}})$.
     - **Static Break Distance (mm)**: Direct mechanical pull distance to snap capillary droplet bridge.
     - **Max Fan Temp Drop (°C)**: Maximum tip cooling drop under 100% fan.
     - **Ooze Time Constant $\tau$ (s)**: Asymptotic ooze rate.

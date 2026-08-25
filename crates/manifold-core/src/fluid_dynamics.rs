@@ -59,7 +59,7 @@ pub struct FluidDynamicsEngine {
     config: FluidDynamicsConfig,
     /// Non-Newtonian shear sensitivity exponent $\alpha$.
     alpha: f64,
-    /// Zero-flow baseline pressure advance coefficient $C_{\text{PA\_zero}}$.
+    /// Zero-flow baseline pressure advance coefficient $C_{\text{PA,zero}}$.
     c_pa_zero: f64,
 }
 
@@ -109,7 +109,7 @@ impl FluidDynamicsEngine {
     /// Evaluates dynamic pressure advance coefficient for a given volumetric flow rate $Q$ (mm³/s)
     /// and part cooling fan speed fraction $F \in [0.0, 1.0]$.
     ///
-    /// $$C_{\text{PA\_dynamic}} = C_{\text{PA\_zero}} \cdot Q^{-\alpha} \cdot e^{-0.02 \cdot \Delta T}$$
+    /// $$C_{\text{PA,dynamic}} = C_{\text{PA,zero}} \cdot Q^{-\alpha} \cdot e^{-0.02 \cdot \Delta T}$$
     #[must_use]
     pub fn dynamic_pressure_advance(&self, flow_rate_q: f64, fan_speed_fraction: f64) -> f64 {
         let q = flow_rate_q.max(0.01);
@@ -119,7 +119,7 @@ impl FluidDynamicsEngine {
     }
 
     /// Evaluates adaptive retraction distance $L_{\text{residual}}$ (mm) at a path stop
-    /// given the dynamic PA value and extruder filament exit velocity $v_{\text{filament\_exit}} = Q / A_{\text{filament}}$ (mm/s).
+    /// given the dynamic PA value and extruder filament exit velocity $v_{\text{filament}} = Q / A_{\text{filament}}$ (mm/s).
     ///
     /// $$L_{\text{residual}} = C_{\text{PA}} \cdot v_{\text{filament}} + L_{\text{static}} = C_{\text{PA}} \cdot \left(\frac{Q}{A_{\text{filament}}}\right) + L_{\text{static}}$$
     #[must_use]
@@ -132,10 +132,10 @@ impl FluidDynamicsEngine {
         )
     }
 
-    /// Evaluates extra prime length $L_{\text{extra\_prime}}$ (mm) to compensate for thermal ooze
+    /// Evaluates extra prime length $L_{\text{extra,prime}}$ (mm) to compensate for thermal ooze
     /// accumulated during travel duration $t_{\text{travel}}$ (seconds) at fan speed fraction $F$.
     ///
-    /// $$L_{\text{extra\_prime}} = L_{\text{max\_scaled}} \cdot \left(1 - e^{-t_{\text{travel}} / \tau_{\text{scaled}}}\right)$$
+    /// $$L_{\text{extra,prime}} = L_{\text{max,scaled}} \cdot \left(1 - e^{-t_{\text{travel}} / \tau_{\text{scaled}}}\right)$$
     #[must_use]
     pub fn extra_prime_length(&self, travel_time_s: f64, fan_speed_fraction: f64) -> f64 {
         if travel_time_s <= 1e-4 {

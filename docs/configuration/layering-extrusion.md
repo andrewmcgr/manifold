@@ -9,7 +9,7 @@ This section describes all slicing parameters governing layer heights, perimeter
 | Key in JSON | Type | Default | Description |
 |---|---|---|---|
 | `layer_height` | `f64` | `0.20` | Nominal non-planar layer thickness in mm. |
-| `first_layer_height` | `Option<f64>` | `layer_height` | Dedicated thickness for the bed contact layer (e.g. `0.25 mm`). Slicing starts at $\text{order}_{\text{min}} + \text{first\_layer\_height}$. |
+| `first_layer_height` | `Option<f64>` | `layer_height` | Dedicated thickness for the bed contact layer (e.g. `0.25 mm`). Slicing starts at `order_min + first_layer_height`. |
 | `solid_layers_top` | `usize` | `3` | Count of solid shell layers covering upward-exposed regions. |
 | `solid_layers_bottom` | `usize` | `3` | Count of solid shell layers covering downward-exposed overhangs. |
 
