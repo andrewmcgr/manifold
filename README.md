@@ -11,6 +11,15 @@ layers.
 - `crates/manifold-cli` — CLI front-end (`manifold`) for headless/batch use.
 - `crates/manifold-gui` — desktop GUI (egui + wgpu) for interactive use.
 
+## Documentation
+
+Complete documentation is available in the [`docs/`](docs/index.md) directory:
+
+- [Getting Started](docs/getting-started.md) — System requirements, build instructions, and quickstart workflows.
+- [CLI Reference](docs/cli.md) — Command line options, multi-tool syntax, and batch scripting.
+- [GUI User Guide](docs/gui/index.md) — Viewport navigation, settings panel, data views, and custom G-code macros.
+- [Configuration & Profile Reference](docs/configuration/index.md) — Full reference for all parameters in `profile.json`.
+
 ## Building
 
 ```sh
