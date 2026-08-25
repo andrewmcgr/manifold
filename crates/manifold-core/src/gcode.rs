@@ -217,7 +217,7 @@ pub fn emit_with_machine(
     let mut current_accel: Option<f64> = None;
     let mut current_pa: Option<f64> = None;
     let mut last_move_kind: Option<MoveKind> = None;
-    let mut last_extruding_speed_mm_s: f64 = 0.0;
+    let mut last_extruding_flow_q: f64 = 0.0;
     let mut last_retraction_len: f64 = config.retraction_length();
     let mut accumulated_travel_time_s: f64 = 0.0;
     let mut retracted = true;
@@ -334,7 +334,9 @@ pub fn emit_with_machine(
                             let pa_val = current_pa.unwrap_or_else(|| {
                                 engine.dynamic_pressure_advance(5.0, fan_fraction)
                             });
-                            engine.retraction_length(pa_val, last_extruding_speed_mm_s)
+                            let filament_velocity =
+                                (last_extruding_flow_q / filament_area).max(0.0);
+                            engine.retraction_length(pa_val, filament_velocity)
                         } else {
                             config.retraction_length()
                         };
@@ -366,7 +368,6 @@ pub fn emit_with_machine(
                     }
                     retracted = false;
                 }
-                last_extruding_speed_mm_s = actual_speed_mm_s;
             }
 
             // Dynamic pressure advance update for extruding moves
@@ -388,12 +389,14 @@ pub fn emit_with_machine(
                     let target_pa = engine.dynamic_pressure_advance(flow_rate_q, fan_fraction);
                     let pa_deadband = engine.config().pa_deadband;
                     let should_emit_pa = current_pa.is_none_or(|active| {
-                        (target_pa - active).abs() / active.max(0.001) >= pa_deadband
+                        (last_move_kind != Some(move_kind) || i <= 1)
+                            && (target_pa - active).abs() / active.max(0.001) >= pa_deadband
                     });
                     if should_emit_pa {
                         out.push_str(&format!("SET_PRESSURE_ADVANCE ADVANCE={target_pa:.4}\n"));
                         current_pa = Some(target_pa);
                     }
+                    last_extruding_flow_q = flow_rate_q;
                 }
             } else {
                 // Accumulate travel time during non-extruding moves

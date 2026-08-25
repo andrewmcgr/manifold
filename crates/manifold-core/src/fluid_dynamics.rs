@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// Thermodynamic and non-Newtonian material configuration for fluid-driven pressure advance
 /// and adaptive retraction.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FluidDynamicsConfig {
     /// Low-flow calibration point: (pressure advance in seconds, volumetric flow rate in mm³/s).
     /// Default: `(0.045 s, 2.0 mm³/s)`.
@@ -28,6 +29,8 @@ pub struct FluidDynamicsConfig {
     /// Static mechanical retraction distance to break surface tension at path stop in mm.
     /// Default: `0.15 mm`.
     pub static_retraction_mm: f64,
+    /// Maximum safe retraction length in mm under dynamic fluid model. Default: `1.5 mm`.
+    pub max_retraction_mm: f64,
     /// Deadband fraction for pressure advance updates (e.g. `0.10` for 10% change).
     /// Default: `0.10`.
     pub pa_deadband: f64,
@@ -44,6 +47,7 @@ impl Default for FluidDynamicsConfig {
             ooze_time_constant_ref_s: 1.5,
             ooze_max_length_ref_mm: 0.30,
             static_retraction_mm: 0.15,
+            max_retraction_mm: 1.5,
             pa_deadband: 0.10,
         }
     }
@@ -115,14 +119,17 @@ impl FluidDynamicsEngine {
     }
 
     /// Evaluates adaptive retraction distance $L_{\text{residual}}$ (mm) at a path stop
-    /// given the dynamic PA value and toolhead exit velocity $v_{\text{end}}$ (mm/s).
+    /// given the dynamic PA value and extruder filament exit velocity $v_{\text{filament\_exit}} = Q / A_{\text{filament}}$ (mm/s).
     ///
-    /// $$L_{\text{residual}} = (C_{\text{PA\_dynamic}} \cdot v_{\text{end}}) + L_{\text{static}}$$
+    /// $$L_{\text{residual}} = C_{\text{PA}} \cdot v_{\text{filament}} + L_{\text{static}} = C_{\text{PA}} \cdot \left(\frac{Q}{A_{\text{filament}}}\right) + L_{\text{static}}$$
     #[must_use]
-    pub fn retraction_length(&self, dynamic_pa: f64, exit_velocity_mm_s: f64) -> f64 {
-        let v = exit_velocity_mm_s.max(0.0);
+    pub fn retraction_length(&self, dynamic_pa: f64, filament_velocity_mm_s: f64) -> f64 {
+        let v = filament_velocity_mm_s.max(0.0);
         let l_residual = (dynamic_pa * v) + self.config.static_retraction_mm;
-        l_residual.clamp(self.config.static_retraction_mm * 0.5, 5.0)
+        l_residual.clamp(
+            self.config.static_retraction_mm * 0.5,
+            self.config.max_retraction_mm,
+        )
     }
 
     /// Evaluates extra prime length $L_{\text{extra\_prime}}$ (mm) to compensate for thermal ooze
@@ -210,16 +217,17 @@ mod tests {
     fn retraction_scales_with_junction_velocity() {
         let config = FluidDynamicsConfig {
             static_retraction_mm: 0.15,
+            max_retraction_mm: 1.5,
             ..Default::default()
         };
         let engine = FluidDynamicsEngine::new(config);
 
         let r_zero_v = engine.retraction_length(0.035, 0.0);
-        let r_slow_v = engine.retraction_length(0.035, 20.0);
-        let r_fast_v = engine.retraction_length(0.035, 150.0);
+        let r_slow_v = engine.retraction_length(0.035, 2.0);
+        let r_fast_v = engine.retraction_length(0.035, 10.0);
 
         assert_eq!(r_zero_v, 0.15);
-        assert!((r_slow_v - (0.15 + 0.035 * 20.0)).abs() < 1e-5);
+        assert!((r_slow_v - (0.15 + 0.035 * 2.0)).abs() < 1e-5);
         assert!(r_fast_v > r_slow_v);
     }
 
@@ -240,5 +248,18 @@ mod tests {
         assert!(prime_short > 0.0);
         assert!(prime_long > prime_short);
         assert!((prime_long - 0.40).abs() < 0.01);
+    }
+
+    #[test]
+    fn deserialization_fills_missing_fields_from_defaults() {
+        let json = r#"{
+            "pa_calibration_low": [0.040, 2.0],
+            "pa_calibration_high": [0.025, 12.0]
+        }"#;
+        let config: FluidDynamicsConfig =
+            serde_json::from_str(json).expect("deserialization with missing fields must succeed");
+        assert_eq!(config.pa_calibration_low, (0.040, 2.0));
+        assert_eq!(config.max_retraction_mm, 1.5);
+        assert_eq!(config.static_retraction_mm, 0.15);
     }
 }
