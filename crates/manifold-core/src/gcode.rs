@@ -186,7 +186,7 @@ pub fn emit_with_machine(
     out.push_str("M83\n");
 
     if let Some(pa) = config.pressure_advance {
-        if pa > 0.0 {
+        if pa > 0.0 && !config.use_fluid_dynamics() {
             out.push_str(&format!("SET_PRESSURE_ADVANCE ADVANCE={pa:.4}\n"));
         }
     }
@@ -215,11 +215,17 @@ pub fn emit_with_machine(
     let mut current_tool = None;
     let mut current_f: Option<f64> = None;
     let mut current_accel: Option<f64> = None;
+    let mut current_pa: Option<f64> = None;
     let mut last_move_kind: Option<MoveKind> = None;
+    let mut last_extruding_speed_mm_s: f64 = 0.0;
+    let mut last_retraction_len: f64 = config.retraction_length();
+    let mut accumulated_travel_time_s: f64 = 0.0;
     let mut retracted = true;
     let motion_model = config.resolved_motion_model(machine);
     let speed_deadband = config.speed_deadband_percent() / 100.0;
     let accel_deadband = config.acceleration_deadband_percent() / 100.0;
+    let fluid_engine = config.fluid_dynamics_engine();
+    let filament_area = std::f64::consts::PI * (config.filament_diameter / 2.0).powi(2);
 
     let min_order = paths
         .iter()
@@ -313,32 +319,101 @@ pub fn emit_with_machine(
                 current_fan_pwm = Some(target_fan_pwm);
             }
 
+            let fan_fraction = (target_fan_pwm as f64) / 255.0;
+
             // Retract before travel moves:
             // 1. If starting a new path (i == 0) and currently unretracted, retract before the G0 positioning move.
             // 2. If entering an in-path Travel segment, retract before the move.
             // Unretract before resuming an extruding move.
             if !extruding {
                 if !retracted {
-                    if config.use_firmware_retraction {
+                    if config.use_firmware_retraction && !config.use_fluid_dynamics() {
                         out.push_str("G10\n");
                     } else {
-                        let r_len = config.retraction_length();
+                        let r_len = if let Some(ref engine) = fluid_engine {
+                            let pa_val = current_pa.unwrap_or_else(|| {
+                                engine.dynamic_pressure_advance(5.0, fan_fraction)
+                            });
+                            engine.retraction_length(pa_val, last_extruding_speed_mm_s)
+                        } else {
+                            config.retraction_length()
+                        };
                         let r_spd = config.retraction_speed();
                         out.push_str(&format!("G1 E-{r_len:.5} F{r_spd:.0}\n"));
                         current_f = Some(r_spd);
+                        last_retraction_len = r_len;
+                        accumulated_travel_time_s = 0.0;
                     }
                     retracted = true;
                 }
-            } else if retracted {
-                if config.use_firmware_retraction {
-                    out.push_str("G11\n");
-                } else {
-                    let u_len = config.retraction_length() + config.unretract_extra_length();
-                    let u_spd = config.unretract_speed();
-                    out.push_str(&format!("G1 E{u_len:.5} F{u_spd:.0}\n"));
-                    current_f = Some(u_spd);
+            } else {
+                if retracted {
+                    if config.use_firmware_retraction && !config.use_fluid_dynamics() {
+                        out.push_str("G11\n");
+                    } else {
+                        let u_len = if let Some(ref engine) = fluid_engine {
+                            engine.unretract_length(
+                                last_retraction_len,
+                                accumulated_travel_time_s,
+                                fan_fraction,
+                            )
+                        } else {
+                            config.retraction_length() + config.unretract_extra_length()
+                        };
+                        let u_spd = config.unretract_speed();
+                        out.push_str(&format!("G1 E{u_len:.5} F{u_spd:.0}\n"));
+                        current_f = Some(u_spd);
+                    }
+                    retracted = false;
                 }
-                retracted = false;
+                last_extruding_speed_mm_s = actual_speed_mm_s;
+            }
+
+            // Dynamic pressure advance update for extruding moves
+            if extruding {
+                if let Some(ref engine) = fluid_engine {
+                    let duration_s = if i > 0 {
+                        profiles
+                            .get(i - 1)
+                            .map_or(0.05, |prof| prof.duration_seconds)
+                    } else {
+                        0.05
+                    };
+                    let delta_e = incoming_segment.map_or(0.0, |s| s.extrusion_length);
+                    let flow_rate_q = if duration_s > 1e-4 && delta_e > 0.0 {
+                        (delta_e * filament_area) / duration_s
+                    } else {
+                        actual_speed_mm_s * config.layer_height * config.wall_line_width
+                    };
+                    let target_pa = engine.dynamic_pressure_advance(flow_rate_q, fan_fraction);
+                    let pa_deadband = engine.config().pa_deadband;
+                    let should_emit_pa = current_pa.is_none_or(|active| {
+                        (target_pa - active).abs() / active.max(0.001) >= pa_deadband
+                    });
+                    if should_emit_pa {
+                        out.push_str(&format!("SET_PRESSURE_ADVANCE ADVANCE={target_pa:.4}\n"));
+                        current_pa = Some(target_pa);
+                    }
+                }
+            } else {
+                // Accumulate travel time during non-extruding moves
+                let travel_dur = if i > 0 {
+                    profiles.get(i - 1).map_or_else(
+                        || {
+                            if let Some(prev) = last_pos {
+                                prev.distance(*p) / (move_speed / 60.0).max(1.0)
+                            } else {
+                                0.0
+                            }
+                        },
+                        |prof| prof.duration_seconds,
+                    )
+                } else if let Some(prev) = last_pos {
+                    prev.distance(*p) / (move_speed / 60.0).max(1.0)
+                } else {
+                    0.0
+                };
+                accumulated_travel_time_s += travel_dur;
             }
 
             let cmd = if !extruding { "G0" } else { "G1" };
@@ -1211,5 +1286,57 @@ mod tests {
         // Only one SET_VELOCITY_LIMIT ACCEL=2500 for the outer wall pass, not 3
         let accel_count = out.matches("SET_VELOCITY_LIMIT ACCEL=2500").count();
         assert_eq!(accel_count, 1);
+    }
+
+    #[test]
+    fn emit_dynamic_fluid_model_emits_dynamic_pa_and_adaptive_retraction() {
+        use crate::fluid_dynamics::FluidDynamicsConfig;
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        let path1 = Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.2), DVec3::new(20.0, 0.0, 0.2)],
+            segments: vec![Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 1.0,
+                speed: 6000.0, // 100 mm/s
+                order: 0.2,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+        };
+
+        let path2 = Path {
+            points: vec![DVec3::new(50.0, 50.0, 0.2), DVec3::new(70.0, 50.0, 0.2)],
+            segments: vec![Segment {
+                kind: MoveKind::Infill,
+                extrusion_length: 1.0,
+                speed: 12000.0, // 200 mm/s
+                order: 0.2,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            fluid_dynamics: Some(FluidDynamicsConfig {
+                pa_calibration_low: (0.045, 2.0),
+                pa_calibration_high: (0.025, 15.0),
+                static_retraction_mm: 0.15,
+                ..Default::default()
+            }),
+            retraction_speed: Some(3600.0),
+            unretract_speed: Some(2400.0),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&[path1, path2], &config);
+
+        // Dynamic SET_PRESSURE_ADVANCE is emitted
+        assert!(out.contains("SET_PRESSURE_ADVANCE ADVANCE="));
+        // Adaptive G1 E negative retraction is emitted before travel
+        assert!(out.contains("G1 E-"));
+        // Adaptive unretract is emitted before path 2
+        assert!(out.contains("G1 E0."));
     }
 }

@@ -105,6 +105,14 @@ struct Cli {
     /// Klipper square corner velocity limit (mm/s).
     #[arg(long)]
     square_corner_velocity: Option<f64>,
+
+    /// Enable unified thermodynamic and non-Newtonian fluid dynamics model.
+    #[arg(long)]
+    fluid_dynamics: bool,
+
+    /// Static mechanical retraction distance (mm) when fluid dynamics model is enabled.
+    #[arg(long)]
+    static_retraction: Option<f64>,
 }
 
 /// Parses a `--eikonal-slope-profile` argument of comma-separated
@@ -205,6 +213,15 @@ fn main() -> Result<()> {
         speed_deadband_percent: cli.speed_deadband,
         acceleration_deadband_percent: cli.acceleration_deadband,
         square_corner_velocity: cli.square_corner_velocity,
+        fluid_dynamics: if cli.fluid_dynamics || cli.static_retraction.is_some() {
+            let mut cfg = manifold_core::fluid_dynamics::FluidDynamicsConfig::default();
+            if let Some(sr) = cli.static_retraction {
+                cfg.static_retraction_mm = sr;
+            }
+            Some(cfg)
+        } else {
+            None
+        },
         sparse_infill_pattern: cli.sparse_infill_pattern.map(Into::into),
         solid_infill_pattern: cli.solid_infill_pattern.map(Into::into),
         infill_pattern: cli.infill_pattern.into(),

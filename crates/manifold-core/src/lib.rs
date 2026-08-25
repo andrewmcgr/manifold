@@ -7,6 +7,7 @@
 pub mod bounds;
 pub mod error;
 pub mod extrusion;
+pub mod fluid_dynamics;
 pub mod gcode;
 pub mod ids;
 pub mod infill;
@@ -361,6 +362,10 @@ pub struct SlicerConfig {
     /// Klipper square corner velocity limit (mm/s), defaulting to 5.0 mm/s.
     #[serde(default)]
     pub square_corner_velocity: Option<f64>,
+    /// Thermodynamic and non-Newtonian fluid dynamics configuration for dynamic pressure advance
+    /// and adaptive retraction. When present, enables dynamic fluid state modeling.
+    #[serde(default)]
+    pub fluid_dynamics: Option<fluid_dynamics::FluidDynamicsConfig>,
 }
 
 /// Static serde-deserialize fallback for [`SlicerConfig::wave_overhangs_enabled`]: `true`.
@@ -501,6 +506,7 @@ impl Default for SlicerConfig {
             speed_deadband_percent: None,
             acceleration_deadband_percent: None,
             square_corner_velocity: None,
+            fluid_dynamics: None,
         }
     }
 }
@@ -734,6 +740,19 @@ impl SlicerConfig {
     #[must_use]
     pub fn square_corner_velocity(&self) -> f64 {
         self.square_corner_velocity.unwrap_or(5.0).max(0.1)
+    }
+
+    /// Returns whether the dynamic thermodynamic and non-Newtonian fluid dynamics model is enabled.
+    #[must_use]
+    pub fn use_fluid_dynamics(&self) -> bool {
+        self.fluid_dynamics.is_some()
+    }
+
+    /// Returns the resolved fluid dynamics engine, if configured.
+    #[must_use]
+    pub fn fluid_dynamics_engine(&self) -> Option<fluid_dynamics::FluidDynamicsEngine> {
+        self.fluid_dynamics
+            .map(fluid_dynamics::FluidDynamicsEngine::new)
     }
 }
 

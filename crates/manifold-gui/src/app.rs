@@ -743,13 +743,124 @@ impl ManifoldApp {
         });
 
         ui.collapsing("Retraction & Seams", |ui| {
-            let mut r_len = self.config.retraction_length();
+            let mut use_fluid = self.config.use_fluid_dynamics();
             if ui
-                .add(egui::Slider::new(&mut r_len, 0.0..=10.0).text("Retraction distance (mm)"))
+                .checkbox(
+                    &mut use_fluid,
+                    "Use dynamic fluid model (adaptive PA & retraction)",
+                )
                 .changed()
             {
-                self.config.retraction_length = Some(r_len);
+                if use_fluid {
+                    self.config.fluid_dynamics =
+                        Some(manifold_core::fluid_dynamics::FluidDynamicsConfig::default());
+                    self.config.use_firmware_retraction = false;
+                } else {
+                    self.config.fluid_dynamics = None;
+                }
             }
+
+            if let Some(ref mut fluid_cfg) = self.config.fluid_dynamics {
+                ui.collapsing("Fluid Dynamics Parameters", |ui| {
+                    ui.label("2-Point Pressure Advance Calibration:");
+                    let mut pa_low = fluid_cfg.pa_calibration_low.0;
+                    let mut q_low = fluid_cfg.pa_calibration_low.1;
+                    if ui
+                        .add(egui::Slider::new(&mut pa_low, 0.005..=0.20).text("Low-flow PA (s)"))
+                        .changed()
+                    {
+                        fluid_cfg.pa_calibration_low.0 = pa_low;
+                    }
+                    if ui
+                        .add(egui::Slider::new(&mut q_low, 0.5..=10.0).text("Low-flow Q (mm³/s)"))
+                        .changed()
+                    {
+                        fluid_cfg.pa_calibration_low.1 = q_low;
+                    }
+
+                    let mut pa_high = fluid_cfg.pa_calibration_high.0;
+                    let mut q_high = fluid_cfg.pa_calibration_high.1;
+                    if ui
+                        .add(egui::Slider::new(&mut pa_high, 0.005..=0.20).text("High-flow PA (s)"))
+                        .changed()
+                    {
+                        fluid_cfg.pa_calibration_high.0 = pa_high;
+                    }
+                    if ui
+                        .add(egui::Slider::new(&mut q_high, 5.0..=50.0).text("High-flow Q (mm³/s)"))
+                        .changed()
+                    {
+                        fluid_cfg.pa_calibration_high.1 = q_high;
+                    }
+
+                    ui.separator();
+                    ui.label("Thermal & Ooze Parameters:");
+                    ui.add(
+                        egui::Slider::new(&mut fluid_cfg.static_retraction_mm, 0.05..=1.0)
+                            .text("Static break distance (mm)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut fluid_cfg.heater_block_temp_c, 170.0..=350.0)
+                            .text("Hotend temp (°C)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut fluid_cfg.max_fan_temp_drop_c, 0.0..=25.0)
+                            .text("Max fan temp drop (°C)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut fluid_cfg.ooze_time_constant_ref_s, 0.2..=10.0)
+                            .text("Ooze time constant τ (s)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut fluid_cfg.ooze_max_length_ref_mm, 0.0..=2.0)
+                            .text("Max ooze prime (mm)"),
+                    );
+                });
+            } else {
+                let mut r_len = self.config.retraction_length();
+                if ui
+                    .add(egui::Slider::new(&mut r_len, 0.0..=10.0).text("Retraction distance (mm)"))
+                    .changed()
+                {
+                    self.config.retraction_length = Some(r_len);
+                }
+                let mut u_extra = self.config.unretract_extra_length();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut u_extra, 0.0..=2.0)
+                            .text("Unretract extra length (mm)"),
+                    )
+                    .changed()
+                {
+                    self.config.unretract_extra_length = Some(u_extra);
+                }
+                let mut pa_val = self.config.pressure_advance.unwrap_or(0.0);
+                if ui
+                    .add(egui::Slider::new(&mut pa_val, 0.0..=0.2).text("Pressure advance (s)"))
+                    .changed()
+                {
+                    self.config.pressure_advance = if pa_val > 0.0 { Some(pa_val) } else { None };
+                }
+                let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut taper_dist, 0.0..=10.0)
+                            .text("Pre-retract taper distance (mm)"),
+                    )
+                    .changed()
+                {
+                    self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
+                        Some(taper_dist)
+                    } else {
+                        None
+                    };
+                }
+                ui.checkbox(
+                    &mut self.config.use_firmware_retraction,
+                    "Use firmware retraction (G10/G11)",
+                );
+            }
+
             let mut r_spd_mms = (self.config.retraction_speed() / 60.0).round();
             if ui
                 .add(
@@ -758,34 +869,6 @@ impl ManifoldApp {
                 .changed()
             {
                 self.config.retraction_speed = Some(r_spd_mms * 60.0);
-            }
-            let mut u_extra = self.config.unretract_extra_length();
-            if ui
-                .add(egui::Slider::new(&mut u_extra, 0.0..=2.0).text("Unretract extra length (mm)"))
-                .changed()
-            {
-                self.config.unretract_extra_length = Some(u_extra);
-            }
-            let mut pa_val = self.config.pressure_advance.unwrap_or(0.0);
-            if ui
-                .add(egui::Slider::new(&mut pa_val, 0.0..=0.2).text("Pressure advance (s)"))
-                .changed()
-            {
-                self.config.pressure_advance = if pa_val > 0.0 { Some(pa_val) } else { None };
-            }
-            let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
-            if ui
-                .add(
-                    egui::Slider::new(&mut taper_dist, 0.0..=10.0)
-                        .text("Pre-retract taper distance (mm)"),
-                )
-                .changed()
-            {
-                self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
-                    Some(taper_dist)
-                } else {
-                    None
-                };
             }
             ui.checkbox(&mut self.config.scarf_joint_enabled, "Scarf joint seams");
             if self.config.scarf_joint_enabled {
