@@ -355,6 +355,31 @@ impl NanoGridBuffer {
         false
     }
 
+    /// Checks whether point `p` is within `top_depth` of an exposed top surface
+    /// (by probing along $+Z$).
+    pub fn is_exposed_top(&self, p: DVec3, top_depth: f64) -> bool {
+        if top_depth <= 0.0 {
+            return false;
+        }
+        let probe = p + DVec3::new(0.0, 0.0, top_depth);
+        self.sample(probe) > 0.0
+    }
+
+    /// Checks whether point `p` is within `bottom_depth` of an exposed bottom surface
+    /// (by probing along $-Z$).
+    pub fn is_exposed_bottom(&self, p: DVec3, bottom_depth: f64) -> bool {
+        if bottom_depth <= 0.0 {
+            return false;
+        }
+        let probe = p - DVec3::new(0.0, 0.0, bottom_depth);
+        self.sample(probe) > 0.0
+    }
+
+    /// Checks whether point `p` is within top or bottom solid skin depth.
+    pub fn is_skin(&self, p: DVec3, top_depth: f64, bottom_depth: f64) -> bool {
+        self.is_exposed_top(p, top_depth) || self.is_exposed_bottom(p, bottom_depth)
+    }
+
     /// Converts this grid buffer into contiguous byte representation.
     pub fn to_bytes(&self) -> Vec<u8> {
         let header_bytes = bytemuck::bytes_of(&self.header);

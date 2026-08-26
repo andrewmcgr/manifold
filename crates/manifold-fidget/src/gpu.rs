@@ -1204,6 +1204,278 @@ impl GpuTpmsInfill {
     }
 }
 
+/// GPU Directional Solid Skin Exposure compute pipeline.
+pub struct GpuSolidSkin {
+    ctx: GpuContext,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl GpuSolidSkin {
+    pub fn new(ctx: GpuContext) -> Self {
+        let device = &ctx.device;
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("solid_skin_shader"),
+            source: wgpu::ShaderSource::Wgsl(SOLID_SKIN_WGSL.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("solid_skin_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("solid_skin_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("solid_skin_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        Self {
+            ctx,
+            pipeline,
+            bind_group_layout,
+        }
+    }
+
+    /// Evaluates exposure flags across all leaf bricks on the GPU.
+    pub fn classify_exposure(
+        &self,
+        sdf_grid: &NanoGridBuffer,
+        top_depth: f32,
+        bottom_depth: f32,
+    ) -> Vec<u32> {
+        if sdf_grid.leaves.is_empty() {
+            return Vec::new();
+        }
+
+        let device = &self.ctx.device;
+        let queue = &self.ctx.queue;
+
+        let leaves_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("skin_sdf_leaves"),
+            contents: bytemuck::cast_slice(&sdf_grid.leaves),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct SkinParams {
+            top_depth: f32,
+            bottom_depth: f32,
+            leaf_count: u32,
+            voxel_dz: f32,
+        }
+
+        let params = SkinParams {
+            top_depth,
+            bottom_depth,
+            leaf_count: sdf_grid.leaves.len() as u32,
+            voxel_dz: sdf_grid.header.voxel_size[2],
+        };
+
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("skin_params_buf"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        // 512 voxels = 16 u32 bitmask words per leaf brick
+        let mask_words = sdf_grid.leaves.len() * 16;
+        let mask_bytes = (mask_words * 4) as u64;
+
+        let mask_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("skin_mask_buf"),
+            size: mask_bytes.max(64),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("solid_skin_bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: leaves_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: mask_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("skin_encoder"),
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("skin_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(sdf_grid.leaves.len() as u32, 1, 1);
+        }
+
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("skin_readback"),
+            size: mask_bytes.max(64),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        encoder.copy_buffer_to_buffer(&mask_buf, 0, &readback, 0, mask_bytes.max(64));
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        if rx.recv().ok().and_then(|r| r.ok()).is_none() {
+            return Vec::new();
+        }
+
+        let out = {
+            let data = slice.get_mapped_range();
+            let raw: &[u32] = bytemuck::cast_slice(&data[0..mask_words * 4]);
+            raw.to_vec()
+        };
+        readback.unmap();
+        out
+    }
+}
+
+/// WGSL shader source for 3D Directional Solid Skin Exposure Stencil.
+const SOLID_SKIN_WGSL: &str = r#"
+struct SkinParams {
+    top_depth: f32,
+    bottom_depth: f32,
+    leaf_count: u32,
+    voxel_dz: f32,
+};
+
+struct NanoLeafBrick {
+    origin: vec4<i32>,
+    bbox_min: vec4<f32>,
+    bbox_max: vec4<f32>,
+    value_min: f32,
+    value_max: f32,
+    pad: vec2<f32>,
+    values: array<f32, 512>,
+};
+
+@group(0) @binding(0) var<uniform> params: SkinParams;
+@group(0) @binding(1) var<storage, read> leaves: array<NanoLeafBrick>;
+@group(0) @binding(2) var<storage, read_write> out_mask: array<u32>;
+
+fn get_val_skin(leaf_idx: u32, cx: u32, cy: u32, cz: u32) -> f32 {
+    let idx = (cz * 8u + cy) * 8u + cx;
+    return leaves[leaf_idx].values[idx];
+}
+
+@compute @workgroup_size(16, 1, 1)
+fn main(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>
+) {
+    let leaf_idx = workgroup_id.x;
+    if (leaf_idx >= params.leaf_count) {
+        return;
+    }
+
+    let word_idx = local_id.x; // 0..15 (32 voxels per word = 512 voxels)
+    var word_mask: u32 = 0u;
+
+    let top_steps = u32(max(1.0, ceil(params.top_depth / max(params.voxel_dz, 0.001))));
+    let bot_steps = u32(max(1.0, ceil(params.bottom_depth / max(params.voxel_dz, 0.001))));
+
+    for (var b = 0u; b < 32u; b = b + 1u) {
+        let voxel_idx = word_idx * 32u + b;
+        let cz = voxel_idx / 64u;
+        let rem = voxel_idx % 64u;
+        let cy = rem / 8u;
+        let cx = rem % 8u;
+
+        let val = get_val_skin(leaf_idx, cx, cy, cz);
+        if (val <= 0.0) { // Inside solid
+            var exposed = false;
+            // Top exposure check
+            if (params.top_depth > 0.0) {
+                let top_z = cz + top_steps;
+                if (top_z >= 8u) {
+                    exposed = true;
+                } else if (get_val_skin(leaf_idx, cx, cy, top_z) > 0.0) {
+                    exposed = true;
+                }
+            }
+            // Bottom exposure check
+            if (!exposed && params.bottom_depth > 0.0) {
+                if (cz < bot_steps) {
+                    exposed = true;
+                } else if (get_val_skin(leaf_idx, cx, cy, cz - bot_steps) > 0.0) {
+                    exposed = true;
+                }
+            }
+
+            if (exposed) {
+                word_mask = word_mask | (1u << b);
+            }
+        }
+    }
+
+    out_mask[leaf_idx * 16u + word_idx] = word_mask;
+}
+"#;
+
 /// WGSL shader source for TPMS Volumetric Infill Generation.
 const TPMS_INFILL_WGSL: &str = r#"
 struct TpmsParams {
@@ -1997,5 +2269,27 @@ mod tests {
         // Gyroid infill (kind 0), wavelength 0.5, wall_offset 0.0, target_order 0.0
         let segments = tpms.generate_infill_segments(&sdf_grid, &order_grid, 0, 0.5, 0.0, 0.0);
         assert!(!segments.is_empty(), "GPU TPMS produced no infill segments");
+    }
+
+    #[test]
+    fn gpu_solid_skin_classifies_exposure() {
+        let Some(ctx) = GpuContext::new() else {
+            eprintln!("Skipping GPU test: no compatible GPU adapter available.");
+            return;
+        };
+
+        let tree = TreeField::new(sphere_tree(1.0));
+        let sdf_grid = NanoGridBuffer::build_from_scalar_field(
+            &tree,
+            DVec3::splat(-1.5),
+            DVec3::splat(1.5),
+            0.1,
+            0.0,
+            0.5,
+        );
+
+        let skin = GpuSolidSkin::new(ctx);
+        let mask = skin.classify_exposure(&sdf_grid, 0.2, 0.2);
+        assert!(!mask.is_empty(), "GPU solid skin produced mask");
     }
 }
