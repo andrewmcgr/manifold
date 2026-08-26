@@ -635,7 +635,7 @@ pub fn slice_mesh_with_progress(
     };
 
     let completed = AtomicUsize::new(0);
-    let progress_callback = Mutex::new(on_progress);
+    let progress_callback = Mutex::new((on_progress, 0.0f64));
 
     let mut layers: Vec<Layer> = order_values
         .par_iter()
@@ -730,8 +730,10 @@ pub fn slice_mesh_with_progress(
                 }
             }
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            if let Ok(mut callback) = progress_callback.lock() {
-                callback(0.10 + 0.85 * (done as f64 / total_steps as f64));
+            if let Ok(mut guard) = progress_callback.lock() {
+                let fraction = (0.10 + 0.85 * (done as f64 / total_steps as f64)).max(guard.1);
+                guard.1 = fraction;
+                (guard.0)(fraction);
             }
             // The infill boundary sits where wall pass `wall_count` would
             // be if one more wall were printed — one further
@@ -899,8 +901,10 @@ pub fn slice_mesh_with_progress(
         stitch_wall_gaps(&mut layers, config, basis1, basis2);
     }
 
-    if let Ok(mut callback) = progress_callback.lock() {
-        callback(1.0);
+    if let Ok(mut guard) = progress_callback.lock() {
+        let fraction = 1.0f64.max(guard.1);
+        guard.1 = fraction;
+        (guard.0)(fraction);
     }
 
     Ok(layers)

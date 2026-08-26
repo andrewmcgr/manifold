@@ -830,7 +830,7 @@ impl ManifoldApp {
                             .text("Max fan temp drop (°C)"),
                     );
                     ui.add(
-                        egui::Slider::new(&mut fluid_cfg.ooze_time_constant_ref_s, 0.2..=10.0)
+                        egui::Slider::new(&mut fluid_cfg.ooze_time_constant_ref_s, 0.05..=10.0)
                             .text("Ooze time constant τ (s)"),
                     );
                     ui.add(

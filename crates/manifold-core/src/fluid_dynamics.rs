@@ -142,7 +142,7 @@ impl FluidDynamicsEngine {
             return 0.0;
         }
         let dt = self.temperature_delta(fan_speed_fraction);
-        let tau_scaled = (self.config.ooze_time_constant_ref_s * (-0.03 * dt).exp()).max(0.05);
+        let tau_scaled = (self.config.ooze_time_constant_ref_s * (-0.03 * dt).exp()).max(0.01);
         let l_max_scaled = (self.config.ooze_max_length_ref_mm * (1.0 + 0.02 * dt)).max(0.0);
 
         let ooze = l_max_scaled * (1.0 - (-travel_time_s / tau_scaled).exp());
@@ -248,6 +248,24 @@ mod tests {
         assert!(prime_short > 0.0);
         assert!(prime_long > prime_short);
         assert!((prime_long - 0.40).abs() < 0.01);
+    }
+
+    #[test]
+    fn thermal_ooze_supports_fast_50ms_time_constant() {
+        let config = FluidDynamicsConfig {
+            ooze_time_constant_ref_s: 0.05, // 50 ms
+            ooze_max_length_ref_mm: 0.20,
+            ..Default::default()
+        };
+        let engine = FluidDynamicsEngine::new(config);
+
+        // At t = 50ms (1 time constant), ooze should be ~63.2% of max (0.20 * 0.632 = 0.126)
+        let prime_1tau = engine.extra_prime_length(0.05, 0.0);
+        assert!((prime_1tau - 0.126).abs() < 0.01);
+
+        // At t = 200ms (4 time constants), ooze should approach ~98% of max (0.20 * 0.98 = 0.196)
+        let prime_4tau = engine.extra_prime_length(0.20, 0.0);
+        assert!((prime_4tau - 0.196).abs() < 0.01);
     }
 
     #[test]
