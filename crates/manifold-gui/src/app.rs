@@ -2295,7 +2295,9 @@ impl ManifoldApp {
                                             });
                                         }
 
-                                        if view == ToolpathDataView::FlowRate {
+                                        if view == ToolpathDataView::FlowRate
+                                            || view == ToolpathDataView::Speed
+                                        {
                                             ui.horizontal(|ui| {
                                                 let (badge_rect, _) = ui.allocate_exact_size(
                                                     egui::vec2(10.0, 10.0),

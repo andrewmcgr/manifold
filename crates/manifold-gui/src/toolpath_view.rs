@@ -158,56 +158,28 @@ pub fn data_view_range(
     let mut max_val = f64::NEG_INFINITY;
     let mut count = 0;
 
-    let mut prev_endpoint: Option<glam::DVec3> = None;
-
     for path in paths {
         let n = path.points.len();
         if n == 0 {
             continue;
         }
-        let path_start = path.points[0];
-        let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
-
-        if let Some(prev_end) = prev_endpoint {
-            if prev_end.distance(path_start) > 1e-6 && data_view != ToolpathDataView::FlowRate {
-                let travel_segment = manifold_core::toolpath::Segment {
-                    kind: MoveKind::Travel,
-                    speed: config.travel_speed,
-                    extrusion_rate: 0.0,
-                    support_fraction: 0.0,
-                    order: path_order,
-                    extrusion_length: 0.0,
-                };
-                let val = segment_scalar_value(
-                    &travel_segment,
-                    prev_end,
-                    path_start,
-                    data_view,
-                    config,
-                    machine,
-                );
-                min_val = min_val.min(val);
-                max_val = max_val.max(val);
-                count += 1;
-            }
-        }
 
         for (i, segment) in path.segments.iter().enumerate() {
-            if data_view == ToolpathDataView::FlowRate && segment.kind == MoveKind::Travel {
+            // Travel moves are rendered in a dedicated travel color (COLOR_TRAVEL)
+            // and should not skew the scalar gradient range of extrusion features.
+            if segment.kind == MoveKind::Travel {
                 continue;
             }
             let start = path.points[i];
             let end = path.points[(i + 1) % n];
             let val = segment_scalar_value(segment, start, end, data_view, config, machine);
+            // Ignore near-zero non-extruding artifacts when computing flow rate ranges
+            if data_view == ToolpathDataView::FlowRate && val <= 1e-3 {
+                continue;
+            }
             min_val = min_val.min(val);
             max_val = max_val.max(val);
             count += 1;
-        }
-
-        if path.segments.len() == n {
-            prev_endpoint = Some(path.points[0]);
-        } else {
-            prev_endpoint = path.points.last().copied();
         }
     }
 
@@ -325,7 +297,9 @@ pub fn build_toolpath_lines(
                     extrusion_length: 0.0,
                 };
                 let color = match data_view {
-                    ToolpathDataView::LineType | ToolpathDataView::FlowRate => COLOR_TRAVEL,
+                    ToolpathDataView::LineType
+                    | ToolpathDataView::FlowRate
+                    | ToolpathDataView::Speed => COLOR_TRAVEL,
                     _ => {
                         let val = segment_scalar_value(
                             &travel_segment,
@@ -336,8 +310,8 @@ pub fn build_toolpath_lines(
                             machine,
                         );
                         let t = if let Some((min, max)) = scalar_range {
-                            if max > min {
-                                (val - min) / (max - min)
+                            if max > min + 1e-4 {
+                                ((val - min) / (max - min)).clamp(0.0, 1.0)
                             } else {
                                 0.5
                             }
@@ -363,11 +337,12 @@ pub fn build_toolpath_lines(
             let color = match data_view {
                 ToolpathDataView::LineType => palette_color(segment.kind),
                 ToolpathDataView::FlowRate if segment.kind == MoveKind::Travel => COLOR_TRAVEL,
+                ToolpathDataView::Speed if segment.kind == MoveKind::Travel => COLOR_TRAVEL,
                 _ => {
                     let val = segment_scalar_value(segment, start, end, data_view, config, machine);
                     let t = if let Some((min, max)) = scalar_range {
-                        if max > min {
-                            (val - min) / (max - min)
+                        if max > min + 1e-4 {
+                            ((val - min) / (max - min)).clamp(0.0, 1.0)
                         } else {
                             0.5
                         }
@@ -651,7 +626,7 @@ mod tests {
             tool: ToolId(0),
         };
 
-        // Speed view: low speed gets blue (c[2] > c[0]), high speed gets red (c[0] > c[2])
+        // Speed view: low speed gets blue (c[2] > c[0]), high speed gets red (c[0] > c[2]), travel gets COLOR_TRAVEL
         let speed_lines = build_toolpath_lines(
             std::slice::from_ref(&path),
             f64::INFINITY,
@@ -661,7 +636,8 @@ mod tests {
         );
         assert_eq!(speed_lines.len(), 3);
         assert!(speed_lines[0].color[2] > speed_lines[0].color[0]); // Blue > Red for low
-        assert!(speed_lines[2].color[0] > speed_lines[2].color[2]); // Red > Blue for max
+        assert!(speed_lines[1].color[0] > speed_lines[1].color[2]); // Red > Blue for high
+        assert_eq!(speed_lines[2].color, COLOR_TRAVEL); // Travel move gets COLOR_TRAVEL
 
         // Flow rate view: travel move gets grey COLOR_TRAVEL, extrusions get scalar colors
         let flow_lines = build_toolpath_lines(
