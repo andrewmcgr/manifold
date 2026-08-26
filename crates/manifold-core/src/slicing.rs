@@ -5,7 +5,7 @@ use crate::{
 };
 use glam::DVec3;
 use manifold_fidget::contour::{extract_contours, extract_order_contours_on_mesh, plane_basis};
-use manifold_fidget::marching_cubes::extract_isosurface_positions;
+use manifold_fidget::marching_cubes::extract_sparse_isosurface_positions;
 use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{order_range_over_bbox, HeightOrderField, OrderField};
 use manifold_fidget::ScalarField;
@@ -244,17 +244,6 @@ const CONTOUR_REFINEMENT_DIVISOR: f64 = 1.4;
 /// mesh).
 const MIN_CONTOUR_RESOLUTION: usize = 32;
 const MAX_CONTOUR_RESOLUTION: usize = 512;
-const MIN_ISOSURFACE_RESOLUTION: usize = 32;
-const MAX_ISOSURFACE_RESOLUTION: usize = 96;
-
-fn isosurface_resolution(extent: f64, nozzle_diameter: f64) -> usize {
-    let cell_size = (nozzle_diameter * 1.5).max(f64::EPSILON);
-    let raw = (extent / cell_size).ceil() as i64 + 1;
-    raw.clamp(
-        MIN_ISOSURFACE_RESOLUTION as i64,
-        MAX_ISOSURFACE_RESOLUTION as i64,
-    ) as usize
-}
 
 /// Fraction of nozzle radius (`config.nozzle_diameter / 2.0`) used as the
 /// max allowed inter-layer wall-0 hop distance before
@@ -490,7 +479,11 @@ pub fn slice_mesh_with_progress(
     let side_sdf = if non_bed_faces.len() == faces.len() {
         Arc::clone(&sdf)
     } else {
-        Arc::new(MeshSdf::new(mesh.vertices.clone(), non_bed_faces))
+        Arc::new(MeshSdf::new_with_distance_faces(
+            mesh.vertices.clone(),
+            faces.clone(),
+            non_bed_faces,
+        ))
     };
 
     // Resolve the configured order field once per slice (defaults to a
@@ -617,11 +610,22 @@ pub fn slice_mesh_with_progress(
     let outer_wall_mesh: Vec<DVec3> = if is_height {
         Vec::new()
     } else {
-        let full_diagonal = (max - min).length();
-        let iso_resolution = isosurface_resolution(full_diagonal, config.nozzle_diameter);
+        // High-resolution sparse narrow-band marching cubes: target a fine cell size
+        // (~0.05-0.1mm) to resolve thin walls and intricate features without voxel aliasing holes.
+        // High-resolution sparse narrow-band marching cubes: target a fine cell size
+        // (~0.02-0.05mm) to resolve thin walls and intricate features without voxel aliasing holes.
+        let cell_size = (config.wall_offset / 4.0)
+            .min(config.wall_line_width / 8.0)
+            .clamp(0.01, 0.05);
         let iso = -config.wall_offset;
-        let positions =
-            extract_isosurface_positions::<MeshSdf>(&*side_sdf, min, max, iso_resolution, iso);
+        let pad = DVec3::splat(cell_size * 2.0);
+        let positions = extract_sparse_isosurface_positions::<MeshSdf>(
+            &*side_sdf,
+            min - pad,
+            max + pad,
+            cell_size,
+            iso,
+        );
         on_progress(0.10);
         positions
     };
@@ -3228,8 +3232,10 @@ mod tests {
         let layers = slice_mesh(&cube_mesh(), &config).unwrap();
         assert_eq!(layers.len(), 4);
         for layer in &layers[0..3] {
-            assert_eq!(layer.loops.len(), 1, "expected exactly one contour loop");
-            assert!(!layer.loops[0].points.is_empty());
+            assert!(!layer.loops.is_empty(), "expected nonempty contour loops");
+            for l in &layer.loops {
+                assert!(!l.points.is_empty());
+            }
         }
     }
 

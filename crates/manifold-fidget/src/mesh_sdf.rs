@@ -64,6 +64,9 @@ pub struct MeshSdf {
     /// Vertex indices (into `vertex_positions`) for each triangle, same
     /// indexing as `face_normals`/the BVH.
     face_vertex_indices: Vec<[usize; 3]>,
+    /// Vertex indices for the watertight boundary mesh, used exclusively by
+    /// [`MeshSdf::winding_number_sign`].
+    watertight_face_vertex_indices: Vec<[usize; 3]>,
     /// Original mesh vertex positions.
     vertex_positions: Vec<DVec3>,
     /// Angle-weighted pseudonormal per vertex, same indexing as
@@ -127,7 +130,55 @@ impl MeshSdf {
         MeshSdf {
             bvh,
             face_normals,
-            face_vertex_indices: faces,
+            face_vertex_indices: faces.clone(),
+            watertight_face_vertex_indices: faces,
+            vertex_positions: vertices,
+            vertex_pseudonormals,
+            edge_pseudonormals,
+            sign_method: SignMethod::Pseudonormal,
+        }
+    }
+
+    /// Builds a `MeshSdf` using a dedicated set of `distance_faces` for distance/BVH
+    /// and feature-normal queries, while retaining the full `watertight_faces` for
+    /// generalized winding-number sign evaluation ([`MeshSdf::winding_number_sign`]).
+    ///
+    /// This allows excluding non-side faces (such as downward-facing bed-contact
+    /// triangles) from distance calculations without breaking the topological
+    /// closure required for reliable interior/exterior winding-number classification.
+    pub fn new_with_distance_faces(
+        vertices: Vec<DVec3>,
+        watertight_faces: Vec<[usize; 3]>,
+        distance_faces: Vec<[usize; 3]>,
+    ) -> Self {
+        let triangles: Vec<Triangle> = distance_faces
+            .iter()
+            .map(|f| Triangle::new(vertices[f[0]], vertices[f[1]], vertices[f[2]]))
+            .collect();
+
+        let face_normals: Vec<DVec3> = triangles
+            .iter()
+            .map(|tri| {
+                let n = (tri.b - tri.a).cross(tri.c - tri.a);
+                if n.length_squared() > DEGENERATE_EPSILON {
+                    n.normalize()
+                } else {
+                    DVec3::ZERO
+                }
+            })
+            .collect();
+
+        let vertex_pseudonormals =
+            Self::compute_vertex_pseudonormals(&vertices, &distance_faces, &face_normals);
+        let edge_pseudonormals = Self::compute_edge_pseudonormals(&distance_faces, &face_normals);
+
+        let bvh = TriangleBvh::build(triangles);
+
+        MeshSdf {
+            bvh,
+            face_normals,
+            face_vertex_indices: distance_faces,
+            watertight_face_vertex_indices: watertight_faces,
             vertex_positions: vertices,
             vertex_pseudonormals,
             edge_pseudonormals,
@@ -423,7 +474,7 @@ impl MeshSdf {
     /// solid angle and are harmless to include unconditionally.
     fn winding_number_sign(&self, p: DVec3) -> f64 {
         let mut solid_angle_sum = 0.0f64;
-        for verts in &self.face_vertex_indices {
+        for verts in &self.watertight_face_vertex_indices {
             let a = self.vertex_positions[verts[0]] - p;
             let b = self.vertex_positions[verts[1]] - p;
             let c = self.vertex_positions[verts[2]] - p;
