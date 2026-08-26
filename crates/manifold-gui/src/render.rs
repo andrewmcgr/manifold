@@ -109,6 +109,38 @@ impl UploadedMesh {
     }
 }
 
+/// A NanoVDB sparse grid uploaded to the GPU as storage + uniform buffers for real-time volume raymarching.
+#[allow(dead_code)]
+pub struct UploadedNanoGrid {
+    pub storage_buffer: wgpu::Buffer,
+    pub header_buffer: wgpu::Buffer,
+    pub leaf_count: u32,
+}
+
+#[allow(dead_code)]
+impl UploadedNanoGrid {
+    /// Uploads `grid` to the GPU as storage and uniform buffers.
+    pub fn upload(device: &wgpu::Device, grid: &manifold_fidget::nanovdb::NanoGridBuffer) -> Self {
+        let storage_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nanogrid_storage_buffer"),
+            contents: bytemuck::cast_slice(&grid.leaves),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let header_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nanogrid_header_buffer"),
+            contents: bytemuck::bytes_of(&grid.header),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        Self {
+            storage_buffer,
+            header_buffer,
+            leaf_count: grid.leaves.len() as u32,
+        }
+    }
+}
+
 /// A scene-dressing buffer (origin axes, grid, bed quad, or toolhead
 /// markers) already uploaded to the GPU — see `crate::scene`.
 pub struct UploadedScene {
