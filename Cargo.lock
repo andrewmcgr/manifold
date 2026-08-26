@@ -2488,10 +2488,13 @@ dependencies = [
 name = "manifold-fidget"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "fidget",
  "glam 0.29.3",
+ "pollster 0.3.0",
  "rayon",
  "tracing",
+ "wgpu 22.1.0",
 ]
 
 [[package]]

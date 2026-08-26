@@ -18,9 +18,13 @@ pub mod geometry;
 pub mod height_along;
 pub mod marching_cubes;
 pub mod mesh_sdf;
+pub mod nanovdb;
 pub mod order;
 pub mod slice;
 pub mod slope_profile;
+
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
 /// Builds a `fidget::context::Tree` for a sphere of the given `radius`
 /// centered at the origin: `f(p) = |p| - radius`.

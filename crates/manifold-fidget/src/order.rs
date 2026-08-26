@@ -8,6 +8,7 @@
 //! (unlike [`ScalarField::sample`](crate::ScalarField::sample), which also
 //! returns a gradient for the angle-field use case).
 
+use crate::{FieldSample, ScalarField};
 use glam::DVec3;
 
 /// A scalar field over 3D space whose isosurfaces (`order(p) == c` for a
@@ -48,6 +49,15 @@ impl OrderField for HeightOrderField {
     }
 }
 
+impl ScalarField for HeightOrderField {
+    fn sample(&self, p: DVec3) -> FieldSample {
+        FieldSample {
+            value: self.order(p),
+            gradient: self.direction,
+        }
+    }
+}
+
 /// A genuinely curved [`OrderField`]: isosurfaces are cones nested around
 /// `axis`, apex at `apex`, opening in the `+axis` direction.
 /// `order(p) = along - slope * radial`, where `along = (p - apex).dot(axis)`
@@ -84,6 +94,25 @@ impl OrderField for ConicalOrderField {
         let along = offset.dot(self.axis);
         let radial = (offset - along * self.axis).length();
         along - self.slope * radial
+    }
+}
+
+impl ScalarField for ConicalOrderField {
+    fn sample(&self, p: DVec3) -> FieldSample {
+        let offset = p - self.apex;
+        let along = offset.dot(self.axis);
+        let radial_vec = offset - along * self.axis;
+        let radial = radial_vec.length();
+        let radial_grad = if radial > f64::EPSILON {
+            radial_vec / radial
+        } else {
+            DVec3::ZERO
+        };
+        let gradient = self.axis - self.slope * radial_grad;
+        FieldSample {
+            value: along - self.slope * radial,
+            gradient,
+        }
     }
 }
 

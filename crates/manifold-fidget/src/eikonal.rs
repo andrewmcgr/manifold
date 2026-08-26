@@ -26,6 +26,7 @@
 use crate::height_along::HeightAlong;
 use crate::order::OrderField;
 use crate::slope_profile::SlopeProfile;
+use crate::{FieldSample, ScalarField};
 use glam::DVec3;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -888,26 +889,6 @@ impl EikonalOrderField {
 }
 
 impl OrderField for EikonalOrderField {
-    /// Interpolates the precomputed FMM distance grid at `p` (clamped into
-    /// the grid's bounding box). Nodes the front never reached remain
-    /// `f64::INFINITY`.
-    ///
-    /// Uses a gradient-augmented (Hermite) blend over the containing cell's
-    /// 8 corners when every corner is finite: each corner carries both its
-    /// distance value and a per-axis gradient estimate computed once in
-    /// [`EikonalOrderField::compute_gradients`] from the FMM solve itself
-    /// (physically meaningful, magnitude ~1 for a unit-speed Eikonal field)
-    /// rather than inferred after the fact -- this is C1-continuous and, by
-    /// construction, bounded (unlike a wider finite-difference cubic
-    /// stencil, which can overshoot near thin features using only inferred
-    /// derivatives). Falls back to plain trilinear (dropping unreached
-    /// corners and renormalizing weights over the rest) whenever any of the
-    /// 8 corners is non-finite -- the common case for queries near the
-    /// surface, where up to half of a cell's corners sit in unmarched air.
-    /// Only when *every* corner with nonzero trilinear weight is unreached
-    /// (e.g. an empty seed set, or a genuinely unreached region) does this
-    /// return `+inf` -- the documented best-effort fallback for a query
-    /// point the front cannot reach.
     fn order(&self, p: DVec3) -> f64 {
         let [nx, ny, nz] = self.dims;
         if nx == 0 || ny == 0 || nz == 0 {
@@ -1096,6 +1077,15 @@ fn clamp_index(v: f64, count: usize) -> usize {
     }
     let max = (count - 1) as f64;
     v.clamp(0.0, max) as usize
+}
+
+impl ScalarField for EikonalOrderField {
+    fn sample(&self, p: DVec3) -> FieldSample {
+        FieldSample {
+            value: self.order(p),
+            gradient: DVec3::Z,
+        }
+    }
 }
 
 /// Splits a continuous (already `/h`-scaled) local axis coordinate into a

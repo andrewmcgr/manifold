@@ -705,7 +705,7 @@ pub fn extract_sparse_isosurface<F: ScalarField + Sync>(
 /// (inside/outside corner) configurations, a 12-bit mask of which of the 12
 /// cube edges the isosurface crosses.
 #[rustfmt::skip]
-const EDGE_TABLE: [u16; 256] = [
+pub(crate) const EDGE_TABLE: [u16; 256] = [
     0x0, 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c,
     0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
     0x190, 0x99, 0x393, 0x29a, 0x596, 0x49f, 0x795, 0x69c,
@@ -744,7 +744,7 @@ const EDGE_TABLE: [u16; 256] = [
 /// configurations, up to 5 triangles (15 edge indices) describing how to
 /// triangulate the isosurface within that cube, terminated by `-1`.
 #[rustfmt::skip]
-const TRI_TABLE: [[i8; 16]; 256] = include!("marching_cubes_tri_table.rs.in");
+pub(crate) const TRI_TABLE: [[i8; 16]; 256] = include!("marching_cubes_tri_table.rs.in");
 
 #[cfg(test)]
 mod tests {

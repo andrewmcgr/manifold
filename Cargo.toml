@@ -28,6 +28,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rayon = "1"
 i_overlay = { version = "8.0.0", features = ["glam"] }
+wgpu = "22"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"
 
 [profile.release]
 lto = true
