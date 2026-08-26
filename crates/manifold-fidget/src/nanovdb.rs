@@ -314,6 +314,47 @@ impl NanoGridBuffer {
         leaf.values[(lz * LEAF_DIM + ly) * LEAF_DIM + lx]
     }
 
+    /// Digital Differential Analyzer (DDA) 3D raymarcher through the sparse NanoVDB grid.
+    ///
+    /// Checks whether the straight chord `start -> end` intersects solid material or violates
+    /// `clearance` from the surface.
+    ///
+    /// Near the endpoints, the required clearance ramps from 0 at the start/end points
+    /// up to the full `clearance` distance, allowing departures and arrivals.
+    pub fn is_chord_blocked(&self, start: DVec3, end: DVec3, clearance: f64) -> bool {
+        let total_dist = start.distance(end);
+        if total_dist <= 1e-6 {
+            return false;
+        }
+
+        let dir = (end - start) / total_dist;
+        let dx = self.header.voxel_size[0] as f64;
+        let dy = self.header.voxel_size[1] as f64;
+        let dz = self.header.voxel_size[2] as f64;
+        let min_voxel_dim = dx.min(dy).min(dz);
+        let step_size = (min_voxel_dim * 0.5).clamp(0.01, 0.5);
+
+        let n_steps = (total_dist / step_size).ceil() as usize;
+        let dt = total_dist / n_steps as f64;
+
+        let mut t = 0.0;
+        for _ in 0..=n_steps {
+            let p = start + dir * t;
+            let dist_from_start = t;
+            let dist_from_end = total_dist - t;
+            let req_clear = (clearance as f32)
+                .min(dist_from_start as f32)
+                .min(dist_from_end as f32);
+
+            let val = self.sample(p);
+            if val < req_clear {
+                return true;
+            }
+            t += dt;
+        }
+        false
+    }
+
     /// Converts this grid buffer into contiguous byte representation.
     pub fn to_bytes(&self) -> Vec<u8> {
         let header_bytes = bytemuck::bytes_of(&self.header);
@@ -357,5 +398,28 @@ mod tests {
         // Sample outside narrow band returns background
         let s_out = grid.sample(DVec3::new(3.0, 0.0, 0.0));
         assert_eq!(s_out, grid.header.background_value);
+    }
+
+    #[test]
+    fn nanovdb_dda_raymarcher_detects_blockage() {
+        let tree = TreeField::new(sphere_tree(1.0));
+        let grid = NanoGridBuffer::build_from_scalar_field(
+            &tree,
+            DVec3::splat(-1.5),
+            DVec3::splat(1.5),
+            0.1,
+            0.0,
+            0.5,
+        );
+
+        // Ray passing straight through the sphere center from (-2, 0, 0) to (2, 0, 0)
+        let blocked =
+            grid.is_chord_blocked(DVec3::new(-2.0, 0.0, 0.0), DVec3::new(2.0, 0.0, 0.0), 0.2);
+        assert!(blocked, "expected chord through sphere to be blocked");
+
+        // Ray passing safely outside the sphere from (-2, 2, 0) to (2, 2, 0)
+        let clear =
+            grid.is_chord_blocked(DVec3::new(-2.0, 2.0, 0.0), DVec3::new(2.0, 2.0, 0.0), 0.2);
+        assert!(!clear, "expected chord outside sphere to be clear");
     }
 }
