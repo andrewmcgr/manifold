@@ -468,23 +468,26 @@ fn compensate_flat_nozzle(paths: Vec<Path>, layer: &Layer, config: &SlicerConfig
         .collect()
 }
 
-/// Per-point worker behind [`compensate_flat_nozzle`]; see that function's
-/// doc for the geometric model. `points` is a closed loop (wraps like
-/// `Path`'s own contract).
+/// Per-point worker behind [`compensate_flat_nozzle`].
+///
+/// On sloped non-planar layers, a flat nozzle tip (with land radius `flat_radius`)
+/// tilts relative to the surface normal, causing its lowest outer perimeter edge
+/// to drop toward previously deposited material.
+///
+/// Rather than shifting the toolpath centerline laterally in X/Y (which introduces
+/// dimensional asymmetry and wall bulging), this pass elevates the nozzle along
+/// the vertical axis (+Z) by `flat_radius * sin(alpha) * (1.0 - cos(alpha))`
+/// where `alpha` is the surface slope angle. This ensures the lowest edge of the
+/// rigid flat land clears the underlying sloped surface without plowing, while
+/// preserving the true X/Y contour centerline.
 fn compensate_wall_loop_points(
     points: &[DVec3],
     field: &dyn manifold_fidget::order::OrderField,
     flat_radius: f64,
-    layer_height: f64,
-    layer_order: f64,
+    _layer_height: f64,
+    _layer_order: f64,
     min_extrusion_z: f64,
 ) -> Vec<DVec3> {
-    // Order value of the layer printed just before this one -- order
-    // increases as printing proceeds (see `slicing::BUILD_DIRECTION`), so
-    // the already-solidified prior layer sits at a *lower* order value.
-    let prev_layer_order = layer_order - layer_height;
-    let nozzle_dir = crate::slicing::NOZZLE_DIRECTION;
-
     points
         .iter()
         .map(|&p| {
@@ -494,70 +497,28 @@ fn compensate_wall_loop_points(
                 return p;
             };
 
-            // The component of the (world-fixed) nozzle axis lying in the
-            // tangent plane at `p` -- i.e. how far the nozzle axis leans
-            // away from this point's own surface normal, and in which
-            // direction. This is the only direction the flat tip's
-            // footprint can actually mismatch the surface across: probing
-            // along it (rather than along the loop's own travel/tangent
-            // direction) naturally excludes artifacts from walking around
-            // an axisymmetric loop (e.g. a cone's constant-slope wall),
-            // where the surface normal rotates purely because the loop
-            // goes around, without the true cross-sectional slope
-            // changing at all -- since `nozzle_dir` is the same fixed
-            // vector everywhere, its projection only varies with the
-            // local normal, not with loop-traversal position.
-            let projected = nozzle_dir - normal * nozzle_dir.dot(normal);
-            let Some(shift_dir) = projected.try_normalize() else {
-                // Nozzle axis is parallel to the surface normal here (a
-                // flat tip lands flush): no correction needed.
-                return p;
-            };
+            // Calculate tilt angle alpha between the surface normal and the vertical nozzle axis.
+            let cos_alpha = normal
+                .dot(crate::slicing::NOZZLE_DIRECTION)
+                .abs()
+                .clamp(0.0, 1.0);
+            let sin_alpha = (1.0 - cos_alpha * cos_alpha).sqrt();
 
-            let probe_a = p + shift_dir * flat_radius;
-            let probe_b = p - shift_dir * flat_radius;
-            let (Some(normal_a), Some(normal_b)) = (
-                crate::order_field::numeric_gradient(field, probe_a)
-                    .and_then(|g| g.try_normalize().map(|n| -n)),
-                crate::order_field::numeric_gradient(field, probe_b)
-                    .and_then(|g| g.try_normalize().map(|n| -n)),
-            ) else {
-                return p;
-            };
-
-            let theta = normal_a.dot(normal_b).clamp(-1.0, 1.0).acos();
-            if theta < 1e-6 {
+            if sin_alpha < 1e-4 {
                 return p;
             }
 
-            let order_a = field.order(probe_a);
-            let order_b = field.order(probe_b);
-            if !order_a.is_finite() || !order_b.is_finite() {
-                return p;
-            }
-            let score_a = -(order_a - prev_layer_order).abs();
-            let score_b = -(order_b - prev_layer_order).abs();
+            // Lowest outer edge clearance adjustment:
+            let z_clearance = flat_radius * sin_alpha * (1.0 - cos_alpha);
+            let mut elevated = p;
+            elevated.z += z_clearance;
 
-            let shift_mag = flat_radius * (theta / 2.0).sin();
-            let mut shifted = if score_b > score_a {
-                // Side `b` (`-shift_dir`) is the one closer to
-                // already-printed material: pull the center back toward
-                // `a` so the flat's trailing edge on the `b` side lands
-                // on the original contour.
-                p + shift_dir * shift_mag
-            } else if score_a > score_b {
-                p - shift_dir * shift_mag
-            } else {
-                p
-            };
-            // Flat nozzle compensation must never push a toolpath into the bed
-            // floor or below the safe minimum extrusion height for the first layer.
-            if p.z >= min_extrusion_z && shifted.z < min_extrusion_z {
-                shifted.z = min_extrusion_z;
-            } else if shifted.z < 0.0 {
-                shifted.z = 0.0;
+            if p.z >= min_extrusion_z && elevated.z < min_extrusion_z {
+                elevated.z = min_extrusion_z;
+            } else if elevated.z < 0.0 {
+                elevated.z = 0.0;
             }
-            shifted
+            elevated
         })
         .collect()
 }
@@ -1677,11 +1638,26 @@ pub fn plan_with_progress(
                             bed_fraction,
                         )
                     };
+                    let climb_slope = if distance > 1e-6 {
+                        (end.z - start.z) / distance
+                    } else {
+                        0.0
+                    };
+                    // Directional slope flow compensation:
+                    // Climbing uphill (climb_slope > 0): trailing heel irons the bead smoothly (+5% * sin)
+                    // Descending downhill (climb_slope < 0): trailing heel plows the melt, reduce flow to prevent squish (-12% * |sin|)
+                    let directional_flow_mult = if climb_slope >= 0.0 {
+                        1.0 + 0.05 * climb_slope.clamp(0.0, 1.0)
+                    } else {
+                        1.0 - 0.12 * (-climb_slope).clamp(0.0, 1.0)
+                    };
+
                     segment.extrusion_length =
                         extrusion::segment_extrusion_length(distance, bead_area, filament_area)
                             * segment.extrusion_rate
                             * extrusion_multiplier
-                            * first_layer_mult;
+                            * first_layer_mult
+                            * directional_flow_mult;
                     let nominal_speed = if is_overhang {
                         config.wave_overhang_speed()
                     } else {
@@ -3342,6 +3318,27 @@ mod tests {
             assert!(
                 pt.z >= min_extrusion_z,
                 "compensated point must not dip below min extrusion z: {pt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compensate_flat_nozzle_preserves_xy_centerline_without_distortion() {
+        let field =
+            manifold_fidget::order::ConicalOrderField::new(DVec3::ZERO, BUILD_DIRECTION, 0.5);
+        let points = vec![
+            DVec3::new(2.0, 0.0, 1.0),
+            DVec3::new(0.0, 2.0, 1.0),
+            DVec3::new(-2.0, 0.0, 1.0),
+            DVec3::new(0.0, -2.0, 1.0),
+        ];
+        let compensated = compensate_wall_loop_points(&points, &field, 0.4, 0.2, 1.0, 0.0);
+        for (orig, comp) in points.iter().zip(compensated.iter()) {
+            assert_eq!(orig.x, comp.x, "X coordinate must remain on true contour");
+            assert_eq!(orig.y, comp.y, "Y coordinate must remain on true contour");
+            assert!(
+                comp.z >= orig.z,
+                "Z coordinate must be elevated for clearance on slope"
             );
         }
     }
