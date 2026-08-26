@@ -4,7 +4,9 @@ use crate::{
     ids::ObjectId, mesh::Mesh, object::Object, order_field, polygon2d, Error, Result, SlicerConfig,
 };
 use glam::DVec3;
-use manifold_fidget::contour::{extract_contours, extract_order_contours_on_mesh, plane_basis};
+use manifold_fidget::contour::{
+    extract_contours, extract_order_contours_on_mesh_with_orders, plane_basis,
+};
 use manifold_fidget::marching_cubes::extract_sparse_isosurface_positions;
 use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{order_range_over_bbox, HeightOrderField, OrderField};
@@ -492,6 +494,7 @@ pub fn slice_mesh_with_progress(
     // old `min.dot(BUILD_DIRECTION)`/`max.dot(BUILD_DIRECTION)` shortcut —
     // exact for any field whose extrema are attained at box corners, which
     // covers the affine `HeightOrderField` default used everywhere today.
+    on_progress(0.01);
     let field: Arc<dyn OrderField> = Arc::from(order_field::order_field_for_with_sdf(
         config.order_field,
         config,
@@ -499,7 +502,7 @@ pub fn slice_mesh_with_progress(
         slope_profile,
         Some(&*sdf),
     ));
-    on_progress(0.05);
+    on_progress(0.04);
     // `order_range_over_bbox` samples 27 points on the mesh's axis-aligned
     // bounding box (corners, edge midpoints, face center). That's exact for
     // affine fields (`HeightOrderField`, `ConicalOrderField`) whose extrema
@@ -607,18 +610,17 @@ pub fn slice_mesh_with_progress(
     // isosurface once (not once per layer) and walks it per layer.
     let is_height = matches!(config.order_field, order_field::OrderFieldKind::Height);
 
-    let outer_wall_mesh: Vec<DVec3> = if is_height {
-        Vec::new()
+    let (outer_wall_mesh, outer_wall_mesh_orders): (Vec<DVec3>, Vec<f64>) = if is_height {
+        (Vec::new(), Vec::new())
     } else {
         // High-resolution sparse narrow-band marching cubes: target a fine cell size
-        // (~0.05-0.1mm) to resolve thin walls and intricate features without voxel aliasing holes.
-        // High-resolution sparse narrow-band marching cubes: target a fine cell size
-        // (~0.02-0.05mm) to resolve thin walls and intricate features without voxel aliasing holes.
-        let cell_size = (config.wall_offset / 4.0)
-            .min(config.wall_line_width / 8.0)
-            .clamp(0.01, 0.05);
+        // (~0.05-0.10mm) to resolve thin walls and intricate features without voxel aliasing holes.
+        let cell_size = (config.wall_offset / 2.0)
+            .min(config.wall_line_width / 4.0)
+            .clamp(0.04, 0.10);
         let iso = -config.wall_offset;
         let pad = DVec3::splat(cell_size * 2.0);
+        on_progress(0.05);
         let positions = extract_sparse_isosurface_positions::<MeshSdf>(
             &*side_sdf,
             min - pad,
@@ -626,8 +628,10 @@ pub fn slice_mesh_with_progress(
             cell_size,
             iso,
         );
+        on_progress(0.08);
+        let orders: Vec<f64> = positions.par_iter().map(|&p| field.order(p)).collect();
         on_progress(0.10);
-        positions
+        (positions, orders)
     };
 
     let completed = AtomicUsize::new(0);
@@ -665,9 +669,9 @@ pub fn slice_mesh_with_progress(
             } else {
                 // Wall 0: straight from the mesh's actual isosurface (see
                 // `outer_wall_mesh`'s doc comment above).
-                let wall0_loops = extract_order_contours_on_mesh(
+                let wall0_loops = extract_order_contours_on_mesh_with_orders(
                     &outer_wall_mesh,
-                    &*field,
+                    &outer_wall_mesh_orders,
                     order_value,
                     BUILD_DIRECTION,
                 );

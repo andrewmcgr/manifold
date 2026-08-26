@@ -160,6 +160,21 @@ impl Aabb {
         let dz = (self.min.z - p.z).max(0.0).max(p.z - self.max.z);
         dx * dx + dy * dy + dz * dz
     }
+
+    /// Fast slab-based ray-AABB intersection test.
+    fn ray_intersects(&self, orig: DVec3, inv_dir: DVec3) -> bool {
+        let t1 = (self.min.x - orig.x) * inv_dir.x;
+        let t2 = (self.max.x - orig.x) * inv_dir.x;
+        let t3 = (self.min.y - orig.y) * inv_dir.y;
+        let t4 = (self.max.y - orig.y) * inv_dir.y;
+        let t5 = (self.min.z - orig.z) * inv_dir.z;
+        let t6 = (self.max.z - orig.z) * inv_dir.z;
+
+        let tmin = t1.min(t2).max(t3.min(t4)).max(t5.min(t6));
+        let tmax = t1.max(t2).min(t3.max(t4)).min(t5.max(t6));
+
+        tmax >= tmin.max(0.0)
+    }
 }
 
 enum Node {
@@ -323,6 +338,56 @@ impl TriangleBvh {
         }
     }
 
+    /// Counts the number of triangle intersections for a ray originating at `orig`
+    /// travelling along unit direction `dir`, using $O(\log N)$ BVH pruning and
+    /// Möller–Trumbore intersection tests.
+    pub fn ray_crossings(&self, orig: DVec3, dir: DVec3) -> usize {
+        let Some(root) = &self.root else {
+            return 0;
+        };
+        let inv_dir = DVec3::new(
+            if dir.x.abs() > 1e-12 {
+                1.0 / dir.x
+            } else {
+                1e12
+            },
+            if dir.y.abs() > 1e-12 {
+                1.0 / dir.y
+            } else {
+                1e12
+            },
+            if dir.z.abs() > 1e-12 {
+                1.0 / dir.z
+            } else {
+                1e12
+            },
+        );
+
+        let mut count = 0;
+        let mut stack = Vec::with_capacity(32);
+        stack.push(root);
+
+        while let Some(node) = stack.pop() {
+            if !node.bounds().ray_intersects(orig, inv_dir) {
+                continue;
+            }
+            match node {
+                Node::Leaf { indices, .. } => {
+                    for &idx in indices {
+                        if ray_triangle_hit(orig, dir, &self.triangles[idx]) {
+                            count += 1;
+                        }
+                    }
+                }
+                Node::Internal { left, right, .. } => {
+                    stack.push(left);
+                    stack.push(right);
+                }
+            }
+        }
+        count
+    }
+
     /// Number of triangles indexed by this BVH.
     pub fn len(&self) -> usize {
         self.triangles.len()
@@ -337,6 +402,31 @@ impl TriangleBvh {
     pub fn triangle(&self, index: usize) -> &Triangle {
         &self.triangles[index]
     }
+}
+
+/// Möller–Trumbore ray-triangle intersection test.
+fn ray_triangle_hit(orig: DVec3, dir: DVec3, tri: &Triangle) -> bool {
+    const EPS: f64 = 1e-9;
+    let edge1 = tri.b - tri.a;
+    let edge2 = tri.c - tri.a;
+    let h = dir.cross(edge2);
+    let det = edge1.dot(h);
+    if det.abs() < EPS {
+        return false;
+    }
+    let inv_det = 1.0 / det;
+    let s = orig - tri.a;
+    let u = s.dot(h) * inv_det;
+    if !(0.0..=1.0).contains(&u) {
+        return false;
+    }
+    let q = s.cross(edge1);
+    let v = dir.dot(q) * inv_det;
+    if v < 0.0 || u + v > 1.0 {
+        return false;
+    }
+    let t = edge2.dot(q) * inv_det;
+    t > EPS
 }
 
 #[cfg(test)]

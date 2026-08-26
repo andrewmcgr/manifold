@@ -443,14 +443,35 @@ impl MeshSdf {
                 // cos(angle between diff and normal).
                 let cos_angle = diff.dot(normal) / dist;
 
-                const AMBIGUOUS_COS_THRESHOLD: f64 = 0.7;
+                const AMBIGUOUS_COS_THRESHOLD: f64 = 0.15;
                 if cos_angle.abs() >= AMBIGUOUS_COS_THRESHOLD {
                     return if cos_angle < 0.0 { -1.0 } else { 1.0 };
                 }
 
-                self.winding_number_sign(p)
+                self.fast_parity_sign(p)
             }
             SignMethod::WindingNumber => self.winding_number_sign(p),
+        }
+    }
+
+    /// Fast BVH-accelerated multi-ray parity sign check: casts rays along 3 slightly
+    /// non-axis-aligned directions through the BVH in $O(\log N)$ time, using majority vote.
+    fn fast_parity_sign(&self, p: DVec3) -> f64 {
+        const DIRS: [DVec3; 3] = [
+            DVec3::new(1.0, 0.0173, 0.0091),
+            DVec3::new(0.0091, 1.0, 0.0173),
+            DVec3::new(0.0173, 0.0091, 1.0),
+        ];
+        let mut inside_votes = 0;
+        for dir in DIRS {
+            if self.bvh.ray_crossings(p, dir) % 2 == 1 {
+                inside_votes += 1;
+            }
+        }
+        if inside_votes >= 2 {
+            -1.0
+        } else {
+            1.0
         }
     }
 

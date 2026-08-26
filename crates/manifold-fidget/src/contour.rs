@@ -770,6 +770,20 @@ pub fn extract_order_contours_on_mesh<O: OrderField + ?Sized>(
     order_value: f64,
     reference: DVec3,
 ) -> Vec<Vec<DVec3>> {
+    let orders: Vec<f64> = triangle_positions
+        .iter()
+        .map(|&p| order_field.order(p))
+        .collect();
+    extract_order_contours_on_mesh_with_orders(triangle_positions, &orders, order_value, reference)
+}
+
+/// Extracts polylines at `order_value` from `triangle_positions` with precomputed per-vertex `triangle_orders`.
+pub fn extract_order_contours_on_mesh_with_orders(
+    triangle_positions: &[DVec3],
+    triangle_orders: &[f64],
+    order_value: f64,
+    reference: DVec3,
+) -> Vec<Vec<DVec3>> {
     // Relative epsilon: generous enough to absorb floating-point noise from
     // marching-cubes' isosurface interpolation landing a hair off an
     // FMM-solved plateau value, but far smaller than any real layer/wall
@@ -794,13 +808,12 @@ pub fn extract_order_contours_on_mesh<O: OrderField + ?Sized>(
 
     let mut segments: Vec<(DVec3, DVec3)> = Vec::new();
 
-    for tri in triangle_positions.chunks_exact(3) {
+    for (tri, v_chunk) in triangle_positions
+        .chunks_exact(3)
+        .zip(triangle_orders.chunks_exact(3))
+    {
         let p = [tri[0], tri[1], tri[2]];
-        let v = [
-            order_field.order(p[0]),
-            order_field.order(p[1]),
-            order_field.order(p[2]),
-        ];
+        let v = [v_chunk[0], v_chunk[1], v_chunk[2]];
         let s = [side(v[0]), side(v[1]), side(v[2])];
 
         let mut crossing_points: Vec<DVec3> = Vec::with_capacity(2);
