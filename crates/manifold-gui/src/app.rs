@@ -2115,6 +2115,20 @@ impl ManifoldApp {
                                         Some(&self.machine),
                                     );
                                     ui.label(format!("speed (actual): {:.1} mm/s", actual_speed));
+
+                                    let length = (b - a).length();
+                                    let duration = if actual_speed > 1e-4 {
+                                        length / actual_speed
+                                    } else {
+                                        let speed_mm_s = (segment.speed / 60.0).max(1e-3);
+                                        length / speed_mm_s
+                                    };
+                                    if duration < 0.1 {
+                                        ui.label(format!("duration: {:.1} ms", duration * 1000.0));
+                                    } else {
+                                        ui.label(format!("duration: {:.3} s", duration));
+                                    }
+
                                     let flow = toolpath_view::segment_scalar_value(
                                         segment,
                                         a,
@@ -2125,23 +2139,6 @@ impl ManifoldApp {
                                     );
                                     if segment.kind != manifold_core::toolpath::MoveKind::Travel {
                                         ui.label(format!("flow rate: {:.2} mm³/s", flow));
-                                    } else {
-                                        let duration = toolpath_view::segment_scalar_value(
-                                            segment,
-                                            a,
-                                            b,
-                                            ToolpathDataView::TravelDurations,
-                                            &self.config,
-                                            Some(&self.machine),
-                                        );
-                                        if duration < 0.1 {
-                                            ui.label(format!(
-                                                "duration: {:.1} ms",
-                                                duration * 1000.0
-                                            ));
-                                        } else {
-                                            ui.label(format!("duration: {:.3} s", duration));
-                                        }
                                     }
                                     let accel = toolpath_view::segment_scalar_value(
                                         segment,
