@@ -9,6 +9,11 @@ pub struct Tool {
     pub id: ToolId,
     /// Nozzle diameter in millimeters.
     pub nozzle_diameter: f64,
+    /// Diameter (mm) of the nozzle tip's flat land, used by
+    /// `toolpath::compensate_flat_nozzle`. Defaults to twice
+    /// `nozzle_diameter` when `None`.
+    #[serde(default)]
+    pub nozzle_flat_diameter: Option<f64>,
     /// Full position + orientation of this tool's mount on the machine.
     ///
     /// Modeled as a transform (not a Z-offset scalar) so tilting-tool
@@ -39,6 +44,7 @@ impl Tool {
         Self {
             id,
             nozzle_diameter,
+            nozzle_flat_diameter: None,
             mount: Transform::identity(),
             collision_envelope: BoundingVolume::Sphere {
                 center: DVec3::ZERO,
@@ -53,6 +59,14 @@ impl Tool {
     #[must_use]
     pub fn nozzle_temperature(&self) -> f64 {
         self.nozzle_temperature.unwrap_or(240.0)
+    }
+
+    /// Diameter (mm) of the nozzle tip's flat land, defaulting to twice
+    /// [`Self::nozzle_diameter`] if unset.
+    #[must_use]
+    pub fn nozzle_flat_diameter(&self) -> f64 {
+        self.nozzle_flat_diameter
+            .unwrap_or(2.0 * self.nozzle_diameter)
     }
 }
 

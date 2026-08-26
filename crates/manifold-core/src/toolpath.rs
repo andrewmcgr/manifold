@@ -439,16 +439,24 @@ fn support_fractions_at(
     (support_fraction, bed_fraction)
 }
 
-fn compensate_flat_nozzle(paths: Vec<Path>, layer: &Layer, config: &SlicerConfig) -> Vec<Path> {
-    let flat_radius = config.nozzle_flat_diameter() / 2.0;
-    if flat_radius <= f64::EPSILON {
-        return paths;
-    }
+fn compensate_flat_nozzle(
+    paths: Vec<Path>,
+    layer: &Layer,
+    config: &SlicerConfig,
+    tools: &[Tool],
+) -> Vec<Path> {
     let field = layer.order_field.as_ref();
 
     paths
         .into_iter()
         .map(|mut path| {
+            let flat_radius = tools.iter().find(|t| t.id == path.tool).map_or_else(
+                || config.nozzle_flat_diameter() / 2.0,
+                |t| t.nozzle_flat_diameter() / 2.0,
+            );
+            if flat_radius <= f64::EPSILON {
+                return path;
+            }
             let is_outer_wall = path
                 .segments
                 .first()
@@ -1572,7 +1580,7 @@ pub fn plan_with_progress(
                 layer.order,
                 config.nozzle_diameter,
             );
-            let paths = compensate_flat_nozzle(paths, layer, config);
+            let paths = compensate_flat_nozzle(paths, layer, config, tools);
             let paths = simplify_paths(paths, config);
             let paths = optimize_travel_order(paths, config);
             let paths = route_travel_moves(paths, layer.mesh_sdf.as_deref(), slope_profile, config);

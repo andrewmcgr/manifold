@@ -653,20 +653,6 @@ impl ManifoldApp {
 
         ui.collapsing("Extrusion & Walls", |ui| {
             ui.add(
-                egui::Slider::new(&mut self.config.nozzle_diameter, 0.1..=1.5)
-                    .text("Nozzle diameter (mm)"),
-            );
-            let mut flat_diam = self.config.nozzle_flat_diameter();
-            if ui
-                .add(
-                    egui::Slider::new(&mut flat_diam, 0.0..=3.0)
-                        .text("Nozzle flat land diameter (mm)"),
-                )
-                .changed()
-            {
-                self.config.nozzle_flat_diameter = Some(flat_diam);
-            }
-            ui.add(
                 egui::Slider::new(&mut self.config.wall_line_width, 0.05..=1.5)
                     .text("Wall line width (mm)"),
             );
@@ -1455,6 +1441,16 @@ impl ManifoldApp {
                         egui::Slider::new(&mut tool.nozzle_diameter, 0.1..=1.5)
                             .text("Nozzle diameter (mm)"),
                     );
+                    let mut flat_diam = tool.nozzle_flat_diameter();
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut flat_diam, 0.0..=3.0)
+                                .text("Nozzle flat land diameter (mm)"),
+                        )
+                        .changed()
+                    {
+                        tool.nozzle_flat_diameter = Some(flat_diam);
+                    }
                     ui.add(
                         egui::Slider::new(&mut tool.extrusion_multiplier, 0.5..=1.5)
                             .text("Extrusion multiplier"),
