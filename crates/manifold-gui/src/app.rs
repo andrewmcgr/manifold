@@ -949,11 +949,28 @@ impl ManifoldApp {
         ui.heading("Infill");
         let mut sparse_pattern = self.config.sparse_infill_pattern();
         if egui::ComboBox::from_label("Sparse pattern")
-            .selected_text(format!("{:?}", sparse_pattern))
+            .selected_text(infill_pattern_label(sparse_pattern))
             .show_ui(ui, |ui| {
                 let mut changed = false;
                 changed |= ui
                     .selectable_value(&mut sparse_pattern, InfillPatternKind::Cubic, "Cubic")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut sparse_pattern, InfillPatternKind::Gyroid, "Gyroid")
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut sparse_pattern,
+                        InfillPatternKind::SchwarzD,
+                        "Schwarz Diamond (D)",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut sparse_pattern,
+                        InfillPatternKind::SchwarzP,
+                        "Schwarz Primitive (P)",
+                    )
                     .changed();
                 changed |= ui
                     .selectable_value(
@@ -989,7 +1006,7 @@ impl ManifoldApp {
 
         let mut solid_pattern = self.config.solid_infill_pattern();
         if egui::ComboBox::from_label("Solid pattern")
-            .selected_text(format!("{:?}", solid_pattern))
+            .selected_text(infill_pattern_label(solid_pattern))
             .show_ui(ui, |ui| {
                 let mut changed = false;
                 changed |= ui
@@ -1007,6 +1024,26 @@ impl ManifoldApp {
                         &mut solid_pattern,
                         InfillPatternKind::Monotonic,
                         "Monotonic",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut solid_pattern, InfillPatternKind::Cubic, "Cubic")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut solid_pattern, InfillPatternKind::Gyroid, "Gyroid")
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut solid_pattern,
+                        InfillPatternKind::SchwarzD,
+                        "Schwarz Diamond (D)",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut solid_pattern,
+                        InfillPatternKind::SchwarzP,
+                        "Schwarz Primitive (P)",
                     )
                     .changed();
                 changed |= ui
@@ -2377,6 +2414,20 @@ fn default_machine() -> Machine {
         },
         vec![Tool::new(ToolId(0), 0.4)],
     )
+}
+
+/// Human-readable display label for an [`InfillPatternKind`].
+fn infill_pattern_label(kind: InfillPatternKind) -> &'static str {
+    match kind {
+        InfillPatternKind::Cubic => "Cubic",
+        InfillPatternKind::Gyroid => "Gyroid",
+        InfillPatternKind::SchwarzD => "Schwarz Diamond (D)",
+        InfillPatternKind::SchwarzP => "Schwarz Primitive (P)",
+        InfillPatternKind::Monotonic => "Monotonic",
+        InfillPatternKind::Concentric => "Concentric",
+        InfillPatternKind::AllWalls => "All Walls",
+        InfillPatternKind::None => "None",
+    }
 }
 
 impl eframe::App for ManifoldApp {
