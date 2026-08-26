@@ -391,6 +391,26 @@ impl NanoGridBuffer {
     }
 }
 
+impl ScalarField for NanoGridBuffer {
+    fn sample(&self, p: DVec3) -> crate::FieldSample {
+        let val = self.sample(p);
+        let h = (self.header.voxel_size[0] as f64).max(1e-4);
+        let gx = (self.sample(p + DVec3::new(h, 0.0, 0.0))
+            - self.sample(p - DVec3::new(h, 0.0, 0.0))) as f64
+            / (2.0 * h);
+        let gy = (self.sample(p + DVec3::new(0.0, h, 0.0))
+            - self.sample(p - DVec3::new(0.0, h, 0.0))) as f64
+            / (2.0 * h);
+        let gz = (self.sample(p + DVec3::new(0.0, 0.0, h))
+            - self.sample(p - DVec3::new(0.0, 0.0, h))) as f64
+            / (2.0 * h);
+        crate::FieldSample {
+            value: val as f64,
+            gradient: DVec3::new(gx, gy, gz),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +466,22 @@ mod tests {
         let clear =
             grid.is_chord_blocked(DVec3::new(-2.0, 2.0, 0.0), DVec3::new(2.0, 2.0, 0.0), 0.2);
         assert!(!clear, "expected chord outside sphere to be clear");
+    }
+
+    #[test]
+    fn nanovdb_scalar_field_sample_returns_value_and_gradient() {
+        let tree = TreeField::new(sphere_tree(1.0));
+        let grid = NanoGridBuffer::build_from_scalar_field(
+            &tree,
+            DVec3::splat(-1.5),
+            DVec3::splat(1.5),
+            0.1,
+            0.0,
+            0.5,
+        );
+
+        let s = ScalarField::sample(&grid, DVec3::new(1.0, 0.0, 0.0));
+        assert!(s.value.abs() < 0.15);
+        assert!(s.gradient.length() > 0.5);
     }
 }
