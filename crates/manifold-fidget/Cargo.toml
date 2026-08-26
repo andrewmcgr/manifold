@@ -12,6 +12,7 @@ fidget = "0.5"
 rayon.workspace = true
 tracing.workspace = true
 bytemuck = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 

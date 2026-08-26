@@ -178,6 +178,9 @@ enum InfillPatternArg {
     AllWalls,
     #[default]
     Cubic,
+    Gyroid,
+    SchwarzD,
+    SchwarzP,
     None,
 }
 
@@ -188,6 +191,9 @@ impl From<InfillPatternArg> for InfillPatternKind {
             InfillPatternArg::Concentric => InfillPatternKind::Concentric,
             InfillPatternArg::AllWalls => InfillPatternKind::AllWalls,
             InfillPatternArg::Cubic => InfillPatternKind::Cubic,
+            InfillPatternArg::Gyroid => InfillPatternKind::Gyroid,
+            InfillPatternArg::SchwarzD => InfillPatternKind::SchwarzD,
+            InfillPatternArg::SchwarzP => InfillPatternKind::SchwarzP,
             InfillPatternArg::None => InfillPatternKind::None,
         }
     }

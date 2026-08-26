@@ -22,6 +22,7 @@ pub mod nanovdb;
 pub mod order;
 pub mod slice;
 pub mod slope_profile;
+pub mod tpms;
 
 #[cfg(feature = "gpu")]
 pub mod gpu;

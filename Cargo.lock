@@ -2493,6 +2493,7 @@ dependencies = [
  "glam 0.29.3",
  "pollster 0.3.0",
  "rayon",
+ "serde",
  "tracing",
  "wgpu 22.1.0",
 ]

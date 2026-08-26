@@ -14,6 +14,7 @@ use crate::transform::Transform;
 use crate::SlicerConfig;
 use glam::DVec3;
 use manifold_fidget::contour::plane_basis;
+use manifold_fidget::ScalarField;
 
 /// Which built-in infill pattern to generate. New patterns are added as a
 /// new variant here plus a new `InfillGenerator` impl wired into
@@ -41,6 +42,15 @@ pub enum InfillPatternKind {
     /// with space diagonals along the Cartesian axes (45-degree inclination to
     /// the build plate), forming a 3D isotropic truss. See [`CubicInfill`].
     Cubic,
+    /// Triply Periodic Minimal Surface (TPMS) Gyroid infill: continuous, self-supporting
+    /// 3D minimal surface lattice with isotropic stiffness and high permeability.
+    Gyroid,
+    /// Triply Periodic Minimal Surface (TPMS) Schwarz Diamond (D) infill: high-strength
+    /// continuous minimal surface truss structure.
+    SchwarzD,
+    /// Triply Periodic Minimal Surface (TPMS) Schwarz Primitive (P) infill: simple, highly
+    /// open continuous cubic minimal surface structure.
+    SchwarzP,
     /// No sparse infill at all. Walls and solid-fill (top/bottom) regions
     /// still print; sprarse infill between them is omitted.
     None,
@@ -54,6 +64,9 @@ pub fn generator_for(kind: InfillPatternKind) -> Box<dyn InfillGenerator + Sync>
         InfillPatternKind::Concentric => Box::new(ConcentricInfill),
         InfillPatternKind::AllWalls => Box::new(AllWallsInfill),
         InfillPatternKind::Cubic => Box::new(CubicInfill),
+        InfillPatternKind::Gyroid => Box::new(GyroidInfill),
+        InfillPatternKind::SchwarzD => Box::new(SchwarzDInfill),
+        InfillPatternKind::SchwarzP => Box::new(SchwarzPInfill),
         InfillPatternKind::None => Box::new(NoneInfill),
     }
 }
@@ -512,6 +525,251 @@ pub struct ConcentricInfill;
 /// the build plate), forming a 3D isotropic truss.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CubicInfill;
+
+/// Triply Periodic Minimal Surface (TPMS) Gyroid infill generator.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GyroidInfill;
+
+impl InfillGenerator for GyroidInfill {
+    fn generate(
+        &self,
+        region: &InfillRegion,
+        config: &SlicerConfig,
+        layer: &Layer,
+        object_transform: &Transform,
+        density: f64,
+    ) -> Vec<Path> {
+        generate_tpms_infill(
+            manifold_fidget::tpms::TpmsKind::Gyroid,
+            region,
+            config,
+            layer,
+            object_transform,
+            density,
+        )
+    }
+}
+
+/// Triply Periodic Minimal Surface (TPMS) Schwarz Diamond (D) infill generator.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SchwarzDInfill;
+
+impl InfillGenerator for SchwarzDInfill {
+    fn generate(
+        &self,
+        region: &InfillRegion,
+        config: &SlicerConfig,
+        layer: &Layer,
+        object_transform: &Transform,
+        density: f64,
+    ) -> Vec<Path> {
+        generate_tpms_infill(
+            manifold_fidget::tpms::TpmsKind::SchwarzD,
+            region,
+            config,
+            layer,
+            object_transform,
+            density,
+        )
+    }
+}
+
+/// Triply Periodic Minimal Surface (TPMS) Schwarz Primitive (P) infill generator.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SchwarzPInfill;
+
+impl InfillGenerator for SchwarzPInfill {
+    fn generate(
+        &self,
+        region: &InfillRegion,
+        config: &SlicerConfig,
+        layer: &Layer,
+        object_transform: &Transform,
+        density: f64,
+    ) -> Vec<Path> {
+        generate_tpms_infill(
+            manifold_fidget::tpms::TpmsKind::SchwarzP,
+            region,
+            config,
+            layer,
+            object_transform,
+            density,
+        )
+    }
+}
+
+fn generate_tpms_infill(
+    kind: manifold_fidget::tpms::TpmsKind,
+    region: &InfillRegion,
+    config: &SlicerConfig,
+    layer: &Layer,
+    _object_transform: &Transform,
+    density: f64,
+) -> Vec<Path> {
+    if region.is_empty() || density <= 0.0 {
+        return Vec::new();
+    }
+
+    let wavelength =
+        manifold_fidget::tpms::TpmsField::wavelength_for_density(config.infill_line_width, density);
+    let tpms_field = manifold_fidget::tpms::TpmsField::new(kind, wavelength, 0.0);
+
+    let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
+    let (basis1, basis2) = plane_basis(axis);
+
+    let loops_2d = polygon2d::canonicalize(&polygon2d::to_2d(&region.loops, basis1, basis2, apex));
+    if loops_2d.is_empty() {
+        return Vec::new();
+    }
+
+    let mut min_u = f64::INFINITY;
+    let mut max_u = f64::NEG_INFINITY;
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
+
+    for loop_pts in &loops_2d {
+        for &[u, v] in loop_pts {
+            min_u = min_u.min(u);
+            max_u = max_u.max(u);
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+        }
+    }
+
+    let step = (config.infill_line_width * 0.75).clamp(0.1, 1.5);
+    let nu = (((max_u - min_u) / step).ceil() as usize).max(2);
+    let nv = (((max_v - min_v) / step).ceil() as usize).max(2);
+    let du = (max_u - min_u) / nu as f64;
+    let dv = (max_v - min_v) / nv as f64;
+
+    let mut grid_vals = vec![0.0f64; (nu + 1) * (nv + 1)];
+    for j in 0..=nv {
+        let v = min_v + j as f64 * dv;
+        for i in 0..=nu {
+            let u = min_u + i as f64 * du;
+            let world_p = apex + basis1 * u + basis2 * v + axis * layer.order;
+            grid_vals[j * (nu + 1) + i] = tpms_field.sample(world_p).value;
+        }
+    }
+
+    let mut segments_2d: Vec<([f64; 2], [f64; 2])> = Vec::new();
+    for j in 0..nv {
+        let v0 = min_v + j as f64 * dv;
+        let v1 = v0 + dv;
+        for i in 0..nu {
+            let u0 = min_u + i as f64 * du;
+            let u1 = u0 + du;
+
+            let c0 = [u0, v0];
+            let c1 = [u1, v0];
+            let c2 = [u1, v1];
+            let c3 = [u0, v1];
+
+            let val0 = grid_vals[j * (nu + 1) + i];
+            let val1 = grid_vals[j * (nu + 1) + (i + 1)];
+            let val2 = grid_vals[(j + 1) * (nu + 1) + (i + 1)];
+            let val3 = grid_vals[(j + 1) * (nu + 1) + i];
+
+            let mut mask = 0u8;
+            if val0 < 0.0 {
+                mask |= 1;
+            }
+            if val1 < 0.0 {
+                mask |= 2;
+            }
+            if val2 < 0.0 {
+                mask |= 4;
+            }
+            if val3 < 0.0 {
+                mask |= 8;
+            }
+
+            let lerp_e = |pa: [f64; 2], va: f64, pb: [f64; 2], vb: f64| -> [f64; 2] {
+                let denom = vb - va;
+                let t = if denom.abs() < 1e-7 {
+                    0.5
+                } else {
+                    (-va / denom).clamp(0.0, 1.0)
+                };
+                [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t]
+            };
+
+            let e0 = lerp_e(c0, val0, c1, val1);
+            let e1 = lerp_e(c1, val1, c2, val2);
+            let e2 = lerp_e(c2, val2, c3, val3);
+            let e3 = lerp_e(c3, val3, c0, val0);
+
+            match mask {
+                1 | 14 => segments_2d.push((e3, e0)),
+                2 | 13 => segments_2d.push((e0, e1)),
+                3 | 12 => segments_2d.push((e3, e1)),
+                4 | 11 => segments_2d.push((e1, e2)),
+                5 => {
+                    segments_2d.push((e3, e0));
+                    segments_2d.push((e1, e2));
+                }
+                6 | 9 => segments_2d.push((e0, e2)),
+                7 | 8 => segments_2d.push((e2, e3)),
+                10 => {
+                    segments_2d.push((e0, e1));
+                    segments_2d.push((e2, e3));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if segments_2d.is_empty() {
+        return Vec::new();
+    }
+
+    let mut polylines_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+    for (p0, p1) in segments_2d {
+        let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
+        if polygon2d::contains_point(&loops_2d, mid) {
+            polylines_2d.push(vec![p0, p1]);
+        }
+    }
+
+    if polylines_2d.is_empty() {
+        return Vec::new();
+    }
+
+    let world_polylines = order_field::reconstruct_on_order_field_near(
+        polylines_2d,
+        &region.loops,
+        basis1,
+        basis2,
+        axis,
+        apex,
+        layer.order,
+        order_field::max_along_for(config),
+        layer.order_field.as_ref(),
+    );
+
+    world_polylines
+        .into_iter()
+        .filter(|pts| pts.len() >= 2)
+        .map(|points| {
+            let segments = points
+                .iter()
+                .map(|_| Segment {
+                    kind: MoveKind::Infill,
+                    speed: speed_for_kind(MoveKind::Infill, config),
+                    extrusion_rate: 1.0,
+                    support_fraction: 0.0,
+                    order: layer.order,
+                    extrusion_length: 0.0,
+                })
+                .collect();
+            Path {
+                points,
+                segments,
+                tool: crate::ids::ToolId::default(),
+            }
+        })
+        .collect()
+}
 
 impl InfillGenerator for CubicInfill {
     fn generate(
@@ -1759,5 +2017,38 @@ mod tests {
                 "expected first ring to sit on the boundary (distance ~0), got {d} at {p:?}"
             );
         }
+    }
+
+    #[test]
+    fn gyroid_infill_produces_paths_covering_a_square() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths = GyroidInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.2);
+        assert!(!paths.is_empty(), "expected gyroid infill paths");
+        for path in &paths {
+            assert!(!path.points.is_empty());
+            for p in &path.points {
+                assert!(p.x >= -5.001 && p.x <= 5.001, "x out of bounds: {p:?}");
+                assert!(p.y >= -5.001 && p.y <= 5.001, "y out of bounds: {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn schwarz_d_infill_produces_paths_covering_a_square() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths =
+            SchwarzDInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.2);
+        assert!(!paths.is_empty(), "expected schwarz d infill paths");
+    }
+
+    #[test]
+    fn schwarz_p_infill_produces_paths_covering_a_square() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+        let paths =
+            SchwarzPInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.2);
+        assert!(!paths.is_empty(), "expected schwarz p infill paths");
     }
 }

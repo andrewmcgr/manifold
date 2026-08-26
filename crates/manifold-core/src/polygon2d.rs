@@ -285,7 +285,7 @@ pub fn signed_area(loop_: &[[f64; 2]]) -> f64 {
 }
 
 /// Standard even-odd point-in-polygon ray cast. `loop_` is treated as closed.
-fn point_in_polygon(point: [f64; 2], loop_: &[[f64; 2]]) -> bool {
+pub fn point_in_polygon(point: [f64; 2], loop_: &[[f64; 2]]) -> bool {
     if loop_.len() < 3 {
         return false;
     }
@@ -300,6 +300,17 @@ fn point_in_polygon(point: [f64; 2], loop_: &[[f64; 2]]) -> bool {
             inside = !inside;
         }
         j = i;
+    }
+    inside
+}
+
+/// Whether `point` lies inside the region bounded by `loops_2d`.
+pub fn contains_point(loops_2d: &[Vec<[f64; 2]>], point: [f64; 2]) -> bool {
+    let mut inside = false;
+    for l in loops_2d {
+        if point_in_polygon(point, l) {
+            inside = !inside;
+        }
     }
     inside
 }
