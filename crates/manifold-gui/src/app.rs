@@ -2102,7 +2102,19 @@ impl ManifoldApp {
                             if dist <= PICK_THRESHOLD_PX {
                                 response.clone().show_tooltip_ui(|ui| {
                                     ui.label(format!("kind: {:?}", segment.kind));
-                                    ui.label(format!("speed: {:.1} mm/s", segment.speed / 60.0));
+                                    ui.label(format!(
+                                        "speed (cmd): {:.1} mm/s",
+                                        segment.speed / 60.0
+                                    ));
+                                    let actual_speed = toolpath_view::segment_scalar_value(
+                                        segment,
+                                        a,
+                                        b,
+                                        ToolpathDataView::ActualSpeed,
+                                        &self.config,
+                                        Some(&self.machine),
+                                    );
+                                    ui.label(format!("speed (actual): {:.1} mm/s", actual_speed));
                                     let flow = toolpath_view::segment_scalar_value(
                                         segment,
                                         a,
@@ -2139,7 +2151,16 @@ impl ManifoldApp {
                                         &self.config,
                                         Some(&self.machine),
                                     );
-                                    ui.label(format!("accel: {:.0} mm/s²", accel));
+                                    ui.label(format!("accel (cmd): {:.0} mm/s²", accel));
+                                    let actual_accel = toolpath_view::segment_scalar_value(
+                                        segment,
+                                        a,
+                                        b,
+                                        ToolpathDataView::ActualAcceleration,
+                                        &self.config,
+                                        Some(&self.machine),
+                                    );
+                                    ui.label(format!("accel (actual): {:.0} mm/s²", actual_accel));
                                     ui.label(format!(
                                         "extrusion_rate: {:.3}",
                                         segment.extrusion_rate
@@ -2233,8 +2254,10 @@ impl ManifoldApp {
                                             for view in [
                                                 ToolpathDataView::LineType,
                                                 ToolpathDataView::Speed,
+                                                ToolpathDataView::ActualSpeed,
                                                 ToolpathDataView::FlowRate,
                                                 ToolpathDataView::Acceleration,
+                                                ToolpathDataView::ActualAcceleration,
                                                 ToolpathDataView::TravelDurations,
                                             ] {
                                                 ui.selectable_value(
@@ -2321,6 +2344,9 @@ impl ManifoldApp {
 
                                         if view == ToolpathDataView::FlowRate
                                             || view == ToolpathDataView::Speed
+                                            || view == ToolpathDataView::ActualSpeed
+                                            || view == ToolpathDataView::Acceleration
+                                            || view == ToolpathDataView::ActualAcceleration
                                         {
                                             ui.horizontal(|ui| {
                                                 let (badge_rect, _) = ui.allocate_exact_size(

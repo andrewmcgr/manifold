@@ -47,8 +47,10 @@ pub enum ToolpathDataView {
     #[default]
     LineType,
     Speed,
+    ActualSpeed,
     FlowRate,
     Acceleration,
+    ActualAcceleration,
     TravelDurations,
 }
 
@@ -57,8 +59,10 @@ impl ToolpathDataView {
         match self {
             Self::LineType => "Line Type",
             Self::Speed => "Speed",
+            Self::ActualSpeed => "Actual Speed",
             Self::FlowRate => "Flow Rate",
             Self::Acceleration => "Acceleration",
+            Self::ActualAcceleration => "Actual Acceleration",
             Self::TravelDurations => "Travel Durations",
         }
     }
@@ -67,8 +71,10 @@ impl ToolpathDataView {
         match self {
             Self::LineType => "",
             Self::Speed => "mm/s",
+            Self::ActualSpeed => "mm/s",
             Self::FlowRate => "mm³/s",
             Self::Acceleration => "mm/s²",
+            Self::ActualAcceleration => "mm/s²",
             Self::TravelDurations => "s",
         }
     }
@@ -107,18 +113,26 @@ pub fn scalar_to_color(t: f64) -> [f32; 4] {
     ]
 }
 
-/// Computes the scalar value for `segment` under `data_view`.
-pub fn segment_scalar_value(
+/// Computes the scalar value for `segment` under `data_view`, optionally using a precomputed motion profile.
+pub fn segment_scalar_value_with_profile(
     segment: &manifold_core::toolpath::Segment,
     start: glam::DVec3,
     end: glam::DVec3,
     data_view: ToolpathDataView,
     config: &manifold_core::SlicerConfig,
     machine: Option<&manifold_core::machine::Machine>,
+    profile: Option<&manifold_core::kinematics::PlannedMotionProfile>,
 ) -> f64 {
     match data_view {
         ToolpathDataView::LineType => 0.0,
         ToolpathDataView::Speed => segment.speed / 60.0,
+        ToolpathDataView::ActualSpeed => {
+            if let Some(prof) = profile {
+                prof.cruise_speed / 60.0
+            } else {
+                segment.speed / 60.0
+            }
+        }
         ToolpathDataView::FlowRate => {
             if segment.kind == MoveKind::Travel || segment.extrusion_length <= 0.0 {
                 return 0.0;
@@ -143,6 +157,17 @@ pub fn segment_scalar_value(
                 || segment.order <= config.first_layer_height();
             model.available_acceleration(segment.kind, is_first_layer, segment.speed / 60.0)
         }
+        ToolpathDataView::ActualAcceleration => {
+            let model = config.resolved_motion_model(machine);
+            let is_first_layer = (segment.order - config.first_layer_height()).abs() < 1e-4
+                || segment.order <= config.first_layer_height();
+            let v = if let Some(prof) = profile {
+                prof.cruise_speed / 60.0
+            } else {
+                segment.speed / 60.0
+            };
+            model.available_acceleration(segment.kind, is_first_layer, v)
+        }
         ToolpathDataView::TravelDurations => {
             if segment.kind != MoveKind::Travel {
                 return 0.0;
@@ -152,6 +177,38 @@ pub fn segment_scalar_value(
             length / speed_mm_s
         }
     }
+}
+
+/// Computes the scalar value for `segment` under `data_view`.
+pub fn segment_scalar_value(
+    segment: &manifold_core::toolpath::Segment,
+    start: glam::DVec3,
+    end: glam::DVec3,
+    data_view: ToolpathDataView,
+    config: &manifold_core::SlicerConfig,
+    machine: Option<&manifold_core::machine::Machine>,
+) -> f64 {
+    segment_scalar_value_with_profile(segment, start, end, data_view, config, machine, None)
+}
+
+fn plan_path_motion_profiles(
+    path: &Path,
+    config: &manifold_core::SlicerConfig,
+    machine: Option<&manifold_core::machine::Machine>,
+) -> Vec<manifold_core::kinematics::PlannedMotionProfile> {
+    let motion_model = config.resolved_motion_model(machine);
+    let is_first_layer = path.segments.first().is_some_and(|s| {
+        (s.order - config.first_layer_height()).abs() < 1e-4
+            || s.order <= config.first_layer_height()
+    });
+    let scv = config.square_corner_velocity.unwrap_or(5.0);
+    manifold_core::kinematics::plan_path_velocities(
+        &path.points,
+        &path.segments,
+        &*motion_model,
+        is_first_layer,
+        scv,
+    )
 }
 
 /// The `(min, max)` scalar value range across all segments in `paths` for `data_view`.
@@ -207,6 +264,15 @@ pub fn data_view_range(
             }
         }
 
+        let profiles = if matches!(
+            data_view,
+            ToolpathDataView::ActualSpeed | ToolpathDataView::ActualAcceleration
+        ) {
+            plan_path_motion_profiles(path, config, machine)
+        } else {
+            Vec::new()
+        };
+
         for (i, segment) in path.segments.iter().enumerate() {
             if data_view == ToolpathDataView::TravelDurations {
                 if segment.kind != MoveKind::Travel {
@@ -230,7 +296,15 @@ pub fn data_view_range(
             }
             let start = path.points[i];
             let end = path.points[(i + 1) % n];
-            let val = segment_scalar_value(segment, start, end, data_view, config, machine);
+            let val = segment_scalar_value_with_profile(
+                segment,
+                start,
+                end,
+                data_view,
+                config,
+                machine,
+                profiles.get(i),
+            );
             // Ignore near-zero non-extruding artifacts when computing flow rate ranges
             if data_view == ToolpathDataView::FlowRate && val <= 1e-3 {
                 continue;
@@ -363,7 +437,10 @@ pub fn build_toolpath_lines(
                 let color = match data_view {
                     ToolpathDataView::LineType
                     | ToolpathDataView::FlowRate
-                    | ToolpathDataView::Speed => COLOR_TRAVEL,
+                    | ToolpathDataView::Speed
+                    | ToolpathDataView::ActualSpeed
+                    | ToolpathDataView::Acceleration
+                    | ToolpathDataView::ActualAcceleration => COLOR_TRAVEL,
                     _ => {
                         let val = segment_scalar_value(
                             &travel_segment,
@@ -390,6 +467,15 @@ pub fn build_toolpath_lines(
                 ));
             }
         }
+
+        let profiles = if matches!(
+            data_view,
+            ToolpathDataView::ActualSpeed | ToolpathDataView::ActualAcceleration
+        ) {
+            plan_path_motion_profiles(path, config, machine)
+        } else {
+            Vec::new()
+        };
 
         for (index, segment) in path.segments.iter().enumerate() {
             if segment.order > scrub_order {
@@ -420,10 +506,25 @@ pub fn build_toolpath_lines(
 
             let color = match data_view {
                 ToolpathDataView::LineType => palette_color(segment.kind),
-                ToolpathDataView::FlowRate if segment.kind == MoveKind::Travel => COLOR_TRAVEL,
-                ToolpathDataView::Speed if segment.kind == MoveKind::Travel => COLOR_TRAVEL,
+                ToolpathDataView::FlowRate
+                | ToolpathDataView::Speed
+                | ToolpathDataView::ActualSpeed
+                | ToolpathDataView::Acceleration
+                | ToolpathDataView::ActualAcceleration
+                    if segment.kind == MoveKind::Travel =>
+                {
+                    COLOR_TRAVEL
+                }
                 _ => {
-                    let val = segment_scalar_value(segment, start, end, data_view, config, machine);
+                    let val = segment_scalar_value_with_profile(
+                        segment,
+                        start,
+                        end,
+                        data_view,
+                        config,
+                        machine,
+                        profiles.get(index),
+                    );
                     let t = if let Some((min, max)) = scalar_range {
                         if max > min + 1e-4 {
                             ((val - min) / (max - min)).clamp(0.0, 1.0)
@@ -743,6 +844,28 @@ mod tests {
             None,
         );
         assert_eq!(accel_lines.len(), 3);
+
+        // Actual Speed view: plans acceleration ramp and returns valid line colors
+        let actual_speed_lines = build_toolpath_lines(
+            std::slice::from_ref(&path),
+            f64::INFINITY,
+            ToolpathDataView::ActualSpeed,
+            &config,
+            None,
+        );
+        assert_eq!(actual_speed_lines.len(), 3);
+        assert_eq!(actual_speed_lines[2].color, COLOR_TRAVEL);
+
+        // Actual Acceleration view
+        let actual_accel_lines = build_toolpath_lines(
+            std::slice::from_ref(&path),
+            f64::INFINITY,
+            ToolpathDataView::ActualAcceleration,
+            &config,
+            None,
+        );
+        assert_eq!(actual_accel_lines.len(), 3);
+        assert_eq!(actual_accel_lines[2].color, COLOR_TRAVEL);
 
         // Travel Durations view: only the Travel move is emitted, non-travel extrusion moves are filtered out
         let travel_lines = build_toolpath_lines(
