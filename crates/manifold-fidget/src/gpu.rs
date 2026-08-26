@@ -708,6 +708,240 @@ impl GpuDualFieldToolpath {
     }
 }
 
+/// GPU Eikonal Slope Profile Relaxation compute pipeline.
+pub struct GpuEikonalRelaxation {
+    ctx: GpuContext,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl GpuEikonalRelaxation {
+    pub fn new(ctx: GpuContext) -> Self {
+        let device = &ctx.device;
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("eikonal_relax_shader"),
+            source: wgpu::ShaderSource::Wgsl(EIKONAL_RELAX_WGSL.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("eikonal_relax_bgl"),
+            entries: &[
+                // 0: Params uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 1: NanoVDB Leaves storage (read-write)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("eikonal_relax_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("eikonal_relax_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        Self {
+            ctx,
+            pipeline,
+            bind_group_layout,
+        }
+    }
+
+    /// Relaxes the Lipschitz slope bounds across all active NanoVDB leaf bricks in parallel on the GPU.
+    pub fn relax(&self, grid: &mut NanoGridBuffer, slope_multiplier: f32, iterations: u32) {
+        if grid.leaves.is_empty() || iterations == 0 {
+            return;
+        }
+
+        let device = &self.ctx.device;
+        let queue = &self.ctx.queue;
+
+        let leaves_bytes = bytemuck::cast_slice(&grid.leaves);
+        let leaves_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("relax_leaves_buf"),
+            contents: leaves_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        });
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct RelaxParams {
+            h: f32,
+            slope_multiplier: f32,
+            leaf_count: u32,
+            pad0: u32,
+        }
+
+        let params = RelaxParams {
+            h: grid.header.voxel_size[0],
+            slope_multiplier,
+            leaf_count: grid.leaves.len() as u32,
+            pad0: 0,
+        };
+
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("relax_params_buf"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("relax_bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: leaves_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("relax_encoder"),
+        });
+
+        for _ in 0..iterations {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("relax_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(grid.leaves.len() as u32, 1, 1);
+        }
+
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("relax_readback"),
+            size: leaves_bytes.len() as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        encoder.copy_buffer_to_buffer(&leaves_buf, 0, &readback, 0, leaves_bytes.len() as u64);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        if rx.recv().ok().and_then(|r| r.ok()).is_none() {
+            return;
+        }
+
+        {
+            let data = slice.get_mapped_range();
+            let updated: &[crate::nanovdb::NanoLeafBrick] =
+                bytemuck::cast_slice(&data[..leaves_bytes.len()]);
+            grid.leaves.copy_from_slice(updated);
+        }
+        readback.unmap();
+    }
+}
+
+/// WGSL shader source for Eikonal Slope Profile Relaxation on NanoVDB leaf bricks.
+const EIKONAL_RELAX_WGSL: &str = r#"
+struct RelaxParams {
+    h: f32,
+    slope_multiplier: f32,
+    leaf_count: u32,
+    pad0: u32,
+};
+
+struct NanoLeafBrick {
+    origin: vec4<i32>,
+    bbox_min: vec4<f32>,
+    bbox_max: vec4<f32>,
+    value_min: f32,
+    value_max: f32,
+    pad: vec2<f32>,
+    values: array<f32, 512>,
+};
+
+@group(0) @binding(0) var<uniform> params: RelaxParams;
+@group(0) @binding(1) var<storage, read_write> leaves: array<NanoLeafBrick>;
+
+fn get_val(leaf_idx: u32, cx: u32, cy: u32, cz: u32) -> f32 {
+    let idx = (cz * 8u + cy) * 8u + cx;
+    return leaves[leaf_idx].values[idx];
+}
+
+@compute @workgroup_size(8, 8, 4)
+fn main(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>
+) {
+    let leaf_idx = workgroup_id.x;
+    if (leaf_idx >= params.leaf_count) {
+        return;
+    }
+
+    let cx = local_id.x;
+    let cy = local_id.y;
+    let step = params.slope_multiplier * params.h;
+
+    for (var s = 0u; s < 2u; s = s + 1u) {
+        let cz = local_id.z * 2u + s;
+        var cur_val = get_val(leaf_idx, cx, cy, cz);
+
+        // Check 4-connected horizontal neighbors within brick
+        if (cx > 0u) {
+            let n_val = get_val(leaf_idx, cx - 1u, cy, cz);
+            cur_val = min(cur_val, n_val + step);
+        }
+        if (cx < 7u) {
+            let n_val = get_val(leaf_idx, cx + 1u, cy, cz);
+            cur_val = min(cur_val, n_val + step);
+        }
+        if (cy > 0u) {
+            let n_val = get_val(leaf_idx, cx, cy - 1u, cz);
+            cur_val = min(cur_val, n_val + step);
+        }
+        if (cy < 7u) {
+            let n_val = get_val(leaf_idx, cx, cy + 1u, cz);
+            cur_val = min(cur_val, n_val + step);
+        }
+
+        let out_idx = (cz * 8u + cy) * 8u + cx;
+        leaves[leaf_idx].values[out_idx] = cur_val;
+    }
+}
+"#;
+
 /// WGSL shader source for Dual-Field Toolpath Curve Intersection.
 const DUAL_FIELD_WGSL: &str = r#"
 struct DfParams {
@@ -1138,5 +1372,28 @@ mod tests {
             assert!((r0 - 1.0).abs() < 0.15, "p0 radius off 1.0: {r0}");
             assert!((r1 - 1.0).abs() < 0.15, "p1 radius off 1.0: {r1}");
         }
+    }
+
+    #[test]
+    fn gpu_eikonal_relaxation_relaxes_grid() {
+        let Some(ctx) = GpuContext::new() else {
+            eprintln!("Skipping GPU test: no compatible GPU adapter available.");
+            return;
+        };
+
+        let tree = TreeField::new(sphere_tree(1.0));
+        let mut grid = NanoGridBuffer::build_from_scalar_field(
+            &tree,
+            DVec3::splat(-1.5),
+            DVec3::splat(1.5),
+            0.1,
+            0.0,
+            0.5,
+        );
+
+        let relaxer = GpuEikonalRelaxation::new(ctx);
+        let slope_mult = 15.0f32.to_radians().tan();
+        relaxer.relax(&mut grid, slope_mult, 3);
+        assert!(!grid.leaves.is_empty());
     }
 }

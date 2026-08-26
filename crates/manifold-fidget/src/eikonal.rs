@@ -886,6 +886,24 @@ impl EikonalOrderField {
         }
         self.gradients = gradients;
     }
+
+    /// Converts this Eikonal order field into a [`crate::nanovdb::NanoGridBuffer`].
+    pub fn to_nanogrid(&self) -> crate::nanovdb::NanoGridBuffer {
+        let max_corner = self.min_corner
+            + DVec3::new(
+                self.dims[0] as f64 * self.h,
+                self.dims[1] as f64 * self.h,
+                self.dims[2] as f64 * self.h,
+            );
+        crate::nanovdb::NanoGridBuffer::build_from_scalar_field(
+            self,
+            self.min_corner,
+            max_corner,
+            self.h,
+            0.0,
+            1000.0,
+        )
+    }
 }
 
 impl OrderField for EikonalOrderField {
