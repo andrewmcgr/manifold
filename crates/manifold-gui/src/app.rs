@@ -2113,6 +2113,23 @@ impl ManifoldApp {
                                     );
                                     if segment.kind != manifold_core::toolpath::MoveKind::Travel {
                                         ui.label(format!("flow rate: {:.2} mm³/s", flow));
+                                    } else {
+                                        let duration = toolpath_view::segment_scalar_value(
+                                            segment,
+                                            a,
+                                            b,
+                                            ToolpathDataView::TravelDurations,
+                                            &self.config,
+                                            Some(&self.machine),
+                                        );
+                                        if duration < 0.1 {
+                                            ui.label(format!(
+                                                "duration: {:.1} ms",
+                                                duration * 1000.0
+                                            ));
+                                        } else {
+                                            ui.label(format!("duration: {:.3} s", duration));
+                                        }
                                     }
                                     let accel = toolpath_view::segment_scalar_value(
                                         segment,
@@ -2218,6 +2235,7 @@ impl ManifoldApp {
                                                 ToolpathDataView::Speed,
                                                 ToolpathDataView::FlowRate,
                                                 ToolpathDataView::Acceleration,
+                                                ToolpathDataView::TravelDurations,
                                             ] {
                                                 ui.selectable_value(
                                                     &mut self.toolpath_data_view,
@@ -2285,12 +2303,18 @@ impl ManifoldApp {
                                                     egui::Sense::hover(),
                                                 );
                                                 ui.painter().rect_filled(badge_rect, 2.0, color);
-                                                let label_str = if (max_val - min_val).abs() > 10.0
-                                                {
-                                                    format!("{val:.0} {unit}")
-                                                } else {
-                                                    format!("{val:.2} {unit}")
-                                                };
+                                                let label_str =
+                                                    if view == ToolpathDataView::TravelDurations {
+                                                        if max_val < 0.1 {
+                                                            format!("{:.1} ms", val * 1000.0)
+                                                        } else {
+                                                            format!("{val:.3} s")
+                                                        }
+                                                    } else if (max_val - min_val).abs() > 10.0 {
+                                                        format!("{val:.0} {unit}")
+                                                    } else {
+                                                        format!("{val:.2} {unit}")
+                                                    };
                                                 ui.label(egui::RichText::new(label_str).size(11.0));
                                             });
                                         }

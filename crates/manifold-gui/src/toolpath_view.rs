@@ -49,6 +49,7 @@ pub enum ToolpathDataView {
     Speed,
     FlowRate,
     Acceleration,
+    TravelDurations,
 }
 
 impl ToolpathDataView {
@@ -58,6 +59,7 @@ impl ToolpathDataView {
             Self::Speed => "Speed",
             Self::FlowRate => "Flow Rate",
             Self::Acceleration => "Acceleration",
+            Self::TravelDurations => "Travel Durations",
         }
     }
 
@@ -67,6 +69,7 @@ impl ToolpathDataView {
             Self::Speed => "mm/s",
             Self::FlowRate => "mm³/s",
             Self::Acceleration => "mm/s²",
+            Self::TravelDurations => "s",
         }
     }
 }
@@ -140,6 +143,14 @@ pub fn segment_scalar_value(
                 || segment.order <= config.first_layer_height();
             model.available_acceleration(segment.kind, is_first_layer, segment.speed / 60.0)
         }
+        ToolpathDataView::TravelDurations => {
+            if segment.kind != MoveKind::Travel {
+                return 0.0;
+            }
+            let length = (end - start).length();
+            let speed_mm_s = (segment.speed / 60.0).max(1e-3);
+            length / speed_mm_s
+        }
     }
 }
 
@@ -158,13 +169,60 @@ pub fn data_view_range(
     let mut max_val = f64::NEG_INFINITY;
     let mut count = 0;
 
+    let mut prev_endpoint: Option<glam::DVec3> = None;
+
     for path in paths {
         let n = path.points.len();
         if n == 0 {
             continue;
         }
+        let path_start = path.points[0];
+        let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
+
+        if let Some(prev_end) = prev_endpoint {
+            if prev_end.distance(path_start) > 1e-6
+                && data_view == ToolpathDataView::TravelDurations
+            {
+                let travel_segment = manifold_core::toolpath::Segment {
+                    kind: MoveKind::Travel,
+                    speed: config.travel_speed,
+                    extrusion_rate: 0.0,
+                    support_fraction: 0.0,
+                    order: path_order,
+                    extrusion_length: 0.0,
+                };
+                let val = segment_scalar_value(
+                    &travel_segment,
+                    prev_end,
+                    path_start,
+                    data_view,
+                    config,
+                    machine,
+                );
+                if val > 1e-6 {
+                    min_val = min_val.min(val);
+                    max_val = max_val.max(val);
+                    count += 1;
+                }
+            }
+        }
 
         for (i, segment) in path.segments.iter().enumerate() {
+            if data_view == ToolpathDataView::TravelDurations {
+                if segment.kind != MoveKind::Travel {
+                    continue;
+                }
+                let start = path.points[i];
+                let end = path.points[(i + 1) % n];
+                let val = segment_scalar_value(segment, start, end, data_view, config, machine);
+                if val > 1e-6 {
+                    min_val = min_val.min(val);
+                    max_val = max_val.max(val);
+                    count += 1;
+                }
+                continue;
+            }
+
             // Travel moves are rendered in a dedicated travel color (COLOR_TRAVEL)
             // and should not skew the scalar gradient range of extrusion features.
             if segment.kind == MoveKind::Travel {
@@ -180,6 +238,12 @@ pub fn data_view_range(
             min_val = min_val.min(val);
             max_val = max_val.max(val);
             count += 1;
+        }
+
+        if path.segments.len() == n {
+            prev_endpoint = Some(path.points[0]);
+        } else {
+            prev_endpoint = path.points.last().copied();
         }
     }
 
@@ -333,6 +397,26 @@ pub fn build_toolpath_lines(
             }
             let start = path.points[index];
             let end = path.points[(index + 1) % count];
+
+            // In TravelDurations mode, show only travel moves
+            if data_view == ToolpathDataView::TravelDurations {
+                if segment.kind != MoveKind::Travel {
+                    continue;
+                }
+                let val = segment_scalar_value(segment, start, end, data_view, config, machine);
+                let t = if let Some((min, max)) = scalar_range {
+                    if max > min + 1e-4 {
+                        ((val - min) / (max - min)).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    }
+                } else {
+                    0.5
+                };
+                let color = scalar_to_color(t);
+                instances.push(ToolpathLineInstance::new(start, end, color, segment.order));
+                continue;
+            }
 
             let color = match data_view {
                 ToolpathDataView::LineType => palette_color(segment.kind),
@@ -659,5 +743,17 @@ mod tests {
             None,
         );
         assert_eq!(accel_lines.len(), 3);
+
+        // Travel Durations view: only the Travel move is emitted, non-travel extrusion moves are filtered out
+        let travel_lines = build_toolpath_lines(
+            std::slice::from_ref(&path),
+            f64::INFINITY,
+            ToolpathDataView::TravelDurations,
+            &config,
+            None,
+        );
+        assert_eq!(travel_lines.len(), 1);
+        assert_eq!(travel_lines[0].start, [20.0, 0.0, 0.0]);
+        assert_eq!(travel_lines[0].end, [0.0, 0.0, 0.0]);
     }
 }
