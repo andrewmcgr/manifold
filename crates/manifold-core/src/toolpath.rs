@@ -518,13 +518,15 @@ fn compensate_wall_loop_points(
 
             // Lowest outer edge clearance adjustment:
             let z_clearance = flat_radius * sin_alpha * (1.0 - cos_alpha);
-            let mut elevated = p;
-            elevated.z += z_clearance;
+            let mut elevated = p + crate::slicing::NOZZLE_DIRECTION * z_clearance;
 
-            if p.z >= min_extrusion_z && elevated.z < min_extrusion_z {
-                elevated.z = min_extrusion_z;
-            } else if elevated.z < 0.0 {
-                elevated.z = 0.0;
+            let p_proj = p.dot(crate::slicing::BUILD_DIRECTION);
+            let elevated_proj = elevated.dot(crate::slicing::BUILD_DIRECTION);
+
+            if p_proj >= min_extrusion_z && elevated_proj < min_extrusion_z {
+                elevated += crate::slicing::BUILD_DIRECTION * (min_extrusion_z - elevated_proj);
+            } else if elevated_proj < 0.0 {
+                elevated += crate::slicing::BUILD_DIRECTION * (-elevated_proj);
             }
             elevated
         })
@@ -1602,7 +1604,29 @@ pub fn plan_with_progress(
                     }
                     let start = path.points[i];
                     let end = path.points[(i + 1) % point_count];
-                    let distance = start.distance(end);
+                    let diff = end - start;
+                    let distance = diff.length();
+                    let unit_dir = if distance > 1e-6 {
+                        diff / distance
+                    } else {
+                        DVec3::ZERO
+                    };
+                    let nozzle_parallel_comp = unit_dir.dot(crate::slicing::NOZZLE_DIRECTION);
+                    let climb_slope = unit_dir.dot(crate::slicing::BUILD_DIRECTION);
+
+                    // Trajectory slope cosine compensation:
+                    // A nozzle oriented along NOZZLE_DIRECTION sweeps a volume proportional to its
+                    // orthogonal cross-section (distance * cos(beta)).
+                    // On sloped moves, 3D arc length L_3D is inflated by 1 / cos(beta) = sec(beta),
+                    // which causes severe overextrusion if uncompensated.
+                    // Multiplying by cos(beta) = sqrt(1 - (dir . NOZZLE_DIRECTION)^2) preserves exact
+                    // volumetric consistency across all slope angles.
+                    let slope_cosine = (1.0 - nozzle_parallel_comp * nozzle_parallel_comp)
+                        .max(0.0)
+                        .sqrt()
+                        .clamp(0.05, 1.0);
+                    let effective_distance = distance * slope_cosine;
+
                     let line_width = extrusion::line_width_for_kind(segment.kind, config);
                     let (support_fraction, bed_fraction) = support_fractions_at(
                         (start + end) * 0.5,
@@ -1646,11 +1670,7 @@ pub fn plan_with_progress(
                             bed_fraction,
                         )
                     };
-                    let climb_slope = if distance > 1e-6 {
-                        (end.z - start.z) / distance
-                    } else {
-                        0.0
-                    };
+
                     // Directional slope flow compensation:
                     // Climbing uphill (climb_slope > 0): trailing heel irons the bead smoothly (+5% * sin)
                     // Descending downhill (climb_slope < 0): trailing heel plows the melt, reduce flow to prevent squish (-12% * |sin|)
@@ -1660,12 +1680,14 @@ pub fn plan_with_progress(
                         1.0 - 0.12 * (-climb_slope).clamp(0.0, 1.0)
                     };
 
-                    segment.extrusion_length =
-                        extrusion::segment_extrusion_length(distance, bead_area, filament_area)
-                            * segment.extrusion_rate
-                            * extrusion_multiplier
-                            * first_layer_mult
-                            * directional_flow_mult;
+                    segment.extrusion_length = extrusion::segment_extrusion_length(
+                        effective_distance,
+                        bead_area,
+                        filament_area,
+                    ) * segment.extrusion_rate
+                        * extrusion_multiplier
+                        * first_layer_mult
+                        * directional_flow_mult;
                     let nominal_speed = if is_overhang {
                         config.wave_overhang_speed()
                     } else {
@@ -3349,5 +3371,85 @@ mod tests {
                 "Z coordinate must be elevated for clearance on slope"
             );
         }
+    }
+
+    #[test]
+    fn plan_applies_slope_cosine_volumetric_compensation_to_sloped_moves() {
+        let obj_id = ObjectId(1);
+        let object = Object::new(obj_id, Mesh::default(), ToolId(0));
+        let field: Arc<dyn manifold_fidget::order::OrderField> =
+            Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+
+        let p0 = DVec3::new(0.0, 0.0, 1.0);
+        let p1 = DVec3::new(10.0, 0.0, 11.0);
+        let p2 = DVec3::new(10.0, 10.0, 11.0);
+        let p3 = DVec3::new(0.0, 10.0, 1.0);
+
+        let layer0 = Layer {
+            object: obj_id,
+            index: 0,
+            order: 0.2,
+            loops: vec![WallLoop {
+                points: vec![
+                    DVec3::new(0.0, 0.0, 0.2),
+                    DVec3::new(10.0, 0.0, 0.2),
+                    DVec3::new(10.0, 10.0, 0.2),
+                    DVec3::new(0.0, 10.0, 0.2),
+                ],
+                wall_index: 0,
+                top_surface: vec![false; 4],
+                arc_fraction: vec![0.0; 4],
+                unsupported: vec![false; 4],
+            }],
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            order_field: Arc::clone(&field),
+            mesh_sdf: None,
+        };
+
+        let layer = Layer {
+            object: obj_id,
+            index: 5,
+            order: 5.0,
+            loops: vec![WallLoop {
+                points: vec![p0, p1, p2, p3],
+                wall_index: 0,
+                top_surface: vec![false; 4],
+                arc_fraction: vec![0.0; 4],
+                unsupported: vec![false; 4],
+            }],
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            order_field: Arc::clone(&field),
+            mesh_sdf: None,
+        };
+
+        let config = SlicerConfig {
+            scarf_joint_enabled: false,
+            path_simplify_enabled: false,
+            travel_order_optimization_enabled: false,
+            travel_collision_avoidance_enabled: false,
+            ..SlicerConfig::default()
+        };
+        let tools = vec![Tool::new(ToolId(0), 0.4)];
+
+        let planned = plan(&[layer0, layer], &[object], &tools, &config).unwrap();
+        assert_eq!(planned.len(), 2);
+        let path = &planned[1];
+        assert_eq!(path.segments.len(), 4);
+
+        let bead_area =
+            extrusion::bead_cross_section_area(config.wall_line_width, config.layer_height);
+        let fil_area = extrusion::filament_cross_section_area(config.filament_diameter);
+        let expected_flat_e = extrusion::segment_extrusion_length(10.0, bead_area, fil_area);
+
+        let climb_sin = 1.0 / std::f64::consts::SQRT_2;
+        let expected_climbing_e = expected_flat_e * (1.0 + 0.05 * climb_sin);
+
+        let actual_e = path.segments[0].extrusion_length;
+        assert!(
+            (actual_e - expected_climbing_e).abs() < 1e-4,
+            "Actual extrusion length ({actual_e}) should match horizontal projection ({expected_climbing_e})"
+        );
     }
 }
