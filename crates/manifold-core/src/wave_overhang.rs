@@ -14,7 +14,7 @@ use std::collections::BinaryHeap;
 use glam::DVec3;
 
 use crate::ids::ToolId;
-use crate::order_field::{self, OrderFieldKind};
+use crate::order_field;
 use crate::polygon2d;
 use crate::slicing::Layer;
 use crate::toolpath::{MoveKind, Path, Segment};
@@ -600,10 +600,7 @@ pub fn plan_wave_overhangs(
     config: &SlicerConfig,
     tool: ToolId,
 ) -> WaveOverhangPlan {
-    if !config.wave_overhangs_enabled()
-        || layers.len() < 2
-        || config.order_field != OrderFieldKind::Height
-    {
+    if !config.wave_overhangs_enabled() || layers.len() < 2 {
         return WaveOverhangPlan {
             paths_by_layer: vec![Vec::new(); layers.len()],
             wall_overhang_tags_by_layer: vec![Vec::new(); layers.len()],
@@ -1047,43 +1044,5 @@ mod tests {
         assert!(tags_l1[3], "p(20, 10) is unsupported overhang");
         assert!(!tags_l1[4], "p(10, 10) is supported");
         assert!(!tags_l1[5], "p(0, 10) is supported");
-    }
-
-    #[test]
-    fn plan_wave_overhangs_is_disabled_for_non_planar_order_fields() {
-        let config = SlicerConfig {
-            wave_overhangs_enabled: true,
-            order_field: OrderFieldKind::Eikonal,
-            ..SlicerConfig::default()
-        };
-
-        let l0 = mock_layer(
-            0.0,
-            vec![
-                DVec3::new(0.0, 0.0, 0.0),
-                DVec3::new(10.0, 0.0, 0.0),
-                DVec3::new(10.0, 10.0, 0.0),
-                DVec3::new(0.0, 10.0, 0.0),
-            ],
-        );
-        let mut l1 = mock_layer(
-            0.2,
-            vec![
-                DVec3::new(0.0, 0.0, 0.2),
-                DVec3::new(10.0, 0.0, 0.2),
-                DVec3::new(20.0, 0.0, 0.2),
-                DVec3::new(20.0, 10.0, 0.2),
-                DVec3::new(10.0, 10.0, 0.2),
-                DVec3::new(0.0, 10.0, 0.2),
-            ],
-        );
-        l1.index = 1;
-
-        let layers = vec![l0, l1];
-        let plan = plan_wave_overhangs(&layers, &config, ToolId(0));
-        assert!(plan.paths_by_layer[0].is_empty());
-        assert!(plan.paths_by_layer[1].is_empty());
-        assert!(plan.wall_overhang_tags_by_layer[0].is_empty());
-        assert!(plan.wall_overhang_tags_by_layer[1].is_empty());
     }
 }

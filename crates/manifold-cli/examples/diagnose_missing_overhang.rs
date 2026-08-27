@@ -35,29 +35,47 @@ fn slice_and_report(
     let layers = slicing::slice_workspace(&objects, &[ObjectId(0)], config)?;
     let paths = toolpath::plan(&layers, &objects, &machine.tools, config)?;
 
+    let (min, max) = mesh.bounding_box().expect("non-empty mesh");
+    let max_x_band = max.x - 0.15 * (max.x - min.x);
+
     let mut total_overhang = 0usize;
-    let mut overhang_by_order: std::collections::BTreeMap<i32, usize> =
-        std::collections::BTreeMap::new();
+    let mut near_max_x_overhang = 0usize;
+    let mut near_order_5_5 = 0usize;
+    let mut sample_points: Vec<DVec3> = Vec::new();
+
     for path in &paths {
-        for seg in &path.segments {
-            if seg.kind == MoveKind::Overhang {
-                total_overhang += 1;
-                let order_key = (seg.order * 100.0).round() as i32;
-                *overhang_by_order.entry(order_key).or_insert(0) += 1;
+        let n = path.points.len();
+        for (i, seg) in path.segments.iter().enumerate() {
+            if seg.kind != MoveKind::Overhang {
+                continue;
+            }
+            let start = path.points[i];
+            let end = path.points[(i + 1) % n];
+            total_overhang += 1;
+            if start.x >= max_x_band || end.x >= max_x_band {
+                near_max_x_overhang += 1;
+                if (seg.order - 5.5).abs() < 0.6 {
+                    near_order_5_5 += 1;
+                    if sample_points.len() < 5 {
+                        sample_points.push(start);
+                    }
+                }
             }
         }
     }
+
     println!("--- {label} ---");
-    println!("Total Overhang segments across whole print: {total_overhang}");
-    if !overhang_by_order.is_empty() {
-        println!("Overhang segments by order:");
-        for (order_key, count) in overhang_by_order {
-            println!(
-                "  Order {:.2}: {} segments",
-                order_key as f64 / 100.0,
-                count
-            );
-        }
+    println!(
+        "shell_thickness={:.2} wall_count={}",
+        config.shell_thickness,
+        config.wall_count()
+    );
+    println!("mesh bbox: min={min:.3?} max={max:.3?} (max_x_band threshold={max_x_band:.3})");
+    println!("total Overhang segments: {total_overhang}");
+    println!("Overhang segments near max-X band: {near_max_x_overhang}");
+    println!("...of those, near order~5.5 (+/-0.6): {near_order_5_5}");
+    for p in &sample_points {
+        println!("  sample overhang point: {p:.3?}");
     }
     println!();
     Ok(())
