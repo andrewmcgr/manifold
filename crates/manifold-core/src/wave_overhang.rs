@@ -690,16 +690,31 @@ pub fn plan_wave_overhangs(
 
         // Tag wall loops for layer k: points not supported by previous layer are Overhang
         let mut layer_wall_tags = Vec::new();
+        let support_dist = config.nozzle_diameter * 0.6;
+        let bed_threshold = config.first_layer_height() * 0.75;
         for wall in &layers[k].loops {
             let mut tags = vec![false; wall.points.len()];
             if let Some(prev_k) = prev_idx {
+                let prev_layer = &layers[prev_k];
                 let prev_b = &boundaries_2d[prev_k];
-                if !prev_b.is_empty() {
-                    for (i, p) in wall.points.iter().enumerate() {
-                        let p_2d = [(p - origin).dot(basis1), (p - origin).dot(basis2)];
-                        if !polygon2d_contains_or_near(p_2d, prev_b, config.nozzle_diameter * 0.4) {
-                            tags[i] = true;
+                for (i, p) in wall.points.iter().enumerate() {
+                    if p.z <= bed_threshold {
+                        continue;
+                    }
+
+                    let mut min_3d_dist = f64::INFINITY;
+                    for prev_wall in &prev_layer.loops {
+                        for prev_p in &prev_wall.points {
+                            min_3d_dist = min_3d_dist.min(p.distance(*prev_p));
                         }
+                    }
+
+                    let p_2d = [(p - origin).dot(basis1), (p - origin).dot(basis2)];
+                    let in_prev_2d = !prev_b.is_empty()
+                        && polygon2d_contains_or_near(p_2d, prev_b, support_dist);
+
+                    if min_3d_dist > support_dist && !in_prev_2d {
+                        tags[i] = true;
                     }
                 }
             }
