@@ -837,6 +837,26 @@ impl ManifoldApp {
                         egui::Slider::new(&mut fluid_cfg.ooze_max_length_ref_mm, 0.0..=2.0)
                             .text("Max ooze prime (mm)"),
                     );
+                    let mut b_low = fluid_cfg.swell_ratio_low();
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut b_low, 1.0..=1.5)
+                                .text("Swell ratio @ low flow (B_low)"),
+                        )
+                        .changed()
+                    {
+                        fluid_cfg.swell_ratio_low = Some(b_low);
+                    }
+                    let mut b_high = fluid_cfg.swell_ratio_high();
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut b_high, 1.0..=1.5)
+                                .text("Swell ratio @ high flow (B_high)"),
+                        )
+                        .changed()
+                    {
+                        fluid_cfg.swell_ratio_high = Some(b_high);
+                    }
                 });
             } else {
                 let mut r_len = self.config.retraction_length();

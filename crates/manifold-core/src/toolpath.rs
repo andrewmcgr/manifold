@@ -1680,14 +1680,7 @@ pub fn plan_with_progress(
                         1.0 - 0.12 * (-climb_slope).clamp(0.0, 1.0)
                     };
 
-                    segment.extrusion_length = extrusion::segment_extrusion_length(
-                        effective_distance,
-                        bead_area,
-                        filament_area,
-                    ) * segment.extrusion_rate
-                        * extrusion_multiplier
-                        * first_layer_mult
-                        * directional_flow_mult;
+                    let fluid_engine = config.fluid_dynamics_engine();
                     let nominal_speed = if is_overhang {
                         config.wave_overhang_speed()
                     } else {
@@ -1695,6 +1688,22 @@ pub fn plan_with_progress(
                             .resolved_motion_model(machine)
                             .max_feedrate(segment.kind, is_first_layer)
                     };
+                    let swell_mult = if let Some(ref engine) = fluid_engine {
+                        let flow_q = ((nominal_speed / 60.0) * bead_area).max(0.01);
+                        engine.swell_volume_multiplier(flow_q, 0.0)
+                    } else {
+                        1.0
+                    };
+
+                    segment.extrusion_length = extrusion::segment_extrusion_length(
+                        effective_distance,
+                        bead_area,
+                        filament_area,
+                    ) * segment.extrusion_rate
+                        * extrusion_multiplier
+                        * first_layer_mult
+                        * directional_flow_mult
+                        * swell_mult;
                     segment.speed = crate::kinematics::clamp_feedrate_by_volumetric_limit(
                         nominal_speed,
                         bead_area,
