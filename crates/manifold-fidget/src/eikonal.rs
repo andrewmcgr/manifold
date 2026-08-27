@@ -229,6 +229,7 @@ impl EikonalOrderField {
         is_solid: &(dyn Fn(DVec3) -> bool + Sync),
         is_bed_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
         is_top_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
+        skin_depth_mm: f64,
         slope_profile: Option<&SlopeProfile>,
         height_along: Option<&dyn HeightAlong>,
     ) -> Self {
@@ -236,14 +237,20 @@ impl EikonalOrderField {
             Self::build_grid(min_corner, max_corner, requested_cell_size, is_solid);
         bed_field.march_from_region(is_bed_seed_region, &occupied);
 
+        if let Some(profile) = slope_profile {
+            let default_height =
+                crate::height_along::ConstantAxisHeight::new(glam::DVec3::Z, min_corner);
+            let ha: &dyn HeightAlong = height_along.unwrap_or(&default_height);
+            bed_field.relax_with_slope_limit(profile, ha, &occupied);
+        }
+
         let (top_distances, nearest_surface_value) = bed_field.march_downward_with_surface_values(
             is_top_seed_region,
             &occupied,
             &bed_field.distances,
         );
 
-        // Skin thickness: top ~2.0mm or 6 grid cells
-        let skin_thickness = (bed_field.h * 6.0).max(1.0);
+        let skin_thickness = skin_depth_mm.max(bed_field.h * 2.0);
 
         for (idx, &is_occ) in occupied.iter().enumerate() {
             if !is_occ {
@@ -262,12 +269,6 @@ impl EikonalOrderField {
             }
         }
 
-        if let Some(profile) = slope_profile {
-            let default_height =
-                crate::height_along::ConstantAxisHeight::new(glam::DVec3::Z, min_corner);
-            let ha: &dyn HeightAlong = height_along.unwrap_or(&default_height);
-            bed_field.relax_with_slope_limit(profile, ha, &occupied);
-        }
         bed_field.compute_gradients(&occupied);
         bed_field
     }
@@ -1442,6 +1443,7 @@ mod tests {
                 &is_solid,
                 &is_bed_seed,
                 &is_top_seed,
+                1.5,
                 None,
                 None,
             );

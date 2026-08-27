@@ -1143,6 +1143,28 @@ impl ManifoldApp {
                 &mut self.config.eikonal_conform_top_surfaces,
                 "Conform to top surfaces",
             );
+            if self.config.eikonal_conform_top_surfaces {
+                let mut max_angle = self.config.eikonal_conformal_max_angle_deg();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut max_angle, 5.0..=75.0)
+                            .text("Conformal max surface angle (°)"),
+                    )
+                    .changed()
+                {
+                    self.config.eikonal_conformal_max_angle_deg = Some(max_angle);
+                }
+                let mut skin_depth = self.config.eikonal_conformal_skin_depth_mm();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut skin_depth, 0.4..=5.0)
+                            .text("Conformal skin depth (mm)"),
+                    )
+                    .changed()
+                {
+                    self.config.eikonal_conformal_skin_depth_mm = Some(skin_depth);
+                }
+            }
             ui.collapsing("Toolhead clearance profile (XZ)", |ui| {
                 ui.label("Radial distance (X) and height (Z) from nozzle tip");
                 let mut remove_index: Option<usize> = None;

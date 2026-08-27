@@ -128,6 +128,15 @@ pub struct SlicerConfig {
     /// Defaults to `false`.
     #[serde(default)]
     pub eikonal_conform_top_surfaces: bool,
+    /// Maximum surface inclination angle from horizontal (degrees) for conformal top shell tracking.
+    /// Surfaces steeper than this angle are excluded from conformal deformation.
+    /// Defaults to `45.0°`.
+    #[serde(default)]
+    pub eikonal_conformal_max_angle_deg: Option<f64>,
+    /// Subsurface skin layer depth (mm) within which order isosurfaces conform parallel to the top shell.
+    /// Defaults to `1.2 mm`.
+    #[serde(default)]
+    pub eikonal_conformal_skin_depth_mm: Option<f64>,
     /// Apex point of the cone used when `order_field` is
     /// `OrderFieldKind::Conical`. Inert (unused) otherwise. Defaults to
     /// the origin.
@@ -468,6 +477,8 @@ impl Default for SlicerConfig {
             bottom_layers: 3,
             order_field: order_field::OrderFieldKind::default(),
             eikonal_conform_top_surfaces: false,
+            eikonal_conformal_max_angle_deg: None,
+            eikonal_conformal_skin_depth_mm: None,
             order_field_apex: glam::DVec3::ZERO,
             order_field_axis: slicing::BUILD_DIRECTION,
             order_field_slope: 0.0,
@@ -700,6 +711,24 @@ impl SlicerConfig {
     #[must_use]
     pub fn fan_layer_delay(&self) -> u32 {
         self.fan_layer_delay.unwrap_or(1)
+    }
+
+    /// Maximum surface inclination angle (degrees) for conformal top surface tracking.
+    /// Defaults to `45.0°`.
+    #[must_use]
+    pub fn eikonal_conformal_max_angle_deg(&self) -> f64 {
+        self.eikonal_conformal_max_angle_deg
+            .unwrap_or(45.0)
+            .clamp(5.0, 85.0)
+    }
+
+    /// Subsurface skin layer depth (mm) for conformal top surface tracking.
+    /// Defaults to `1.2 mm`.
+    #[must_use]
+    pub fn eikonal_conformal_skin_depth_mm(&self) -> f64 {
+        self.eikonal_conformal_skin_depth_mm
+            .unwrap_or(1.2)
+            .clamp(0.2, 10.0)
     }
 
     /// Diameter (mm) of the nozzle tip's flat land, used by

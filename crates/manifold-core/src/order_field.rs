@@ -234,6 +234,10 @@ fn eikonal_field_for(
         );
     }
     if config.eikonal_conform_top_surfaces {
+        let max_angle = config.eikonal_conformal_max_angle_deg();
+        let cos_limit = max_angle.to_radians().cos();
+        let skin_depth = config.eikonal_conformal_skin_depth_mm();
+
         let top_faces: Vec<[usize; 3]> = mesh
             .indices
             .chunks_exact(3)
@@ -243,7 +247,8 @@ fn eikonal_field_for(
                 let v1 = mesh.vertices[i1];
                 let v2 = mesh.vertices[i2];
                 let normal = (v1 - v0).cross(v2 - v0);
-                if normal.z > 0.1 * normal.length() {
+                let normal_len = normal.length();
+                if normal_len > 1e-9 && normal.dot(BUILD_DIRECTION) >= cos_limit * normal_len {
                     Some([i0, i1, i2])
                 } else {
                     None
@@ -268,6 +273,7 @@ fn eikonal_field_for(
                     &is_solid,
                     &is_seed_region,
                     &is_top_seed,
+                    skin_depth,
                     Some(slope_profile),
                     Some(&height_along),
                 );
@@ -281,6 +287,7 @@ fn eikonal_field_for(
                 &is_solid,
                 &is_seed_region,
                 &is_top_seed,
+                skin_depth,
                 Some(slope_profile),
                 Some(&height_along),
             );
