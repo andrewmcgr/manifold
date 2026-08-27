@@ -123,21 +123,38 @@ pub fn segment_scalar_value_with_profile(
     machine: Option<&manifold_core::machine::Machine>,
     profile: Option<&manifold_core::kinematics::PlannedMotionProfile>,
 ) -> f64 {
+    let diff = end - start;
+    let dir = if diff.length() > 1e-6 {
+        diff.normalize()
+    } else {
+        glam::DVec3::ZERO
+    };
+
     match data_view {
         ToolpathDataView::LineType => 0.0,
-        ToolpathDataView::Speed => segment.speed / 60.0,
+        ToolpathDataView::Speed => {
+            let model = config.resolved_motion_model(machine);
+            let is_first_layer = (segment.order - config.first_layer_height()).abs() < 1e-4
+                || segment.order <= config.first_layer_height();
+            let max_feed = model.max_directional_feedrate(segment.kind, is_first_layer, dir);
+            segment.speed.min(max_feed) / 60.0
+        }
         ToolpathDataView::ActualSpeed => {
             if let Some(prof) = profile {
                 prof.cruise_speed / 60.0
             } else {
-                segment.speed / 60.0
+                let model = config.resolved_motion_model(machine);
+                let is_first_layer = (segment.order - config.first_layer_height()).abs() < 1e-4
+                    || segment.order <= config.first_layer_height();
+                let max_feed = model.max_directional_feedrate(segment.kind, is_first_layer, dir);
+                segment.speed.min(max_feed) / 60.0
             }
         }
         ToolpathDataView::FlowRate => {
             if segment.kind == MoveKind::Travel || segment.extrusion_length <= 0.0 {
                 return 0.0;
             }
-            let length = (end - start).length();
+            let length = diff.length();
             if length < 1e-6 {
                 return 0.0;
             }
@@ -155,7 +172,12 @@ pub fn segment_scalar_value_with_profile(
             let model = config.resolved_motion_model(machine);
             let is_first_layer = (segment.order - config.first_layer_height()).abs() < 1e-4
                 || segment.order <= config.first_layer_height();
-            model.available_acceleration(segment.kind, is_first_layer, segment.speed / 60.0)
+            model.available_directional_acceleration(
+                segment.kind,
+                is_first_layer,
+                segment.speed / 60.0,
+                dir,
+            )
         }
         ToolpathDataView::ActualAcceleration => {
             let model = config.resolved_motion_model(machine);
@@ -166,13 +188,13 @@ pub fn segment_scalar_value_with_profile(
             } else {
                 segment.speed / 60.0
             };
-            model.available_acceleration(segment.kind, is_first_layer, v)
+            model.available_directional_acceleration(segment.kind, is_first_layer, v, dir)
         }
         ToolpathDataView::TravelDurations => {
             if segment.kind != MoveKind::Travel {
                 return 0.0;
             }
-            let length = (end - start).length();
+            let length = diff.length();
             let speed_mm_s = (segment.speed / 60.0).max(1e-3);
             length / speed_mm_s
         }
@@ -785,7 +807,7 @@ mod tests {
                 speed: 1200.0, // 20 mm/s (low)
                 extrusion_rate: 1.0,
                 support_fraction: 0.0,
-                order: 0.2,
+                order: 1.0,
                 extrusion_length: 0.3,
             },
             Segment {
@@ -793,7 +815,7 @@ mod tests {
                 speed: 12000.0, // 200 mm/s (high)
                 extrusion_rate: 1.0,
                 support_fraction: 0.0,
-                order: 0.2,
+                order: 1.0,
                 extrusion_length: 0.3,
             },
             Segment {
@@ -801,7 +823,7 @@ mod tests {
                 speed: 18000.0, // 300 mm/s (travel)
                 extrusion_rate: 0.0,
                 support_fraction: 0.0,
-                order: 0.2,
+                order: 1.0,
                 extrusion_length: 0.0,
             },
         ];

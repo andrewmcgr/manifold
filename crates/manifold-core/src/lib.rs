@@ -596,6 +596,7 @@ impl SlicerConfig {
             infill_acceleration: self.infill_acceleration.unwrap_or(7000.0),
             travel_acceleration: self.travel_acceleration.unwrap_or(10000.0),
             first_layer_acceleration: self.first_layer_acceleration.unwrap_or(2000.0),
+            axis_limits: std::collections::HashMap::new(),
         }
     }
 
@@ -606,16 +607,19 @@ impl SlicerConfig {
         &self,
         machine: Option<&crate::machine::Machine>,
     ) -> Box<dyn kinematics::MotionModel> {
-        let std_model = self.motion_model();
+        let mut std_model = self.motion_model();
         if let Some(m) = machine {
+            std_model.axis_limits = m.axis_limits.clone();
             if m.use_stepper_dynamics {
-                return Box::new(kinematics::StepperDynamicModel::new(
+                let mut stepper = kinematics::StepperDynamicModel::new(
                     std_model,
                     m.zero_speed_acceleration(),
                     m.max_available_speed(),
                     m.acceleration_limit(),
                     m.speed_limit(),
-                ));
+                );
+                stepper.axis_limits = m.axis_limits.clone();
+                return Box::new(stepper);
             }
         }
         Box::new(std_model)

@@ -7,6 +7,69 @@
 use crate::toolpath::MoveKind;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Motion axes for multi-axis machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+impl std::fmt::Display for Axis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Axis::X => write!(f, "X"),
+            Axis::Y => write!(f, "Y"),
+            Axis::Z => write!(f, "Z"),
+        }
+    }
+}
+
+/// Limits and dynamic motor model parameters for an individual motion axis.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AxisLimits {
+    /// Maximum velocity limit along this axis (mm/s).
+    #[serde(default)]
+    pub speed_limit: Option<f64>,
+    /// Maximum acceleration limit along this axis (mm/s²).
+    #[serde(default)]
+    pub acceleration_limit: Option<f64>,
+    /// Whether this axis uses a dedicated stepper dynamics roll-off model.
+    #[serde(default)]
+    pub use_stepper_dynamics: bool,
+    /// Acceleration at zero velocity for this axis (a0, mm/s²).
+    #[serde(default)]
+    pub zero_speed_acceleration: Option<f64>,
+    /// Maximum velocity where motor torque reaches zero for this axis (v_max, mm/s).
+    #[serde(default)]
+    pub max_available_speed: Option<f64>,
+}
+
+impl AxisLimits {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Available motor acceleration for this axis at component velocity `v_axis_mm_s`.
+    #[must_use]
+    pub fn motor_acceleration_at_speed(
+        &self,
+        v_axis_mm_s: f64,
+        fallback_a0: f64,
+        fallback_vmax: f64,
+    ) -> f64 {
+        let a0 = self.zero_speed_acceleration.unwrap_or(fallback_a0);
+        let vmax = self.max_available_speed.unwrap_or(fallback_vmax);
+        if vmax <= 1e-6 {
+            return 0.0;
+        }
+        let factor = (1.0 - (v_axis_mm_s / vmax).clamp(0.0, 1.0)).max(0.0);
+        a0 * factor
+    }
+}
 
 /// Pluggable interface for motion kinematics and acceleration constraints.
 pub trait MotionModel: Send + Sync {
@@ -15,6 +78,22 @@ pub trait MotionModel: Send + Sync {
 
     /// Available acceleration at current speed `v_mm_s` (in mm/s²).
     fn available_acceleration(&self, kind: MoveKind, is_first_layer: bool, v_mm_s: f64) -> f64;
+
+    /// Direction-constrained maximum feedrate (in mm/min) along unit direction `dir`.
+    fn max_directional_feedrate(&self, kind: MoveKind, is_first_layer: bool, _dir: DVec3) -> f64 {
+        self.max_feedrate(kind, is_first_layer)
+    }
+
+    /// Direction-constrained available acceleration (in mm/s²) at speed `v_mm_s` along unit direction `dir`.
+    fn available_directional_acceleration(
+        &self,
+        kind: MoveKind,
+        is_first_layer: bool,
+        v_mm_s: f64,
+        _dir: DVec3,
+    ) -> f64 {
+        self.available_acceleration(kind, is_first_layer, v_mm_s)
+    }
 
     /// Calculate the maximum reachable speed (in mm/s) over `distance_mm` starting from `v_entry_mm_s`.
     fn max_reachable_speed(
@@ -32,6 +111,24 @@ pub trait MotionModel: Send + Sync {
         reachable.min(max_v)
     }
 
+    /// Calculate the directional maximum reachable speed (in mm/s) over `distance_mm` starting from `v_entry_mm_s` along `dir`.
+    fn max_directional_reachable_speed(
+        &self,
+        kind: MoveKind,
+        is_first_layer: bool,
+        v_entry_mm_s: f64,
+        distance_mm: f64,
+        dir: DVec3,
+    ) -> f64 {
+        let accel =
+            self.available_directional_acceleration(kind, is_first_layer, v_entry_mm_s, dir);
+        let max_v = self.max_directional_feedrate(kind, is_first_layer, dir) / 60.0;
+        let reachable = (v_entry_mm_s * v_entry_mm_s + 2.0 * accel * distance_mm.max(0.0))
+            .max(0.0)
+            .sqrt();
+        reachable.min(max_v)
+    }
+
     /// Calculate the time (in seconds) required to traverse `distance_mm` from `v_entry_mm_s` to `v_exit_mm_s`.
     fn move_duration(
         &self,
@@ -41,9 +138,29 @@ pub trait MotionModel: Send + Sync {
         v_entry_mm_s: f64,
         v_exit_mm_s: f64,
     ) -> f64 {
+        self.directional_move_duration(
+            kind,
+            is_first_layer,
+            distance_mm,
+            v_entry_mm_s,
+            v_exit_mm_s,
+            DVec3::ZERO,
+        )
+    }
+
+    /// Calculate the time (in seconds) required to traverse `distance_mm` from `v_entry_mm_s` to `v_exit_mm_s` along `dir`.
+    fn directional_move_duration(
+        &self,
+        kind: MoveKind,
+        is_first_layer: bool,
+        distance_mm: f64,
+        v_entry_mm_s: f64,
+        v_exit_mm_s: f64,
+        dir: DVec3,
+    ) -> f64 {
         let avg_v = ((v_entry_mm_s + v_exit_mm_s) * 0.5).max(1.0);
-        let accel = self.available_acceleration(kind, is_first_layer, avg_v);
-        let max_v = self.max_feedrate(kind, is_first_layer) / 60.0;
+        let accel = self.available_directional_acceleration(kind, is_first_layer, avg_v, dir);
+        let max_v = self.max_directional_feedrate(kind, is_first_layer, dir) / 60.0;
         let v_peak =
             ((v_entry_mm_s * v_entry_mm_s + v_exit_mm_s * v_exit_mm_s + 2.0 * accel * distance_mm)
                 * 0.5)
@@ -52,8 +169,8 @@ pub trait MotionModel: Send + Sync {
                 .min(max_v);
 
         if v_peak > v_entry_mm_s && v_peak > v_exit_mm_s {
-            let t_acc = (v_peak - v_entry_mm_s) / accel;
-            let t_dec = (v_peak - v_exit_mm_s) / accel;
+            let t_acc = (v_peak - v_entry_mm_s) / accel.max(1.0);
+            let t_dec = (v_peak - v_exit_mm_s) / accel.max(1.0);
             let d_acc = (v_entry_mm_s + v_peak) * 0.5 * t_acc;
             let d_dec = (v_peak + v_exit_mm_s) * 0.5 * t_dec;
             let d_cruise = (distance_mm - d_acc - d_dec).max(0.0);
@@ -82,6 +199,9 @@ pub struct StandardMotionModel {
     pub infill_acceleration: f64,
     pub travel_acceleration: f64,
     pub first_layer_acceleration: f64,
+
+    #[serde(default)]
+    pub axis_limits: HashMap<Axis, AxisLimits>,
 }
 
 impl Default for StandardMotionModel {
@@ -101,6 +221,7 @@ impl Default for StandardMotionModel {
             infill_acceleration: 7000.0,
             travel_acceleration: 10000.0,
             first_layer_acceleration: 2000.0,
+            axis_limits: HashMap::new(),
         }
     }
 }
@@ -134,6 +255,55 @@ impl MotionModel for StandardMotionModel {
             MoveKind::Travel => self.travel_acceleration,
         }
     }
+
+    fn max_directional_feedrate(&self, kind: MoveKind, is_first_layer: bool, dir: DVec3) -> f64 {
+        let mut max_speed = self.max_feedrate(kind, is_first_layer) / 60.0;
+        let comps = [
+            (Axis::X, dir.x.abs()),
+            (Axis::Y, dir.y.abs()),
+            (Axis::Z, dir.z.abs()),
+        ];
+        for (axis, comp) in comps {
+            if comp > 1e-6 {
+                if let Some(limits) = self.axis_limits.get(&axis) {
+                    if let Some(spd) = limits.speed_limit {
+                        max_speed = max_speed.min(spd / comp);
+                    }
+                }
+            }
+        }
+        max_speed * 60.0
+    }
+
+    fn available_directional_acceleration(
+        &self,
+        kind: MoveKind,
+        is_first_layer: bool,
+        v_mm_s: f64,
+        dir: DVec3,
+    ) -> f64 {
+        let mut accel = self.available_acceleration(kind, is_first_layer, v_mm_s);
+        let comps = [
+            (Axis::X, dir.x.abs()),
+            (Axis::Y, dir.y.abs()),
+            (Axis::Z, dir.z.abs()),
+        ];
+        for (axis, comp) in comps {
+            if comp > 1e-6 {
+                if let Some(limits) = self.axis_limits.get(&axis) {
+                    if let Some(a_lim) = limits.acceleration_limit {
+                        accel = accel.min(a_lim / comp);
+                    }
+                    if limits.use_stepper_dynamics {
+                        let motor_a =
+                            limits.motor_acceleration_at_speed(v_mm_s * comp, 20000.0, 1000.0);
+                        accel = accel.min(motor_a / comp);
+                    }
+                }
+            }
+        }
+        accel.max(10.0)
+    }
 }
 
 /// Stepper motor dynamic performance model.
@@ -156,6 +326,9 @@ pub struct StepperDynamicModel {
     pub acceleration_limit: f64,
     /// Hard upper bound on speed (mm/s).
     pub speed_limit: f64,
+    /// Per-axis kinematic overrides and dedicated stepper models.
+    #[serde(default)]
+    pub axis_limits: HashMap<Axis, AxisLimits>,
 }
 
 impl StepperDynamicModel {
@@ -173,6 +346,7 @@ impl StepperDynamicModel {
             max_available_speed,
             acceleration_limit,
             speed_limit,
+            axis_limits: HashMap::new(),
         }
     }
 
@@ -198,6 +372,7 @@ impl Default for StepperDynamicModel {
             max_available_speed,
             acceleration_limit: zero_speed_accel * 0.5, // 10,000 mm/s²
             speed_limit: max_available_speed * 0.75,    // 750 mm/s
+            axis_limits: HashMap::new(),
         }
     }
 }
@@ -222,6 +397,58 @@ impl MotionModel for StepperDynamicModel {
         std_accel.min(dynamic_accel).max(100.0)
     }
 
+    fn max_directional_feedrate(&self, kind: MoveKind, is_first_layer: bool, dir: DVec3) -> f64 {
+        let mut max_speed = self.max_feedrate(kind, is_first_layer) / 60.0;
+        let comps = [
+            (Axis::X, dir.x.abs()),
+            (Axis::Y, dir.y.abs()),
+            (Axis::Z, dir.z.abs()),
+        ];
+        for (axis, comp) in comps {
+            if comp > 1e-6 {
+                if let Some(limits) = self.axis_limits.get(&axis) {
+                    if let Some(spd) = limits.speed_limit {
+                        max_speed = max_speed.min(spd / comp);
+                    }
+                }
+            }
+        }
+        max_speed * 60.0
+    }
+
+    fn available_directional_acceleration(
+        &self,
+        kind: MoveKind,
+        is_first_layer: bool,
+        v_mm_s: f64,
+        dir: DVec3,
+    ) -> f64 {
+        let mut accel = self.available_acceleration(kind, is_first_layer, v_mm_s);
+        let comps = [
+            (Axis::X, dir.x.abs()),
+            (Axis::Y, dir.y.abs()),
+            (Axis::Z, dir.z.abs()),
+        ];
+        for (axis, comp) in comps {
+            if comp > 1e-6 {
+                if let Some(limits) = self.axis_limits.get(&axis) {
+                    if let Some(a_lim) = limits.acceleration_limit {
+                        accel = accel.min(a_lim / comp);
+                    }
+                    if limits.use_stepper_dynamics {
+                        let motor_a = limits.motor_acceleration_at_speed(
+                            v_mm_s * comp,
+                            self.zero_speed_accel,
+                            self.max_available_speed,
+                        );
+                        accel = accel.min(motor_a / comp);
+                    }
+                }
+            }
+        }
+        accel.max(10.0)
+    }
+
     fn max_reachable_speed(
         &self,
         kind: MoveKind,
@@ -229,18 +456,60 @@ impl MotionModel for StepperDynamicModel {
         v_entry_mm_s: f64,
         distance_mm: f64,
     ) -> f64 {
-        let max_v = self.max_feedrate(kind, is_first_layer) / 60.0;
-        let v_stepper = stepper_max_reachable_velocity(
+        self.max_directional_reachable_speed(
+            kind,
+            is_first_layer,
+            v_entry_mm_s,
+            distance_mm,
+            DVec3::ZERO,
+        )
+    }
+
+    fn max_directional_reachable_speed(
+        &self,
+        kind: MoveKind,
+        is_first_layer: bool,
+        v_entry_mm_s: f64,
+        distance_mm: f64,
+        dir: DVec3,
+    ) -> f64 {
+        let max_v = self.max_directional_feedrate(kind, is_first_layer, dir) / 60.0;
+        let mut v_stepper = stepper_max_reachable_velocity(
             v_entry_mm_s,
             distance_mm,
             self.zero_speed_accel,
             self.max_available_speed,
         );
-        let v_std = self.standard_model.max_reachable_speed(
+        let comps = [
+            (Axis::X, dir.x.abs()),
+            (Axis::Y, dir.y.abs()),
+            (Axis::Z, dir.z.abs()),
+        ];
+        for (axis, comp) in comps {
+            if comp > 1e-6 {
+                if let Some(limits) = self.axis_limits.get(&axis) {
+                    if limits.use_stepper_dynamics {
+                        let a0 = limits
+                            .zero_speed_acceleration
+                            .unwrap_or(self.zero_speed_accel);
+                        let vmax = limits
+                            .max_available_speed
+                            .unwrap_or(self.max_available_speed);
+                        let v_axis_entry = v_entry_mm_s * comp;
+                        let d_axis = distance_mm * comp;
+                        let v_axis_exit =
+                            stepper_max_reachable_velocity(v_axis_entry, d_axis, a0, vmax);
+                        v_stepper = v_stepper.min(v_axis_exit / comp);
+                    }
+                }
+            }
+        }
+        let v_std = self.standard_model.max_directional_reachable_speed(
             kind,
             is_first_layer,
             v_entry_mm_s,
             distance_mm,
+            dir,
         );
         v_stepper.min(v_std).min(max_v)
     }
@@ -370,8 +639,10 @@ pub fn plan_path_velocities(
         let diff = p1 - p0;
         let d = diff.length();
         distances.push(d);
-        directions.push(if d > 1e-6 { diff / d } else { DVec3::ZERO });
-        nominal_speeds.push(seg.speed / 60.0); // mm/s
+        let dir = if d > 1e-6 { diff / d } else { DVec3::ZERO };
+        directions.push(dir);
+        let max_feed = model.max_directional_feedrate(seg.kind, is_first_layer, dir);
+        nominal_speeds.push((seg.speed.min(max_feed)) / 60.0); // mm/s
     }
 
     // 1. Compute junction speed limits between consecutive segments
@@ -384,8 +655,12 @@ pub fn plan_path_velocities(
     for i in 0..n.saturating_sub(1) {
         let d0 = directions[i];
         let d1 = directions[i + 1];
-        let accel =
-            model.available_acceleration(segments[i].kind, is_first_layer, nominal_speeds[i]);
+        let accel = model.available_directional_acceleration(
+            segments[i].kind,
+            is_first_layer,
+            nominal_speeds[i],
+            d0,
+        );
         let corner_v = klipper_corner_velocity(d0, d1, square_corner_velocity_mm_s, accel);
         junction_speeds[i + 1] = corner_v.min(nominal_speeds[i]).min(nominal_speeds[i + 1]);
     }
@@ -397,8 +672,13 @@ pub fn plan_path_velocities(
     for i in 0..n {
         let v_in = junction_speeds[i].min(nominal_speeds[i]);
         entry_speeds[i] = v_in;
-        let v_reachable =
-            model.max_reachable_speed(segments[i].kind, is_first_layer, v_in, distances[i]);
+        let v_reachable = model.max_directional_reachable_speed(
+            segments[i].kind,
+            is_first_layer,
+            v_in,
+            distances[i],
+            directions[i],
+        );
         exit_speeds[i] = v_reachable
             .min(nominal_speeds[i])
             .min(junction_speeds[i + 1]);
@@ -409,7 +689,12 @@ pub fn plan_path_velocities(
     for i in (0..n).rev() {
         let v_out = junction_speeds[i + 1];
         exit_speeds[i] = exit_speeds[i].min(v_out);
-        let accel = model.available_acceleration(segments[i].kind, is_first_layer, exit_speeds[i]);
+        let accel = model.available_directional_acceleration(
+            segments[i].kind,
+            is_first_layer,
+            exit_speeds[i],
+            directions[i],
+        );
         let max_v_in = (exit_speeds[i] * exit_speeds[i] + 2.0 * accel * distances[i])
             .max(0.0)
             .sqrt();
@@ -423,12 +708,13 @@ pub fn plan_path_velocities(
         let v_entry = entry_speeds[i];
         let v_exit = exit_speeds[i];
         let v_cruise = nominal_speeds[i].min(v_entry.max(v_exit));
-        let duration = model.move_duration(
+        let duration = model.directional_move_duration(
             segments[i].kind,
             is_first_layer,
             distances[i],
             v_entry,
             v_exit,
+            directions[i],
         );
         profiles.push(PlannedMotionProfile {
             entry_speed: v_entry * 60.0,
@@ -702,6 +988,7 @@ mod tests {
                 outer_wall_speed: 600.0 * 60.0,
                 ..StandardMotionModel::default()
             },
+            axis_limits: HashMap::new(),
         };
 
         // At v = 0, available motor accel is 10,000, clamped by acceleration_limit (8,000)
@@ -757,6 +1044,7 @@ mod tests {
                 first_layer_acceleration: 2000.0,
                 ..StandardMotionModel::default()
             },
+            axis_limits: HashMap::new(),
         };
 
         // Normal layer: outer wall runs at 6000 (below global 750mm/s limit)
@@ -990,5 +1278,62 @@ mod tests {
         // Overlap region total extrusion = 0.5 * 1.5 + 0.5 * 1.5 = 1.5mm (exact nominal amount for 3.0mm of 20mm/10.0E)
         let overlap_e = segments[0].extrusion_length + segments[5].extrusion_length;
         assert!((overlap_e - 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn per_axis_limits_constrain_directional_moves() {
+        let mut model = StandardMotionModel::default();
+        // Global travel speed: 18000 mm/min = 300 mm/s
+        // Global travel accel: 10000 mm/s²
+
+        // Configure Z axis with low limits (e.g. leadscrew Z)
+        let mut z_limits = AxisLimits::new();
+        z_limits.speed_limit = Some(30.0); // 30 mm/s = 1800 mm/min
+        z_limits.acceleration_limit = Some(1500.0); // 1500 mm/s²
+        model.axis_limits.insert(Axis::Z, z_limits);
+
+        // Pure horizontal XY move: should use full global speed & accel
+        let xy_dir = DVec3::new(1.0, 0.0, 0.0);
+        let xy_feed = model.max_directional_feedrate(MoveKind::Travel, false, xy_dir);
+        let xy_accel =
+            model.available_directional_acceleration(MoveKind::Travel, false, 200.0, xy_dir);
+        assert_eq!(xy_feed, 18000.0);
+        assert_eq!(xy_accel, 10000.0);
+
+        // Pure vertical Z move: should be capped by Z axis limits
+        let z_dir = DVec3::new(0.0, 0.0, 1.0);
+        let z_feed = model.max_directional_feedrate(MoveKind::Travel, false, z_dir);
+        let z_accel =
+            model.available_directional_acceleration(MoveKind::Travel, false, 20.0, z_dir);
+        assert_eq!(z_feed, 1800.0); // 30 mm/s * 60
+        assert_eq!(z_accel, 1500.0);
+
+        // 45-degree climbing move (equal XY and Z components)
+        let climb_dir = DVec3::new(1.0, 0.0, 1.0).normalize(); // comp_z = 1 / sqrt(2) ~ 0.7071
+        let climb_feed = model.max_directional_feedrate(MoveKind::Travel, false, climb_dir);
+        let climb_accel =
+            model.available_directional_acceleration(MoveKind::Travel, false, 20.0, climb_dir);
+        // Linear speed along vector is capped such that v * comp_z <= 30 => v <= 30 * sqrt(2) ~ 42.42 mm/s = 2545.5 mm/min
+        assert!((climb_feed - (30.0 * std::f64::consts::SQRT_2 * 60.0)).abs() < 1e-2);
+        assert!((climb_accel - (1500.0 * std::f64::consts::SQRT_2)).abs() < 1e-2);
+    }
+
+    #[test]
+    fn per_axis_stepper_dynamics_rolls_off_individual_axis_acceleration() {
+        let mut model = StepperDynamicModel::default();
+        let mut z_limits = AxisLimits::new();
+        z_limits.use_stepper_dynamics = true;
+        z_limits.zero_speed_acceleration = Some(2000.0);
+        z_limits.max_available_speed = Some(50.0); // 50 mm/s max Z speed
+        model.axis_limits.insert(Axis::Z, z_limits);
+
+        let z_dir = DVec3::new(0.0, 0.0, 1.0);
+        // At 0 speed, full 2000 mm/s² available
+        let a_0 = model.available_directional_acceleration(MoveKind::Travel, false, 0.0, z_dir);
+        assert_eq!(a_0, 2000.0);
+
+        // At 25 mm/s (50% max speed), 50% torque = 1000 mm/s² available
+        let a_half = model.available_directional_acceleration(MoveKind::Travel, false, 25.0, z_dir);
+        assert!((a_half - 1000.0).abs() < 1e-2);
     }
 }

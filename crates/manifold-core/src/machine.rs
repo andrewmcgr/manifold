@@ -1,8 +1,14 @@
 //! Machine (printer) definition: substrate, build volume, tools, and
 //! kinematics capability.
 
-use crate::{bounds::BoundingVolume, tool::Tool, transform::Transform};
+use crate::{
+    bounds::BoundingVolume,
+    kinematics::{Axis, AxisLimits},
+    tool::Tool,
+    transform::Transform,
+};
 use glam::DVec3;
+use std::collections::HashMap;
 
 /// Empty (unconstrained) default for [`Machine::eikonal_slope_profile`], used
 /// by `#[serde(default = ...)]` so machine profiles saved before this field
@@ -62,6 +68,9 @@ pub struct Machine {
     /// Hard upper bound on velocity (mm/s). Defaults to 75% of max_available_speed (750 mm/s).
     #[serde(default)]
     pub speed_limit: Option<f64>,
+    /// Per-axis kinematic overrides and dedicated stepper dynamics models.
+    #[serde(default)]
+    pub axis_limits: HashMap<Axis, AxisLimits>,
 }
 
 impl Default for Machine {
@@ -90,6 +99,7 @@ impl Machine {
             max_available_speed: None,
             acceleration_limit: None,
             speed_limit: None,
+            axis_limits: HashMap::new(),
         }
     }
 
@@ -113,6 +123,22 @@ impl Machine {
     pub fn speed_limit(&self) -> f64 {
         self.speed_limit
             .unwrap_or_else(|| self.max_available_speed() * 0.75)
+    }
+
+    /// Returns the configured limits for a given axis, if any.
+    #[must_use]
+    pub fn axis_limits(&self, axis: Axis) -> Option<&AxisLimits> {
+        self.axis_limits.get(&axis)
+    }
+
+    /// Sets or updates the limits for a specific axis.
+    pub fn set_axis_limits(&mut self, axis: Axis, limits: AxisLimits) {
+        self.axis_limits.insert(axis, limits);
+    }
+
+    /// Removes any custom limit overrides for a specific axis, reverting to machine globals.
+    pub fn clear_axis_limits(&mut self, axis: Axis) {
+        self.axis_limits.remove(&axis);
     }
 
     /// Converts the serde-friendly `eikonal_slope_profile` breakpoints into
@@ -173,5 +199,24 @@ mod tests {
         machine.speed_limit = Some(800.0);
         assert_eq!(machine.acceleration_limit(), 12000.0);
         assert_eq!(machine.speed_limit(), 800.0);
+    }
+
+    #[test]
+    fn machine_axis_limits_roundtrip_and_override() {
+        let mut machine = Machine::default();
+        assert!(machine.axis_limits(Axis::Z).is_none());
+
+        let mut z_limits = AxisLimits::new();
+        z_limits.speed_limit = Some(25.0);
+        z_limits.acceleration_limit = Some(1200.0);
+        z_limits.use_stepper_dynamics = true;
+        z_limits.zero_speed_acceleration = Some(2500.0);
+        z_limits.max_available_speed = Some(40.0);
+
+        machine.set_axis_limits(Axis::Z, z_limits.clone());
+        assert_eq!(machine.axis_limits(Axis::Z), Some(&z_limits));
+
+        machine.clear_axis_limits(Axis::Z);
+        assert!(machine.axis_limits(Axis::Z).is_none());
     }
 }

@@ -1477,10 +1477,10 @@ impl ManifoldApp {
 
         ui.checkbox(
             &mut self.machine.use_stepper_dynamics,
-            "Use stepper dynamics model",
+            "Use global stepper dynamics model",
         );
         if self.machine.use_stepper_dynamics {
-            ui.collapsing("Stepper Motor Dynamics", |ui| {
+            ui.collapsing("Global Stepper Dynamics", |ui| {
                 let mut a0 = self.machine.zero_speed_acceleration();
                 if ui
                     .add(
@@ -1523,6 +1523,103 @@ impl ManifoldApp {
                 }
             });
         }
+
+        ui.collapsing("Per-Axis Kinematics & Stepper Dynamics", |ui| {
+            let global_speed = self.machine.speed_limit();
+            let global_accel = self.machine.acceleration_limit();
+            let global_a0 = self.machine.zero_speed_acceleration();
+            let global_vmax = self.machine.max_available_speed();
+
+            for axis in [
+                manifold_core::kinematics::Axis::X,
+                manifold_core::kinematics::Axis::Y,
+                manifold_core::kinematics::Axis::Z,
+            ] {
+                let axis_name = match axis {
+                    manifold_core::kinematics::Axis::X => "X Axis",
+                    manifold_core::kinematics::Axis::Y => "Y Axis",
+                    manifold_core::kinematics::Axis::Z => "Z Axis",
+                };
+                let mut has_override = self.machine.axis_limits.contains_key(&axis);
+                ui.collapsing(axis_name, |ui| {
+                    if ui
+                        .checkbox(&mut has_override, "Override global limits")
+                        .changed()
+                    {
+                        if has_override {
+                            self.machine
+                                .axis_limits
+                                .insert(axis, manifold_core::kinematics::AxisLimits::default());
+                        } else {
+                            self.machine.axis_limits.remove(&axis);
+                        }
+                    }
+                    if let Some(limits) = self.machine.axis_limits.get_mut(&axis) {
+                        let mut spd = limits.speed_limit.unwrap_or(match axis {
+                            manifold_core::kinematics::Axis::Z => 40.0,
+                            _ => global_speed,
+                        });
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut spd, 1.0..=1000.0)
+                                    .text("Max speed limit (mm/s)"),
+                            )
+                            .changed()
+                        {
+                            limits.speed_limit = Some(spd);
+                        }
+
+                        let mut accel = limits.acceleration_limit.unwrap_or(match axis {
+                            manifold_core::kinematics::Axis::Z => 1500.0,
+                            _ => global_accel,
+                        });
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut accel, 100.0..=30000.0)
+                                    .text("Max acceleration (mm/s²)"),
+                            )
+                            .changed()
+                        {
+                            limits.acceleration_limit = Some(accel);
+                        }
+
+                        ui.checkbox(
+                            &mut limits.use_stepper_dynamics,
+                            "Use stepper dynamics model",
+                        );
+                        if limits.use_stepper_dynamics {
+                            let mut a0 = limits.zero_speed_acceleration.unwrap_or(match axis {
+                                manifold_core::kinematics::Axis::Z => 3000.0,
+                                _ => global_a0,
+                            });
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut a0, 500.0..=50000.0)
+                                        .text("Zero-speed accel (a₀, mm/s²)"),
+                                )
+                                .changed()
+                            {
+                                limits.zero_speed_acceleration = Some(a0);
+                            }
+
+                            let mut vmax = limits.max_available_speed.unwrap_or(match axis {
+                                manifold_core::kinematics::Axis::Z => 60.0,
+                                _ => global_vmax,
+                            });
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut vmax, 10.0..=2000.0)
+                                        .text("Max available speed (v_max, mm/s)"),
+                                )
+                                .changed()
+                            {
+                                limits.max_available_speed = Some(vmax);
+                            }
+                        }
+                    }
+                });
+            }
+        });
 
         ui.collapsing("Custom Gcode Macros", |ui| {
             ui.label("Start Gcode");
