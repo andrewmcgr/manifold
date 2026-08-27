@@ -427,6 +427,39 @@ pub fn emit_with_machine(
                     }
                     retracted = true;
                 }
+
+                // Move SET_PRESSURE_ADVANCE earlier: emit immediately before the travel move
+                // that gets to the unretract so the firmware can process PA ahead of time
+                // during transit rather than pausing between unretract and extrusion.
+                if let Some(ref engine) = fluid_engine {
+                    let upcoming_start = if i == 0 { 0 } else { i };
+                    let upcoming_extruding = path.segments[upcoming_start..]
+                        .iter()
+                        .enumerate()
+                        .find(|(_, seg)| seg.kind != MoveKind::Travel)
+                        .map(|(offset, seg)| (seg, upcoming_start + offset));
+
+                    if let Some((next_seg, next_idx)) = upcoming_extruding {
+                        let dur_s = profiles
+                            .get(next_idx)
+                            .map_or(0.05, |prof| prof.duration_seconds);
+                        let delta_e = next_seg.extrusion_length;
+                        let flow_rate_q = if dur_s > 1e-4 && delta_e > 0.0 {
+                            (delta_e * filament_area) / dur_s
+                        } else {
+                            (next_seg.speed / 60.0) * config.layer_height * config.wall_line_width
+                        };
+                        let target_pa = engine.dynamic_pressure_advance(flow_rate_q, fan_fraction);
+                        let pa_deadband = engine.config().pa_deadband;
+                        let should_emit_pa = current_pa.is_none_or(|active| {
+                            (target_pa - active).abs() / active.max(0.001) >= pa_deadband
+                        });
+                        if should_emit_pa {
+                            out.push_str(&format!("SET_PRESSURE_ADVANCE ADVANCE={target_pa:.4}\n"));
+                            current_pa = Some(target_pa);
+                        }
+                    }
+                }
             } else {
                 if retracted {
                     if config.use_firmware_retraction && !config.use_fluid_dynamics() {
@@ -449,7 +482,7 @@ pub fn emit_with_machine(
                 }
             }
 
-            // Dynamic pressure advance update for extruding moves
+            // Dynamic pressure advance update for mid-path extruding moves without preceding travel
             if extruding {
                 if let Some(ref engine) = fluid_engine {
                     let duration_s = if i > 0 {
@@ -1435,12 +1468,12 @@ mod tests {
         };
 
         let path2 = Path {
-            points: vec![DVec3::new(50.0, 50.0, 0.2), DVec3::new(70.0, 50.0, 0.2)],
+            points: vec![DVec3::new(50.0, 50.0, 0.4), DVec3::new(70.0, 50.0, 0.4)],
             segments: vec![Segment {
                 kind: MoveKind::Infill,
                 extrusion_length: 1.0,
                 speed: 12000.0, // 200 mm/s
-                order: 0.2,
+                order: 0.4,
                 ..Segment::default()
             }],
             tool: ToolId(0),
@@ -1455,6 +1488,8 @@ mod tests {
             }),
             retraction_speed: Some(3600.0),
             unretract_speed: Some(2400.0),
+            outer_wall_speed: Some(6000.0),
+            infill_speed: Some(12000.0),
             ..config_without_print_gcode()
         };
 
@@ -1466,5 +1501,41 @@ mod tests {
         assert!(out.contains("G1 E-"));
         // Adaptive unretract is emitted before path 2
         assert!(out.contains("G1 E0."));
+
+        // Verify SET_PRESSURE_ADVANCE for path 2 occurs AFTER retraction and BEFORE the G0 travel move,
+        // not between unretract (G1 E...) and extrusion (G1 X...)
+        let retract_pos = out.find("G1 E-").unwrap();
+        let pa2_offset = out[retract_pos..]
+            .find("SET_PRESSURE_ADVANCE ADVANCE=")
+            .unwrap();
+        let pa2_pos = retract_pos + pa2_offset;
+        let travel_pos = out.find("G0 X50.000 Y50.000 Z0.400").unwrap();
+        let unretract_offset = out[travel_pos..].find("G1 E0.").unwrap();
+        let unretract_pos = travel_pos + unretract_offset;
+        let extrude_pos = out.find("G1 X70.000 Y50.000 Z0.400").unwrap();
+
+        assert!(
+            retract_pos < pa2_pos,
+            "Retraction should precede SET_PRESSURE_ADVANCE for path 2 (retract={retract_pos}, pa={pa2_pos})"
+        );
+        assert!(
+            pa2_pos < travel_pos,
+            "SET_PRESSURE_ADVANCE should be emitted before the travel move (pa={pa2_pos}, travel={travel_pos})"
+        );
+        assert!(
+            travel_pos < unretract_pos,
+            "Travel move should precede unretract (travel={travel_pos}, unretract={unretract_pos})"
+        );
+        assert!(
+            unretract_pos < extrude_pos,
+            "Unretract should precede extrusion (unretract={unretract_pos}, extrude={extrude_pos})"
+        );
+
+        // Verify no SET_PRESSURE_ADVANCE occurs between unretract and extrusion
+        let between_unretract_and_extrude = &out[unretract_pos..extrude_pos];
+        assert!(
+            !between_unretract_and_extrude.contains("SET_PRESSURE_ADVANCE"),
+            "There should be no SET_PRESSURE_ADVANCE between unretract and extrusion: {between_unretract_and_extrude}"
+        );
     }
 }
