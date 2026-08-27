@@ -251,10 +251,12 @@ impl EikonalOrderField {
         );
 
         let skin_thickness = skin_depth_mm.max(bed_field.h * 2.0);
+        let total = bed_field.distances.len();
+        let [nx, ny, nz] = bed_field.dims;
+        let mut delta = vec![0.0f64; total];
 
-        for (idx, &is_occ) in occupied.iter().enumerate() {
-            if !is_occ {
-                bed_field.distances[idx] = f64::INFINITY;
+        for idx in 0..total {
+            if !occupied[idx] {
                 continue;
             }
             let d_top = top_distances[idx];
@@ -265,7 +267,50 @@ impl EikonalOrderField {
                 let skin_order = surf_val - d_top;
                 let t = (d_top / skin_thickness).clamp(0.0, 1.0);
                 let alpha = t * t * (3.0 - 2.0 * t);
-                bed_field.distances[idx] = (1.0 - alpha) * skin_order + alpha * d_bed;
+                delta[idx] = (1.0 - alpha) * (skin_order - d_bed);
+            }
+        }
+
+        // Apply smoothing to delta to ensure C1 continuity without lateral gradient tearing
+        let mut smoothed_delta = delta.clone();
+        for _ in 0..4 {
+            let src = smoothed_delta.clone();
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let idx = bed_field.idx(x, y, z);
+                        if !occupied[idx] {
+                            continue;
+                        }
+                        let mut sum = src[idx] * 2.0;
+                        let mut weight = 2.0;
+                        for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                            let nxp = x as isize + dx;
+                            let nyp = y as isize + dy;
+                            let nzp = z as isize + dz;
+                            if nxp >= 0
+                                && nyp >= 0
+                                && nzp >= 0
+                                && (nxp as usize) < nx
+                                && (nyp as usize) < ny
+                                && (nzp as usize) < nz
+                            {
+                                let nidx = bed_field.idx(nxp as usize, nyp as usize, nzp as usize);
+                                if occupied[nidx] {
+                                    sum += src[nidx];
+                                    weight += 1.0;
+                                }
+                            }
+                        }
+                        smoothed_delta[idx] = sum / weight;
+                    }
+                }
+            }
+        }
+
+        for idx in 0..total {
+            if occupied[idx] && bed_field.distances[idx].is_finite() {
+                bed_field.distances[idx] += smoothed_delta[idx];
             }
         }
 

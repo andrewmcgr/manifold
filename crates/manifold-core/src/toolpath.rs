@@ -1262,6 +1262,13 @@ pub fn validate_within_bounds(paths: &[Path], build_volume: &BoundingVolume) -> 
     for path in paths {
         for &point in &path.points {
             if !build_volume.contains(point) {
+                tracing::error!(
+                    "Planned move at [{:.6}, {:.6}, {:.6}] lies outside the machine's build volume: {:?}",
+                    point.x,
+                    point.y,
+                    point.z,
+                    build_volume
+                );
                 return Err(Error::MoveOutOfBounds { point });
             }
         }
@@ -1749,7 +1756,7 @@ pub fn plan_with_progress(
 
             // Drop unprintable micro-paths whose total extruding length is negligible (< 0.5 * nozzle_diameter or total E < 0.0005 mm)
             let min_extruding_distance = config.nozzle_diameter * 0.5;
-            let paths: Vec<Path> = paths
+            let mut paths: Vec<Path> = paths
                 .into_iter()
                 .filter(|path| {
                     let n = path.points.len();
@@ -1769,6 +1776,16 @@ pub fn plan_with_progress(
                     total_d >= min_extruding_distance && total_e >= 0.0005
                 })
                 .collect();
+
+            // Ensure no planned points dip below the build bed floor (Z = 0.0)
+            for path in &mut paths {
+                for pt in &mut path.points {
+                    let p_z = pt.dot(crate::slicing::BUILD_DIRECTION);
+                    if p_z < 0.0 {
+                        *pt += crate::slicing::BUILD_DIRECTION * (-p_z);
+                    }
+                }
+            }
 
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if let Ok(mut on_progress) = on_progress.lock() {
