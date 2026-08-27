@@ -478,6 +478,8 @@ fn assemble_scanlines_into_paths(
 
         let mut points: Vec<DVec3> = Vec::new();
         let mut segments: Vec<Segment> = Vec::new();
+        let mut last_end: Option<DVec3> = None;
+        let connect_dist = (spacing * 2.5).max(config.infill_line_width.abs() * 2.5);
 
         for (scan_index, pair) in group {
             let (start, end) = if scan_index.is_multiple_of(2) {
@@ -485,8 +487,34 @@ fn assemble_scanlines_into_paths(
             } else {
                 (pair.1, pair.0)
             };
-            push_point(&mut points, &mut segments, start, MoveKind::Travel);
+
+            if let Some(prev) = last_end {
+                let dist = prev.distance(start);
+                if dist <= connect_dist && dist > 1e-4 {
+                    // Turnaround is adjacent along the perimeter boundary: connect with an extruding move
+                    push_point(&mut points, &mut segments, start, MoveKind::Infill);
+                } else if dist > connect_dist {
+                    // Far jump across a void/hole: split into a separate path so travel optimizer can sequence it
+                    if points.len() >= 2 {
+                        all_paths.push(Path {
+                            points,
+                            segments,
+                            tool: crate::ids::ToolId::default(),
+                        });
+                        points = Vec::new();
+                        segments = Vec::new();
+                    } else {
+                        points.clear();
+                        segments.clear();
+                    }
+                    push_point(&mut points, &mut segments, start, MoveKind::Infill);
+                }
+            } else {
+                push_point(&mut points, &mut segments, start, MoveKind::Infill);
+            }
+
             push_point(&mut points, &mut segments, end, MoveKind::Infill);
+            last_end = Some(end);
         }
 
         if points.len() >= 2 {
@@ -596,6 +624,65 @@ impl InfillGenerator for SchwarzPInfill {
             density,
         )
     }
+}
+
+/// Stitches disconnected 2D line segments into continuous polyline chains.
+fn stitch_segments_into_polylines_2d(
+    mut segments: Vec<([f64; 2], [f64; 2])>,
+    tolerance: f64,
+) -> Vec<Vec<[f64; 2]>> {
+    let tol_sq = tolerance * tolerance;
+    let mut polylines: Vec<Vec<[f64; 2]>> = Vec::new();
+
+    while let Some((p0, p1)) = segments.pop() {
+        let mut chain = vec![p0, p1];
+
+        // Extend forward
+        let mut extended = true;
+        while extended {
+            extended = false;
+            let tip = *chain.last().unwrap();
+            for i in (0..segments.len()).rev() {
+                let (s0, s1) = segments[i];
+                if (tip[0] - s0[0]).powi(2) + (tip[1] - s0[1]).powi(2) <= tol_sq {
+                    chain.push(s1);
+                    segments.swap_remove(i);
+                    extended = true;
+                    break;
+                } else if (tip[0] - s1[0]).powi(2) + (tip[1] - s1[1]).powi(2) <= tol_sq {
+                    chain.push(s0);
+                    segments.swap_remove(i);
+                    extended = true;
+                    break;
+                }
+            }
+        }
+
+        // Extend backward
+        let mut extended_back = true;
+        while extended_back {
+            extended_back = false;
+            let base = chain[0];
+            for i in (0..segments.len()).rev() {
+                let (s0, s1) = segments[i];
+                if (base[0] - s1[0]).powi(2) + (base[1] - s1[1]).powi(2) <= tol_sq {
+                    chain.insert(0, s0);
+                    segments.swap_remove(i);
+                    extended_back = true;
+                    break;
+                } else if (base[0] - s0[0]).powi(2) + (base[1] - s0[1]).powi(2) <= tol_sq {
+                    chain.insert(0, s1);
+                    segments.swap_remove(i);
+                    extended_back = true;
+                    break;
+                }
+            }
+        }
+
+        polylines.push(chain);
+    }
+
+    polylines
 }
 
 fn generate_tpms_infill(
@@ -723,17 +810,20 @@ fn generate_tpms_infill(
         return Vec::new();
     }
 
-    let mut polylines_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut filtered_segments: Vec<([f64; 2], [f64; 2])> = Vec::new();
     for (p0, p1) in segments_2d {
         let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
         if polygon2d::contains_point(&loops_2d, mid) {
-            polylines_2d.push(vec![p0, p1]);
+            filtered_segments.push((p0, p1));
         }
     }
 
-    if polylines_2d.is_empty() {
+    if filtered_segments.is_empty() {
         return Vec::new();
     }
+
+    let tol = (step * 0.5).max(0.01);
+    let polylines_2d = stitch_segments_into_polylines_2d(filtered_segments, tol);
 
     let world_polylines = order_field::reconstruct_on_order_field_near(
         polylines_2d,
@@ -1616,9 +1706,7 @@ mod tests {
         };
         let region = InfillRegion::from_layer(&layer, &config());
         let paths = MonotonicInfill.generate(&region, &cfg, &layer, &Transform::identity(), 1.0);
-        assert_eq!(paths.len(), 1);
-        let path = &paths[0];
-        assert_eq!(path.points.len() - 1, path.segments.len());
+        assert!(!paths.is_empty());
 
         let hole_min = DVec3::new(-1.0, -1.0, -1.0);
         let hole_max = DVec3::new(1.0, 1.0, 1.0);
@@ -1626,34 +1714,28 @@ mod tests {
             |p: DVec3| p.x > hole_min.x && p.x < hole_max.x && p.y > hole_min.y && p.y < hole_max.y;
 
         let mut saw_infill = false;
-        let mut saw_travel_across_hole = false;
-        for (i, segment) in path.segments.iter().enumerate() {
-            let start = path.points[i];
-            let end = path.points[i + 1];
-            let mid = (start + end) * 0.5;
-            match segment.kind {
-                MoveKind::Infill => {
-                    saw_infill = true;
-                    // A genuine fill line never has its midpoint inside
-                    // the hole (it should stop at the hole's boundary).
-                    assert!(
-                        !inside_hole(mid),
-                        "Infill-kind edge {start:?} -> {end:?} passes through the hole"
-                    );
-                }
-                MoveKind::Travel => {
-                    if inside_hole(mid) {
-                        saw_travel_across_hole = true;
+        for path in &paths {
+            assert_eq!(path.points.len() - 1, path.segments.len());
+            for (i, segment) in path.segments.iter().enumerate() {
+                let start = path.points[i];
+                let end = path.points[i + 1];
+                let mid = (start + end) * 0.5;
+                match segment.kind {
+                    MoveKind::Infill => {
+                        saw_infill = true;
+                        // A genuine fill line never has its midpoint inside
+                        // the hole (it should stop at the hole's boundary).
+                        assert!(
+                            !inside_hole(mid),
+                            "Infill-kind edge {start:?} -> {end:?} passes through the hole"
+                        );
                     }
+                    MoveKind::Travel => {}
+                    other => panic!("unexpected move kind in infill path: {other:?}"),
                 }
-                other => panic!("unexpected move kind in infill path: {other:?}"),
             }
         }
         assert!(saw_infill, "expected at least one Infill-kind edge");
-        assert!(
-            saw_travel_across_hole,
-            "expected at least one Travel-kind edge jumping across the hole"
-        );
     }
 
     #[test]
