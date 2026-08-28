@@ -292,87 +292,14 @@ impl EikonalOrderField {
             1.0
         };
 
-        if let Some(is_top_seed) = options.is_top_seed_region {
-            let (d_top, s_top) =
-                bed_field.march_distance_from_region(is_top_seed, &occupied, -1.0, lipschitz);
-            bed_field.apply_conformal_blend(
-                &d_top,
-                &s_top,
-                &occupied,
-                skin_depth,
-                options.top_detach_angle_deg,
-                options.detach_feather_mm,
-                false,
-            );
-        }
-        let pre_bottom = bed_field.distances.clone();
-        if let Some(is_bottom_seed) = options.is_bottom_seed_region {
-            let (d_bottom, s_bottom) =
-                bed_field.march_distance_from_region(is_bottom_seed, &occupied, 1.0, lipschitz);
-            bed_field.apply_conformal_blend(
-                &d_bottom,
-                &s_bottom,
-                &occupied,
-                skin_depth,
-                options.bottom_detach_angle_deg,
-                options.detach_feather_mm,
-                true,
-            );
-        }
-
-        // The conformal blends can *raise* skin-band nodes (top-patch
-        // flattening toward `A - d`) well past what the slope limit
-        // allows relative to adjacent un-blended nodes — e.g. where a
-        // conformed patch borders a detached (steep, zero-weight) surface
-        // region or a different patch component, the field can end up with
-        // a near-vertical order cliff across one cell. Isosurfaces then cut
-        // that cliff as detached rings on the surface whose interior
-        // neighbors print a full order later — floating (unsupported)
-        // wall loops. Re-run the slope-limit relaxation so conforming
-        // never violates the global printability bound (it shaves the
-        // blend only near such transitions), then re-apply the minimum-
-        // growth column repair since relaxation is a lowering pass.
-        //
-        // The first relaxation pass filled *air* (unoccupied) nodes with
-        // finite pre-blend values (that is how it couples disconnected
-        // features across open space). Those stale values sit directly
-        // against the raised conformal skin band, and reusing them as caps
-        // would shave the whole band straight back down to the pre-blend
-        // bulk field — silently disabling conforming. Reset air to +inf
-        // first: the relaxation refills it from the *post-blend* solid
-        // values, keeping air coupling consistent with the blended field.
-        if let Some(profile) = slope_profile {
-            // Slack on the slope cap for the post-blend pass — see
-            // `relax_with_slope_limit_scaled`. Only *bottom*-raised node
-            // pairs receive it: the bottom target `S + d` structurally
-            // exceeds the strict bound (strict shaving erases bottom
-            // conforming entirely), whereas top-patch flattening survives
-            // strict shaving and granting it slack was observed to
-            // reintroduce floating WallOuter islands at patch/detach
-            // transitions. The band exceeds the strict bound by up to
-            // `1 + tan(detach)/tan(max_angle)`; bound `tan(max_angle)`
-            // conservatively from below at 30°.
-            let slope_slack = 1.0
-                + options.bottom_detach_angle_deg.to_radians().tan() / 30.0f64.to_radians().tan();
-            let raised: Vec<bool> = pre_bottom
-                .iter()
-                .zip(&bed_field.distances)
-                .map(|(a, b)| (*b - *a).abs() > 1e-9)
-                .collect();
-            for (idx, &occ) in occupied.iter().enumerate() {
-                if !occ {
-                    bed_field.distances[idx] = f64::INFINITY;
-                }
-            }
-            bed_field.relax_bilateral_fixed_point(
-                profile,
-                ha,
-                &occupied,
-                slope_slack,
-                Some(&raised),
-                false,
-            );
-        }
+        bed_field.relax_conformal_fixed_point(
+            options,
+            &occupied,
+            slope_profile,
+            ha,
+            skin_depth,
+            lipschitz,
+        );
 
         bed_field.compute_gradients(&occupied);
         bed_field
@@ -1476,39 +1403,85 @@ impl EikonalOrderField {
         }
     }
 
-    /// Runs bilateral upward-downward fixed-point iteration until both the
-    /// bottom-up Eikonal wavefront and the downward/lateral collision shadows converge stably.
-    fn relax_bilateral_fixed_point(
+    /// Runs fixed-point iteration including top/bottom conformal surface constraints,
+    /// forward slope relaxation, downward non-collision, and vertical monotonicity
+    /// until the entire coupled field reaches equilibrium.
+    #[allow(clippy::too_many_arguments)]
+    fn relax_conformal_fixed_point(
         &mut self,
-        profile: &SlopeProfile,
-        height_along: &dyn HeightAlong,
+        options: &ConformalSurfaceOptions<'_>,
         occupied: &[bool],
-        slope_slack: f64,
-        slack_mask: Option<&[bool]>,
-        smooth_horizontal: bool,
+        slope_profile: Option<&SlopeProfile>,
+        height_along: &dyn HeightAlong,
+        skin_depth: f64,
+        lipschitz: f64,
     ) {
         const MAX_ITERATIONS: usize = 12;
         const CONVERGENCE_EPSILON: f64 = 1e-4;
 
+        let slope_slack =
+            1.0 + options.bottom_detach_angle_deg.to_radians().tan() / 30.0f64.to_radians().tan();
+
         for _ in 0..MAX_ITERATIONS {
             let prev = self.distances.clone();
 
-            // 1. Upward/Forward slope-limiting relaxation pass (lowering)
-            self.relax_with_slope_limit_scaled(
-                profile,
-                height_along,
-                occupied,
-                slope_slack,
-                slack_mask,
-            );
+            // 1. Top conformal surface constraint (if enabled)
+            if let Some(is_top_seed) = options.is_top_seed_region {
+                let (d_top, s_top) =
+                    self.march_distance_from_region(is_top_seed, occupied, -1.0, lipschitz);
+                self.apply_conformal_blend(
+                    &d_top,
+                    &s_top,
+                    occupied,
+                    skin_depth,
+                    options.top_detach_angle_deg,
+                    options.detach_feather_mm,
+                    false,
+                );
+            }
 
-            // 2. Downward non-collision check (raising/delaying higher voxels)
-            self.enforce_downward_non_collision(profile, height_along, occupied);
+            // 2. Bottom conformal surface constraint (if enabled)
+            let pre_bottom = self.distances.clone();
+            if let Some(is_bottom_seed) = options.is_bottom_seed_region {
+                let (d_bottom, s_bottom) =
+                    self.march_distance_from_region(is_bottom_seed, occupied, 1.0, lipschitz);
+                self.apply_conformal_blend(
+                    &d_bottom,
+                    &s_bottom,
+                    occupied,
+                    skin_depth,
+                    options.bottom_detach_angle_deg,
+                    options.detach_feather_mm,
+                    true,
+                );
+            }
 
-            // 3. Monotonic column growth pass
-            self.enforce_min_column_growth(occupied, smooth_horizontal);
+            // 3. Slope-limit relaxation & Downward non-collision
+            if let Some(profile) = slope_profile {
+                let raised: Vec<bool> = pre_bottom
+                    .iter()
+                    .zip(&self.distances)
+                    .map(|(a, b)| (*b - *a).abs() > 1e-9)
+                    .collect();
+                for (idx, &occ) in occupied.iter().enumerate() {
+                    if !occ {
+                        self.distances[idx] = f64::INFINITY;
+                    }
+                }
+                self.relax_with_slope_limit_scaled(
+                    profile,
+                    height_along,
+                    occupied,
+                    slope_slack,
+                    Some(&raised),
+                );
+                self.enforce_downward_non_collision(profile, height_along, occupied);
+            }
 
-            // 4. Convergence check
+            // 4. Monotonic column growth
+            self.enforce_min_column_growth(occupied, false);
+
+            // 5. Convergence check
             let max_diff = self
                 .distances
                 .iter()
