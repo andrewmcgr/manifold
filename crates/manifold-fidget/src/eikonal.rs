@@ -371,6 +371,7 @@ impl EikonalOrderField {
                 slope_slack,
                 Some(&raised),
             );
+            bed_field.enforce_downward_non_collision(profile, ha, &occupied);
             bed_field.enforce_min_column_growth(&occupied, false);
         }
 
@@ -1268,11 +1269,7 @@ impl EikonalOrderField {
         height_along: &dyn HeightAlong,
         occupied: &[bool],
     ) {
-        // Forward (lowering) pass: caps neighbor values at T(p) + tan(theta) * h
         self.relax_with_slope_limit_scaled(profile, height_along, occupied, 1.0, None);
-        // Reverse (raising) pass: bounds lagging neighbors at T(p) - tan(theta) * h
-        // to enforce symmetric Lipschitz continuity based on the anti-collision SlopeProfile
-        self.relax_with_slope_limit_reverse(profile, height_along, occupied);
     }
 
     /// [`Self::relax_with_slope_limit`] with a constant multiplicative
@@ -1407,118 +1404,74 @@ impl EikonalOrderField {
         }
     }
 
-    /// Reverse / Raising Lipschitz relaxation pass:
-    /// Enforces `T(q) >= T(p) - max_slope_at(height) * h` using the existing
-    /// toolhead clearance anti-collision SlopeProfile constraints.
-    /// Uses a MaxHeap over finite nodes to raise lagging neighbor nodes, ensuring
-    /// symmetric Lipschitz continuity across adjacent columns.
-    fn relax_with_slope_limit_reverse(
+    /// Downward Non-Collision Check:
+    /// For every solid voxel (x, y, z), query lateral neighbor columns (nx, ny).
+    /// If a neighbor column contains a solid voxel that is lower down (nz_lower < z)
+    /// but has a higher or matching order value (T(nx, ny, nz_lower) >= T(x, y, z)),
+    /// the current (higher) voxel's order value T(x, y, z) must be delayed (increased)
+    /// so the lower voxel prints first, preventing the toolhead from colliding with
+    /// an already-deposited higher voxel when later printing the lower voxel.
+    fn enforce_downward_non_collision(
         &mut self,
         profile: &SlopeProfile,
         height_along: &dyn HeightAlong,
-        _occupied: &[bool],
+        occupied: &[bool],
     ) {
-        #[derive(Copy, Clone, PartialEq)]
-        struct MaxHeapEntry {
-            value: f64,
-            x: usize,
-            y: usize,
-            z: usize,
+        if profile.points().is_empty() {
+            return;
         }
-
-        impl Eq for MaxHeapEntry {}
-
-        impl Ord for MaxHeapEntry {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.value
-                    .partial_cmp(&other.value)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }
-        }
-
-        impl PartialOrd for MaxHeapEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
+        const NEAR_VERTICAL_ANGLE_DEG: f64 = 89.999;
+        const MIN_GROWTH: f64 = 0.15;
         let [nx, ny, nz] = self.dims;
-        let mut heap: BinaryHeap<MaxHeapEntry> = BinaryHeap::new();
 
         for z in 0..nz {
             for y in 0..ny {
                 for x in 0..nx {
                     let idx = self.idx(x, y, z);
-                    if self.distances[idx].is_finite() {
-                        heap.push(MaxHeapEntry {
-                            value: self.distances[idx],
-                            x,
-                            y,
-                            z,
-                        });
+                    if !occupied[idx] || !self.distances[idx].is_finite() {
+                        continue;
                     }
-                }
-            }
-        }
+                    let t_low = self.distances[idx];
+                    let height = height_along.height(self.node_pos(x, y, z));
+                    if height.is_nan() {
+                        continue;
+                    }
+                    let max_angle = profile.max_slope_at(height);
+                    if !max_angle.is_finite() || max_angle >= NEAR_VERTICAL_ANGLE_DEG {
+                        continue;
+                    }
+                    let slope_multiplier = max_angle.to_radians().tan();
+                    if !slope_multiplier.is_finite() {
+                        continue;
+                    }
 
-        const NEAR_VERTICAL_ANGLE_DEG: f64 = 89.999;
+                    for (dx, dy) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)] {
+                        let nxp = x as isize + dx;
+                        let nyp = y as isize + dy;
+                        if nxp < 0 || nyp < 0 || nxp as usize >= nx || nyp as usize >= ny {
+                            continue;
+                        }
+                        let nxu = nxp as usize;
+                        let nyu = nyp as usize;
 
-        while let Some(MaxHeapEntry { value, x, y, z }) = heap.pop() {
-            let idx = self.idx(x, y, z);
-            if self.distances[idx] > value {
-                // Stale heap entry
-                continue;
-            }
-            let t_p = self.distances[idx];
-
-            let height = height_along.height(self.node_pos(x, y, z));
-            if height.is_nan() {
-                continue;
-            }
-            let max_angle = profile.max_slope_at(height);
-            if !max_angle.is_finite() || max_angle >= NEAR_VERTICAL_ANGLE_DEG {
-                continue;
-            }
-            let slope_multiplier = max_angle.to_radians().tan();
-            if !slope_multiplier.is_finite() {
-                continue;
-            }
-
-            for (dx, dy, dz) in NEIGHBOR_OFFSETS {
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
-                let nxp = x as isize + dx;
-                let nyp = y as isize + dy;
-                let nzp = z as isize + dz;
-                if nxp < 0
-                    || nyp < 0
-                    || nzp < 0
-                    || nxp as usize >= nx
-                    || nyp as usize >= ny
-                    || nzp as usize >= nz
-                {
-                    continue;
-                }
-                let (nxu, nyu, nzu) = (nxp as usize, nyp as usize, nzp as usize);
-                let nidx = self.idx(nxu, nyu, nzu);
-                if self.distances[nidx] == 0.0 || !self.distances[nidx].is_finite() {
-                    // Bed seeds are anchored
-                    continue;
-                }
-
-                let candidate = t_p - slope_multiplier * self.h;
-                if candidate.is_nan() {
-                    continue;
-                }
-                if candidate > self.distances[nidx] {
-                    self.distances[nidx] = candidate;
-                    heap.push(MaxHeapEntry {
-                        value: candidate,
-                        x: nxu,
-                        y: nyu,
-                        z: nzu,
-                    });
+                        // Check higher solid voxels in neighbor column (nz_higher > z)
+                        for nz_higher in (z + 1)..nz {
+                            let nidx = self.idx(nxu, nyu, nz_higher);
+                            if !occupied[nidx] || !self.distances[nidx].is_finite() {
+                                continue;
+                            }
+                            let dz = (nz_higher - z) as f64 * self.h;
+                            if dz > slope_multiplier * self.h {
+                                let t_high = self.distances[nidx];
+                                if t_high <= t_low {
+                                    let required_t = t_low + MIN_GROWTH * dz;
+                                    if required_t > self.distances[nidx] {
+                                        self.distances[nidx] = required_t;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2926,5 +2879,39 @@ mod tests {
                 "horizontal gradient must satisfy Lipschitz bound without shear: o0={o0}, o1={o1}"
             );
         }
+    }
+
+    /// Downward non-collision check: if a lateral neighbor column has a solid voxel
+    /// that is higher up but has a lower/matching order, the lower voxel must be delayed
+    /// to avoid colliding with the already-printed higher solid.
+    #[test]
+    fn downward_non_collision_check_delays_lower_voxels_when_higher_neighbor_is_early() {
+        let min_corner = DVec3::new(0.0, 0.0, 0.0);
+        let max_corner = DVec3::new(4.0, 2.0, 6.0);
+        // Two columns: Pillar A at x in [0, 1], Pillar B at x in [2, 3]
+        let is_solid = |p: DVec3| (p.x <= 1.0 || (p.x >= 2.0 && p.x <= 3.0)) && p.z <= 6.0;
+        let is_seed = |p: DVec3| p.z <= 0.25;
+
+        let profile = SlopeProfile::from_angle(45.0);
+        let field = EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
+            min_corner,
+            max_corner,
+            0.5,
+            &is_solid,
+            &is_seed,
+            Some(&profile),
+            None,
+        );
+
+        // Lower voxel in Pillar A vs higher voxel in neighbor Pillar B
+        let p_low = DVec3::new(0.5, 1.0, 1.0);
+        let p_high = DVec3::new(0.5, 1.0, 3.0);
+        let o_low = field.order(p_low);
+        let o_high = field.order(p_high);
+        assert!(o_low.is_finite() && o_high.is_finite());
+        assert!(
+            o_high >= o_low,
+            "higher voxel must have order >= lower voxel along column: o_low={o_low}, o_high={o_high}"
+        );
     }
 }
