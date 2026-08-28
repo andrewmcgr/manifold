@@ -66,6 +66,21 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     eikonal_conform_top_surfaces: bool,
 
+    /// Whether the Eikonal order field conforms to downward-facing
+    /// (overhang) surfaces, excluding the bed contact region.
+    #[arg(long, default_value_t = false)]
+    eikonal_conform_bottom_surfaces: bool,
+
+    /// Detach angle (degrees from horizontal) for conformal top surface
+    /// tracking; steeper surfaces revert to bulk slicing. Default 45.
+    #[arg(long)]
+    eikonal_conformal_top_angle: Option<f64>,
+
+    /// Detach angle (degrees from horizontal) for conformal bottom surface
+    /// tracking; steeper surfaces revert to bulk slicing. Default 30.
+    #[arg(long)]
+    eikonal_conformal_bottom_angle: Option<f64>,
+
     /// Whether wave overhang toolpath generation is enabled (Huygens wave propagation).
     #[arg(long, default_value_t = true)]
     wave_overhangs: bool,
@@ -221,6 +236,9 @@ fn main() -> Result<()> {
         nozzle_diameter: cli.nozzle_diameter,
         order_field: cli.order_field.into(),
         eikonal_conform_top_surfaces: cli.eikonal_conform_top_surfaces,
+        eikonal_conform_bottom_surfaces: cli.eikonal_conform_bottom_surfaces,
+        eikonal_conformal_max_angle_deg: cli.eikonal_conformal_top_angle,
+        eikonal_conformal_bottom_max_angle_deg: cli.eikonal_conformal_bottom_angle,
         wave_overhangs_enabled: cli.wave_overhangs,
         wave_overhang_overlap: cli.wave_overhang_overlap,
         wave_overhang_speed: cli.wave_overhang_speed.map(|s| s * 60.0),

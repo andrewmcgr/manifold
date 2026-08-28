@@ -26,6 +26,7 @@ pub mod threemf;
 pub mod tool;
 pub mod toolpath;
 pub mod transform;
+pub mod verification;
 pub mod wave_overhang;
 pub mod workspace;
 
@@ -128,11 +129,25 @@ pub struct SlicerConfig {
     /// Defaults to `false`.
     #[serde(default)]
     pub eikonal_conform_top_surfaces: bool,
-    /// Maximum surface inclination angle from horizontal (degrees) for conformal top shell tracking.
-    /// Surfaces steeper than this angle are excluded from conformal deformation.
+    /// Whether the `Eikonal` order field conforms to downward-facing
+    /// (bottom/overhang) exterior surfaces, excluding the bed contact
+    /// region, so near-underside layers run parallel to the underside
+    /// instead of staircasing (which produces unsupported bead edges).
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub eikonal_conform_bottom_surfaces: bool,
+    /// Detach angle (degrees from horizontal) for conformal *top* surface
+    /// tracking: surfaces steeper than this smoothly hand off to ordinary
+    /// bulk slicing instead of being conformed to.
     /// Defaults to `45.0°`.
     #[serde(default)]
     pub eikonal_conformal_max_angle_deg: Option<f64>,
+    /// Detach angle (degrees from horizontal) for conformal *bottom*
+    /// surface tracking. Bottom conforming is most valuable on shallow
+    /// overhangs, so this defaults lower than the top angle.
+    /// Defaults to `30.0°`.
+    #[serde(default)]
+    pub eikonal_conformal_bottom_max_angle_deg: Option<f64>,
     /// Subsurface skin layer depth (mm) within which order isosurfaces conform parallel to the top shell.
     /// Defaults to `1.2 mm`.
     #[serde(default)]
@@ -477,7 +492,9 @@ impl Default for SlicerConfig {
             bottom_layers: 3,
             order_field: order_field::OrderFieldKind::default(),
             eikonal_conform_top_surfaces: false,
+            eikonal_conform_bottom_surfaces: false,
             eikonal_conformal_max_angle_deg: None,
+            eikonal_conformal_bottom_max_angle_deg: None,
             eikonal_conformal_skin_depth_mm: None,
             order_field_apex: glam::DVec3::ZERO,
             order_field_axis: slicing::BUILD_DIRECTION,
@@ -713,12 +730,21 @@ impl SlicerConfig {
         self.fan_layer_delay.unwrap_or(1)
     }
 
-    /// Maximum surface inclination angle (degrees) for conformal top surface tracking.
+    /// Detach angle (degrees from horizontal) for conformal top surface tracking.
     /// Defaults to `45.0°`.
     #[must_use]
     pub fn eikonal_conformal_max_angle_deg(&self) -> f64 {
         self.eikonal_conformal_max_angle_deg
             .unwrap_or(45.0)
+            .clamp(5.0, 85.0)
+    }
+
+    /// Detach angle (degrees from horizontal) for conformal bottom surface tracking.
+    /// Defaults to `30.0°`.
+    #[must_use]
+    pub fn eikonal_conformal_bottom_max_angle_deg(&self) -> f64 {
+        self.eikonal_conformal_bottom_max_angle_deg
+            .unwrap_or(30.0)
             .clamp(5.0, 85.0)
     }
 

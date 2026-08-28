@@ -64,6 +64,31 @@ pub struct EikonalOrderField {
     gradients: Vec<DVec3>,
 }
 
+/// Which exterior surfaces the conformal Eikonal constructor should conform
+/// to, and how aggressively — see
+/// [`EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit`].
+///
+/// Each side is independently optional (pass `None` to disable it), and each
+/// side carries its own *detach angle*: the surface inclination from
+/// horizontal (degrees) beyond which conformity smoothly hands off to
+/// ordinary bulk slicing instead of fighting the global slope limit.
+pub struct ConformalSurfaceOptions<'a> {
+    /// Region classifier for the top exterior surface band (typically
+    /// "within one cell of an upward-facing face"). `None` disables top
+    /// conforming.
+    pub is_top_seed_region: Option<&'a (dyn Fn(DVec3) -> bool + Sync)>,
+    /// Region classifier for the bottom exterior surface band (downward
+    /// facing, excluding bed contact). `None` disables bottom conforming.
+    pub is_bottom_seed_region: Option<&'a (dyn Fn(DVec3) -> bool + Sync)>,
+    /// Depth (mm) of the subsurface band within which isosurfaces conform;
+    /// clamped to at least two grid cells.
+    pub skin_depth_mm: f64,
+    /// Detach angle (degrees from horizontal) for top conforming.
+    pub top_detach_angle_deg: f64,
+    /// Detach angle (degrees from horizontal) for bottom conforming.
+    pub bottom_detach_angle_deg: f64,
+}
+
 impl EikonalOrderField {
     /// Builds an [`EikonalOrderField`] over the axis-aligned bounding box
     /// `[min_corner, max_corner]` (corners are normalized component-wise, so
@@ -216,11 +241,19 @@ impl EikonalOrderField {
         field
     }
 
-    /// Two-sided boundary-conforming Eikonal field: marches distances upward
-    /// from the bed contact region (`is_bed_seed_region`) and downward from
-    /// the top exterior surface (`is_top_seed_region`), and smoothly warps the
-    /// top skin layers so they lie parallel to and conform with sloped and curved
-    /// top surfaces, while keeping the bulk and base 100% strictly monotonic.
+    /// Surface-conforming Eikonal field: after the ordinary bed-seeded FMM
+    /// march (plus optional slope-limit relaxation), the field is blended,
+    /// inside a skin band near the model's top and/or bottom exterior
+    /// surfaces, with a *surface-offset field* `A ∓ d_side` (where `d_side`
+    /// is the in-solid distance to that surface and `A` a per-surface-patch
+    /// matching constant), so isosurfaces there lie parallel to (conform
+    /// with) those surfaces — see [`EikonalOrderField::apply_conformal_blend`].
+    ///
+    /// Each side has its own *detach angle* (`ConformalSurfaceOptions`):
+    /// where the local surface inclination from horizontal exceeds it, the
+    /// conformity weight smoothly falls to zero and the field reverts to
+    /// ordinary slope-limited bulk behavior — conforming never fights the
+    /// global slope limit on steep surfaces.
     #[allow(clippy::too_many_arguments)]
     pub fn new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
         min_corner: DVec3,
@@ -228,8 +261,7 @@ impl EikonalOrderField {
         requested_cell_size: f64,
         is_solid: &(dyn Fn(DVec3) -> bool + Sync),
         is_bed_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
-        is_top_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
-        skin_depth_mm: f64,
+        options: &ConformalSurfaceOptions<'_>,
         slope_profile: Option<&SlopeProfile>,
         height_along: Option<&dyn HeightAlong>,
     ) -> Self {
@@ -237,99 +269,65 @@ impl EikonalOrderField {
             Self::build_grid(min_corner, max_corner, requested_cell_size, is_solid);
         bed_field.march_from_region(is_bed_seed_region, &occupied);
 
+        let default_height =
+            crate::height_along::ConstantAxisHeight::new(glam::DVec3::Z, min_corner);
+        let ha: &dyn HeightAlong = height_along.unwrap_or(&default_height);
         if let Some(profile) = slope_profile {
-            let default_height =
-                crate::height_along::ConstantAxisHeight::new(glam::DVec3::Z, min_corner);
-            let ha: &dyn HeightAlong = height_along.unwrap_or(&default_height);
             bed_field.relax_with_slope_limit(profile, ha, &occupied);
         }
 
-        let (top_distances, nearest_surface_value) = bed_field.march_downward_with_surface_values(
-            is_top_seed_region,
-            &occupied,
-            &bed_field.distances,
-        );
+        let skin_depth = options.skin_depth_mm.max(bed_field.h * 2.0);
 
-        let skin_thickness = skin_depth_mm.max(bed_field.h * 2.0);
-        let total = bed_field.distances.len();
-        let [nx, ny, nz] = bed_field.dims;
-        let mut delta = vec![0.0f64; total];
-
-        for idx in 0..total {
-            if !occupied[idx] {
-                continue;
-            }
-            let d_top = top_distances[idx];
-            let d_bed = bed_field.distances[idx];
-            let surf_val = nearest_surface_value[idx];
-
-            if d_top < skin_thickness && surf_val.is_finite() && d_bed.is_finite() {
-                let skin_order = surf_val - d_top;
-                let t = (d_top / skin_thickness).clamp(0.0, 1.0);
-                let alpha = t * t * (3.0 - 2.0 * t);
-                delta[idx] = (1.0 - alpha) * (skin_order - d_bed);
-            }
+        if let Some(is_top_seed) = options.is_top_seed_region {
+            let (d_top, s_top) = bed_field.march_distance_from_region(is_top_seed, &occupied);
+            bed_field.apply_conformal_blend(
+                &d_top,
+                &s_top,
+                &occupied,
+                skin_depth,
+                options.top_detach_angle_deg,
+                false,
+            );
         }
-
-        // Apply smoothing to delta to ensure C1 continuity without lateral gradient tearing
-        let mut smoothed_delta = delta.clone();
-        for _ in 0..4 {
-            let src = smoothed_delta.clone();
-            for z in 0..nz {
-                for y in 0..ny {
-                    for x in 0..nx {
-                        let idx = bed_field.idx(x, y, z);
-                        if !occupied[idx] {
-                            continue;
-                        }
-                        let mut sum = src[idx] * 2.0;
-                        let mut weight = 2.0;
-                        for (dx, dy, dz) in NEIGHBOR_OFFSETS {
-                            let nxp = x as isize + dx;
-                            let nyp = y as isize + dy;
-                            let nzp = z as isize + dz;
-                            if nxp >= 0
-                                && nyp >= 0
-                                && nzp >= 0
-                                && (nxp as usize) < nx
-                                && (nyp as usize) < ny
-                                && (nzp as usize) < nz
-                            {
-                                let nidx = bed_field.idx(nxp as usize, nyp as usize, nzp as usize);
-                                if occupied[nidx] {
-                                    sum += src[nidx];
-                                    weight += 1.0;
-                                }
-                            }
-                        }
-                        smoothed_delta[idx] = sum / weight;
-                    }
-                }
-            }
-        }
-
-        for idx in 0..total {
-            if occupied[idx] && bed_field.distances[idx].is_finite() {
-                bed_field.distances[idx] += smoothed_delta[idx];
-            }
+        if let Some(is_bottom_seed) = options.is_bottom_seed_region {
+            let (d_bottom, s_bottom) =
+                bed_field.march_distance_from_region(is_bottom_seed, &occupied);
+            bed_field.apply_conformal_blend(
+                &d_bottom,
+                &s_bottom,
+                &occupied,
+                skin_depth,
+                options.bottom_detach_angle_deg,
+                true,
+            );
         }
 
         bed_field.compute_gradients(&occupied);
         bed_field
     }
 
-    /// Helper for conformal top skin: marches downward from `is_top_seed_region`,
-    /// propagating both the distance to the top surface and the `surface_values`
-    /// of the nearest top seed.
-    fn march_downward_with_surface_values(
+    /// Chamfer-style distance march from every *exposed* occupied node
+    /// inside `is_seed_region` (frozen at `0.0`), stepping `self.h` per
+    /// grid-neighbor hop through occupied nodes. "Exposed" means the node
+    /// has at least one non-occupied (or out-of-grid) 6-neighbor, so a
+    /// thick caller-supplied seed band still yields a one-cell-thin seed
+    /// front on the actual surface — `d` then measures true depth below
+    /// the surface instead of zeroing out across the whole band. Used to
+    /// measure depth below/above an exterior surface for the conformal
+    /// skin band — approximate (axis-metric) distance is sufficient for
+    /// band gating and normal estimation.
+    fn march_distance_from_region(
         &self,
-        is_top_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
+        is_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
         occupied: &[bool],
-        surface_values: &[f64],
     ) -> (Vec<f64>, Vec<f64>) {
         let total = self.distances.len();
-        let mut top_distances = vec![f64::INFINITY; total];
-        let mut nearest_surface_value = vec![f64::NAN; total];
+        let mut dist = vec![f64::INFINITY; total];
+        // Per-node bulk-field value at the seed node this node's shortest
+        // marched path originated from (its approximate surface foot
+        // point) — the per-node conformal anchor for
+        // `apply_conformal_blend`.
+        let mut surface_value = vec![f64::NAN; total];
 
         let [nx, ny, nz] = self.dims;
         let seeded: Vec<bool> = (0..total)
@@ -341,28 +339,42 @@ impl EikonalOrderField {
                 let z = idx / (nx * ny);
                 let y = (idx / nx) % ny;
                 let x = idx % nx;
-                is_top_seed_region(self.node_pos(x, y, z))
+                if !is_seed_region(self.node_pos(x, y, z)) {
+                    return false;
+                }
+                // Exposed check: at least one non-occupied or out-of-grid
+                // 6-neighbor.
+                NEIGHBOR_OFFSETS.iter().any(|&(dx, dy, dz)| {
+                    let nxp = x as isize + dx;
+                    let nyp = y as isize + dy;
+                    let nzp = z as isize + dz;
+                    if nxp < 0
+                        || nyp < 0
+                        || nzp < 0
+                        || nxp >= nx as isize
+                        || nyp >= ny as isize
+                        || nzp >= nz as isize
+                    {
+                        return true;
+                    }
+                    !occupied[self.idx(nxp as usize, nyp as usize, nzp as usize)]
+                })
             })
             .collect();
 
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
         let mut frozen = vec![false; total];
 
-        for (idx, &is_seed) in seeded.iter().enumerate() {
-            if is_seed && surface_values[idx].is_finite() {
-                top_distances[idx] = 0.0;
-                nearest_surface_value[idx] = surface_values[idx];
-            }
-        }
-
         for z in 0..nz {
             for y in 0..ny {
                 for x in 0..nx {
                     let idx = self.idx(x, y, z);
-                    if top_distances[idx].is_finite() {
+                    if seeded[idx] {
+                        dist[idx] = 0.0;
+                        surface_value[idx] = self.distances[idx];
                         frozen[idx] = true;
                         heap.push(HeapEntry {
-                            value: top_distances[idx],
+                            value: 0.0,
                             x,
                             y,
                             z,
@@ -374,11 +386,10 @@ impl EikonalOrderField {
 
         while let Some(HeapEntry { value, x, y, z }) = heap.pop() {
             let idx = self.idx(x, y, z);
-            if frozen[idx] && top_distances[idx] < value {
+            if frozen[idx] && dist[idx] < value {
                 continue;
             }
             frozen[idx] = true;
-            let surf_val = nearest_surface_value[idx];
 
             for (dx, dy, dz) in NEIGHBOR_OFFSETS {
                 let nxp = x as isize + dx;
@@ -399,9 +410,9 @@ impl EikonalOrderField {
                     continue;
                 }
                 let next_dist = value + self.h;
-                if next_dist < top_distances[n_idx] {
-                    top_distances[n_idx] = next_dist;
-                    nearest_surface_value[n_idx] = surf_val;
+                if next_dist < dist[n_idx] {
+                    dist[n_idx] = next_dist;
+                    surface_value[n_idx] = surface_value[idx];
                     heap.push(HeapEntry {
                         value: next_dist,
                         x: nx_u,
@@ -412,7 +423,346 @@ impl EikonalOrderField {
             }
         }
 
-        (top_distances, nearest_surface_value)
+        (dist, surface_value)
+    }
+
+    /// Blends the field, inside the skin band of one surface side, toward
+    /// a *surface-offset field* so isosurfaces there run parallel to that
+    /// surface.
+    ///
+    /// `d` is the in-solid chamfer distance to the side's surface and
+    /// `surface_values` the bulk-field order at each node's marched surface
+    /// foot point (both produced by
+    /// [`EikonalOrderField::march_distance_from_region`]).
+    ///
+    /// The two sides get *different* conformal targets, because their
+    /// physical constraints differ:
+    ///
+    /// - **Top** (`flip_normal == false`): target `A - d`, with `A` a
+    ///   per-connected-surface-patch matching constant (the extremal
+    ///   `T + d` over the patch's well-conformed core). The whole top
+    ///   patch becomes the patch's *last* isosurface — a staircase-free
+    ///   final skin. Safe: everything beneath a top surface is already
+    ///   printed by the time the skin is deposited.
+    /// - **Bottom** (`flip_normal == true`): target `S + d`, with
+    ///   `S = surface_values[idx]` the *per-node* anchor. At the underside
+    ///   itself the target equals the bulk field, so order keeps advancing
+    ///   along the surface exactly as the bulk march does (a shallow
+    ///   underside still prints outward from its supported edge,
+    ///   wavefront-style) while isosurface *spacing* normal to the surface
+    ///   becomes uniform — conforming layer thickness. Flattening an
+    ///   underside to one order (the top-style target) would schedule the
+    ///   entire underside skin as one early "layer" hanging in mid-air far
+    ///   from any support — unprintable.
+    ///
+    /// The blend weight is the product of:
+    /// - a depth falloff: `1` in a plateau near the surface, smoothstepping
+    ///   to `0` at `skin_depth`; and
+    /// - a detach-angle falloff: `1` while the surface inclination `β`
+    ///   (from horizontal, estimated from `-∇d`) is below
+    ///   `detach_angle_deg - DETACH_TRANSITION_DEG`, smoothstepping to `0`
+    ///   at `detach_angle_deg` — surfaces steeper than the detach angle
+    ///   cleanly revert to bulk slicing rather than fighting the slope
+    ///   limit.
+    fn apply_conformal_blend(
+        &mut self,
+        d: &[f64],
+        surface_values: &[f64],
+        occupied: &[bool],
+        skin_depth: f64,
+        detach_angle_deg: f64,
+        flip_normal: bool,
+    ) {
+        /// Width (degrees) of the smooth hand-off band below the detach
+        /// angle, so the field stays C1-ish where conforming detaches.
+        const DETACH_TRANSITION_DEG: f64 = 5.0;
+        /// Fraction of `skin_depth` over which the depth falloff stays at
+        /// full weight before easing out, so the surface-adjacent layers
+        /// are fully conformal.
+        const DEPTH_PLATEAU: f64 = 0.35;
+        const WEIGHT_EPS: f64 = 1e-6;
+
+        let total = self.distances.len();
+        let [nx, ny, nz] = self.dims;
+
+        let mut weight = vec![0.0f64; total];
+        // Angle weight is NaN where the surface normal cannot be estimated
+        // (degenerate `d` gradient — typically deep inside a thick seed
+        // band where `d` is 0 across whole slabs); such nodes inherit their
+        // neighbors' angle weight in a propagation pass below.
+        let mut w_angle_grid = vec![f64::NAN; total];
+        let mut w_depth_grid = vec![0.0f64; total];
+        let mut in_band = vec![false; total];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let idx = self.idx(x, y, z);
+                    if !occupied[idx] || !self.distances[idx].is_finite() {
+                        continue;
+                    }
+                    let depth = d[idx];
+                    if !depth.is_finite() || depth >= skin_depth {
+                        continue;
+                    }
+                    in_band[idx] = true;
+
+                    let t = (depth / skin_depth).clamp(0.0, 1.0);
+                    w_depth_grid[idx] = if t <= DEPTH_PLATEAU {
+                        1.0
+                    } else {
+                        let s = (t - DEPTH_PLATEAU) / (1.0 - DEPTH_PLATEAU);
+                        1.0 - s * s * (3.0 - 2.0 * s)
+                    };
+
+                    let Some(grad) = self.finite_difference_gradient(d, occupied, x, y, z) else {
+                        continue;
+                    };
+                    if grad.length_squared() < 1e-18 {
+                        continue;
+                    }
+                    // `d` grows away from the surface, so the outward
+                    // surface normal is -grad.
+                    let outward = -grad.normalize();
+                    let candidate = if flip_normal { -outward } else { outward };
+                    if candidate.z <= 1e-3 {
+                        // Vertical or inverted surface patch: never conform.
+                        w_angle_grid[idx] = 0.0;
+                        continue;
+                    }
+
+                    let beta_deg = candidate.z.clamp(-1.0, 1.0).acos().to_degrees();
+                    w_angle_grid[idx] = if beta_deg >= detach_angle_deg {
+                        0.0
+                    } else if beta_deg <= detach_angle_deg - DETACH_TRANSITION_DEG {
+                        1.0
+                    } else {
+                        let t = (detach_angle_deg - beta_deg) / DETACH_TRANSITION_DEG;
+                        t * t * (3.0 - 2.0 * t)
+                    };
+                }
+            }
+        }
+
+        // Propagate angle weight into degenerate-gradient band nodes from
+        // their neighbors (a few Jacobi passes over the 6-neighborhood).
+        for _ in 0..4 {
+            let mut changed = false;
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let idx = self.idx(x, y, z);
+                        if !in_band[idx] || !w_angle_grid[idx].is_nan() {
+                            continue;
+                        }
+                        let mut best = f64::NAN;
+                        for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                            let nxp = x as isize + dx;
+                            let nyp = y as isize + dy;
+                            let nzp = z as isize + dz;
+                            if nxp < 0
+                                || nyp < 0
+                                || nzp < 0
+                                || nxp as usize >= nx
+                                || nyp as usize >= ny
+                                || nzp as usize >= nz
+                            {
+                                continue;
+                            }
+                            let nidx = self.idx(nxp as usize, nyp as usize, nzp as usize);
+                            let wa = w_angle_grid[nidx];
+                            if wa.is_finite() && (best.is_nan() || wa > best) {
+                                best = wa;
+                            }
+                        }
+                        if best.is_finite() {
+                            w_angle_grid[idx] = best;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for idx in 0..total {
+            if in_band[idx] && w_angle_grid[idx].is_finite() {
+                weight[idx] = w_angle_grid[idx] * w_depth_grid[idx];
+            }
+        }
+
+        if flip_normal {
+            // Bottom: per-node surface-anchored target `S + d` — preserves
+            // along-surface order growth (printable wavefront), uniform
+            // normal spacing. Nodes whose march never reached a seed are
+            // left untouched.
+            for idx in 0..total {
+                let w = weight[idx];
+                if w <= WEIGHT_EPS || self.distances[idx] == 0.0 {
+                    // Zero-weight or bed-seed node: anchored, never moved.
+                    continue;
+                }
+                let s = surface_values[idx];
+                if !s.is_finite() {
+                    continue;
+                }
+                let conformal = s + d[idx];
+                self.distances[idx] = (1.0 - w) * self.distances[idx] + w * conformal;
+            }
+        } else {
+            // Top: per-patch flattening. Connected components
+            // (6-connectivity) over weighted nodes, so each disjoint
+            // surface patch gets its own matching constant `A` instead of
+            // averaging unrelated patches together.
+            let mut component = vec![usize::MAX; total];
+            let mut component_count = 0usize;
+            let mut stack = Vec::new();
+            for start in 0..total {
+                if weight[start] <= WEIGHT_EPS || component[start] != usize::MAX {
+                    continue;
+                }
+                let id = component_count;
+                component_count += 1;
+                component[start] = id;
+                stack.push(start);
+                while let Some(idx) = stack.pop() {
+                    let z = idx / (nx * ny);
+                    let y = (idx / nx) % ny;
+                    let x = idx % nx;
+                    for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                        let nxp = x as isize + dx;
+                        let nyp = y as isize + dy;
+                        let nzp = z as isize + dz;
+                        if nxp < 0
+                            || nyp < 0
+                            || nzp < 0
+                            || nxp as usize >= nx
+                            || nyp as usize >= ny
+                            || nzp as usize >= nz
+                        {
+                            continue;
+                        }
+                        let nidx = self.idx(nxp as usize, nyp as usize, nzp as usize);
+                        if weight[nidx] > WEIGHT_EPS && component[nidx] == usize::MAX {
+                            component[nidx] = id;
+                            stack.push(nidx);
+                        }
+                    }
+                }
+            }
+            if component_count == 0 {
+                return;
+            }
+
+            // Per-component matching constant `A`: the max `T + d` over the
+            // patch's well-conformed core (w >= 0.5), so the top surface is
+            // the patch's *last* layer (target never below bulk — the blend
+            // only raises order), keeping growth along the build direction
+            // intact.
+            let mut a_extreme = vec![f64::NAN; component_count];
+            for idx in 0..total {
+                if weight[idx] < 0.5 {
+                    continue;
+                }
+                let a = self.distances[idx] + d[idx];
+                let cur = &mut a_extreme[component[idx]];
+                if cur.is_nan() || a > *cur {
+                    *cur = a;
+                }
+            }
+
+            for idx in 0..total {
+                let w = weight[idx];
+                if w <= WEIGHT_EPS || self.distances[idx] == 0.0 {
+                    // Zero-weight or bed-seed node: anchored, never moved.
+                    continue;
+                }
+                let a = a_extreme[component[idx]];
+                if !a.is_finite() {
+                    continue;
+                }
+                let conformal = a - d[idx];
+                self.distances[idx] = (1.0 - w) * self.distances[idx] + w * conformal;
+            }
+        }
+
+        // Minimum-growth repair: on the lowered side of a conformed patch,
+        // the blend compresses the bulk-to-surface order mismatch into the
+        // band, which can stall growth along the build direction (over-
+        // thick layers → voids). Sweep every column bottom-up and keep
+        // order growing by at least `MIN_GROWTH` per unit height through
+        // and above blended nodes (raising only — conformity is preserved
+        // wherever it left enough growth).
+        /// Minimum order growth per unit height enforced after blending.
+        const MIN_GROWTH: f64 = 0.15;
+        for y in 0..ny {
+            for x in 0..nx {
+                let mut prev: Option<f64> = None;
+                for z in 0..nz {
+                    let idx = self.idx(x, y, z);
+                    if !occupied[idx] || !self.distances[idx].is_finite() {
+                        prev = None;
+                        continue;
+                    }
+                    if let Some(p) = prev {
+                        let floor = p + MIN_GROWTH * self.h;
+                        if self.distances[idx] != 0.0 && self.distances[idx] < floor {
+                            self.distances[idx] = floor;
+                        }
+                    }
+                    prev = Some(self.distances[idx]);
+                }
+            }
+        }
+    }
+
+    /// Central (falling back to one-sided) finite-difference gradient of a
+    /// per-node scalar `values` grid at node `(x, y, z)`, considering only
+    /// occupied nodes with finite values. Returns `None` when no axis has
+    /// any usable neighbor pair.
+    fn finite_difference_gradient(
+        &self,
+        values: &[f64],
+        occupied: &[bool],
+        x: usize,
+        y: usize,
+        z: usize,
+    ) -> Option<DVec3> {
+        let [nx, ny, nz] = self.dims;
+        let center = values[self.idx(x, y, z)];
+        if !center.is_finite() {
+            return None;
+        }
+        let mut grad = DVec3::ZERO;
+        let mut any_axis = false;
+        for (axis, (pos, count)) in [(x, nx), (y, ny), (z, nz)].into_iter().enumerate() {
+            let sample = |i: usize| -> Option<f64> {
+                let idx = match axis {
+                    0 => self.idx(i, y, z),
+                    1 => self.idx(x, i, z),
+                    _ => self.idx(x, y, i),
+                };
+                (occupied[idx] && values[idx].is_finite()).then(|| values[idx])
+            };
+            let lo = (pos > 0).then(|| sample(pos - 1)).flatten();
+            let hi = (pos + 1 < count).then(|| sample(pos + 1)).flatten();
+            let d = match (lo, hi) {
+                (Some(lo), Some(hi)) => Some((hi - lo) / (2.0 * self.h)),
+                (Some(lo), None) => Some((center - lo) / self.h),
+                (None, Some(hi)) => Some((hi - center) / self.h),
+                (None, None) => None,
+            };
+            if let Some(d) = d {
+                any_axis = true;
+                match axis {
+                    0 => grad.x = d,
+                    1 => grad.y = d,
+                    _ => grad.z = d,
+                }
+            }
+        }
+        any_axis.then_some(grad)
     }
 
     /// Shared grid construction + occupancy classification behind both
@@ -1480,6 +1830,13 @@ mod tests {
         let is_bed_seed = |p: DVec3| p.z <= 0.25;
         let is_top_seed = |p: DVec3| (p.z - (5.0 + 0.5 * p.x)).abs() <= 0.5;
 
+        let options = ConformalSurfaceOptions {
+            is_top_seed_region: Some(&is_top_seed),
+            is_bottom_seed_region: None,
+            skin_depth_mm: 1.5,
+            top_detach_angle_deg: 45.0,
+            bottom_detach_angle_deg: 30.0,
+        };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
                 min_corner,
@@ -1487,8 +1844,7 @@ mod tests {
                 0.5,
                 &is_solid,
                 &is_bed_seed,
-                &is_top_seed,
-                1.5,
+                &options,
                 None,
                 None,
             );
@@ -1501,16 +1857,20 @@ mod tests {
             "bed order should be approximately flat"
         );
 
-        // Points on the sloped top surface should match their local surface height
+        // Conformity: the sloped top face approaches a single isosurface,
+        // so order along it should be near-equal despite its 3mm height
+        // difference between the probes (bulk slicing would give ~3mm).
         let top1 = field.order(DVec3::new(2.0, 5.0, 6.0));
         let top2 = field.order(DVec3::new(8.0, 5.0, 9.0));
+        assert!(top1.is_finite() && top2.is_finite());
         assert!(
-            (top1 - 6.0).abs() < 0.5,
-            "top point 1 order should be near 6.0: {top1}"
+            (top1 - top2).abs() < 1.0,
+            "near-surface order should be conformal (parallel to the top): top1={top1}, top2={top2}"
         );
+        // And it must not collapse toward the bed: still well above mid-bulk.
         assert!(
-            (top2 - 9.0).abs() < 0.5,
-            "top point 2 order should be near 9.0: {top2}"
+            top1 > 3.0 && top2 > 3.0,
+            "conformal top order should not collapse: top1={top1}, top2={top2}"
         );
 
         // Subsurface points 0.5mm below the top surface should be ~0.5mm lower in order
@@ -1518,12 +1878,174 @@ mod tests {
         let sub2 = field.order(DVec3::new(8.0, 5.0, 8.5));
         assert!(
             (top1 - sub1 - 0.5).abs() < 0.3,
-            "subsurface 1 should be parallel to top surface"
+            "subsurface 1 should be parallel to top surface: top1={top1}, sub1={sub1}"
         );
         assert!(
             (top2 - sub2 - 0.5).abs() < 0.3,
-            "subsurface 2 should be parallel to top surface"
+            "subsurface 2 should be parallel to top surface: top2={top2}, sub2={sub2}"
         );
+    }
+
+    /// Bottom conforming: a solid ramp whose underside is a shallow sloped
+    /// overhang (z >= 0.3 * x + 2, capped flat top). Bottom conforming
+    /// must NOT flatten the underside to a single order (that would
+    /// schedule the whole underside skin as one mid-air "layer"); instead
+    /// order keeps advancing along the underside while isosurface spacing
+    /// *normal* to it becomes uniform (constant layer thickness).
+    #[test]
+    fn conformal_eikonal_field_aligns_with_sloped_bottom_surface() {
+        let min_corner = DVec3::new(0.0, 0.0, 0.0);
+        let max_corner = DVec3::new(10.0, 10.0, 10.0);
+        // Solid: above a sloped underside z = 2.0 + 0.3 * x, below flat top
+        // z = 9.0, with a bed-contact column near x <= 1 reaching the floor.
+        let underside = |x: f64| 2.0 + 0.3 * x;
+        let is_solid = |p: DVec3| (p.z <= 9.0) && (p.x <= 1.0 || p.z >= underside(p.x) - 0.1);
+        let is_bed_seed = |p: DVec3| p.z <= 0.25 && p.x <= 1.0;
+        let is_bottom_seed = |p: DVec3| p.x > 1.5 && (p.z - underside(p.x)).abs() <= 0.5;
+
+        let options = ConformalSurfaceOptions {
+            is_top_seed_region: None,
+            is_bottom_seed_region: Some(&is_bottom_seed),
+            skin_depth_mm: 1.5,
+            top_detach_angle_deg: 45.0,
+            bottom_detach_angle_deg: 45.0,
+        };
+        let field =
+            EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
+                min_corner,
+                max_corner,
+                0.5,
+                &is_solid,
+                &is_bed_seed,
+                &options,
+                None,
+                None,
+            );
+
+        // Along-surface growth preserved: a probe farther along the
+        // underside must have strictly later order (roughly tracking the
+        // bulk march), not collapse to the nearer probe's order.
+        let p1 = DVec3::new(4.0, 5.0, underside(4.0) + 0.4);
+        let p2 = DVec3::new(8.0, 5.0, underside(8.0) + 0.4);
+        let o1 = field.order(p1);
+        let o2 = field.order(p2);
+        assert!(o1.is_finite() && o2.is_finite());
+        assert!(
+            o2 > o1 + 1.0,
+            "order must keep advancing along the underside (printable wavefront): o1={o1}, o2={o2}"
+        );
+
+        // Uniform normal spacing: stepping ~0.5mm deeper (up, away from
+        // the underside) must advance order by ~0.5 at both probes — the
+        // isosurfaces run parallel to the underside locally.
+        for (x, o_surf) in [(4.0, o1), (8.0, o2)] {
+            let deeper = field.order(DVec3::new(x, 5.0, underside(x) + 0.9));
+            assert!(
+                (deeper - o_surf - 0.5).abs() < 0.3,
+                "normal spacing should be ~0.5 at x={x}: surf={o_surf}, deeper={deeper}"
+            );
+        }
+    }
+
+    /// Detach angle: a surface steeper than the configured detach angle
+    /// must not be conformed to — the conformal field should match the
+    /// plain (non-conformal) field there.
+    #[test]
+    fn conformal_field_detaches_from_surfaces_steeper_than_the_detach_angle() {
+        let min_corner = DVec3::new(0.0, 0.0, 0.0);
+        let max_corner = DVec3::new(10.0, 10.0, 10.0);
+        // Steep wedge: top surface z = 1.5 * x (56.3 degrees from horizontal).
+        let is_solid = |p: DVec3| p.z <= 1.5 * p.x + 0.1;
+        let is_bed_seed = |p: DVec3| p.z <= 0.25;
+        let is_top_seed = |p: DVec3| (p.z - 1.5 * p.x).abs() <= 0.5;
+
+        let options = ConformalSurfaceOptions {
+            is_top_seed_region: Some(&is_top_seed),
+            is_bottom_seed_region: None,
+            skin_depth_mm: 1.5,
+            // Detach angle well below the 56.3 degree surface slope.
+            top_detach_angle_deg: 30.0,
+            bottom_detach_angle_deg: 30.0,
+        };
+        let conformal =
+            EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
+                min_corner,
+                max_corner,
+                0.5,
+                &is_solid,
+                &is_bed_seed,
+                &options,
+                None,
+                None,
+            );
+        let plain = EikonalOrderField::new_with_occupancy_and_seed_region(
+            min_corner,
+            max_corner,
+            0.5,
+            &is_solid,
+            &is_bed_seed,
+        );
+
+        for probe in [
+            DVec3::new(3.0, 5.0, 4.0),
+            DVec3::new(5.0, 5.0, 7.0),
+            DVec3::new(6.0, 5.0, 8.5),
+        ] {
+            let a = conformal.order(probe);
+            let b = plain.order(probe);
+            assert!(
+                (a - b).abs() < 0.3,
+                "steep surface should detach (conformal ~= plain) at {probe}: {a} vs {b}"
+            );
+        }
+    }
+
+    /// Conformity must never flatten the field's growth along the frame
+    /// normal below the g_min bound — the anti-void guarantee: order still
+    /// strictly increases through the skin band.
+    #[test]
+    fn conformal_skin_band_preserves_monotonic_growth_toward_the_surface() {
+        let min_corner = DVec3::new(0.0, 0.0, 0.0);
+        let max_corner = DVec3::new(10.0, 10.0, 10.0);
+        let is_solid = |p: DVec3| p.z <= 5.0 + 0.5 * p.x + 0.1;
+        let is_bed_seed = |p: DVec3| p.z <= 0.25;
+        let is_top_seed = |p: DVec3| (p.z - (5.0 + 0.5 * p.x)).abs() <= 0.5;
+
+        let options = ConformalSurfaceOptions {
+            is_top_seed_region: Some(&is_top_seed),
+            is_bottom_seed_region: None,
+            skin_depth_mm: 2.0,
+            top_detach_angle_deg: 45.0,
+            bottom_detach_angle_deg: 30.0,
+        };
+        let field =
+            EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
+                min_corner,
+                max_corner,
+                0.5,
+                &is_solid,
+                &is_bed_seed,
+                &options,
+                None,
+                None,
+            );
+
+        // Walk up a vertical column through the skin band: order must be
+        // strictly increasing with meaningful growth (no flattened voids).
+        for x in [2.0, 5.0, 8.0] {
+            let surface_z = 5.0 + 0.5 * x;
+            let mut prev = field.order(DVec3::new(x, 5.0, surface_z - 2.0));
+            let mut z = surface_z - 1.5;
+            while z <= surface_z - 0.2 {
+                let cur = field.order(DVec3::new(x, 5.0, z));
+                assert!(
+                    cur > prev + 0.05,
+                    "order must keep growing through the skin band at x={x}, z={z}: {prev} -> {cur}"
+                );
+                prev = cur;
+                z += 0.5;
+            }
+        }
     }
 
     /// Regression test for "Eikonal seeds only the boundary of the contact

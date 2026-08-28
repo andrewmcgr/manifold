@@ -233,52 +233,90 @@ fn eikonal_field_for(
             Some(&height_along),
         );
     }
-    if config.eikonal_conform_top_surfaces {
-        let max_angle = config.eikonal_conformal_max_angle_deg();
-        let cos_limit = max_angle.to_radians().cos();
+    let conform_top = config.eikonal_conform_top_surfaces;
+    let conform_bottom = config.eikonal_conform_bottom_surfaces;
+    if conform_top || conform_bottom {
         let skin_depth = config.eikonal_conformal_skin_depth_mm();
+        let top_detach_deg = config.eikonal_conformal_max_angle_deg();
+        let bottom_detach_deg = config.eikonal_conformal_bottom_max_angle_deg();
 
-        let top_faces: Vec<[usize; 3]> = mesh
-            .indices
-            .chunks_exact(3)
-            .filter_map(|chunk| {
-                let [i0, i1, i2] = [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
-                let v0 = mesh.vertices[i0];
-                let v1 = mesh.vertices[i1];
-                let v2 = mesh.vertices[i2];
-                let normal = (v1 - v0).cross(v2 - v0);
-                let normal_len = normal.length();
-                if normal_len > 1e-9 && normal.dot(BUILD_DIRECTION) >= cos_limit * normal_len {
-                    Some([i0, i1, i2])
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let top_sdf = if top_faces.is_empty() {
-            None
-        } else {
-            Some(MeshSdf::new(mesh.vertices.clone(), top_faces))
+        // Upward-facing faces within the top detach angle. The detach-angle
+        // falloff inside the conformal relaxation handles the smooth
+        // hand-off; gating the seed set by the same angle just avoids
+        // seeding surfaces that could never be conformed to anyway.
+        let side_faces = |upward: bool, detach_deg: f64| -> Vec<[usize; 3]> {
+            let cos_limit = detach_deg.to_radians().cos();
+            mesh.indices
+                .chunks_exact(3)
+                .filter_map(|chunk| {
+                    let [i0, i1, i2] = [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
+                    let v0 = mesh.vertices[i0];
+                    let v1 = mesh.vertices[i1];
+                    let v2 = mesh.vertices[i2];
+                    let normal = (v1 - v0).cross(v2 - v0);
+                    let normal_len = normal.length();
+                    if normal_len <= 1e-9 {
+                        return None;
+                    }
+                    let cos_up = normal.dot(BUILD_DIRECTION) / normal_len;
+                    let facing = if upward {
+                        cos_up >= cos_limit
+                    } else {
+                        // Downward-facing within the detach angle, excluding
+                        // bed-contact faces (all vertices in the contact
+                        // band): the bed itself is the seed front, not an
+                        // overhang underside to conform to.
+                        let on_bed = v0.z <= min.z + seed_tolerance
+                            && v1.z <= min.z + seed_tolerance
+                            && v2.z <= min.z + seed_tolerance;
+                        cos_up <= -cos_limit && !on_bed
+                    };
+                    facing.then_some([i0, i1, i2])
+                })
+                .collect()
         };
 
-        if let Some(top_sdf) = top_sdf {
-            let is_top_seed = |p: DVec3| top_sdf.sample(p).value.abs() <= cell_size;
-            if let Some(sdf) = existing_sdf {
-                let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
-                return EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
-                    min,
-                    max,
-                    cell_size,
-                    &is_solid,
-                    &is_seed_region,
-                    &is_top_seed,
-                    skin_depth,
-                    Some(slope_profile),
-                    Some(&height_along),
-                );
-            }
-            let sdf = MeshSdf::new(mesh.vertices.clone(), faces);
+        let build_side_sdf = |faces: Vec<[usize; 3]>| -> Option<MeshSdf> {
+            (!faces.is_empty()).then(|| MeshSdf::new(mesh.vertices.clone(), faces))
+        };
+        let top_sdf = conform_top
+            .then(|| build_side_sdf(side_faces(true, top_detach_deg)))
+            .flatten();
+        let bottom_sdf = conform_bottom
+            .then(|| build_side_sdf(side_faces(false, bottom_detach_deg)))
+            .flatten();
+
+        if top_sdf.is_some() || bottom_sdf.is_some() {
+            let is_top_seed = |p: DVec3| {
+                top_sdf
+                    .as_ref()
+                    .is_some_and(|s| s.sample(p).value.abs() <= cell_size)
+            };
+            let is_bottom_seed = |p: DVec3| {
+                bottom_sdf
+                    .as_ref()
+                    .is_some_and(|s| s.sample(p).value.abs() <= cell_size)
+            };
+            let options = manifold_fidget::eikonal::ConformalSurfaceOptions {
+                is_top_seed_region: top_sdf
+                    .is_some()
+                    .then_some(&is_top_seed as &(dyn Fn(DVec3) -> bool + Sync)),
+                is_bottom_seed_region: bottom_sdf
+                    .is_some()
+                    .then_some(&is_bottom_seed as &(dyn Fn(DVec3) -> bool + Sync)),
+                skin_depth_mm: skin_depth,
+                top_detach_angle_deg: top_detach_deg,
+                bottom_detach_angle_deg: bottom_detach_deg,
+            };
+
+            let owned_sdf;
+            let sdf = match existing_sdf {
+                Some(sdf) => sdf,
+                None => {
+                    owned_sdf = MeshSdf::new(mesh.vertices.clone(), faces);
+                    &owned_sdf
+                }
+            };
             let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
             return EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
                 min,
@@ -286,8 +324,7 @@ fn eikonal_field_for(
                 cell_size,
                 &is_solid,
                 &is_seed_region,
-                &is_top_seed,
-                skin_depth,
+                &options,
                 Some(slope_profile),
                 Some(&height_along),
             );
@@ -988,7 +1025,7 @@ pub(crate) fn project_onto_isosurface<F: OrderField + ?Sized>(
 /// points (e.g. `p` is outside the region the field has information about
 /// at all) -- callers must not treat that as "assume zero gradient", which
 /// would silently fabricate a direction.
-pub(crate) fn numeric_gradient<F: OrderField + ?Sized>(field: &F, p: DVec3) -> Option<DVec3> {
+pub fn numeric_gradient<F: OrderField + ?Sized>(field: &F, p: DVec3) -> Option<DVec3> {
     const GRAD_EPS: f64 = 1e-4;
 
     let sample = |offset: DVec3| -> Option<f64> {

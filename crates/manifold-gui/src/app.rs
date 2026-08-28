@@ -1148,12 +1148,32 @@ impl ManifoldApp {
                 if ui
                     .add(
                         egui::Slider::new(&mut max_angle, 5.0..=75.0)
-                            .text("Conformal max surface angle (°)"),
+                            .text("Top conform detach angle (°)"),
                     )
                     .changed()
                 {
                     self.config.eikonal_conformal_max_angle_deg = Some(max_angle);
                 }
+            }
+            ui.checkbox(
+                &mut self.config.eikonal_conform_bottom_surfaces,
+                "Conform to bottom surfaces",
+            );
+            if self.config.eikonal_conform_bottom_surfaces {
+                let mut bottom_angle = self.config.eikonal_conformal_bottom_max_angle_deg();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut bottom_angle, 5.0..=75.0)
+                            .text("Bottom conform detach angle (°)"),
+                    )
+                    .changed()
+                {
+                    self.config.eikonal_conformal_bottom_max_angle_deg = Some(bottom_angle);
+                }
+            }
+            if self.config.eikonal_conform_top_surfaces
+                || self.config.eikonal_conform_bottom_surfaces
+            {
                 let mut skin_depth = self.config.eikonal_conformal_skin_depth_mm();
                 if ui
                     .add(

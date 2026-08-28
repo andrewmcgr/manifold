@@ -398,14 +398,19 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
 ///   layer directly on the bed) fading to `0.0` at the plate itself (a
 ///   second layer sitting on the first).
 /// - **Material support** (`support_fraction`): sample the mesh SDF at
-///   `q`. Inside the mesh (`sdf <= 0`) an earlier layer deposited
-///   material there — fully supported. Fraction fades linearly to zero
-///   by one nozzle radius outside: `clamp(1 - sdf(q) / nozzle_radius,
-///   0, 1)`, giving overhang perimeters a smooth stadium->circle flow
-///   ramp instead of a binary jump. (The mesh SDF is a proxy for
-///   "printed material": exact for walls/solid regions; sparse-infill
-///   interiors read as supported, which matches the traditional slicer
-///   treatment of infill-on-infill.)
+///   `q`. Inside the mesh (`sdf <= 0`) *and* scheduled earlier than the
+///   bead (`order(q) <= bead_order - 0.5 * layer_height`) an earlier
+///   layer deposited material there — fully supported. Fraction fades
+///   linearly to zero by one nozzle radius outside: `clamp(1 - sdf(q) /
+///   nozzle_radius, 0, 1)`, giving overhang perimeters a smooth
+///   stadium->circle flow ramp instead of a binary jump. Mesh-solid
+///   material the order field schedules *later* than the bead is air at
+///   deposition time and counts as no support at all — without the order
+///   gate, conformal order fields (e.g. bottom-surface conforming) would
+///   report full support for beads bridging not-yet-printed solid. (The
+///   mesh SDF is a proxy for "printed material": exact for walls/solid
+///   regions; sparse-infill interiors read as supported, which matches
+///   the traditional slicer treatment of infill-on-infill.)
 ///
 /// Degenerate cases fall back to fully-supported stadium flow (today's
 /// uniform model) rather than fabricating a bridge: missing/zero
@@ -414,6 +419,7 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
 /// `support_fraction = 1.0`.
 fn support_fractions_at(
     p: DVec3,
+    bead_order: f64,
     field: &dyn manifold_fidget::order::OrderField,
     mesh_sdf: Option<&manifold_fidget::mesh_sdf::MeshSdf>,
     bed_z: f64,
@@ -431,7 +437,21 @@ fn support_fractions_at(
         Some(sdf) => {
             let nozzle_radius = (config.nozzle_diameter / 2.0).max(f64::EPSILON);
             let distance = sdf.sample(probe).value;
-            (1.0 - distance / nozzle_radius).clamp(0.0, 1.0)
+            let fraction = (1.0 - distance / nozzle_radius).clamp(0.0, 1.0);
+            if fraction > 0.0 {
+                // Order gate: mesh-solid material only supports this bead
+                // if the order field schedules it *earlier*. Solid-but-
+                // later material is air at deposition time (conformal
+                // fields can invert deposition order relative to the mesh).
+                let probe_order = field.order(probe);
+                if probe_order.is_finite() && probe_order <= bead_order - 0.5 * layer_height {
+                    fraction
+                } else {
+                    0.0
+                }
+            } else {
+                fraction
+            }
         }
         None => 1.0,
     };
@@ -1637,6 +1657,7 @@ pub fn plan_with_progress(
                     let line_width = extrusion::line_width_for_kind(segment.kind, config);
                     let (support_fraction, bed_fraction) = support_fractions_at(
                         (start + end) * 0.5,
+                        segment.order,
                         layer.order_field.as_ref(),
                         layer.mesh_sdf.as_deref(),
                         bed_z,
