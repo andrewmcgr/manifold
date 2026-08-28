@@ -364,15 +364,14 @@ impl EikonalOrderField {
                     bed_field.distances[idx] = f64::INFINITY;
                 }
             }
-            bed_field.relax_with_slope_limit_scaled(
+            bed_field.relax_bilateral_fixed_point(
                 profile,
                 ha,
                 &occupied,
                 slope_slack,
                 Some(&raised),
+                false,
             );
-            bed_field.enforce_downward_non_collision(profile, ha, &occupied);
-            bed_field.enforce_min_column_growth(&occupied, false);
         }
 
         bed_field.compute_gradients(&occupied);
@@ -1473,6 +1472,53 @@ impl EikonalOrderField {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Runs bilateral upward-downward fixed-point iteration until both the
+    /// bottom-up Eikonal wavefront and the downward/lateral collision shadows converge stably.
+    fn relax_bilateral_fixed_point(
+        &mut self,
+        profile: &SlopeProfile,
+        height_along: &dyn HeightAlong,
+        occupied: &[bool],
+        slope_slack: f64,
+        slack_mask: Option<&[bool]>,
+        smooth_horizontal: bool,
+    ) {
+        const MAX_ITERATIONS: usize = 12;
+        const CONVERGENCE_EPSILON: f64 = 1e-4;
+
+        for _ in 0..MAX_ITERATIONS {
+            let prev = self.distances.clone();
+
+            // 1. Upward/Forward slope-limiting relaxation pass (lowering)
+            self.relax_with_slope_limit_scaled(
+                profile,
+                height_along,
+                occupied,
+                slope_slack,
+                slack_mask,
+            );
+
+            // 2. Downward non-collision check (raising/delaying higher voxels)
+            self.enforce_downward_non_collision(profile, height_along, occupied);
+
+            // 3. Monotonic column growth pass
+            self.enforce_min_column_growth(occupied, smooth_horizontal);
+
+            // 4. Convergence check
+            let max_diff = self
+                .distances
+                .iter()
+                .zip(&prev)
+                .filter(|&(a, b)| a.is_finite() && b.is_finite())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f64, f64::max);
+
+            if max_diff <= CONVERGENCE_EPSILON {
+                break;
             }
         }
     }
