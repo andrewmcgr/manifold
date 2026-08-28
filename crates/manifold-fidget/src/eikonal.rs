@@ -362,7 +362,7 @@ impl EikonalOrderField {
                 slope_slack,
                 Some(&raised),
             );
-            bed_field.enforce_min_column_growth(&occupied);
+            bed_field.enforce_min_column_growth(&occupied, false);
         }
 
         bed_field.compute_gradients(&occupied);
@@ -820,20 +820,34 @@ impl EikonalOrderField {
         // band, which can stall growth along the build direction (over-
         // thick layers → voids). See
         // [`EikonalOrderField::enforce_min_column_growth`].
-        self.enforce_min_column_growth(occupied);
+        //
+        // Top surfaces (flip_normal == false) apply horizontal Lipschitz
+        // smoothing to prevent column shear at flat-to-sloped patch boundaries.
+        // Bottom surfaces (flip_normal == true) preserve exact per-node
+        // underside wavefront timing.
+        self.enforce_min_column_growth(occupied, !flip_normal);
     }
 
     /// Sweep every vertical column bottom-up and keep order growing by at
     /// least [`Self::MIN_GROWTH`] per unit height through and above blended
     /// nodes (raising only — conformity is preserved wherever it left
-    /// enough growth). Run after [`EikonalOrderField::apply_conformal_blend`]
+    /// enough growth). For top surfaces, follows with a horizontal
+    /// Gauss-Seidel relaxation pass across raised columns to re-enforce
+    /// horizontal Lipschitz bounds without violating vertical monotonicity.
+    /// Run after [`EikonalOrderField::apply_conformal_blend`]
     /// (and again after any later lowering pass such as
     /// [`EikonalOrderField::relax_with_slope_limit`]) so columns never
     /// stall or invert along the build direction.
-    fn enforce_min_column_growth(&mut self, occupied: &[bool]) {
+    fn enforce_min_column_growth(&mut self, occupied: &[bool], smooth_horizontal: bool) {
         /// Minimum order growth per unit height enforced after blending.
         const MIN_GROWTH: f64 = 0.15;
+        /// Maximum horizontal gradient (Lipschitz constant) across columns to prevent shear.
+        const MAX_HORIZONTAL_LIPSCHITZ: f64 = 1.0;
         let [nx, ny, nz] = self.dims;
+
+        let mut raised_mask = vec![false; self.distances.len()];
+
+        // Pass 1: Vertical bottom-up column sweep
         for y in 0..ny {
             for x in 0..nx {
                 let mut prev: Option<f64> = None;
@@ -847,9 +861,76 @@ impl EikonalOrderField {
                         let floor = p + MIN_GROWTH * self.h;
                         if self.distances[idx] != 0.0 && self.distances[idx] < floor {
                             self.distances[idx] = floor;
+                            raised_mask[idx] = true;
                         }
                     }
                     prev = Some(self.distances[idx]);
+                }
+            }
+        }
+
+        if !smooth_horizontal {
+            return;
+        }
+
+        // Pass 2: Localized horizontal Lipschitz relaxation across raised columns
+        let horiz_step = MAX_HORIZONTAL_LIPSCHITZ * self.h;
+        for _ in 0..4 {
+            let mut changed = false;
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let idx = self.idx(x, y, z);
+                        if !raised_mask[idx] || !self.distances[idx].is_finite() {
+                            continue;
+                        }
+                        let cur = self.distances[idx];
+                        for (dx, dy) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)] {
+                            let nxp = x as isize + dx;
+                            let nyp = y as isize + dy;
+                            if nxp < 0 || nyp < 0 || nxp as usize >= nx || nyp as usize >= ny {
+                                continue;
+                            }
+                            let nidx = self.idx(nxp as usize, nyp as usize, z);
+                            if !occupied[nidx]
+                                || !self.distances[nidx].is_finite()
+                                || self.distances[nidx] == 0.0
+                            {
+                                continue;
+                            }
+                            let floor = cur - horiz_step;
+                            if self.distances[nidx] < floor {
+                                self.distances[nidx] = floor;
+                                raised_mask[nidx] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+
+            // Re-enforce vertical column growth after horizontal adjustment
+            for y in 0..ny {
+                for x in 0..nx {
+                    let mut prev: Option<f64> = None;
+                    for z in 0..nz {
+                        let idx = self.idx(x, y, z);
+                        if !occupied[idx] || !self.distances[idx].is_finite() {
+                            prev = None;
+                            continue;
+                        }
+                        if let Some(p) = prev {
+                            let floor = p + MIN_GROWTH * self.h;
+                            if self.distances[idx] != 0.0 && self.distances[idx] < floor {
+                                self.distances[idx] = floor;
+                                raised_mask[idx] = true;
+                            }
+                        }
+                        prev = Some(self.distances[idx]);
+                    }
                 }
             }
         }
@@ -2665,5 +2746,50 @@ mod tests {
             (order_a - order_b).abs(),
             max_allowed_delta
         );
+    }
+
+    /// Horizontal Lipschitz continuity: adjacent vertical columns in the
+    /// conformal skin band must not experience discontinuous shear steps.
+    #[test]
+    fn conformal_top_enforces_horizontal_lipschitz_without_column_shear() {
+        let min_corner = DVec3::new(0.0, 0.0, 0.0);
+        let max_corner = DVec3::new(10.0, 10.0, 10.0);
+        let is_solid = |p: DVec3| p.z <= 5.0 + 0.5 * p.x + 0.1;
+        let is_bed_seed = |p: DVec3| p.z <= 0.25;
+        let is_top_seed = |p: DVec3| (p.z - (5.0 + 0.5 * p.x)).abs() <= 0.5;
+
+        let options = ConformalSurfaceOptions {
+            is_top_seed_region: Some(&is_top_seed),
+            is_bottom_seed_region: None,
+            skin_depth_mm: 2.0,
+            top_detach_angle_deg: 45.0,
+            bottom_detach_angle_deg: 30.0,
+            detach_feather_mm: 0.0,
+        };
+        let field =
+            EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
+                min_corner,
+                max_corner,
+                0.5,
+                &is_solid,
+                &is_bed_seed,
+                &options,
+                None,
+                None,
+            );
+
+        // Check horizontal differences between adjacent columns in the skin band
+        for x in 2..8 {
+            let x0 = x as f64;
+            let x1 = (x + 1) as f64;
+            let z = 4.0;
+            let o0 = field.order(DVec3::new(x0, 5.0, z));
+            let o1 = field.order(DVec3::new(x1, 5.0, z));
+            assert!(o0.is_finite() && o1.is_finite());
+            assert!(
+                (o1 - o0).abs() <= 1.2 * (x1 - x0),
+                "horizontal gradient must satisfy Lipschitz bound without shear: o0={o0}, o1={o1}"
+            );
+        }
     }
 }
