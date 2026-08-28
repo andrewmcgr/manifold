@@ -302,6 +302,37 @@ impl EikonalOrderField {
             );
         }
 
+        // The conformal blends can *raise* skin-band nodes (top-patch
+        // flattening toward `A - d`) well past what the slope limit
+        // allows relative to adjacent un-blended nodes — e.g. where a
+        // conformed patch borders a detached (steep, zero-weight) surface
+        // region or a different patch component, the field can end up with
+        // a near-vertical order cliff across one cell. Isosurfaces then cut
+        // that cliff as detached rings on the surface whose interior
+        // neighbors print a full order later — floating (unsupported)
+        // wall loops. Re-run the slope-limit relaxation so conforming
+        // never violates the global printability bound (it shaves the
+        // blend only near such transitions), then re-apply the minimum-
+        // growth column repair since relaxation is a lowering pass.
+        //
+        // The first relaxation pass filled *air* (unoccupied) nodes with
+        // finite pre-blend values (that is how it couples disconnected
+        // features across open space). Those stale values sit directly
+        // against the raised conformal skin band, and reusing them as caps
+        // would shave the whole band straight back down to the pre-blend
+        // bulk field — silently disabling conforming. Reset air to +inf
+        // first: the relaxation refills it from the *post-blend* solid
+        // values, keeping air coupling consistent with the blended field.
+        if let Some(profile) = slope_profile {
+            for (idx, &occ) in occupied.iter().enumerate() {
+                if !occ {
+                    bed_field.distances[idx] = f64::INFINITY;
+                }
+            }
+            bed_field.relax_with_slope_limit(profile, ha, &occupied);
+            bed_field.enforce_min_column_growth(&occupied);
+        }
+
         bed_field.compute_gradients(&occupied);
         bed_field
     }
@@ -682,7 +713,14 @@ impl EikonalOrderField {
                 if !a.is_finite() {
                     continue;
                 }
-                let conformal = a - d[idx];
+                // Clamp the target to never fall below the node's own bulk
+                // order: `A` is the max `T + d` over the *core* (w >= 0.5)
+                // only, so falloff-band nodes (w < 0.5) whose bulk order is
+                // later than the patch's core (e.g. skin over a region whose
+                // walls arrive much later) would otherwise be *lowered* —
+                // scheduling surface beads before their support exists
+                // (floating-island loops).
+                let conformal = (a - d[idx]).max(self.distances[idx]);
                 self.distances[idx] = (1.0 - w) * self.distances[idx] + w * conformal;
             }
         }
@@ -690,12 +728,22 @@ impl EikonalOrderField {
         // Minimum-growth repair: on the lowered side of a conformed patch,
         // the blend compresses the bulk-to-surface order mismatch into the
         // band, which can stall growth along the build direction (over-
-        // thick layers → voids). Sweep every column bottom-up and keep
-        // order growing by at least `MIN_GROWTH` per unit height through
-        // and above blended nodes (raising only — conformity is preserved
-        // wherever it left enough growth).
+        // thick layers → voids). See
+        // [`EikonalOrderField::enforce_min_column_growth`].
+        self.enforce_min_column_growth(occupied);
+    }
+
+    /// Sweep every vertical column bottom-up and keep order growing by at
+    /// least [`Self::MIN_GROWTH`] per unit height through and above blended
+    /// nodes (raising only — conformity is preserved wherever it left
+    /// enough growth). Run after [`EikonalOrderField::apply_conformal_blend`]
+    /// (and again after any later lowering pass such as
+    /// [`EikonalOrderField::relax_with_slope_limit`]) so columns never
+    /// stall or invert along the build direction.
+    fn enforce_min_column_growth(&mut self, occupied: &[bool]) {
         /// Minimum order growth per unit height enforced after blending.
         const MIN_GROWTH: f64 = 0.15;
+        let [nx, ny, nz] = self.dims;
         for y in 0..ny {
             for x in 0..nx {
                 let mut prev: Option<f64> = None;

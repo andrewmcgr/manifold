@@ -69,6 +69,12 @@ pub struct UnsupportedPatchOptions {
     /// Linking radius (mm) for clustering unsupported midpoints; two
     /// unsupported segments closer than this belong to the same patch.
     pub link_radius_mm: f64,
+    /// When `true`, also report planner-acknowledged unsupported beads
+    /// (`Overhang`/`Bridge` kinds and segments with near-zero stamped
+    /// `support_fraction`). Useful for debugging: shows *everything*
+    /// physically unsupported, not just what the planner wrongly
+    /// believes is supported.
+    pub include_acknowledged: bool,
 }
 
 impl UnsupportedPatchOptions {
@@ -79,6 +85,7 @@ impl UnsupportedPatchOptions {
         Self {
             min_patch_length_mm: 3.0,
             link_radius_mm: 2.0 * config.nozzle_diameter,
+            include_acknowledged: false,
         }
     }
 }
@@ -160,11 +167,19 @@ pub fn find_unsupported_patches(
 
     for path in paths {
         for (i, segment) in path.segments.iter().enumerate() {
-            if !matches!(
-                segment.kind,
-                MoveKind::WallOuter | MoveKind::WallInner | MoveKind::Infill | MoveKind::TopSurface
-            ) || segment.extrusion_length <= 0.0
-                || segment.support_fraction < acknowledged_support
+            let acknowledged_kind = matches!(segment.kind, MoveKind::Overhang | MoveKind::Bridge);
+            let relevant_kind = acknowledged_kind
+                || matches!(
+                    segment.kind,
+                    MoveKind::WallOuter
+                        | MoveKind::WallInner
+                        | MoveKind::Infill
+                        | MoveKind::TopSurface
+                );
+            let acknowledged = acknowledged_kind || segment.support_fraction < acknowledged_support;
+            if !relevant_kind
+                || segment.extrusion_length <= 0.0
+                || (acknowledged && !options.include_acknowledged)
             {
                 continue;
             }
@@ -373,4 +388,145 @@ mod tests {
         assert_eq!(patches.len(), 1);
         assert_eq!(patches[0].segment_count, 20);
     }
+}
+
+/// One closed toolpath loop that floats almost entirely in mid-air.
+#[derive(Debug, Clone)]
+pub struct FloatingLoop {
+    /// Mean order value of the loop's extruding segments.
+    pub order: f64,
+    /// Total extruded length (mm) of the loop.
+    pub total_length_mm: f64,
+    /// Length-weighted centroid of the loop's segment midpoints.
+    pub centroid: DVec3,
+    /// Fraction (0..=1, length-weighted) of the loop's extruded length
+    /// whose downward-order probe found neither bed nor earlier-order
+    /// solid material.
+    pub unsupported_fraction: f64,
+    /// Extruded length (mm) per [`MoveKind`], largest first.
+    pub length_by_kind: Vec<(MoveKind, f64)>,
+    /// Up to a few unsupported segment midpoints with their probe
+    /// diagnostics: (midpoint, probe point, sdf value at probe, order at
+    /// probe) — for manual debugging of why the loop counts as floating.
+    pub probe_samples: Vec<(DVec3, DVec3, f64, f64)>,
+}
+
+/// Finds closed loops that materialize almost entirely in mid-air —
+/// contour *islands* with no connection to already-printed material —
+/// regardless of stamped kind or `support_fraction` (a fully floating
+/// loop is unprintable even when the planner blended bridge flow into
+/// it; bridge flow needs anchors at both ends).
+///
+/// Reports loops with at least 90% (length-weighted) unsupported
+/// extruded length and more than 2 mm total extrusion.
+#[must_use]
+pub fn floating_loops(
+    paths: &[Path],
+    layers: &[Layer],
+    config: &SlicerConfig,
+) -> Vec<FloatingLoop> {
+    if paths.is_empty() || layers.is_empty() {
+        return Vec::new();
+    }
+
+    let layer_by_order: HashMap<u64, &Layer> =
+        layers.iter().map(|l| (l.order.to_bits(), l)).collect();
+    let nearest_layer = |order: f64| -> &Layer {
+        layer_by_order
+            .get(&order.to_bits())
+            .copied()
+            .unwrap_or_else(|| {
+                layers
+                    .iter()
+                    .min_by(|a, b| (a.order - order).abs().total_cmp(&(b.order - order).abs()))
+                    .expect("layers is non-empty")
+            })
+    };
+
+    let layer_height = config.layer_height.abs().max(f64::EPSILON);
+    let bed_z = paths
+        .iter()
+        .flat_map(|p| p.points.iter())
+        .map(|p| p.z)
+        .fold(f64::INFINITY, f64::min);
+    let sdf_tolerance = 0.5 * config.nozzle_diameter;
+    let order_epsilon = 0.5 * layer_height;
+
+    let mut loops = Vec::new();
+    for path in paths {
+        let mut total = 0.0;
+        let mut unsupported = 0.0;
+        let mut centroid = DVec3::ZERO;
+        let mut order_sum = 0.0;
+        let mut by_kind: Vec<(MoveKind, f64)> = Vec::new();
+        let mut probe_samples: Vec<(DVec3, DVec3, f64, f64)> = Vec::new();
+        for (i, segment) in path.segments.iter().enumerate() {
+            if segment.extrusion_length <= 0.0 {
+                continue;
+            }
+            let a = path.points[i];
+            let b = path.points[(i + 1) % path.points.len()];
+            let length = (b - a).length();
+            if length <= f64::EPSILON {
+                continue;
+            }
+            let midpoint = (a + b) * 0.5;
+            total += length;
+            centroid += midpoint * length;
+            order_sum += segment.order * length;
+            match by_kind.iter_mut().find(|(k, _)| *k == segment.kind) {
+                Some((_, l)) => *l += length,
+                None => by_kind.push((segment.kind, length)),
+            }
+
+            let layer = nearest_layer(segment.order);
+            let field = layer.order_field.as_ref();
+            let (gradient_dir, gradient_len) =
+                match crate::order_field::numeric_gradient(field, midpoint)
+                    .filter(|g| g.length_squared() > 1e-12 && g.is_finite())
+                {
+                    Some(g) => (g / g.length(), g.length()),
+                    None => (crate::slicing::BUILD_DIRECTION, 1.0),
+                };
+            let step = (layer_height / gradient_len).clamp(layer_height, 4.0 * layer_height);
+            let probe = midpoint - step * gradient_dir;
+
+            if probe.z <= bed_z + 0.25 * layer_height {
+                continue;
+            }
+            let inside_solid = layer
+                .mesh_sdf
+                .as_ref()
+                .is_some_and(|sdf| sdf.as_ref().sample(probe).value <= sdf_tolerance);
+            if inside_solid {
+                let probe_order = field.order(probe);
+                if probe_order.is_finite() && probe_order <= segment.order - order_epsilon {
+                    continue;
+                }
+            }
+            unsupported += length;
+            if probe_samples.len() < 4 {
+                let sdf_value = layer
+                    .mesh_sdf
+                    .as_ref()
+                    .map_or(f64::NAN, |sdf| sdf.as_ref().sample(probe).value);
+                probe_samples.push((midpoint, probe, sdf_value, field.order(probe)));
+            }
+        }
+
+        if total > 2.0 && unsupported / total >= 0.9 {
+            let mut length_by_kind = by_kind;
+            length_by_kind.sort_by(|a, b| b.1.total_cmp(&a.1));
+            loops.push(FloatingLoop {
+                order: order_sum / total,
+                total_length_mm: total,
+                centroid: centroid / total,
+                unsupported_fraction: unsupported / total,
+                length_by_kind,
+                probe_samples,
+            });
+        }
+    }
+    loops.sort_by(|a, b| a.order.total_cmp(&b.order));
+    loops
 }
