@@ -34,12 +34,13 @@ struct CameraUniform {
     _pad: f32,
 }
 
-/// One GPU vertex: position + flat face normal, both in world space.
+/// One GPU vertex: position + flat face normal + RGBA color, all in world space.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     position: [f32; 3],
     normal: [f32; 3],
+    color: [f32; 4],
 }
 
 /// A mesh already uploaded to the GPU as a non-indexed vertex buffer.
@@ -52,21 +53,76 @@ impl UploadedMesh {
     /// Expand `mesh` (with `object_transform` baked into vertex positions —
     /// see ROADMAP.md Phase 7 for interactive per-object transforms) into a
     /// flat-shaded, non-indexed vertex buffer and upload it.
+    /// If `conformal_overlay` is `Some`, colors faces according to their Eikonal
+    /// seed and conforming constraint classifications (Bed seed, Top/Bottom Conforming, Detached).
     pub fn upload(
         device: &wgpu::Device,
         mesh: &Mesh,
         object_transform: &manifold_core::transform::Transform,
+        conformal_overlay: Option<&manifold_core::SlicerConfig>,
     ) -> Self {
+        let min_z = mesh.bounding_box().map(|(min, _)| min.z).unwrap_or(0.0);
+        let seed_tolerance = conformal_overlay
+            .map(|c| c.layer_height.min(c.nozzle_diameter) / 8.0)
+            .unwrap_or(0.1);
+
         let mut vertices = Vec::with_capacity(mesh.indices.len());
         for triangle in mesh.indices.chunks_exact(3) {
             let [a, b, c] = [triangle[0], triangle[1], triangle[2]];
             let world = |i: u32| object_transform.transform_point(mesh.vertices[i as usize]);
             let (pa, pb, pc) = (world(a), world(b), world(c));
             let normal = (pb - pa).cross(pc - pa).normalize_or_zero();
+
+            let color = match conformal_overlay {
+                Some(config) => {
+                    let on_bed = pa.z <= min_z + seed_tolerance
+                        && pb.z <= min_z + seed_tolerance
+                        && pc.z <= min_z + seed_tolerance;
+
+                    if on_bed {
+                        // Bed contact seed: Bright Green
+                        [0.2, 0.85, 0.3, 1.0]
+                    } else if normal.z > 1e-3 {
+                        // Upward-facing
+                        let beta_deg = normal.z.clamp(-1.0, 1.0).acos().to_degrees();
+                        let top_detach = config.eikonal_conformal_max_angle_deg();
+                        if beta_deg <= top_detach - 5.0 {
+                            // Top Conforming: Cyan
+                            [0.15, 0.65, 0.95, 1.0]
+                        } else if beta_deg <= top_detach {
+                            // Top Transition Band: Purple
+                            [0.6, 0.35, 0.9, 1.0]
+                        } else {
+                            // Steep/Detached: Default Slate Gray
+                            [0.65, 0.68, 0.72, 1.0]
+                        }
+                    } else if normal.z < -1e-3 {
+                        // Downward-facing
+                        let beta_deg = (-normal.z).clamp(-1.0, 1.0).acos().to_degrees();
+                        let bottom_detach = config.eikonal_conformal_bottom_max_angle_deg();
+                        if beta_deg <= bottom_detach - 5.0 {
+                            // Bottom Conforming: Orange
+                            [0.95, 0.55, 0.1, 1.0]
+                        } else if beta_deg <= bottom_detach {
+                            // Bottom Transition Band: Gold/Yellow
+                            [0.95, 0.75, 0.2, 1.0]
+                        } else {
+                            // Steep/Detached: Default Slate Gray
+                            [0.65, 0.68, 0.72, 1.0]
+                        }
+                    } else {
+                        // Vertical walls
+                        [0.65, 0.68, 0.72, 1.0]
+                    }
+                }
+                None => [0.65, 0.68, 0.72, 1.0],
+            };
+
             for p in [pa, pb, pc] {
                 vertices.push(Vertex {
                     position: p.as_vec3().to_array(),
                     normal: normal.as_vec3().to_array(),
+                    color,
                 });
             }
         }
@@ -86,6 +142,7 @@ impl UploadedMesh {
             .map(|v| Vertex {
                 position: v.position.as_vec3().to_array(),
                 normal: v.normal.as_vec3().to_array(),
+                color: [1.0, 0.55, 0.15, 0.45],
             })
             .collect();
 
@@ -287,7 +344,7 @@ impl MeshRenderResources {
         let vertex_buffers = [wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
         }];
 
         let depth_stencil_state = |depth_write_enabled| wgpu::DepthStencilState {

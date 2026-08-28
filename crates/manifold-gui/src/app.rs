@@ -96,6 +96,8 @@ pub struct ManifoldApp {
     /// Whether the toolpath preview line geometry is drawn in the viewport
     /// (Phase 13, see ROADMAP.md).
     show_toolpaths: bool,
+    /// Whether the Eikonal seed and conformal surface region color overlay is shown on meshes.
+    show_conformal_overlay: bool,
     /// Order-based scrub slider value (Phase 13 subtask 05): segments with
     /// `order <= scrub_order` are drawn, others hidden ("up to and
     /// including" semantics). `f64::INFINITY` (the default) shows every
@@ -218,6 +220,7 @@ impl ManifoldApp {
             toolpath_data_view: ToolpathDataView::default(),
             uploaded_toolpaths: None,
             show_toolpaths: true,
+            show_conformal_overlay: false,
             scrub_order: f64::INFINITY,
             toolpath_order_range: None,
             slice_error: None,
@@ -401,10 +404,13 @@ impl ManifoldApp {
     }
 
     fn reupload(&mut self, device: &eframe::egui_wgpu::wgpu::Device) {
+        let overlay_config = self.show_conformal_overlay.then_some(&self.config);
         let uploaded = self
             .objects
             .iter()
-            .map(|object| UploadedMesh::upload(device, &object.mesh, &object.transform))
+            .map(|object| {
+                UploadedMesh::upload(device, &object.mesh, &object.transform, overlay_config)
+            })
             .collect();
         self.uploaded_meshes = Arc::new(uploaded);
     }
@@ -2133,6 +2139,23 @@ impl ManifoldApp {
                 }
             }
             ui.checkbox(&mut self.show_toolpaths, "Show toolpaths");
+            if ui
+                .checkbox(
+                    &mut self.show_conformal_overlay,
+                    "Show Conformal & Seed Overlay",
+                )
+                .on_hover_text(
+                    "Color faces by Eikonal bed seeds (green), top conforming (cyan), top detach band (purple), and bottom conforming (orange)",
+                )
+                .changed()
+            {
+                let device = frame
+                    .wgpu_render_state()
+                    .expect("wgpu renderer is required")
+                    .device
+                    .clone();
+                self.reupload(&device);
+            }
             if let Some(stats) = &self.print_statistics {
                 ui.separator();
                 ui.label(format!(
