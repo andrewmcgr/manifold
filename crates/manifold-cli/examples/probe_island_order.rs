@@ -55,14 +55,16 @@ fn main() -> anyhow::Result<()> {
         *v = obj.transform.transform_point(*v);
     }
 
+    let mode = std::env::args().nth(7).unwrap_or_else(|| "top".to_string());
     config.eikonal_conform_top_surfaces = false;
     config.eikonal_conform_bottom_surfaces = false;
     let field_off = order_field_for(OrderFieldKind::Eikonal, &config, &mesh, &slope_profile);
 
-    config.eikonal_conform_top_surfaces = true;
+    config.eikonal_conform_top_surfaces = mode == "top" || mode == "both";
+    config.eikonal_conform_bottom_surfaces = mode == "bottom" || mode == "both";
     let field_on = order_field_for(OrderFieldKind::Eikonal, &config, &mesh, &slope_profile);
 
-    println!("column at ({x:.2}, {y:.2}), z {z0:.2}..{z1:.2}:");
+    println!("column at ({x:.2}, {y:.2}), z {z0:.2}..{z1:.2}, mode {mode}:");
     println!(
         "{:>6}  {:>10}  {:>10}  {:>8}",
         "z", "off", "top-on", "delta"

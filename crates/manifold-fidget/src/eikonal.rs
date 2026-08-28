@@ -87,6 +87,12 @@ pub struct ConformalSurfaceOptions<'a> {
     pub top_detach_angle_deg: f64,
     /// Detach angle (degrees from horizontal) for bottom conforming.
     pub bottom_detach_angle_deg: f64,
+    /// Lateral feathering length (mm) applied to the blend weight near
+    /// detached / zero-weight regions, so conforming ramps in smoothly
+    /// instead of forming a one-cell order cliff at detach transitions and
+    /// patch boundaries. Typically twice the wall thickness; `0` disables
+    /// feathering.
+    pub detach_feather_mm: f64,
 }
 
 impl EikonalOrderField {
@@ -286,9 +292,11 @@ impl EikonalOrderField {
                 &occupied,
                 skin_depth,
                 options.top_detach_angle_deg,
+                options.detach_feather_mm,
                 false,
             );
         }
+        let pre_bottom = bed_field.distances.clone();
         if let Some(is_bottom_seed) = options.is_bottom_seed_region {
             let (d_bottom, s_bottom) =
                 bed_field.march_distance_from_region(is_bottom_seed, &occupied);
@@ -298,6 +306,7 @@ impl EikonalOrderField {
                 &occupied,
                 skin_depth,
                 options.bottom_detach_angle_deg,
+                options.detach_feather_mm,
                 true,
             );
         }
@@ -324,12 +333,35 @@ impl EikonalOrderField {
         // first: the relaxation refills it from the *post-blend* solid
         // values, keeping air coupling consistent with the blended field.
         if let Some(profile) = slope_profile {
+            // Slack on the slope cap for the post-blend pass — see
+            // `relax_with_slope_limit_scaled`. Only *bottom*-raised node
+            // pairs receive it: the bottom target `S + d` structurally
+            // exceeds the strict bound (strict shaving erases bottom
+            // conforming entirely), whereas top-patch flattening survives
+            // strict shaving and granting it slack was observed to
+            // reintroduce floating WallOuter islands at patch/detach
+            // transitions. The band exceeds the strict bound by up to
+            // `1 + tan(detach)/tan(max_angle)`; bound `tan(max_angle)`
+            // conservatively from below at 30°.
+            let slope_slack = 1.0
+                + options.bottom_detach_angle_deg.to_radians().tan() / 30.0f64.to_radians().tan();
+            let raised: Vec<bool> = pre_bottom
+                .iter()
+                .zip(&bed_field.distances)
+                .map(|(a, b)| (*b - *a).abs() > 1e-9)
+                .collect();
             for (idx, &occ) in occupied.iter().enumerate() {
                 if !occ {
                     bed_field.distances[idx] = f64::INFINITY;
                 }
             }
-            bed_field.relax_with_slope_limit(profile, ha, &occupied);
+            bed_field.relax_with_slope_limit_scaled(
+                profile,
+                ha,
+                &occupied,
+                slope_slack,
+                Some(&raised),
+            );
             bed_field.enforce_min_column_growth(&occupied);
         }
 
@@ -502,6 +534,7 @@ impl EikonalOrderField {
         occupied: &[bool],
         skin_depth: f64,
         detach_angle_deg: f64,
+        feather_mm: f64,
         flip_normal: bool,
     ) {
         /// Width (degrees) of the smooth hand-off band below the detach
@@ -620,6 +653,63 @@ impl EikonalOrderField {
         for idx in 0..total {
             if in_band[idx] && w_angle_grid[idx].is_finite() {
                 weight[idx] = w_angle_grid[idx] * w_depth_grid[idx];
+            }
+        }
+
+        // Lateral feathering: ramp the weight down to zero over
+        // `feather_mm` of in-band distance to the nearest zero-weight
+        // in-band node (angle-detached surface, or the gap separating two
+        // surface patch components). Without it, the blend raise can drop
+        // from full to nothing across a single cell wherever the surface
+        // steepens past the detach angle faster than
+        // `DETACH_TRANSITION_DEG` resolves spatially, or where two patches
+        // with different matching constants nearly touch — leaving a
+        // near-vertical order cliff that isosurfaces cut as floating
+        // (unsupported) wall loops. Multi-source chamfer BFS through
+        // in-band nodes, stepping `h` per 6-neighbor hop.
+        if feather_mm > 0.0 {
+            let mut dist = vec![f64::INFINITY; total];
+            let mut queue = std::collections::VecDeque::new();
+            for idx in 0..total {
+                if in_band[idx] && weight[idx] <= WEIGHT_EPS {
+                    dist[idx] = 0.0;
+                    queue.push_back(idx);
+                }
+            }
+            while let Some(idx) = queue.pop_front() {
+                let next = dist[idx] + self.h;
+                if next >= feather_mm {
+                    continue;
+                }
+                let z = idx / (nx * ny);
+                let y = (idx / nx) % ny;
+                let x = idx % nx;
+                for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                    let nxp = x as isize + dx;
+                    let nyp = y as isize + dy;
+                    let nzp = z as isize + dz;
+                    if nxp < 0
+                        || nyp < 0
+                        || nzp < 0
+                        || nxp as usize >= nx
+                        || nyp as usize >= ny
+                        || nzp as usize >= nz
+                    {
+                        continue;
+                    }
+                    let nidx = self.idx(nxp as usize, nyp as usize, nzp as usize);
+                    if in_band[nidx] && next < dist[nidx] {
+                        dist[nidx] = next;
+                        queue.push_back(nidx);
+                    }
+                }
+            }
+            for idx in 0..total {
+                if in_band[idx] && dist[idx].is_finite() {
+                    let t = (dist[idx] / feather_mm).clamp(0.0, 1.0);
+                    // Smoothstep for a C1 hand-off at both ends.
+                    weight[idx] *= t * t * (3.0 - 2.0 * t);
+                }
             }
         }
 
@@ -1087,7 +1177,41 @@ impl EikonalOrderField {
         &mut self,
         profile: &SlopeProfile,
         height_along: &dyn HeightAlong,
+        occupied: &[bool],
+    ) {
+        self.relax_with_slope_limit_scaled(profile, height_along, occupied, 1.0, None);
+    }
+
+    /// [`Self::relax_with_slope_limit`] with a constant multiplicative
+    /// `slope_slack` (>= 1) on the cap, applied only to node pairs where
+    /// *both* endpoints are set in `slack_mask` (all pairs when the mask
+    /// is `None`): neighbor `q` is capped at
+    /// `T(p) + tan(max_angle) * h * slack`.
+    ///
+    /// Used by the *post-conformal-blend* relaxation pass with the mask
+    /// set to "node was raised by the blend". The strict bound
+    /// (`slack == 1`) encodes "bulk order grows at most `tan(max_angle)`
+    /// per unit horizontal", which the conformal bands *mildly* exceed by
+    /// design: the bottom target `S + d` keeps the bulk's binding
+    /// along-surface advance (`tan(max)`) and adds the skin-depth
+    /// gradient's horizontal component (`tan(beta)`, `beta <= detach
+    /// angle`), so its horizontal gradient is `tan(max) + tan(beta)` —
+    /// roughly 1.5–2x the strict bound. Relaxing everything with the
+    /// strict bound therefore erases bottom conforming entirely (observed:
+    /// ~17.9k blended nodes shaved to a few hundred on the pug test mesh),
+    /// while granting the slack to *all* pairs lets order cliffs at
+    /// blend/detach transitions survive as floating wall loops (observed:
+    /// WallOuter islands return in top/both modes). Masking to blended↔
+    /// blended pairs resolves both: cliff pairs always have one unraised
+    /// endpoint, so transitions are shaved into strict-bound ramps, while
+    /// band interiors keep their legitimate conformal gradient.
+    fn relax_with_slope_limit_scaled(
+        &mut self,
+        profile: &SlopeProfile,
+        height_along: &dyn HeightAlong,
         _occupied: &[bool],
+        slope_slack: f64,
+        slack_mask: Option<&[bool]>,
     ) {
         let [nx, ny, nz] = self.dims;
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
@@ -1169,7 +1293,11 @@ impl EikonalOrderField {
                 let (nxu, nyu, nzu) = (nxp as usize, nyp as usize, nzp as usize);
                 let nidx = self.idx(nxu, nyu, nzu);
 
-                let candidate = t_p + slope_multiplier * self.h;
+                let slack = match slack_mask {
+                    Some(mask) if !(mask[idx] && mask[nidx]) => 1.0,
+                    _ => slope_slack,
+                };
+                let candidate = t_p + slope_multiplier * self.h * slack;
                 if candidate.is_nan() {
                     continue;
                 }
@@ -1884,6 +2012,7 @@ mod tests {
             skin_depth_mm: 1.5,
             top_detach_angle_deg: 45.0,
             bottom_detach_angle_deg: 30.0,
+            detach_feather_mm: 0.0,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -1957,6 +2086,7 @@ mod tests {
             skin_depth_mm: 1.5,
             top_detach_angle_deg: 45.0,
             bottom_detach_angle_deg: 45.0,
+            detach_feather_mm: 0.0,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2014,6 +2144,7 @@ mod tests {
             // Detach angle well below the 56.3 degree surface slope.
             top_detach_angle_deg: 30.0,
             bottom_detach_angle_deg: 30.0,
+            detach_feather_mm: 0.0,
         };
         let conformal =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2065,6 +2196,7 @@ mod tests {
             skin_depth_mm: 2.0,
             top_detach_angle_deg: 45.0,
             bottom_detach_angle_deg: 30.0,
+            detach_feather_mm: 0.0,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(

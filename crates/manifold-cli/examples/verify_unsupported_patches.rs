@@ -102,11 +102,13 @@ fn main() -> anyhow::Result<()> {
                 100.0 * isl.unsupported_fraction,
                 isl.length_by_kind,
             );
-            if isl
-                .length_by_kind
-                .first()
-                .is_some_and(|(k, _)| matches!(k, manifold_core::toolpath::MoveKind::WallOuter))
-            {
+            if isl.length_by_kind.iter().any(|(k, _)| {
+                matches!(
+                    k,
+                    manifold_core::toolpath::MoveKind::WallOuter
+                        | manifold_core::toolpath::MoveKind::WallInner
+                )
+            }) {
                 for (mid, probe, sdf, ord) in &isl.probe_samples {
                     println!(
                         "      bead ({:7.2},{:7.2},{:7.2}) -> probe ({:7.2},{:7.2},{:7.2}) sdf {:7.3} order {:7.3}",

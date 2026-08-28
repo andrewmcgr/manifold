@@ -307,6 +307,10 @@ fn eikonal_field_for(
                 skin_depth_mm: skin_depth,
                 top_detach_angle_deg: top_detach_deg,
                 bottom_detach_angle_deg: bottom_detach_deg,
+                // Feather conforming in over ~two wall thicknesses near
+                // detach transitions and patch gaps, preventing one-cell
+                // order cliffs (floating wall loops) at blend boundaries.
+                detach_feather_mm: 2.0 * config.wall_line_width,
             };
 
             let owned_sdf;
