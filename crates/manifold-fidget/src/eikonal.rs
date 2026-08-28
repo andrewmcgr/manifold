@@ -1268,7 +1268,11 @@ impl EikonalOrderField {
         height_along: &dyn HeightAlong,
         occupied: &[bool],
     ) {
+        // Forward (lowering) pass: caps neighbor values at T(p) + tan(theta) * h
         self.relax_with_slope_limit_scaled(profile, height_along, occupied, 1.0, None);
+        // Reverse (raising) pass: bounds lagging neighbors at T(p) - tan(theta) * h
+        // to enforce symmetric Lipschitz continuity based on the anti-collision SlopeProfile
+        self.relax_with_slope_limit_reverse(profile, height_along, occupied);
     }
 
     /// [`Self::relax_with_slope_limit`] with a constant multiplicative
@@ -1393,6 +1397,123 @@ impl EikonalOrderField {
                 if candidate < self.distances[nidx] {
                     self.distances[nidx] = candidate;
                     heap.push(HeapEntry {
+                        value: candidate,
+                        x: nxu,
+                        y: nyu,
+                        z: nzu,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Reverse / Raising Lipschitz relaxation pass:
+    /// Enforces `T(q) >= T(p) - max_slope_at(height) * h` using the existing
+    /// toolhead clearance anti-collision SlopeProfile constraints.
+    /// Uses a MaxHeap over finite nodes to raise lagging neighbor nodes, ensuring
+    /// symmetric Lipschitz continuity across adjacent columns.
+    fn relax_with_slope_limit_reverse(
+        &mut self,
+        profile: &SlopeProfile,
+        height_along: &dyn HeightAlong,
+        _occupied: &[bool],
+    ) {
+        #[derive(Copy, Clone, PartialEq)]
+        struct MaxHeapEntry {
+            value: f64,
+            x: usize,
+            y: usize,
+            z: usize,
+        }
+
+        impl Eq for MaxHeapEntry {}
+
+        impl Ord for MaxHeapEntry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.value
+                    .partial_cmp(&other.value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+
+        impl PartialOrd for MaxHeapEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let [nx, ny, nz] = self.dims;
+        let mut heap: BinaryHeap<MaxHeapEntry> = BinaryHeap::new();
+
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let idx = self.idx(x, y, z);
+                    if self.distances[idx].is_finite() {
+                        heap.push(MaxHeapEntry {
+                            value: self.distances[idx],
+                            x,
+                            y,
+                            z,
+                        });
+                    }
+                }
+            }
+        }
+
+        const NEAR_VERTICAL_ANGLE_DEG: f64 = 89.999;
+
+        while let Some(MaxHeapEntry { value, x, y, z }) = heap.pop() {
+            let idx = self.idx(x, y, z);
+            if self.distances[idx] > value {
+                // Stale heap entry
+                continue;
+            }
+            let t_p = self.distances[idx];
+
+            let height = height_along.height(self.node_pos(x, y, z));
+            if height.is_nan() {
+                continue;
+            }
+            let max_angle = profile.max_slope_at(height);
+            if !max_angle.is_finite() || max_angle >= NEAR_VERTICAL_ANGLE_DEG {
+                continue;
+            }
+            let slope_multiplier = max_angle.to_radians().tan();
+            if !slope_multiplier.is_finite() {
+                continue;
+            }
+
+            for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let nxp = x as isize + dx;
+                let nyp = y as isize + dy;
+                let nzp = z as isize + dz;
+                if nxp < 0
+                    || nyp < 0
+                    || nzp < 0
+                    || nxp as usize >= nx
+                    || nyp as usize >= ny
+                    || nzp as usize >= nz
+                {
+                    continue;
+                }
+                let (nxu, nyu, nzu) = (nxp as usize, nyp as usize, nzp as usize);
+                let nidx = self.idx(nxu, nyu, nzu);
+                if self.distances[nidx] == 0.0 || !self.distances[nidx].is_finite() {
+                    // Bed seeds are anchored
+                    continue;
+                }
+
+                let candidate = t_p - slope_multiplier * self.h;
+                if candidate.is_nan() {
+                    continue;
+                }
+                if candidate > self.distances[nidx] {
+                    self.distances[nidx] = candidate;
+                    heap.push(MaxHeapEntry {
                         value: candidate,
                         x: nxu,
                         y: nyu,
@@ -2779,6 +2900,7 @@ mod tests {
             detach_feather_mm: 0.0,
             target_lipschitz_constant: 1.0,
         };
+        let profile = SlopeProfile::from_angle(45.0);
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
                 min_corner,
@@ -2787,7 +2909,7 @@ mod tests {
                 &is_solid,
                 &is_bed_seed,
                 &options,
-                None,
+                Some(&profile),
                 None,
             );
 
