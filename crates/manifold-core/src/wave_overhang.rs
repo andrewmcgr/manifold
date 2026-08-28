@@ -759,16 +759,36 @@ pub fn plan_wave_overhangs(
         }
 
         for shape in &shapes {
-            // Extract seed contact segments: edges of outer boundary bordering prev_b
+            // Extract seed contact segments: edges of outer boundary bordering prev_b or other loops in cur_b
             let mut seed_segments = Vec::new();
             let n = shape.outer.len();
+            let search_dist = (config.nozzle_diameter * 1.25).max(0.4);
             for i in 0..n {
                 let p0 = shape.outer[i];
                 let p1 = shape.outer[(i + 1) % n];
                 let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
 
-                if polygon2d_contains_or_near(mid, prev_b, config.nozzle_diameter * 0.6) {
+                if polygon2d_contains_or_near(mid, prev_b, search_dist) {
                     seed_segments.push(LineSegment2D { p0, p1 });
+                }
+            }
+
+            // If no contact with prev_b, check for contact with other loops in current layer's boundary cur_b
+            if seed_segments.is_empty() && cur_b.len() > 1 {
+                for i in 0..n {
+                    let p0 = shape.outer[i];
+                    let p1 = shape.outer[(i + 1) % n];
+                    let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
+
+                    for other_loop in cur_b {
+                        let other_shape = [other_loop.clone()];
+                        if !point_in_single_loop(mid, other_loop)
+                            && polygon2d_contains_or_near(mid, &other_shape, search_dist)
+                        {
+                            seed_segments.push(LineSegment2D { p0, p1 });
+                            break;
+                        }
+                    }
                 }
             }
 

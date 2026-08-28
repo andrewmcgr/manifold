@@ -527,6 +527,7 @@ impl EikonalOrderField {
     ///   at `detach_angle_deg` — surfaces steeper than the detach angle
     ///   cleanly revert to bulk slicing rather than fighting the slope
     ///   limit.
+    #[allow(clippy::too_many_arguments)]
     fn apply_conformal_blend(
         &mut self,
         d: &[f64],
@@ -776,18 +777,17 @@ impl EikonalOrderField {
                 return;
             }
 
-            // Per-component matching constant `A`: the max `T + d` over the
-            // patch's well-conformed core (w >= 0.5), so the top surface is
-            // the patch's *last* layer (target never below bulk — the blend
-            // only raises order), keeping growth along the build direction
-            // intact.
-            let mut a_extreme = vec![f64::NAN; component_count];
+            // Per-component matching constant A: the max `T + d` over the
+            // patch's well-conformed core (weight >= 0.5), so `A - d` meets
+            // the bulk field at `w = 1` and never schedules surface beads
+            // earlier than their underlying bulk support.
+            let mut a_max = vec![f64::NAN; component_count];
             for idx in 0..total {
                 if weight[idx] < 0.5 {
                     continue;
                 }
                 let a = self.distances[idx] + d[idx];
-                let cur = &mut a_extreme[component[idx]];
+                let cur = &mut a_max[component[idx]];
                 if cur.is_nan() || a > *cur {
                     *cur = a;
                 }
@@ -799,7 +799,7 @@ impl EikonalOrderField {
                     // Zero-weight or bed-seed node: anchored, never moved.
                     continue;
                 }
-                let a = a_extreme[component[idx]];
+                let a = a_max[component[idx]];
                 if !a.is_finite() {
                     continue;
                 }
