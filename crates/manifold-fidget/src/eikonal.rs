@@ -588,7 +588,8 @@ impl EikonalOrderField {
                         1.0
                     } else {
                         let s = (t - DEPTH_PLATEAU) / (1.0 - DEPTH_PLATEAU);
-                        1.0 - s * s * (3.0 - 2.0 * s)
+                        // C2 continuous quintic smootherstep: 1 - (6s^5 - 15s^4 + 10s^3)
+                        1.0 - s * s * s * (s * (s * 6.0 - 15.0) + 10.0)
                     };
 
                     let Some(grad) = self.finite_difference_gradient(d, occupied, x, y, z) else {
@@ -614,7 +615,8 @@ impl EikonalOrderField {
                         1.0
                     } else {
                         let t = (detach_angle_deg - beta_deg) / DETACH_TRANSITION_DEG;
-                        t * t * (3.0 - 2.0 * t)
+                        // C2 continuous quintic smootherstep: 6t^5 - 15t^4 + 10t^3
+                        t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
                     };
                 }
             }
@@ -720,8 +722,8 @@ impl EikonalOrderField {
             for idx in 0..total {
                 if in_band[idx] && dist[idx].is_finite() {
                     let t = (dist[idx] / feather_mm).clamp(0.0, 1.0);
-                    // Smoothstep for a C1 hand-off at both ends.
-                    weight[idx] *= t * t * (3.0 - 2.0 * t);
+                    // C2 continuous quintic smootherstep for derivative-continuous hand-off
+                    weight[idx] *= t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
                 }
             }
         }
@@ -815,13 +817,7 @@ impl EikonalOrderField {
                 if !a.is_finite() {
                     continue;
                 }
-                // Clamp the target to never fall below the node's own bulk
-                // order: `A` is the max `T + d` over the *core* (w >= 0.5)
-                // only, so falloff-band nodes (w < 0.5) whose bulk order is
-                // later than the patch's core (e.g. skin over a region whose
-                // walls arrive much later) would otherwise be *lowered* —
-                // scheduling surface beads before their support exists
-                // (floating-island loops).
+                // Clamp target to never fall below the node's own bulk order.
                 let conformal = (a - d[idx]).max(self.distances[idx]);
                 self.distances[idx] = (1.0 - w) * self.distances[idx] + w * conformal;
             }
