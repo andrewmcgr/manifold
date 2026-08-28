@@ -1817,7 +1817,138 @@ pub fn plan_with_progress(
         })
         .collect::<Result<Vec<Vec<Path>>>>()?;
 
-    Ok(per_layer.into_iter().flatten().collect())
+    Ok(defer_unsupported_paths(per_layer, layers, config))
+}
+
+/// Support-aware emission deferral: reorders the flattened per-layer path
+/// list so that a path planned at layer order `O` but resting mostly on
+/// mesh-solid whose order-field value is *later* than `O` (e.g. infill
+/// over an Eikonal tunnel interior that the fast-march reaches from the
+/// far side) is emitted only *after* the layer group containing its
+/// supporting material, instead of being extruded into free air.
+///
+/// Detection mirrors `verification::floating_loops`' order-aware probe:
+/// each extruding segment midpoint is stepped one layer height against
+/// the local order-field gradient; the landing point is classified as
+/// bed / already-printed solid (`probe order <= own order - eps`) /
+/// future solid (`probe order > own order + eps`) / open air. A path is
+/// deferred only when (a) at least [`DEFER_MIN_UNSUPPORTED_FRACTION`] of
+/// its extruded length is not on bed or earlier-order solid AND (b) at
+/// least [`DEFER_MIN_FUTURE_FRACTION`] of that unsupported length lands
+/// on *future* solid — genuine open-air overhangs (nothing beneath in
+/// the model at all) are left alone for the overhang/bridging passes.
+///
+/// The deferral target is the maximum supporting-solid order among the
+/// future-solid probes, capped at [`DEFER_MAX_ORDER_SPAN`] layer heights
+/// past the path's own layer (deferring further risks nozzle collisions
+/// with much-taller surrounding geometry; such paths are left in place).
+/// The reorder is a stable sort on emission order, so non-deferred
+/// paths keep their exact original sequence (including per-layer travel
+/// optimization), and a deferred path lands just after the layer group
+/// it now rests on. Segment `order` stamps are left untouched — they
+/// describe the geometry's layer, not emission time.
+fn defer_unsupported_paths(
+    per_layer: Vec<Vec<Path>>,
+    layers: &[Layer],
+    config: &SlicerConfig,
+) -> Vec<Path> {
+    const DEFER_MIN_UNSUPPORTED_FRACTION: f64 = 0.7;
+    const DEFER_MIN_FUTURE_FRACTION: f64 = 0.5;
+    const DEFER_MAX_ORDER_SPAN: f64 = 40.0;
+
+    let layer_height = config.layer_height.abs().max(f64::EPSILON);
+    let order_epsilon = 0.5 * layer_height;
+    let sdf_tolerance = 0.5 * config.nozzle_diameter;
+    // Sorted layer orders, for snapping a raw field-sample requirement up
+    // to the discrete layer group that actually prints that material.
+    let mut layer_orders: Vec<f64> = layers.iter().map(|l| l.order).collect();
+    layer_orders.sort_by(f64::total_cmp);
+    let bed_z = per_layer
+        .iter()
+        .flatten()
+        .flat_map(|p| p.points.iter())
+        .map(|p| p.z)
+        .fold(f64::INFINITY, f64::min);
+
+    // (emission_order, original_index) keys; stable sort preserves the
+    // existing sequence wherever emission orders tie.
+    let mut keyed: Vec<(f64, usize, Path)> = Vec::new();
+    let mut flat_index = 0usize;
+    for (layer, paths) in layers.iter().zip(per_layer) {
+        let field = layer.order_field.as_ref();
+        let sdf = layer.mesh_sdf.as_deref();
+        for path in paths {
+            let n = path.points.len();
+            let mut total = 0.0;
+            let mut unsupported = 0.0;
+            let mut future = 0.0;
+            let mut required_order = f64::NEG_INFINITY;
+            for (i, segment) in path.segments.iter().enumerate() {
+                if segment.extrusion_length <= 0.0 || n == 0 {
+                    continue;
+                }
+                let a = path.points[i];
+                let b = path.points[(i + 1) % n];
+                let length = (b - a).length();
+                if length <= f64::EPSILON {
+                    continue;
+                }
+                total += length;
+                let midpoint = (a + b) * 0.5;
+                let (gradient_dir, gradient_len) =
+                    match crate::order_field::numeric_gradient(field, midpoint)
+                        .filter(|g| g.length_squared() > 1e-12 && g.is_finite())
+                    {
+                        Some(g) => (g / g.length(), g.length()),
+                        None => (crate::slicing::BUILD_DIRECTION, 1.0),
+                    };
+                let step = (layer_height / gradient_len).clamp(layer_height, 4.0 * layer_height);
+                let probe = midpoint - step * gradient_dir;
+                if probe.z <= bed_z + 0.25 * layer_height {
+                    continue; // resting on the bed
+                }
+                let inside_solid = sdf.is_some_and(|sdf| sdf.sample(probe).value <= sdf_tolerance);
+                if inside_solid {
+                    let probe_order = field.order(probe);
+                    if probe_order.is_finite() {
+                        if probe_order <= segment.order - order_epsilon {
+                            continue; // supported by already-printed solid
+                        }
+                        // Solid beneath, but printed at the same order or
+                        // later (same-band or genuinely future material) —
+                        // deferrable either way: emitting after the layer
+                        // group that owns `probe_order` makes it printed.
+                        future += length;
+                        required_order = required_order.max(probe_order);
+                    }
+                }
+                unsupported += length;
+            }
+
+            let mut emission_order = layer.order;
+            if total > f64::EPSILON
+                && unsupported / total >= DEFER_MIN_UNSUPPORTED_FRACTION
+                && future / unsupported.max(f64::EPSILON) >= DEFER_MIN_FUTURE_FRACTION
+                && required_order.is_finite()
+                && required_order - layer.order <= DEFER_MAX_ORDER_SPAN * layer_height
+            {
+                // Snap the raw field sample up to the discrete layer order
+                // whose group prints the supporting material, then nudge
+                // past it so ties resolve to "after".
+                let group_order = layer_orders
+                    .iter()
+                    .copied()
+                    .find(|&o| o >= required_order - 1e-9)
+                    .unwrap_or(required_order);
+                emission_order = group_order.max(layer.order) + 1e-9;
+            }
+            keyed.push((emission_order, flat_index, path));
+            flat_index += 1;
+        }
+    }
+
+    keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    keyed.into_iter().map(|(_, _, path)| path).collect()
 }
 
 #[cfg(test)]

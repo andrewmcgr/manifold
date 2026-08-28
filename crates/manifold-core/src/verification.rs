@@ -419,6 +419,13 @@ pub struct FloatingLoop {
 ///
 /// Reports loops with at least 90% (length-weighted) unsupported
 /// extruded length and more than 2 mm total extrusion.
+///
+/// The probe is emission-order-aware: `paths` slice order is Gcode
+/// emission order, and a probe landing in solid counts as supported when
+/// that solid's order is at or below the running maximum segment order
+/// of all *previously emitted* paths — so a path deferred by
+/// `toolpath` past its supporting layer group is correctly counted as
+/// supported even though its own stamped order is earlier.
 #[must_use]
 pub fn floating_loops(
     paths: &[Path],
@@ -451,9 +458,10 @@ pub fn floating_loops(
         .fold(f64::INFINITY, f64::min);
     let sdf_tolerance = 0.5 * config.nozzle_diameter;
     let order_epsilon = 0.5 * layer_height;
+    let emitted_by = emitted_by_orders(paths);
 
     let mut loops = Vec::new();
-    for path in paths {
+    for (path_idx, path) in paths.iter().enumerate() {
         let mut total = 0.0;
         let mut unsupported = 0.0;
         let mut centroid = DVec3::ZERO;
@@ -500,7 +508,10 @@ pub fn floating_loops(
                 .is_some_and(|sdf| sdf.as_ref().sample(probe).value <= sdf_tolerance);
             if inside_solid {
                 let probe_order = field.order(probe);
-                if probe_order.is_finite() && probe_order <= segment.order - order_epsilon {
+                if probe_order.is_finite()
+                    && (probe_order <= segment.order - order_epsilon
+                        || probe_order <= emitted_by[path_idx])
+                {
                     continue;
                 }
             }
@@ -529,4 +540,210 @@ pub fn floating_loops(
     }
     loops.sort_by(|a, b| a.order.total_cmp(&b.order));
     loops
+}
+
+/// A contiguous run of `Overhang`-stamped extruding segments within one
+/// path, with support diagnostics for the run itself and its two end
+/// anchors (the nearest non-overhang extruding neighbors).
+#[derive(Debug, Clone)]
+pub struct FloatingOverhangRun {
+    /// Mean order value of the run's segments.
+    pub order: f64,
+    /// Total extruded length (mm) of the run.
+    pub total_length_mm: f64,
+    /// Number of segments in the run.
+    pub segment_count: usize,
+    /// Length-weighted centroid of the run's segment midpoints.
+    pub centroid: DVec3,
+    /// Whether the non-overhang segment immediately *before* the run
+    /// probes as supported (bed or earlier-order solid). `false` also
+    /// when the run has no preceding extruding neighbor (path start or
+    /// full-loop overhang).
+    pub start_anchored: bool,
+    /// As `start_anchored`, for the segment immediately after the run.
+    pub end_anchored: bool,
+}
+
+/// Finds `Overhang`-stamped runs that are *floating*: overhang beads are
+/// legitimate only when bridged between supported anchors, so a run
+/// whose end anchors are themselves unsupported (or absent — a whole
+/// loop stamped overhang) will physically fall. Reports runs longer than
+/// 2 mm missing at least one anchor, sorted longest first.
+#[must_use]
+pub fn floating_overhang_runs(
+    paths: &[Path],
+    layers: &[Layer],
+    config: &SlicerConfig,
+) -> Vec<FloatingOverhangRun> {
+    if paths.is_empty() || layers.is_empty() {
+        return Vec::new();
+    }
+    let probe = SupportProbe::new(paths, layers, config);
+    let emitted_by = emitted_by_orders(paths);
+
+    let mut runs = Vec::new();
+    for (path_idx, path) in paths.iter().enumerate() {
+        let n = path.points.len();
+        if n == 0 {
+            continue;
+        }
+        // Collect indices of extruding segments in path order.
+        let extruding: Vec<usize> = path
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.extrusion_length > 0.0)
+            .map(|(i, _)| i)
+            .collect();
+        if extruding.is_empty() {
+            continue;
+        }
+        // Split into maximal runs of Overhang kind (over the extruding
+        // subsequence, non-wrapping: a full-loop overhang simply has no
+        // anchors).
+        let mut i = 0;
+        while i < extruding.len() {
+            if path.segments[extruding[i]].kind != MoveKind::Overhang {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < extruding.len() && path.segments[extruding[i]].kind == MoveKind::Overhang {
+                i += 1;
+            }
+            let run = &extruding[start..i];
+
+            let mut total = 0.0;
+            let mut centroid = DVec3::ZERO;
+            let mut order_sum = 0.0;
+            for &si in run {
+                let a = path.points[si];
+                let b = path.points[(si + 1) % n];
+                let len = (b - a).length();
+                total += len;
+                centroid += (a + b) * 0.5 * len;
+                order_sum += path.segments[si].order * len;
+            }
+            if total <= 2.0 {
+                continue;
+            }
+
+            let anchored = |neighbor: Option<&usize>| -> bool {
+                neighbor.is_some_and(|&si| {
+                    let a = path.points[si];
+                    let b = path.points[(si + 1) % n];
+                    probe.is_supported((a + b) * 0.5, path.segments[si].order, emitted_by[path_idx])
+                })
+            };
+            let start_anchored = anchored(start.checked_sub(1).and_then(|p| extruding.get(p)));
+            let end_anchored = anchored(extruding.get(i));
+            if start_anchored && end_anchored {
+                continue;
+            }
+            runs.push(FloatingOverhangRun {
+                order: order_sum / total,
+                total_length_mm: total,
+                segment_count: run.len(),
+                centroid: centroid / total,
+                start_anchored,
+                end_anchored,
+            });
+        }
+    }
+    runs.sort_by(|a, b| b.total_length_mm.total_cmp(&a.total_length_mm));
+    runs
+}
+
+/// Shared order-aware support probe used by the verification detectors:
+/// a point counts as supported when stepping one layer against the local
+/// order gradient lands on the bed or inside earlier-order solid.
+struct SupportProbe<'a> {
+    layers: &'a [Layer],
+    layer_by_order: HashMap<u64, &'a Layer>,
+    layer_height: f64,
+    bed_z: f64,
+    sdf_tolerance: f64,
+    order_epsilon: f64,
+}
+
+impl<'a> SupportProbe<'a> {
+    fn new(paths: &[Path], layers: &'a [Layer], config: &SlicerConfig) -> Self {
+        let layer_by_order: HashMap<u64, &Layer> =
+            layers.iter().map(|l| (l.order.to_bits(), l)).collect();
+        let layer_height = config.layer_height.abs().max(f64::EPSILON);
+        let bed_z = paths
+            .iter()
+            .flat_map(|p| p.points.iter())
+            .map(|p| p.z)
+            .fold(f64::INFINITY, f64::min);
+        Self {
+            layers,
+            layer_by_order,
+            layer_height,
+            bed_z,
+            sdf_tolerance: 0.5 * config.nozzle_diameter,
+            order_epsilon: 0.5 * layer_height,
+        }
+    }
+
+    fn is_supported(&self, midpoint: DVec3, order: f64, emitted_by: f64) -> bool {
+        let layer = self
+            .layer_by_order
+            .get(&order.to_bits())
+            .copied()
+            .unwrap_or_else(|| {
+                self.layers
+                    .iter()
+                    .min_by(|a, b| (a.order - order).abs().total_cmp(&(b.order - order).abs()))
+                    .expect("layers is non-empty")
+            });
+        let field = layer.order_field.as_ref();
+        let (gradient_dir, gradient_len) =
+            match crate::order_field::numeric_gradient(field, midpoint)
+                .filter(|g| g.length_squared() > 1e-12 && g.is_finite())
+            {
+                Some(g) => (g / g.length(), g.length()),
+                None => (crate::slicing::BUILD_DIRECTION, 1.0),
+            };
+        let step =
+            (self.layer_height / gradient_len).clamp(self.layer_height, 4.0 * self.layer_height);
+        let probe = midpoint - step * gradient_dir;
+        if probe.z <= self.bed_z + 0.25 * self.layer_height {
+            return true;
+        }
+        let inside_solid = layer
+            .mesh_sdf
+            .as_ref()
+            .is_some_and(|sdf| sdf.as_ref().sample(probe).value <= self.sdf_tolerance);
+        if inside_solid {
+            let probe_order = field.order(probe);
+            if probe_order.is_finite()
+                && (probe_order <= order - self.order_epsilon || probe_order <= emitted_by)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// For each path, the maximum segment `order` across all *previously
+/// emitted* paths (`paths[..i]`), i.e. "everything up to this order has
+/// already been printed when this path starts". `NEG_INFINITY` for the
+/// first path. Emission-deferred paths (see `toolpath`'s
+/// support-aware deferral) keep their original stamped orders, so this
+/// running maximum is what makes the support probes above recognize
+/// later-order solid as already printed for them.
+fn emitted_by_orders(paths: &[Path]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(paths.len());
+    let mut running = f64::NEG_INFINITY;
+    for path in paths {
+        out.push(running);
+        for segment in &path.segments {
+            if segment.order.is_finite() {
+                running = running.max(segment.order);
+            }
+        }
+    }
+    out
 }

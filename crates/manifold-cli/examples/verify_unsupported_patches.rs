@@ -88,6 +88,48 @@ fn main() -> anyhow::Result<()> {
     // connection to already-printed material, regardless of stamped kind
     // or support_fraction (the GUI shows these as floating red loops).
     {
+        // Per-kind extruded totals: a quick fingerprint of how much of each
+        // MoveKind this slice produced (Overhang total shows whether the
+        // planner stamped any overhang beads at all).
+        let mut by_kind: Vec<(manifold_core::toolpath::MoveKind, f64)> = Vec::new();
+        for path in &paths {
+            for (i, seg) in path.segments.iter().enumerate() {
+                if seg.extrusion_length <= 0.0 {
+                    continue;
+                }
+                let a = path.points[i];
+                let b = path.points[(i + 1) % path.points.len()];
+                let len = (b - a).length();
+                match by_kind.iter_mut().find(|(k, _)| *k == seg.kind) {
+                    Some((_, l)) => *l += len,
+                    None => by_kind.push((seg.kind, len)),
+                }
+            }
+        }
+        by_kind.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!("extruded mm by kind: {by_kind:?}");
+
+        // Floating overhang runs: contiguous Overhang-stamped segment runs
+        // whose downward-order probe finds no earlier-order material at
+        // either end anchor — overhang beads are legitimate only when the
+        // run is anchored to supported material at both ends.
+        use manifold_core::verification::floating_overhang_runs;
+        let runs = floating_overhang_runs(&paths, &layers, &config);
+        println!("{} floating overhang run(s):", runs.len());
+        for r in &runs {
+            println!(
+                "  order {:7.3}: {:8.1} mm run of {:4} segs, centroid ({:7.2},{:7.2},{:7.2}), anchors start:{} end:{}",
+                r.order,
+                r.total_length_mm,
+                r.segment_count,
+                r.centroid.x,
+                r.centroid.y,
+                r.centroid.z,
+                r.start_anchored,
+                r.end_anchored,
+            );
+        }
+
         use manifold_core::verification::floating_loops;
         let islands = floating_loops(&paths, &layers, &config);
         println!("{} floating closed loop(s):", islands.len());
@@ -107,6 +149,7 @@ fn main() -> anyhow::Result<()> {
                     k,
                     manifold_core::toolpath::MoveKind::WallOuter
                         | manifold_core::toolpath::MoveKind::WallInner
+                        | manifold_core::toolpath::MoveKind::Infill
                 )
             }) {
                 for (mid, probe, sdf, ord) in &isl.probe_samples {
