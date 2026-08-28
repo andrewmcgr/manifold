@@ -93,6 +93,9 @@ pub struct ConformalSurfaceOptions<'a> {
     /// patch boundaries. Typically twice the wall thickness; `0` disables
     /// feathering.
     pub detach_feather_mm: f64,
+    /// Target gradient magnitude (Lipschitz scaling factor) for converting physical
+    /// voxel distance steps into order field units. Defaults to 1.0 (unit speed) when <= 0.
+    pub target_lipschitz_constant: f64,
 }
 
 impl EikonalOrderField {
@@ -283,9 +286,15 @@ impl EikonalOrderField {
         }
 
         let skin_depth = options.skin_depth_mm.max(bed_field.h * 2.0);
+        let lipschitz = if options.target_lipschitz_constant > 0.0 {
+            options.target_lipschitz_constant
+        } else {
+            1.0
+        };
 
         if let Some(is_top_seed) = options.is_top_seed_region {
-            let (d_top, s_top) = bed_field.march_distance_from_region(is_top_seed, &occupied);
+            let (d_top, s_top) =
+                bed_field.march_distance_from_region(is_top_seed, &occupied, -1.0, lipschitz);
             bed_field.apply_conformal_blend(
                 &d_top,
                 &s_top,
@@ -299,7 +308,7 @@ impl EikonalOrderField {
         let pre_bottom = bed_field.distances.clone();
         if let Some(is_bottom_seed) = options.is_bottom_seed_region {
             let (d_bottom, s_bottom) =
-                bed_field.march_distance_from_region(is_bottom_seed, &occupied);
+                bed_field.march_distance_from_region(is_bottom_seed, &occupied, 1.0, lipschitz);
             bed_field.apply_conformal_blend(
                 &d_bottom,
                 &s_bottom,
@@ -383,6 +392,8 @@ impl EikonalOrderField {
         &self,
         is_seed_region: &(dyn Fn(DVec3) -> bool + Sync),
         occupied: &[bool],
+        inward_gradient_sign: f64,
+        target_lipschitz_constant: f64,
     ) -> (Vec<f64>, Vec<f64>) {
         let total = self.distances.len();
         let mut dist = vec![f64::INFINITY; total];
@@ -475,7 +486,8 @@ impl EikonalOrderField {
                 let next_dist = value + self.h;
                 if next_dist < dist[n_idx] {
                     dist[n_idx] = next_dist;
-                    surface_value[n_idx] = surface_value[idx];
+                    let order_step = inward_gradient_sign * self.h * target_lipschitz_constant;
+                    surface_value[n_idx] = surface_value[idx] + order_step;
                     heap.push(HeapEntry {
                         value: next_dist,
                         x: nx_u,
@@ -715,8 +727,8 @@ impl EikonalOrderField {
         }
 
         if flip_normal {
-            // Bottom: per-node surface-anchored target `S + d` — preserves
-            // along-surface order growth (printable wavefront), uniform
+            // Bottom: per-node distance-aware surface-anchored target —
+            // preserves along-surface order growth (printable wavefront), uniform
             // normal spacing. Nodes whose march never reached a seed are
             // left untouched.
             for idx in 0..total {
@@ -729,7 +741,7 @@ impl EikonalOrderField {
                 if !s.is_finite() {
                     continue;
                 }
-                let conformal = s + d[idx];
+                let conformal = s.max(self.distances[idx]);
                 self.distances[idx] = (1.0 - w) * self.distances[idx] + w * conformal;
             }
         } else {
@@ -2094,6 +2106,7 @@ mod tests {
             top_detach_angle_deg: 45.0,
             bottom_detach_angle_deg: 30.0,
             detach_feather_mm: 0.0,
+            target_lipschitz_constant: 1.0,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2168,6 +2181,7 @@ mod tests {
             top_detach_angle_deg: 45.0,
             bottom_detach_angle_deg: 45.0,
             detach_feather_mm: 0.0,
+            target_lipschitz_constant: 1.0,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2226,6 +2240,7 @@ mod tests {
             top_detach_angle_deg: 30.0,
             bottom_detach_angle_deg: 30.0,
             detach_feather_mm: 0.0,
+            target_lipschitz_constant: 1.0,
         };
         let conformal =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2278,6 +2293,7 @@ mod tests {
             top_detach_angle_deg: 45.0,
             bottom_detach_angle_deg: 30.0,
             detach_feather_mm: 0.0,
+            target_lipschitz_constant: 1.0,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2765,6 +2781,7 @@ mod tests {
             top_detach_angle_deg: 45.0,
             bottom_detach_angle_deg: 30.0,
             detach_feather_mm: 0.0,
+            target_lipschitz_constant: 1.0,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(

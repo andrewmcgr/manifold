@@ -311,6 +311,7 @@ fn eikonal_field_for(
                 // detach transitions and patch gaps, preventing one-cell
                 // order cliffs (floating wall loops) at blend boundaries.
                 detach_feather_mm: 2.0 * config.wall_line_width,
+                target_lipschitz_constant: 1.0,
             };
 
             let owned_sdf;
