@@ -633,6 +633,7 @@ impl ManifoldApp {
     }
 
     fn settings_panel(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let config_before = self.config.clone();
         ui.heading("Settings");
 
         ui.collapsing("Layering", |ui| {
@@ -1850,6 +1851,24 @@ impl ManifoldApp {
                 .show(ui, |ui| {
                     ui.monospace(gcode);
                 });
+        }
+
+        if self.show_conformal_overlay
+            && (self.config.layer_height != config_before.layer_height
+                || self.config.nozzle_diameter != config_before.nozzle_diameter
+                || self.config.eikonal_conform_top_surfaces
+                    != config_before.eikonal_conform_top_surfaces
+                || self.config.eikonal_conformal_max_angle_deg
+                    != config_before.eikonal_conformal_max_angle_deg
+                || self.config.eikonal_conform_bottom_surfaces
+                    != config_before.eikonal_conform_bottom_surfaces
+                || self.config.eikonal_conformal_bottom_max_angle_deg
+                    != config_before.eikonal_conformal_bottom_max_angle_deg
+                || self.config.order_field != config_before.order_field)
+        {
+            if let Some(render_state) = frame.wgpu_render_state() {
+                self.reupload(&render_state.device);
+            }
         }
     }
 
