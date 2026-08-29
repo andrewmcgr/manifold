@@ -96,6 +96,11 @@ pub struct ConformalSurfaceOptions<'a> {
     /// Target gradient magnitude (Lipschitz scaling factor) for converting physical
     /// voxel distance steps into order field units. Defaults to 1.0 (unit speed) when <= 0.
     pub target_lipschitz_constant: f64,
+    /// Optional surface geodesic lower-bound evaluator returning the minimum order
+    /// arrival time $T_{\text{surf}}(p)$ for points $p$ on or near the mesh boundary.
+    /// Clamps $T(p) \ge T_{\text{surf}}(p)$ to eliminate surface local minima and
+    /// guarantee monotonic progression along the exterior skin of the model.
+    pub surface_min_order: Option<&'a (dyn Fn(DVec3) -> Option<f64> + Sync)>,
 }
 
 impl EikonalOrderField {
@@ -1456,7 +1461,27 @@ impl EikonalOrderField {
                 );
             }
 
-            // 3. Slope-limit relaxation & Downward non-collision
+            // 3. Surface geodesic lower-bound enforcement
+            if let Some(surf_min) = options.surface_min_order {
+                let [nx, ny, nz] = self.dims;
+                for z in 0..nz {
+                    for y in 0..ny {
+                        for x in 0..nx {
+                            let idx = self.idx(x, y, z);
+                            if occupied[idx] && self.distances[idx].is_finite() {
+                                let p = self.node_pos(x, y, z);
+                                if let Some(min_t) = surf_min(p) {
+                                    if min_t > self.distances[idx] {
+                                        self.distances[idx] = min_t;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Slope-limit relaxation & Downward non-collision
             if let Some(profile) = slope_profile {
                 let raised: Vec<bool> = pre_bottom
                     .iter()
@@ -1478,10 +1503,10 @@ impl EikonalOrderField {
                 self.enforce_downward_non_collision(profile, height_along, occupied);
             }
 
-            // 4. Monotonic column growth
+            // 5. Monotonic column growth
             self.enforce_min_column_growth(occupied, false);
 
-            // 5. Convergence check
+            // 6. Convergence check
             let max_diff = self
                 .distances
                 .iter()
@@ -2196,6 +2221,7 @@ mod tests {
             bottom_detach_angle_deg: 30.0,
             detach_feather_mm: 0.0,
             target_lipschitz_constant: 1.0,
+            surface_min_order: None,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2271,6 +2297,7 @@ mod tests {
             bottom_detach_angle_deg: 45.0,
             detach_feather_mm: 0.0,
             target_lipschitz_constant: 1.0,
+            surface_min_order: None,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2330,6 +2357,7 @@ mod tests {
             bottom_detach_angle_deg: 30.0,
             detach_feather_mm: 0.0,
             target_lipschitz_constant: 1.0,
+            surface_min_order: None,
         };
         let conformal =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2383,6 +2411,7 @@ mod tests {
             bottom_detach_angle_deg: 30.0,
             detach_feather_mm: 0.0,
             target_lipschitz_constant: 1.0,
+            surface_min_order: None,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2871,6 +2900,7 @@ mod tests {
             bottom_detach_angle_deg: 30.0,
             detach_feather_mm: 0.0,
             target_lipschitz_constant: 1.0,
+            surface_min_order: None,
         };
         let profile = SlopeProfile::from_angle(45.0);
         let field =

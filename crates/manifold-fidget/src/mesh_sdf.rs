@@ -298,6 +298,12 @@ impl MeshSdf {
         self.sign_method
     }
 
+    /// Returns the nearest triangle index, closest point on that triangle,
+    /// and squared distance to it.
+    pub fn nearest(&self, p: DVec3) -> Option<(usize, DVec3, f64)> {
+        self.bvh.nearest(p)
+    }
+
     /// The normal to use for sign determination at `closest` on triangle
     /// `face_idx`.
     ///
