@@ -12,6 +12,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use glam::DVec3;
+use rayon::prelude::*;
 
 use crate::ids::ToolId;
 use crate::order_field;
@@ -652,12 +653,9 @@ pub fn plan_wave_overhangs(
         _ => true,
     };
 
-    let mut paths_result = vec![Vec::new(); layers.len()];
-    let mut wall_tags_result = vec![Vec::new(); layers.len()];
-
-    // Compute 2D outer wall boundaries for all layers
+    // Compute 2D outer wall boundaries for all layers in parallel
     let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = layers
-        .iter()
+        .par_iter()
         .map(|layer| {
             let wall0_loops: Vec<Vec<DVec3>> = layer
                 .loops
@@ -674,180 +672,186 @@ pub fn plan_wave_overhangs(
         })
         .collect();
 
-    for k in 0..layers.len() {
-        // Find the layer physically underneath layer k
-        let prev_idx = if z_increases {
-            if k == 0 {
-                None
+    let (wall_tags_result, paths_result): (Vec<_>, Vec<_>) = (0..layers.len())
+        .into_par_iter()
+        .map(|k| {
+            // Find the layer physically underneath layer k
+            let prev_idx = if z_increases {
+                if k == 0 {
+                    None
+                } else {
+                    Some(k - 1)
+                }
+            } else if k + 1 < layers.len() {
+                Some(k + 1)
             } else {
-                Some(k - 1)
-            }
-        } else if k + 1 < layers.len() {
-            Some(k + 1)
-        } else {
-            None
-        };
+                None
+            };
 
-        // Tag wall loops for layer k: points not supported by previous layer are Overhang
-        let mut layer_wall_tags = Vec::new();
-        let support_dist = config.nozzle_diameter * 0.6;
-        let bed_threshold = config.first_layer_height() * 0.75;
-        for wall in &layers[k].loops {
-            let mut tags = vec![false; wall.points.len()];
-            if let Some(prev_k) = prev_idx {
-                let prev_layer = &layers[prev_k];
-                let prev_b = &boundaries_2d[prev_k];
-                for (i, p) in wall.points.iter().enumerate() {
-                    if p.z <= bed_threshold {
-                        continue;
-                    }
+            // Tag wall loops for layer k: points not supported by previous layer are Overhang
+            let mut layer_wall_tags = Vec::new();
+            let support_dist = config.nozzle_diameter * 0.6;
+            let support_dist_sq = support_dist * support_dist;
+            let bed_threshold = config.first_layer_height() * 0.75;
+            for wall in &layers[k].loops {
+                let mut tags = vec![false; wall.points.len()];
+                if let Some(prev_k) = prev_idx {
+                    let prev_layer = &layers[prev_k];
+                    let prev_b = &boundaries_2d[prev_k];
+                    for (i, p) in wall.points.iter().enumerate() {
+                        if p.z <= bed_threshold {
+                            continue;
+                        }
 
-                    let mut min_3d_dist = f64::INFINITY;
-                    for prev_wall in &prev_layer.loops {
-                        for prev_p in &prev_wall.points {
-                            min_3d_dist = min_3d_dist.min(p.distance(*prev_p));
+                        let p_2d = [(p - origin).dot(basis1), (p - origin).dot(basis2)];
+                        let in_prev_2d = !prev_b.is_empty()
+                            && polygon2d_contains_or_near(p_2d, prev_b, support_dist);
+
+                        if !in_prev_2d {
+                            let mut supported_3d = false;
+                            'search: for prev_wall in &prev_layer.loops {
+                                for prev_p in &prev_wall.points {
+                                    if p.distance_squared(*prev_p) <= support_dist_sq {
+                                        supported_3d = true;
+                                        break 'search;
+                                    }
+                                }
+                            }
+                            if !supported_3d {
+                                tags[i] = true;
+                            }
                         }
                     }
-
-                    let p_2d = [(p - origin).dot(basis1), (p - origin).dot(basis2)];
-                    let in_prev_2d = !prev_b.is_empty()
-                        && polygon2d_contains_or_near(p_2d, prev_b, support_dist);
-
-                    if min_3d_dist > support_dist && !in_prev_2d {
-                        tags[i] = true;
-                    }
                 }
-            }
-            layer_wall_tags.push(tags);
-        }
-        wall_tags_result[k] = layer_wall_tags;
-
-        let Some(prev_k) = prev_idx else {
-            // First layer resting on bed -- fully supported by print bed
-            continue;
-        };
-
-        let cur_b = &boundaries_2d[k];
-        let prev_b = &boundaries_2d[prev_k];
-
-        if cur_b.is_empty() || prev_b.is_empty() {
-            continue;
-        }
-
-        // Unsupported overhang region: cur_layer \ prev_layer
-        let raw_overhang = polygon2d::difference(cur_b, prev_b);
-        let overhang_filtered = polygon2d::filter_min_area(&raw_overhang, min_overhang_area);
-
-        if overhang_filtered.is_empty() {
-            continue;
-        }
-
-        // Group loops into outer boundaries and holes
-        let shapes = group_loops_into_polygon_shapes(&overhang_filtered);
-
-        let mut layer_polylines_2d = Vec::new();
-
-        // 3D references for height refinement on this layer
-        let mut references: Vec<Vec<DVec3>> = layers[k]
-            .loops
-            .iter()
-            .filter(|w| w.wall_index == 0)
-            .map(|w| w.points.clone())
-            .collect();
-        if references.is_empty() {
-            references = layers[k].infill_boundary.clone();
-        }
-
-        for shape in &shapes {
-            // Extract seed contact segments: edges of outer boundary bordering prev_b or other loops in cur_b
-            let mut seed_segments = Vec::new();
-            let n = shape.outer.len();
-            let search_dist = (config.nozzle_diameter * 1.25).max(0.4);
-            for i in 0..n {
-                let p0 = shape.outer[i];
-                let p1 = shape.outer[(i + 1) % n];
-                let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
-
-                if polygon2d_contains_or_near(mid, prev_b, search_dist) {
-                    seed_segments.push(LineSegment2D { p0, p1 });
-                }
+                layer_wall_tags.push(tags);
             }
 
-            // If no contact with prev_b, check for contact with other loops in current layer's boundary cur_b
-            if seed_segments.is_empty() && cur_b.len() > 1 {
+            let Some(prev_k) = prev_idx else {
+                return (layer_wall_tags, Vec::new());
+            };
+
+            let cur_b = &boundaries_2d[k];
+            let prev_b = &boundaries_2d[prev_k];
+
+            if cur_b.is_empty() || prev_b.is_empty() {
+                return (layer_wall_tags, Vec::new());
+            }
+
+            // Unsupported overhang region: cur_layer \ prev_layer
+            let raw_overhang = polygon2d::difference(cur_b, prev_b);
+            let overhang_filtered = polygon2d::filter_min_area(&raw_overhang, min_overhang_area);
+
+            if overhang_filtered.is_empty() {
+                return (layer_wall_tags, Vec::new());
+            }
+
+            // Group loops into outer boundaries and holes
+            let shapes = group_loops_into_polygon_shapes(&overhang_filtered);
+
+            let mut layer_polylines_2d = Vec::new();
+
+            // 3D references for height refinement on this layer
+            let mut references: Vec<Vec<DVec3>> = layers[k]
+                .loops
+                .iter()
+                .filter(|w| w.wall_index == 0)
+                .map(|w| w.points.clone())
+                .collect();
+            if references.is_empty() {
+                references = layers[k].infill_boundary.clone();
+            }
+
+            for shape in &shapes {
+                // Extract seed contact segments: edges of outer boundary bordering prev_b or other loops in cur_b
+                let mut seed_segments = Vec::new();
+                let n = shape.outer.len();
+                let search_dist = (config.nozzle_diameter * 1.25).max(0.4);
                 for i in 0..n {
                     let p0 = shape.outer[i];
                     let p1 = shape.outer[(i + 1) % n];
                     let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
 
-                    for other_loop in cur_b {
-                        let other_shape = [other_loop.clone()];
-                        if !point_in_single_loop(mid, other_loop)
-                            && polygon2d_contains_or_near(mid, &other_shape, search_dist)
-                        {
-                            seed_segments.push(LineSegment2D { p0, p1 });
-                            break;
+                    if polygon2d_contains_or_near(mid, prev_b, search_dist) {
+                        seed_segments.push(LineSegment2D { p0, p1 });
+                    }
+                }
+
+                // If no contact with prev_b, check for contact with other loops in current layer's boundary cur_b
+                if seed_segments.is_empty() && cur_b.len() > 1 {
+                    for i in 0..n {
+                        let p0 = shape.outer[i];
+                        let p1 = shape.outer[(i + 1) % n];
+                        let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
+
+                        for other_loop in cur_b {
+                            let other_shape = [other_loop.clone()];
+                            if !point_in_single_loop(mid, other_loop)
+                                && polygon2d_contains_or_near(mid, &other_shape, search_dist)
+                            {
+                                seed_segments.push(LineSegment2D { p0, p1 });
+                                break;
+                            }
                         }
                     }
                 }
+
+                let polylines =
+                    generate_wave_overhang_paths_2d(shape, &seed_segments, wavelength, config);
+                layer_polylines_2d.extend(polylines);
             }
 
-            let polylines =
-                generate_wave_overhang_paths_2d(shape, &seed_segments, wavelength, config);
-            layer_polylines_2d.extend(polylines);
-        }
-
-        if layer_polylines_2d.is_empty() {
-            continue;
-        }
-
-        // Reconstruct 2D wave polylines to 3D on the layer's order field
-        let polylines_3d = order_field::reconstruct_on_order_field_near(
-            layer_polylines_2d,
-            &references,
-            basis1,
-            basis2,
-            axis,
-            apex,
-            layers[k].order,
-            max_along,
-            layers[k].order_field.as_ref(),
-        );
-
-        let mut paths = Vec::new();
-        let mut reverse = false;
-
-        for poly in polylines_3d {
-            let pts_3d: Vec<DVec3> = if reverse {
-                poly.into_iter().rev().collect()
-            } else {
-                poly
-            };
-            reverse = !reverse;
-
-            if pts_3d.len() >= 2 {
-                let segment_count = pts_3d.len() - 1;
-                let segments: Vec<Segment> = (0..segment_count)
-                    .map(|_| Segment {
-                        kind: MoveKind::Overhang,
-                        speed,
-                        extrusion_rate: 1.0,
-                        support_fraction: 0.0,
-                        order: layers[k].order,
-                        extrusion_length: 0.0,
-                    })
-                    .collect();
-
-                paths.push(Path {
-                    points: pts_3d,
-                    segments,
-                    tool,
-                });
+            if layer_polylines_2d.is_empty() {
+                return (layer_wall_tags, Vec::new());
             }
-        }
 
-        paths_result[k] = paths;
-    }
+            // Reconstruct 2D wave polylines to 3D on the layer's order field
+            let polylines_3d = order_field::reconstruct_on_order_field_near(
+                layer_polylines_2d,
+                &references,
+                basis1,
+                basis2,
+                axis,
+                apex,
+                layers[k].order,
+                max_along,
+                layers[k].order_field.as_ref(),
+            );
+
+            let mut paths = Vec::new();
+            let mut reverse = false;
+
+            for poly in polylines_3d {
+                let pts_3d: Vec<DVec3> = if reverse {
+                    poly.into_iter().rev().collect()
+                } else {
+                    poly
+                };
+                reverse = !reverse;
+
+                if pts_3d.len() >= 2 {
+                    let segment_count = pts_3d.len() - 1;
+                    let segments: Vec<Segment> = (0..segment_count)
+                        .map(|_| Segment {
+                            kind: MoveKind::Overhang,
+                            speed,
+                            extrusion_rate: 1.0,
+                            support_fraction: 0.0,
+                            order: layers[k].order,
+                            extrusion_length: 0.0,
+                        })
+                        .collect();
+
+                    paths.push(Path {
+                        points: pts_3d,
+                        segments,
+                        tool,
+                    });
+                }
+            }
+
+            (layer_wall_tags, paths)
+        })
+        .unzip();
 
     WaveOverhangPlan {
         paths_by_layer: paths_result,
