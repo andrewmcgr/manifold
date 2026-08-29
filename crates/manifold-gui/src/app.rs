@@ -4,7 +4,8 @@
 use crate::camera::OrbitCamera;
 use crate::profile::Profile;
 use crate::render::{
-    MeshRenderResources, UploadedMesh, UploadedScene, UploadedToolpaths, Viewport3dCallback,
+    MeshOverlayMode, MeshRenderResources, UploadedMesh, UploadedScene, UploadedToolpaths,
+    Viewport3dCallback,
 };
 use crate::scene;
 use crate::toolpath_view::{self, ToolpathDataView};
@@ -96,8 +97,8 @@ pub struct ManifoldApp {
     /// Whether the toolpath preview line geometry is drawn in the viewport
     /// (Phase 13, see ROADMAP.md).
     show_toolpaths: bool,
-    /// Whether the Eikonal seed and conformal surface region color overlay is shown on meshes.
-    show_conformal_overlay: bool,
+    /// Mesh visualization mode (None, Conformal Regions, or Surface Order Gradient).
+    mesh_overlay_mode: MeshOverlayMode,
     /// Order-based scrub slider value (Phase 13 subtask 05): segments with
     /// `order <= scrub_order` are drawn, others hidden ("up to and
     /// including" semantics). `f64::INFINITY` (the default) shows every
@@ -220,7 +221,7 @@ impl ManifoldApp {
             toolpath_data_view: ToolpathDataView::default(),
             uploaded_toolpaths: None,
             show_toolpaths: true,
-            show_conformal_overlay: false,
+            mesh_overlay_mode: MeshOverlayMode::default(),
             scrub_order: f64::INFINITY,
             toolpath_order_range: None,
             slice_error: None,
@@ -404,12 +405,17 @@ impl ManifoldApp {
     }
 
     fn reupload(&mut self, device: &eframe::egui_wgpu::wgpu::Device) {
-        let overlay_config = self.show_conformal_overlay.then_some(&self.config);
         let uploaded = self
             .objects
             .iter()
             .map(|object| {
-                UploadedMesh::upload(device, &object.mesh, &object.transform, overlay_config)
+                UploadedMesh::upload(
+                    device,
+                    &object.mesh,
+                    &object.transform,
+                    self.mesh_overlay_mode,
+                    Some(&self.config),
+                )
             })
             .collect();
         self.uploaded_meshes = Arc::new(uploaded);
@@ -1853,7 +1859,7 @@ impl ManifoldApp {
                 });
         }
 
-        if self.show_conformal_overlay
+        if self.mesh_overlay_mode != MeshOverlayMode::None
             && (self.config.layer_height != config_before.layer_height
                 || self.config.nozzle_diameter != config_before.nozzle_diameter
                 || self.config.eikonal_conform_top_surfaces
@@ -2158,16 +2164,31 @@ impl ManifoldApp {
                 }
             }
             ui.checkbox(&mut self.show_toolpaths, "Show toolpaths");
-            if ui
-                .checkbox(
-                    &mut self.show_conformal_overlay,
-                    "Show Conformal & Seed Overlay",
-                )
-                .on_hover_text(
-                    "Color faces by Eikonal bed seeds (green), top conforming (cyan), top detach band (purple), and bottom conforming (orange)",
-                )
-                .changed()
-            {
+            let mode_before = self.mesh_overlay_mode;
+            egui::ComboBox::from_label("Mesh Overlay")
+                .selected_text(match self.mesh_overlay_mode {
+                    MeshOverlayMode::None => "None (Shaded)",
+                    MeshOverlayMode::ConformalRegions => "Conformal & Seed Regions",
+                    MeshOverlayMode::SurfaceOrder => "Surface Order Gradient",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.mesh_overlay_mode,
+                        MeshOverlayMode::None,
+                        "None (Shaded)",
+                    );
+                    ui.selectable_value(
+                        &mut self.mesh_overlay_mode,
+                        MeshOverlayMode::ConformalRegions,
+                        "Conformal & Seed Regions",
+                    );
+                    ui.selectable_value(
+                        &mut self.mesh_overlay_mode,
+                        MeshOverlayMode::SurfaceOrder,
+                        "Surface Order Gradient",
+                    );
+                });
+            if self.mesh_overlay_mode != mode_before {
                 let device = frame
                     .wgpu_render_state()
                     .expect("wgpu renderer is required")

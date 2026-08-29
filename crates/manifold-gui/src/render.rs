@@ -17,9 +17,18 @@ use crate::toolpath_view::ToolpathLineInstance;
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 use egui_wgpu::wgpu::util::DeviceExt as _;
-use glam::Mat4;
+use glam::{DVec3, Mat4};
 use manifold_core::mesh::Mesh;
 use manifold_fidget::marching_cubes::Vertex as FieldVertex;
+
+/// Strategy for coloring the uploaded mesh in the 3D viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum MeshOverlayMode {
+    #[default]
+    None,
+    ConformalRegions,
+    SurfaceOrder,
+}
 
 /// Number of multisample anti-aliasing samples used for 3D viewport rendering.
 const MSAA_SAMPLES: u32 = 4;
@@ -53,13 +62,14 @@ impl UploadedMesh {
     /// Expand `mesh` (with `object_transform` baked into vertex positions —
     /// see ROADMAP.md Phase 7 for interactive per-object transforms) into a
     /// flat-shaded, non-indexed vertex buffer and upload it.
-    /// If `conformal_overlay` is `Some`, colors faces according to their Eikonal
-    /// seed and conforming constraint classifications (Bed seed, Top/Bottom Conforming, Detached).
+    /// If `overlay_mode` is active, colors faces according to their Eikonal
+    /// seed/conforming classifications or continuous surface arrival order gradient.
     pub fn upload(
         device: &wgpu::Device,
         mesh: &Mesh,
         object_transform: &manifold_core::transform::Transform,
-        conformal_overlay: Option<&manifold_core::SlicerConfig>,
+        overlay_mode: MeshOverlayMode,
+        config: Option<&manifold_core::SlicerConfig>,
     ) -> Self {
         let min_z = mesh
             .vertices
@@ -67,9 +77,42 @@ impl UploadedMesh {
             .map(|v| object_transform.transform_point(*v).z)
             .fold(f64::INFINITY, f64::min);
         let min_z = if min_z.is_finite() { min_z } else { 0.0 };
-        let seed_tolerance = conformal_overlay
+        let seed_tolerance = config
             .map(|c| c.layer_height.min(c.nozzle_diameter) / 8.0)
             .unwrap_or(0.1);
+
+        let surface_arrival_times = if overlay_mode == MeshOverlayMode::SurfaceOrder {
+            let is_seed = |p: DVec3| p.z <= min_z + seed_tolerance;
+            let world_verts: Vec<DVec3> = mesh
+                .vertices
+                .iter()
+                .map(|v| object_transform.transform_point(*v))
+                .collect();
+            let faces: Vec<[usize; 3]> = mesh
+                .indices
+                .chunks_exact(3)
+                .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
+                .collect();
+            Some(manifold_fidget::surface_eikonal::solve_surface_eikonal(
+                &world_verts,
+                &faces,
+                is_seed,
+            ))
+        } else {
+            None
+        };
+
+        let max_surface_time = surface_arrival_times
+            .as_ref()
+            .map(|times| {
+                times
+                    .iter()
+                    .filter(|t| t.is_finite())
+                    .copied()
+                    .fold(0.0f64, f64::max)
+                    .max(1e-6)
+            })
+            .unwrap_or(1.0);
 
         let mut vertices = Vec::with_capacity(mesh.indices.len());
         for triangle in mesh.indices.chunks_exact(3) {
@@ -78,66 +121,95 @@ impl UploadedMesh {
             let (pa, pb, pc) = (world(a), world(b), world(c));
             let normal = (pb - pa).cross(pc - pa).normalize_or_zero();
 
-            let color = match conformal_overlay {
-                Some(config) => {
-                    let on_bed = pa.z <= min_z + seed_tolerance
-                        && pb.z <= min_z + seed_tolerance
-                        && pc.z <= min_z + seed_tolerance;
-
-                    if on_bed {
-                        // Bed contact seed: Bright Green
-                        [0.2, 0.85, 0.3, 1.0]
-                    } else if normal.z > 1e-3 {
-                        // Upward-facing
-                        if !config.eikonal_conform_top_surfaces {
-                            [0.65, 0.68, 0.72, 1.0]
-                        } else {
-                            let beta_deg = normal.z.clamp(-1.0, 1.0).acos().to_degrees();
-                            let top_detach = config.eikonal_conformal_max_angle_deg();
-                            if beta_deg <= top_detach - 5.0 {
-                                // Top Conforming: Cyan
-                                [0.15, 0.65, 0.95, 1.0]
-                            } else if beta_deg <= top_detach {
-                                // Top Transition Band: Purple
-                                [0.6, 0.35, 0.9, 1.0]
-                            } else {
-                                // Steep/Detached: Default Slate Gray
-                                [0.65, 0.68, 0.72, 1.0]
-                            }
-                        }
-                    } else if normal.z < -1e-3 {
-                        // Downward-facing
-                        if !config.eikonal_conform_bottom_surfaces {
-                            [0.65, 0.68, 0.72, 1.0]
-                        } else {
-                            let beta_deg = (-normal.z).clamp(-1.0, 1.0).acos().to_degrees();
-                            let bottom_detach = config.eikonal_conformal_bottom_max_angle_deg();
-                            if beta_deg <= bottom_detach - 5.0 {
-                                // Bottom Conforming: Orange
-                                [0.95, 0.55, 0.1, 1.0]
-                            } else if beta_deg <= bottom_detach {
-                                // Bottom Transition Band: Gold/Yellow
-                                [0.95, 0.75, 0.2, 1.0]
-                            } else {
-                                // Steep/Detached: Default Slate Gray
-                                [0.65, 0.68, 0.72, 1.0]
-                            }
-                        }
-                    } else {
-                        // Vertical walls
-                        [0.65, 0.68, 0.72, 1.0]
-                    }
+            let (ca, cb, cc) = match overlay_mode {
+                MeshOverlayMode::SurfaceOrder => {
+                    let map_color = |v_idx: u32| {
+                        surface_arrival_times
+                            .as_ref()
+                            .map_or([0.65, 0.68, 0.72, 1.0], |times| {
+                                let t = (times[v_idx as usize] / max_surface_time).clamp(0.0, 1.0);
+                                crate::toolpath_view::scalar_to_color(t)
+                            })
+                    };
+                    (map_color(a), map_color(b), map_color(c))
                 }
-                None => [0.65, 0.68, 0.72, 1.0],
+                MeshOverlayMode::ConformalRegions => {
+                    let color = match config {
+                        Some(cfg) => {
+                            let on_bed = pa.z <= min_z + seed_tolerance
+                                && pb.z <= min_z + seed_tolerance
+                                && pc.z <= min_z + seed_tolerance;
+
+                            if on_bed {
+                                // Bed contact seed: Bright Green
+                                [0.2, 0.85, 0.3, 1.0]
+                            } else if normal.z > 1e-3 {
+                                // Upward-facing
+                                if !cfg.eikonal_conform_top_surfaces {
+                                    [0.65, 0.68, 0.72, 1.0]
+                                } else {
+                                    let beta_deg = normal.z.clamp(-1.0, 1.0).acos().to_degrees();
+                                    let top_detach = cfg.eikonal_conformal_max_angle_deg();
+                                    if beta_deg <= top_detach - 5.0 {
+                                        // Top Conforming: Cyan
+                                        [0.15, 0.65, 0.95, 1.0]
+                                    } else if beta_deg <= top_detach {
+                                        // Top Transition Band: Purple
+                                        [0.6, 0.35, 0.9, 1.0]
+                                    } else {
+                                        // Steep/Detached: Default Slate Gray
+                                        [0.65, 0.68, 0.72, 1.0]
+                                    }
+                                }
+                            } else if normal.z < -1e-3 {
+                                // Downward-facing
+                                if !cfg.eikonal_conform_bottom_surfaces {
+                                    [0.65, 0.68, 0.72, 1.0]
+                                } else {
+                                    let beta_deg = (-normal.z).clamp(-1.0, 1.0).acos().to_degrees();
+                                    let bottom_detach =
+                                        cfg.eikonal_conformal_bottom_max_angle_deg();
+                                    if beta_deg <= bottom_detach - 5.0 {
+                                        // Bottom Conforming: Orange
+                                        [0.95, 0.55, 0.1, 1.0]
+                                    } else if beta_deg <= bottom_detach {
+                                        // Bottom Transition Band: Gold/Yellow
+                                        [0.95, 0.75, 0.2, 1.0]
+                                    } else {
+                                        // Steep/Detached: Default Slate Gray
+                                        [0.65, 0.68, 0.72, 1.0]
+                                    }
+                                }
+                            } else {
+                                // Vertical walls
+                                [0.65, 0.68, 0.72, 1.0]
+                            }
+                        }
+                        None => [0.65, 0.68, 0.72, 1.0],
+                    };
+                    (color, color, color)
+                }
+                MeshOverlayMode::None => {
+                    let default_color = [0.65, 0.68, 0.72, 1.0];
+                    (default_color, default_color, default_color)
+                }
             };
 
-            for p in [pa, pb, pc] {
-                vertices.push(Vertex {
-                    position: p.as_vec3().to_array(),
-                    normal: normal.as_vec3().to_array(),
-                    color,
-                });
-            }
+            vertices.push(Vertex {
+                position: pa.as_vec3().to_array(),
+                normal: normal.as_vec3().to_array(),
+                color: ca,
+            });
+            vertices.push(Vertex {
+                position: pb.as_vec3().to_array(),
+                normal: normal.as_vec3().to_array(),
+                color: cb,
+            });
+            vertices.push(Vertex {
+                position: pc.as_vec3().to_array(),
+                normal: normal.as_vec3().to_array(),
+                color: cc,
+            });
         }
 
         Self::from_vertices(device, &vertices, "manifold mesh vertex buffer")
