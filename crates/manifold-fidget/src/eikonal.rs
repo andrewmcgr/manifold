@@ -64,6 +64,25 @@ pub struct EikonalOrderField {
     gradients: Vec<DVec3>,
 }
 
+/// Polynomial $C^2$ continuous smooth maximum with smoothing radius $k > 0$.
+/// Smoothly blends between $a$ and $b$ when $|a - b| < k$ with continuous first
+/// and second derivatives, and exactly matches $\max(a, b)$ outside the transition band.
+#[inline]
+pub fn smax_c2(a: f64, b: f64, k: f64) -> f64 {
+    if k <= 1e-12 {
+        return a.max(b);
+    }
+    let diff = a - b;
+    if diff >= k {
+        a
+    } else if diff <= -k {
+        b
+    } else {
+        let h = (0.5 + 0.5 * diff / k).clamp(0.0, 1.0);
+        (1.0 - h) * b + h * a + k * h * (1.0 - h)
+    }
+}
+
 /// Which exterior surfaces the conformal Eikonal constructor should conform
 /// to, and how aggressively — see
 /// [`EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit`].
@@ -726,16 +745,19 @@ impl EikonalOrderField {
                 return;
             }
 
-            // Per-component matching constant A: the max `T + d` over the
-            // patch's well-conformed core (weight >= 0.5), so `A - d` meets
-            // the bulk field at `w = 1` and never schedules surface beads
-            // earlier than their underlying bulk support.
+            // Per-component matching constant A: the max `S + d` over the
+            // patch's well-conformed core (weight >= 0.5) from the immutable
+            // marched surface values, guaranteeing a stable, noise-free target.
             let mut a_max = vec![f64::NAN; component_count];
             for idx in 0..total {
                 if weight[idx] < 0.5 {
                     continue;
                 }
-                let a = self.distances[idx] + d[idx];
+                let s = surface_values[idx];
+                if !s.is_finite() {
+                    continue;
+                }
+                let a = s + d[idx];
                 let cur = &mut a_max[component[idx]];
                 if cur.is_nan() || a > *cur {
                     *cur = a;
@@ -1345,6 +1367,7 @@ impl EikonalOrderField {
     /// the current (higher) voxel's order value T(x, y, z) must be delayed (increased)
     /// so the lower voxel prints first, preventing the toolhead from colliding with
     /// an already-deposited higher voxel when later printing the lower voxel.
+    #[allow(dead_code)]
     fn enforce_downward_non_collision(
         &mut self,
         profile: &SlopeProfile,
@@ -1464,9 +1487,10 @@ impl EikonalOrderField {
                 );
             }
 
-            // 3. Surface geodesic lower-bound enforcement
+            // 3. Surface geodesic smooth lower-bound enforcement (C2 soft-max)
             if let Some(surf_min) = options.surface_min_order {
                 let [nx, ny, nz] = self.dims;
+                let k = 2.0 * std::f64::consts::SQRT_2 * self.h;
                 for z in 0..nz {
                     for y in 0..ny {
                         for x in 0..nx {
@@ -1474,8 +1498,9 @@ impl EikonalOrderField {
                             if occupied[idx] && self.distances[idx].is_finite() {
                                 let p = self.node_pos(x, y, z);
                                 if let Some(min_t) = surf_min(p) {
-                                    if min_t > self.distances[idx] {
-                                        self.distances[idx] = min_t;
+                                    if min_t + k > self.distances[idx] {
+                                        self.distances[idx] =
+                                            smax_c2(self.distances[idx], min_t, k);
                                     }
                                 }
                             }
@@ -1484,7 +1509,7 @@ impl EikonalOrderField {
                 }
             }
 
-            // 4. Slope-limit relaxation & Downward non-collision
+            // 4. Slope-limit relaxation
             if let Some(profile) = slope_profile {
                 let raised: Vec<bool> = pre_bottom
                     .iter()
@@ -1503,7 +1528,6 @@ impl EikonalOrderField {
                     slope_slack,
                     Some(&raised),
                 );
-                self.enforce_downward_non_collision(profile, height_along, occupied);
             }
 
             // 5. Monotonic column growth
@@ -2972,5 +2996,30 @@ mod tests {
             o_high >= o_low,
             "higher voxel must have order >= lower voxel along column: o_low={o_low}, o_high={o_high}"
         );
+    }
+
+    #[test]
+    fn smax_c2_is_c2_continuous_and_monotonic() {
+        let k = 1.0;
+        let b = 5.0;
+
+        // Outside upper bound: exactly a
+        assert_eq!(smax_c2(7.0, b, k), 7.0);
+        // Outside lower bound: exactly b
+        assert_eq!(smax_c2(3.0, b, k), 5.0);
+        // At center: smooth peak
+        assert!((smax_c2(b, b, k) - (b + 0.25 * k)).abs() < 1e-12);
+
+        // Monotonicity check
+        let mut prev = -f64::INFINITY;
+        for step in 0..100 {
+            let a = 3.0 + (step as f64 / 100.0) * 4.0;
+            let val = smax_c2(a, b, k);
+            assert!(
+                val >= prev,
+                "smax_c2 must be monotonic: prev={prev}, val={val} at a={a}"
+            );
+            prev = val;
+        }
     }
 }

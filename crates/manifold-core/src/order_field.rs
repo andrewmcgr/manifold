@@ -233,6 +233,8 @@ fn eikonal_field_for(
             Some(&height_along),
         );
     }
+    let conform_top = config.eikonal_conform_top_surfaces;
+    let conform_bottom = config.eikonal_conform_bottom_surfaces;
     let owned_sdf;
     let sdf = match existing_sdf {
         Some(sdf) => sdf,
@@ -241,12 +243,24 @@ fn eikonal_field_for(
             &owned_sdf
         }
     };
+    let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
 
-    let conform_top = config.eikonal_conform_top_surfaces;
-    let conform_bottom = config.eikonal_conform_bottom_surfaces;
     let skin_depth = config.eikonal_conformal_skin_depth_mm();
     let top_detach_deg = config.eikonal_conformal_max_angle_deg();
     let bottom_detach_deg = config.eikonal_conformal_bottom_max_angle_deg();
+    let surface_weight = config.eikonal_surface_order_weight();
+
+    if !conform_top && !conform_bottom && surface_weight <= 0.0 {
+        return EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
+            min,
+            max,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+            Some(slope_profile),
+            Some(&height_along),
+        );
+    }
 
     let side_faces = |upward: bool, detach_deg: f64| -> Vec<[usize; 3]> {
         let cos_limit = detach_deg.to_radians().cos();
