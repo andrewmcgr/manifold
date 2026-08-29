@@ -115,11 +115,11 @@ pub struct ConformalSurfaceOptions<'a> {
     /// Target gradient magnitude (Lipschitz scaling factor) for converting physical
     /// voxel distance steps into order field units. Defaults to 1.0 (unit speed) when <= 0.
     pub target_lipschitz_constant: f64,
-    /// Optional surface geodesic lower-bound evaluator returning the minimum order
-    /// arrival time $T_{\text{surf}}(p)$ for points $p$ on or near the mesh boundary.
+    /// Optional surface geodesic lower-bound grid containing precomputed minimum order
+    /// arrival times $T_{\text{surf}}(p)$ for grid nodes on or near the mesh boundary.
     /// Clamps $T(p) \ge T_{\text{surf}}(p)$ to eliminate surface local minima and
     /// guarantee monotonic progression along the exterior skin of the model.
-    pub surface_min_order: Option<&'a (dyn Fn(DVec3) -> Option<f64> + Sync)>,
+    pub surface_min_order: Option<&'a [f64]>,
     /// Whether to enforce vertical column monotonicity (minimum growth per unit height).
     /// Defaults to `true`.
     pub enforce_monotonic_growth: bool,
@@ -1489,22 +1489,14 @@ impl EikonalOrderField {
 
             // 3. Surface geodesic smooth lower-bound enforcement (C2 soft-max)
             if let Some(surf_min) = options.surface_min_order {
-                let [nx, ny, nz] = self.dims;
                 let k = 2.0 * std::f64::consts::SQRT_2 * self.h;
-                for z in 0..nz {
-                    for y in 0..ny {
-                        for x in 0..nx {
-                            let idx = self.idx(x, y, z);
-                            if occupied[idx] && self.distances[idx].is_finite() {
-                                let p = self.node_pos(x, y, z);
-                                if let Some(min_t) = surf_min(p) {
-                                    if min_t + k > self.distances[idx] {
-                                        self.distances[idx] =
-                                            smax_c2(self.distances[idx], min_t, k);
-                                    }
-                                }
-                            }
-                        }
+                for (idx, &min_t) in surf_min.iter().enumerate() {
+                    if min_t.is_finite()
+                        && occupied[idx]
+                        && self.distances[idx].is_finite()
+                        && min_t + k > self.distances[idx]
+                    {
+                        self.distances[idx] = smax_c2(self.distances[idx], min_t, k);
                     }
                 }
             }

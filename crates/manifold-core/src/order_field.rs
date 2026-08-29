@@ -14,6 +14,7 @@ use glam::DVec3;
 use manifold_fidget::eikonal::EikonalOrderField;
 use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{ConicalOrderField, HeightOrderField, OrderField};
+use rayon::prelude::*;
 
 // Re-exported so downstream diagnostics (e.g. the manifold-cli
 // verification examples) can name the trait when calling helpers like
@@ -311,36 +312,55 @@ fn eikonal_field_for(
             .is_some_and(|s| s.sample(p).value.abs() <= cell_size)
     };
 
-    let surface_weight = config.eikonal_surface_order_weight();
-    let surface_times = (surface_weight > 0.0).then(|| {
-        manifold_fidget::surface_eikonal::solve_surface_eikonal(
+    let surface_min_grid: Option<Vec<f64>> = if surface_weight > 0.0 {
+        let surface_times = manifold_fidget::surface_eikonal::solve_surface_eikonal(
             &mesh.vertices,
             &faces,
             is_seed_region,
-        )
-    });
-    let surface_min_order = |p: DVec3| -> Option<f64> {
-        let surface_times = surface_times.as_ref()?;
-        let sample = sdf.sample(p);
-        if sample.value.abs() <= skin_depth {
-            if let Some((face_idx, closest, _)) = sdf.nearest(p) {
-                if face_idx < faces.len() {
-                    let [i0, i1, i2] = faces[face_idx];
-                    let t = manifold_fidget::surface_eikonal::interpolate_barycentric(
-                        mesh.vertices[i0],
-                        mesh.vertices[i1],
-                        mesh.vertices[i2],
-                        surface_times[i0],
-                        surface_times[i1],
-                        surface_times[i2],
-                        closest,
-                    );
-                    if t.is_finite() {
-                        return Some(t * surface_weight);
+        );
+        let nx = ((max.x - min.x) / cell_size).ceil() as usize + 1;
+        let ny = ((max.y - min.y) / cell_size).ceil() as usize + 1;
+        let nz = ((max.z - min.z) / cell_size).ceil() as usize + 1;
+        let total = nx * ny * nz;
+
+        Some(
+            (0..total)
+                .into_par_iter()
+                .map(|idx| {
+                    let z = idx / (nx * ny);
+                    let y = (idx / nx) % ny;
+                    let x = idx % nx;
+                    let p = min
+                        + DVec3::new(
+                            x as f64 * cell_size,
+                            y as f64 * cell_size,
+                            z as f64 * cell_size,
+                        );
+                    let sample = sdf.sample(p);
+                    if sample.value.abs() <= skin_depth {
+                        if let Some((face_idx, closest, _)) = sdf.nearest(p) {
+                            if face_idx < faces.len() {
+                                let [i0, i1, i2] = faces[face_idx];
+                                let t = manifold_fidget::surface_eikonal::interpolate_barycentric(
+                                    mesh.vertices[i0],
+                                    mesh.vertices[i1],
+                                    mesh.vertices[i2],
+                                    surface_times[i0],
+                                    surface_times[i1],
+                                    surface_times[i2],
+                                    closest,
+                                );
+                                if t.is_finite() {
+                                    return t * surface_weight;
+                                }
+                            }
+                        }
                     }
-                }
-            }
-        }
+                    f64::NAN
+                })
+                .collect(),
+        )
+    } else {
         None
     };
 
@@ -356,8 +376,7 @@ fn eikonal_field_for(
         bottom_detach_angle_deg: bottom_detach_deg,
         detach_feather_mm: 2.0 * config.wall_line_width,
         target_lipschitz_constant: 1.0,
-        surface_min_order: (surface_weight > 0.0)
-            .then_some(&surface_min_order as &(dyn Fn(DVec3) -> Option<f64> + Sync)),
+        surface_min_order: surface_min_grid.as_deref(),
         enforce_monotonic_growth: config.eikonal_enforce_monotonic_growth,
     };
     let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
