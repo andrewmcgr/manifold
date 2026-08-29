@@ -11,7 +11,7 @@ This guide covers system requirements, building Manifold from source, and runnin
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   ```
 - **Operating Systems**: macOS (Apple Silicon & Intel), Linux (x86_64 / ARM64 with Vulkan/OpenGL), Windows (x86_64 with Direct3D12/Vulkan).
-- **GPU Requirements (GUI only)**: A graphics card supporting WGPU (Metal, Vulkan, DX12).
+- **GPU Requirements (GUI only)**: A graphics card supporting WGPU (Metal, Vulkan, DX12) for viewport rendering and GPU-accelerated Eikonal/TPMS compute pipelines.
 
 ---
 
@@ -50,10 +50,13 @@ cargo run --release -p manifold-cli -- path/to/model.stl -o output.gcode
 
 ### Common CLI Examples
 
-1. **Eikonal Non-Planar Slicing with Toolhead Clearance**:
+1. **Conformal Eikonal Slicing with Toolhead Clearance**:
    ```sh
    manifold model.stl --order-field eikonal \
-     --eikonal-slope-profile "0:0,15:5,35:20" \
+     --eikonal-slope-profile "0:45,5:15,20:5" \
+     --eikonal-conform-top-surfaces \
+     --eikonal-conform-bottom-surfaces \
+     --sparse-infill-pattern gyroid \
      --layer-height 0.20 \
      -o output.gcode
    ```
@@ -89,9 +92,10 @@ cargo run --release -p manifold-gui
 ### Basic Workflow in GUI
 
 1. **Load a Model**: Drag and drop an `.stl` or `.3mf` file into the 3D viewport, or click **Import Objects…** in the left sidebar.
-2. **Adjust Settings**: Select layer heights, wall counts, infill patterns, or machine speeds in the collapsible settings sidebar.
-3. **Slice**: Click the **Slice** button in the top toolbar. Watch real-time progress across order field derivation, outer wall extraction, and layer toolpath generation.
-4. **Inspect Toolpaths**: Toggle **Toolpath preview** to view internal loops, infill, bridges, and travels. Switch between `Line Type`, `Speed`, `Flow Rate`, and `Acceleration` data views.
-5. **Export G-code**: Click **Export G-code…** to save the generated program to disk.
+2. **Adjust Settings**: Select layer heights, wall counts, infill patterns (e.g. Gyroid, Schwarz Diamond, Cubic), or machine speeds in the collapsible settings sidebar.
+3. **Inspect Overlays**: Use the **Mesh Overlay** dropdown in the top toolbar to preview conformal seed regions or the geodesic surface order gradient.
+4. **Slice**: Click the **Slice** button in the top toolbar. Watch real-time progress across order field derivation, outer wall extraction, and layer toolpath generation.
+5. **Inspect Toolpaths**: Toggle **Show toolpaths** to view internal loops, infill, bridges, and travels. Switch between `Line Type`, `Speed`, `Actual Speed`, `Flow Rate`, `Acceleration`, `Actual Acceleration`, and `Travel Durations` data views. Hover over any path to view detailed segment metrics.
+6. **Export G-code**: Click **Export G-code…** to save the generated program to disk.
 
 For in-depth details on the visual interface, see the [GUI User Guide](gui/index.md).
