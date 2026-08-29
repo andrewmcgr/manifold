@@ -1,5 +1,7 @@
 # Manifold
 
+![Manifold Non-Planar Slicing Preview](Manifold-Benchy.png)
+
 A non-planar slicer for 3D printers: turns a mesh into Gcode using
 toolpaths that deform off the flat XY plane, rather than strictly planar
 layers.
