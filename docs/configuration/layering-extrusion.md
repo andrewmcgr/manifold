@@ -19,11 +19,9 @@ This section describes all slicing parameters governing layer heights, perimeter
 
 | Key in JSON | Type | Default | Description |
 |---|---|---|---|
-| `nozzle_diameter` | `f64` | `0.40` | Default nozzle orifice diameter in mm. |
 | `wall_line_width` | `f64` | `0.40` | Nominal extrusion line width for perimeter walls. |
 | `shell_thickness` | `f64` | `0.80` | Total perimeter shell thickness ($N_{\text{walls}} = \text{round}(\text{thickness} / \text{width})$). |
 | `wall_offset` | `f64` | `0.20` | Distance from geometric surface to outer perimeter centerline ($0.5 \times d_{\text{nozzle}}$). |
-| `nozzle_flat_diameter` | `Option<f64>` | `2.0 * nozzle` | Physical flat diameter of nozzle tip used for tangent flat compensation. |
 
 ---
 
@@ -52,6 +50,6 @@ Manifold computes extrusion lengths using a stadium cross-section model:
 
 $$A_{\text{bead}} = (w - h) \cdot h + \pi \left(\frac{h}{2}\right)^2$$
 
-where $w$ is line width and $h$ is local layer thickness. For a segment of length $L$, the volume is $V = A_{\text{bead}} \cdot L$, requiring raw filament extrusion length:
+where $w$ is line width and $h$ is local layer thickness. For a 3D non-planar segment of length $L_{\text{3D}}$ inclined at slope angle $\theta_{\text{slope}}$, the volumetric extrusion compensates by the slope cosine:
 
-$$\Delta E = \frac{A_{\text{bead}} \cdot L}{A_{\text{filament}}} = \frac{A_{\text{bead}} \cdot L}{\pi (d_{\text{filament}} / 2)^2}$$
+$$\Delta E = \frac{A_{\text{bead}} \cdot L_{\text{3D}} \cdot \cos(\theta_{\text{slope}})}{A_{\text{filament}}} = \frac{A_{\text{bead}} \cdot \sqrt{\Delta x^2 + \Delta y^2}}{\pi (d_{\text{filament}} / 2)^2}$$

@@ -1,6 +1,6 @@
-# Machine Envelopes, Tools & Temperatures
+# Machine Envelopes, Tools & Kinematics
 
-This section documents printer hardware definitions, multi-tool setups, and thermal targets.
+This section documents printer hardware definitions, multi-tool setups, and per-axis kinematic parameters.
 
 ---
 
@@ -9,6 +9,7 @@ This section documents printer hardware definitions, multi-tool setups, and ther
 ```json
 {
   "machine": {
+    "substrate_transform": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
     "build_volume": {
       "Aabb": {
         "min": [0.0, 0.0, 0.0],
@@ -34,6 +35,7 @@ This section documents printer hardware definitions, multi-tool setups, and ther
       {
         "id": 0,
         "nozzle_diameter": 0.4,
+        "nozzle_flat_diameter": 0.8,
         "mount": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         "collision_envelope": {
           "Sphere": { "center": [0.0, 0.0, 0.0], "radius": 0.0 }
@@ -44,6 +46,7 @@ This section documents printer hardware definitions, multi-tool setups, and ther
       {
         "id": 1,
         "nozzle_diameter": 0.6,
+        "nozzle_flat_diameter": 1.2,
         "mount": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         "collision_envelope": {
           "Sphere": { "center": [0.0, 0.0, 0.0], "radius": 0.0 }
@@ -60,8 +63,31 @@ This section documents printer hardware definitions, multi-tool setups, and ther
 |---|---|---|---|
 | `id` | Integer | `0` | Sequential Tool ID (`0`, `1`, `2`...). |
 | `nozzle_diameter` | `f64` | `0.40` | Orifice diameter in millimeters. |
+| `nozzle_flat_diameter` | `Option<f64>` | `2.0 * nozzle` | Diameter (mm) of nozzle tip flat land used for vertical slope clearance compensation. |
 | `extrusion_multiplier` | `f64` | `1.0` | Material-specific flow scaling factor. |
 | `nozzle_temperature` | `Option<f64>` | `240.0` | Target hotend temperature (°C) for this tool. |
+
+---
+
+## Per-Axis Kinematic Overrides (`machine.axis_limits`)
+
+```json
+{
+  "machine": {
+    "axis_limits": {
+      "Z": {
+        "speed_limit": 40.0,
+        "acceleration_limit": 1500.0,
+        "use_stepper_dynamics": true,
+        "zero_speed_acceleration": 3000.0,
+        "max_available_speed": 60.0
+      }
+    }
+  }
+}
+```
+
+- Allows dedicated limits on specific machine axes (such as high-inertia Z-leadscrew drives) to avoid step skipping while allowing fast XY gantry moves.
 
 ---
 

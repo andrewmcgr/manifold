@@ -43,7 +43,9 @@ Manifold provides advanced extrusion control including perimeter wipe moves, non
     "ooze_max_length_ref_mm": 0.30,
     "static_retraction_mm": 0.25,
     "max_retraction_mm": 1.5,
-    "pa_deadband": 0.10
+    "pa_deadband": 0.10,
+    "swell_ratio_low": 1.05,
+    "swell_ratio_high": 1.20
   }
 }
 ```
@@ -58,12 +60,21 @@ Cooling fan air stream drops effective polymer tip temperature:
 
 $$T_{\text{effective}} = T_{\text{block}} - \Delta T_{\text{max,fan}} \cdot F^{0.6}, \quad C_{\text{PA,dynamic}} = C_{\text{PA}}(Q) \cdot e^{-0.02 \cdot (T_{\text{effective}} - T_{\text{ref}})}$$
 
-### 3. Adaptive Junction-Velocity Retraction ($L_{\text{retract}}$)
+### 3. Viscoelastic Extrudate Swell Compensation
+High-viscosity polymer melts store elastic strain energy in the nozzle melt chamber, resulting in die swell (transverse bead expansion upon exit). Manifold interpolates shear-dependent swell ratios:
+
+$$B(Q) = B_{\text{low}} + (B_{\text{high}} - B_{\text{low}}) \cdot \left(\frac{Q - Q_{\text{low}}}{Q_{\text{high}} - Q_{\text{low}}}\right)$$
+
+and scales nominal extrusion rate to maintain precise dimensional tolerances across variable-speed non-planar passes.
+
+### 4. Adaptive Junction-Velocity Retraction ($L_{\text{retract}}$)
 Elastic melt-zone pressure is relieved using filament feed velocity:
 
 $$L_{\text{retract}} = C_{\text{PA}} \cdot \left(\frac{Q_{\text{exit}}}{A_{\text{filament}}}\right) + L_{\text{static}}$$
 
-### 4. Time-Dependent Thermal Ooze Recovery ($L_{\text{unretract}}$)
+### 5. Time-Dependent Thermal Ooze Recovery ($L_{\text{unretract}}$)
 Over travel duration $t_{\text{travel}}$, re-primes oozed polymer:
 
 $$L_{\text{unretract}} = L_{\text{retract}} + L_{\text{max,ooze}} \cdot \left(1 - e^{-t_{\text{travel}} / \tau}\right)$$
+
+with relaxation time constant $\tau$ tunable down to $50\text{ ms}$ ($0.05\text{ s}$) for fast direct-drive extruders.

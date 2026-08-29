@@ -1,6 +1,6 @@
 # Kinematics, Speeds & Stepper Dynamics
 
-Manifold provides a multi-phase kinematic motion planning and lookahead engine with support for standard speed ceilings, Klipper Square Corner Velocity (SCV), and physical stepper motor torque roll-off ODE modeling.
+Manifold provides a multi-phase kinematic motion planning and lookahead engine with support for standard speed ceilings, Klipper Square Corner Velocity (SCV), per-axis physical limits, and stepper motor torque roll-off ODE modeling.
 
 ---
 
@@ -16,13 +16,14 @@ Manifold provides a multi-phase kinematic motion planning and lookahead engine w
   "solid_infill_speed": 7800.0,
   "bridge_speed": 3000.0,
   "first_layer_print_speed": 3720.0,
+  "max_volumetric_speed": 24.0,
   "speed_deadband_percent": 10.0
 }
 ```
 
-- **Volumetric Melt Rate Clamping**: For every move, the maximum feedrate is dynamically capped by the hotend's maximum volumetric melt rate limit:
+- **Volumetric Melt Rate Clamping (`max_volumetric_speed`)**: For every move, the maximum feedrate is dynamically capped by the hotend's volumetric melt limit:
   $$v \le \frac{Q_{\text{max}}}{A_{\text{bead}}}$$
-- **Speed Deadband**: Emits `F{speed}` feedrates only when commanded speed changes by $\ge 10\%$, eliminating redundant micro-feedrate outputs.
+- **Speed Deadband (`speed_deadband_percent`)**: Emits `F{speed}` feedrates only when commanded speed changes by $\ge 10\%$, eliminating redundant micro-feedrate outputs.
 
 ---
 
@@ -30,8 +31,9 @@ Manifold provides a multi-phase kinematic motion planning and lookahead engine w
 
 ```json
 {
+  "default_acceleration": 5000.0,
   "outer_wall_acceleration": 2500.0,
-  "inner_wall_acceleration": 4000.0,
+  "inner_wall_acceleration": 5000.0,
   "infill_acceleration": 7000.0,
   "solid_infill_acceleration": 5000.0,
   "bridge_acceleration": 3000.0,
@@ -69,3 +71,41 @@ $$\frac{dv}{dt} = a(v) = a_0 \cdot \max\left(0, 1 - \frac{v}{v_{\text{max}}}\rig
 - **$a_0$ (`zero_speed_acceleration`)**: Peak holding acceleration at zero velocity (default $20,000\text{ mm/s}^2$).
 - **$v_{\text{max}}$ (`max_available_speed`)**: Theoretical speed where motor torque drops to zero (default $1,000\text{ mm/s}$).
 - **Kinematic Potential Integration**: Velocity lookahead integrates the closed-form potential $F(v) = v_{\text{max}}^2 [(1 - v/v_{\text{max}}) - \ln(1 - v/v_{\text{max}})]$ via Newton-Raphson iteration, giving exact motor acceleration profiles.
+
+---
+
+## Per-Axis Kinematics & 3D Vector Projection (`axis_limits`)
+
+Non-planar 3D toolpaths involve coordinated simultaneous movement across X, Y, and Z axes. Because Z-axis leadscrews or belt reductions typically possess lower maximum speeds and higher inertia than XY gantries, Manifold supports independent per-axis kinematic limits:
+
+```json
+{
+  "machine": {
+    "axis_limits": {
+      "X": {
+        "speed_limit": 500.0,
+        "acceleration_limit": 15000.0
+      },
+      "Y": {
+        "speed_limit": 500.0,
+        "acceleration_limit": 15000.0
+      },
+      "Z": {
+        "speed_limit": 40.0,
+        "acceleration_limit": 1500.0,
+        "use_stepper_dynamics": true,
+        "zero_speed_acceleration": 3000.0,
+        "max_available_speed": 60.0
+      }
+    }
+  }
+}
+```
+
+### Dynamic 3D Move Throttling
+
+For any 3D move along unit direction vector $\vec{u} = (\hat{u}_x, \hat{u}_y, \hat{u}_z)$, the permissible 3D path velocity $v_{\text{path}}$ is dynamically clamped against each active axis limit:
+
+$$v_{\text{path}} \le \min \left( v_{\text{global}}, \frac{v_{\text{limit}, X}}{|\hat{u}_x|}, \frac{v_{\text{limit}, Y}}{|\hat{u}_y|}, \frac{v_{\text{limit}, Z}}{|\hat{u}_z|} \right)$$
+
+This guarantees that steep non-planar vertical climbs automatically throttle toolhead speed so that the Z axis never exceeds its safe feedrate or torque envelope.
