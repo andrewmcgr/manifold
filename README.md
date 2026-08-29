@@ -8,6 +8,8 @@ layers.
 
 - `crates/manifold-core` — the slicing engine (mesh → layers → toolpaths →
   Gcode). No UI dependencies; usable headless or embedded.
+- `crates/manifold-fidget` — geometry backend for SDF evaluation, narrow-band
+  Fast Marching Eikonal solvers, NanoVDB grids, and GPU compute pipelines.
 - `crates/manifold-cli` — CLI front-end (`manifold`) for headless/batch use.
 - `crates/manifold-gui` — desktop GUI (egui + wgpu) for interactive use.
 

@@ -15,14 +15,15 @@ plus separate CLI and GUI front-ends.
 - Math: `glam` (f64 vectors — `DVec3`).
 - Error handling: `thiserror` (library errors), `anyhow` (application errors).
 - Logging: `tracing` + `tracing-subscriber`.
-- Serialization: `serde` / `serde_json` for config.
+- Serialization: `serde` / `serde_json` for config and profile persistence.
 - Geometry backend: `manifold-fidget` (fidget-based SDF/order-field/contour
-  extraction) — depended on by both `manifold-core` (the mesh -> order
-  field -> contour-extraction slicing pipeline) and `manifold-gui`
-  (visualization).
+  extraction, narrow-band Fast Marching Eikonal solvers, GPU compute pipelines,
+  and NanoVDB acceleration) — depended on by `manifold-core` (slicing pipeline)
+  and `manifold-gui` (visualization and overlays).
 - 2D polygon geometry: `i_overlay` (pure-Rust polygon boolean ops and
   inward offsetting) — used by `manifold-core::polygon2d` for per-layer
   infill/solid-fill boundary computation (no C/C++ FFI).
+- Mesh loading: pure Rust STL / 3MF loaders in `manifold-core::mesh`.
 
 ## Directory Structure
 
@@ -32,76 +33,84 @@ crates/
   manifold-core/            # slicing engine — the only crate with domain logic
     src/
       lib.rs                # public API: SlicerConfig, slice_to_gcode()
-      error.rs               # Error/Result
-      mesh.rs                 # Mesh type (vertices/indices)
-      slicing.rs              # mesh -> Layer[] (via manifold-fidget's MeshSdf + contour extraction)
-      toolpath.rs              # Layer[] -> Path[]
-      gcode.rs                  # Path[] -> Gcode string
+      error.rs              # Error/Result
+      mesh.rs               # Mesh type & STL/3MF parsers
+      machine.rs            # Machine envelope, tools, per-axis limits
+      kinematics.rs         # Speeds, accelerations, stepper motor dynamics
+      fluid_dynamics.rs     # 2-point PA, extrudate swell, adaptive retraction
+      order_field.rs        # Height, Conical, and Eikonal order fields
+      slicing.rs            # mesh -> Layer[] via manifold-fidget + contour extraction
+      infill.rs             # Cubic, TPMS (Gyroid, Schwarz), Concentric, AllWalls
+      wave_overhang.rs      # 2D/3D Huygens wavefront planner (LaSO)
+      toolpath.rs           # Layer[] -> Path[] (planning, slope compensation, Z-hops)
+      gcode.rs              # Path[] -> Gcode string (macros, SCV, Klipper headers)
   manifold-fidget/          # SDF/order-field/contour-extraction backend
-    src/                    # depended on by manifold-core (slicing pipeline)
-                            # and manifold-gui (visualization)
+    src/                    # Fast Marching Method, bilateral conformal solvers,
+                            # NanoVDB buffers, and wgpu GPU compute pipelines
   manifold-cli/             # `manifold` binary — headless/batch driver
     src/main.rs
-  manifold-gui/              # `manifold-gui` binary — egui/wgpu desktop app
+  manifold-gui/             # `manifold-gui` binary — egui/wgpu desktop app
     src/main.rs
 ```
 
 ## Core Components
 
 - **`manifold-core`**: the only crate allowed to contain slicing domain
-  logic. Structured as a pipeline:
-  `Mesh -> slicing::slice_mesh -> Layer[] -> toolpath::plan -> Path[] -> gcode::emit -> String`.
-  `toolpath::plan` itself retains a wall-loop-only RDP-style simplification
-  pass (`simplify_paths`/`simplify_path`) between contained-path retention
-  and Z-hop insertion, reducing point count on curved/dense contours
-  (e.g. from `Eikonal` order fields) before Z-hops and extrusion lengths
-  are computed.
-  `slice_mesh` builds a `manifold_fidget::mesh_sdf::MeshSdf` from the mesh
-  and walks a `manifold_fidget::order::OrderField`/
-  `manifold_fidget::contour::extract_contours_at_order` isosurface-walk to
-  produce each `Layer`'s cross-section loops — `manifold-core` depends on
-  `manifold-fidget` for this. Each stage is its own module so slicing,
-  toolpath planning, and Gcode emission can be developed/tested
-  independently. `slice_to_gcode()` in `lib.rs` wires the stages together
-  and is the primary entry point for both front-ends.
-- **`manifold-fidget`**: SDF/order-field/contour-extraction backend (not
-  slicing domain logic itself — a geometry-query library `manifold-core`
-  builds its pipeline on top of). Depended on by both `manifold-core` and
-  `manifold-gui`.
-- **`manifold-cli`**: thin wrapper — parses args with `clap`, builds a
-  `SlicerConfig`, calls `manifold_core::slice_to_gcode`, writes the result
-  to a file. No slicing logic lives here.
-- **`manifold-gui`**: `eframe`/`egui` desktop app (wgpu renderer). Currently
-  a scaffold (`ManifoldApp`); will grow to load meshes, preview toolpaths,
-  and invoke `manifold-core` interactively.
+  logic. Structured as a modular pipeline:
+  `Workspace -> slicing::slice_mesh -> Layer[] -> toolpath::plan -> Path[] -> gcode::emit -> String`.
+  - **Slicing**: Builds a `manifold_fidget::mesh_sdf::MeshSdf` and evaluates the
+    configured `OrderField` (Height, Conical, or bilateral conformal Eikonal).
+    Contour level-sets are extracted via `extract_contours_at_order` and
+    partitioned into outer walls, inner walls, solid exposures, and infill cavities.
+  - **Infill**: Generates 3D Cubic truss lattices, TPMS minimal surfaces
+    (Gyroid, Schwarz D, Schwarz P), boustrophedon monotonic scanlines, or concentric rings,
+    chained with serpentine turnaround bridges to minimize retractions.
+  - **Wave Overhangs (LaSO)**: Generates support-free horizontal and non-planar
+    overhang passes using Huygens wavefront diffraction, lateral seed anchoring,
+    and footprint masking.
+  - **Toolpath Planning**: Applies wall simplification (Ramer-Douglas-Peucker),
+    tangent flat nozzle slope clearance compensation, 3D trajectory slope cosine
+    volumetric compensation, support-aware move sorting, scarf joint seams,
+    perimeter wipes, and Z-hops.
+  - **Kinematics & G-code Emission**: Integrates stepper motor torque roll-off
+    ODEs, Klipper Square Corner Velocity (SCV) lookahead, per-axis velocity/accel
+    clamping, and dynamic 2-point non-Newtonian pressure advance.
+- **`manifold-fidget`**: SDF/order-field/contour-extraction backend. Provides
+  narrow-band 3D Fast Marching, bilateral upward-downward fixed-point conformal
+  iteration, NanoVDB volume grids, 3D DDA raymarching, and `wgpu` GPU compute
+  pipelines (`GpuEikonalRelaxation`, 3D TPMS infill compute).
+- **`manifold-cli`**: Thin CLI wrapper around `manifold_core::slice_to_gcode`
+  with multi-file `:tool_id` syntax, batch processing support, and profile loading.
+- **`manifold-gui`**: Hardware-accelerated `egui`/`wgpu` desktop application
+  featuring interactive 3D orbit/pan/zoom, object transform gizmos, 3D mesh
+  overlays (conformal seed regions, surface order gradients), 7 continuous data views
+  (Line Type, Speed, Actual Speed, Flow Rate, Acceleration, Actual Acceleration, Travel Durations),
+  interactive hover segment HUD, order scrubber, and an optional local MCP automation server.
 
 ## Data Flow
 
-1. Front-end (CLI or GUI) loads/obtains a `Mesh`.
-2. Front-end builds a `SlicerConfig` (layer height, nozzle diameter, ...).
-3. `manifold_core::slice_to_gcode(&mesh, &config)` runs the pipeline and
-   returns a Gcode `String`.
-4. CLI writes it to disk; GUI will render/preview it.
+1. Front-end (CLI or GUI) constructs a `Workspace` containing one or more `Object` meshes,
+   the printer's `Machine` definition (build volume, clearance profile, per-axis limits),
+   and `SlicerConfig`.
+2. `manifold_core::slice_to_gcode(&workspace)` runs the slicing pipeline:
+   - Slices meshes along order field isosurfaces into `Layer[]`.
+   - Plans perimeter walls, solid skins, TPMS/cubic infills, and wave overhangs.
+   - Computes kinematic velocity profiles and fluid dynamics retractions.
+   - Emits Klipper-compatible G-code with evaluated start/end macro placeholders.
+3. CLI writes G-code directly to disk; GUI renders interactive 3D ribbon toolpaths,
+   displays print statistics, and allows export.
 
-## External Integrations
+## Configuration & Persistence
 
-None yet. Anticipated future integrations: mesh file formats (STL/3MF)
-loaded inside `manifold-core::mesh`, and possibly direct printer
-communication (serial/OctoPrint) from a front-end crate — not from
-`manifold-core`.
+Configuration is bundled into a `Profile` (`manifold-gui::profile` / `docs/configuration/`):
+- `Machine`: Hardware envelope, tools, clearance profiles, stepper dynamics, and per-axis limits.
+- `SlicerConfig`: Layer heights, infill patterns, conformal Eikonal settings, wave overhangs, speeds, accelerations, and fluid parameters.
 
-## Configuration
-
-`SlicerConfig` (`manifold-core::lib`) is the single source of slicing
-parameters (`layer_height`, `nozzle_diameter`, ...). It derives
-`serde::Serialize`/`Deserialize` so it can be persisted as JSON/RON by a
-front-end. No environment variables are used yet.
+Profiles serialize cleanly to and from JSON (`profile.json`).
 
 ## Build & Deploy
 
-- Build: `cargo build --workspace` (add `--release` for optimized builds;
-  the release profile uses `lto = true`, `codegen-units = 1`).
+- Build: `cargo build --workspace` (add `--release` for production performance).
 - Test: `cargo test --workspace`.
 - Lint: `cargo clippy --workspace --all-targets`.
 - Format: `cargo fmt --all`.
-- No CI or packaging/deployment pipeline exists yet.
