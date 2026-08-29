@@ -124,6 +124,10 @@ pub struct SlicerConfig {
     /// `order_field::OrderFieldKind`. Defaults to `Height`, i.e. today's
     /// exact flat planar slicing along `slicing::BUILD_DIRECTION`.
     pub order_field: order_field::OrderFieldKind,
+    /// Weight factor `w` in `[0.0, 3.0]` for surface order weighted averaging
+    /// `(w * T_surf + T_vol) / (w + 1.0)`. Defaults to `1.0`.
+    #[serde(default)]
+    pub eikonal_surface_order_weight: Option<f64>,
     /// Whether the `Eikonal` order field blends with the top surface to make
     /// layers lie parallel to top surfaces and follow upper curvature.
     /// Defaults to `false`.
@@ -491,6 +495,7 @@ impl Default for SlicerConfig {
             top_layers: 3,
             bottom_layers: 3,
             order_field: order_field::OrderFieldKind::default(),
+            eikonal_surface_order_weight: None,
             eikonal_conform_top_surfaces: false,
             eikonal_conform_bottom_surfaces: false,
             eikonal_conformal_max_angle_deg: None,
@@ -728,6 +733,15 @@ impl SlicerConfig {
     #[must_use]
     pub fn fan_layer_delay(&self) -> u32 {
         self.fan_layer_delay.unwrap_or(1)
+    }
+
+    /// Weight factor `w` for surface order weighted averaging.
+    /// Defaults to `1.0`.
+    #[must_use]
+    pub fn eikonal_surface_order_weight(&self) -> f64 {
+        self.eikonal_surface_order_weight
+            .unwrap_or(1.0)
+            .clamp(0.0, 10.0)
     }
 
     /// Detach angle (degrees from horizontal) for conformal top surface tracking.

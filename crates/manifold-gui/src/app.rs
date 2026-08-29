@@ -1152,6 +1152,20 @@ impl ManifoldApp {
             );
         }
         if self.config.order_field == OrderFieldKind::Eikonal {
+            let mut surface_weight = self.config.eikonal_surface_order_weight();
+            if ui
+                .add(
+                    egui::Slider::new(&mut surface_weight, 0.0..=2.0)
+                        .text("Surface order weight")
+                        .step_by(0.05),
+                )
+                .on_hover_text(
+                    "Weight multiplier (0.0 to 2.0) for the geodesic SurfaceEikonal lower bound on the model skin. 1.0 enforces the exact surface arrival time to eliminate surface local minima; 0.0 disables it.",
+                )
+                .changed()
+            {
+                self.config.eikonal_surface_order_weight = Some(surface_weight);
+            }
             ui.checkbox(
                 &mut self.config.eikonal_conform_top_surfaces,
                 "Conform to top surfaces",
@@ -1862,6 +1876,8 @@ impl ManifoldApp {
         if self.mesh_overlay_mode != MeshOverlayMode::None
             && (self.config.layer_height != config_before.layer_height
                 || self.config.nozzle_diameter != config_before.nozzle_diameter
+                || self.config.eikonal_surface_order_weight
+                    != config_before.eikonal_surface_order_weight
                 || self.config.eikonal_conform_top_surfaces
                     != config_before.eikonal_conform_top_surfaces
                 || self.config.eikonal_conformal_max_angle_deg

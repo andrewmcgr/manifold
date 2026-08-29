@@ -297,12 +297,16 @@ fn eikonal_field_for(
             .is_some_and(|s| s.sample(p).value.abs() <= cell_size)
     };
 
-    let surface_times = manifold_fidget::surface_eikonal::solve_surface_eikonal(
-        &mesh.vertices,
-        &faces,
-        is_seed_region,
-    );
+    let surface_weight = config.eikonal_surface_order_weight();
+    let surface_times = (surface_weight > 0.0).then(|| {
+        manifold_fidget::surface_eikonal::solve_surface_eikonal(
+            &mesh.vertices,
+            &faces,
+            is_seed_region,
+        )
+    });
     let surface_min_order = |p: DVec3| -> Option<f64> {
+        let surface_times = surface_times.as_ref()?;
         let sample = sdf.sample(p);
         if sample.value.abs() <= skin_depth {
             if let Some((face_idx, closest, _)) = sdf.nearest(p) {
@@ -318,7 +322,7 @@ fn eikonal_field_for(
                         closest,
                     );
                     if t.is_finite() {
-                        return Some(t);
+                        return Some(t * surface_weight);
                     }
                 }
             }
@@ -338,7 +342,8 @@ fn eikonal_field_for(
         bottom_detach_angle_deg: bottom_detach_deg,
         detach_feather_mm: 2.0 * config.wall_line_width,
         target_lipschitz_constant: 1.0,
-        surface_min_order: Some(&surface_min_order as &(dyn Fn(DVec3) -> Option<f64> + Sync)),
+        surface_min_order: (surface_weight > 0.0)
+            .then_some(&surface_min_order as &(dyn Fn(DVec3) -> Option<f64> + Sync)),
     };
     let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
     EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
