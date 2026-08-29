@@ -36,7 +36,7 @@ Unlike planar slicers that slice models with flat horizontal planes ($Z = k \cdo
 
 To eliminate interior local minima near curved skins, Manifold precomputes a **Surface Eikonal** arrival grid $\Phi_{\text{surface}}$ across the triangle boundary in parallel using Rayon. During 3D volume propagation, this surface arrival time is applied as a lower bound via a $C^2$-continuous smooth-max function:
 
-$$\Phi_{\text{effective}} = \text{smooth\_max}\left(\Phi_{\text{bulk}}, w \cdot \Phi_{\text{surface}}, r_{\text{smooth}}\right)$$
+$$\Phi_{\text{effective}} = \operatorname{smooth-max}\left(\Phi_{\text{bulk}}, w \cdot \Phi_{\text{surface}}, r_{\text{smooth}}\right)$$
 
 with smoothing radius $r_{\text{smooth}} = 2\sqrt{2} \cdot h_{\text{grid}}$, guaranteeing $C^2$ smoothness and eliminating sharp derivative creases.
 

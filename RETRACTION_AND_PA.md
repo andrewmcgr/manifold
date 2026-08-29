@@ -42,7 +42,7 @@ The dynamic time constant scaling of the system updates continuously using the t
 
 \[\tau_{\text{ooze}} = \tau_{\text{ref}} \cdot e^{-k_{\tau} \cdot \Delta T}\]
 
-\[L_{\text{max}} = L_{\text{max\_ref}} \cdot (1 + k_{L} \cdot \Delta T)\]
+\[L_{\text{max}} = L_{\text{max,ref}} \cdot (1 + k_{L} \cdot \Delta T)\]
 
 *   \(k_{PA} \approx 0.02\text{/}^\circ\text{C}\), \(k_{\tau} \approx 0.03\text{/}^\circ\text{C}\), \(k_{L} \approx 0.02\text{/}^\circ\text{C}\) (Standard polymer flow sensitivity empirical values).
 
@@ -51,7 +51,7 @@ Retraction length represents the discrete boundary constraint of the continuous 
 
 \[L_{\text{residual}} = (C_{PA\_dynamic} \cdot v_{\text{end}}) + L_{\text{static}}\]
 
-\[L_{\text{extra\_prime}} = L_{\text{max}} \cdot \left(1 - e^{-\frac{t_{\text{travel}}}{\tau_{\text{ooze}}}}\right)\]
+\[L_{\text{extra,prime}} = L_{\text{max}} \cdot \left(1 - e^{-\frac{t_{\text{travel}}}{\tau_{\text{ooze}}}}\right)\]
 
 *   \(v_{\text{end}}\): The toolhead junction velocity exiting the previous print path.
 *   \(L_{\text{static}}\): A tiny mechanical constant (0.1mm to 0.3mm) used to break molten plastic surface tension at the nozzle tip.
