@@ -314,7 +314,7 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
     // in `extract_order_contours_on_mesh`) create false degree-3+ vertices that
     // cause loop-tracing to self-intersect or terminate prematurely.
     let mut seen = HashSet::new();
-    let segments: Vec<(DVec3, DVec3)> = segments
+    let mut segments: Vec<(DVec3, DVec3)> = segments
         .into_iter()
         .filter(|&(a, b)| {
             let ka = point_key(a);
@@ -326,6 +326,45 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
             seen.insert(seg_key)
         })
         .collect();
+
+    // Prune dangling degree-1 endpoints (open-ended hair/spurs with no exact or
+    // repair-tolerance partner): any segment with an unpartnered endpoint cannot belong
+    // to a closed cycle, and walking into a dangling spur causes loop-stitching to fail
+    // to close and falsely mark entire valid cycles as dead starts.
+    loop {
+        let mut by_point: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+        for (i, &(a, b)) in segments.iter().enumerate() {
+            by_point.entry(point_key(a)).or_default().push(i);
+            by_point.entry(point_key(b)).or_default().push(i);
+        }
+        let before_len = segments.len();
+        let has_partner = |idx: usize, pt: DVec3, segs: &[(DVec3, DVec3)]| -> bool {
+            if let Some(cand) = by_point.get(&point_key(pt)) {
+                if cand.iter().any(|&i| i != idx) {
+                    return true;
+                }
+            }
+            segs.iter().enumerate().any(|(i, &(a, b))| {
+                i != idx
+                    && (a.distance(pt) <= STITCH_REPAIR_TOLERANCE
+                        || b.distance(pt) <= STITCH_REPAIR_TOLERANCE)
+            })
+        };
+        let keep_mask: Vec<bool> = segments
+            .iter()
+            .enumerate()
+            .map(|(i, &(a, b))| has_partner(i, a, &segments) && has_partner(i, b, &segments))
+            .collect();
+        let mut idx = 0;
+        segments.retain(|_| {
+            let keep = keep_mask[idx];
+            idx += 1;
+            keep
+        });
+        if segments.len() == before_len {
+            break;
+        }
+    }
 
     // Map from a (quantized) endpoint key to the indices of segments
     // touching that point (a segment appears under both of its endpoints'

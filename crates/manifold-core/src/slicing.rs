@@ -456,7 +456,7 @@ pub fn slice_mesh_with_progress(
         .collect();
     let sdf = Arc::new(MeshSdf::new(mesh.vertices.clone(), faces.clone()));
 
-    let non_bed_faces: Vec<[usize; 3]> = mesh
+    let non_cap_faces: Vec<[usize; 3]> = mesh
         .indices
         .chunks_exact(3)
         .filter_map(|chunk| {
@@ -465,12 +465,18 @@ pub fn slice_mesh_with_progress(
             let v1 = mesh.vertices[i1];
             let v2 = mesh.vertices[i2];
             // Downward-facing triangles sitting directly on the bed plane (min.z)
-            // represent the contact floor. Excluding them from the side-wall SDF
-            // prevents 3D Euclidean distance from treating the print bed as an obstacle
-            // that pushes walls upward/inward vertically on near-bed layers.
+            // or upward-facing triangles sitting on the top ceiling (max.z)
+            // represent the outer bottom/top caps. Excluding them from the side-wall SDF
+            // prevents 3D Euclidean distance from treating the print bed or top cap as obstacles
+            // that push walls upward/inward vertically on near-bed and near-top layers.
             if v0.z <= min.z + 1e-4 && v1.z <= min.z + 1e-4 && v2.z <= min.z + 1e-4 {
                 let normal = (v1 - v0).cross(v2 - v0);
                 if normal.z <= 0.0 {
+                    return None;
+                }
+            } else if v0.z >= max.z - 1e-4 && v1.z >= max.z - 1e-4 && v2.z >= max.z - 1e-4 {
+                let normal = (v1 - v0).cross(v2 - v0);
+                if normal.z >= 0.0 {
                     return None;
                 }
             }
@@ -478,13 +484,13 @@ pub fn slice_mesh_with_progress(
         })
         .collect();
 
-    let side_sdf = if non_bed_faces.len() == faces.len() {
+    let side_sdf = if non_cap_faces.len() == faces.len() {
         Arc::clone(&sdf)
     } else {
         Arc::new(MeshSdf::new_with_distance_faces(
             mesh.vertices.clone(),
             faces.clone(),
-            non_bed_faces,
+            non_cap_faces,
         ))
     };
 
@@ -503,6 +509,8 @@ pub fn slice_mesh_with_progress(
         Some(&*sdf),
     ));
     on_progress(0.04);
+    let is_height = matches!(config.order_field, order_field::OrderFieldKind::Height);
+
     // `order_range_over_bbox` samples 27 points on the mesh's axis-aligned
     // bounding box (corners, edge midpoints, face center). That's exact for
     // affine fields (`HeightOrderField`, `ConicalOrderField`) whose extrema
@@ -526,10 +534,14 @@ pub fn slice_mesh_with_progress(
             }
         }
         if vlo.is_finite() && vhi.is_finite() {
-            let (lo, hi) = order_range_over_bbox(&*field, min, max);
-            let min_val = if lo.is_finite() { vlo.min(lo) } else { vlo };
-            let max_val = if hi.is_finite() { vhi.max(hi) } else { vhi };
-            (min_val, max_val)
+            if is_height {
+                let (lo, hi) = order_range_over_bbox(&*field, min, max);
+                let min_val = if lo.is_finite() { vlo.min(lo) } else { vlo };
+                let max_val = if hi.is_finite() { vhi.max(hi) } else { vhi };
+                (min_val, max_val)
+            } else {
+                (vlo, vhi)
+            }
         } else {
             let (lo, hi) = order_range_over_bbox(&*field, min, max);
             if lo.is_finite() && hi.is_finite() {
@@ -608,8 +620,6 @@ pub fn slice_mesh_with_progress(
     // fast path unchanged; anything else (e.g. `Conical`) uses the
     // generalized "contour-on-mesh" path, which extracts each wall pass's
     // isosurface once (not once per layer) and walks it per layer.
-    let is_height = matches!(config.order_field, order_field::OrderFieldKind::Height);
-
     let (outer_wall_mesh, outer_wall_mesh_orders): (Vec<DVec3>, Vec<f64>) = if is_height {
         (Vec::new(), Vec::new())
     } else {
@@ -653,7 +663,8 @@ pub fn slice_mesh_with_progress(
                     // wall steps another `wall_line_width` inward.
                     let iso = -(config.wall_offset + wall_index as f64 * config.wall_line_width);
                     let wall_loops = extract_contours(
-                        &*sdf, origin, basis1, basis2, extent, extent, resolution, resolution, iso,
+                        &*side_sdf, origin, basis1, basis2, extent, extent, resolution, resolution,
+                        iso,
                     );
                     loops.extend(wall_loops.into_iter().map(|points| {
                         let arc_fraction = compute_arc_fractions(&points);
@@ -843,7 +854,7 @@ pub fn slice_mesh_with_progress(
                 loops,
                 infill_boundary,
                 solid_fill_boundary: Vec::new(),
-                mesh_sdf: Some(Arc::clone(&sdf)),
+                mesh_sdf: Some(Arc::clone(&side_sdf)),
                 order_field: Arc::clone(&field),
             }
         })
@@ -3101,6 +3112,26 @@ mod tests {
         for layer in &layers[0..3] {
             assert_eq!(layer.loops.len(), 1, "expected exactly one contour loop");
             assert!(!layer.loops[0].points.is_empty());
+        }
+    }
+
+    #[test]
+    fn slice_mesh_height_mode_has_no_missing_layers_near_bed_or_top() {
+        let mesh = cube_mesh();
+        let config = SlicerConfig {
+            layer_height: 0.14,
+            wall_offset: 0.2,
+            ..SlicerConfig::default()
+        };
+        let layers = slice_mesh(&mesh, &config).unwrap();
+        assert!(!layers.is_empty());
+        for (i, layer) in layers.iter().enumerate() {
+            assert!(
+                !layer.loops.is_empty(),
+                "layer {} at order {} unexpectedly has no contour loops",
+                i,
+                layer.order
+            );
         }
     }
 

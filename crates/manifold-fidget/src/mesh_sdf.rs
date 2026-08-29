@@ -56,6 +56,9 @@ pub enum SignMethod {
 /// to the nearest triangle (via a [`TriangleBvh`]), signed by `sign_method`.
 pub struct MeshSdf {
     bvh: TriangleBvh,
+    /// Optional BVH of the watertight mesh when `bvh` is built from a subset of faces
+    /// (e.g. `distance_faces` excluding horizontal caps). Used for fast O(log N) ray-parity checks.
+    watertight_bvh: Option<TriangleBvh>,
     /// Flat face normal per triangle, same indexing as the BVH's
     /// (originally-supplied) triangle order. Used for face- and
     /// edge-Voronoi-region queries (see the simplification note on
@@ -129,6 +132,7 @@ impl MeshSdf {
 
         MeshSdf {
             bvh,
+            watertight_bvh: None,
             face_normals,
             face_vertex_indices: faces.clone(),
             watertight_face_vertex_indices: faces,
@@ -174,8 +178,19 @@ impl MeshSdf {
 
         let bvh = TriangleBvh::build(triangles);
 
+        let watertight_bvh = if distance_faces.len() == watertight_faces.len() {
+            None
+        } else {
+            let watertight_triangles: Vec<Triangle> = watertight_faces
+                .iter()
+                .map(|f| Triangle::new(vertices[f[0]], vertices[f[1]], vertices[f[2]]))
+                .collect();
+            Some(TriangleBvh::build(watertight_triangles))
+        };
+
         MeshSdf {
             bvh,
+            watertight_bvh,
             face_normals,
             face_vertex_indices: distance_faces,
             watertight_face_vertex_indices: watertight_faces,
@@ -408,50 +423,15 @@ impl MeshSdf {
         }
     }
 
-    /// When that happens (see `AMBIGUOUS_COS_THRESHOLD`), fall back to
-    /// [`MeshSdf::winding_number_sign`], the generalized winding number (an
-    /// O(triangles) exact solid-angle sum, see [`SignMethod::WindingNumber`]'s
-    /// doc comment) — unlike the previous nearest-tied-feature heuristic
-    /// (`sign_via_tie_break`, removed), this has no notion of "which
-    /// feature is closest" to get wrong: it is a well-defined function of
-    /// every triangle in the mesh and the query point alone, so it cannot
-    /// be fooled by two near-tied, non-adjacent features disagreeing on
-    /// sign.
-    ///
-    /// `AMBIGUOUS_COS_THRESHOLD` is deliberately high (not just "clearly
-    /// nonzero"): confirmed on a real mesh (Voron_Design_Cube_v7.stl) that
-    /// a chosen feature's own alignment can look locally "decisive" (e.g.
-    /// `cos_angle ~= 0.35`) while still being the *wrong* feature, because
-    /// an entirely different, non-adjacent part of the surface happens to
-    /// be at a near-tied distance (differing only by float noise) and
-    /// gives the opposite sign. The chosen feature's own dot product
-    /// can't detect that kind of competing tie by construction -- it only
-    /// measures alignment with the feature the BVH happened to hand back,
-    /// not whether some unrelated feature is equally close. Erring toward
-    /// the (correct, if rarer) winding-number fallback is worth the extra
-    /// cost: this safety net feeds `retain_contained_paths`, and a wrong
-    /// sign here silently drops otherwise-valid wall/infill paths
-    /// wholesale.
-    fn sign_at(&self, face_idx: usize, closest: DVec3, p: DVec3) -> f64 {
+    fn sign_at(&self, _face_idx: usize, closest: DVec3, p: DVec3) -> f64 {
         match self.sign_method {
             SignMethod::Pseudonormal => {
-                let normal = self.feature_normal(face_idx, closest);
                 let diff = p - closest;
                 let dist = diff.length();
                 if dist <= DEGENERATE_EPSILON.sqrt() {
                     // On the surface: sign is immaterial since value ~= 0
                     // either way, default to positive (outside).
                     return 1.0;
-                }
-
-                // `normal` is expected to be unit-length (or zero, handled
-                // by `feature_normal`'s degenerate fallbacks), so this is
-                // cos(angle between diff and normal).
-                let cos_angle = diff.dot(normal) / dist;
-
-                const AMBIGUOUS_COS_THRESHOLD: f64 = 0.15;
-                if cos_angle.abs() >= AMBIGUOUS_COS_THRESHOLD {
-                    return if cos_angle < 0.0 { -1.0 } else { 1.0 };
                 }
 
                 self.fast_parity_sign(p)
@@ -462,15 +442,16 @@ impl MeshSdf {
 
     /// Fast BVH-accelerated multi-ray parity sign check: casts rays along 3 slightly
     /// non-axis-aligned directions through the BVH in $O(\log N)$ time, using majority vote.
-    fn fast_parity_sign(&self, p: DVec3) -> f64 {
+    pub fn fast_parity_sign(&self, p: DVec3) -> f64 {
         const DIRS: [DVec3; 3] = [
             DVec3::new(1.0, 0.0173, 0.0091),
             DVec3::new(0.0091, 1.0, 0.0173),
             DVec3::new(0.0173, 0.0091, 1.0),
         ];
+        let bvh = self.watertight_bvh.as_ref().unwrap_or(&self.bvh);
         let mut inside_votes = 0;
         for dir in DIRS {
-            if self.bvh.ray_crossings(p, dir) % 2 == 1 {
+            if bvh.ray_crossings(p, dir) % 2 == 1 {
                 inside_votes += 1;
             }
         }
