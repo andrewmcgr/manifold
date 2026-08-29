@@ -1212,6 +1212,13 @@ impl ManifoldApp {
                     self.config.eikonal_conformal_skin_depth_mm = Some(skin_depth);
                 }
             }
+            ui.checkbox(
+                &mut self.config.eikonal_enforce_monotonic_growth,
+                "Enforce vertical monotonicity",
+            )
+            .on_hover_text(
+                "Enforces strictly increasing layer order along vertical columns (dOrder/dz >= 0.15) to prevent downward stalls or mid-air floating loops.",
+            );
             ui.collapsing("Toolhead clearance profile (XZ)", |ui| {
                 ui.label("Radial distance (X) and height (Z) from nozzle tip");
                 let mut remove_index: Option<usize> = None;
@@ -1878,6 +1885,8 @@ impl ManifoldApp {
                 || self.config.nozzle_diameter != config_before.nozzle_diameter
                 || self.config.eikonal_surface_order_weight
                     != config_before.eikonal_surface_order_weight
+                || self.config.eikonal_enforce_monotonic_growth
+                    != config_before.eikonal_enforce_monotonic_growth
                 || self.config.eikonal_conform_top_surfaces
                     != config_before.eikonal_conform_top_surfaces
                 || self.config.eikonal_conformal_max_angle_deg

@@ -344,6 +344,7 @@ fn eikonal_field_for(
         target_lipschitz_constant: 1.0,
         surface_min_order: (surface_weight > 0.0)
             .then_some(&surface_min_order as &(dyn Fn(DVec3) -> Option<f64> + Sync)),
+        enforce_monotonic_growth: config.eikonal_enforce_monotonic_growth,
     };
     let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
     EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(

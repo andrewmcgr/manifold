@@ -133,6 +133,10 @@ pub struct SlicerConfig {
     /// Defaults to `false`.
     #[serde(default)]
     pub eikonal_conform_top_surfaces: bool,
+    /// Whether to enforce vertical column monotonicity (minimum growth per unit height)
+    /// in the Eikonal order field relaxation. Defaults to `true`.
+    #[serde(default = "default_eikonal_enforce_monotonic_growth")]
+    pub eikonal_enforce_monotonic_growth: bool,
     /// Whether the `Eikonal` order field conforms to downward-facing
     /// (bottom/overhang) exterior surfaces, excluding the bed contact
     /// region, so near-underside layers run parallel to the underside
@@ -405,6 +409,11 @@ pub struct SlicerConfig {
     pub fluid_dynamics: Option<fluid_dynamics::FluidDynamicsConfig>,
 }
 
+/// Static serde-deserialize fallback for [`SlicerConfig::eikonal_enforce_monotonic_growth`]: `true`.
+fn default_eikonal_enforce_monotonic_growth() -> bool {
+    true
+}
+
 /// Static serde-deserialize fallback for [`SlicerConfig::wave_overhangs_enabled`]: `true`.
 fn default_wave_overhangs_enabled() -> bool {
     true
@@ -497,6 +506,7 @@ impl Default for SlicerConfig {
             order_field: order_field::OrderFieldKind::default(),
             eikonal_surface_order_weight: None,
             eikonal_conform_top_surfaces: false,
+            eikonal_enforce_monotonic_growth: true,
             eikonal_conform_bottom_surfaces: false,
             eikonal_conformal_max_angle_deg: None,
             eikonal_conformal_bottom_max_angle_deg: None,

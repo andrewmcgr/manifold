@@ -101,6 +101,9 @@ pub struct ConformalSurfaceOptions<'a> {
     /// Clamps $T(p) \ge T_{\text{surf}}(p)$ to eliminate surface local minima and
     /// guarantee monotonic progression along the exterior skin of the model.
     pub surface_min_order: Option<&'a (dyn Fn(DVec3) -> Option<f64> + Sync)>,
+    /// Whether to enforce vertical column monotonicity (minimum growth per unit height).
+    /// Defaults to `true`.
+    pub enforce_monotonic_growth: bool,
 }
 
 impl EikonalOrderField {
@@ -1504,7 +1507,9 @@ impl EikonalOrderField {
             }
 
             // 5. Monotonic column growth
-            self.enforce_min_column_growth(occupied, false);
+            if options.enforce_monotonic_growth {
+                self.enforce_min_column_growth(occupied, false);
+            }
 
             // 6. Convergence check
             let max_diff = self
@@ -2222,6 +2227,7 @@ mod tests {
             detach_feather_mm: 0.0,
             target_lipschitz_constant: 1.0,
             surface_min_order: None,
+            enforce_monotonic_growth: true,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2298,6 +2304,7 @@ mod tests {
             detach_feather_mm: 0.0,
             target_lipschitz_constant: 1.0,
             surface_min_order: None,
+            enforce_monotonic_growth: true,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2358,6 +2365,7 @@ mod tests {
             detach_feather_mm: 0.0,
             target_lipschitz_constant: 1.0,
             surface_min_order: None,
+            enforce_monotonic_growth: true,
         };
         let conformal =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2412,6 +2420,7 @@ mod tests {
             detach_feather_mm: 0.0,
             target_lipschitz_constant: 1.0,
             surface_min_order: None,
+            enforce_monotonic_growth: true,
         };
         let field =
             EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
@@ -2901,6 +2910,7 @@ mod tests {
             detach_feather_mm: 0.0,
             target_lipschitz_constant: 1.0,
             surface_min_order: None,
+            enforce_monotonic_growth: true,
         };
         let profile = SlopeProfile::from_angle(45.0);
         let field =
