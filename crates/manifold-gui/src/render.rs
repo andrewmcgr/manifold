@@ -61,7 +61,12 @@ impl UploadedMesh {
         object_transform: &manifold_core::transform::Transform,
         conformal_overlay: Option<&manifold_core::SlicerConfig>,
     ) -> Self {
-        let min_z = mesh.bounding_box().map(|(min, _)| min.z).unwrap_or(0.0);
+        let min_z = mesh
+            .vertices
+            .iter()
+            .map(|v| object_transform.transform_point(*v).z)
+            .fold(f64::INFINITY, f64::min);
+        let min_z = if min_z.is_finite() { min_z } else { 0.0 };
         let seed_tolerance = conformal_overlay
             .map(|c| c.layer_height.min(c.nozzle_diameter) / 8.0)
             .unwrap_or(0.1);
@@ -84,31 +89,39 @@ impl UploadedMesh {
                         [0.2, 0.85, 0.3, 1.0]
                     } else if normal.z > 1e-3 {
                         // Upward-facing
-                        let beta_deg = normal.z.clamp(-1.0, 1.0).acos().to_degrees();
-                        let top_detach = config.eikonal_conformal_max_angle_deg();
-                        if beta_deg <= top_detach - 5.0 {
-                            // Top Conforming: Cyan
-                            [0.15, 0.65, 0.95, 1.0]
-                        } else if beta_deg <= top_detach {
-                            // Top Transition Band: Purple
-                            [0.6, 0.35, 0.9, 1.0]
-                        } else {
-                            // Steep/Detached: Default Slate Gray
+                        if !config.eikonal_conform_top_surfaces {
                             [0.65, 0.68, 0.72, 1.0]
+                        } else {
+                            let beta_deg = normal.z.clamp(-1.0, 1.0).acos().to_degrees();
+                            let top_detach = config.eikonal_conformal_max_angle_deg();
+                            if beta_deg <= top_detach - 5.0 {
+                                // Top Conforming: Cyan
+                                [0.15, 0.65, 0.95, 1.0]
+                            } else if beta_deg <= top_detach {
+                                // Top Transition Band: Purple
+                                [0.6, 0.35, 0.9, 1.0]
+                            } else {
+                                // Steep/Detached: Default Slate Gray
+                                [0.65, 0.68, 0.72, 1.0]
+                            }
                         }
                     } else if normal.z < -1e-3 {
                         // Downward-facing
-                        let beta_deg = (-normal.z).clamp(-1.0, 1.0).acos().to_degrees();
-                        let bottom_detach = config.eikonal_conformal_bottom_max_angle_deg();
-                        if beta_deg <= bottom_detach - 5.0 {
-                            // Bottom Conforming: Orange
-                            [0.95, 0.55, 0.1, 1.0]
-                        } else if beta_deg <= bottom_detach {
-                            // Bottom Transition Band: Gold/Yellow
-                            [0.95, 0.75, 0.2, 1.0]
-                        } else {
-                            // Steep/Detached: Default Slate Gray
+                        if !config.eikonal_conform_bottom_surfaces {
                             [0.65, 0.68, 0.72, 1.0]
+                        } else {
+                            let beta_deg = (-normal.z).clamp(-1.0, 1.0).acos().to_degrees();
+                            let bottom_detach = config.eikonal_conformal_bottom_max_angle_deg();
+                            if beta_deg <= bottom_detach - 5.0 {
+                                // Bottom Conforming: Orange
+                                [0.95, 0.55, 0.1, 1.0]
+                            } else if beta_deg <= bottom_detach {
+                                // Bottom Transition Band: Gold/Yellow
+                                [0.95, 0.75, 0.2, 1.0]
+                            } else {
+                                // Steep/Detached: Default Slate Gray
+                                [0.65, 0.68, 0.72, 1.0]
+                            }
                         }
                     } else {
                         // Vertical walls
