@@ -156,7 +156,7 @@ fn insert_z_hops(paths: Vec<Path>, config: &SlicerConfig) -> Vec<Path> {
         return paths;
     }
     paths
-        .into_iter()
+        .into_par_iter()
         .map(|path| insert_z_hops_into_path(path, config.z_hop_height))
         .collect()
 }
@@ -1010,55 +1010,79 @@ fn route_travel_moves(
         .max(f64::EPSILON)
         / 2.0;
 
-    let mut routed: Vec<Path> = Vec::with_capacity(paths.len());
-    let mut iter = paths.into_iter().peekable();
-    while let Some(path) = iter.next() {
-        let end = path.points.last().copied();
-        let tool = path.tool;
-        routed.push(path);
+    let pairs: Vec<(usize, DVec3, DVec3, crate::ids::ToolId, f64)> = (0..paths.len() - 1)
+        .filter_map(|i| {
+            let a = paths[i].points.last().copied()?;
+            let b = paths[i + 1].points.first().copied()?;
+            if a.distance(b) <= f64::EPSILON {
+                return None;
+            }
+            let tool = paths[i].tool;
+            let order = paths[i].segments.first().map(|s| s.order).unwrap_or(0.0);
+            Some((i, a, b, tool, order))
+        })
+        .collect();
 
-        let (Some(a), Some(next)) = (end, iter.peek()) else {
-            continue;
-        };
-        let Some(&b) = next.points.first() else {
-            continue;
-        };
-        if a.distance(b) <= f64::EPSILON {
-            continue;
+    if pairs.is_empty() {
+        return paths;
+    }
+
+    let z_penalty = config.z_travel_penalty;
+    let detours: Vec<(usize, Path)> = pairs
+        .into_par_iter()
+        .filter_map(|(i, a, b, tool, order)| {
+            if !travel_chord_is_blocked(mesh_sdf, a, b, clearance) {
+                return None;
+            }
+            let waypoints = route_around_obstruction(
+                mesh_sdf,
+                slope_profile,
+                a,
+                b,
+                cell_size,
+                z_penalty,
+                clearance,
+            )?;
+            if waypoints.len() < 2 {
+                return None;
+            }
+            let segment_count = waypoints.len() - 1;
+            let segments = (0..segment_count)
+                .map(|_| Segment {
+                    kind: MoveKind::Travel,
+                    speed: speed_for_kind(MoveKind::Travel, config),
+                    extrusion_rate: 0.0,
+                    support_fraction: 0.0,
+                    order,
+                    extrusion_length: 0.0,
+                })
+                .collect();
+            Some((
+                i,
+                Path {
+                    points: waypoints,
+                    segments,
+                    tool,
+                },
+            ))
+        })
+        .collect();
+
+    if detours.is_empty() {
+        return paths;
+    }
+
+    let mut detour_map = std::collections::HashMap::with_capacity(detours.len());
+    for (i, detour) in detours {
+        detour_map.insert(i, detour);
+    }
+
+    let mut routed = Vec::with_capacity(paths.len() + detour_map.len());
+    for (i, path) in paths.into_iter().enumerate() {
+        routed.push(path);
+        if let Some(detour) = detour_map.remove(&i) {
+            routed.push(detour);
         }
-        if !travel_chord_is_blocked(mesh_sdf, a, b, clearance) {
-            continue;
-        }
-        let Some(waypoints) = route_around_obstruction(
-            mesh_sdf,
-            slope_profile,
-            a,
-            b,
-            cell_size,
-            config.z_travel_penalty,
-            clearance,
-        ) else {
-            continue;
-        };
-        if waypoints.len() < 2 {
-            continue;
-        }
-        let segment_count = waypoints.len() - 1;
-        let segments = (0..segment_count)
-            .map(|_| Segment {
-                kind: MoveKind::Travel,
-                speed: speed_for_kind(MoveKind::Travel, config),
-                extrusion_rate: 0.0,
-                support_fraction: 0.0,
-                order: 0.0,
-                extrusion_length: 0.0,
-            })
-            .collect();
-        routed.push(Path {
-            points: waypoints,
-            segments,
-            tool,
-        });
     }
 
     routed
@@ -1834,7 +1858,7 @@ pub fn plan_with_progress(
 
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if let Ok(mut on_progress) = on_progress.lock() {
-                on_progress(done as f64 / total_layers);
+                on_progress((done as f64 / total_layers) * 0.9);
             }
 
             Ok(paths)
@@ -1845,6 +1869,10 @@ pub fn plan_with_progress(
     let global_mesh_sdf = layers.iter().find_map(|l| l.mesh_sdf.as_deref());
     let all_paths = route_travel_moves(all_paths, global_mesh_sdf, slope_profile, config);
     let all_paths = insert_z_hops(all_paths, config);
+
+    if let Ok(mut on_progress) = on_progress.lock() {
+        on_progress(1.0);
+    }
 
     Ok(all_paths)
 }
