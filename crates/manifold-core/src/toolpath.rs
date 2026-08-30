@@ -708,6 +708,7 @@ fn route_around_obstruction(
     let start_normal = start_sample.gradient.try_normalize();
     let start_clear = if let Some(n) = start_normal {
         let p = start + n * clearance;
+        let p = DVec3::new(p.x, p.y, p.z.max(0.0));
         if mesh_sdf.sample(p).value >= start_sample.value {
             p
         } else {
@@ -721,6 +722,7 @@ fn route_around_obstruction(
     let end_normal = end_sample.gradient.try_normalize();
     let end_clear = if let Some(n) = end_normal {
         let p = end + n * clearance;
+        let p = DVec3::new(p.x, p.y, p.z.max(0.0));
         if mesh_sdf.sample(p).value >= end_sample.value {
             p
         } else {
@@ -739,11 +741,10 @@ fn route_around_obstruction(
     // Never allow the search grid to extend below the print bed (Z < 0): a
     // physical 3D printer head cannot dive under the build plate to avoid an
     // obstacle.
-    let min_z_floor = 0.0f64.min(start.z).min(end.z);
     let min = DVec3::new(
         start.x.min(end.x).min(search_start.x).min(search_end.x) - margin,
         start.y.min(end.y).min(search_start.y).min(search_end.y) - margin,
-        (start.z.min(end.z).min(search_start.z).min(search_end.z) - margin).max(min_z_floor),
+        (start.z.min(end.z).min(search_start.z).min(search_end.z) - margin).max(0.0),
     );
     let max = DVec3::new(
         start.x.max(end.x).max(search_start.x).max(search_end.x) + margin,
@@ -960,6 +961,10 @@ fn route_around_obstruction(
         .is_none_or(|last| last.distance(end) > 1e-4)
     {
         waypoints.push(end);
+    }
+
+    for pt in &mut waypoints {
+        pt.z = pt.z.max(0.0);
     }
 
     Some(waypoints)
@@ -1868,7 +1873,17 @@ pub fn plan_with_progress(
     let all_paths = defer_unsupported_paths(per_layer, layers, config);
     let global_mesh_sdf = layers.iter().find_map(|l| l.mesh_sdf.as_deref());
     let all_paths = route_travel_moves(all_paths, global_mesh_sdf, slope_profile, config);
-    let all_paths = insert_z_hops(all_paths, config);
+    let mut all_paths = insert_z_hops(all_paths, config);
+
+    // Ensure no planned points dip below the build bed floor (Z = 0.0)
+    for path in &mut all_paths {
+        for pt in &mut path.points {
+            let p_z = pt.dot(crate::slicing::BUILD_DIRECTION);
+            if p_z < 0.0 {
+                *pt += crate::slicing::BUILD_DIRECTION * (-p_z);
+            }
+        }
+    }
 
     if let Ok(mut on_progress) = on_progress.lock() {
         on_progress(1.0);
@@ -3573,6 +3588,33 @@ mod tests {
         let clearance = 2.0 * config.wall_line_width;
         for pair in detour.points.windows(2) {
             assert!(!travel_chord_is_blocked(&sdf, pair[0], pair[1], clearance));
+        }
+    }
+
+    #[test]
+    fn route_travel_moves_clamps_all_waypoints_at_or_above_bed_floor() {
+        let sdf = Arc::new(cube_sdf_fixture());
+
+        // Chords along bottom bed (z = 0.0) where outward normals point downward
+        let a = open_path(
+            vec![DVec3::new(-2.0, 0.5, 0.0), DVec3::new(-0.5, 0.5, 0.0)],
+            MoveKind::Infill,
+        );
+        let b = open_path(
+            vec![DVec3::new(1.5, 0.5, 0.0), DVec3::new(3.0, 0.5, 0.0)],
+            MoveKind::Infill,
+        );
+        let config = SlicerConfig::default();
+        let slope_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
+
+        let routed = route_travel_moves(vec![a, b], Some(&sdf), &slope_profile, &config);
+        assert_eq!(routed.len(), 3);
+        let detour = &routed[1];
+        for pt in &detour.points {
+            assert!(
+                pt.z >= 0.0,
+                "travel waypoint must never dip below bed floor z=0: {pt:?}"
+            );
         }
     }
 
