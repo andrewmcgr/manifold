@@ -36,10 +36,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-3-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcursor-dev \
+            libxinerama-dev \
+            libxi-dev \
+            libxrandr-dev \
             libxcb-render0-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
             libxkbcommon-dev \
+            libwayland-dev \
             libssl-dev \
             libvulkan-dev \
             mesa-vulkan-drivers \
@@ -67,7 +74,7 @@ jobs:
           cp target/release/manifold-gui${{ matrix.ext }} dist/manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}
           
           # Stage manifold-cli
-          cp target/release/manifold-cli${{ matrix.ext }} dist/manifold-cli-${{ matrix.suffix }}${{ matrix.ext }}
+          cp target/release/manifold${{ matrix.ext }} dist/manifold-${{ matrix.suffix }}${{ matrix.ext }}
 
       # Uploads both artifacts simultaneously to the GitHub Release page
       - name: Upload binaries to release
@@ -75,5 +82,5 @@ jobs:
         with:
           files: |
             dist/manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}
-            dist/manifold-cli-${{ matrix.suffix }}${{ matrix.ext }}
+            dist/manifold-${{ matrix.suffix }}${{ matrix.ext }}
 
