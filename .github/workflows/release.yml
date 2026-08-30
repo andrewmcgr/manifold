@@ -93,7 +93,8 @@ jobs:
       # Uploads both artifacts simultaneously to the GitHub Release page
       - name: Upload binaries to release
         uses: softprops/action-gh-release@v2
-        files: |
+        with:
+          files: |
             dist/manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}
             dist/manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}.sha256
             dist/manifold-cli-${{ matrix.suffix }}${{ matrix.ext }}
