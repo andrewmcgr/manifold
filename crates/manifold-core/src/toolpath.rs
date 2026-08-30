@@ -7,6 +7,7 @@ use crate::{
 };
 use glam::DVec3;
 use manifold_fidget::mesh_sdf::MeshSdf;
+use manifold_fidget::order::OrderField;
 use manifold_fidget::ScalarField;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -670,13 +671,21 @@ const MAX_TRAVEL_GRID_NODES: usize = 8_000;
 /// fields to safely advance across open air in large steps rather than fixed dense sampling,
 /// speeding up clearance verification by 50x-100x. Near the endpoints `a` and `b`, the required
 /// clearance ramps from 0 at the contact boundary up to `clearance`.
-fn travel_chord_is_blocked(mesh_sdf: &MeshSdf, a: DVec3, b: DVec3, clearance: f64) -> bool {
+fn travel_chord_is_blocked(
+    mesh_sdf: &MeshSdf,
+    order_field: Option<&dyn OrderField>,
+    current_order: f64,
+    a: DVec3,
+    b: DVec3,
+    clearance: f64,
+) -> bool {
     let distance = a.distance(b);
     if distance <= f64::EPSILON {
         return false;
     }
     let step = (clearance * 0.5).max(0.1);
     let samples = ((distance / step).ceil() as usize).clamp(4, 64);
+    let order_epsilon = 1e-4;
     (0..=samples).any(|s| {
         let t = s as f64 / samples as f64;
         let p = a.lerp(b, t);
@@ -684,7 +693,17 @@ fn travel_chord_is_blocked(mesh_sdf: &MeshSdf, a: DVec3, b: DVec3, clearance: f6
         let dist_from_end = (1.0 - t) * distance;
         let required_clearance = clearance.min(dist_from_start).min(dist_from_end);
         let sample = mesh_sdf.sample(p);
-        sample.value < required_clearance
+        if sample.value < required_clearance {
+            if let Some(field) = order_field {
+                let p_order = field.order(p);
+                if p_order.is_finite() && p_order > current_order + order_epsilon {
+                    return false;
+                }
+            }
+            true
+        } else {
+            false
+        }
     })
 }
 
@@ -709,6 +728,8 @@ fn travel_chord_is_blocked(mesh_sdf: &MeshSdf, a: DVec3, b: DVec3, clearance: f6
 #[allow(clippy::too_many_arguments)]
 fn route_around_obstruction(
     mesh_sdf: &MeshSdf,
+    order_field: Option<&dyn OrderField>,
+    current_order: f64,
     _slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     start: DVec3,
     end: DVec3,
@@ -812,9 +833,21 @@ fn route_around_obstruction(
             let lift_z = start.z.max(end.z) + clearance * 2.0;
             let mid = (start + end) * 0.5;
             let lift_pt = DVec3::new(mid.x, mid.y, lift_z);
-            if !travel_chord_is_blocked(mesh_sdf, start, lift_pt, clearance * 0.5)
-                && !travel_chord_is_blocked(mesh_sdf, lift_pt, end, clearance * 0.5)
-            {
+            if !travel_chord_is_blocked(
+                mesh_sdf,
+                order_field,
+                current_order,
+                start,
+                lift_pt,
+                clearance * 0.5,
+            ) && !travel_chord_is_blocked(
+                mesh_sdf,
+                order_field,
+                current_order,
+                lift_pt,
+                end,
+                clearance * 0.5,
+            ) {
                 return Some(vec![start, lift_pt, end]);
             }
             return None;
@@ -905,7 +938,15 @@ fn route_around_obstruction(
             } else {
                 let status = clearance_memo[neighbor_flat];
                 if status == 0 {
-                    let clear = mesh_sdf.sample(neighbor_point).value >= clearance;
+                    let sample = mesh_sdf.sample(neighbor_point);
+                    let clear = if sample.value >= clearance {
+                        true
+                    } else if let Some(field) = order_field {
+                        let p_order = field.order(neighbor_point);
+                        p_order.is_finite() && p_order > current_order + 1e-4
+                    } else {
+                        false
+                    };
                     clearance_memo[neighbor_flat] = if clear { 2 } else { 1 };
                     clear
                 } else {
@@ -1007,6 +1048,7 @@ fn route_around_obstruction(
 fn route_travel_moves(
     paths: Vec<Path>,
     layer_mesh_sdf: Option<&MeshSdf>,
+    order_field: Option<&dyn OrderField>,
     slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     config: &SlicerConfig,
     z_penalty: f64,
@@ -1051,12 +1093,14 @@ fn route_travel_moves(
     let detours: Vec<(usize, Path)> = pairs
         .into_par_iter()
         .filter_map(|(i, a, b, tool, order)| {
-            if !travel_chord_is_blocked(mesh_sdf, a, b, clearance) {
+            if !travel_chord_is_blocked(mesh_sdf, order_field, order, a, b, clearance) {
                 return None;
             }
             let min_travel_z = a.z.min(b.z).max(min_bed_clearance);
             let waypoints = route_around_obstruction(
                 mesh_sdf,
+                order_field,
+                order,
                 slope_profile,
                 a,
                 b,
@@ -1686,6 +1730,7 @@ pub fn plan_with_progress(
             let paths = route_travel_moves(
                 paths,
                 layer.mesh_sdf.as_deref(),
+                Some(layer.order_field.as_ref()),
                 slope_profile,
                 config,
                 z_travel_penalty,
@@ -1896,9 +1941,11 @@ pub fn plan_with_progress(
 
     let all_paths = defer_unsupported_paths(per_layer, layers, config);
     let global_mesh_sdf = layers.iter().find_map(|l| l.mesh_sdf.as_deref());
+    let global_order_field = layers.first().map(|l| l.order_field.as_ref());
     let all_paths = route_travel_moves(
         all_paths,
         global_mesh_sdf,
+        global_order_field,
         slope_profile,
         config,
         z_travel_penalty,
@@ -3545,6 +3592,8 @@ mod tests {
         // Straight through the cube along x at y = z = 0.5.
         assert!(travel_chord_is_blocked(
             &sdf,
+            None,
+            0.0,
             DVec3::new(-1.0, 0.5, 0.5),
             DVec3::new(2.0, 0.5, 0.5),
             clearance,
@@ -3553,8 +3602,40 @@ mod tests {
         // Well clear of the cube.
         assert!(!travel_chord_is_blocked(
             &sdf,
+            None,
+            0.0,
             DVec3::new(-1.0, 5.0, 5.0),
             DVec3::new(2.0, 5.0, 5.0),
+            clearance,
+        ));
+    }
+
+    #[test]
+    fn travel_chord_is_blocked_respects_order_field_for_future_geometry() {
+        let sdf = cube_sdf_fixture();
+        let field = HeightOrderField::new(DVec3::Z);
+        let clearance = 0.05;
+
+        // Path crossing through the cube at z = 0.8:
+        // When current_order = 0.2 (layer height 0.2), the cube material at z = 0.8
+        // is in the future (unprinted), so it should NOT be considered blocked.
+        assert!(!travel_chord_is_blocked(
+            &sdf,
+            Some(&field),
+            0.2,
+            DVec3::new(-1.0, 0.5, 0.8),
+            DVec3::new(2.0, 0.5, 0.8),
+            clearance,
+        ));
+
+        // When current_order = 0.9 (layer height 0.9), the cube material at z = 0.8
+        // has already been printed, so it MUST be considered blocked.
+        assert!(travel_chord_is_blocked(
+            &sdf,
+            Some(&field),
+            0.9,
+            DVec3::new(-1.0, 0.5, 0.8),
+            DVec3::new(2.0, 0.5, 0.8),
             clearance,
         ));
     }
@@ -3577,6 +3658,7 @@ mod tests {
         let routed = route_travel_moves(
             vec![a, b],
             Some(&sdf),
+            None,
             &slope_profile,
             &config,
             config.z_travel_penalty,
@@ -3597,7 +3679,9 @@ mod tests {
         // cube (within the same clearance used to plan it).
         let clearance = 2.0 * config.wall_line_width;
         for pair in detour.points.windows(2) {
-            assert!(!travel_chord_is_blocked(&sdf, pair[0], pair[1], clearance));
+            assert!(!travel_chord_is_blocked(
+                &sdf, None, 0.0, pair[0], pair[1], clearance
+            ));
         }
     }
 
@@ -3619,6 +3703,7 @@ mod tests {
         let routed = route_travel_moves(
             vec![a, b],
             Some(&sdf),
+            None,
             &slope_profile,
             &config,
             config.z_travel_penalty,
@@ -3659,6 +3744,7 @@ mod tests {
         let routed = route_travel_moves(
             vec![a, b],
             Some(&sdf),
+            None,
             &slope_profile,
             &config,
             config.z_travel_penalty,
@@ -3671,7 +3757,9 @@ mod tests {
         let detour = &routed[1];
         let clearance = 2.0 * config.wall_line_width;
         for pair in detour.points.windows(2) {
-            assert!(!travel_chord_is_blocked(&sdf, pair[0], pair[1], clearance));
+            assert!(!travel_chord_is_blocked(
+                &sdf, None, 0.0, pair[0], pair[1], clearance
+            ));
         }
     }
 
@@ -3694,6 +3782,7 @@ mod tests {
         let routed = route_travel_moves(
             vec![a, b],
             Some(&sdf),
+            None,
             &slope_profile,
             &config,
             config.z_travel_penalty,
@@ -3734,6 +3823,7 @@ mod tests {
         let routed = route_travel_moves(
             vec![a, b],
             Some(&sdf),
+            None,
             &slope_profile,
             &config,
             config.z_travel_penalty,
