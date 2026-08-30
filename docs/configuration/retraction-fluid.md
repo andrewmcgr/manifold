@@ -19,13 +19,21 @@ Manifold provides advanced extrusion control including perimeter wipe moves, non
   "wipe_distance": 1.0,
   "pre_retract_taper_distance": 1.0,
   "z_hop_enabled": true,
-  "z_hop_height": 0.40
+  "z_hop_height": 0.40,
+  "travel_order_optimization_enabled": true,
+  "travel_collision_avoidance_enabled": true,
+  "z_travel_penalty": 8.0
 }
 ```
 
 - **Non-Planar Scarf Joint Seams (`scarf_joint_enabled`)**: Over the configured `scarf_joint_length` ($3.0\text{ mm}$), the lead-in segment ramps extrusion flow from $0 \to 100\%$. After traversing the closed loop, the nozzle continues for an overlapping $3.0\text{ mm}$ tail ramping flow from $100\% \to 0$, eliminating vertical seam lines.
 - **Wipe Moves (`wipe_enabled`)**: Appends an unextruded nozzle move along the perimeter/interior before travel lifts to break the capillary droplet bridge.
+- **Travel Collision Avoidance (`travel_collision_avoidance_enabled`)**: Detects travel chords that cross solid material using the mesh Signed Distance Field (`MeshSdf`) and plans collision-free 3D detour paths in open air using parallel A* search.
 - **Two-Line-Width Travel Clearance**: Travel moves automatically enforce $2 \times \text{line width}$ ($0.8\text{ mm}$) clearance from printed material, departing and arriving along surface normals into open air.
+- **Minimum Bed Clearance Floor**: Travel waypoints in open air maintain $Z \ge \min(\text{start}.z, \text{end}.z)$ with an absolute floor of $0.5 \times \text{first\_layer\_height}$, preventing the toolhead from diving into the build plate or dragging across textured bed clips.
+- **Kinematic Z-Travel Cost Penalty (`z_travel_penalty`)**: Travel order optimization and A* obstacle routing calculate movement cost using the anisotropic kinematic metric:
+  $$\text{cost}(a, b) = \sqrt{(b_x - a_x)^2 + (b_y - a_y)^2 + (\text{penalty}_z \cdot (b_z - a_z))^2}$$
+  where $\text{penalty}_z$ dynamically incorporates the printer's Z vs. XY axis speed ratio ($v_{xy} / v_z$) and acceleration ratio ($\sqrt{a_{xy} / a_z}$) from `machine.axis_limits`.
 
 ---
 

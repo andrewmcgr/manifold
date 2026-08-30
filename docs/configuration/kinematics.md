@@ -109,3 +109,22 @@ For any 3D move along unit direction vector $\vec{u} = (\hat{u}_x, \hat{u}_y, \h
 $$v_{\text{path}} \le \min \left( v_{\text{global}}, \frac{v_{\text{limit}, X}}{|\hat{u}_x|}, \frac{v_{\text{limit}, Y}}{|\hat{u}_y|}, \frac{v_{\text{limit}, Z}}{|\hat{u}_z|} \right)$$
 
 This guarantees that steep non-planar vertical climbs automatically throttle toolhead speed so that the Z axis never exceeds its safe feedrate or torque envelope.
+
+---
+
+## Kinematic Travel Move & Detour Planning
+
+Travel moves in 3D non-planar space are planned using machine axis speeds and accelerations to minimize actual elapsed print time:
+
+1. **Relative Velocity & Acceleration Scaling**:
+   The travel planner calculates the physical kinematic penalty factor $\text{penalty}_z$:
+   $$\text{speed\_ratio} = \frac{v_{xy}}{v_z}, \quad \text{accel\_ratio} = \sqrt{\frac{a_{xy}}{a_z}}$$
+   $$\text{penalty}_z = \max\left(\text{config.z\_travel\_penalty}, \text{speed\_ratio}, \text{accel\_ratio}\right)$$
+
+2. **Kinematic Travel Order Optimization (`optimize_travel_order`)**:
+   Nearest-neighbor path selection uses an anisotropic distance metric:
+   $$\text{cost}(a, b) = \sqrt{(b_x - a_x)^2 + (b_y - a_y)^2 + (\text{penalty}_z \cdot (b_z - a_z))^2}$$
+   preventing excessive vertical jumps between separate features or scanlines.
+
+3. **Anisotropic A\* Collision Detour Routing (`route_around_obstruction`)**:
+   When a travel chord passes through solid material, A\* obstacle routing uses the same consistent kinematic metric for step costs and heuristic estimation, naturally favoring fast planar detours around obstacles over slow vertical climbing.

@@ -71,7 +71,9 @@ crates/
   - **Toolpath Planning**: Applies wall simplification (Ramer-Douglas-Peucker),
     tangent flat nozzle slope clearance compensation, 3D trajectory slope cosine
     volumetric compensation, support-aware move sorting, scarf joint seams,
-    perimeter wipes, and Z-hops.
+    perimeter wipes, parallel A* travel collision avoidance routing with
+    machine kinematic Z-penalty weighting and bed-floor clearance clamping,
+    and Z-hops.
   - **Kinematics & G-code Emission**: Integrates stepper motor torque roll-off
     ODEs, Klipper Square Corner Velocity (SCV) lookahead, per-axis velocity/accel
     clamping, and dynamic 2-point non-Newtonian pressure advance.

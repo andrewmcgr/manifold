@@ -64,6 +64,9 @@ The left sidebar in `manifold-gui` organizes slicing and machine parameters into
 ## 6. Travel & Simplification
 - **Z-hop on Travel**: Lifts nozzle vertically during travel jumps to prevent dragging across printed beads.
 - **Z-hop Height (mm)**: Lift clearance ($0.0\text{--}2.0\text{ mm}$).
+- **Travel Collision Avoidance**: Detects travel chords crossing solid material against the mesh SDF and computes collision-free 3D detour paths in open air using parallel A* search.
+- **Travel Order Optimization**: Reorders paths within each layer using a greedy nearest-neighbor solver to minimize inter-path travel time.
+- **Z Travel Penalty**: Cost weighting factor ($1.0\text{--}50.0$) applied to vertical movements during travel path optimization and obstacle routing. Dynamically scales with the machine's Z vs. XY axis speed and acceleration ratio.
 - **Simplify Wall Toolpaths**: Ramer-Douglas-Peucker simplification on curved wall loops.
 - **Simplification Tolerance (mm)**: Vertex reduction tolerance ($0.0\text{--}0.5\text{ mm}$).
 
