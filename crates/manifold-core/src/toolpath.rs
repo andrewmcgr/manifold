@@ -1832,15 +1832,25 @@ pub fn plan_with_progress(
                     };
 
                     let fluid_engine = config.fluid_dynamics_engine();
+                    let motion_model = config.resolved_motion_model(machine);
                     let nominal_speed = if is_overhang {
                         config.wave_overhang_speed()
                     } else {
-                        config
-                            .resolved_motion_model(machine)
-                            .max_feedrate(segment.kind, is_first_layer)
+                        motion_model.max_directional_feedrate(
+                            segment.kind,
+                            is_first_layer,
+                            unit_dir,
+                        )
                     };
+                    let clamped_speed = crate::kinematics::clamp_feedrate_by_volumetric_limit(
+                        nominal_speed,
+                        bead_area,
+                        config.max_volumetric_speed,
+                    );
+                    segment.speed = clamped_speed;
+
                     let swell_mult = if let Some(ref engine) = fluid_engine {
-                        let flow_q = ((nominal_speed / 60.0) * bead_area).max(0.01);
+                        let flow_q = ((clamped_speed / 60.0) * bead_area).max(0.01);
                         engine.swell_volume_multiplier(flow_q, 0.0)
                     } else {
                         1.0
@@ -1855,11 +1865,6 @@ pub fn plan_with_progress(
                         * first_layer_mult
                         * directional_flow_mult
                         * swell_mult;
-                    segment.speed = crate::kinematics::clamp_feedrate_by_volumetric_limit(
-                        nominal_speed,
-                        bead_area,
-                        config.max_volumetric_speed,
-                    );
                 }
             }
 
@@ -3974,5 +3979,116 @@ mod tests {
             (actual_e - expected_climbing_e).abs() < 1e-4,
             "Actual extrusion length ({actual_e}) should match horizontal projection ({expected_climbing_e})"
         );
+    }
+
+    #[test]
+    fn plan_clamps_segment_speed_directionally_against_axis_limits() {
+        use crate::kinematics::{Axis, AxisLimits};
+        use crate::machine::Machine;
+        use crate::tool::Tool;
+
+        let obj_id = ObjectId(1);
+        let object = Object::new(obj_id, Mesh::default(), ToolId(0));
+        let field: Arc<dyn manifold_fidget::order::OrderField> =
+            Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+
+        let layer0 = Layer {
+            object: obj_id,
+            index: 0,
+            order: 0.0,
+            loops: vec![WallLoop {
+                points: vec![
+                    DVec3::new(0.0, 0.0, 0.0),
+                    DVec3::new(10.0, 0.0, 0.0),
+                    DVec3::new(10.0, 10.0, 0.0),
+                    DVec3::new(0.0, 10.0, 0.0),
+                ],
+                wall_index: 0,
+                top_surface: vec![false; 4],
+                arc_fraction: vec![0.0; 4],
+                unsupported: vec![false; 4],
+            }],
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            order_field: Arc::clone(&field),
+            mesh_sdf: None,
+        };
+
+        let layer = Layer {
+            object: obj_id,
+            index: 1,
+            order: 1.0,
+            loops: vec![WallLoop {
+                points: vec![
+                    DVec3::new(0.0, 0.0, 0.0),
+                    DVec3::new(10.0, 0.0, 10.0),
+                    DVec3::new(10.0, 10.0, 10.0),
+                    DVec3::new(0.0, 10.0, 0.0),
+                ],
+                wall_index: 0,
+                top_surface: vec![false; 4],
+                arc_fraction: vec![0.0; 4],
+                unsupported: vec![false; 4],
+            }],
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            order_field: Arc::clone(&field),
+            mesh_sdf: None,
+        };
+
+        // Standard outer wall speed: 6000 mm/min (100 mm/s)
+        // Machine has Z max speed = 20 mm/s (1200 mm/min)
+        let mut machine = Machine::default();
+        machine.set_axis_limits(
+            Axis::Z,
+            AxisLimits {
+                speed_limit: Some(20.0),
+                ..AxisLimits::default()
+            },
+        );
+
+        let config = SlicerConfig {
+            scarf_joint_enabled: false,
+            path_simplify_enabled: false,
+            travel_order_optimization_enabled: false,
+            travel_collision_avoidance_enabled: false,
+            ..SlicerConfig::default()
+        };
+
+        let tools = vec![Tool::new(ToolId(0), 0.4)];
+        let paths = plan_with_progress(
+            &[layer0, layer],
+            &[object],
+            &tools,
+            &config,
+            Some(&machine),
+            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(paths.len(), 2);
+        let path = &paths[1];
+
+        let mut sloped_count = 0;
+        for (i, seg) in path.segments.iter().enumerate() {
+            let start = path.points[i];
+            let end = path.points[(i + 1) % path.points.len()];
+            let diff = end - start;
+            let d = diff.length();
+            if d > 1e-4 {
+                let dir = diff / d;
+                if dir.z.abs() > 0.01 {
+                    sloped_count += 1;
+                    let expected_speed = (20.0 / dir.z.abs()) * 60.0;
+                    assert!(
+                        (seg.speed - expected_speed).abs() < 1.0,
+                        "Sloped segment speed ({}) must match expected ({})",
+                        seg.speed,
+                        expected_speed
+                    );
+                }
+            }
+        }
+        assert!(sloped_count > 0, "Expected at least one sloped segment");
     }
 }
