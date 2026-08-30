@@ -47,6 +47,16 @@ cargo run --release -p manifold-cli -- path/to/model.stl -o out.gcode
 cargo run --release -p manifold-gui
 ```
 
+### macOS Application Bundle
+
+To build a standalone `Manifold.app` bundle locally on macOS (so it launches directly from Finder/Dock without opening a Terminal window):
+
+```sh
+./scripts/build-macos-app.sh            # Builds target/release/Manifold.app
+./scripts/build-macos-app.sh --open     # Builds and launches Manifold.app
+./scripts/build-macos-app.sh --zip      # Packages target/release/Manifold-macos-app.zip
+```
+
 ### Automation (dev only)
 
 `manifold-gui` can optionally expose a local MCP automation server for

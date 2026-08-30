@@ -70,32 +70,36 @@ jobs:
         run: |
           mkdir dist
 
-          # 1. Define final asset names
-          GUI_ASSET="manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}"
-          CLI_ASSET="manifold-cli-${{ matrix.suffix }}${{ matrix.ext }}"
-
-          # 2. Copy and rename binaries into the staging folder
-          cp target/release/manifold-gui${{ matrix.ext }} dist/$GUI_ASSET
-          cp target/release/manifold${{ matrix.ext }} dist/$CLI_ASSET
-
-          # 3. Generate SHA-256 checksums inside the dist directory
-          cd dist
-
-          # Use shasum if available (macOS), otherwise fall back to sha256sum (Linux/Windows Git Bash)
-          if command -v shasum &> /dev/null; then
-            shasum -a 256 "$GUI_ASSET" > "$GUI_ASSET.sha256"
-            shasum -a 256 "$CLI_ASSET" > "$CLI_ASSET.sha256"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # macOS: GUI .app bundle as .zip, CLI as .tar.gz
+            bash scripts/build-macos-app.sh --release --zip
+            cp target/release/Manifold-macos-app.zip "dist/manifold-gui-${{ matrix.suffix }}.zip"
+            tar -czf "dist/manifold-cli-${{ matrix.suffix }}.tar.gz" -C target/release manifold
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            # Windows: Zip executables
+            7z a "dist/manifold-gui-${{ matrix.suffix }}.zip" ./target/release/manifold-gui.exe
+            7z a "dist/manifold-cli-${{ matrix.suffix }}.zip" ./target/release/manifold.exe
           else
-            sha256sum "$GUI_ASSET" > "$GUI_ASSET.sha256"
-            sha256sum "$CLI_ASSET" > "$CLI_ASSET.sha256"
+            # Linux: gzip (tar.gz) executables to preserve permissions
+            tar -czf "dist/manifold-gui-${{ matrix.suffix }}.tar.gz" -C target/release manifold-gui
+            tar -czf "dist/manifold-cli-${{ matrix.suffix }}.tar.gz" -C target/release manifold
           fi
+
+          # Generate SHA-256 checksums inside the dist directory
+          cd dist
+          for file in *; do
+            if [ -f "$file" ]; then
+              if command -v shasum &> /dev/null; then
+                shasum -a 256 "$file" > "$file.sha256"
+              else
+                sha256sum "$file" > "$file.sha256"
+              fi
+            fi
+          done
 
       # Uploads both artifacts simultaneously to the GitHub Release page
       - name: Upload binaries to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}
-            dist/manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}.sha256
-            dist/manifold-cli-${{ matrix.suffix }}${{ matrix.ext }}
-            dist/manifold-cli-${{ matrix.suffix }}${{ matrix.ext }}.sha256
+            dist/*
