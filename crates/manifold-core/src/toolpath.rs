@@ -596,7 +596,11 @@ fn compensate_wall_loop_points(
 /// it does not attempt any *routing* around obstacles (see ROADMAP.md's
 /// open item on travel collision avoidance) -- only which path to visit
 /// next and which end to enter it from.
-fn optimize_travel_order(mut paths: Vec<Path>, config: &SlicerConfig) -> Vec<Path> {
+fn optimize_travel_order(
+    mut paths: Vec<Path>,
+    config: &SlicerConfig,
+    z_travel_penalty: f64,
+) -> Vec<Path> {
     if !config.travel_order_optimization_enabled || paths.len() <= 1 {
         return paths;
     }
@@ -605,18 +609,26 @@ fn optimize_travel_order(mut paths: Vec<Path>, config: &SlicerConfig) -> Vec<Pat
     ordered.push(paths.remove(0));
     let mut current = ordered[0].points.last().copied().unwrap_or(DVec3::ZERO);
 
+    let z_scale = z_travel_penalty.max(1.0);
+    let kinematic_cost = |a: DVec3, b: DVec3| -> f64 {
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let dz = (b.z - a.z) * z_scale;
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    };
+
     while !paths.is_empty() {
         let mut best_idx = 0;
         let mut best_reverse = false;
-        let mut best_dist = f64::INFINITY;
+        let mut best_cost = f64::INFINITY;
 
         for (idx, path) in paths.iter().enumerate() {
             let Some(&start) = path.points.first() else {
                 continue;
             };
-            let forward_dist = current.distance(start);
-            if forward_dist < best_dist {
-                best_dist = forward_dist;
+            let forward_cost = kinematic_cost(current, start);
+            if forward_cost < best_cost {
+                best_cost = forward_cost;
                 best_idx = idx;
                 best_reverse = false;
             }
@@ -624,9 +636,9 @@ fn optimize_travel_order(mut paths: Vec<Path>, config: &SlicerConfig) -> Vec<Pat
             let is_open = path.segments.len() + 1 == path.points.len();
             if is_open {
                 if let Some(&end) = path.points.last() {
-                    let reverse_dist = current.distance(end);
-                    if reverse_dist < best_dist {
-                        best_dist = reverse_dist;
+                    let reverse_cost = kinematic_cost(current, end);
+                    if reverse_cost < best_cost {
+                        best_cost = reverse_cost;
                         best_idx = idx;
                         best_reverse = true;
                     }
@@ -834,7 +846,10 @@ fn route_around_obstruction(
         }
     }
 
-    let heuristic = |p: DVec3| -> f64 { p.distance(search_end) };
+    let heuristic = |p: DVec3| -> f64 {
+        let d = search_end - p;
+        (d.x * d.x + d.y * d.y + (d.z * z_penalty).powi(2)).sqrt()
+    };
 
     let mut best_cost = vec![f64::INFINITY; total];
     let mut came_from: Vec<Option<usize>> = vec![None; total];
@@ -903,13 +918,8 @@ fn route_around_obstruction(
             }
 
             let step = neighbor_point - cur_point;
-            let has_z = step.z.abs() > 1e-9;
-            let step_len = step.length();
-            let step_cost = if has_z {
-                step_len * z_penalty.max(1.0)
-            } else {
-                step_len
-            };
+            let step_cost =
+                (step.x * step.x + step.y * step.y + (step.z * z_penalty).powi(2)).sqrt();
             let next_cost = cost + step_cost;
 
             if next_cost < best_cost[neighbor_flat] {
@@ -999,6 +1009,7 @@ fn route_travel_moves(
     layer_mesh_sdf: Option<&MeshSdf>,
     slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     config: &SlicerConfig,
+    z_penalty: f64,
 ) -> Vec<Path> {
     if !config.travel_collision_avoidance_enabled || paths.len() < 2 {
         return paths;
@@ -1037,7 +1048,6 @@ fn route_travel_moves(
     }
 
     let min_bed_clearance = 0.5 * config.first_layer_height();
-    let z_penalty = config.z_travel_penalty;
     let detours: Vec<(usize, Path)> = pairs
         .into_par_iter()
         .filter_map(|(i, a, b, tool, order)| {
@@ -1548,6 +1558,7 @@ pub fn plan_with_progress(
     let total_layers = layers.len().max(1) as f64;
     let completed = AtomicUsize::new(0);
     let on_progress = Mutex::new(on_progress);
+    let z_travel_penalty = config.resolved_z_travel_penalty(machine);
 
     let wave_overhang_plan = if config.wave_overhangs_enabled() {
         let default_tool = objects.first().map(|o| o.tool).unwrap_or(ToolId(0));
@@ -1671,8 +1682,14 @@ pub fn plan_with_progress(
             );
             let paths = compensate_flat_nozzle(paths, layer, config, tools);
             let paths = simplify_paths(paths, config);
-            let paths = optimize_travel_order(paths, config);
-            let paths = route_travel_moves(paths, layer.mesh_sdf.as_deref(), slope_profile, config);
+            let paths = optimize_travel_order(paths, config, z_travel_penalty);
+            let paths = route_travel_moves(
+                paths,
+                layer.mesh_sdf.as_deref(),
+                slope_profile,
+                config,
+                z_travel_penalty,
+            );
             let mut paths = insert_z_hops(paths, config);
 
             let extrusion_multiplier = tools
@@ -1879,7 +1896,13 @@ pub fn plan_with_progress(
 
     let all_paths = defer_unsupported_paths(per_layer, layers, config);
     let global_mesh_sdf = layers.iter().find_map(|l| l.mesh_sdf.as_deref());
-    let all_paths = route_travel_moves(all_paths, global_mesh_sdf, slope_profile, config);
+    let all_paths = route_travel_moves(
+        all_paths,
+        global_mesh_sdf,
+        slope_profile,
+        config,
+        z_travel_penalty,
+    );
     let mut all_paths = insert_z_hops(all_paths, config);
 
     // Ensure no planned points dip below the build bed floor (Z = 0.0)
@@ -3081,7 +3104,7 @@ mod tests {
             ..SlicerConfig::default()
         };
         let original_starts: Vec<DVec3> = paths.iter().map(|p| p.points[0]).collect();
-        let result = optimize_travel_order(paths, &config);
+        let result = optimize_travel_order(paths, &config, config.z_travel_penalty);
         let result_starts: Vec<DVec3> = result.iter().map(|p| p.points[0]).collect();
         assert_eq!(result_starts, original_starts);
     }
@@ -3107,7 +3130,8 @@ mod tests {
             MoveKind::Infill,
         );
         let config = SlicerConfig::default();
-        let result = optimize_travel_order(vec![anchor, far, near], &config);
+        let result =
+            optimize_travel_order(vec![anchor, far, near], &config, config.z_travel_penalty);
 
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].points[0], DVec3::new(0.0, 0.0, 0.0));
@@ -3130,7 +3154,8 @@ mod tests {
             MoveKind::Infill,
         );
         let config = SlicerConfig::default();
-        let result = optimize_travel_order(vec![anchor, candidate], &config);
+        let result =
+            optimize_travel_order(vec![anchor, candidate], &config, config.z_travel_penalty);
 
         assert_eq!(result.len(), 2);
         // Reversed: now starts at 1.2 (close to anchor's exit at 1.0) and
@@ -3159,10 +3184,44 @@ mod tests {
         );
         let original_points = wall.points.clone();
         let config = SlicerConfig::default();
-        let result = optimize_travel_order(vec![anchor, wall], &config);
+        let result = optimize_travel_order(vec![anchor, wall], &config, config.z_travel_penalty);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[1].points, original_points);
+    }
+
+    #[test]
+    fn optimize_travel_order_penalizes_z_motion_over_xy_motion() {
+        // Anchor ends at (1.0, 0.0, 0.0).
+        // Candidate A is at (5.0, 0.0, 0.0) -> XY distance 4.0, delta Z 0.0
+        // Candidate B is at (1.0, 0.0, 1.0) -> XY distance 0.0, delta Z 1.0
+        // With z_penalty = 8.0, B has cost 8.0 > A's cost 4.0, so A is chosen first.
+        let anchor = open_path(
+            vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
+            MoveKind::Infill,
+        );
+        let path_xy_far = open_path(
+            vec![DVec3::new(5.0, 0.0, 0.0), DVec3::new(6.0, 0.0, 0.0)],
+            MoveKind::Infill,
+        );
+        let path_z_near = open_path(
+            vec![DVec3::new(1.0, 0.0, 1.0), DVec3::new(2.0, 0.0, 1.0)],
+            MoveKind::Infill,
+        );
+        let config = SlicerConfig {
+            z_travel_penalty: 8.0,
+            ..SlicerConfig::default()
+        };
+        let result = optimize_travel_order(
+            vec![anchor, path_z_near, path_xy_far],
+            &config,
+            config.z_travel_penalty,
+        );
+        assert_eq!(result.len(), 3);
+        // path_xy_far (at z=0) selected before path_z_near (at z=1) due to z_penalty
+        assert_eq!(result[1].points[0], DVec3::new(5.0, 0.0, 0.0));
+        // path_z_near entered at closer reversed end (2.0, 0.0, 1.0)
+        assert_eq!(result[2].points[0], DVec3::new(2.0, 0.0, 1.0));
     }
 
     #[test]
@@ -3515,7 +3574,13 @@ mod tests {
         let config = SlicerConfig::default();
         let slope_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
 
-        let routed = route_travel_moves(vec![a, b], Some(&sdf), &slope_profile, &config);
+        let routed = route_travel_moves(
+            vec![a, b],
+            Some(&sdf),
+            &slope_profile,
+            &config,
+            config.z_travel_penalty,
+        );
 
         assert_eq!(
             routed.len(),
@@ -3551,7 +3616,13 @@ mod tests {
         let config = SlicerConfig::default();
         let slope_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
 
-        let routed = route_travel_moves(vec![a, b], Some(&sdf), &slope_profile, &config);
+        let routed = route_travel_moves(
+            vec![a, b],
+            Some(&sdf),
+            &slope_profile,
+            &config,
+            config.z_travel_penalty,
+        );
         assert_eq!(routed.len(), 3);
         let detour = &routed[1];
 
@@ -3585,7 +3656,13 @@ mod tests {
         let slope_profile =
             manifold_fidget::slope_profile::SlopeProfile::new(vec![(3.8, 1.6), (32.0, 11.0)]);
 
-        let routed = route_travel_moves(vec![a, b], Some(&sdf), &slope_profile, &config);
+        let routed = route_travel_moves(
+            vec![a, b],
+            Some(&sdf),
+            &slope_profile,
+            &config,
+            config.z_travel_penalty,
+        );
         assert_eq!(
             routed.len(),
             3,
@@ -3614,7 +3691,13 @@ mod tests {
         let config = SlicerConfig::default();
         let slope_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
 
-        let routed = route_travel_moves(vec![a, b], Some(&sdf), &slope_profile, &config);
+        let routed = route_travel_moves(
+            vec![a, b],
+            Some(&sdf),
+            &slope_profile,
+            &config,
+            config.z_travel_penalty,
+        );
         assert_eq!(routed.len(), 3);
         let detour = &routed[1];
         for pt in &detour.points {
@@ -3648,7 +3731,13 @@ mod tests {
         };
         let slope_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
 
-        let routed = route_travel_moves(vec![a, b], Some(&sdf), &slope_profile, &config);
+        let routed = route_travel_moves(
+            vec![a, b],
+            Some(&sdf),
+            &slope_profile,
+            &config,
+            config.z_travel_penalty,
+        );
         assert_eq!(routed.len(), 2, "disabled pass must leave paths untouched");
     }
 

@@ -668,6 +668,38 @@ impl SlicerConfig {
         Box::new(std_model)
     }
 
+    /// Returns the effective Z travel cost penalty, taking into account the relative
+    /// maximum travel speed and acceleration limits of the Z axis compared to XY axes
+    /// from `machine` and `self.z_travel_penalty`.
+    #[must_use]
+    pub fn resolved_z_travel_penalty(&self, machine: Option<&crate::machine::Machine>) -> f64 {
+        let base_penalty = self.z_travel_penalty.max(1.0);
+        let Some(m) = machine else {
+            return base_penalty;
+        };
+        let xy_speed = (self.travel_speed / 60.0).min(m.speed_limit()).max(1.0);
+        let z_speed = m
+            .axis_limits(crate::kinematics::Axis::Z)
+            .and_then(|l| l.speed_limit)
+            .unwrap_or(xy_speed)
+            .max(1.0);
+        let speed_ratio = xy_speed / z_speed;
+
+        let xy_accel = self
+            .travel_acceleration
+            .unwrap_or(10000.0)
+            .min(m.acceleration_limit())
+            .max(1.0);
+        let z_accel = m
+            .axis_limits(crate::kinematics::Axis::Z)
+            .and_then(|l| l.acceleration_limit)
+            .unwrap_or(xy_accel)
+            .max(1.0);
+        let accel_ratio = (xy_accel / z_accel).sqrt();
+
+        base_penalty.max(speed_ratio).max(accel_ratio)
+    }
+
     /// First layer extrusion multiplier, defaulting to `1.0` when `None`.
     #[must_use]
     pub fn first_layer_extrusion_multiplier(&self) -> f64 {
@@ -1021,6 +1053,36 @@ mod tests {
         let workspace = Workspace::new(vec![object], machine, SlicerConfig::default());
 
         assert!(slice_to_gcode(&workspace).is_ok());
+    }
+
+    #[test]
+    fn resolved_z_travel_penalty_derives_ratio_from_machine_axis_limits() {
+        let mut machine = crate::machine::Machine::new(
+            crate::bounds::BoundingVolume::Sphere {
+                center: glam::DVec3::ZERO,
+                radius: 1.0,
+            },
+            Vec::new(),
+        );
+        machine.speed_limit = Some(700.0);
+        machine.acceleration_limit = Some(12500.0);
+        let z_limits = crate::kinematics::AxisLimits {
+            speed_limit: Some(50.0),
+            acceleration_limit: Some(800.0),
+            ..Default::default()
+        };
+        machine.set_axis_limits(crate::kinematics::Axis::Z, z_limits);
+
+        let config = SlicerConfig {
+            travel_speed: 41400.0, // 690 mm/s
+            travel_acceleration: Some(23000.0),
+            z_travel_penalty: 2.0,
+            ..SlicerConfig::default()
+        };
+
+        let penalty = config.resolved_z_travel_penalty(Some(&machine));
+        // speed ratio: 690 / 50 = 13.8, which exceeds base penalty 2.0
+        assert!((penalty - 13.8).abs() < 1e-4);
     }
 
     /// Unit cube spanning [0,1]^3 — same fixture pattern as
