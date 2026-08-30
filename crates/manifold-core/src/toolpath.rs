@@ -703,33 +703,34 @@ fn route_around_obstruction(
     _cell_size: f64,
     z_penalty: f64,
     clearance: f64,
+    min_travel_z: f64,
 ) -> Option<Vec<DVec3>> {
     let start_sample = mesh_sdf.sample(start);
     let start_normal = start_sample.gradient.try_normalize();
     let start_clear = if let Some(n) = start_normal {
         let p = start + n * clearance;
-        let p = DVec3::new(p.x, p.y, p.z.max(0.0));
+        let p = DVec3::new(p.x, p.y, p.z.max(min_travel_z));
         if mesh_sdf.sample(p).value >= start_sample.value {
             p
         } else {
-            start
+            DVec3::new(start.x, start.y, start.z.max(min_travel_z))
         }
     } else {
-        start
+        DVec3::new(start.x, start.y, start.z.max(min_travel_z))
     };
 
     let end_sample = mesh_sdf.sample(end);
     let end_normal = end_sample.gradient.try_normalize();
     let end_clear = if let Some(n) = end_normal {
         let p = end + n * clearance;
-        let p = DVec3::new(p.x, p.y, p.z.max(0.0));
+        let p = DVec3::new(p.x, p.y, p.z.max(min_travel_z));
         if mesh_sdf.sample(p).value >= end_sample.value {
             p
         } else {
-            end
+            DVec3::new(end.x, end.y, end.z.max(min_travel_z))
         }
     } else {
-        end
+        DVec3::new(end.x, end.y, end.z.max(min_travel_z))
     };
 
     let search_start = start_clear;
@@ -738,13 +739,13 @@ fn route_around_obstruction(
     let base_cell = (clearance * 0.5).max(0.4);
     let chord_dist = start.distance(end);
     let margin = (chord_dist * 0.75).max(clearance * 6.0).max(10.0);
-    // Never allow the search grid to extend below the print bed (Z < 0): a
-    // physical 3D printer head cannot dive under the build plate to avoid an
-    // obstacle.
+    // Never allow the search grid to extend below the travel Z floor
+    // (min(start.z, end.z) with minimum bed clearance) to prevent nozzle collisions
+    // with the build plate, bed clips, or texture ridges.
     let min = DVec3::new(
         start.x.min(end.x).min(search_start.x).min(search_end.x) - margin,
         start.y.min(end.y).min(search_start.y).min(search_end.y) - margin,
-        (start.z.min(end.z).min(search_start.z).min(search_end.z) - margin).max(0.0),
+        (start.z.min(end.z).min(search_start.z).min(search_end.z) - margin).max(min_travel_z),
     );
     let max = DVec3::new(
         start.x.max(end.x).max(search_start.x).max(search_end.x) + margin,
@@ -963,8 +964,11 @@ fn route_around_obstruction(
         waypoints.push(end);
     }
 
-    for pt in &mut waypoints {
-        pt.z = pt.z.max(0.0);
+    if waypoints.len() > 2 {
+        let last_idx = waypoints.len() - 1;
+        for pt in &mut waypoints[1..last_idx] {
+            pt.z = pt.z.max(min_travel_z);
+        }
     }
 
     Some(waypoints)
@@ -1032,6 +1036,7 @@ fn route_travel_moves(
         return paths;
     }
 
+    let min_bed_clearance = 0.5 * config.first_layer_height();
     let z_penalty = config.z_travel_penalty;
     let detours: Vec<(usize, Path)> = pairs
         .into_par_iter()
@@ -1039,6 +1044,7 @@ fn route_travel_moves(
             if !travel_chord_is_blocked(mesh_sdf, a, b, clearance) {
                 return None;
             }
+            let min_travel_z = a.z.min(b.z).max(min_bed_clearance);
             let waypoints = route_around_obstruction(
                 mesh_sdf,
                 slope_profile,
@@ -1047,6 +1053,7 @@ fn route_travel_moves(
                 cell_size,
                 z_penalty,
                 clearance,
+                min_travel_z,
             )?;
             if waypoints.len() < 2 {
                 return None;
@@ -3614,6 +3621,12 @@ mod tests {
             assert!(
                 pt.z >= 0.0,
                 "travel waypoint must never dip below bed floor z=0: {pt:?}"
+            );
+        }
+        for pt in &detour.points[1..detour.points.len() - 1] {
+            assert!(
+                pt.z >= 0.5 * config.first_layer_height(),
+                "intermediate travel transit waypoint must maintain clearance above bed floor: {pt:?}"
             );
         }
     }
