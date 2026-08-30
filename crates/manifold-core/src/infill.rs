@@ -472,17 +472,37 @@ fn assemble_scanlines_into_paths(
     }
 
     let mut all_paths: Vec<Path> = Vec::new();
+    let mut last_end: Option<DVec3> = None;
     for root in order_of_root {
         let mut group = groups.remove(&root).expect("root was just recorded");
         group.sort_by_key(|(scan_index, _)| *scan_index);
 
+        if let Some(prev) = last_end {
+            if let (Some(first), Some(last)) = (group.first(), group.last()) {
+                let dist_first = prev
+                    .distance_squared(first.1 .0)
+                    .min(prev.distance_squared(first.1 .1));
+                let dist_last = prev
+                    .distance_squared(last.1 .0)
+                    .min(prev.distance_squared(last.1 .1));
+                if dist_last < dist_first {
+                    group.reverse();
+                }
+            }
+        }
+
         let mut points: Vec<DVec3> = Vec::new();
         let mut segments: Vec<Segment> = Vec::new();
-        let mut last_end: Option<DVec3> = None;
         let connect_dist = (spacing * 2.5).max(config.infill_line_width.abs() * 2.5);
 
         for (scan_index, pair) in group {
-            let (start, end) = if scan_index.is_multiple_of(2) {
+            let (start, end) = if let Some(prev) = last_end {
+                if prev.distance_squared(pair.0) <= prev.distance_squared(pair.1) {
+                    (pair.0, pair.1)
+                } else {
+                    (pair.1, pair.0)
+                }
+            } else if scan_index.is_multiple_of(2) {
                 pair
             } else {
                 (pair.1, pair.0)
@@ -837,28 +857,36 @@ fn generate_tpms_infill(
         layer.order_field.as_ref(),
     );
 
-    world_polylines
-        .into_iter()
-        .filter(|pts| pts.len() >= 2)
-        .map(|points| {
-            let segments = points
-                .iter()
-                .map(|_| Segment {
-                    kind: MoveKind::Infill,
-                    speed: speed_for_kind(MoveKind::Infill, config),
-                    extrusion_rate: 1.0,
-                    support_fraction: 0.0,
-                    order: layer.order,
-                    extrusion_length: 0.0,
-                })
-                .collect();
-            Path {
-                points,
-                segments,
-                tool: crate::ids::ToolId::default(),
+    let mut last_end: Option<DVec3> = None;
+    let mut paths = Vec::new();
+    for mut points in world_polylines.into_iter().filter(|pts| pts.len() >= 2) {
+        if let Some(prev) = last_end {
+            let start = points.first().copied().unwrap();
+            let end = points.last().copied().unwrap();
+            if prev.distance_squared(end) < prev.distance_squared(start) {
+                points.reverse();
             }
-        })
-        .collect()
+        }
+        last_end = points.last().copied();
+        let segments = points
+            .iter()
+            .map(|_| Segment {
+                kind: MoveKind::Infill,
+                speed: speed_for_kind(MoveKind::Infill, config),
+                extrusion_rate: 1.0,
+                support_fraction: 0.0,
+                order: layer.order,
+                extrusion_length: 0.0,
+            })
+            .collect();
+        paths.push(Path {
+            points,
+            segments,
+            tool: crate::ids::ToolId::default(),
+        });
+    }
+
+    paths
 }
 
 impl InfillGenerator for CubicInfill {
@@ -2126,11 +2154,69 @@ mod tests {
     }
 
     #[test]
-    fn schwarz_p_infill_produces_paths_covering_a_square() {
+    fn infill_paths_start_from_endpoint_closest_to_previous_path() {
+        // Disconnected squares producing multiple infill paths: verify that
+        // each subsequent path starts from the endpoint closer to the previous
+        // path's exit point.
+        let layer = Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: Vec::new(),
+            infill_boundary: vec![
+                vec![
+                    DVec3::new(-5.0, -5.0, 0.0),
+                    DVec3::new(-3.0, -5.0, 0.0),
+                    DVec3::new(-3.0, 5.0, 0.0),
+                    DVec3::new(-5.0, 5.0, 0.0),
+                ],
+                vec![
+                    DVec3::new(3.0, -5.0, 0.0),
+                    DVec3::new(5.0, -5.0, 0.0),
+                    DVec3::new(5.0, 5.0, 0.0),
+                    DVec3::new(3.0, 5.0, 0.0),
+                ],
+            ],
+            solid_fill_boundary: Vec::new(),
+            ..Layer::default()
+        };
+        let config = SlicerConfig {
+            infill_line_width: 0.5,
+            infill_angle_deg: 90.0,
+            ..SlicerConfig::default()
+        };
+        let region = InfillRegion::from_layer(&layer, &config);
+        let paths = MonotonicInfill.generate(&region, &config, &layer, &Transform::identity(), 1.0);
+
+        assert_eq!(paths.len(), 2);
+        let first_exit = *paths[0].points.last().unwrap();
+        let second_start = *paths[1].points.first().unwrap();
+        let second_exit = *paths[1].points.last().unwrap();
+
+        assert!(
+            first_exit.distance_squared(second_start) <= first_exit.distance_squared(second_exit),
+            "second path should start from the endpoint closest to the first path's exit: \
+             first_exit={first_exit:?}, second_start={second_start:?}, second_exit={second_exit:?}"
+        );
+    }
+
+    #[test]
+    fn tpms_infill_paths_start_from_endpoint_closest_to_previous_path() {
         let layer = square_layer(5.0);
         let region = InfillRegion::from_layer(&layer, &config());
-        let paths =
-            SchwarzPInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.2);
-        assert!(!paths.is_empty(), "expected schwarz p infill paths");
+        let paths = GyroidInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.2);
+        assert!(paths.len() >= 2);
+
+        for i in 1..paths.len() {
+            let prev_exit = *paths[i - 1].points.last().unwrap();
+            let start = *paths[i].points.first().unwrap();
+            let end = *paths[i].points.last().unwrap();
+            assert!(
+                prev_exit.distance_squared(start) <= prev_exit.distance_squared(end),
+                "path {i} should start from endpoint closest to path {} exit: \
+                 prev_exit={prev_exit:?}, start={start:?}, end={end:?}",
+                i - 1
+            );
+        }
     }
 }
