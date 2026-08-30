@@ -69,18 +69,32 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          
-          # Stage manifold-gui
-          cp target/release/manifold-gui${{ matrix.ext }} dist/manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}
-          
-          # Stage manifold-cli
-          cp target/release/manifold${{ matrix.ext }} dist/manifold-${{ matrix.suffix }}${{ matrix.ext }}
+
+          # 1. Define final asset names
+          GUI_ASSET="manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}"
+          CLI_ASSET="manifold-cli-${{ matrix.suffix }}${{ matrix.ext }}"
+
+          # 2. Copy and rename binaries into the staging folder
+          cp target/release/manifold-gui${{ matrix.ext }} dist/$GUI_ASSET
+          cp target/release/manifold${{ matrix.ext }} dist/$CLI_ASSET
+
+          # 3. Generate SHA-256 checksums inside the dist directory
+          cd dist
+
+          # Use shasum if available (macOS), otherwise fall back to sha256sum (Linux/Windows Git Bash)
+          if command -v shasum &> /dev/null; then
+            shasum -a 256 "$GUI_ASSET" > "$GUI_ASSET.sha256"
+            shasum -a 256 "$CLI_ASSET" > "$CLI_ASSET.sha256"
+          else
+            sha256sum "$GUI_ASSET" > "$GUI_ASSET.sha256"
+            sha256sum "$CLI_ASSET" > "$CLI_ASSET.sha256"
+          fi
 
       # Uploads both artifacts simultaneously to the GitHub Release page
       - name: Upload binaries to release
         uses: softprops/action-gh-release@v2
-        with:
           files: |
             dist/manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}
-            dist/manifold-${{ matrix.suffix }}${{ matrix.ext }}
-
+            dist/manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}.sha256
+            dist/manifold-cli-${{ matrix.suffix }}${{ matrix.ext }}
+            dist/manifold-cli-${{ matrix.suffix }}${{ matrix.ext }}.sha256
