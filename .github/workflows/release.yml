@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers the workflow when you push a tag like v1.0.0
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            ext: ".exe"
+            suffix: "windows-amd64"
+          - os: ubuntu-latest
+            ext: ""
+            suffix: "linux-amd64"
+          - os: macos-14 # Specifically pins to Apple Silicon (M-series) runner
+            ext: ""
+            suffix: "macos-arm64"
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies (including wgpu requirements)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev \
+            libvulkan-dev \
+            mesa-vulkan-drivers \
+            clang
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # Compiling the individual crates explicitly
+      - name: Build Release Binaries
+        run: |
+          cargo build --release -p manifold-gui
+          cargo build --release -p manifold-cli
+
+      # Group, rename, and stage the files for deployment
+      - name: Prepare artifacts
+        shell: bash
+        run: |
+          mkdir dist
+          
+          # Stage manifold-gui
+          cp target/release/manifold-gui${{ matrix.ext }} dist/manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}
+          
+          # Stage manifold-cli
+          cp target/release/manifold-cli${{ matrix.ext }} dist/manifold-cli-${{ matrix.suffix }}${{ matrix.ext }}
+
+      # Uploads both artifacts simultaneously to the GitHub Release page
+      - name: Upload binaries to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/manifold-gui-${{ matrix.suffix }}${{ matrix.ext }}
+            dist/manifold-cli-${{ matrix.suffix }}${{ matrix.ext }}
+
