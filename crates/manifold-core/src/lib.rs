@@ -275,9 +275,15 @@ pub struct SlicerConfig {
     /// Whether non-planar scarf joint perimeter seam ramping is enabled (default true).
     #[serde(default = "default_scarf_joint_enabled")]
     pub scarf_joint_enabled: bool,
-    /// Length (mm) over which closed wall loops ramp extrusion up on entry and down on overlap (default 3.0 mm).
+    /// Length (mm) over which closed wall loops ramp extrusion up on entry and down on overlap (default 8.0 mm).
     #[serde(default)]
     pub scarf_joint_length: Option<f64>,
+    /// Number of discrete discretization steps along the scarf ramp (default 9).
+    #[serde(default)]
+    pub scarf_joint_steps: Option<usize>,
+    /// Starting slice-normal height/flow fraction at the start of the lead-in ramp (default 0.10, i.e. 10%).
+    #[serde(default)]
+    pub scarf_joint_start_height_fraction: Option<f64>,
     /// Whether Z-hop (lift-before-travel / lower-after-arrival) is enabled.
     /// When `false`, `plan`/`emit` behave exactly as before this field
     /// existed: Z tracks `point.z` unmodified even across
@@ -543,6 +549,8 @@ impl Default for SlicerConfig {
             use_firmware_retraction: false,
             scarf_joint_enabled: true,
             scarf_joint_length: None,
+            scarf_joint_steps: None,
+            scarf_joint_start_height_fraction: None,
             z_hop_enabled: false,
             z_hop_height: default_z_hop_height(),
             path_simplify_enabled: true,
@@ -743,10 +751,22 @@ impl SlicerConfig {
         self.filament_density_g_cm3.unwrap_or(1.24)
     }
 
-    /// Scarf joint overlap length (mm), defaulting to `3.0` mm when `None`.
+    /// Scarf joint overlap length (mm), defaulting to `8.0` mm when `None`.
     #[must_use]
     pub fn scarf_joint_length(&self) -> f64 {
-        self.scarf_joint_length.unwrap_or(3.0)
+        self.scarf_joint_length.unwrap_or(8.0)
+    }
+
+    /// Scarf joint discretization step count, defaulting to `9` when `None`.
+    #[must_use]
+    pub fn scarf_joint_steps(&self) -> usize {
+        self.scarf_joint_steps.unwrap_or(9)
+    }
+
+    /// Scarf joint start height / flow fraction, defaulting to `0.10` when `None`.
+    #[must_use]
+    pub fn scarf_joint_start_height_fraction(&self) -> f64 {
+        self.scarf_joint_start_height_fraction.unwrap_or(0.10)
     }
 
     /// First layer line width (mm), defaulting to `1.3 * nozzle_diameter`

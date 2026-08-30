@@ -1624,6 +1624,7 @@ pub fn plan_with_progress(
                     ))
                 })?;
 
+            let is_layer_0 = layer.index == 0 || (layer.order - order_min).abs() < 1e-6;
             let mut paths = Vec::new();
             for (w_idx, wall_loop) in layer.loops.iter().enumerate() {
                 // Placeholder metadata: real support/bridge/overhang
@@ -1864,11 +1865,22 @@ pub fn plan_with_progress(
 
             if config.scarf_joint_enabled {
                 let scarf_len = config.scarf_joint_length();
+                let scarf_steps = config.scarf_joint_steps();
+                let scarf_start_h = config.scarf_joint_start_height_fraction();
+                let layer_h = if is_layer_0 {
+                    config.first_layer_height()
+                } else {
+                    config.layer_height
+                };
                 for path in &mut paths {
                     crate::kinematics::apply_scarf_joint(
                         &mut path.points,
                         &mut path.segments,
                         scarf_len,
+                        scarf_steps,
+                        scarf_start_h,
+                        layer_h,
+                        Some(layer.order_field.as_ref()),
                     );
                 }
             }
@@ -2230,7 +2242,11 @@ mod tests {
             },
         ];
 
-        let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
+        let config = SlicerConfig {
+            scarf_joint_enabled: false,
+            ..SlicerConfig::default()
+        };
+        let paths = plan(&layers, &objects, &[], &config).unwrap();
 
         // No `infill_boundary` is set on either layer, so `plan` emits no
         // infill paths here — every emitted path is a wall path.
@@ -2300,7 +2316,11 @@ mod tests {
             order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 
-        let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
+        let config = SlicerConfig {
+            scarf_joint_enabled: false,
+            ..SlicerConfig::default()
+        };
+        let paths = plan(&layers, &objects, &[], &config).unwrap();
 
         // No `infill_boundary` is set, so `plan` emits no infill path
         // here — every emitted path is a wall path.
@@ -2761,7 +2781,11 @@ mod tests {
             order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
         }];
 
-        let paths = plan(&layers, &objects, &[], &SlicerConfig::default()).unwrap();
+        let config = SlicerConfig {
+            scarf_joint_enabled: false,
+            ..SlicerConfig::default()
+        };
+        let paths = plan(&layers, &objects, &[], &config).unwrap();
 
         let wall_paths: Vec<_> = paths
             .iter()

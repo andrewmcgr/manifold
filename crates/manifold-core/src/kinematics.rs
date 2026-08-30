@@ -888,17 +888,23 @@ pub fn apply_wipe_moves(
 }
 
 /// Applies non-planar scarf joint seam ramping to a closed perimeter wall loop:
-/// - Ramps extrusion flow linearly from 0 -> 100% over the initial `scarf_length_mm` (lead-in).
-/// - Overlaps the start of the loop by continuing past the start point for `scarf_length_mm`,
-///   ramping extrusion flow from 100% -> 0 (lead-out).
-/// - The sum of the complementary ramps is exactly 100% nominal bead everywhere across the joint,
-///   eliminating vertical seam lines on perimeters.
+/// - Subdivides the scarf region into `steps` discrete segments over length `scarf_length_mm`.
+/// - Ramps extrusion flow and slice-normal height from `start_height_fraction` (e.g. 10%) -> 100%
+///   over the initial lead-in ramp, offset along `-layer_normal` to create the bottom wedge.
+/// - Overlaps the start of the loop by continuing past the start point at nominal layer height,
+///   ramping extrusion flow from `(1.0 - start_height_fraction)` -> 0% (lead-out top wedge).
+/// - The sum of the complementary flow ramps is exactly 100% nominal bead everywhere across the joint,
+///   eliminating vertical seam lines on perimeters without localized overextrusion.
 pub fn apply_scarf_joint(
     points: &mut Vec<DVec3>,
     segments: &mut Vec<crate::toolpath::Segment>,
     scarf_length_mm: f64,
+    steps: usize,
+    start_height_fraction: f64,
+    layer_height: f64,
+    order_field: Option<&dyn manifold_fidget::order::OrderField>,
 ) {
-    if scarf_length_mm <= 1e-4 || points.len() < 3 || segments.is_empty() {
+    if scarf_length_mm <= 1e-4 || steps == 0 || points.len() < 3 || segments.is_empty() {
         return;
     }
     // Only apply to closed extruding loops (points.len() == segments.len())
@@ -912,42 +918,176 @@ pub fn apply_scarf_joint(
         return;
     }
 
-    let p0 = points[0];
-    let p1 = points[1];
-    let first_seg_len = (p1 - p0).length();
-    if first_seg_len <= 1e-4 {
+    let n = points.len();
+    let orig_points = points.clone();
+    let orig_segments = segments.clone();
+
+    let mut seg_lens = Vec::with_capacity(n);
+    let mut cum_dist = Vec::with_capacity(n + 1);
+    cum_dist.push(0.0);
+    let mut total_len = 0.0;
+
+    for i in 0..n {
+        let p0 = orig_points[i];
+        let p1 = orig_points[(i + 1) % n];
+        let l = (p1 - p0).length();
+        seg_lens.push(l);
+        total_len += l;
+        cum_dist.push(total_len);
+    }
+
+    if total_len <= 1e-4 {
         return;
     }
 
-    if first_seg_len > scarf_length_mm + 0.1 {
-        let split_ratio = scarf_length_mm / first_seg_len;
-        let p_scarf_end = p0.lerp(p1, split_ratio);
-
-        let orig_first_seg = segments[0];
-        let mut lead_in_seg = orig_first_seg;
-        let mut rem_seg = orig_first_seg;
-
-        // Lead-in ramps 0 -> 1.0 (average flow 0.5)
-        lead_in_seg.extrusion_rate *= 0.5;
-        lead_in_seg.extrusion_length = orig_first_seg.extrusion_length * split_ratio * 0.5;
-
-        // Remainder has full 1.0 flow
-        rem_seg.extrusion_length = orig_first_seg.extrusion_length * (1.0 - split_ratio);
-
-        // Lead-out tail overlapping p0 -> p_scarf_end ramps 1.0 -> 0 (average flow 0.5)
-        let mut lead_out_seg = orig_first_seg;
-        lead_out_seg.extrusion_rate *= 0.5;
-        lead_out_seg.extrusion_length = orig_first_seg.extrusion_length * split_ratio * 0.5;
-
-        // Update initial segment and insert split point
-        segments[0] = lead_in_seg;
-        points.insert(1, p_scarf_end);
-        segments.insert(1, rem_seg);
-
-        // Append the overlapping scarf tail (from p0 -> p_scarf_end)
-        points.push(p_scarf_end);
-        segments.push(lead_out_seg);
+    let effective_scarf_len = scarf_length_mm.min(0.40 * total_len);
+    if effective_scarf_len <= 1e-3 {
+        return;
     }
+
+    let k_steps = steps.max(1);
+    let delta_s = effective_scarf_len / (k_steps as f64);
+    let h_start = start_height_fraction.clamp(0.0, 0.95);
+
+    let sample_at_distance = |d: f64| -> (DVec3, crate::toolpath::Segment, f64) {
+        let d = d.clamp(0.0, total_len);
+        let mut seg_idx = 0;
+        for i in 0..n {
+            if d <= cum_dist[i + 1] || i == n - 1 {
+                seg_idx = i;
+                break;
+            }
+        }
+        let seg_len = seg_lens[seg_idx];
+        let seg_start_d = cum_dist[seg_idx];
+        let u = if seg_len > 1e-9 {
+            ((d - seg_start_d) / seg_len).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let p_start = orig_points[seg_idx];
+        let p_end = orig_points[(seg_idx + 1) % n];
+        let p = p_start.lerp(p_end, u);
+        let seg = orig_segments[seg_idx];
+        let e_per_mm = if seg_len > 1e-9 {
+            seg.extrusion_length / seg_len
+        } else {
+            0.0
+        };
+        (p, seg, e_per_mm)
+    };
+
+    // Do not apply scarf joints on loops that contain unsupported overhang segments
+    if orig_segments.iter().any(|s| {
+        s.support_fraction < 0.8 || s.kind == MoveKind::Overhang || s.kind == MoveKind::Bridge
+    }) {
+        return;
+    }
+
+    let slice_normal = |p: DVec3| -> DVec3 {
+        if let Some(field) = order_field {
+            if let Some(grad) = crate::order_field::numeric_gradient(field, p) {
+                let len = grad.length();
+                if len > 1e-6 {
+                    let mut norm = grad / len;
+                    if norm.z < 0.0 {
+                        norm = -norm;
+                    }
+                    return norm;
+                }
+            }
+        }
+        DVec3::Z
+    };
+
+    let mut new_points = Vec::with_capacity(n + 2 * k_steps + 2);
+    let mut new_segments = Vec::with_capacity(n + 2 * k_steps + 2);
+
+    // 1. Lead-in ramp (k = 0..k_steps)
+    let mut lead_in_pts = Vec::with_capacity(k_steps + 1);
+    for k in 0..=k_steps {
+        let s = (k as f64) * delta_s;
+        let tau = (k as f64) / (k_steps as f64);
+        let h_frac = h_start + (1.0 - h_start) * tau;
+        let (base_p, seg, _) = sample_at_distance(s);
+        let offset = if seg.support_fraction >= 0.7
+            && seg.kind != MoveKind::Overhang
+            && seg.kind != MoveKind::Bridge
+        {
+            let norm = slice_normal(base_p);
+            -((1.0 - h_frac) * layer_height) * norm
+        } else {
+            DVec3::ZERO
+        };
+        lead_in_pts.push(base_p + offset);
+    }
+
+    for (k, &pt) in lead_in_pts.iter().enumerate().take(k_steps) {
+        let t = (k as f64 + 0.5) / (k_steps as f64);
+        let flow_frac = h_start + (1.0 - h_start) * t;
+        let s_mid = (k as f64 + 0.5) * delta_s;
+        let (_, mut seg, e_per_mm) = sample_at_distance(s_mid);
+        seg.extrusion_rate *= flow_frac;
+        seg.extrusion_length = e_per_mm * delta_s * flow_frac;
+        new_points.push(pt);
+        new_segments.push(seg);
+    }
+
+    // 2. Main loop body (from s = effective_scarf_len to s = total_len)
+    let p_scarf_end = lead_in_pts[k_steps];
+    new_points.push(p_scarf_end);
+
+    // Find the segment spanning effective_scarf_len
+    let mut span_idx = 0;
+    for i in 0..n {
+        if effective_scarf_len <= cum_dist[i + 1] || i == n - 1 {
+            span_idx = i;
+            break;
+        }
+    }
+
+    // Remainder of the spanning segment (from effective_scarf_len to cum_dist[span_idx + 1])
+    let rem_len = cum_dist[span_idx + 1] - effective_scarf_len;
+    if rem_len > 1e-6 {
+        let mut seg = orig_segments[span_idx];
+        let e_per_mm = if seg_lens[span_idx] > 1e-9 {
+            seg.extrusion_length / seg_lens[span_idx]
+        } else {
+            0.0
+        };
+        seg.extrusion_length = e_per_mm * rem_len;
+        new_segments.push(seg);
+        new_points.push(orig_points[(span_idx + 1) % n]);
+    }
+
+    // Subsequent full segments up to total_len (which ends at orig_points[0])
+    for i in (span_idx + 1)..n {
+        let seg = orig_segments[i];
+        new_segments.push(seg);
+        new_points.push(orig_points[(i + 1) % n]);
+    }
+
+    // 3. Lead-out overlap ramp (k = 0..k_steps)
+    let mut lead_out_pts = Vec::with_capacity(k_steps + 1);
+    for k in 0..=k_steps {
+        let s = (k as f64) * delta_s;
+        let (base_p, _, _) = sample_at_distance(s);
+        lead_out_pts.push(base_p);
+    }
+
+    for k in 0..k_steps {
+        let t = (k as f64 + 0.5) / (k_steps as f64);
+        let flow_frac = (1.0 - h_start) * (1.0 - t);
+        let s_mid = (k as f64 + 0.5) * delta_s;
+        let (_, mut seg, e_per_mm) = sample_at_distance(s_mid);
+        seg.extrusion_rate *= flow_frac;
+        seg.extrusion_length = e_per_mm * delta_s * flow_frac;
+        new_segments.push(seg);
+        new_points.push(lead_out_pts[k + 1]);
+    }
+
+    *points = new_points;
+    *segments = new_segments;
 }
 
 #[cfg(test)]
@@ -1228,56 +1368,85 @@ mod tests {
         use crate::toolpath::Segment;
 
         let mut points = vec![
-            DVec3::new(0.0, 0.0, 0.0),
-            DVec3::new(20.0, 0.0, 0.0),
-            DVec3::new(20.0, 20.0, 0.0),
-            DVec3::new(0.0, 20.0, 0.0),
+            DVec3::new(0.0, 0.0, 1.0),
+            DVec3::new(20.0, 0.0, 1.0),
+            DVec3::new(20.0, 20.0, 1.0),
+            DVec3::new(0.0, 20.0, 1.0),
         ];
         let mut segments = vec![
             Segment {
                 kind: MoveKind::WallOuter,
                 extrusion_length: 10.0,
                 extrusion_rate: 1.0,
+                support_fraction: 1.0,
                 ..Segment::default()
             },
             Segment {
                 kind: MoveKind::WallOuter,
                 extrusion_length: 10.0,
                 extrusion_rate: 1.0,
+                support_fraction: 1.0,
                 ..Segment::default()
             },
             Segment {
                 kind: MoveKind::WallOuter,
                 extrusion_length: 10.0,
                 extrusion_rate: 1.0,
+                support_fraction: 1.0,
                 ..Segment::default()
             },
             Segment {
                 kind: MoveKind::WallOuter,
                 extrusion_length: 10.0,
                 extrusion_rate: 1.0,
+                support_fraction: 1.0,
                 ..Segment::default()
             },
         ];
 
-        apply_scarf_joint(&mut points, &mut segments, 3.0);
+        // 8.0mm scarf joint with 9 steps, 10% start height, 0.2mm layer height on planar order field
+        apply_scarf_joint(&mut points, &mut segments, 8.0, 9, 0.10, 0.2, None);
 
-        // Initial 20mm segment split at 3.0mm (lead-in) + remaining 17mm + 3 segments + 1 overlapping tail = 6 segments
-        assert_eq!(points.len(), 6);
-        assert_eq!(segments.len(), 6);
+        // 9 lead-in segments + 1 body segment + 3 remaining full segments + 9 lead-out segments = 22 segments
+        // Waypoints: 22 + 1 = 23 points
+        assert_eq!(segments.len(), 22);
+        assert_eq!(points.len(), 23);
 
-        // Split point at 3.0mm
-        assert!((points[1].x - 3.0).abs() < 1e-4);
-        // Lead-in has 0.5x average flow
-        assert!((segments[0].extrusion_rate - 0.5).abs() < 1e-4);
-        // Remainder has 1.0x flow
-        assert_eq!(segments[1].extrusion_rate, 1.0);
-        // Tail overlap has 0.5x average flow
-        assert!((segments[5].extrusion_rate - 0.5).abs() < 1e-4);
+        // Lead-in start (point 0) is lowered by -0.90 * 0.2mm = -0.18mm in Z (normal = DVec3::Z)
+        assert!((points[0].z - (1.0 - 0.18)).abs() < 1e-4);
+        assert_eq!(points[0].x, 0.0);
 
-        // Overlap region total extrusion = 0.5 * 1.5 + 0.5 * 1.5 = 1.5mm (exact nominal amount for 3.0mm of 20mm/10.0E)
-        let overlap_e = segments[0].extrusion_length + segments[5].extrusion_length;
-        assert!((overlap_e - 1.5).abs() < 1e-4);
+        // Lead-in end (point 9) reaches nominal height (Z = 1.0) and distance 8.0mm
+        assert!((points[9].z - 1.0).abs() < 1e-4);
+        assert!((points[9].x - 8.0).abs() < 1e-4);
+
+        // First lead-in segment has flow factor starting near 10% (midpoint at t = 0.5/9 ≈ 0.0556 -> 0.10 + 0.90*0.0556 ≈ 0.15)
+        assert!(segments[0].extrusion_rate < 0.20);
+        assert!(segments[0].extrusion_rate > 0.10);
+
+        // Last lead-in segment has flow factor near 100% (midpoint at t = 8.5/9 ≈ 0.9444 -> 0.10 + 0.90*0.9444 ≈ 0.95)
+        assert!(segments[8].extrusion_rate > 0.90);
+
+        // Lead-out overlap starts at nominal height (Z = 1.0) from x = 0.0 to x = 8.0
+        let lead_out_start_idx = 9 + 4; // after 9 lead-in + 4 body moves = idx 13
+        assert_eq!(points[lead_out_start_idx].x, 0.0);
+        assert_eq!(points[lead_out_start_idx].z, 1.0);
+
+        // Volume conservation: Across the 8mm overlap, total lead-in E + total lead-out E equals exact nominal E (4.0mm of 10.0E / 20mm = 4.0E)
+        let mut lead_in_e = 0.0;
+        for seg in segments.iter().take(9) {
+            lead_in_e += seg.extrusion_length;
+        }
+        let mut lead_out_e = 0.0;
+        for seg in segments.iter().take(22).skip(13) {
+            lead_out_e += seg.extrusion_length;
+        }
+        let total_scarf_e = lead_in_e + lead_out_e;
+        let expected_nominal_8mm_e = 10.0 * (8.0 / 20.0); // 4.0 mm filament
+        assert!(
+            (total_scarf_e - expected_nominal_8mm_e).abs() < 1e-4,
+            "Total scarf extrusion {total_scarf_e} must equal exact nominal volume {expected_nominal_8mm_e}"
+        );
     }
 
     #[test]

@@ -80,7 +80,9 @@ A `Profile` JSON bundles two top-level objects:
     "wave_overhang_speed": 1500.0,
     "wave_overhang_flow": 1.05,
     "scarf_joint_enabled": true,
-    "scarf_joint_length": 3.0,
+    "scarf_joint_length": 8.0,
+    "scarf_joint_steps": 9,
+    "scarf_joint_start_height_fraction": 0.10,
     "fluid_dynamics": {
       "pa_calibration_low": [0.045, 2.0],
       "pa_calibration_high": [0.030, 15.0],
