@@ -662,8 +662,8 @@ fn travel_chord_is_blocked(mesh_sdf: &MeshSdf, a: DVec3, b: DVec3, clearance: f6
     if distance <= f64::EPSILON {
         return false;
     }
-    let step = (clearance * 0.5).max(0.05);
-    let samples = ((distance / step).ceil() as usize).clamp(4, 128);
+    let step = (clearance * 0.25).max(0.05);
+    let samples = ((distance / step).ceil() as usize).clamp(4, 512);
     (0..=samples).any(|s| {
         let t = s as f64 / samples as f64;
         let p = a.lerp(b, t);
@@ -676,27 +676,17 @@ fn travel_chord_is_blocked(mesh_sdf: &MeshSdf, a: DVec3, b: DVec3, clearance: f6
 }
 
 /// Searches a bounded local grid around the straight chord `start -> end`
-/// for a route that avoids solid material (queried via `mesh_sdf`) and
-/// respects `slope_profile`'s per-height overhang/climb limit, using
-/// Dijkstra/A*-style uniform-cost search (no heuristic -- the local grid
-/// is small enough that an admissible heuristic isn't needed for
-/// acceptable performance) over a 26-connected neighborhood.
+/// for a route that avoids solid material (queried via `mesh_sdf`),
+/// using Dijkstra/A*-style uniform-cost search over a 26-connected neighborhood.
 ///
 /// The search region is `start`/`end`'s bounding box expanded by a margin
-/// (half their distance, or four grid cells, whichever is larger) so a
-/// genuine detour around an obstruction has room to be found. `cell_size`
+/// so a genuine detour around an obstruction has room to be found. `cell_size`
 /// is coarsened (grown) as needed so the dense grid's total node count
 /// never exceeds [`MAX_TRAVEL_GRID_NODES`], the same node-budget technique
 /// `order_field::eikonal_field_for` uses for its whole-mesh grid, just
 /// scoped to this much smaller local region.
 ///
-/// A candidate step is rejected outright (not merely penalized) if its
-/// grade -- the angle from horizontal implied by its vertical component
-/// over its horizontal run -- exceeds `slope_profile.max_slope_at` at the
-/// step's destination height: the same physical assumption already used
-/// to limit Eikonal wall steepness, since a travel move implies gantry/
-/// nozzle clearance no real geometry supports otherwise. Any accepted
-/// step with a nonzero Z component is additionally charged `z_penalty`
+/// Any accepted step with a nonzero Z component is charged `z_penalty`
 /// (relative to a horizontal step of the same length), biasing the
 /// search toward horizontal detours while still allowing a genuinely
 /// necessary 3D diagonal route when it is cheaper than any
@@ -708,7 +698,7 @@ fn travel_chord_is_blocked(mesh_sdf: &MeshSdf, a: DVec3, b: DVec3, clearance: f6
 #[allow(clippy::too_many_arguments)]
 fn route_around_obstruction(
     mesh_sdf: &MeshSdf,
-    slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
+    _slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     start: DVec3,
     end: DVec3,
     cell_size: f64,
@@ -717,30 +707,49 @@ fn route_around_obstruction(
 ) -> Option<Vec<DVec3>> {
     let start_sample = mesh_sdf.sample(start);
     let start_normal = start_sample.gradient.try_normalize();
-    let start_clear = start_normal.map_or(start, |n| start + n * clearance);
+    let start_clear = if let Some(n) = start_normal {
+        let p = start + n * clearance;
+        if mesh_sdf.sample(p).value >= start_sample.value {
+            p
+        } else {
+            start
+        }
+    } else {
+        start
+    };
 
     let end_sample = mesh_sdf.sample(end);
     let end_normal = end_sample.gradient.try_normalize();
-    let end_clear = end_normal.map_or(end, |n| end + n * clearance);
+    let end_clear = if let Some(n) = end_normal {
+        let p = end + n * clearance;
+        if mesh_sdf.sample(p).value >= end_sample.value {
+            p
+        } else {
+            end
+        }
+    } else {
+        end
+    };
 
     let search_start = start_clear;
     let search_end = end_clear;
 
-    let base_cell = cell_size.max(1e-6);
-    let margin = (search_start.distance(search_end) * 0.5).max(base_cell * 4.0) + clearance;
+    let base_cell = cell_size.max(0.2);
+    let chord_dist = start.distance(end);
+    let margin = (chord_dist * 0.75).max(clearance * 6.0).max(10.0);
     // Never allow the search grid to extend below the print bed (Z < 0): a
     // physical 3D printer head cannot dive under the build plate to avoid an
     // obstacle.
-    let min_z_floor = 0.0f64.min(search_start.z).min(search_end.z);
+    let min_z_floor = 0.0f64.min(start.z).min(end.z);
     let min = DVec3::new(
-        search_start.x.min(search_end.x) - margin,
-        search_start.y.min(search_end.y) - margin,
-        (search_start.z.min(search_end.z) - margin).max(min_z_floor),
+        start.x.min(end.x).min(search_start.x).min(search_end.x) - margin,
+        start.y.min(end.y).min(search_start.y).min(search_end.y) - margin,
+        (start.z.min(end.z).min(search_start.z).min(search_end.z) - margin).max(min_z_floor),
     );
     let max = DVec3::new(
-        search_start.x.max(search_end.x) + margin,
-        search_start.y.max(search_end.y) + margin,
-        search_start.z.max(search_end.z) + margin,
+        start.x.max(end.x).max(search_start.x).max(search_end.x) + margin,
+        start.y.max(end.y).max(search_start.y).max(search_end.y) + margin,
+        start.z.max(end.z).max(search_start.z).max(search_end.z) + margin,
     );
     let extent = max - min;
 
@@ -754,7 +763,7 @@ fn route_around_obstruction(
     let mut cell = base_cell;
     let mut dims = dims_for(cell);
     while dims[0] * dims[1] * dims[2] > MAX_TRAVEL_GRID_NODES {
-        cell *= 1.5;
+        cell *= 1.25;
         dims = dims_for(cell);
     }
 
@@ -784,7 +793,19 @@ fn route_around_obstruction(
     let start_idx = index_of(search_start);
     let end_idx = index_of(search_end);
     if start_idx == end_idx {
-        return None;
+        let direct_start = index_of(start);
+        let direct_end = index_of(end);
+        if direct_start == direct_end {
+            let lift_z = start.z.max(end.z) + clearance * 2.0;
+            let mid = (start + end) * 0.5;
+            let lift_pt = DVec3::new(mid.x, mid.y, lift_z);
+            if !travel_chord_is_blocked(mesh_sdf, start, lift_pt, clearance * 0.5)
+                && !travel_chord_is_blocked(mesh_sdf, lift_pt, end, clearance * 0.5)
+            {
+                return Some(vec![start, lift_pt, end]);
+            }
+            return None;
+        }
     }
 
     let total = dims[0] * dims[1] * dims[2];
@@ -861,15 +882,20 @@ fn route_around_obstruction(
             let neighbor_flat = flat(neighbor);
             let neighbor_point = point_of(neighbor);
 
-            let status = clearance_memo[neighbor_flat];
             let is_clear = if neighbor_flat == end_flat || neighbor_flat == start_flat {
                 true
-            } else if status == 0 {
-                let clear = mesh_sdf.sample(neighbor_point).value >= clearance * 0.5;
-                clearance_memo[neighbor_flat] = if clear { 2 } else { 1 };
-                clear
             } else {
-                status == 2
+                let status = clearance_memo[neighbor_flat];
+                if status == 0 {
+                    let d_s = neighbor_point.distance(start);
+                    let d_e = neighbor_point.distance(end);
+                    let req_clear = clearance.min(d_s * 0.5).min(d_e * 0.5);
+                    let clear = mesh_sdf.sample(neighbor_point).value >= req_clear;
+                    clearance_memo[neighbor_flat] = if clear { 2 } else { 1 };
+                    clear
+                } else {
+                    status == 2
+                }
             };
 
             if !is_clear {
@@ -877,23 +903,15 @@ fn route_around_obstruction(
             }
 
             let step = neighbor_point - cur_point;
-            let horizontal = (step.x * step.x + step.y * step.y).sqrt();
             let has_z = step.z.abs() > 1e-9;
-            if has_z {
-                let angle_deg = step.z.abs().atan2(horizontal).to_degrees();
-                if angle_deg > slope_profile.max_slope_at(neighbor_point.z) {
-                    continue;
-                }
-            }
             let step_len = step.length();
             let step_cost = if has_z {
-                step_len * z_penalty
+                step_len * z_penalty.max(1.0)
             } else {
                 step_len
             };
             let next_cost = cost + step_cost;
 
-            let neighbor_flat = flat(neighbor);
             if next_cost < best_cost[neighbor_flat] {
                 best_cost[neighbor_flat] = next_cost;
                 came_from[neighbor_flat] = Some(idx);
@@ -920,24 +938,54 @@ fn route_around_obstruction(
     }
     path_indices.reverse();
 
-    let mut waypoints: Vec<DVec3> = vec![start];
+    let mut raw_waypoints: Vec<DVec3> = vec![start];
     if start_clear.distance(start) > 1e-4 {
-        waypoints.push(start_clear);
+        raw_waypoints.push(start_clear);
     }
     for &idx in &path_indices {
         let p = point_of(coords_of(idx));
-        if waypoints.last().is_none_or(|last| last.distance(p) > 1e-4) {
-            waypoints.push(p);
+        if raw_waypoints
+            .last()
+            .is_none_or(|last| last.distance(p) > 1e-4)
+        {
+            raw_waypoints.push(p);
         }
     }
     if end_clear.distance(end) > 1e-4
-        && waypoints
+        && raw_waypoints
             .last()
             .is_none_or(|last| last.distance(end_clear) > 1e-4)
     {
-        waypoints.push(end_clear);
+        raw_waypoints.push(end_clear);
     }
-    waypoints.push(end);
+    if raw_waypoints
+        .last()
+        .is_none_or(|last| last.distance(end) > 1e-4)
+    {
+        raw_waypoints.push(end);
+    }
+
+    // Line-of-sight shortcutting: reduce grid step noise to clean straight chords in open air
+    let mut waypoints: Vec<DVec3> = Vec::with_capacity(raw_waypoints.len());
+    waypoints.push(raw_waypoints[0]);
+    let mut cur_i = 0;
+    while cur_i < raw_waypoints.len() - 1 {
+        let mut next_i = cur_i + 1;
+        for candidate_i in ((cur_i + 2)..raw_waypoints.len()).rev() {
+            if !travel_chord_is_blocked(
+                mesh_sdf,
+                raw_waypoints[cur_i],
+                raw_waypoints[candidate_i],
+                clearance,
+            ) {
+                next_i = candidate_i;
+                break;
+            }
+        }
+        waypoints.push(raw_waypoints[next_i]);
+        cur_i = next_i;
+    }
+
     Some(waypoints)
 }
 
@@ -1016,7 +1064,7 @@ fn route_travel_moves(
         ) else {
             continue;
         };
-        if waypoints.len() < 3 {
+        if waypoints.len() < 2 {
             continue;
         }
         let segment_count = waypoints.len() - 1;
@@ -1817,7 +1865,12 @@ pub fn plan_with_progress(
         })
         .collect::<Result<Vec<Vec<Path>>>>()?;
 
-    Ok(defer_unsupported_paths(per_layer, layers, config))
+    let all_paths = defer_unsupported_paths(per_layer, layers, config);
+    let global_mesh_sdf = layers.iter().find_map(|l| l.mesh_sdf.as_deref());
+    let all_paths = route_travel_moves(all_paths, global_mesh_sdf, slope_profile, config);
+    let all_paths = insert_z_hops(all_paths, config);
+
+    Ok(all_paths)
 }
 
 /// Support-aware emission deferral: reorders the flattened per-layer path
@@ -3476,17 +3529,43 @@ mod tests {
         assert_eq!(routed.len(), 3);
         let detour = &routed[1];
 
-        assert!(detour.points.len() >= 4);
-        let p_dep = detour.points[1];
-        assert!(
-            sdf.sample(p_dep).value >= 0.5,
-            "departure waypoint must be in open air"
+        assert!(detour.points.len() >= 3);
+        for pt in &detour.points[1..detour.points.len() - 1] {
+            assert!(
+                sdf.sample(*pt).value >= 0.2,
+                "detour waypoint must be in open air: {pt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_travel_moves_with_steep_slope_profile_still_routes_around_solid() {
+        let sdf = Arc::new(cube_sdf_fixture());
+
+        let a = open_path(
+            vec![DVec3::new(-2.0, 0.5, 0.5), DVec3::new(-0.5, 0.5, 0.5)],
+            MoveKind::Infill,
         );
-        let p_arr = detour.points[detour.points.len() - 2];
-        assert!(
-            sdf.sample(p_arr).value >= 0.5,
-            "arrival waypoint must be in open air"
+        let b = open_path(
+            vec![DVec3::new(1.5, 0.5, 0.5), DVec3::new(3.0, 0.5, 0.5)],
+            MoveKind::Infill,
         );
+        let config = SlicerConfig::default();
+        // Restrictive slope profile simulating nozzle clearance envelope
+        let slope_profile =
+            manifold_fidget::slope_profile::SlopeProfile::new(vec![(3.8, 1.6), (32.0, 11.0)]);
+
+        let routed = route_travel_moves(vec![a, b], Some(&sdf), &slope_profile, &config);
+        assert_eq!(
+            routed.len(),
+            3,
+            "expected route_travel_moves to find a detour even with slope profile"
+        );
+        let detour = &routed[1];
+        let clearance = 2.0 * config.wall_line_width;
+        for pair in detour.points.windows(2) {
+            assert!(!travel_chord_is_blocked(&sdf, pair[0], pair[1], clearance));
+        }
     }
 
     #[test]

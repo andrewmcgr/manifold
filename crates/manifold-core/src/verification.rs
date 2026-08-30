@@ -146,9 +146,10 @@ pub fn find_unsupported_patches(
     let layer_height = config.layer_height.abs().max(f64::EPSILON);
     // "Rests on floor" convention (see `gcode`): the bed sits at the
     // lowest deposited point.
-    let bed_z = paths
+    let bed_z = layers
         .iter()
-        .flat_map(|p| p.points.iter())
+        .flat_map(|layer| &layer.loops)
+        .flat_map(|wall| &wall.points)
         .map(|p| p.z)
         .fold(f64::INFINITY, f64::min);
 
@@ -451,9 +452,10 @@ pub fn floating_loops(
     };
 
     let layer_height = config.layer_height.abs().max(f64::EPSILON);
-    let bed_z = paths
+    let bed_z = layers
         .iter()
-        .flat_map(|p| p.points.iter())
+        .flat_map(|layer| &layer.loops)
+        .flat_map(|wall| &wall.points)
         .map(|p| p.z)
         .fold(f64::INFINITY, f64::min);
     let sdf_tolerance = 0.5 * config.nozzle_diameter;
