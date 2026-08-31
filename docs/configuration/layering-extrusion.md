@@ -19,9 +19,12 @@ This section describes all slicing parameters governing layer heights, perimeter
 
 | Key in JSON | Type | Default | Description |
 |---|---|---|---|
-| `wall_line_width` | `f64` | `0.40` | Nominal extrusion line width for perimeter walls. |
+| `wall_line_width` | `f64` | `0.40` | Advisory target extrusion line width for perimeter walls. |
 | `shell_thickness` | `f64` | `0.80` | Total perimeter shell thickness ($N_{\text{walls}} = \text{round}(\text{thickness} / \text{width})$). |
-| `wall_offset` | `f64` | `0.20` | Distance from geometric surface to outer perimeter centerline ($0.5 \times d_{\text{nozzle}}$). |
+| `min_bead_width_ratio` | `Option<f64>` | `0.70` | Physical minimum bead width multiplier ($0.70 \times d_{\text{nozzle}}$) preventing starve-out on narrow features. |
+| `max_bead_width_ratio` | `Option<f64>` | `1.60` | Physical maximum bead width multiplier ($1.60 \times d_{\text{nozzle}}$) preventing un-ironed melt escape. |
+| `curvature_compensation_enabled` | `Option<bool>` | `true` | Dynamic in-plane curvature compensation reducing inner-radius over-packing on tight turns ($R < 10 \cdot w$). |
+| `wall_offset` | `f64` | `0.20` | *Deprecated*. Outer perimeter offset is now derived dynamically from bead width and nozzle aperture. |
 
 ---
 

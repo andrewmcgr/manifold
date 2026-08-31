@@ -881,6 +881,7 @@ pub fn apply_wipe_moves(
         speed: last_seg.speed,
         order: last_seg.order,
         support_fraction: last_seg.support_fraction,
+        line_width: 0.0,
     };
 
     points.push(p_wipe);

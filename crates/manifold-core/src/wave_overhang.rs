@@ -838,6 +838,7 @@ pub fn plan_wave_overhangs(
                             support_fraction: 0.0,
                             order: layers[k].order,
                             extrusion_length: 0.0,
+                            line_width: config.wall_line_width,
                         })
                         .collect();
 
@@ -898,6 +899,7 @@ mod tests {
                 unsupported: vec![false; loop_points.len()],
                 top_surface: vec![false; loop_points.len()],
                 arc_fraction: vec![0.0; loop_points.len()],
+                line_widths: vec![0.4; loop_points.len()],
             }],
             infill_boundary: vec![loop_points],
             solid_fill_boundary: Vec::new(),

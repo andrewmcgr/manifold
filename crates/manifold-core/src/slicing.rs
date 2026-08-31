@@ -204,6 +204,9 @@ pub struct WallLoop {
     /// direct indexing, mirroring `unsupported`'s existing read pattern
     /// in `plan`).
     pub top_surface: Vec<bool>,
+    /// Per-point dynamic line width in mm (parallel to `points`).
+    /// When empty, downstream toolpath planning falls back to nominal configured line width.
+    pub line_widths: Vec<f64>,
 }
 
 /// Build/order direction: conventional planar slicing along
@@ -668,11 +671,13 @@ pub fn slice_mesh_with_progress(
                     );
                     loops.extend(wall_loops.into_iter().map(|points| {
                         let arc_fraction = compute_arc_fractions(&points);
+                        let n_pts = points.len();
                         WallLoop {
                             wall_index,
-                            unsupported: vec![false; points.len()],
+                            unsupported: vec![false; n_pts],
                             top_surface: Vec::new(),
                             arc_fraction,
+                            line_widths: vec![config.wall_line_width; n_pts],
                             points,
                         }
                     }));
@@ -688,11 +693,13 @@ pub fn slice_mesh_with_progress(
                 );
                 loops.extend(wall0_loops.iter().cloned().map(|points| {
                     let arc_fraction = compute_arc_fractions(&points);
+                    let n_pts = points.len();
                     WallLoop {
                         wall_index: 0,
-                        unsupported: vec![false; points.len()],
+                        unsupported: vec![false; n_pts],
                         top_surface: Vec::new(),
                         arc_fraction,
+                        line_widths: vec![config.wall_line_width; n_pts],
                         points,
                     }
                 }));
@@ -729,11 +736,13 @@ pub fn slice_mesh_with_progress(
                     );
                     loops.extend(reconstructed.iter().cloned().map(|points| {
                         let arc_fraction = compute_arc_fractions(&points);
+                        let n_pts = points.len();
                         WallLoop {
                             wall_index,
-                            unsupported: vec![false; points.len()],
+                            unsupported: vec![false; n_pts],
                             top_surface: Vec::new(),
                             arc_fraction,
+                            line_widths: vec![config.wall_line_width; n_pts],
                             points,
                         }
                     }));
@@ -3777,6 +3786,7 @@ mod tests {
                     points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&[
                         DVec3::new(0.0, 0.0, 0.0),
                         DVec3::new(1.0, 0.0, 0.0),
@@ -3793,6 +3803,7 @@ mod tests {
                     points: vec![DVec3::new(0.01, 0.0, -0.05), DVec3::new(1.01, 0.0, -0.05)],
                     unsupported: vec![false, false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&[
                         DVec3::new(0.01, 0.0, -0.05),
                         DVec3::new(1.01, 0.0, -0.05),
@@ -3832,6 +3843,7 @@ mod tests {
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
                     unsupported: vec![false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0],
                 }],
                 order_field: Arc::clone(&field),
@@ -3845,6 +3857,7 @@ mod tests {
                     points: vec![DVec3::new(2.0, 0.0, -0.2)],
                     unsupported: vec![false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0],
                 }],
                 order_field: Arc::clone(&field),
@@ -3932,6 +3945,7 @@ mod tests {
                     wall_index: 0,
                     unsupported: vec![false; prev_points.len()],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&prev_points),
                     points: prev_points,
                 }],
@@ -3945,6 +3959,7 @@ mod tests {
                     wall_index: 0,
                     unsupported: vec![false; cur_points.len()],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&cur_points),
                     points: cur_points,
                 }],
@@ -4000,6 +4015,7 @@ mod tests {
                     wall_index: 0,
                     unsupported: vec![false; prev_points.len()],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&prev_points),
                     points: prev_points,
                 }],
@@ -4013,6 +4029,7 @@ mod tests {
                     wall_index: 0,
                     unsupported: vec![false; cur_points.len()],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&cur_points),
                     points: cur_points,
                 }],
@@ -4167,6 +4184,7 @@ mod tests {
                     arc_fraction: compute_arc_fractions(&prev_points),
                     unsupported: vec![false; prev_points.len()],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     points: prev_points,
                 }],
                 order_field: Arc::clone(&field),
@@ -4180,6 +4198,7 @@ mod tests {
                     arc_fraction: compute_arc_fractions(&cur_points),
                     unsupported: vec![false; cur_points.len()],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     points: cur_points,
                 }],
                 order_field: Arc::clone(&field),
@@ -4262,6 +4281,7 @@ mod tests {
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
                     unsupported: vec![false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0],
                 }],
                 order_field: Arc::clone(&field),
@@ -4275,6 +4295,7 @@ mod tests {
                     points: vec![DVec3::new(7.0, 0.0, -0.2)],
                     unsupported: vec![false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0],
                 }],
                 order_field: Arc::clone(&field),
@@ -4463,6 +4484,7 @@ mod tests {
                         points: vec![DVec3::new(0.0, 0.0, 0.0)],
                         unsupported: vec![false],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
@@ -4470,6 +4492,7 @@ mod tests {
                         points: vec![DVec3::new(100.0, 0.0, 0.0)],
                         unsupported: vec![false],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                 ],
@@ -4485,6 +4508,7 @@ mod tests {
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
                         unsupported: vec![false],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
@@ -4492,6 +4516,7 @@ mod tests {
                         points: vec![DVec3::new(102.0, 0.0, -0.2)],
                         unsupported: vec![false],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                 ],
@@ -4545,6 +4570,7 @@ mod tests {
                         points: vec![DVec3::new(0.0, 0.0, 0.0)],
                         unsupported: vec![false],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
@@ -4552,6 +4578,7 @@ mod tests {
                         points: vec![DVec3::new(100.0, 0.0, 0.0)],
                         unsupported: vec![false],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                 ],
@@ -4570,6 +4597,7 @@ mod tests {
                         points: vec![DVec3::new(102.0, 0.0, -0.2)],
                         unsupported: vec![false],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
@@ -4577,6 +4605,7 @@ mod tests {
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
                         unsupported: vec![false],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                 ],
@@ -4641,6 +4670,7 @@ mod tests {
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
                     unsupported: vec![false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0],
                 }],
                 order_field: Arc::clone(&field),
@@ -4655,6 +4685,7 @@ mod tests {
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
                         unsupported: vec![false],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
@@ -4662,6 +4693,7 @@ mod tests {
                         points: vec![DVec3::new(1000.0, 0.0, -0.2)],
                         unsupported: vec![false],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
                     },
                 ],
@@ -4734,6 +4766,7 @@ mod tests {
                     wall_index: 0,
                     unsupported: vec![false; big_square.len()],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&big_square),
                     points: big_square,
                 }],
@@ -4747,6 +4780,7 @@ mod tests {
                     wall_index: 0,
                     unsupported: vec![false; small_square.len()],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&small_square),
                     points: small_square.clone(),
                 }],
@@ -4841,6 +4875,7 @@ mod tests {
                         wall_index: 0,
                         unsupported: vec![false; prev_a.len()],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: compute_arc_fractions(&prev_a),
                         points: prev_a,
                     },
@@ -4848,6 +4883,7 @@ mod tests {
                         wall_index: 0,
                         unsupported: vec![false; prev_b.len()],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: compute_arc_fractions(&prev_b),
                         points: prev_b,
                     },
@@ -4855,6 +4891,7 @@ mod tests {
                         wall_index: 0,
                         unsupported: vec![false; prev_decoy.len()],
                         top_surface: Vec::new(),
+                        line_widths: Vec::new(),
                         arc_fraction: compute_arc_fractions(&prev_decoy),
                         points: prev_decoy,
                     },
@@ -4869,6 +4906,7 @@ mod tests {
                     wall_index: 0,
                     unsupported: vec![false; current.len()],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&current),
                     points: current.clone(),
                 }],

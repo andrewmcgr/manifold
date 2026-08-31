@@ -269,6 +269,7 @@ pub fn data_view_range(
                     support_fraction: 0.0,
                     order: path_order,
                     extrusion_length: 0.0,
+                    line_width: 0.0,
                 };
                 let val = segment_scalar_value(
                     &travel_segment,
@@ -455,6 +456,7 @@ pub fn build_toolpath_lines(
                     support_fraction: 0.0,
                     order: path_order,
                     extrusion_length: 0.0,
+                    line_width: 0.0,
                 };
                 let color = match data_view {
                     ToolpathDataView::LineType
@@ -608,6 +610,7 @@ mod tests {
                 support_fraction: 0.0,
                 order,
                 extrusion_length: 0.0,
+                line_width: 0.4,
             })
             .collect();
         Path {
@@ -702,6 +705,7 @@ mod tests {
                     support_fraction: 0.0,
                     order: 0.0,
                     extrusion_length: 1.0,
+                    line_width: 0.4,
                 },
                 Segment {
                     kind: MoveKind::WallOuter,
@@ -710,6 +714,7 @@ mod tests {
                     support_fraction: 0.0,
                     order: 0.0,
                     extrusion_length: 1.0,
+                    line_width: 0.4,
                 },
             ],
             tool: ToolId(0),
@@ -724,6 +729,7 @@ mod tests {
                     support_fraction: 0.0,
                     order: 0.2,
                     extrusion_length: 1.0,
+                    line_width: 0.4,
                 },
                 Segment {
                     kind: MoveKind::WallOuter,
@@ -732,6 +738,7 @@ mod tests {
                     support_fraction: 0.0,
                     order: 0.2,
                     extrusion_length: 1.0,
+                    line_width: 0.4,
                 },
             ],
             tool: ToolId(0),
@@ -809,6 +816,7 @@ mod tests {
                 support_fraction: 0.0,
                 order: 1.0,
                 extrusion_length: 0.3,
+                line_width: 0.4,
             },
             Segment {
                 kind: MoveKind::Infill,
@@ -817,6 +825,7 @@ mod tests {
                 support_fraction: 0.0,
                 order: 1.0,
                 extrusion_length: 0.3,
+                line_width: 0.4,
             },
             Segment {
                 kind: MoveKind::Travel,
@@ -825,6 +834,7 @@ mod tests {
                 support_fraction: 0.0,
                 order: 1.0,
                 extrusion_length: 0.0,
+                line_width: 0.0,
             },
         ];
         let path = Path {

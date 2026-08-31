@@ -1121,6 +1121,7 @@ fn route_travel_moves(
                     support_fraction: 0.0,
                     order,
                     extrusion_length: 0.0,
+                    line_width: 0.0,
                 })
                 .collect();
             Some((
@@ -1464,6 +1465,8 @@ pub struct Segment {
     /// `crate::extrusion`), `extrusion_rate`, and the printing tool's
     /// `Tool::extrusion_multiplier`.
     pub extrusion_length: f64,
+    /// Dynamic physical line width (mm) of this segment's deposited bead.
+    pub line_width: f64,
 }
 
 /// A single continuous toolpath (e.g. one perimeter or infill pass).
@@ -1669,6 +1672,11 @@ pub fn plan_with_progress(
                         } else {
                             base_kind
                         };
+                        let line_w = wall_loop
+                            .line_widths
+                            .get(dest)
+                            .copied()
+                            .unwrap_or(config.wall_line_width);
                         Segment {
                             kind,
                             speed: speed_for_kind(kind, config),
@@ -1676,6 +1684,7 @@ pub fn plan_with_progress(
                             support_fraction: 0.0,
                             order: layer.order,
                             extrusion_length: 0.0,
+                            line_width: line_w,
                         }
                     })
                     .collect();
@@ -1777,7 +1786,11 @@ pub fn plan_with_progress(
                         .clamp(0.05, 1.0);
                     let effective_distance = distance * slope_cosine;
 
-                    let line_width = extrusion::line_width_for_kind(segment.kind, config);
+                    let line_width = if segment.line_width > 1e-4 {
+                        segment.line_width
+                    } else {
+                        extrusion::line_width_for_kind(segment.kind, config)
+                    };
                     let (support_fraction, bed_fraction) = support_fractions_at(
                         (start + end) * 0.5,
                         segment.order,
@@ -1809,7 +1822,9 @@ pub fn plan_with_progress(
                         1.0
                     };
                     let is_overhang = segment.kind == MoveKind::Overhang;
-                    let bead_area = if is_overhang {
+                    let p_prev = path.points[(i + point_count - 1) % point_count];
+                    let r_curvature = extrusion::in_plane_radius_of_curvature(p_prev, start, end);
+                    let raw_bead_area = if is_overhang {
                         let track_w = config.nozzle_diameter - config.wave_overhang_overlap();
                         track_w * effective_layer_height * config.wave_overhang_flow()
                     } else {
@@ -1820,6 +1835,15 @@ pub fn plan_with_progress(
                             support_fraction,
                             bed_fraction,
                         )
+                    };
+                    let bead_area = if config.curvature_compensation_enabled() && !is_overhang {
+                        extrusion::curvature_compensated_bead_area(
+                            raw_bead_area,
+                            effective_line_width,
+                            r_curvature,
+                        )
+                    } else {
+                        raw_bead_area
                     };
 
                     // Directional slope flow compensation:
@@ -2136,6 +2160,7 @@ mod tests {
                 support_fraction: 0.0,
                 order: 0.0,
                 extrusion_length: 0.0,
+                line_width: 0.4,
             })
             .collect();
         Path {
@@ -2651,6 +2676,7 @@ mod tests {
                     points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
@@ -2658,6 +2684,7 @@ mod tests {
                     points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
             ],
@@ -2695,6 +2722,7 @@ mod tests {
                     points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
@@ -2702,6 +2730,7 @@ mod tests {
                     points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
@@ -2709,6 +2738,7 @@ mod tests {
                     points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
             ],
@@ -2768,6 +2798,7 @@ mod tests {
                     ],
                     unsupported: vec![false, false, true, false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.25, 0.5, 0.75],
                 },
                 // wall_index 1: no unsupported points -- must be unaffected
@@ -2777,6 +2808,7 @@ mod tests {
                     points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
                     top_surface: Vec::new(),
+                    line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
                 },
             ],
@@ -2834,6 +2866,7 @@ mod tests {
             support_fraction: 0.0,
             order: 0.0,
             extrusion_length: 1.23,
+            line_width: 0.4,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -2842,6 +2875,7 @@ mod tests {
             support_fraction: 0.0,
             order: 0.0,
             extrusion_length: 0.0,
+            line_width: 0.0,
         };
         let path = Path {
             points: vec![p0, p1, p2, p3],
@@ -2915,6 +2949,7 @@ mod tests {
             support_fraction: 0.0,
             order: 0.0,
             extrusion_length: 1.0,
+            line_width: 0.4,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -2923,6 +2958,7 @@ mod tests {
             support_fraction: 0.0,
             order: 0.0,
             extrusion_length: 0.0,
+            line_width: 0.0,
         };
         let path = Path {
             points: vec![p0, p1, p2, p3],
@@ -2965,6 +3001,7 @@ mod tests {
             support_fraction: 0.0,
             order: 0.0,
             extrusion_length: 0.0,
+            line_width: 0.0,
         };
         let infill_segment = Segment {
             kind: MoveKind::Infill,
@@ -2973,6 +3010,7 @@ mod tests {
             support_fraction: 0.0,
             order: 0.0,
             extrusion_length: 1.0,
+            line_width: 0.4,
         };
         let path = Path {
             points: vec![p0, p1, p2],
@@ -3008,6 +3046,7 @@ mod tests {
             support_fraction: 0.0,
             order: 0.0,
             extrusion_length: 1.23,
+            line_width: 0.4,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -3016,6 +3055,7 @@ mod tests {
             support_fraction: 0.0,
             order: 0.0,
             extrusion_length: 0.0,
+            line_width: 0.0,
         };
         // Only 2 segments for 3 points: no closing edge.
         let path = Path {
@@ -3070,6 +3110,7 @@ mod tests {
             support_fraction: 0.0,
             order: 0.0,
             extrusion_length: 1.23,
+            line_width: 0.4,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -3078,6 +3119,7 @@ mod tests {
             support_fraction: 0.0,
             order: 0.0,
             extrusion_length: 0.0,
+            line_width: 0.0,
         };
         let path = Path {
             points: vec![p0, p1, p2],
@@ -3135,6 +3177,7 @@ mod tests {
                 support_fraction: 0.0,
                 order: 0.0,
                 extrusion_length: 0.0,
+                line_width: 0.4,
             })
             .collect();
         Path {
@@ -3154,6 +3197,7 @@ mod tests {
                 support_fraction: 0.0,
                 order: 0.0,
                 extrusion_length: 0.0,
+                line_width: 0.4,
             })
             .collect();
         Path {
@@ -3540,6 +3584,7 @@ mod tests {
             path_simplify_enabled: true,
             path_simplify_tolerance: 0.05,
             scarf_joint_enabled: false,
+            curvature_compensation_enabled: Some(false),
             ..SlicerConfig::default()
         };
 
@@ -3926,6 +3971,7 @@ mod tests {
                 ],
                 wall_index: 0,
                 top_surface: vec![false; 4],
+                line_widths: Vec::new(),
                 arc_fraction: vec![0.0; 4],
                 unsupported: vec![false; 4],
             }],
@@ -3943,6 +3989,7 @@ mod tests {
                 points: vec![p0, p1, p2, p3],
                 wall_index: 0,
                 top_surface: vec![false; 4],
+                line_widths: Vec::new(),
                 arc_fraction: vec![0.0; 4],
                 unsupported: vec![false; 4],
             }],
@@ -3957,6 +4004,7 @@ mod tests {
             path_simplify_enabled: false,
             travel_order_optimization_enabled: false,
             travel_collision_avoidance_enabled: false,
+            curvature_compensation_enabled: Some(false),
             ..SlicerConfig::default()
         };
         let tools = vec![Tool::new(ToolId(0), 0.4)];
@@ -4005,6 +4053,7 @@ mod tests {
                 ],
                 wall_index: 0,
                 top_surface: vec![false; 4],
+                line_widths: Vec::new(),
                 arc_fraction: vec![0.0; 4],
                 unsupported: vec![false; 4],
             }],
@@ -4027,6 +4076,7 @@ mod tests {
                 ],
                 wall_index: 0,
                 top_surface: vec![false; 4],
+                line_widths: Vec::new(),
                 arc_fraction: vec![0.0; 4],
                 unsupported: vec![false; 4],
             }],

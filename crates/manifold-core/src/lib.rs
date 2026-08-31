@@ -76,9 +76,19 @@ pub struct SlicerConfig {
     /// clamped to a minimum of one.
     pub shell_thickness: f64,
     /// Inset of the outermost wall's nozzle-center path from the true
-    /// mesh surface, in mm. Defaults to half the nozzle diameter so the
-    /// nozzle's outer edge (not its center) lands on the surface.
+    /// mesh surface, in mm. Deprecated: wall centerline placement is derived
+    /// dynamically from nozzle geometry and bead width. Preserved for profile compatibility.
+    #[serde(default = "default_wall_offset")]
     pub wall_offset: f64,
+    /// Minimum physical bead width ratio relative to nozzle diameter (default 0.70).
+    #[serde(default)]
+    pub min_bead_width_ratio: Option<f64>,
+    /// Maximum physical bead width ratio relative to nozzle diameter (default 1.60).
+    #[serde(default)]
+    pub max_bead_width_ratio: Option<f64>,
+    /// Whether tight-radius corner curvature compensation is enabled (default true).
+    #[serde(default)]
+    pub curvature_compensation_enabled: Option<bool>,
     /// Infill pattern for sparse interior regions. Defaults to `InfillPatternKind::Cubic`.
     #[serde(default)]
     pub sparse_infill_pattern: Option<infill::InfillPatternKind>,
@@ -415,6 +425,11 @@ pub struct SlicerConfig {
     pub fluid_dynamics: Option<fluid_dynamics::FluidDynamicsConfig>,
 }
 
+/// Static serde-deserialize fallback for [`SlicerConfig::wall_offset`]: `0.20` mm.
+fn default_wall_offset() -> f64 {
+    0.20
+}
+
 /// Static serde-deserialize fallback for [`SlicerConfig::eikonal_enforce_monotonic_growth`]: `true`.
 fn default_eikonal_enforce_monotonic_growth() -> bool {
     true
@@ -501,6 +516,9 @@ impl Default for SlicerConfig {
             wall_line_width,
             shell_thickness: wall_line_width,
             wall_offset: nozzle_diameter / 2.0,
+            min_bead_width_ratio: None,
+            max_bead_width_ratio: None,
+            curvature_compensation_enabled: None,
             sparse_infill_pattern: Some(infill::InfillPatternKind::Cubic),
             solid_infill_pattern: Some(infill::InfillPatternKind::AllWalls),
             infill_pattern: infill::InfillPatternKind::Cubic,
@@ -749,6 +767,36 @@ impl SlicerConfig {
     #[must_use]
     pub fn filament_density(&self) -> f64 {
         self.filament_density_g_cm3.unwrap_or(1.24)
+    }
+
+    /// Minimum bead width ratio relative to nozzle diameter (default `0.70`).
+    #[must_use]
+    pub fn min_bead_width_ratio(&self) -> f64 {
+        self.min_bead_width_ratio.unwrap_or(0.70)
+    }
+
+    /// Maximum bead width ratio relative to nozzle diameter (default `1.60`).
+    #[must_use]
+    pub fn max_bead_width_ratio(&self) -> f64 {
+        self.max_bead_width_ratio.unwrap_or(1.60)
+    }
+
+    /// Minimum allowable physical bead width (mm).
+    #[must_use]
+    pub fn min_bead_width(&self) -> f64 {
+        self.min_bead_width_ratio() * self.nozzle_diameter
+    }
+
+    /// Maximum allowable physical bead width (mm).
+    #[must_use]
+    pub fn max_bead_width(&self) -> f64 {
+        self.max_bead_width_ratio() * self.nozzle_diameter
+    }
+
+    /// Whether tight-radius corner curvature compensation is enabled (default `true`).
+    #[must_use]
+    pub fn curvature_compensation_enabled(&self) -> bool {
+        self.curvature_compensation_enabled.unwrap_or(true)
     }
 
     /// Scarf joint overlap length (mm), defaulting to `8.0` mm when `None`.

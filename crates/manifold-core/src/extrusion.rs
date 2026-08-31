@@ -84,6 +84,52 @@ pub fn blended_bead_cross_section_area(
     airborne_blend + (rectangle - airborne_blend) * bed
 }
 
+/// Adjusts nominal bead cross-section area for in-plane path curvature $R = 1 / \kappa$ (mm)
+/// around tight corners or small circular loops:
+///
+/// $$A_{\text{curved}} = A_{\text{nominal}} \cdot \max\left(0.70, \, 1.0 - \frac{w}{2R}\right)$$
+///
+/// Prevents inner-edge melt over-packing on small circular bosses and sharp turns.
+#[must_use]
+pub fn curvature_compensated_bead_area(
+    nominal_area: f64,
+    line_width: f64,
+    radius_of_curvature: f64,
+) -> f64 {
+    if radius_of_curvature <= 1e-4 || !radius_of_curvature.is_finite() {
+        return nominal_area;
+    }
+    let r = radius_of_curvature.abs();
+    let ratio = (line_width / (2.0 * r)).clamp(0.0, 0.30);
+    nominal_area * (1.0 - ratio)
+}
+
+/// Evaluates in-plane radius of curvature (mm) from three consecutive 3D path points $(P_{i-1}, P_i, P_{i+1})$.
+///
+/// Uses Menger curvature (the circumradius of the triangle formed by the three points).
+/// Returns `f64::INFINITY` for collinear or degenerate points.
+#[must_use]
+pub fn in_plane_radius_of_curvature(
+    p_prev: glam::DVec3,
+    p_curr: glam::DVec3,
+    p_next: glam::DVec3,
+) -> f64 {
+    let a = (p_curr - p_prev).length();
+    let b = (p_next - p_curr).length();
+    let c = (p_next - p_prev).length();
+    if a <= 1e-6 || b <= 1e-6 || c <= 1e-6 {
+        return f64::INFINITY;
+    }
+    // Heron's formula for triangle area:
+    let s = (a + b + c) * 0.5;
+    let area_sq = s * (s - a) * (s - b) * (s - c);
+    if area_sq <= 1e-12 {
+        return f64::INFINITY;
+    }
+    let area = area_sq.sqrt();
+    (a * b * c) / (4.0 * area)
+}
+
 /// Cross-sectional area (mm^2) of the filament being fed, treated as a
 /// perfect circle of `filament_diameter` mm (1.75mm by default -- see
 /// [`SlicerConfig::filament_diameter`]).
@@ -219,6 +265,41 @@ mod tests {
             ..SlicerConfig::default()
         };
         assert_eq!(line_width_for_kind(MoveKind::Overhang, &config), 0.35);
+    }
+
+    #[test]
+    fn curvature_compensated_bead_area_reduces_volume_on_tight_curves() {
+        let nominal_area = 0.08;
+        let line_width = 0.4;
+        let r_tight = 1.5; // R = 1.5mm -> ratio = 0.4 / 3.0 ≈ 0.1333
+        let curved_area = curvature_compensated_bead_area(nominal_area, line_width, r_tight);
+        let expected = nominal_area * (1.0 - (0.4 / 3.0));
+        assert!((curved_area - expected).abs() < 1e-6);
+
+        // Infinite radius / straight line -> no reduction
+        let straight_area =
+            curvature_compensated_bead_area(nominal_area, line_width, f64::INFINITY);
+        assert_eq!(straight_area, nominal_area);
+    }
+
+    #[test]
+    fn in_plane_radius_of_curvature_computes_circumradius_correctly() {
+        use glam::DVec3;
+        // 90-degree circular arc of radius 2.0 at origin:
+        // p0 = (2.0, 0.0), p1 = (sqrt(2), sqrt(2)), p2 = (0.0, 2.0)
+        let p0 = DVec3::new(2.0, 0.0, 0.0);
+        let p1 = DVec3::new(2.0f64.sqrt(), 2.0f64.sqrt(), 0.0);
+        let p2 = DVec3::new(0.0, 2.0, 0.0);
+        let r = in_plane_radius_of_curvature(p0, p1, p2);
+        assert!((r - 2.0).abs() < 1e-4);
+
+        // Collinear line -> infinity
+        let r_collinear = in_plane_radius_of_curvature(
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(5.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 0.0),
+        );
+        assert!(!r_collinear.is_finite());
     }
 
     #[test]
