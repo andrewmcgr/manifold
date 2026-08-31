@@ -839,6 +839,7 @@ pub fn plan_wave_overhangs(
                             order: layers[k].order,
                             extrusion_length: 0.0,
                             line_width: config.wall_line_width,
+                            is_scarf: false,
                         })
                         .collect();
 

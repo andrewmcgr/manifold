@@ -132,6 +132,8 @@ pub struct ManifoldApp {
     /// ROADMAP.md).
     profile_error: Option<String>,
     next_tool_id: u32,
+    /// Identifiers of line types currently toggled off/hidden in the viewport.
+    hidden_line_types: std::collections::HashSet<crate::toolpath_view::LineTypeKey>,
     /// Summary statistics for the last successful slice (estimated time, filament volume/mass).
     print_statistics: Option<manifold_core::PrintStatistics>,
     /// Whether the SDF debug panel (Phase D, see MESH_SDF_VISUALIZATION.md)
@@ -219,6 +221,7 @@ impl ManifoldApp {
             gcode: None,
             toolpaths: None,
             toolpath_data_view: ToolpathDataView::default(),
+            hidden_line_types: std::collections::HashSet::new(),
             uploaded_toolpaths: None,
             show_toolpaths: true,
             mesh_overlay_mode: MeshOverlayMode::default(),
@@ -432,12 +435,13 @@ impl ManifoldApp {
     /// changes.
     fn reupload_toolpaths(&mut self, device: &eframe::egui_wgpu::wgpu::Device) {
         self.uploaded_toolpaths = self.toolpaths.as_ref().map(|paths| {
-            let instances = toolpath_view::build_toolpath_lines(
+            let instances = toolpath_view::build_toolpath_lines_filtered(
                 paths,
                 self.scrub_order,
                 self.toolpath_data_view,
                 &self.config,
                 Some(&self.machine),
+                &self.hidden_line_types,
             );
             Arc::new(UploadedToolpaths::upload(device, &instances))
         });
@@ -2523,24 +2527,63 @@ impl ManifoldApp {
                                 ui.add_space(3.0);
                                 match self.toolpath_data_view {
                                     ToolpathDataView::LineType => {
+                                        let mut toggled = false;
                                         for entry in toolpath_view::line_type_legend() {
+                                            let is_hidden =
+                                                self.hidden_line_types.contains(&entry.key);
                                             ui.horizontal(|ui| {
                                                 let (badge_rect, _) = ui.allocate_exact_size(
                                                     egui::vec2(10.0, 10.0),
                                                     egui::Sense::hover(),
                                                 );
                                                 let [r, g, b, a] = entry.color;
-                                                let color = egui::Color32::from_rgba_unmultiplied(
-                                                    (r * 255.0).round() as u8,
-                                                    (g * 255.0).round() as u8,
-                                                    (b * 255.0).round() as u8,
-                                                    (a * 255.0).round() as u8,
-                                                );
+                                                let color = if is_hidden {
+                                                    egui::Color32::from_rgba_unmultiplied(
+                                                        (r * 80.0).round() as u8,
+                                                        (g * 80.0).round() as u8,
+                                                        (b * 80.0).round() as u8,
+                                                        70,
+                                                    )
+                                                } else {
+                                                    egui::Color32::from_rgba_unmultiplied(
+                                                        (r * 255.0).round() as u8,
+                                                        (g * 255.0).round() as u8,
+                                                        (b * 255.0).round() as u8,
+                                                        (a * 255.0).round() as u8,
+                                                    )
+                                                };
                                                 ui.painter().rect_filled(badge_rect, 2.0, color);
-                                                ui.label(
-                                                    egui::RichText::new(entry.label).size(11.0),
-                                                );
+                                                let text = if is_hidden {
+                                                    egui::RichText::new(entry.label)
+                                                        .size(11.0)
+                                                        .color(egui::Color32::from_gray(120))
+                                                        .strikethrough()
+                                                } else {
+                                                    egui::RichText::new(entry.label).size(11.0)
+                                                };
+                                                if ui
+                                                    .selectable_label(!is_hidden, text)
+                                                    .on_hover_text(if is_hidden {
+                                                        "Click to show this line type"
+                                                    } else {
+                                                        "Click to hide this line type"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    if is_hidden {
+                                                        self.hidden_line_types.remove(&entry.key);
+                                                    } else {
+                                                        self.hidden_line_types.insert(entry.key);
+                                                    }
+                                                    toggled = true;
+                                                }
                                             });
+                                        }
+                                        if toggled {
+                                            if let Some(render_state) = frame.wgpu_render_state() {
+                                                let device = render_state.device.clone();
+                                                self.reupload_toolpaths(&device);
+                                            }
                                         }
                                     }
                                     view => {

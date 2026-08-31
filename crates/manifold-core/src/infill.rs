@@ -402,6 +402,7 @@ fn assemble_scanlines_into_paths(
                     order: layer.order,
                     extrusion_length: 0.0,
                     line_width: config.infill_line_width,
+                    is_scarf: false,
                 });
             }
             points.push(world);
@@ -879,6 +880,7 @@ fn generate_tpms_infill(
                 order: layer.order,
                 extrusion_length: 0.0,
                 line_width: config.infill_line_width,
+                is_scarf: false,
             })
             .collect();
         paths.push(Path {
@@ -1143,6 +1145,7 @@ impl InfillGenerator for ConcentricInfill {
                         order: layer.order,
                         extrusion_length: 0.0,
                         line_width: config.infill_line_width,
+                        is_scarf: false,
                     })
                     .collect();
                 Path {
@@ -1243,6 +1246,7 @@ impl InfillGenerator for AllWallsInfill {
                         order: layer.order,
                         extrusion_length: 0.0,
                         line_width: config.infill_line_width,
+                        is_scarf: false,
                     })
                     .collect();
                 Path {

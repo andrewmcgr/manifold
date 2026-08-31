@@ -1122,6 +1122,7 @@ fn route_travel_moves(
                     order,
                     extrusion_length: 0.0,
                     line_width: 0.0,
+                    is_scarf: false,
                 })
                 .collect();
             Some((
@@ -1467,6 +1468,8 @@ pub struct Segment {
     pub extrusion_length: f64,
     /// Dynamic physical line width (mm) of this segment's deposited bead.
     pub line_width: f64,
+    /// Whether this segment is part of a non-planar scarf joint seam ramp.
+    pub is_scarf: bool,
 }
 
 /// A single continuous toolpath (e.g. one perimeter or infill pass).
@@ -1685,6 +1688,7 @@ pub fn plan_with_progress(
                             order: layer.order,
                             extrusion_length: 0.0,
                             line_width: line_w,
+                            is_scarf: false,
                         }
                     })
                     .collect();
@@ -2161,6 +2165,7 @@ mod tests {
                 order: 0.0,
                 extrusion_length: 0.0,
                 line_width: 0.4,
+                is_scarf: false,
             })
             .collect();
         Path {
@@ -2867,6 +2872,7 @@ mod tests {
             order: 0.0,
             extrusion_length: 1.23,
             line_width: 0.4,
+            is_scarf: false,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -2876,6 +2882,7 @@ mod tests {
             order: 0.0,
             extrusion_length: 0.0,
             line_width: 0.0,
+            is_scarf: false,
         };
         let path = Path {
             points: vec![p0, p1, p2, p3],
@@ -2950,6 +2957,7 @@ mod tests {
             order: 0.0,
             extrusion_length: 1.0,
             line_width: 0.4,
+            is_scarf: false,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -2959,6 +2967,7 @@ mod tests {
             order: 0.0,
             extrusion_length: 0.0,
             line_width: 0.0,
+            is_scarf: false,
         };
         let path = Path {
             points: vec![p0, p1, p2, p3],
@@ -3002,6 +3011,7 @@ mod tests {
             order: 0.0,
             extrusion_length: 0.0,
             line_width: 0.0,
+            is_scarf: false,
         };
         let infill_segment = Segment {
             kind: MoveKind::Infill,
@@ -3011,6 +3021,7 @@ mod tests {
             order: 0.0,
             extrusion_length: 1.0,
             line_width: 0.4,
+            is_scarf: false,
         };
         let path = Path {
             points: vec![p0, p1, p2],
@@ -3047,6 +3058,7 @@ mod tests {
             order: 0.0,
             extrusion_length: 1.23,
             line_width: 0.4,
+            is_scarf: false,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -3056,6 +3068,7 @@ mod tests {
             order: 0.0,
             extrusion_length: 0.0,
             line_width: 0.0,
+            is_scarf: false,
         };
         // Only 2 segments for 3 points: no closing edge.
         let path = Path {
@@ -3111,6 +3124,7 @@ mod tests {
             order: 0.0,
             extrusion_length: 1.23,
             line_width: 0.4,
+            is_scarf: false,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -3120,6 +3134,7 @@ mod tests {
             order: 0.0,
             extrusion_length: 0.0,
             line_width: 0.0,
+            is_scarf: false,
         };
         let path = Path {
             points: vec![p0, p1, p2],
@@ -3178,6 +3193,7 @@ mod tests {
                 order: 0.0,
                 extrusion_length: 0.0,
                 line_width: 0.4,
+                is_scarf: false,
             })
             .collect();
         Path {
@@ -3198,6 +3214,7 @@ mod tests {
                 order: 0.0,
                 extrusion_length: 0.0,
                 line_width: 0.4,
+                is_scarf: false,
             })
             .collect();
         Path {

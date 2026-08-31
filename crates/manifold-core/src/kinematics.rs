@@ -882,6 +882,7 @@ pub fn apply_wipe_moves(
         order: last_seg.order,
         support_fraction: last_seg.support_fraction,
         line_width: 0.0,
+        is_scarf: false,
     };
 
     points.push(p_wipe);
@@ -1030,6 +1031,7 @@ pub fn apply_scarf_joint(
         let (_, mut seg, e_per_mm) = sample_at_distance(s_mid);
         seg.extrusion_rate *= flow_frac;
         seg.extrusion_length = e_per_mm * delta_s * flow_frac;
+        seg.is_scarf = true;
         new_points.push(pt);
         new_segments.push(seg);
     }
@@ -1083,6 +1085,7 @@ pub fn apply_scarf_joint(
         let (_, mut seg, e_per_mm) = sample_at_distance(s_mid);
         seg.extrusion_rate *= flow_frac;
         seg.extrusion_length = e_per_mm * delta_s * flow_frac;
+        seg.is_scarf = false;
         new_segments.push(seg);
         new_points.push(lead_out_pts[k + 1]);
     }

@@ -39,7 +39,21 @@ pub const COLOR_INFILL: [f32; 4] = [0.95, 0.65, 0.15, 1.0];
 pub const COLOR_BRIDGE: [f32; 4] = [0.9, 0.2, 0.75, 1.0];
 pub const COLOR_OVERHANG: [f32; 4] = [0.9, 0.15, 0.15, 1.0];
 pub const COLOR_TOP_SURFACE: [f32; 4] = [0.2, 0.85, 0.4, 1.0];
+pub const COLOR_SCARF_JOINT: [f32; 4] = [1.0, 0.80, 0.25, 1.0];
 pub const COLOR_TRAVEL: [f32; 4] = [0.35, 0.55, 0.75, 0.65];
+
+/// Identifiers for toggling individual line types on and off in the viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum LineTypeKey {
+    WallOuter,
+    WallInner,
+    Infill,
+    Bridge,
+    Overhang,
+    TopSurface,
+    ScarfJoint,
+    Travel,
+}
 
 /// Available data view color-coding modes for the toolpath preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -270,6 +284,7 @@ pub fn data_view_range(
                     order: path_order,
                     extrusion_length: 0.0,
                     line_width: 0.0,
+                    is_scarf: false,
                 };
                 let val = segment_scalar_value(
                     &travel_segment,
@@ -353,6 +368,7 @@ pub fn data_view_range(
 
 /// An entry in a toolpath viewport legend (color badge + descriptive label).
 pub struct LegendEntry {
+    pub key: LineTypeKey,
     pub label: &'static str,
     pub color: [f32; 4],
 }
@@ -361,30 +377,42 @@ pub struct LegendEntry {
 pub fn line_type_legend() -> &'static [LegendEntry] {
     &[
         LegendEntry {
+            key: LineTypeKey::WallOuter,
             label: "Outer Wall",
             color: COLOR_WALL_OUTER,
         },
         LegendEntry {
+            key: LineTypeKey::WallInner,
             label: "Inner Wall",
             color: COLOR_WALL_INNER,
         },
         LegendEntry {
+            key: LineTypeKey::Infill,
             label: "Infill",
             color: COLOR_INFILL,
         },
         LegendEntry {
+            key: LineTypeKey::Bridge,
             label: "Bridge",
             color: COLOR_BRIDGE,
         },
         LegendEntry {
+            key: LineTypeKey::Overhang,
             label: "Overhang",
             color: COLOR_OVERHANG,
         },
         LegendEntry {
+            key: LineTypeKey::TopSurface,
             label: "Top Surface",
             color: COLOR_TOP_SURFACE,
         },
         LegendEntry {
+            key: LineTypeKey::ScarfJoint,
+            label: "Scarf Joint",
+            color: COLOR_SCARF_JOINT,
+        },
+        LegendEntry {
+            key: LineTypeKey::Travel,
             label: "Travel",
             color: COLOR_TRAVEL,
         },
@@ -392,16 +420,20 @@ pub fn line_type_legend() -> &'static [LegendEntry] {
 }
 
 /// Fixed `MoveKind` -> RGBA color palette used for toolpath preview
-/// rendering.
-fn palette_color(kind: MoveKind) -> [f32; 4] {
-    match kind {
-        MoveKind::WallOuter => COLOR_WALL_OUTER,
-        MoveKind::WallInner => COLOR_WALL_INNER,
-        MoveKind::Infill => COLOR_INFILL,
-        MoveKind::Bridge => COLOR_BRIDGE,
-        MoveKind::Overhang => COLOR_OVERHANG,
-        MoveKind::TopSurface => COLOR_TOP_SURFACE,
-        MoveKind::Travel => COLOR_TRAVEL,
+/// rendering, with support for distinct scarf joint seam highlighting.
+pub fn palette_color(kind: MoveKind, is_scarf: bool) -> [f32; 4] {
+    if is_scarf {
+        COLOR_SCARF_JOINT
+    } else {
+        match kind {
+            MoveKind::WallOuter => COLOR_WALL_OUTER,
+            MoveKind::WallInner => COLOR_WALL_INNER,
+            MoveKind::Infill => COLOR_INFILL,
+            MoveKind::Bridge => COLOR_BRIDGE,
+            MoveKind::Overhang => COLOR_OVERHANG,
+            MoveKind::TopSurface => COLOR_TOP_SURFACE,
+            MoveKind::Travel => COLOR_TRAVEL,
+        }
     }
 }
 
@@ -409,29 +441,32 @@ fn palette_color(kind: MoveKind) -> [f32; 4] {
 /// line instance per `Segment` (`points[i] -> points[(i + 1) % points.len()]`),
 /// colored by `segment.kind` via [`palette_color`], with `segment.order` carried
 /// on each instance.
-///
-/// `scrub_order` implements the order-based scrub slider's "up to and
-/// including" semantics (Phase 13 subtask 05): only segments with
-/// `segment.order <= scrub_order` are included. Pass `f64::INFINITY` to
-/// include every segment (no filtering).
-///
-/// This is the **CPU-side rebuild-on-change** approach: the caller
-/// (`app.rs`'s `reupload_toolpaths`) re-runs this filter-and-rebuild step
-/// only when the slider value actually changes, then re-uploads the
-/// resulting buffer. That is simpler than threading a scrub uniform
-/// through `render.rs`'s bind-group setup and a shader-side `discard`, at
-/// the cost of a full CPU rebuild + GPU re-upload per slider-drag frame
-/// instead of a single per-frame uniform write — acceptable at the MVP
-/// single-object scale this phase targets (see `toolpath_shader.wgsl`'s
-/// doc comment, which reserves the per-instance `order` attribute for a
-/// possible future shader-side discard if drag interactivity ever becomes
-/// a problem).
+#[allow(dead_code)]
 pub fn build_toolpath_lines(
     paths: &[Path],
     scrub_order: f64,
     data_view: ToolpathDataView,
     config: &manifold_core::SlicerConfig,
     machine: Option<&manifold_core::machine::Machine>,
+) -> Vec<ToolpathLineInstance> {
+    build_toolpath_lines_filtered(
+        paths,
+        scrub_order,
+        data_view,
+        config,
+        machine,
+        &std::collections::HashSet::new(),
+    )
+}
+
+/// Build a line-instance buffer from a set of planned toolpaths with line type filtering.
+pub fn build_toolpath_lines_filtered(
+    paths: &[Path],
+    scrub_order: f64,
+    data_view: ToolpathDataView,
+    config: &manifold_core::SlicerConfig,
+    machine: Option<&manifold_core::machine::Machine>,
+    hidden_line_types: &std::collections::HashSet<LineTypeKey>,
 ) -> Vec<ToolpathLineInstance> {
     let scalar_range = data_view_range(paths, data_view, config, machine);
     let mut instances = Vec::new();
@@ -448,7 +483,10 @@ pub fn build_toolpath_lines(
 
         // Inter-path travel move from previous path end to this path start
         if let Some(prev_end) = prev_endpoint {
-            if prev_end.distance(path_start) > 1e-6 && path_order <= scrub_order {
+            if prev_end.distance(path_start) > 1e-6
+                && path_order <= scrub_order
+                && !hidden_line_types.contains(&LineTypeKey::Travel)
+            {
                 let travel_segment = manifold_core::toolpath::Segment {
                     kind: MoveKind::Travel,
                     speed: config.travel_speed,
@@ -457,6 +495,7 @@ pub fn build_toolpath_lines(
                     order: path_order,
                     extrusion_length: 0.0,
                     line_width: 0.0,
+                    is_scarf: false,
                 };
                 let color = match data_view {
                     ToolpathDataView::LineType
@@ -505,6 +544,24 @@ pub fn build_toolpath_lines(
             if segment.order > scrub_order {
                 continue;
             }
+
+            let key = if segment.is_scarf {
+                LineTypeKey::ScarfJoint
+            } else {
+                match segment.kind {
+                    MoveKind::WallOuter => LineTypeKey::WallOuter,
+                    MoveKind::WallInner => LineTypeKey::WallInner,
+                    MoveKind::Infill => LineTypeKey::Infill,
+                    MoveKind::Bridge => LineTypeKey::Bridge,
+                    MoveKind::Overhang => LineTypeKey::Overhang,
+                    MoveKind::TopSurface => LineTypeKey::TopSurface,
+                    MoveKind::Travel => LineTypeKey::Travel,
+                }
+            };
+            if hidden_line_types.contains(&key) {
+                continue;
+            }
+
             let start = path.points[index];
             let end = path.points[(index + 1) % count];
 
@@ -529,7 +586,7 @@ pub fn build_toolpath_lines(
             }
 
             let color = match data_view {
-                ToolpathDataView::LineType => palette_color(segment.kind),
+                ToolpathDataView::LineType => palette_color(segment.kind, segment.is_scarf),
                 ToolpathDataView::FlowRate
                 | ToolpathDataView::Speed
                 | ToolpathDataView::ActualSpeed
@@ -611,6 +668,7 @@ mod tests {
                 order,
                 extrusion_length: 0.0,
                 line_width: 0.4,
+                is_scarf: false,
             })
             .collect();
         Path {
@@ -706,6 +764,7 @@ mod tests {
                     order: 0.0,
                     extrusion_length: 1.0,
                     line_width: 0.4,
+                    is_scarf: false,
                 },
                 Segment {
                     kind: MoveKind::WallOuter,
@@ -715,6 +774,7 @@ mod tests {
                     order: 0.0,
                     extrusion_length: 1.0,
                     line_width: 0.4,
+                    is_scarf: false,
                 },
             ],
             tool: ToolId(0),
@@ -730,6 +790,7 @@ mod tests {
                     order: 0.2,
                     extrusion_length: 1.0,
                     line_width: 0.4,
+                    is_scarf: false,
                 },
                 Segment {
                     kind: MoveKind::WallOuter,
@@ -739,6 +800,7 @@ mod tests {
                     order: 0.2,
                     extrusion_length: 1.0,
                     line_width: 0.4,
+                    is_scarf: false,
                 },
             ],
             tool: ToolId(0),
@@ -793,11 +855,47 @@ mod tests {
     #[test]
     fn line_type_legend_covers_all_line_types_and_has_valid_colors() {
         let legend = line_type_legend();
-        assert_eq!(legend.len(), 7);
+        assert_eq!(legend.len(), 8);
         for entry in legend {
             assert!(!entry.label.is_empty());
             assert!(entry.color[3] > 0.0);
         }
+    }
+
+    #[test]
+    fn scarf_joint_segments_are_colored_with_scarf_palette() {
+        let mut seg = Segment {
+            kind: MoveKind::WallOuter,
+            speed: 60.0,
+            extrusion_rate: 1.0,
+            support_fraction: 1.0,
+            order: 1.0,
+            extrusion_length: 0.5,
+            line_width: 0.4,
+            is_scarf: true,
+        };
+        assert_eq!(palette_color(seg.kind, seg.is_scarf), COLOR_SCARF_JOINT);
+        seg.is_scarf = false;
+        assert_eq!(palette_color(seg.kind, seg.is_scarf), COLOR_WALL_OUTER);
+    }
+
+    #[test]
+    fn build_toolpath_lines_filtered_skips_hidden_line_types() {
+        let path_a = path_with_kinds(&[MoveKind::WallOuter], 0.0);
+        let path_b = path_with_kinds(&[MoveKind::Infill], 1.0);
+        let mut hidden = std::collections::HashSet::new();
+        hidden.insert(LineTypeKey::Travel);
+
+        let instances = build_toolpath_lines_filtered(
+            &[path_a, path_b],
+            f64::INFINITY,
+            ToolpathDataView::LineType,
+            &manifold_core::SlicerConfig::default(),
+            None,
+            &hidden,
+        );
+        // Without travel moves, only path_a (1) + path_b (1) = 2 instances (inter-path travel omitted)
+        assert_eq!(instances.len(), 2);
     }
 
     #[test]
@@ -817,6 +915,7 @@ mod tests {
                 order: 1.0,
                 extrusion_length: 0.3,
                 line_width: 0.4,
+                is_scarf: false,
             },
             Segment {
                 kind: MoveKind::Infill,
@@ -826,6 +925,7 @@ mod tests {
                 order: 1.0,
                 extrusion_length: 0.3,
                 line_width: 0.4,
+                is_scarf: false,
             },
             Segment {
                 kind: MoveKind::Travel,
@@ -835,6 +935,7 @@ mod tests {
                 order: 1.0,
                 extrusion_length: 0.0,
                 line_width: 0.0,
+                is_scarf: false,
             },
         ];
         let path = Path {
