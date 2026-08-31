@@ -1851,10 +1851,10 @@ pub fn plan_with_progress(
                     };
 
                     // Directional slope flow compensation:
-                    // Climbing uphill (climb_slope > 0): trailing heel irons the bead smoothly (+5% * sin)
+                    // Climbing uphill: neutral flow (avoids over-pressurizing corners/seams during deceleration)
                     // Descending downhill (climb_slope < 0): trailing heel plows the melt, reduce flow to prevent squish (-12% * |sin|)
                     let directional_flow_mult = if climb_slope >= 0.0 {
-                        1.0 + 0.05 * climb_slope.clamp(0.0, 1.0)
+                        1.0
                     } else {
                         1.0 - 0.12 * (-climb_slope).clamp(0.0, 1.0)
                     };
@@ -1923,6 +1923,10 @@ pub fn plan_with_progress(
             if let Some(taper_dist) = config.pre_retract_taper_distance {
                 if taper_dist > 0.0 {
                     for path in &mut paths {
+                        // Skip pre-retract taper on paths that already have a scarf joint seam
+                        if config.scarf_joint_enabled && path.segments.iter().any(|s| s.is_scarf) {
+                            continue;
+                        }
                         crate::kinematics::apply_pre_retract_taper(
                             &mut path.points,
                             &mut path.segments,
@@ -4038,8 +4042,7 @@ mod tests {
         let fil_area = extrusion::filament_cross_section_area(config.filament_diameter);
         let expected_flat_e = extrusion::segment_extrusion_length(10.0, bead_area, fil_area);
 
-        let climb_sin = 1.0 / std::f64::consts::SQRT_2;
-        let expected_climbing_e = expected_flat_e * (1.0 + 0.05 * climb_sin);
+        let expected_climbing_e = expected_flat_e;
 
         let actual_e = path.segments[0].extrusion_length;
         assert!(

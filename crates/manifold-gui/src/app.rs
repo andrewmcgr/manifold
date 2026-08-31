@@ -960,6 +960,20 @@ impl ManifoldApp {
                 {
                     self.config.scarf_joint_start_height_fraction = Some(scarf_start_h / 100.0);
                 }
+                let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut taper_dist, 0.0..=5.0)
+                            .text("Pre-retract taper distance (mm)"),
+                    )
+                    .changed()
+                {
+                    self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
+                        Some(taper_dist)
+                    } else {
+                        None
+                    };
+                }
             }
             ui.checkbox(&mut self.config.wipe_enabled, "Wipe on retraction");
             if self.config.wipe_enabled {
