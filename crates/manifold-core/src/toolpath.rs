@@ -516,13 +516,15 @@ fn compensate_wall_loop_points(
     points: &[DVec3],
     field: &dyn manifold_fidget::order::OrderField,
     flat_radius: f64,
-    _layer_height: f64,
+    layer_height: f64,
     _layer_order: f64,
     min_extrusion_z: f64,
 ) -> Vec<DVec3> {
+    let n_pts = points.len();
     points
         .iter()
-        .map(|&p| {
+        .enumerate()
+        .map(|(i, &p)| {
             let Some(normal) = crate::order_field::numeric_gradient(field, p)
                 .and_then(|g| g.try_normalize().map(|n| -n))
             else {
@@ -536,12 +538,41 @@ fn compensate_wall_loop_points(
                 .clamp(0.0, 1.0);
             let sin_alpha = (1.0 - cos_alpha * cos_alpha).sqrt();
 
-            if sin_alpha < 1e-4 {
+            // Lowest outer edge clearance adjustment for planar slope:
+            let z_slope_clearance = if sin_alpha >= 1e-4 {
+                flat_radius * sin_alpha * (1.0 - cos_alpha)
+            } else {
+                0.0
+            };
+
+            // Transverse concave clearance adjustment (V-grooves / valleys):
+            let p_prev = points[(i + n_pts - 1) % n_pts];
+            let p_next = points[(i + 1) % n_pts];
+            let tangent = (p_next - p_prev).try_normalize().unwrap_or(DVec3::X);
+            let u_perp = tangent.cross(normal).try_normalize().unwrap_or(DVec3::ZERO);
+
+            let z_concave_clearance = if u_perp.length_squared() > 0.5 {
+                let n_plus = crate::order_field::numeric_gradient(field, p + u_perp * flat_radius)
+                    .and_then(|g| g.try_normalize().map(|n| -n));
+                let n_minus = crate::order_field::numeric_gradient(field, p - u_perp * flat_radius)
+                    .and_then(|g| g.try_normalize().map(|n| -n));
+                if let (Some(np), Some(nm)) = (n_plus, n_minus) {
+                    let sin_transverse = ((np - nm).dot(u_perp) * 0.5).clamp(0.0, 1.0);
+                    let cos_transverse = (1.0 - sin_transverse * sin_transverse).sqrt();
+                    let flank_rise = flat_radius * sin_transverse;
+                    (flank_rise * (1.0 - cos_transverse)).min(0.60 * layer_height)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            let z_clearance = z_slope_clearance + z_concave_clearance;
+            if z_clearance < 1e-5 {
                 return p;
             }
 
-            // Lowest outer edge clearance adjustment:
-            let z_clearance = flat_radius * sin_alpha * (1.0 - cos_alpha);
             let mut elevated = p + crate::slicing::NOZZLE_DIRECTION * z_clearance;
 
             let p_proj = p.dot(crate::slicing::BUILD_DIRECTION);
@@ -1844,11 +1875,52 @@ pub fn plan_with_progress(
                         )
                     };
                     let bead_area = if config.curvature_compensation_enabled() && !is_overhang {
-                        extrusion::curvature_compensated_bead_area(
+                        let r_curv_area = extrusion::curvature_compensated_bead_area(
                             raw_bead_area,
                             effective_line_width,
                             r_curvature,
-                        )
+                        );
+                        // Transverse concavity / V-groove compensation:
+                        let mid_pt = (start + end) * 0.5;
+                        if let Some(normal) =
+                            crate::order_field::numeric_gradient(layer.order_field.as_ref(), mid_pt)
+                                .and_then(|g| g.try_normalize().map(|n| -n))
+                        {
+                            let u_perp = unit_dir
+                                .cross(normal)
+                                .try_normalize()
+                                .unwrap_or(DVec3::ZERO);
+                            if u_perp.length_squared() > 0.5 {
+                                let r_flat = config.nozzle_flat_diameter() * 0.5;
+                                let n_plus = crate::order_field::numeric_gradient(
+                                    layer.order_field.as_ref(),
+                                    mid_pt + u_perp * r_flat,
+                                )
+                                .and_then(|g| g.try_normalize().map(|n| -n));
+                                let n_minus = crate::order_field::numeric_gradient(
+                                    layer.order_field.as_ref(),
+                                    mid_pt - u_perp * r_flat,
+                                )
+                                .and_then(|g| g.try_normalize().map(|n| -n));
+                                if let (Some(np), Some(nm)) = (n_plus, n_minus) {
+                                    let sin_transverse =
+                                        ((np - nm).dot(u_perp) * 0.5).clamp(0.0, 1.0);
+                                    let flank_rise = r_flat * sin_transverse;
+                                    extrusion::concavity_compensated_bead_area(
+                                        r_curv_area,
+                                        effective_layer_height,
+                                        flank_rise,
+                                        sin_transverse,
+                                    )
+                                } else {
+                                    r_curv_area
+                                }
+                            } else {
+                                r_curv_area
+                            }
+                        } else {
+                            r_curv_area
+                        }
                     } else {
                         raw_bead_area
                     };
@@ -3943,6 +4015,38 @@ mod tests {
             config.z_travel_penalty,
         );
         assert_eq!(routed.len(), 2, "disabled pass must leave paths untouched");
+    }
+
+    #[test]
+    fn compensate_flat_nozzle_elevates_on_concave_v_groove() {
+        // Conical field creates a concave cone where the apex is below and walls slope outward/upward:
+        let field =
+            manifold_fidget::order::ConicalOrderField::new(DVec3::ZERO, BUILD_DIRECTION, 0.5);
+        let points = vec![
+            DVec3::new(1.0, 0.0, 1.0),
+            DVec3::new(0.0, 1.0, 1.0),
+            DVec3::new(-1.0, 0.0, 1.0),
+            DVec3::new(0.0, -1.0, 1.0),
+        ];
+        let flat_radius = 0.5;
+        let layer_height = 0.2;
+        let min_extrusion_z = 0.1;
+        let compensated = compensate_wall_loop_points(
+            &points,
+            &field,
+            flat_radius,
+            layer_height,
+            1.0,
+            min_extrusion_z,
+        );
+        for (orig, comp) in points.iter().zip(compensated.iter()) {
+            assert!(
+                comp.z >= orig.z,
+                "compensated point must be elevated on concave geometry: comp.z={}, orig.z={}",
+                comp.z,
+                orig.z
+            );
+        }
     }
 
     #[test]

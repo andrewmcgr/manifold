@@ -104,6 +104,27 @@ pub fn curvature_compensated_bead_area(
     nominal_area * (1.0 - ratio)
 }
 
+/// Adjusts nominal bead cross-section area for transverse surface concavity / V-groove pinch:
+///
+/// $$\Phi_{\text{concave}} = \max\left(0.40, \, 1.0 - \frac{\Delta z_{\text{flanks}}}{h_{\text{layer}}} \cdot \sin \theta_{\text{transverse}}\right)$$
+///
+/// Prevents the flat nozzle land from plowing molten plastic and forcing forward overextrusion waves
+/// at the bottom of V-grooves and concave troughs.
+#[must_use]
+pub fn concavity_compensated_bead_area(
+    nominal_area: f64,
+    layer_height: f64,
+    flank_rise: f64,
+    sin_transverse: f64,
+) -> f64 {
+    if flank_rise <= 1e-4 || sin_transverse <= 1e-4 {
+        return nominal_area;
+    }
+    let h = layer_height.max(1e-3);
+    let pinch_ratio = (flank_rise / h * sin_transverse).clamp(0.0, 0.60);
+    nominal_area * (1.0 - pinch_ratio)
+}
+
 /// Evaluates in-plane radius of curvature (mm) from three consecutive 3D path points $(P_{i-1}, P_i, P_{i+1})$.
 ///
 /// Uses Menger curvature (the circumradius of the triangle formed by the three points).
@@ -300,6 +321,24 @@ mod tests {
             DVec3::new(10.0, 0.0, 0.0),
         );
         assert!(!r_collinear.is_finite());
+    }
+
+    #[test]
+    fn concavity_compensated_bead_area_scales_down_at_v_grooves() {
+        let nominal_area = 0.08;
+        let layer_height = 0.20;
+        let flank_rise = 0.10;
+        let sin_transverse = 0.50;
+        let area =
+            concavity_compensated_bead_area(nominal_area, layer_height, flank_rise, sin_transverse);
+        // pinch_ratio = (0.10 / 0.20) * 0.50 = 0.25 -> 75% flow
+        let expected = nominal_area * 0.75;
+        assert!((area - expected).abs() < 1e-6);
+
+        // Zero flank rise / planar -> no reduction
+        let flat_area =
+            concavity_compensated_bead_area(nominal_area, layer_height, 0.0, sin_transverse);
+        assert_eq!(flat_area, nominal_area);
     }
 
     #[test]
