@@ -934,12 +934,31 @@ impl ManifoldApp {
                 let mut scarf_len = self.config.scarf_joint_length();
                 if ui
                     .add(
-                        egui::Slider::new(&mut scarf_len, 1.0..=10.0)
+                        egui::Slider::new(&mut scarf_len, 1.0..=25.0)
                             .text("Scarf overlap length (mm)"),
                     )
                     .changed()
                 {
                     self.config.scarf_joint_length = Some(scarf_len);
+                }
+
+                let mut scarf_steps = self.config.scarf_joint_steps();
+                if ui
+                    .add(egui::Slider::new(&mut scarf_steps, 2..=20).text("Scarf steps"))
+                    .changed()
+                {
+                    self.config.scarf_joint_steps = Some(scarf_steps);
+                }
+
+                let mut scarf_start_h = self.config.scarf_joint_start_height_fraction() * 100.0;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut scarf_start_h, 5.0..=50.0)
+                            .text("Scarf start height (%)"),
+                    )
+                    .changed()
+                {
+                    self.config.scarf_joint_start_height_fraction = Some(scarf_start_h / 100.0);
                 }
             }
             ui.checkbox(&mut self.config.wipe_enabled, "Wipe on retraction");
