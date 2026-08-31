@@ -466,6 +466,9 @@ fn compensate_flat_nozzle(
     config: &SlicerConfig,
     tools: &[Tool],
 ) -> Vec<Path> {
+    if config.slope_compensation_mode() == crate::SlopeCompensationMode::VolumetricModulation {
+        return paths;
+    }
     let field = layer.order_field.as_ref();
 
     paths
@@ -1851,12 +1854,25 @@ pub fn plan_with_progress(
                     };
 
                     // Directional slope flow compensation:
-                    // Climbing uphill: neutral flow (avoids over-pressurizing corners/seams during deceleration)
-                    // Descending downhill (climb_slope < 0): trailing heel plows the melt, reduce flow to prevent squish (-12% * |sin|)
-                    let directional_flow_mult = if climb_slope >= 0.0 {
-                        1.0
-                    } else {
-                        1.0 - 0.12 * (-climb_slope).clamp(0.0, 1.0)
+                    let directional_flow_mult = match config.slope_compensation_mode() {
+                        crate::SlopeCompensationMode::GeometricOffset => {
+                            if climb_slope >= 0.0 {
+                                1.0
+                            } else {
+                                1.0 - 0.12 * (-climb_slope).clamp(0.0, 1.0)
+                            }
+                        }
+                        crate::SlopeCompensationMode::VolumetricModulation => {
+                            let flat_diam = config.nozzle_flat_diameter();
+                            let bead_w = line_width.max(1e-3);
+                            let squeeze_ratio = (flat_diam / (2.0 * bead_w)).clamp(0.5, 2.5);
+                            if climb_slope >= 0.0 {
+                                1.0 + 0.03 * climb_slope.clamp(0.0, 1.0)
+                            } else {
+                                let descent_sin = (-climb_slope).clamp(0.0, 1.0);
+                                (1.0 - (0.15 * squeeze_ratio * descent_sin)).max(0.60)
+                            }
+                        }
                     };
 
                     let fluid_engine = config.fluid_dynamics_engine();
@@ -1916,6 +1932,7 @@ pub fn plan_with_progress(
                         layer_h,
                         Some(layer.order_field.as_ref()),
                         fluid_engine.as_ref(),
+                        config.slope_compensation_mode(),
                     );
                 }
             }
@@ -3926,6 +3943,47 @@ mod tests {
             config.z_travel_penalty,
         );
         assert_eq!(routed.len(), 2, "disabled pass must leave paths untouched");
+    }
+
+    #[test]
+    fn compensate_flat_nozzle_volumetric_mode_leaves_paths_untouched() {
+        let field: Arc<dyn manifold_fidget::order::OrderField> =
+            Arc::new(HeightOrderField::new(BUILD_DIRECTION));
+        let obj_id = ObjectId(0);
+        let layer = Layer {
+            object: obj_id,
+            index: 1,
+            order: 1.0,
+            loops: Vec::new(),
+            infill_boundary: Vec::new(),
+            solid_fill_boundary: Vec::new(),
+            order_field: Arc::clone(&field),
+            mesh_sdf: None,
+        };
+        let config = SlicerConfig {
+            slope_compensation_mode: Some(crate::SlopeCompensationMode::VolumetricModulation),
+            ..SlicerConfig::default()
+        };
+        let tools = vec![Tool::new(ToolId(0), 0.4)];
+        let orig_points = vec![
+            DVec3::new(0.0, 0.0, 1.0),
+            DVec3::new(10.0, 0.0, 1.0),
+            DVec3::new(10.0, 10.0, 1.0),
+        ];
+        let paths = vec![Path {
+            tool: ToolId(0),
+            points: orig_points.clone(),
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    ..Segment::default()
+                };
+                3
+            ],
+        }];
+
+        let result = compensate_flat_nozzle(paths, &layer, &config, &tools);
+        assert_eq!(result[0].points, orig_points);
     }
 
     #[test]

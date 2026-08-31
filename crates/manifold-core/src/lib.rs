@@ -36,6 +36,16 @@ pub use statistics::{
 };
 pub use workspace::Workspace;
 
+/// Strategy for non-planar nozzle slope clearance and flow compensation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum SlopeCompensationMode {
+    /// Elevate nozzle tip along +Z to physically clear flat nozzle heel on sloped toolpaths (default).
+    #[default]
+    GeometricOffset,
+    /// Keep nozzle on nominal layer centerline and modulate extrusion volume based on hydrodynamic squeeze-film angle.
+    VolumetricModulation,
+}
+
 /// Slicer configuration shared across the pipeline.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SlicerConfig {
@@ -80,6 +90,10 @@ pub struct SlicerConfig {
     /// dynamically from nozzle geometry and bead width. Preserved for profile compatibility.
     #[serde(default = "default_wall_offset")]
     pub wall_offset: f64,
+    /// Strategy for non-planar nozzle slope clearance and flow compensation.
+    /// Defaults to [`SlopeCompensationMode::GeometricOffset`].
+    #[serde(default)]
+    pub slope_compensation_mode: Option<SlopeCompensationMode>,
     /// Minimum physical bead width ratio relative to nozzle diameter (default 0.70).
     #[serde(default)]
     pub min_bead_width_ratio: Option<f64>,
@@ -518,6 +532,7 @@ impl Default for SlicerConfig {
             wall_offset: nozzle_diameter / 2.0,
             min_bead_width_ratio: None,
             max_bead_width_ratio: None,
+            slope_compensation_mode: None,
             curvature_compensation_enabled: None,
             sparse_infill_pattern: Some(infill::InfillPatternKind::Cubic),
             solid_infill_pattern: Some(infill::InfillPatternKind::AllWalls),
@@ -801,6 +816,10 @@ impl SlicerConfig {
 
     /// Scarf joint overlap length (mm), defaulting to `8.0` mm when `None`.
     #[must_use]
+    pub fn slope_compensation_mode(&self) -> SlopeCompensationMode {
+        self.slope_compensation_mode.unwrap_or_default()
+    }
+
     pub fn scarf_joint_length(&self) -> f64 {
         self.scarf_joint_length.unwrap_or(8.0)
     }

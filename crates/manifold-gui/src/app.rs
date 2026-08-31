@@ -673,6 +673,29 @@ impl ManifoldApp {
                 egui::Slider::new(&mut self.config.wall_line_width, 0.05..=1.5)
                     .text("Wall line width (mm)"),
             );
+            let mut slope_mode = self.config.slope_compensation_mode();
+            egui::ComboBox::from_label("Slope compensation mode")
+                .selected_text(match slope_mode {
+                    manifold_core::SlopeCompensationMode::GeometricOffset => {
+                        "Geometric Offset (+Z)"
+                    }
+                    manifold_core::SlopeCompensationMode::VolumetricModulation => {
+                        "Volumetric Modulation (Flow)"
+                    }
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut slope_mode,
+                        manifold_core::SlopeCompensationMode::GeometricOffset,
+                        "Geometric Offset (+Z)",
+                    );
+                    ui.selectable_value(
+                        &mut slope_mode,
+                        manifold_core::SlopeCompensationMode::VolumetricModulation,
+                        "Volumetric Modulation (Flow)",
+                    );
+                });
+            self.config.slope_compensation_mode = Some(slope_mode);
             ui.add(
                 egui::Slider::new(&mut self.config.shell_thickness, 0.0..=5.0)
                     .text("Shell thickness (mm)"),

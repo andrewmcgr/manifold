@@ -907,6 +907,7 @@ pub fn apply_scarf_joint(
     layer_height: f64,
     order_field: Option<&dyn manifold_fidget::order::OrderField>,
     fluid_engine: Option<&crate::fluid_dynamics::FluidDynamicsEngine>,
+    compensation_mode: crate::SlopeCompensationMode,
 ) {
     if scarf_length_mm <= 1e-4 || steps == 0 || points.len() < 3 || segments.is_empty() {
         return;
@@ -1014,7 +1015,8 @@ pub fn apply_scarf_joint(
         let tau = (k as f64) / (k_steps as f64);
         let h_frac = h_start + (1.0 - h_start) * tau;
         let (base_p, seg, _) = sample_at_distance(s);
-        let offset = if seg.support_fraction >= 0.7
+        let offset = if compensation_mode == crate::SlopeCompensationMode::GeometricOffset
+            && seg.support_fraction >= 0.7
             && seg.kind != MoveKind::Overhang
             && seg.kind != MoveKind::Bridge
         {
@@ -1460,7 +1462,17 @@ mod tests {
         ];
 
         // 8.0mm scarf joint with 9 steps, 10% start height, 0.2mm layer height on planar order field
-        apply_scarf_joint(&mut points, &mut segments, 8.0, 9, 0.10, 0.2, None, None);
+        apply_scarf_joint(
+            &mut points,
+            &mut segments,
+            8.0,
+            9,
+            0.10,
+            0.2,
+            None,
+            None,
+            crate::SlopeCompensationMode::GeometricOffset,
+        );
 
         // 9 lead-in segments + 1 body segment + 3 remaining full segments + 9 lead-out segments = 22 segments
         // Waypoints: 22 + 1 = 23 points
@@ -1570,6 +1582,7 @@ mod tests {
             0.2,
             None,
             Some(&engine),
+            crate::SlopeCompensationMode::GeometricOffset,
         );
 
         // At low flow (step 0), extrusion length should be reduced by the swell correction factor (ramp_swell / nom_swell < 1.0)
@@ -1580,6 +1593,48 @@ mod tests {
             segments[0].extrusion_length,
             uncorrected_step0_e
         );
+    }
+
+    #[test]
+    fn apply_scarf_joint_volumetric_mode_leaves_points_at_nominal_centerline() {
+        let mut points = vec![
+            DVec3::new(0.0, 0.0, 5.0),
+            DVec3::new(10.0, 0.0, 5.0),
+            DVec3::new(10.0, 10.0, 5.0),
+            DVec3::new(0.0, 10.0, 5.0),
+        ];
+        let mut segments = vec![
+            crate::toolpath::Segment {
+                kind: MoveKind::WallOuter,
+                speed: 60.0,
+                extrusion_rate: 1.0,
+                support_fraction: 1.0,
+                order: 5.0,
+                extrusion_length: 1.0,
+                line_width: 0.4,
+                is_scarf: false,
+            };
+            4
+        ];
+
+        apply_scarf_joint(
+            &mut points,
+            &mut segments,
+            8.0,
+            9,
+            0.10,
+            0.2,
+            None,
+            None,
+            crate::SlopeCompensationMode::VolumetricModulation,
+        );
+
+        // In volumetric modulation mode, Z positions must remain strictly at 5.0 (no normal wedging)
+        for p in &points {
+            assert_eq!(p.z, 5.0);
+        }
+        // Segments are still partitioned and tagged as scarf
+        assert!(segments.iter().take(9).all(|s| s.is_scarf));
     }
 
     #[test]
