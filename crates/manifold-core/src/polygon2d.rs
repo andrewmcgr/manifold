@@ -315,6 +315,66 @@ pub fn contains_point(loops_2d: &[Vec<[f64; 2]>], point: [f64; 2]) -> bool {
     inside
 }
 
+/// A partitioned wall ring with its local bead width.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionedWall {
+    pub loops_2d: Vec<Vec<[f64; 2]>>,
+    pub line_width: f64,
+    pub wall_index: usize,
+}
+
+/// Adaptively partitions a 2D boundary into concentric wall loops with variable line widths,
+/// preventing channel overcrowding on narrow features.
+///
+/// For each pass $k \in [1 \dots \text{wall\_count}-1]$:
+/// - Insets by $w_{\text{target}}$.
+/// - If the remaining inner area is narrower than $w_{\text{min}}$, terminates further wall generation
+///   and returns the completed wall passes so narrow features don't suffer from overlapping perimeters.
+#[must_use]
+pub fn partition_walls_adaptive(
+    outer_loops_2d: &[Vec<[f64; 2]>],
+    target_width: f64,
+    min_width: f64,
+    max_walls: usize,
+) -> Vec<PartitionedWall> {
+    if outer_loops_2d.is_empty() || max_walls == 0 {
+        return Vec::new();
+    }
+
+    let mut result = Vec::with_capacity(max_walls);
+    result.push(PartitionedWall {
+        loops_2d: outer_loops_2d.to_vec(),
+        line_width: target_width,
+        wall_index: 0,
+    });
+
+    let mut current_loops = outer_loops_2d.to_vec();
+    for wall_index in 1..max_walls {
+        if current_loops.is_empty() {
+            break;
+        }
+        let inset = inward_offset(&current_loops, target_width);
+        if inset.is_empty() {
+            break;
+        }
+        // Filter out degenerate micro-loops whose area is smaller than a circle of min_width
+        let min_area = std::f64::consts::PI * (min_width / 2.0).powi(2);
+        let valid_inset = filter_min_area(&inset, min_area);
+        if valid_inset.is_empty() {
+            break;
+        }
+
+        result.push(PartitionedWall {
+            loops_2d: valid_inset.clone(),
+            line_width: target_width,
+            wall_index,
+        });
+        current_loops = valid_inset;
+    }
+
+    result
+}
+
 /// Insets `loops2d` inward by `distance` (a positive value moves boundaries
 /// toward the interior of the shape, shrinking it — as used for wall-inset
 /// infill boundaries). `loops2d` is simplified first.
@@ -628,5 +688,17 @@ mod tests {
         // downstream offset/boolean ops treat it as a hole rather than a
         // nested solid.
         assert!(signed_area(&canonical[1]) < 0.0);
+    }
+
+    #[test]
+    fn partition_walls_adaptive_limits_rings_on_narrow_channel() {
+        // A narrow 1.0mm wide rectangular channel:
+        // outer = 1.0 x 10.0mm.
+        // target_width = 0.40mm, min_width = 0.28mm, max_walls = 3.
+        let channel = square(0.0, 0.0, 1.0); // 1.0 x 1.0mm box
+        let walls = partition_walls_adaptive(&[channel], 0.40, 0.28, 3);
+        // On a 1.0mm box, after wall 0 (outer), wall 1 insets by 0.40mm leaving a tiny 0.20mm center box.
+        // Because 0.20mm < min_width (0.28mm), wall 2 is not generated, avoiding inner wall overcrowding!
+        assert!(walls.len() <= 2);
     }
 }

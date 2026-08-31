@@ -713,18 +713,18 @@ pub fn slice_mesh_with_progress(
                 // for a layer whose cross-section is too small to fit every
                 // configured wall (e.g. near a tapered tip) rather than
                 // producing garbage from an empty/degenerate offset.
-                let mut previous_loops = wall0_loops;
-                for wall_index in 1..wall_count {
-                    if previous_loops.is_empty() {
-                        break;
-                    }
-                    let loops_2d = polygon2d::to_2d(&previous_loops, basis1, basis2, origin);
-                    let offset_2d = polygon2d::inward_offset(&loops_2d, config.wall_line_width);
-                    if offset_2d.is_empty() {
-                        break;
-                    }
+                let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
+                let partitioned = polygon2d::partition_walls_adaptive(
+                    &loops_2d,
+                    config.wall_line_width,
+                    config.min_bead_width(),
+                    wall_count,
+                );
+
+                let mut previous_loops = wall0_loops.clone();
+                for p_wall in partitioned.into_iter().skip(1) {
                     let reconstructed = order_field::reconstruct_on_order_field_near(
-                        offset_2d,
+                        p_wall.loops_2d,
                         &previous_loops,
                         basis1,
                         basis2,
@@ -738,11 +738,11 @@ pub fn slice_mesh_with_progress(
                         let arc_fraction = compute_arc_fractions(&points);
                         let n_pts = points.len();
                         WallLoop {
-                            wall_index,
+                            wall_index: p_wall.wall_index,
                             unsupported: vec![false; n_pts],
                             top_surface: Vec::new(),
                             arc_fraction,
-                            line_widths: vec![config.wall_line_width; n_pts],
+                            line_widths: vec![p_wall.line_width; n_pts],
                             points,
                         }
                     }));
