@@ -1905,6 +1905,7 @@ pub fn plan_with_progress(
                 } else {
                     config.layer_height
                 };
+                let fluid_engine = config.fluid_dynamics_engine();
                 for path in &mut paths {
                     crate::kinematics::apply_scarf_joint(
                         &mut path.points,
@@ -1914,6 +1915,7 @@ pub fn plan_with_progress(
                         scarf_start_h,
                         layer_h,
                         Some(layer.order_field.as_ref()),
+                        fluid_engine.as_ref(),
                     );
                 }
             }

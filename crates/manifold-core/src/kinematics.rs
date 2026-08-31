@@ -897,6 +897,7 @@ pub fn apply_wipe_moves(
 ///   ramping extrusion flow from `(1.0 - start_height_fraction)` -> 0% (lead-out top wedge).
 /// - The sum of the complementary flow ramps is exactly 100% nominal bead everywhere across the joint,
 ///   eliminating vertical seam lines on perimeters without localized overextrusion.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_scarf_joint(
     points: &mut Vec<DVec3>,
     segments: &mut Vec<crate::toolpath::Segment>,
@@ -905,6 +906,7 @@ pub fn apply_scarf_joint(
     start_height_fraction: f64,
     layer_height: f64,
     order_field: Option<&dyn manifold_fidget::order::OrderField>,
+    fluid_engine: Option<&crate::fluid_dynamics::FluidDynamicsEngine>,
 ) {
     if scarf_length_mm <= 1e-4 || steps == 0 || points.len() < 3 || segments.is_empty() {
         return;
@@ -1024,13 +1026,44 @@ pub fn apply_scarf_joint(
         lead_in_pts.push(base_p + offset);
     }
 
+    let calc_swell_correction = |seg: &crate::toolpath::Segment, flow_frac: f64| -> f64 {
+        if let Some(engine) = fluid_engine {
+            let bead_area =
+                crate::extrusion::bead_cross_section_area(seg.line_width.max(0.2), layer_height);
+            let nom_q = ((seg.speed / 60.0) * bead_area).max(0.01);
+            let nom_swell = engine.swell_volume_multiplier(nom_q, 0.0);
+            let ramp_q = (nom_q * flow_frac).max(0.01);
+            let ramp_swell = engine.swell_volume_multiplier(ramp_q, 0.0);
+            (ramp_swell / nom_swell.max(1.0)).clamp(0.60, 1.0)
+        } else {
+            1.0
+        }
+    };
+
     for (k, &pt) in lead_in_pts.iter().enumerate().take(k_steps) {
         let t = (k as f64 + 0.5) / (k_steps as f64);
         let flow_frac = h_start + (1.0 - h_start) * t;
         let s_mid = (k as f64 + 0.5) * delta_s;
         let (_, mut seg, e_per_mm) = sample_at_distance(s_mid);
+        let swell_corr = calc_swell_correction(&seg, flow_frac);
+
+        let pt_next = lead_in_pts[k + 1];
+        let diff = pt_next - pt;
+        let d_3d = diff.length();
+        let unit_dir = if d_3d > 1e-6 {
+            diff / d_3d
+        } else {
+            DVec3::ZERO
+        };
+        let wedge_climb = unit_dir.dot(crate::slicing::BUILD_DIRECTION);
+        let downhill_corr = if wedge_climb < -0.05 {
+            (1.0 - 0.15 * (-wedge_climb).clamp(0.0, 1.0)).clamp(0.70, 1.0)
+        } else {
+            1.0
+        };
+
         seg.extrusion_rate *= flow_frac;
-        seg.extrusion_length = e_per_mm * delta_s * flow_frac;
+        seg.extrusion_length = e_per_mm * delta_s * flow_frac * swell_corr * downhill_corr;
         seg.is_scarf = true;
         new_points.push(pt);
         new_segments.push(seg);
@@ -1083,8 +1116,26 @@ pub fn apply_scarf_joint(
         let flow_frac = (1.0 - h_start) * (1.0 - t);
         let s_mid = (k as f64 + 0.5) * delta_s;
         let (_, mut seg, e_per_mm) = sample_at_distance(s_mid);
+        let swell_corr = calc_swell_correction(&seg, flow_frac);
+
+        let pt_curr = lead_out_pts[k];
+        let pt_next = lead_out_pts[k + 1];
+        let diff = pt_next - pt_curr;
+        let d_3d = diff.length();
+        let unit_dir = if d_3d > 1e-6 {
+            diff / d_3d
+        } else {
+            DVec3::ZERO
+        };
+        let climb = unit_dir.dot(crate::slicing::BUILD_DIRECTION);
+        let downhill_corr = if climb < -0.05 {
+            (1.0 - 0.15 * (-climb).clamp(0.0, 1.0)).clamp(0.70, 1.0)
+        } else {
+            1.0
+        };
+
         seg.extrusion_rate *= flow_frac;
-        seg.extrusion_length = e_per_mm * delta_s * flow_frac;
+        seg.extrusion_length = e_per_mm * delta_s * flow_frac * swell_corr * downhill_corr;
         seg.is_scarf = false;
         new_segments.push(seg);
         new_points.push(lead_out_pts[k + 1]);
@@ -1409,7 +1460,7 @@ mod tests {
         ];
 
         // 8.0mm scarf joint with 9 steps, 10% start height, 0.2mm layer height on planar order field
-        apply_scarf_joint(&mut points, &mut segments, 8.0, 9, 0.10, 0.2, None);
+        apply_scarf_joint(&mut points, &mut segments, 8.0, 9, 0.10, 0.2, None, None);
 
         // 9 lead-in segments + 1 body segment + 3 remaining full segments + 9 lead-out segments = 22 segments
         // Waypoints: 22 + 1 = 23 points
@@ -1450,6 +1501,84 @@ mod tests {
         assert!(
             (total_scarf_e - expected_nominal_8mm_e).abs() < 1e-4,
             "Total scarf extrusion {total_scarf_e} must equal exact nominal volume {expected_nominal_8mm_e}"
+        );
+    }
+
+    #[test]
+    fn apply_scarf_joint_with_fluid_engine_applies_low_flow_swell_correction() {
+        use crate::fluid_dynamics::{FluidDynamicsConfig, FluidDynamicsEngine};
+        use crate::toolpath::Segment;
+
+        let mut points = vec![
+            DVec3::new(0.0, 0.0, 1.0),
+            DVec3::new(20.0, 0.0, 1.0),
+            DVec3::new(20.0, 20.0, 1.0),
+            DVec3::new(0.0, 20.0, 1.0),
+        ];
+        let mut segments = vec![
+            Segment {
+                kind: MoveKind::WallOuter,
+                speed: 6000.0, // 100 mm/s
+                extrusion_length: 10.0,
+                extrusion_rate: 1.0,
+                support_fraction: 1.0,
+                line_width: 0.4,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                speed: 6000.0,
+                extrusion_length: 10.0,
+                extrusion_rate: 1.0,
+                support_fraction: 1.0,
+                line_width: 0.4,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                speed: 6000.0,
+                extrusion_length: 10.0,
+                extrusion_rate: 1.0,
+                support_fraction: 1.0,
+                line_width: 0.4,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                speed: 6000.0,
+                extrusion_length: 10.0,
+                extrusion_rate: 1.0,
+                support_fraction: 1.0,
+                line_width: 0.4,
+                ..Segment::default()
+            },
+        ];
+
+        let fluid_cfg = FluidDynamicsConfig {
+            swell_ratio_low: Some(1.01),
+            swell_ratio_high: Some(1.15),
+            ..FluidDynamicsConfig::default()
+        };
+        let engine = FluidDynamicsEngine::new(fluid_cfg);
+
+        apply_scarf_joint(
+            &mut points,
+            &mut segments,
+            8.0,
+            9,
+            0.10,
+            0.2,
+            None,
+            Some(&engine),
+        );
+
+        // At low flow (step 0), extrusion length should be reduced by the swell correction factor (ramp_swell / nom_swell < 1.0)
+        let uncorrected_step0_e = (10.0 / 20.0) * (8.0 / 9.0) * (0.10 + 0.90 * (0.5 / 9.0));
+        assert!(
+            segments[0].extrusion_length < uncorrected_step0_e,
+            "Step 0 extrusion {} must be strictly less than uncorrected {}",
+            segments[0].extrusion_length,
+            uncorrected_step0_e
         );
     }
 
