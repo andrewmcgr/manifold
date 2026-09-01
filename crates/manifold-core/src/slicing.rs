@@ -619,7 +619,16 @@ pub fn slice_mesh_with_progress(
         (positions, orders)
     };
 
-    let effective_order_max = order_max;
+    let effective_order_max = if !is_height && !outer_wall_mesh_orders.is_empty() {
+        let max_mesh_order = outer_wall_mesh_orders
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(order_max, f64::max);
+        max_mesh_order
+    } else {
+        order_max
+    };
 
     // Precompute every order-field value this walk will sample, so the
     // per-layer contour extraction below can run in parallel (each layer
@@ -837,7 +846,7 @@ pub fn slice_mesh_with_progress(
                 loops,
                 infill_boundary,
                 solid_fill_boundary: Vec::new(),
-                mesh_sdf: Some(Arc::clone(&side_sdf)),
+                mesh_sdf: Some(Arc::clone(&sdf)),
                 order_field: Arc::clone(&field),
             }
         })
