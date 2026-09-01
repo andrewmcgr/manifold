@@ -597,8 +597,9 @@ pub fn slice_mesh_with_progress(
     let (outer_wall_mesh, outer_wall_mesh_orders): (Vec<DVec3>, Vec<f64>) = if is_height {
         (Vec::new(), Vec::new())
     } else {
-        // High-resolution sparse narrow-band marching cubes: target a fine cell size
-        // (~0.05-0.10mm) to resolve thin walls and intricate features without voxel aliasing holes.
+        // Sparse narrow-band marching cubes: target a cell size proportional
+        // to bead dimensions (~0.20-0.35mm) to accurately extract the outer perimeter
+        // isosurface without memory blowup or slowdowns on large meshes.
         let cell_size = (config.wall_offset / 2.0)
             .min(config.wall_line_width / 4.0)
             .clamp(0.04, 0.10);
@@ -606,7 +607,7 @@ pub fn slice_mesh_with_progress(
         let pad = DVec3::splat(cell_size * 2.0);
         on_progress(0.05);
         let positions = extract_sparse_isosurface_positions::<MeshSdf>(
-            &*sdf,
+            &*side_sdf,
             min - pad,
             max + pad,
             cell_size,
@@ -618,20 +619,7 @@ pub fn slice_mesh_with_progress(
         (positions, orders)
     };
 
-    let effective_order_max = if !is_height && !outer_wall_mesh_orders.is_empty() {
-        let max_mesh_order = outer_wall_mesh_orders
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .fold(f64::NEG_INFINITY, f64::max);
-        if max_mesh_order.is_finite() && max_mesh_order > order_max {
-            max_mesh_order
-        } else {
-            order_max
-        }
-    } else {
-        order_max
-    };
+    let effective_order_max = order_max;
 
     // Precompute every order-field value this walk will sample, so the
     // per-layer contour extraction below can run in parallel (each layer
@@ -657,14 +645,6 @@ pub fn slice_mesh_with_progress(
         }
         order_values.push(order_value);
         order_value += layer_height;
-    }
-
-    if !is_height {
-        if let Some(&last) = order_values.last() {
-            if effective_order_max - last > 0.05 * layer_height {
-                order_values.push(effective_order_max);
-            }
-        }
     }
 
     let total_steps = order_values.len().max(1);
@@ -922,8 +902,6 @@ pub fn slice_mesh_with_progress(
             layers.pop();
         }
     }
-
-    compute_solid_fill_boundaries(&mut layers, config);
 
     if let Ok(mut guard) = progress_callback.lock() {
         let fraction = 1.0f64.max(guard.1);
@@ -2483,26 +2461,22 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             continue;
         }
 
-        let outer_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
-            .par_iter()
-            .map(|&pos| {
-                let wall0_loops: Vec<Vec<DVec3>> = layers[pos]
-                    .loops
-                    .iter()
-                    .filter(|w| w.wall_index == 0)
-                    .map(|w| w.points.clone())
-                    .collect();
-                if wall0_loops.is_empty() {
-                    polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin)
-                } else {
-                    polygon2d::to_2d(&wall0_loops, basis1, basis2, origin)
-                }
-            })
-            .collect();
-
         let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
             .par_iter()
-            .map(|&pos| polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin))
+            .map(|&pos| {
+                let infill = &layers[pos].infill_boundary;
+                if infill.is_empty() {
+                    let wall0_loops: Vec<Vec<DVec3>> = layers[pos]
+                        .loops
+                        .iter()
+                        .filter(|w| w.wall_index == 0)
+                        .map(|w| w.points.clone())
+                        .collect();
+                    polygon2d::to_2d(&wall0_loops, basis1, basis2, origin)
+                } else {
+                    polygon2d::to_2d(infill, basis1, basis2, origin)
+                }
+            })
             .collect();
         let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
 
@@ -2556,11 +2530,11 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
-                    let next = outer_2d.get(k + 1).unwrap_or(&empty_2d);
+                    let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
                     let exp = if next.is_empty() {
-                        outer_2d[k].clone()
+                        boundaries_2d[k].clone()
                     } else {
-                        polygon2d::difference(&outer_2d[k], next)
+                        polygon2d::difference(&boundaries_2d[k], next)
                     };
                     polygon2d::filter_min_area(&exp, min_solid_area)
                 })
@@ -2569,9 +2543,9 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                 .into_par_iter()
                 .map(|k| {
                     let exp = if k == 0 {
-                        outer_2d[k].clone()
+                        boundaries_2d[k].clone()
                     } else {
-                        polygon2d::difference(&outer_2d[k], &outer_2d[k - 1])
+                        polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
                     };
                     polygon2d::filter_min_area(&exp, min_solid_area)
                 })
@@ -2609,9 +2583,9 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                 .into_par_iter()
                 .map(|k| {
                     let exp = if k == 0 {
-                        outer_2d[k].clone()
+                        boundaries_2d[k].clone()
                     } else {
-                        polygon2d::difference(&outer_2d[k], &outer_2d[k - 1])
+                        polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
                     };
                     polygon2d::filter_min_area(&exp, min_solid_area)
                 })
@@ -2619,11 +2593,11 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
-                    let next = outer_2d.get(k + 1).unwrap_or(&empty_2d);
+                    let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
                     let exp = if next.is_empty() {
-                        outer_2d[k].clone()
+                        boundaries_2d[k].clone()
                     } else {
-                        polygon2d::difference(&outer_2d[k], next)
+                        polygon2d::difference(&boundaries_2d[k], next)
                     };
                     polygon2d::filter_min_area(&exp, min_solid_area)
                 })
@@ -3316,7 +3290,8 @@ mod tests {
             ..SlicerConfig::default()
         };
 
-        let layers = slice_mesh(&big_cube_mesh(), &config).unwrap();
+        let mut layers = slice_mesh(&big_cube_mesh(), &config).unwrap();
+        compute_solid_fill_boundaries(&mut layers, &config);
         assert!(!layers.is_empty());
         let bottom_layer = &layers[0];
         assert!(

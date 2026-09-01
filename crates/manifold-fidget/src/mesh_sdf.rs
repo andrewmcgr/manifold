@@ -423,7 +423,7 @@ impl MeshSdf {
         }
     }
 
-    fn sign_at(&self, _face_idx: usize, closest: DVec3, p: DVec3) -> f64 {
+    fn sign_at(&self, face_idx: usize, closest: DVec3, p: DVec3) -> f64 {
         match self.sign_method {
             SignMethod::Pseudonormal => {
                 let diff = p - closest;
@@ -432,6 +432,23 @@ impl MeshSdf {
                     // On the surface: sign is immaterial since value ~= 0
                     // either way, default to positive (outside).
                     return 1.0;
+                }
+
+                if face_idx < self.face_vertex_indices.len() {
+                    let verts = self.face_vertex_indices[face_idx];
+                    if let Some(edge) =
+                        Self::edge_containing_point(verts, &self.vertex_positions, closest)
+                    {
+                        if let Some(&pseudo) = self.edge_pseudonormals.get(&edge) {
+                            return if diff.dot(pseudo) >= 0.0 { 1.0 } else { -1.0 };
+                        }
+                    } else if face_idx < self.face_normals.len() {
+                        let n = self.face_normals[face_idx];
+                        let dot = diff.dot(n);
+                        if dot.abs() > 1e-12 {
+                            return if dot > 0.0 { 1.0 } else { -1.0 };
+                        }
+                    }
                 }
 
                 self.fast_parity_sign(p)

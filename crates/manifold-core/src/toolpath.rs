@@ -427,10 +427,14 @@ fn support_fractions_at(
     config: &SlicerConfig,
 ) -> (f64, f64) {
     let layer_height = config.layer_height.abs().max(f64::EPSILON);
-    let gradient_dir = crate::order_field::numeric_gradient(field, p)
+    let (gradient_dir, gradient_len) = match crate::order_field::numeric_gradient(field, p)
         .filter(|g| g.length_squared() > 1e-12 && g.is_finite())
-        .map_or(crate::slicing::BUILD_DIRECTION, |g| g.normalize());
-    let probe = p - layer_height * gradient_dir;
+    {
+        Some(g) => (g / g.length(), g.length()),
+        None => (crate::slicing::BUILD_DIRECTION, 1.0),
+    };
+    let step = (layer_height / gradient_len).clamp(layer_height, 4.0 * layer_height);
+    let probe = p - step * gradient_dir;
 
     let bed_fraction = ((bed_z - probe.z) / layer_height).clamp(0.0, 1.0);
 
@@ -1745,7 +1749,13 @@ pub fn plan_with_progress(
                 paths.push(infill_path);
             }
 
-            if !layer.solid_fill_boundary.is_empty() {
+            if !layer.solid_fill_boundary.is_empty()
+                && matches!(
+                    config.order_field,
+                    crate::order_field::OrderFieldKind::Height
+                )
+                && config.sparse_infill_pattern() != infill::InfillPatternKind::AllWalls
+            {
                 let solid_region = InfillRegion {
                     loops: layer.solid_fill_boundary.clone(),
                 };

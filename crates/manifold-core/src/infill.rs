@@ -92,7 +92,10 @@ impl InfillRegion {
     /// the layer entirely if its whole infill boundary is solid.
     #[must_use]
     pub fn from_layer(layer: &Layer, config: &SlicerConfig) -> Self {
-        if layer.solid_fill_boundary.is_empty() {
+        if layer.solid_fill_boundary.is_empty()
+            || !matches!(config.order_field, order_field::OrderFieldKind::Height)
+            || config.sparse_infill_pattern() == InfillPatternKind::AllWalls
+        {
             return Self {
                 loops: layer.infill_boundary.clone(),
             };
