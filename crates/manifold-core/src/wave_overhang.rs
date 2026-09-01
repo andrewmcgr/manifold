@@ -12,6 +12,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use glam::DVec3;
+use manifold_fidget::ScalarField;
 use rayon::prelude::*;
 
 use crate::ids::ToolId;
@@ -718,7 +719,15 @@ pub fn plan_wave_overhangs(
                                 }
                             }
                             if !supported_3d {
-                                tags[i] = true;
+                                let solid_underneath =
+                                    layers[k].mesh_sdf.as_ref().is_some_and(|sdf| {
+                                        let probe_p =
+                                            *p - DVec3::Z * (config.nozzle_diameter * 0.75);
+                                        sdf.sample(probe_p).value <= config.nozzle_diameter * 0.5
+                                    });
+                                if !solid_underneath {
+                                    tags[i] = true;
+                                }
                             }
                         }
                     }

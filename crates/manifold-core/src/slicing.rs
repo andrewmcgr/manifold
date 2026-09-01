@@ -587,34 +587,6 @@ pub fn slice_mesh_with_progress(
     let first_layer_height = config.first_layer_height();
     let resolution = contour_resolution(extent, config.nozzle_diameter, CONTOUR_REFINEMENT_DIVISOR);
 
-    // Precompute every order-field value this walk will sample, so the
-    // per-layer contour extraction below can run in parallel (each layer
-    // only reads the shared, immutable `sdf` — see `MeshSdf`, whose query
-    // methods all take `&self` — and writes its own independent `Layer`;
-    // there's no cross-layer dependency to serialize on).
-    //
-    // Defensive cap: even with the finite `order_min`/`order_max` guaranteed
-    // above, guard the step count against any other future degenerate range
-    // (e.g. a bug producing `order_min > order_max` combined with a tiny
-    // `layer_height`) so a bad range fails fast with `Error::Slicing`
-    // instead of growing this `Vec` without bound until the process is
-    // killed for memory exhaustion.
-    const MAX_ORDER_STEPS: usize = 1_000_000;
-    let mut order_values = Vec::new();
-    let mut order_value = order_min + first_layer_height;
-    while order_value <= order_max + f64::EPSILON {
-        if order_values.len() >= MAX_ORDER_STEPS {
-            return Err(Error::Slicing(format!(
-                "order range [{order_min}, {order_max}] with layer_height {layer_height} would \
-                 require more than {MAX_ORDER_STEPS} layers; refusing to continue"
-            )));
-        }
-        order_values.push(order_value);
-        order_value += layer_height;
-    }
-
-    let total_steps = order_values.len().max(1);
-
     let wall_count = config.wall_count();
 
     // Dispatch on the resolved field kind (cheap enum comparison on
@@ -646,6 +618,57 @@ pub fn slice_mesh_with_progress(
         on_progress(0.10);
         (positions, orders)
     };
+
+    let effective_order_max = if !is_height && !outer_wall_mesh_orders.is_empty() {
+        let max_mesh_order = outer_wall_mesh_orders
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+        if max_mesh_order.is_finite() && max_mesh_order > order_max {
+            max_mesh_order
+        } else {
+            order_max
+        }
+    } else {
+        order_max
+    };
+
+    // Precompute every order-field value this walk will sample, so the
+    // per-layer contour extraction below can run in parallel (each layer
+    // only reads the shared, immutable `sdf` — see `MeshSdf`, whose query
+    // methods all take `&self` — and writes its own independent `Layer`;
+    // there's no cross-layer dependency to serialize on).
+    //
+    // Defensive cap: even with the finite `order_min`/`effective_order_max` guaranteed
+    // above, guard the step count against any other future degenerate range
+    // (e.g. a bug producing `order_min > effective_order_max` combined with a tiny
+    // `layer_height`) so a bad range fails fast with `Error::Slicing`
+    // instead of growing this `Vec` without bound until the process is
+    // killed for memory exhaustion.
+    const MAX_ORDER_STEPS: usize = 1_000_000;
+    let mut order_values = Vec::new();
+    let mut order_value = order_min + first_layer_height;
+    while order_value <= effective_order_max + f64::EPSILON {
+        if order_values.len() >= MAX_ORDER_STEPS {
+            return Err(Error::Slicing(format!(
+                "order range [{order_min}, {effective_order_max}] with layer_height {layer_height} would \
+                 require more than {MAX_ORDER_STEPS} layers; refusing to continue"
+            )));
+        }
+        order_values.push(order_value);
+        order_value += layer_height;
+    }
+
+    if !is_height {
+        if let Some(&last) = order_values.last() {
+            if effective_order_max - last > 0.05 * layer_height {
+                order_values.push(effective_order_max);
+            }
+        }
+    }
+
+    let total_steps = order_values.len().max(1);
 
     let completed = AtomicUsize::new(0);
     let progress_callback = Mutex::new((on_progress, 0.0f64));
@@ -1325,13 +1348,21 @@ fn has_solid_material_in_direction(
     // something solid beneath it, not just its centerline.
     let half_width = wall_line_width * 0.5;
     let tolerance = nozzle_diameter * 0.5;
-    let probe_at = |offset: f64| point + tangent * offset + probe_direction * depth;
+    let binormal = tangent.cross(probe_direction);
+    let normal = if binormal.length_squared() > 1e-12 {
+        binormal.normalize()
+    } else {
+        DVec3::X
+    };
+    let probe_at = |offset: f64| point + normal * offset + probe_direction * depth;
     let edge_a = probe_at(half_width);
     let edge_b = probe_at(-half_width);
+    let center = point + probe_direction * depth;
     let inside = |p: DVec3| sdf.sample(p).value <= tolerance;
     let a_inside = inside(edge_a);
     let b_inside = inside(edge_b);
-    if a_inside && b_inside {
+    let center_inside = inside(center);
+    if (a_inside && b_inside) || center_inside {
         return true;
     }
     if !a_inside && !b_inside {
