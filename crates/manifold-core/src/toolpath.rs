@@ -1745,9 +1745,7 @@ pub fn plan_with_progress(
                 paths.push(infill_path);
             }
 
-            if !layer.solid_fill_boundary.is_empty()
-                && config.sparse_infill_pattern() != infill::InfillPatternKind::AllWalls
-            {
+            if !layer.solid_fill_boundary.is_empty() {
                 let solid_region = InfillRegion {
                     loops: layer.solid_fill_boundary.clone(),
                 };

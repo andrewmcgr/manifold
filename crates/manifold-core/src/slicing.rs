@@ -471,7 +471,7 @@ pub fn slice_mesh_with_progress(
             // or upward-facing triangles sitting on the top ceiling (max.z)
             // represent the outer bottom/top caps. Excluding them from the side-wall SDF
             // prevents 3D Euclidean distance from treating the print bed or top cap as obstacles
-            // that push walls upward/inward vertically on near-bed and near-top layers.
+            // that push walls upward/inward vertically on near-bed and near-top layers in planar Height slicing.
             if v0.z <= min.z + 1e-4 && v1.z <= min.z + 1e-4 && v2.z <= min.z + 1e-4 {
                 let normal = (v1 - v0).cross(v2 - v0);
                 if normal.z <= 0.0 {
@@ -607,7 +607,7 @@ pub fn slice_mesh_with_progress(
         let pad = DVec3::splat(cell_size * 2.0);
         on_progress(0.05);
         let positions = extract_sparse_isosurface_positions::<MeshSdf>(
-            &*side_sdf,
+            &*sdf,
             min - pad,
             max + pad,
             cell_size,
@@ -914,6 +914,14 @@ pub fn slice_mesh_with_progress(
     // outer wall loops unbroken.
     if !is_height && !config.wave_overhangs_enabled() {
         stitch_wall_gaps(&mut layers, config, basis1, basis2);
+    }
+
+    // Prune any trailing empty apex layers (e.g. from singular apex points with no contour):
+    // Prune any trailing empty apex layers on curved fields (e.g. from singular apex points with no contour):
+    if !is_height {
+        while layers.last().is_some_and(|l| l.loops.is_empty()) {
+            layers.pop();
+        }
     }
 
     if let Ok(mut guard) = progress_callback.lock() {
@@ -2474,6 +2482,23 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             continue;
         }
 
+        let outer_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
+            .par_iter()
+            .map(|&pos| {
+                let wall0_loops: Vec<Vec<DVec3>> = layers[pos]
+                    .loops
+                    .iter()
+                    .filter(|w| w.wall_index == 0)
+                    .map(|w| w.points.clone())
+                    .collect();
+                if wall0_loops.is_empty() {
+                    polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin)
+                } else {
+                    polygon2d::to_2d(&wall0_loops, basis1, basis2, origin)
+                }
+            })
+            .collect();
+
         let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
             .par_iter()
             .map(|&pos| polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin))
@@ -2530,11 +2555,11 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
-                    let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
+                    let next = outer_2d.get(k + 1).unwrap_or(&empty_2d);
                     let exp = if next.is_empty() {
-                        boundaries_2d[k].clone()
+                        outer_2d[k].clone()
                     } else {
-                        polygon2d::difference(&boundaries_2d[k], next)
+                        polygon2d::difference(&outer_2d[k], next)
                     };
                     polygon2d::filter_min_area(&exp, min_solid_area)
                 })
@@ -2543,9 +2568,9 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                 .into_par_iter()
                 .map(|k| {
                     let exp = if k == 0 {
-                        boundaries_2d[k].clone()
+                        outer_2d[k].clone()
                     } else {
-                        polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
+                        polygon2d::difference(&outer_2d[k], &outer_2d[k - 1])
                     };
                     polygon2d::filter_min_area(&exp, min_solid_area)
                 })
@@ -2583,9 +2608,9 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                 .into_par_iter()
                 .map(|k| {
                     let exp = if k == 0 {
-                        boundaries_2d[k].clone()
+                        outer_2d[k].clone()
                     } else {
-                        polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
+                        polygon2d::difference(&outer_2d[k], &outer_2d[k - 1])
                     };
                     polygon2d::filter_min_area(&exp, min_solid_area)
                 })
@@ -2593,11 +2618,11 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
-                    let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
+                    let next = outer_2d.get(k + 1).unwrap_or(&empty_2d);
                     let exp = if next.is_empty() {
-                        boundaries_2d[k].clone()
+                        outer_2d[k].clone()
                     } else {
-                        polygon2d::difference(&boundaries_2d[k], next)
+                        polygon2d::difference(&outer_2d[k], next)
                     };
                     polygon2d::filter_min_area(&exp, min_solid_area)
                 })
@@ -2637,7 +2662,15 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             // this layer's own 3D infill boundary gives every rebuilt
             // point a same-branch height seed, avoiding the wrong-branch
             // axis-ray solves that spiked Eikonal solid fill.
-            let references = layers[positions[k]].infill_boundary.clone();
+            let mut references = layers[positions[k]].infill_boundary.clone();
+            if references.is_empty() {
+                references = layers[positions[k]]
+                    .loops
+                    .iter()
+                    .filter(|w| w.wall_index == 0)
+                    .map(|w| w.points.clone())
+                    .collect();
+            }
             layers[positions[k]].solid_fill_boundary = order_field::reconstruct_on_order_field_near(
                 solid_2d,
                 &references,
