@@ -86,6 +86,7 @@ A `Profile` JSON bundles two top-level objects:
     "scarf_joint_length": 8.0,
     "scarf_joint_steps": 9,
     "scarf_joint_start_height_fraction": 0.10,
+    "scarf_joint_flow_ratio": 0.90,
     "fluid_dynamics": {
       "pa_calibration_low": [0.045, 2.0],
       "pa_calibration_high": [0.030, 15.0],

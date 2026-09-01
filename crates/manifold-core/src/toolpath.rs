@@ -1988,6 +1988,7 @@ pub fn plan_with_progress(
                 let scarf_len = config.scarf_joint_length();
                 let scarf_steps = config.scarf_joint_steps();
                 let scarf_start_h = config.scarf_joint_start_height_fraction();
+                let scarf_flow = config.scarf_joint_flow_ratio();
                 let layer_h = if is_layer_0 {
                     config.first_layer_height()
                 } else {
@@ -2001,6 +2002,7 @@ pub fn plan_with_progress(
                         scarf_len,
                         scarf_steps,
                         scarf_start_h,
+                        scarf_flow,
                         layer_h,
                         Some(layer.order_field.as_ref()),
                         fluid_engine.as_ref(),

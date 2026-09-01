@@ -308,6 +308,9 @@ pub struct SlicerConfig {
     /// Starting slice-normal height/flow fraction at the start of the lead-in ramp (default 0.10, i.e. 10%).
     #[serde(default)]
     pub scarf_joint_start_height_fraction: Option<f64>,
+    /// Global flow multiplier applied across both scarf joint wedges (default 0.90, i.e. 90% combined volume).
+    #[serde(default)]
+    pub scarf_joint_flow_ratio: Option<f64>,
     /// Whether Z-hop (lift-before-travel / lower-after-arrival) is enabled.
     /// When `false`, `plan`/`emit` behave exactly as before this field
     /// existed: Z tracks `point.z` unmodified even across
@@ -584,6 +587,7 @@ impl Default for SlicerConfig {
             scarf_joint_length: None,
             scarf_joint_steps: None,
             scarf_joint_start_height_fraction: None,
+            scarf_joint_flow_ratio: None,
             z_hop_enabled: false,
             z_hop_height: default_z_hop_height(),
             path_simplify_enabled: true,
@@ -834,6 +838,12 @@ impl SlicerConfig {
     #[must_use]
     pub fn scarf_joint_start_height_fraction(&self) -> f64 {
         self.scarf_joint_start_height_fraction.unwrap_or(0.10)
+    }
+
+    /// Scarf joint flow multiplier, defaulting to `0.90` (90% combined volume) when `None`.
+    #[must_use]
+    pub fn scarf_joint_flow_ratio(&self) -> f64 {
+        self.scarf_joint_flow_ratio.unwrap_or(0.90).clamp(0.10, 2.0)
     }
 
     /// First layer line width (mm), defaulting to `1.3 * nozzle_diameter`

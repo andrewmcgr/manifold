@@ -904,6 +904,7 @@ pub fn apply_scarf_joint(
     scarf_length_mm: f64,
     steps: usize,
     start_height_fraction: f64,
+    scarf_flow_ratio: f64,
     layer_height: f64,
     order_field: Option<&dyn manifold_fidget::order::OrderField>,
     fluid_engine: Option<&crate::fluid_dynamics::FluidDynamicsEngine>,
@@ -1064,8 +1065,9 @@ pub fn apply_scarf_joint(
             1.0
         };
 
-        seg.extrusion_rate *= flow_frac;
-        seg.extrusion_length = e_per_mm * delta_s * flow_frac * swell_corr * downhill_corr;
+        let flow_mult = flow_frac * scarf_flow_ratio.clamp(0.10, 2.0);
+        seg.extrusion_rate *= flow_mult;
+        seg.extrusion_length = e_per_mm * delta_s * flow_mult * swell_corr * downhill_corr;
         seg.is_scarf = true;
         new_points.push(pt);
         new_segments.push(seg);
@@ -1136,8 +1138,9 @@ pub fn apply_scarf_joint(
             1.0
         };
 
-        seg.extrusion_rate *= flow_frac;
-        seg.extrusion_length = e_per_mm * delta_s * flow_frac * swell_corr * downhill_corr;
+        let flow_mult = flow_frac * scarf_flow_ratio.clamp(0.10, 2.0);
+        seg.extrusion_rate *= flow_mult;
+        seg.extrusion_length = e_per_mm * delta_s * flow_mult * swell_corr * downhill_corr;
         seg.is_scarf = false;
         new_segments.push(seg);
         new_points.push(lead_out_pts[k + 1]);
@@ -1461,13 +1464,14 @@ mod tests {
             },
         ];
 
-        // 8.0mm scarf joint with 9 steps, 10% start height, 0.2mm layer height on planar order field
+        // 8.0mm scarf joint with 9 steps, 10% start height, 100% flow ratio, 0.2mm layer height on planar order field
         apply_scarf_joint(
             &mut points,
             &mut segments,
             8.0,
             9,
             0.10,
+            1.00,
             0.2,
             None,
             None,
@@ -1579,6 +1583,7 @@ mod tests {
             8.0,
             9,
             0.10,
+            1.00,
             0.2,
             None,
             Some(&engine),
@@ -1623,6 +1628,7 @@ mod tests {
             8.0,
             9,
             0.10,
+            1.00,
             0.2,
             None,
             None,
@@ -1635,6 +1641,57 @@ mod tests {
         }
         // Segments are still partitioned and tagged as scarf
         assert!(segments.iter().take(9).all(|s| s.is_scarf));
+    }
+
+    #[test]
+    fn apply_scarf_joint_scales_total_volume_with_flow_ratio() {
+        let mut points = vec![
+            DVec3::new(0.0, 0.0, 1.0),
+            DVec3::new(20.0, 0.0, 1.0),
+            DVec3::new(20.0, 20.0, 1.0),
+            DVec3::new(0.0, 20.0, 1.0),
+        ];
+        let mut segments = vec![
+            crate::toolpath::Segment {
+                kind: MoveKind::WallOuter,
+                speed: 60.0,
+                extrusion_rate: 1.0,
+                support_fraction: 1.0,
+                order: 1.0,
+                extrusion_length: 10.0,
+                line_width: 0.4,
+                is_scarf: false,
+            };
+            4
+        ];
+
+        apply_scarf_joint(
+            &mut points,
+            &mut segments,
+            8.0,
+            9,
+            0.10,
+            0.90, // 90% default flow ratio
+            0.2,
+            None,
+            None,
+            crate::SlopeCompensationMode::GeometricOffset,
+        );
+
+        let mut lead_in_e = 0.0;
+        for seg in segments.iter().take(9) {
+            lead_in_e += seg.extrusion_length;
+        }
+        let mut lead_out_e = 0.0;
+        for seg in segments.iter().take(22).skip(13) {
+            lead_out_e += seg.extrusion_length;
+        }
+        let total_scarf_e = lead_in_e + lead_out_e;
+        let expected_nominal_8mm_e = 10.0 * (8.0 / 20.0) * 0.90; // 3.6 mm filament
+        assert!(
+            (total_scarf_e - expected_nominal_8mm_e).abs() < 1e-4,
+            "Total scarf extrusion {total_scarf_e} must equal scaled volume {expected_nominal_8mm_e}"
+        );
     }
 
     #[test]

@@ -983,6 +983,18 @@ impl ManifoldApp {
                 {
                     self.config.scarf_joint_start_height_fraction = Some(scarf_start_h / 100.0);
                 }
+
+                let mut scarf_flow = self.config.scarf_joint_flow_ratio();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut scarf_flow, 0.50..=1.20)
+                            .step_by(0.01)
+                            .text("Scarf joint flow multiplier"),
+                    )
+                    .changed()
+                {
+                    self.config.scarf_joint_flow_ratio = Some(scarf_flow);
+                }
                 let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
                 if ui
                     .add(
