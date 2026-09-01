@@ -92,10 +92,7 @@ impl InfillRegion {
     /// the layer entirely if its whole infill boundary is solid.
     #[must_use]
     pub fn from_layer(layer: &Layer, config: &SlicerConfig) -> Self {
-        if layer.solid_fill_boundary.is_empty()
-            || !matches!(config.order_field, order_field::OrderFieldKind::Height)
-            || config.sparse_infill_pattern() == InfillPatternKind::AllWalls
-        {
+        if layer.solid_fill_boundary.is_empty() {
             return Self {
                 loops: layer.infill_boundary.clone(),
             };
@@ -115,12 +112,9 @@ impl InfillRegion {
             apex,
         ));
         let sparse_2d = polygon2d::difference(&infill_2d, &solid_2d);
-        // Reference-seeded reconstruction (see
-        // `reconstruct_on_order_field_near`): boolean-op output points lie
-        // on the input loops' edges, and the layer's own 3D boundaries are
-        // already on the correct branch of the isosurface, so seeding each
-        // rebuilt point from its nearest input point avoids the
-        // wrong-branch axis-ray solves that spiked Eikonal infill.
+        if sparse_2d.is_empty() {
+            return Self { loops: Vec::new() };
+        }
         let references: Vec<Vec<DVec3>> = layer
             .infill_boundary
             .iter()

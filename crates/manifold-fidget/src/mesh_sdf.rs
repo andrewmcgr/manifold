@@ -435,19 +435,10 @@ impl MeshSdf {
                 }
 
                 if face_idx < self.face_vertex_indices.len() {
-                    let verts = self.face_vertex_indices[face_idx];
-                    if let Some(edge) =
-                        Self::edge_containing_point(verts, &self.vertex_positions, closest)
-                    {
-                        if let Some(&pseudo) = self.edge_pseudonormals.get(&edge) {
-                            return if diff.dot(pseudo) >= 0.0 { 1.0 } else { -1.0 };
-                        }
-                    } else if face_idx < self.face_normals.len() {
-                        let n = self.face_normals[face_idx];
-                        let dot = diff.dot(n);
-                        if dot.abs() > 1e-12 {
-                            return if dot > 0.0 { 1.0 } else { -1.0 };
-                        }
+                    let fnorm = self.feature_normal(face_idx, closest);
+                    let cos_angle = diff.dot(fnorm) / dist;
+                    if cos_angle.abs() >= 0.05 {
+                        return if cos_angle > 0.0 { 1.0 } else { -1.0 };
                     }
                 }
 

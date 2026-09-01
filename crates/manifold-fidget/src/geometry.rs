@@ -364,10 +364,12 @@ impl TriangleBvh {
         );
 
         let mut count = 0;
-        let mut stack = Vec::with_capacity(32);
-        stack.push(root);
+        let mut stack: [&Node; 64] = [root; 64];
+        let mut stack_len = 1;
 
-        while let Some(node) = stack.pop() {
+        while stack_len > 0 {
+            stack_len -= 1;
+            let node = stack[stack_len];
             if !node.bounds().ray_intersects(orig, inv_dir) {
                 continue;
             }
@@ -380,8 +382,11 @@ impl TriangleBvh {
                     }
                 }
                 Node::Internal { left, right, .. } => {
-                    stack.push(left);
-                    stack.push(right);
+                    if stack_len + 2 <= 64 {
+                        stack[stack_len] = left.as_ref();
+                        stack[stack_len + 1] = right.as_ref();
+                        stack_len += 2;
+                    }
                 }
             }
         }
