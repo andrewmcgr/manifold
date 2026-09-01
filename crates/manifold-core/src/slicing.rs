@@ -467,19 +467,18 @@ pub fn slice_mesh_with_progress(
             let v0 = mesh.vertices[i0];
             let v1 = mesh.vertices[i1];
             let v2 = mesh.vertices[i2];
-            // Downward-facing triangles sitting directly on the bed plane (min.z)
-            // or upward-facing triangles sitting on the top ceiling (max.z)
-            // represent the outer bottom/top caps. Excluding them from the side-wall SDF
-            // prevents 3D Euclidean distance from treating the print bed or top cap as obstacles
-            // that push walls upward/inward vertically on near-bed and near-top layers in planar Height slicing.
-            if v0.z <= min.z + 1e-4 && v1.z <= min.z + 1e-4 && v2.z <= min.z + 1e-4 {
-                let normal = (v1 - v0).cross(v2 - v0);
-                if normal.z <= 0.0 {
-                    return None;
-                }
-            } else if v0.z >= max.z - 1e-4 && v1.z >= max.z - 1e-4 && v2.z >= max.z - 1e-4 {
-                let normal = (v1 - v0).cross(v2 - v0);
-                if normal.z >= 0.0 {
+            let normal = (v1 - v0).cross(v2 - v0);
+            let normal_len_sq = normal.length_squared();
+            // Flat horizontal triangles (facing purely upward or downward) represent
+            // top roofs, intermediate shelves/plateaus, or bottom bed floors.
+            // In planar Height slicing, distance to the perimeters of the layer must be
+            // measured in-plane (XY) from the side walls, not vertically (Z) from ceilings or floors.
+            // Excluding all horizontal faces from the distance BVH prevents 3D Euclidean distance
+            // from treating roofs, floors, and intermediate horizontal shelves as obstacles that
+            // collapse or destroy side-wall perimeters on near-horizontal layers.
+            if normal_len_sq > 1e-12 {
+                let nz_sq = normal.z * normal.z;
+                if nz_sq >= 0.998 * normal_len_sq {
                     return None;
                 }
             }
@@ -923,6 +922,8 @@ pub fn slice_mesh_with_progress(
             layers.pop();
         }
     }
+
+    compute_solid_fill_boundaries(&mut layers, config);
 
     if let Ok(mut guard) = progress_callback.lock() {
         let fraction = 1.0f64.max(guard.1);
@@ -3301,6 +3302,39 @@ mod tests {
             layers.len() < 1_000,
             "expected a small, finite layer count, got {}",
             layers.len()
+        );
+    }
+
+    #[test]
+    fn slice_mesh_height_mode_generates_solid_fill_boundary_for_stepped_horizontal_surfaces() {
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            shell_thickness: 0.8,
+            top_layers: 3,
+            bottom_layers: 3,
+            order_field: crate::order_field::OrderFieldKind::Height,
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&big_cube_mesh(), &config).unwrap();
+        assert!(!layers.is_empty());
+        let bottom_layer = &layers[0];
+        assert!(
+            !bottom_layer.loops.is_empty(),
+            "expected non-empty loops on bottom layer"
+        );
+        assert!(
+            !bottom_layer.solid_fill_boundary.is_empty(),
+            "expected non-empty solid_fill_boundary on bottom layer"
+        );
+        let top_layer = layers.last().unwrap();
+        assert!(
+            !top_layer.loops.is_empty(),
+            "expected non-empty loops on top layer"
+        );
+        assert!(
+            !top_layer.solid_fill_boundary.is_empty(),
+            "expected non-empty solid_fill_boundary on top layer"
         );
     }
 
