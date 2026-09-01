@@ -725,8 +725,18 @@ pub fn slice_mesh_with_progress(
                 // configured wall (e.g. near a tapered tip) rather than
                 // producing garbage from an empty/degenerate offset.
                 let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
-                let partitioned = polygon2d::partition_walls_adaptive(
+                let canonical_2d = polygon2d::canonicalize_with_sdf(
                     &loops_2d,
+                    basis1,
+                    basis2,
+                    BUILD_DIRECTION,
+                    origin,
+                    order_value,
+                    &*field,
+                    Some(&*sdf),
+                );
+                let partitioned = polygon2d::partition_walls_adaptive(
+                    &canonical_2d,
                     config.wall_line_width,
                     config.min_bead_width(),
                     wall_count,
@@ -783,8 +793,18 @@ pub fn slice_mesh_with_progress(
                 for island in &wall0_loops {
                     let island_2d =
                         polygon2d::to_2d(std::slice::from_ref(island), basis1, basis2, origin);
-                    let partitioned = polygon2d::partition_walls_adaptive(
+                    let canonical_island_2d = polygon2d::canonicalize_with_sdf(
                         &island_2d,
+                        basis1,
+                        basis2,
+                        BUILD_DIRECTION,
+                        origin,
+                        order_value,
+                        &*field,
+                        Some(&*sdf),
+                    );
+                    let partitioned = polygon2d::partition_walls_adaptive(
+                        &canonical_island_2d,
                         config.wall_line_width,
                         config.min_bead_width(),
                         wall_count,
@@ -807,8 +827,18 @@ pub fn slice_mesh_with_progress(
                 for island in &wall0_loops {
                     let island_2d =
                         polygon2d::to_2d(std::slice::from_ref(island), basis1, basis2, origin);
-                    let partitioned = polygon2d::partition_walls_adaptive(
+                    let canonical_island_2d = polygon2d::canonicalize_with_sdf(
                         &island_2d,
+                        basis1,
+                        basis2,
+                        BUILD_DIRECTION,
+                        origin,
+                        order_value,
+                        &*field,
+                        Some(&*sdf),
+                    );
+                    let partitioned = polygon2d::partition_walls_adaptive(
+                        &canonical_island_2d,
                         config.wall_line_width,
                         config.min_bead_width(),
                         wall_count,

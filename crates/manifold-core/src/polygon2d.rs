@@ -18,6 +18,7 @@ use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::float::single::SingleFloatOverlay;
 use i_overlay::mesh::outline::offset::OutlineOffset;
 use i_overlay::mesh::style::OutlineStyle;
+use manifold_fidget::ScalarField;
 
 /// The fill rule used for every boolean/offset operation in this module.
 ///
@@ -251,6 +252,90 @@ pub fn canonicalize(loops2d: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
         .map(|(loop_, depth)| {
             let want_ccw = depth % 2 == 0;
             let is_ccw = signed_area(loop_) > 0.0;
+            if want_ccw == is_ccw {
+                loop_.clone()
+            } else {
+                loop_.iter().copied().rev().collect()
+            }
+        })
+        .collect()
+}
+
+/// Reorients 2D loops using both topological nesting parity and 3D mesh SDF containment.
+///
+/// If a loop encloses open air (`sdf.sample > 0`), it is classified as a hole (CW winding).
+/// If it encloses solid material (`sdf.sample <= 0`), it is classified as a solid island (CCW winding).
+#[allow(clippy::too_many_arguments)]
+pub fn canonicalize_with_sdf(
+    loops2d: &[Vec<[f64; 2]>],
+    basis1: DVec3,
+    basis2: DVec3,
+    axis: DVec3,
+    apex: DVec3,
+    order_value: f64,
+    field: &dyn manifold_fidget::order::OrderField,
+    mesh_sdf: Option<&manifold_fidget::mesh_sdf::MeshSdf>,
+) -> Vec<Vec<[f64; 2]>> {
+    let loops2d: Vec<Vec<[f64; 2]>> = loops2d
+        .iter()
+        .filter(|loop_| loop_.len() >= 3 && signed_area(loop_).abs() > DEGENERATE_AREA_EPSILON)
+        .cloned()
+        .collect();
+
+    if loops2d.is_empty() {
+        return Vec::new();
+    }
+
+    let depths: Vec<usize> = loops2d
+        .iter()
+        .enumerate()
+        .map(|(i, loop_)| {
+            let test = loop_[0];
+            (0..loops2d.len())
+                .filter(|&j| j != i && point_in_polygon(test, &loops2d[j]))
+                .count()
+        })
+        .collect();
+
+    loops2d
+        .iter()
+        .zip(depths)
+        .map(|(loop_, depth)| {
+            let mut c_u = 0.0;
+            let mut c_v = 0.0;
+            for &[u, v] in loop_ {
+                c_u += u;
+                c_v += v;
+            }
+            let n = loop_.len() as f64;
+            let c_u = c_u / n;
+            let c_v = c_v / n;
+            let is_ccw = signed_area(loop_) > 0.0;
+
+            let want_ccw = if let Some(sdf) = mesh_sdf {
+                let planar = apex + basis1 * c_u + basis2 * c_v;
+                if let Some(p_3d) = crate::order_field::reconstruct_point_on_order_field(
+                    planar,
+                    axis,
+                    order_value,
+                    50.0,
+                    field,
+                ) {
+                    let d = sdf.sample(p_3d).value;
+                    if d > 0.05 {
+                        false // Hole in air -> CW
+                    } else if d < -0.05 {
+                        true // Solid interior -> CCW
+                    } else {
+                        depth % 2 == 0
+                    }
+                } else {
+                    depth % 2 == 0
+                }
+            } else {
+                depth % 2 == 0
+            };
+
             if want_ccw == is_ccw {
                 loop_.clone()
             } else {
