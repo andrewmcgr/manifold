@@ -1010,6 +1010,17 @@ impl ManifoldApp {
                     };
                 }
             }
+            let mut min_travel_retract = self.config.min_travel_for_retract();
+            if ui
+                .add(
+                    egui::Slider::new(&mut min_travel_retract, 0.0..=10.0)
+                        .step_by(0.1)
+                        .text("Minimum travel for retract (mm)"),
+                )
+                .changed()
+            {
+                self.config.min_travel_for_retract = Some(min_travel_retract);
+            }
             ui.checkbox(&mut self.config.wipe_enabled, "Wipe on retraction");
             if self.config.wipe_enabled {
                 let mut wipe_dist = self.config.wipe_distance();

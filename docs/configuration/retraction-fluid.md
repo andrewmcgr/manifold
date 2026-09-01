@@ -21,6 +21,7 @@ Manifold provides advanced extrusion control including perimeter wipe moves, non
   "wipe_enabled": true,
   "wipe_distance": 1.0,
   "pre_retract_taper_distance": 1.0,
+  "min_travel_for_retract": 1.5,
   "z_hop_enabled": true,
   "z_hop_height": 0.40,
   "travel_order_optimization_enabled": true,
@@ -30,6 +31,7 @@ Manifold provides advanced extrusion control including perimeter wipe moves, non
 ```
 
 - **Non-Planar Scarf Joint Seams (`scarf_joint_enabled`)**: Over the configured `scarf_joint_length` ($8.0\text{ mm}$), the lead-in segment ramps extrusion flow and slice-normal layer height from `scarf_joint_start_height_fraction` ($10\%$) to $100\%$ across `scarf_joint_steps` ($9$ discrete steps), forming a bottom wedge offset along the negative slice normal. After traversing the closed loop, the nozzle continues for an overlapping $8.0\text{ mm}$ tail at nominal surface height, ramping flow from $90\% \to 0\%$ (top wedge). The combined volume is scaled by `scarf_joint_flow_ratio` (default $0.90$, i.e. $90\%$ combined volume) to prevent seam bulging on curved or non-planar perimeters.
+- **Minimum Travel for Retract (`min_travel_for_retract`)**: Minimum travel distance ($1.5\text{ mm}$ default) required to trigger a retraction move. When scarf joints are enabled, the scarf joint length ($8.0\text{ mm}$) is automatically added to this threshold ($1.5 + 8.0 = 9.5\text{ mm}$), preventing unnecessary retract/unretract cycles and filament grinding when the nozzle transitions directly from the end of one perimeter scarf joint to the start of an adjacent wall seam.
 - **Wipe Moves (`wipe_enabled`)**: Appends an unextruded nozzle move along the perimeter/interior before travel lifts to break the capillary droplet bridge.
 - **Travel Collision Avoidance (`travel_collision_avoidance_enabled`)**: Detects travel chords that cross solid material and plans collision-free 3D detour paths in open air using parallel A* search.
 - **Order-Aware Temporal Geometry**: Collision checking is strictly time-aware: a point $p$ only obstructs travel if it is inside the solid mesh (`MeshSdf` value $< \text{clearance}$) *and* its scalar order-field value satisfies $\Phi(p) \le T_{\text{current}} + \epsilon$ (material that has already been deposited on the bed). Future unprinted geometry ($\Phi(p) > T_{\text{current}}$) is recognized as open physical air, allowing direct straight-line travel without artificial detours around objects that do not yet exist.

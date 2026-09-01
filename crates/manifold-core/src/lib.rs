@@ -275,6 +275,11 @@ pub struct SlicerConfig {
     /// Distance (mm) before a retraction over which extrusion rate is tapered down.
     #[serde(default)]
     pub pre_retract_taper_distance: Option<f64>,
+    /// Minimum travel distance (mm) before triggering a retraction (default 1.5 mm).
+    /// When scarf joint seams are enabled, the scarf joint length is added to this threshold
+    /// to avoid retractions when traveling between adjacent perimeter seams.
+    #[serde(default)]
+    pub min_travel_for_retract: Option<f64>,
     /// Retraction distance in mm (default 0.8 mm).
     #[serde(default)]
     pub retraction_length: Option<f64>,
@@ -576,6 +581,7 @@ impl Default for SlicerConfig {
             max_volumetric_speed: None,
             pressure_advance: None,
             pre_retract_taper_distance: None,
+            min_travel_for_retract: None,
             retraction_length: None,
             retraction_speed: None,
             unretract_speed: None,
@@ -749,6 +755,25 @@ impl SlicerConfig {
     #[must_use]
     pub fn first_layer_extrusion_multiplier(&self) -> f64 {
         self.first_layer_extrusion_multiplier.unwrap_or(1.0)
+    }
+
+    /// Minimum travel distance (mm) before triggering a retraction, defaulting to `1.5` mm when `None`.
+    #[must_use]
+    pub fn min_travel_for_retract(&self) -> f64 {
+        self.min_travel_for_retract.unwrap_or(1.5)
+    }
+
+    /// Effective travel distance threshold (mm) for triggering retractions.
+    /// When scarf joints are enabled, the scarf joint length is added so that traveling
+    /// between adjacent seam positions skips unnecessary retract/unretract cycles.
+    #[must_use]
+    pub fn effective_min_travel_for_retract(&self) -> f64 {
+        let base = self.min_travel_for_retract();
+        if self.scarf_joint_enabled {
+            base + self.scarf_joint_length()
+        } else {
+            base
+        }
     }
 
     /// Retraction distance (mm), defaulting to `0.8` mm when `None`.

@@ -300,6 +300,7 @@ pub fn emit_with_machine(
     let mut last_retraction_len: f64 = config.retraction_length();
     let mut accumulated_travel_time_s: f64 = 0.0;
     let mut retracted = true;
+    let mut last_pos: Option<DVec3> = None;
     let motion_model = config.resolved_motion_model(machine);
     let speed_deadband = config.speed_deadband_percent() / 100.0;
     let accel_deadband = config.acceleration_deadband_percent() / 100.0;
@@ -337,7 +338,6 @@ pub fn emit_with_machine(
             config.square_corner_velocity(),
         );
 
-        let mut last_pos: Option<DVec3> = None;
         for (i, p) in path.points.iter().enumerate() {
             // `segments[i]` describes the edge `points[i] -> points[i + 1]`
             // (see `toolpath::Path`'s contract), so the move *arriving* at
@@ -401,31 +401,67 @@ pub fn emit_with_machine(
             let fan_fraction = (target_fan_pwm as f64) / 255.0;
 
             // Retract before travel moves:
-            // 1. If starting a new path (i == 0) and currently unretracted, retract before the G0 positioning move.
-            // 2. If entering an in-path Travel segment, retract before the move.
+            // 1. If starting a new path (i == 0) and currently unretracted, retract before the G0 positioning move
+            //    provided the upcoming travel distance exceeds config.effective_min_travel_for_retract().
+            // 2. If entering an in-path Travel segment, retract before the move if travel distance exceeds threshold.
             // Unretract before resuming an extruding move.
             if !extruding {
                 if !retracted {
-                    if config.use_firmware_retraction && !config.use_fluid_dynamics() {
-                        out.push_str("G10\n");
+                    // Calculate total upcoming travel distance for this travel run.
+                    let mut upcoming_travel_dist = 0.0;
+                    if i == 0 {
+                        if let Some(prev) = last_pos {
+                            upcoming_travel_dist += prev.distance(*p);
+                        }
+                        for (seg_idx, seg) in path.segments.iter().enumerate() {
+                            if seg.kind == MoveKind::Travel {
+                                if let (Some(p0), Some(p1)) =
+                                    (path.points.get(seg_idx), path.points.get(seg_idx + 1))
+                                {
+                                    upcoming_travel_dist += p0.distance(*p1);
+                                }
+                            } else {
+                                break;
+                            }
+                        }
                     } else {
-                        let r_len = if let Some(ref engine) = fluid_engine {
-                            let pa_val = current_pa.unwrap_or_else(|| {
-                                engine.dynamic_pressure_advance(5.0, fan_fraction)
-                            });
-                            let filament_velocity =
-                                (last_extruding_flow_q / filament_area).max(0.0);
-                            engine.retraction_length(pa_val, filament_velocity)
-                        } else {
-                            config.retraction_length()
-                        };
-                        let r_spd = config.retraction_speed();
-                        out.push_str(&format!("G1 E-{r_len:.5} F{r_spd:.0}\n"));
-                        current_f = Some(r_spd);
-                        last_retraction_len = r_len;
-                        accumulated_travel_time_s = 0.0;
+                        for (seg_idx, seg) in path.segments[i - 1..].iter().enumerate() {
+                            if seg.kind == MoveKind::Travel {
+                                let abs_idx = i - 1 + seg_idx;
+                                if let (Some(p0), Some(p1)) =
+                                    (path.points.get(abs_idx), path.points.get(abs_idx + 1))
+                                {
+                                    upcoming_travel_dist += p0.distance(*p1);
+                                }
+                            } else {
+                                break;
+                            }
+                        }
                     }
-                    retracted = true;
+
+                    let min_retract_travel = config.effective_min_travel_for_retract();
+                    if upcoming_travel_dist > min_retract_travel {
+                        if config.use_firmware_retraction && !config.use_fluid_dynamics() {
+                            out.push_str("G10\n");
+                        } else {
+                            let r_len = if let Some(ref engine) = fluid_engine {
+                                let pa_val = current_pa.unwrap_or_else(|| {
+                                    engine.dynamic_pressure_advance(5.0, fan_fraction)
+                                });
+                                let filament_velocity =
+                                    (last_extruding_flow_q / filament_area).max(0.0);
+                                engine.retraction_length(pa_val, filament_velocity)
+                            } else {
+                                config.retraction_length()
+                            };
+                            let r_spd = config.retraction_speed();
+                            out.push_str(&format!("G1 E-{r_len:.5} F{r_spd:.0}\n"));
+                            current_f = Some(r_spd);
+                            last_retraction_len = r_len;
+                            accumulated_travel_time_s = 0.0;
+                        }
+                        retracted = true;
+                    }
                 }
 
                 // Move SET_PRESSURE_ADVANCE earlier: emit immediately before the travel move
@@ -701,10 +737,12 @@ mod tests {
 
         let config = SlicerConfig {
             use_firmware_retraction: false,
+            scarf_joint_enabled: false,
             retraction_length: Some(0.8),
             retraction_speed: Some(3000.0),
             unretract_speed: Some(3000.0),
             unretract_extra_length: Some(0.1),
+            min_travel_for_retract: Some(0.0),
             start_gcode: String::new(),
             end_gcode: String::new(),
             ..SlicerConfig::default()
@@ -754,7 +792,10 @@ mod tests {
 
         // Started retracted (fresh tool), so the *first* extruding move
         // (arriving at points[1]) must be preceded by an unretract.
-        let out = emit(&paths, &config_without_print_gcode());
+        let mut config = config_without_print_gcode();
+        config.scarf_joint_enabled = false;
+        config.min_travel_for_retract = Some(0.0);
+        let out = emit(&paths, &config);
         let lines: Vec<&str> = out.lines().collect();
         let g10_idx = lines.iter().position(|l| *l == "G10");
         let g11_idx = lines.iter().position(|l| *l == "G11");
@@ -1217,6 +1258,120 @@ mod tests {
         let out = emit(&[], &config);
 
         assert!(out.contains("PRINT_START PRINT_MIN=0.000,0.000"));
+    }
+
+    #[test]
+    fn emit_skips_retraction_for_short_travel_under_threshold() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        // Path 1 (extruding from 0,0 to 10,0) -> short travel to 11,0 (1.0 mm) -> Path 2 (extruding from 11,0 to 20,0)
+        let paths = vec![
+            Path {
+                points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(10.0, 0.0, 0.0)],
+                segments: vec![Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 0.5,
+                    ..Segment::default()
+                }],
+                tool: ToolId(0),
+            },
+            Path {
+                points: vec![DVec3::new(11.0, 0.0, 0.0), DVec3::new(20.0, 0.0, 0.0)],
+                segments: vec![Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 0.5,
+                    ..Segment::default()
+                }],
+                tool: ToolId(0),
+            },
+        ];
+
+        let config = SlicerConfig {
+            scarf_joint_enabled: false,
+            min_travel_for_retract: Some(1.5),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&paths, &config);
+        // Start primes once (1x G11), and end of program retracts once (1x G10).
+        // The intermediate 1.0mm travel move MUST NOT retract or unretract.
+        assert_eq!(out.matches("G10").count(), 1, "only end-of-program G10");
+        assert_eq!(out.matches("G11").count(), 1, "only start-of-print G11");
+    }
+
+    #[test]
+    fn emit_skips_retraction_for_travel_bridging_scarf_joint_seams() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        // Traveling 8.5 mm between adjacent perimeter scarf seams (under the 1.5 + 8.0 = 9.5 mm threshold)
+        let paths = vec![
+            Path {
+                points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(10.0, 0.0, 0.0)],
+                segments: vec![Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 0.5,
+                    ..Segment::default()
+                }],
+                tool: ToolId(0),
+            },
+            Path {
+                points: vec![DVec3::new(18.5, 0.0, 0.0), DVec3::new(30.0, 0.0, 0.0)],
+                segments: vec![Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 0.5,
+                    ..Segment::default()
+                }],
+                tool: ToolId(0),
+            },
+        ];
+
+        let config = SlicerConfig {
+            scarf_joint_enabled: true,
+            scarf_joint_length: Some(8.0),
+            min_travel_for_retract: Some(1.5),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&paths, &config);
+        // 8.5mm travel <= 9.5mm threshold: no intermediate retract/unretract!
+        assert_eq!(out.matches("G10").count(), 1, "only end-of-program G10");
+        assert_eq!(out.matches("G11").count(), 1, "only start-of-print G11");
+
+        // If travel is 10.0 mm (> 9.5 mm threshold), it MUST retract:
+        let long_paths = vec![
+            Path {
+                points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(10.0, 0.0, 0.0)],
+                segments: vec![Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 0.5,
+                    ..Segment::default()
+                }],
+                tool: ToolId(0),
+            },
+            Path {
+                points: vec![DVec3::new(20.0, 0.0, 0.0), DVec3::new(30.0, 0.0, 0.0)],
+                segments: vec![Segment {
+                    kind: MoveKind::WallOuter,
+                    extrusion_length: 0.5,
+                    ..Segment::default()
+                }],
+                tool: ToolId(0),
+            },
+        ];
+
+        let out_long = emit(&long_paths, &config);
+        assert_eq!(
+            out_long.matches("G10").count(),
+            2,
+            "intermediate G10 + end-of-program G10"
+        );
+        assert_eq!(
+            out_long.matches("G11").count(),
+            2,
+            "start-of-print G11 + resume G11"
+        );
     }
 
     #[test]
