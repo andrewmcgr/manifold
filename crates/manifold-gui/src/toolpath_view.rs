@@ -18,18 +18,70 @@ pub struct ToolpathLineInstance {
     pub end: [f32; 3],
     pub color: [f32; 4],
     pub order: f32,
+    pub width: f32,
+    pub height: f32,
     pub _pad: [f32; 3],
 }
 
 impl ToolpathLineInstance {
-    pub fn new(start: glam::DVec3, end: glam::DVec3, color: [f32; 4], order: f64) -> Self {
+    pub fn new(
+        start: glam::DVec3,
+        end: glam::DVec3,
+        color: [f32; 4],
+        order: f64,
+        width: f64,
+        height: f64,
+    ) -> Self {
         Self {
             start: start.as_vec3().to_array(),
             end: end.as_vec3().to_array(),
             color,
             order: order as f32,
+            width: width as f32,
+            height: height as f32,
             _pad: [0.0; 3],
         }
+    }
+}
+
+/// Computes physical cross-sectional dimensions `(width, height)` in millimeters for `segment`.
+pub fn segment_bead_dimensions(
+    segment: &manifold_core::toolpath::Segment,
+    start: glam::DVec3,
+    end: glam::DVec3,
+    config: &manifold_core::SlicerConfig,
+) -> (f64, f64) {
+    if segment.kind == MoveKind::Travel || segment.extrusion_length <= 0.0 {
+        return (0.0, 0.0);
+    }
+
+    let dist = start.distance(end);
+    let nominal_width = if segment.line_width > 1e-4 {
+        segment.line_width
+    } else {
+        manifold_core::extrusion::line_width_for_kind(segment.kind, config)
+    };
+    let nominal_height = config.layer_height;
+
+    if dist < 1e-6 {
+        return (nominal_width, nominal_height);
+    }
+
+    // Actual volume deposited per unit path length:
+    let filament_area =
+        manifold_core::extrusion::filament_cross_section_area(config.filament_diameter);
+    let actual_bead_area = (segment.extrusion_length / dist) * filament_area;
+    let nominal_bead_area =
+        manifold_core::extrusion::bead_cross_section_area(nominal_width, nominal_height);
+
+    if nominal_bead_area > 1e-6 && actual_bead_area > 1e-6 {
+        let volumetric_ratio = actual_bead_area / nominal_bead_area;
+        let scale = volumetric_ratio.sqrt();
+        let width = (nominal_width * scale).clamp(0.05, 3.0);
+        let height = (nominal_height * scale).clamp(0.02, 2.0);
+        (width, height)
+    } else {
+        (nominal_width, nominal_height)
     }
 }
 
@@ -526,7 +578,7 @@ pub fn build_toolpath_lines_filtered(
                     }
                 };
                 instances.push(ToolpathLineInstance::new(
-                    prev_end, path_start, color, path_order,
+                    prev_end, path_start, color, path_order, 0.0, 0.0,
                 ));
             }
         }
@@ -581,7 +633,14 @@ pub fn build_toolpath_lines_filtered(
                     0.5
                 };
                 let color = scalar_to_color(t);
-                instances.push(ToolpathLineInstance::new(start, end, color, segment.order));
+                instances.push(ToolpathLineInstance::new(
+                    start,
+                    end,
+                    color,
+                    segment.order,
+                    0.0,
+                    0.0,
+                ));
                 continue;
             }
 
@@ -619,7 +678,15 @@ pub fn build_toolpath_lines_filtered(
                 }
             };
 
-            instances.push(ToolpathLineInstance::new(start, end, color, segment.order));
+            let (w, h) = segment_bead_dimensions(segment, start, end, config);
+            instances.push(ToolpathLineInstance::new(
+                start,
+                end,
+                color,
+                segment.order,
+                w,
+                h,
+            ));
         }
 
         if path.segments.len() == count {
@@ -1011,5 +1078,57 @@ mod tests {
         assert_eq!(travel_lines.len(), 1);
         assert_eq!(travel_lines[0].start, [20.0, 0.0, 0.0]);
         assert_eq!(travel_lines[0].end, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn segment_bead_dimensions_scales_with_extrusion_volume_ratio() {
+        let config = manifold_core::SlicerConfig {
+            wall_line_width: 0.4,
+            layer_height: 0.2,
+            filament_diameter: 1.75,
+            ..manifold_core::SlicerConfig::default()
+        };
+
+        let start = DVec3::new(0.0, 0.0, 0.0);
+        let end = DVec3::new(10.0, 0.0, 0.0);
+
+        // Travel move: dimensions must be 0.0
+        let travel_seg = Segment {
+            kind: MoveKind::Travel,
+            extrusion_length: 0.0,
+            line_width: 0.0,
+            ..Segment::default()
+        };
+        let (w_travel, h_travel) = segment_bead_dimensions(&travel_seg, start, end, &config);
+        assert_eq!(w_travel, 0.0);
+        assert_eq!(h_travel, 0.0);
+
+        // Standard 100% extrusion move
+        let nominal_bead_area = manifold_core::extrusion::bead_cross_section_area(0.4, 0.2);
+        let filament_area = manifold_core::extrusion::filament_cross_section_area(1.75);
+        let nominal_e = (10.0 * nominal_bead_area) / filament_area;
+
+        let full_seg = Segment {
+            kind: MoveKind::WallOuter,
+            extrusion_length: nominal_e,
+            line_width: 0.4,
+            ..Segment::default()
+        };
+        let (w_full, h_full) = segment_bead_dimensions(&full_seg, start, end, &config);
+        assert!((w_full - 0.4).abs() < 1e-3);
+        assert!((h_full - 0.2).abs() < 1e-3);
+
+        // Scarf joint 10% low-flow move
+        let low_flow_seg = Segment {
+            kind: MoveKind::WallOuter,
+            extrusion_length: nominal_e * 0.10,
+            line_width: 0.4,
+            is_scarf: true,
+            ..Segment::default()
+        };
+        let (w_low, h_low) = segment_bead_dimensions(&low_flow_seg, start, end, &config);
+        assert!(w_low < w_full);
+        assert!(h_low < h_full);
+        assert!((w_low - 0.4 * 0.10_f64.sqrt()).abs() < 1e-3);
     }
 }

@@ -40,7 +40,7 @@ struct CameraUniform {
     view_proj: [f32; 16],
     viewport_size: [f32; 2],
     line_width: f32,
-    _pad: f32,
+    render_mode: f32,
 }
 
 /// One GPU vertex: position + flat face normal + RGBA color, all in world space.
@@ -542,7 +542,7 @@ impl MeshRenderResources {
                 view_proj: Mat4::IDENTITY.to_cols_array(),
                 viewport_size: [1.0, 1.0],
                 line_width: 1.4,
-                _pad: 0.0,
+                render_mode: 0.0,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -636,7 +636,14 @@ impl MeshRenderResources {
         let toolpath_instance_buffers = [wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<ToolpathLineInstance>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32],
+            attributes: &wgpu::vertex_attr_array![
+                0 => Float32x3,
+                1 => Float32x3,
+                2 => Float32x4,
+                3 => Float32,
+                4 => Float32,
+                5 => Float32,
+            ],
         }];
 
         let toolpath_line_pipeline =
@@ -909,7 +916,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             view_proj: view_proj.to_cols_array(),
             viewport_size: [vp_w as f32, vp_h as f32],
             line_width,
-            _pad: 0.0,
+            render_mode: 0.0,
         };
         queue.write_buffer(
             &self.camera_buffer,

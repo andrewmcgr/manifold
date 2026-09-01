@@ -8,7 +8,7 @@ struct Camera {
     view_proj: mat4x4<f32>,
     viewport_size: vec2<f32>,
     line_width: f32,
-    _pad: f32,
+    render_mode: f32,
 }
 
 @group(0) @binding(0)
