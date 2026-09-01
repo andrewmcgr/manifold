@@ -758,95 +758,67 @@ pub fn slice_mesh_with_progress(
             // The infill boundary sits where wall pass `wall_count` would
             // be if one more wall were printed — one further
             // `wall_line_width` step inward from the innermost printed
-            // wall. Kept out of `loops` so `toolpath::plan` never treats it
-            // as a printable wall.
-            //
-            // The innermost *configured* pass (`wall_count - 1`) may have no
-            // geometry at all: a cross-section can be too small to fit every
-            // nested wall the configured `shell_thickness` calls for (e.g.
-            // near a tapered tip), while an outer pass still does. Using a
-            // hardcoded `wall_count - 1` in that case would silently zero
-            // out `infill_boundary` (and therefore `solid_fill_boundary`)
-            // even though the outer wall(s) that did extract still bound a
-            // real interior area. So walk backward from `wall_count - 1` to
-            // find the deepest wall pass that actually produced loops, and
-            // offset inward from there instead — the offset step still
-            // conceptually represents "one more `wall_line_width` inward
-            // from whatever the innermost printed wall turned out to be".
-            //
-            // Computed as a 2D inward offset of that wall loop (rather than
-            // a further 3D SDF isosurface probe at `boundary_iso`): the SDF
-            // probe could come back empty even when the innermost wall
-            // itself is non-empty (e.g. thin features, or contour-extraction
-            // grid resolution missing the slightly-smaller isosurface),
-            // silently dropping infill on otherwise fillable layers.
-            // Offsetting the already-extracted wall loop in 2D instead
-            // guarantees a boundary whenever any wall exists.
-            //
-            // Curved path (non-Height order field): uses the same shared
-            // `plane_basis(BUILD_DIRECTION)` basis as the Height path below
-            // (rather than a separate per-loop best-fit local basis) so the
-            // inward-offset step is consistent across all order field
-            // kinds. Each layer's loops are only *locally* near-planar
-            // (concentric around a common apex/axis — see
-            // `manifold_fidget::contour`'s module docs), so this is a
-            // best-effort approximation, not a single unified
-            // curved-boundary computation: exact correctness for
-            // arbitrarily curved solid-fill boundaries is an explicitly
-            // soft requirement for this phase, not a hard blocker — see
-            // ROADMAP.md Phase 15's "explicitly out of scope" section (no
-            // toolpath-level physical-printability guarantees this phase).
-            let innermost_wall_loops: Vec<Vec<DVec3>> = (0..wall_count)
-                .rev()
-                .map(|wall_index| {
-                    loops
-                        .iter()
-                        .filter(|wall| wall.wall_index == wall_index)
-                        .map(|wall| wall.points.clone())
-                        .collect::<Vec<_>>()
-                })
-                .find(|wall_loops| !wall_loops.is_empty())
-                .unwrap_or_default();
-            let infill_boundary = if innermost_wall_loops.is_empty() {
+            // wall for EACH separate island.
+            let wall0_loops: Vec<Vec<DVec3>> = loops
+                .iter()
+                .filter(|wall| wall.wall_index == 0)
+                .map(|wall| wall.points.clone())
+                .collect();
+
+            let infill_boundary = if wall0_loops.is_empty() {
                 Vec::new()
             } else if is_height {
-                let loops_2d = polygon2d::to_2d(&innermost_wall_loops, basis1, basis2, origin);
-                let offset_2d = polygon2d::inward_offset(&loops_2d, config.wall_line_width);
-                polygon2d::from_2d(offset_2d, basis1, basis2, origin)
+                let mut layer_infill_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+                for island in &wall0_loops {
+                    let island_2d =
+                        polygon2d::to_2d(std::slice::from_ref(island), basis1, basis2, origin);
+                    let partitioned = polygon2d::partition_walls_adaptive(
+                        &island_2d,
+                        config.wall_line_width,
+                        config.min_bead_width(),
+                        wall_count,
+                    );
+                    if let Some(deepest_wall) = partitioned.last() {
+                        let inset = polygon2d::inward_offset(
+                            &deepest_wall.loops_2d,
+                            config.wall_line_width,
+                        );
+                        if !inset.is_empty() {
+                            layer_infill_2d.extend(inset);
+                        } else if !deepest_wall.loops_2d.is_empty() {
+                            layer_infill_2d.extend(deepest_wall.loops_2d.clone());
+                        }
+                    }
+                }
+                polygon2d::from_2d(layer_infill_2d, basis1, basis2, origin)
             } else {
-                // Uses the same global build-direction basis
-                // (`basis1`/`basis2` from `plane_basis(BUILD_DIRECTION)`) as
-                // the Height path above, applied uniformly across all
-                // innermost wall loops rather than a separate per-loop
-                // best-fit local basis — even though each loop is only
-                // *locally* near-planar (concentric around a common
-                // apex/axis, see `manifold_fidget::contour`'s module docs),
-                // a per-loop local basis let small/noisy loops yield a bad
-                // plane normal and send offset points well off the actual
-                // isosurface. Any 2D-projection distortion the shared
-                // global basis introduces on steeply-curved loops is
-                // corrected immediately below by reprojecting each offset
-                // point back onto the isosurface.
-                let loops_2d = polygon2d::to_2d(&innermost_wall_loops, basis1, basis2, origin);
-                let offset_2d_flat = polygon2d::inward_offset(&loops_2d, config.wall_line_width);
-                let offset_3d = polygon2d::from_2d(offset_2d_flat, basis1, basis2, origin);
-                // The shared-basis 2D offset above is only an
-                // approximation for curved layers: projecting non-planar
-                // loops into one flat basis before offsetting can send
-                // offset points somewhat off the layer's actual isosurface
-                // (even below the build plate), and those points then
-                // poison every downstream consumer that uses
-                // `infill_boundary` as a same-branch height reference
-                // (`InfillRegion::from_layer`, `compute_solid_fill_boundaries`,
-                // infill crossing re-solves). Refine each offset point back
-                // onto the isosurface, seeded from the nearest
-                // innermost-wall point -- known-good geometry straight from
-                // contour extraction on the mesh (see
-                // `reconstruct_on_order_field_near`).
+                let mut layer_infill_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+                for island in &wall0_loops {
+                    let island_2d =
+                        polygon2d::to_2d(std::slice::from_ref(island), basis1, basis2, origin);
+                    let partitioned = polygon2d::partition_walls_adaptive(
+                        &island_2d,
+                        config.wall_line_width,
+                        config.min_bead_width(),
+                        wall_count,
+                    );
+                    if let Some(deepest_wall) = partitioned.last() {
+                        let inset = polygon2d::inward_offset(
+                            &deepest_wall.loops_2d,
+                            config.wall_line_width,
+                        );
+                        if !inset.is_empty() {
+                            layer_infill_2d.extend(inset);
+                        } else if !deepest_wall.loops_2d.is_empty() {
+                            layer_infill_2d.extend(deepest_wall.loops_2d.clone());
+                        }
+                    }
+                }
+                let offset_3d = polygon2d::from_2d(layer_infill_2d, basis1, basis2, origin);
                 let offset_2d = polygon2d::to_2d(&offset_3d, basis1, basis2, origin);
                 order_field::reconstruct_on_order_field_near(
                     offset_2d,
-                    &innermost_wall_loops,
+                    &wall0_loops,
                     basis1,
                     basis2,
                     BUILD_DIRECTION,
@@ -4642,6 +4614,63 @@ mod tests {
             "current loop 1 stitched from the wrong previous-layer loop by centroid: \
          first inserted point x = {}, expected near 0.0",
             wall1.points[0].x
+        );
+    }
+
+    #[test]
+    fn slice_mesh_computes_infill_boundary_for_all_islands_regardless_of_wall_count() {
+        // Create a layer with two disconnected wall 0 islands:
+        // - Island 0: large (radius 10mm), easily fits 3 walls.
+        // - Island 1: small boss/summit (radius 0.6mm), fits only 1 wall.
+        // Both islands must generate infill boundaries so the narrow summit is not left with an open hole.
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+        let origin = DVec3::ZERO;
+
+        let circle = |center: DVec3, radius: f64, n_pts: usize| -> Vec<DVec3> {
+            (0..n_pts)
+                .map(|i| {
+                    let angle = 2.0 * std::f64::consts::PI * (i as f64) / (n_pts as f64);
+                    center + basis1 * (radius * angle.cos()) + basis2 * (radius * angle.sin())
+                })
+                .collect()
+        };
+
+        let island0 = circle(DVec3::new(0.0, 0.0, 5.0), 10.0, 32);
+        let island1 = circle(DVec3::new(30.0, 0.0, 5.0), 0.6, 16);
+
+        let config = SlicerConfig {
+            wall_line_width: 0.4,
+            shell_thickness: 1.2, // 3 walls
+            ..SlicerConfig::default()
+        };
+
+        let wall0_loops = vec![island0, island1];
+        let mut layer_infill_2d = Vec::new();
+
+        for island in &wall0_loops {
+            let island_2d = polygon2d::to_2d(std::slice::from_ref(island), basis1, basis2, origin);
+            let partitioned = polygon2d::partition_walls_adaptive(
+                &island_2d,
+                config.wall_line_width,
+                config.min_bead_width(),
+                config.wall_count(),
+            );
+            if let Some(deepest_wall) = partitioned.last() {
+                let inset =
+                    polygon2d::inward_offset(&deepest_wall.loops_2d, config.wall_line_width);
+                if !inset.is_empty() {
+                    layer_infill_2d.extend(inset);
+                } else if !deepest_wall.loops_2d.is_empty() {
+                    layer_infill_2d.extend(deepest_wall.loops_2d.clone());
+                }
+            }
+        }
+
+        // Must produce 2 infill boundary loops (one for each island)
+        assert_eq!(
+            layer_infill_2d.len(),
+            2,
+            "both the large island and the narrow summit must have infill boundaries"
         );
     }
 
