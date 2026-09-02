@@ -1785,20 +1785,40 @@ pub fn plan_with_progress(
             }
 
             let region = InfillRegion::from_layer(layer, config);
-            for mut infill_path in sparse_generator.generate(
-                &region,
-                config,
-                layer,
-                &object.transform,
-                config.infill_density,
-            ) {
-                infill_path.tool = object.tool;
-                paths.push(infill_path);
+            let (sparse_loops, narrow_solid_loops): (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) =
+                region.loops.into_iter().partition(|l| {
+                    let mut min = glam::DVec3::splat(f64::INFINITY);
+                    let mut max = glam::DVec3::splat(f64::NEG_INFINITY);
+                    for p in l {
+                        min = min.min(*p);
+                        max = max.max(*p);
+                    }
+                    let extent = (max - min).length();
+                    extent >= config.nozzle_diameter * 15.0
+                });
+
+            if !sparse_loops.is_empty() {
+                let sparse_region = InfillRegion {
+                    loops: sparse_loops,
+                };
+                for mut infill_path in sparse_generator.generate(
+                    &sparse_region,
+                    config,
+                    layer,
+                    &object.transform,
+                    config.infill_density,
+                ) {
+                    infill_path.tool = object.tool;
+                    paths.push(infill_path);
+                }
             }
 
-            if !layer.solid_fill_boundary.is_empty() {
+            let mut all_solid_loops = layer.solid_fill_boundary.clone();
+            all_solid_loops.extend(narrow_solid_loops);
+
+            if !all_solid_loops.is_empty() {
                 let solid_region = InfillRegion {
-                    loops: layer.solid_fill_boundary.clone(),
+                    loops: all_solid_loops,
                 };
                 for mut infill_path in
                     solid_generator.generate(&solid_region, config, layer, &object.transform, 1.0)
@@ -2424,7 +2444,7 @@ mod tests {
                 object: ObjectId(1),
                 order: 0.0,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: loop_a.clone(),
                     ..Default::default()
@@ -2439,7 +2459,7 @@ mod tests {
                 object: ObjectId(0),
                 order: 0.0,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: loop_b.clone(),
                     ..Default::default()
@@ -2511,7 +2531,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.75,
             loops: vec![WallLoop {
-    is_open: false,
+                is_open: false,
                 wall_index: 0,
                 points: vec![
                     DVec3::ZERO,
@@ -2586,7 +2606,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.0,
             loops: vec![WallLoop {
-    is_open: false,
+                is_open: false,
                 wall_index: 0,
                 points: vec![
                     DVec3::ZERO,
@@ -2623,7 +2643,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.25,
             loops: vec![WallLoop {
-    is_open: false,
+                is_open: false,
                 wall_index: 0,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.25),
@@ -2642,7 +2662,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.50,
             loops: vec![WallLoop {
-    is_open: false,
+                is_open: false,
                 wall_index: 0,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.50),
@@ -2693,7 +2713,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.20,
             loops: vec![WallLoop {
-    is_open: false,
+                is_open: false,
                 wall_index: 0,
                 points: vec![DVec3::new(0.0, 0.0, 0.20), DVec3::new(20.0, 0.0, 0.20)],
                 ..Default::default()
@@ -2856,7 +2876,7 @@ mod tests {
             order: 0.0,
             loops: vec![
                 WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -2865,7 +2885,7 @@ mod tests {
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 1,
                     points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -2904,7 +2924,7 @@ mod tests {
             order: 0.0,
             loops: vec![
                 WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -2913,7 +2933,7 @@ mod tests {
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 1,
                     points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -2922,7 +2942,7 @@ mod tests {
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 2,
                     points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -2978,7 +2998,7 @@ mod tests {
                 // wrap-around segment 3: points[3] -> points[0], whose
                 // destination is supported) should remain `WallOuter`.
                 WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: vec![
                         DVec3::ZERO,
@@ -2994,7 +3014,7 @@ mod tests {
                 // wall_index 1: no unsupported points -- must be unaffected
                 // (no regression to plain `WallInner` classification).
                 WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 1,
                     points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -3785,7 +3805,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.0,
             loops: vec![WallLoop {
-    is_open: false,
+                is_open: false,
                 wall_index: 0,
                 points: loop_points,
                 ..Default::default()
@@ -4252,7 +4272,7 @@ mod tests {
             index: 0,
             order: 0.2,
             loops: vec![WallLoop {
-    is_open: false,
+                is_open: false,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.2),
                     DVec3::new(10.0, 0.0, 0.2),
@@ -4276,7 +4296,7 @@ mod tests {
             index: 5,
             order: 5.0,
             loops: vec![WallLoop {
-    is_open: false,
+                is_open: false,
                 points: vec![p0, p1, p2, p3],
                 wall_index: 0,
                 top_surface: vec![false; 4],
@@ -4335,7 +4355,7 @@ mod tests {
             index: 0,
             order: 0.0,
             loops: vec![WallLoop {
-    is_open: false,
+                is_open: false,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.0),
                     DVec3::new(10.0, 0.0, 0.0),
@@ -4359,7 +4379,7 @@ mod tests {
             index: 1,
             order: 1.0,
             loops: vec![WallLoop {
-    is_open: false,
+                is_open: false,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.0),
                     DVec3::new(10.0, 0.0, 10.0),

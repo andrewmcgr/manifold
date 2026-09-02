@@ -121,6 +121,7 @@ impl InfillRegion {
             .chain(layer.solid_fill_boundary.iter())
             .cloned()
             .collect();
+        let max_along = (config.layer_height * 20.0).max(5.0);
         Self {
             loops: order_field::reconstruct_on_order_field_near(
                 sparse_2d,
@@ -130,7 +131,7 @@ impl InfillRegion {
                 axis,
                 apex,
                 layer.order,
-                order_field::max_along_for(config),
+                max_along,
                 layer.order_field.as_ref(),
             ),
         }

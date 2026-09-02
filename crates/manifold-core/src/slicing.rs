@@ -771,7 +771,7 @@ pub fn slice_mesh_with_progress(
                         let arc_fraction = compute_arc_fractions(&points);
                         let n_pts = points.len();
                         WallLoop {
-    is_open: false,
+                            is_open: false,
                             wall_index,
                             unsupported: vec![false; n_pts],
                             top_surface: Vec::new(),
@@ -794,7 +794,7 @@ pub fn slice_mesh_with_progress(
                     let arc_fraction = compute_arc_fractions(&debug_pts);
                     let n_pts = debug_pts.len();
                     loops.push(WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 999,
                         unsupported: vec![false; n_pts],
                         top_surface: Vec::new(),
@@ -807,7 +807,7 @@ pub fn slice_mesh_with_progress(
                     let arc_fraction = compute_arc_fractions(&points);
                     let n_pts = points.len();
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         unsupported: vec![false; n_pts],
                         top_surface: Vec::new(),
@@ -897,7 +897,7 @@ pub fn slice_mesh_with_progress(
                             let arc_fraction = compute_arc_fractions(&points);
                             let n_pts = points.len();
                             WallLoop {
-    is_open: false,
+                                is_open: false,
                                 wall_index: p_wall.wall_index,
                                 unsupported: vec![false; n_pts],
                                 top_surface: Vec::new(),
@@ -952,6 +952,7 @@ pub fn slice_mesh_with_progress(
                                     polygon2d::from_2d(inset_2d, basis1, basis2, origin);
                                 let offset_2d =
                                     polygon2d::to_2d(&offset_3d, basis1, basis2, origin);
+                                let max_along = (config.layer_height * 20.0).max(5.0);
                                 let reconstructed = order_field::reconstruct_on_order_field_near(
                                     offset_2d,
                                     &target_loops,
@@ -960,7 +961,7 @@ pub fn slice_mesh_with_progress(
                                     BUILD_DIRECTION,
                                     origin,
                                     order_value,
-                                    order_field::max_along_for(config),
+                                    max_along,
                                     &*field,
                                 );
                                 if !reconstructed.is_empty() {
@@ -1006,6 +1007,7 @@ pub fn slice_mesh_with_progress(
             } else {
                 let offset_3d = polygon2d::from_2d(curved_infill_2d, basis1, basis2, origin);
                 let offset_2d = polygon2d::to_2d(&offset_3d, basis1, basis2, origin);
+                let max_along = (config.layer_height * 20.0).max(5.0);
                 order_field::reconstruct_on_order_field_near(
                     offset_2d,
                     &wall0_loops,
@@ -1014,7 +1016,7 @@ pub fn slice_mesh_with_progress(
                     BUILD_DIRECTION,
                     origin,
                     order_value,
-                    order_field::max_along_for(config),
+                    max_along,
                     &*field,
                 )
             };
@@ -2649,42 +2651,42 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             continue;
         }
 
-            let outer_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
-                .par_iter()
-                .map(|&pos| {
+        let outer_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
+            .par_iter()
+            .map(|&pos| {
+                let wall0: Vec<Vec<DVec3>> = layers[pos]
+                    .loops
+                    .iter()
+                    .filter(|w| w.wall_index == 0)
+                    .map(|w| w.points.clone())
+                    .collect();
+                if wall0.is_empty() {
+                    polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin)
+                } else {
+                    polygon2d::to_2d(&wall0, basis1, basis2, origin)
+                }
+            })
+            .collect();
+
+        let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
+            .par_iter()
+            .map(|&pos| {
+                let infill = &layers[pos].infill_boundary;
+                if infill.is_empty() {
                     let wall0: Vec<Vec<DVec3>> = layers[pos]
                         .loops
                         .iter()
                         .filter(|w| w.wall_index == 0)
                         .map(|w| w.points.clone())
                         .collect();
-                    if wall0.is_empty() {
-                        polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin)
-                    } else {
-                        polygon2d::to_2d(&wall0, basis1, basis2, origin)
-                    }
-                })
-                .collect();
-
-            let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
-                .par_iter()
-                .map(|&pos| {
-                    let infill = &layers[pos].infill_boundary;
-                    if infill.is_empty() {
-                        let wall0: Vec<Vec<DVec3>> = layers[pos]
-                            .loops
-                            .iter()
-                            .filter(|w| w.wall_index == 0)
-                            .map(|w| w.points.clone())
-                            .collect();
-                        let wall0_2d = polygon2d::to_2d(&wall0, basis1, basis2, origin);
-                        polygon2d::inward_offset(&wall0_2d, config.wall_line_width)
-                    } else {
-                        polygon2d::to_2d(infill, basis1, basis2, origin)
-                    }
-                })
-                .collect();
-            let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+                    let wall0_2d = polygon2d::to_2d(&wall0, basis1, basis2, origin);
+                    polygon2d::inward_offset(&wall0_2d, config.wall_line_width)
+                } else {
+                    polygon2d::to_2d(infill, basis1, basis2, origin)
+                }
+            })
+            .collect();
+        let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
 
         // Determine whether layer index `k` increases with physical height (Z)
         // or decreases (HeightOrderField has `order = -z`, so index 0 is top;
@@ -2928,6 +2930,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                     .map(|w| w.points.clone())
                     .collect();
             }
+            let max_along = (config.layer_height * 20.0).max(5.0);
             layers[positions[k]].solid_fill_boundary = order_field::reconstruct_on_order_field_near(
                 solid_2d,
                 &references,
@@ -2936,7 +2939,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                 axis,
                 apex,
                 order,
-                order_field::max_along_for(config),
+                max_along,
                 field.as_ref(),
             );
         }
@@ -4139,7 +4142,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -4157,7 +4160,7 @@ mod tests {
                 index: 1,
                 order: 0.05,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(0.01, 0.0, -0.05), DVec3::new(1.01, 0.0, -0.05)],
                     unsupported: vec![false, false],
@@ -4198,7 +4201,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
                     unsupported: vec![false],
@@ -4213,7 +4216,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(2.0, 0.0, -0.2)],
                     unsupported: vec![false],
@@ -4303,7 +4306,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; prev_points.len()],
                     top_surface: Vec::new(),
@@ -4318,7 +4321,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; cur_points.len()],
                     top_surface: Vec::new(),
@@ -4375,7 +4378,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; prev_points.len()],
                     top_surface: Vec::new(),
@@ -4390,7 +4393,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; cur_points.len()],
                     top_surface: Vec::new(),
@@ -4545,7 +4548,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     arc_fraction: compute_arc_fractions(&prev_points),
                     unsupported: vec![false; prev_points.len()],
@@ -4560,7 +4563,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     arc_fraction: compute_arc_fractions(&cur_points),
                     unsupported: vec![false; cur_points.len()],
@@ -4644,7 +4647,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
                     unsupported: vec![false],
@@ -4659,7 +4662,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(7.0, 0.0, -0.2)],
                     unsupported: vec![false],
@@ -4849,7 +4852,7 @@ mod tests {
                 order: 0.0,
                 loops: vec![
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(0.0, 0.0, 0.0)],
                         unsupported: vec![false],
@@ -4858,7 +4861,7 @@ mod tests {
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(100.0, 0.0, 0.0)],
                         unsupported: vec![false],
@@ -4875,7 +4878,7 @@ mod tests {
                 order: 0.2,
                 loops: vec![
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
                         unsupported: vec![false],
@@ -4884,7 +4887,7 @@ mod tests {
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(102.0, 0.0, -0.2)],
                         unsupported: vec![false],
@@ -4939,7 +4942,7 @@ mod tests {
                 order: 0.0,
                 loops: vec![
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(0.0, 0.0, 0.0)],
                         unsupported: vec![false],
@@ -4948,7 +4951,7 @@ mod tests {
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(100.0, 0.0, 0.0)],
                         unsupported: vec![false],
@@ -4968,7 +4971,7 @@ mod tests {
                 // and vice versa.
                 loops: vec![
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(102.0, 0.0, -0.2)],
                         unsupported: vec![false],
@@ -4977,7 +4980,7 @@ mod tests {
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
                         unsupported: vec![false],
@@ -5100,7 +5103,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
                     unsupported: vec![false],
@@ -5116,7 +5119,7 @@ mod tests {
                 order: 0.2,
                 loops: vec![
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
                         unsupported: vec![false],
@@ -5125,7 +5128,7 @@ mod tests {
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(1000.0, 0.0, -0.2)],
                         unsupported: vec![false],
@@ -5200,7 +5203,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; big_square.len()],
                     top_surface: Vec::new(),
@@ -5215,7 +5218,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; small_square.len()],
                     top_surface: Vec::new(),
@@ -5311,7 +5314,7 @@ mod tests {
                 order: 0.0,
                 loops: vec![
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         unsupported: vec![false; prev_a.len()],
                         top_surface: Vec::new(),
@@ -5320,7 +5323,7 @@ mod tests {
                         points: prev_a,
                     },
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         unsupported: vec![false; prev_b.len()],
                         top_surface: Vec::new(),
@@ -5329,7 +5332,7 @@ mod tests {
                         points: prev_b,
                     },
                     WallLoop {
-    is_open: false,
+                        is_open: false,
                         wall_index: 0,
                         unsupported: vec![false; prev_decoy.len()],
                         top_surface: Vec::new(),
@@ -5345,7 +5348,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
-    is_open: false,
+                    is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; current.len()],
                     top_surface: Vec::new(),
