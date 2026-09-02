@@ -1818,6 +1818,23 @@ pub fn plan_with_progress(
                 }
             }
 
+            let min_infill_len = config.nozzle_diameter * 2.0;
+            paths.retain(|p| {
+                let is_infill = p
+                    .segments
+                    .iter()
+                    .any(|s| s.kind == MoveKind::Infill || s.kind == MoveKind::TopSurface);
+                if is_infill && p.points.len() <= 4 {
+                    let total_len: f64 = (0..p.points.len())
+                        .map(|i| p.points[i].distance(p.points[(i + 1) % p.points.len()]))
+                        .sum();
+                    if total_len < min_infill_len {
+                        return false;
+                    }
+                }
+                true
+            });
+
             let paths = retain_contained_paths(
                 paths,
                 layer.mesh_sdf.as_ref(),

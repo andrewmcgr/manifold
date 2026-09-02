@@ -2639,10 +2639,10 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             _ => false,
         };
 
-        // Minimum printable solid-fill area: 0.25 * nozzle_diameter^2 (~0.04 mm^2 for a 0.4mm nozzle).
+        // Minimum printable solid-fill area: 1.0 * nozzle_diameter^2 (~0.16 mm^2 for a 0.4mm nozzle).
         // Discarding sub-bead microscopic slivers prevents exponential polygon fragmentation
         // during multi-layer boolean differences and unions.
-        let min_solid_area = 0.25 * config.nozzle_diameter * config.nozzle_diameter;
+        let min_solid_area = 1.0 * config.nozzle_diameter * config.nozzle_diameter;
 
         let solid_2d_per_k: Vec<Vec<Vec<[f64; 2]>>> = if z_increases {
             // Index increases with height: k + 1 is above k, k - 1 is below k.
@@ -2681,10 +2681,12 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                                         field.as_ref(),
                                     )
                                 {
+                                    let self_val = sdf.sample(p_3d).value;
                                     let probe = p_3d + DVec3::Z * (config.top_layers as f64 * h);
-                                    sdf.sample(probe).value > 0.0
+                                    let probe_val = sdf.sample(probe).value;
+                                    self_val <= 0.0 && probe_val > 0.0
                                 } else {
-                                    true
+                                    false
                                 }
                             })
                             .collect()
@@ -2727,10 +2729,12 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                                         field.as_ref(),
                                     )
                                 {
+                                    let self_val = sdf.sample(p_3d).value;
                                     let probe = p_3d - DVec3::Z * (config.bottom_layers as f64 * h);
-                                    sdf.sample(probe).value > 0.0
+                                    let probe_val = sdf.sample(probe).value;
+                                    self_val <= 0.0 && probe_val > 0.0
                                 } else {
-                                    true
+                                    false
                                 }
                             })
                             .collect()
