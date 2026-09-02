@@ -501,9 +501,42 @@ pub fn stitch_loops_with_debug(
             dead_start[start_idx] = true;
             dropped_fragments += 1;
             dropped_points += loop_points.len();
-            if loop_points.len() >= 2 {
-                debug_unclosed.push(loop_points);
+        }
+    }
+
+    // Second pass: any remaining unused segments that could not form closed loops
+    // are collected once as unclosed debug chains (each segment visited exactly once).
+    for start_idx in 0..segments.len() {
+        if used[start_idx] {
+            continue;
+        }
+        used[start_idx] = true;
+        let (first_point, mut current_point) = segments[start_idx];
+        let mut chain = vec![first_point];
+        loop {
+            let next = by_point
+                .get(&point_key(current_point))
+                .and_then(|candidates| candidates.iter().copied().find(|&i| !used[i]));
+            match next {
+                Some(next_idx) => {
+                    used[next_idx] = true;
+                    let (a, b) = segments[next_idx];
+                    let other = if a.distance(current_point) <= b.distance(current_point) {
+                        b
+                    } else {
+                        a
+                    };
+                    chain.push(current_point);
+                    current_point = other;
+                }
+                None => {
+                    chain.push(current_point);
+                    break;
+                }
             }
+        }
+        if chain.len() >= 2 {
+            debug_unclosed.push(chain);
         }
     }
 
@@ -889,12 +922,15 @@ pub fn extract_order_contours_on_mesh_with_debug(
 
     #[derive(Clone, Copy, PartialEq)]
     enum Side {
+        Invalid,
         Below,
         On,
         Above,
     }
     let side = |v: f64| -> Side {
-        if (v - order_value).abs() <= epsilon {
+        if !v.is_finite() {
+            Side::Invalid
+        } else if (v - order_value).abs() <= epsilon {
             Side::On
         } else if v < order_value {
             Side::Below

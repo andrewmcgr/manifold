@@ -736,27 +736,60 @@ pub fn slice_mesh_with_progress(
                 // for a layer whose cross-section is too small to fit every
                 // configured wall (e.g. near a tapered tip) rather than
                 // producing garbage from an empty/degenerate offset.
-                for island in &wall0_loops {
-                    let island_2d =
-                        polygon2d::to_2d(std::slice::from_ref(island), basis1, basis2, origin);
-                    let canonical_island_2d = polygon2d::canonicalize_with_sdf(
-                        &island_2d,
-                        basis1,
-                        basis2,
-                        BUILD_DIRECTION,
-                        origin,
-                        order_value,
-                        &*field,
-                        Some(&*sdf),
-                    );
+                let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
+                let canonical_2d = polygon2d::canonicalize_with_sdf(
+                    &loops_2d,
+                    basis1,
+                    basis2,
+                    BUILD_DIRECTION,
+                    origin,
+                    order_value,
+                    &*field,
+                    Some(&*sdf),
+                );
+
+                let mut outers: Vec<Vec<[f64; 2]>> = Vec::new();
+                let mut holes: Vec<Vec<[f64; 2]>> = Vec::new();
+                for loop_2d in canonical_2d {
+                    if polygon2d::signed_area(&loop_2d) > 0.0 {
+                        outers.push(loop_2d);
+                    } else {
+                        holes.push(loop_2d);
+                    }
+                }
+
+                let mut islands: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
+                let mut assigned_holes = vec![false; holes.len()];
+
+                for outer in outers {
+                    let mut island = vec![outer.clone()];
+                    for (h_idx, hole) in holes.iter().enumerate() {
+                        if !assigned_holes[h_idx]
+                            && !hole.is_empty()
+                            && polygon2d::point_in_polygon(hole[0], &outer)
+                        {
+                            island.push(hole.clone());
+                            assigned_holes[h_idx] = true;
+                        }
+                    }
+                    islands.push(island);
+                }
+
+                for (h_idx, hole) in holes.into_iter().enumerate() {
+                    if !assigned_holes[h_idx] {
+                        islands.push(vec![hole]);
+                    }
+                }
+
+                for island_2d in &islands {
                     let partitioned = polygon2d::partition_walls_adaptive(
-                        &canonical_island_2d,
+                        island_2d,
                         config.wall_line_width,
                         config.min_bead_width(),
                         wall_count,
                     );
 
-                    let mut previous_loops = vec![island.clone()];
+                    let mut previous_loops = wall0_loops.clone();
                     for p_wall in partitioned.into_iter().skip(1) {
                         let reconstructed = order_field::reconstruct_on_order_field_near(
                             p_wall.loops_2d,
@@ -804,56 +837,84 @@ pub fn slice_mesh_with_progress(
             let infill_boundary = if wall0_loops.is_empty() {
                 Vec::new()
             } else if is_height {
+                let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
+                let canonical_2d = polygon2d::canonicalize_with_sdf(
+                    &loops_2d,
+                    basis1,
+                    basis2,
+                    BUILD_DIRECTION,
+                    origin,
+                    order_value,
+                    &*field,
+                    Some(&*sdf),
+                );
+                let partitioned = polygon2d::partition_walls_adaptive(
+                    &canonical_2d,
+                    config.wall_line_width,
+                    config.min_bead_width(),
+                    wall_count,
+                );
                 let mut layer_infill_2d: Vec<Vec<[f64; 2]>> = Vec::new();
-                for island in &wall0_loops {
-                    let island_2d =
-                        polygon2d::to_2d(std::slice::from_ref(island), basis1, basis2, origin);
-                    let canonical_island_2d = polygon2d::canonicalize_with_sdf(
-                        &island_2d,
-                        basis1,
-                        basis2,
-                        BUILD_DIRECTION,
-                        origin,
-                        order_value,
-                        &*field,
-                        Some(&*sdf),
-                    );
-                    let partitioned = polygon2d::partition_walls_adaptive(
-                        &canonical_island_2d,
-                        config.wall_line_width,
-                        config.min_bead_width(),
-                        wall_count,
-                    );
-                    if let Some(deepest_wall) = partitioned.last() {
-                        let inset = polygon2d::inward_offset(
-                            &deepest_wall.loops_2d,
-                            config.wall_line_width,
-                        );
-                        if !inset.is_empty() {
-                            layer_infill_2d.extend(inset);
-                        } else if !deepest_wall.loops_2d.is_empty() {
-                            layer_infill_2d.extend(deepest_wall.loops_2d.clone());
-                        }
+                if let Some(deepest_wall) = partitioned.last() {
+                    let inset =
+                        polygon2d::inward_offset(&deepest_wall.loops_2d, config.wall_line_width);
+                    if !inset.is_empty() {
+                        layer_infill_2d.extend(inset);
+                    } else if !deepest_wall.loops_2d.is_empty() {
+                        layer_infill_2d.extend(deepest_wall.loops_2d.clone());
                     }
                 }
                 polygon2d::from_2d(layer_infill_2d, basis1, basis2, origin)
             } else {
+                let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
+                let canonical_2d = polygon2d::canonicalize_with_sdf(
+                    &loops_2d,
+                    basis1,
+                    basis2,
+                    BUILD_DIRECTION,
+                    origin,
+                    order_value,
+                    &*field,
+                    Some(&*sdf),
+                );
+
+                let mut outers: Vec<Vec<[f64; 2]>> = Vec::new();
+                let mut holes: Vec<Vec<[f64; 2]>> = Vec::new();
+                for loop_2d in canonical_2d {
+                    if polygon2d::signed_area(&loop_2d) > 0.0 {
+                        outers.push(loop_2d);
+                    } else {
+                        holes.push(loop_2d);
+                    }
+                }
+
+                let mut islands: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
+                let mut assigned_holes = vec![false; holes.len()];
+
+                for outer in outers {
+                    let mut island = vec![outer.clone()];
+                    for (h_idx, hole) in holes.iter().enumerate() {
+                        if !assigned_holes[h_idx]
+                            && !hole.is_empty()
+                            && polygon2d::point_in_polygon(hole[0], &outer)
+                        {
+                            island.push(hole.clone());
+                            assigned_holes[h_idx] = true;
+                        }
+                    }
+                    islands.push(island);
+                }
+
+                for (h_idx, hole) in holes.into_iter().enumerate() {
+                    if !assigned_holes[h_idx] {
+                        islands.push(vec![hole]);
+                    }
+                }
+
                 let mut layer_infill_2d: Vec<Vec<[f64; 2]>> = Vec::new();
-                for island in &wall0_loops {
-                    let island_2d =
-                        polygon2d::to_2d(std::slice::from_ref(island), basis1, basis2, origin);
-                    let canonical_island_2d = polygon2d::canonicalize_with_sdf(
-                        &island_2d,
-                        basis1,
-                        basis2,
-                        BUILD_DIRECTION,
-                        origin,
-                        order_value,
-                        &*field,
-                        Some(&*sdf),
-                    );
+                for island_2d in &islands {
                     let partitioned = polygon2d::partition_walls_adaptive(
-                        &canonical_island_2d,
+                        island_2d,
                         config.wall_line_width,
                         config.min_bead_width(),
                         wall_count,
