@@ -699,6 +699,7 @@ pub fn slice_mesh_with_progress(
             let origin =
                 bbox_center + BUILD_DIRECTION * (order_value - bbox_center.dot(BUILD_DIRECTION));
             let mut loops = Vec::new();
+            let mut curved_infill_2d: Vec<Vec<[f64; 2]>> = Vec::new();
             if is_dual_iso {
                 for w in 0..wall_count {
                     let (w_loops, _dbg) = extract_order_contours_on_mesh_with_debug(
@@ -838,11 +839,18 @@ pub fn slice_mesh_with_progress(
                         island_2d,
                         config.wall_line_width,
                         config.min_bead_width(),
-                        wall_count,
+                        wall_count + 1,
                     );
 
                     let mut previous_loops = wall0_loops.clone();
-                    for p_wall in partitioned.into_iter().skip(1) {
+                    for p_wall in partitioned {
+                        if p_wall.wall_index == 0 {
+                            continue;
+                        }
+                        if p_wall.wall_index == wall_count {
+                            curved_infill_2d.extend(p_wall.loops_2d);
+                            continue;
+                        }
                         let reconstructed = order_field::reconstruct_on_order_field_near(
                             p_wall.loops_2d,
                             &previous_loops,
@@ -867,6 +875,20 @@ pub fn slice_mesh_with_progress(
                             }
                         }));
                         previous_loops = reconstructed;
+                    }
+                }
+                if curved_infill_2d.is_empty() {
+                    // If channel was too narrow for wall_count+1, fallback to innermost wall
+                    for island_2d in &islands {
+                        let partitioned = polygon2d::partition_walls_adaptive(
+                            island_2d,
+                            config.wall_line_width,
+                            config.min_bead_width(),
+                            wall_count,
+                        );
+                        if let Some(deepest) = partitioned.last() {
+                            curved_infill_2d.extend(deepest.loops_2d.clone());
+                        }
                     }
                 }
             }
@@ -926,72 +948,7 @@ pub fn slice_mesh_with_progress(
                 }
                 polygon2d::from_2d(layer_infill_2d, basis1, basis2, origin)
             } else {
-                let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
-                let canonical_2d = polygon2d::canonicalize_with_sdf(
-                    &loops_2d,
-                    basis1,
-                    basis2,
-                    BUILD_DIRECTION,
-                    origin,
-                    order_value,
-                    &*field,
-                    Some(&*sdf),
-                );
-
-                let mut outers: Vec<Vec<[f64; 2]>> = Vec::new();
-                let mut holes: Vec<Vec<[f64; 2]>> = Vec::new();
-                for loop_2d in canonical_2d {
-                    if polygon2d::signed_area(&loop_2d) > 0.0 {
-                        outers.push(loop_2d);
-                    } else {
-                        holes.push(loop_2d);
-                    }
-                }
-
-                let mut islands: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
-                let mut assigned_holes = vec![false; holes.len()];
-
-                for outer in outers {
-                    let mut island = vec![outer.clone()];
-                    for (h_idx, hole) in holes.iter().enumerate() {
-                        if !assigned_holes[h_idx]
-                            && !hole.is_empty()
-                            && polygon2d::point_in_polygon(hole[0], &outer)
-                        {
-                            island.push(hole.clone());
-                            assigned_holes[h_idx] = true;
-                        }
-                    }
-                    islands.push(island);
-                }
-
-                for (h_idx, hole) in holes.into_iter().enumerate() {
-                    if !assigned_holes[h_idx] {
-                        islands.push(vec![hole]);
-                    }
-                }
-
-                let mut layer_infill_2d: Vec<Vec<[f64; 2]>> = Vec::new();
-                for island_2d in &islands {
-                    let partitioned = polygon2d::partition_walls_adaptive(
-                        island_2d,
-                        config.wall_line_width,
-                        config.min_bead_width(),
-                        wall_count,
-                    );
-                    if let Some(deepest_wall) = partitioned.last() {
-                        let inset = polygon2d::inward_offset(
-                            &deepest_wall.loops_2d,
-                            config.wall_line_width,
-                        );
-                        if !inset.is_empty() {
-                            layer_infill_2d.extend(inset);
-                        } else if !deepest_wall.loops_2d.is_empty() {
-                            layer_infill_2d.extend(deepest_wall.loops_2d.clone());
-                        }
-                    }
-                }
-                let offset_3d = polygon2d::from_2d(layer_infill_2d, basis1, basis2, origin);
+                let offset_3d = polygon2d::from_2d(curved_infill_2d, basis1, basis2, origin);
                 let offset_2d = polygon2d::to_2d(&offset_3d, basis1, basis2, origin);
                 order_field::reconstruct_on_order_field_near(
                     offset_2d,

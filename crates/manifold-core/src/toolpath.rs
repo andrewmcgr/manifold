@@ -1322,19 +1322,25 @@ fn simplify_closed_path(
     rdp_mark(&points, &chain_ab, tolerance, &mut keep);
     rdp_mark(&points, &chain_ba, tolerance, &mut keep);
 
-    // Rebuild in the loop's original index/orientation order (rather than
-    // starting at `a`, which the two chains above are anchored to) so a
-    // loop that survives simplification unchanged is *actually* returned
-    // unchanged -- same starting point and winding -- not just
-    // point-for-point equal under rotation.
-    let final_indices: Vec<usize> = (0..point_count).filter(|&i| keep[i]).collect();
+    let kept_ab: Vec<usize> = chain_ab
+        .into_iter()
+        .filter(|&i| keep[i] && i != b)
+        .collect();
+    let kept_ba: Vec<usize> = chain_ba
+        .into_iter()
+        .filter(|&i| keep[i] && i != a)
+        .collect();
+    let mut cyclic_indices = kept_ab;
+    cyclic_indices.extend(kept_ba);
 
-    // Each surviving point keeps its own original outgoing segment
-    // verbatim -- e.g. `[p0, p1, p2, p3]` simplifying to `[p0, p3]` keeps
-    // `segments[0]` (p0's original outgoing edge) for the new `p0`, not
-    // some blend of `segments[0..3]`.
-    let new_points = final_indices.iter().map(|&i| points[i]).collect();
-    let new_segments = final_indices.iter().map(|&i| segments[i]).collect();
+    if let Some(&min_idx) = cyclic_indices.iter().min() {
+        if let Some(pos) = cyclic_indices.iter().position(|&idx| idx == min_idx) {
+            cyclic_indices.rotate_left(pos);
+        }
+    }
+
+    let new_points = cyclic_indices.iter().map(|&i| points[i]).collect();
+    let new_segments = cyclic_indices.iter().map(|&i| segments[i]).collect();
 
     Path {
         points: new_points,
@@ -1689,6 +1695,32 @@ pub fn plan_with_progress(
                 // classification (outer vs. inner) is derived from the loop's
                 // wall index; fixed sane defaults are used for the rest since
                 // they aren't yet meaningfully configurable.
+                if wall_loop.wall_index >= 990 {
+                    // Open debug polyline: N points -> N - 1 segments (no closing edge back to start)
+                    let point_count = wall_loop.points.len();
+                    if point_count >= 2 {
+                        let segments: Vec<Segment> = (0..point_count - 1)
+                            .map(|_| Segment {
+                                kind: MoveKind::DebugExcluded,
+                                speed: speed_for_kind(MoveKind::WallOuter, config),
+                                extrusion_rate: 0.0,
+                                support_fraction: 0.0,
+                                order: layer.order,
+                                extrusion_length: 0.0,
+                                line_width: config.wall_line_width,
+                                is_scarf: false,
+                                id: 0,
+                            })
+                            .collect();
+                        paths.push(Path {
+                            points: wall_loop.points.clone(),
+                            segments,
+                            tool: object.tool,
+                        });
+                    }
+                    continue;
+                }
+
                 let is_debug_loop = wall_loop.wall_index >= 990;
                 let base_kind = if is_debug_loop {
                     MoveKind::DebugExcluded
