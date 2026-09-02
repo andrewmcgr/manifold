@@ -914,32 +914,12 @@ pub fn extract_order_contours_on_mesh_with_debug(
     order_value: f64,
     reference: DVec3,
 ) -> (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) {
-    // Relative epsilon: generous enough to absorb floating-point noise from
-    // marching-cubes' isosurface interpolation landing a hair off an
-    // FMM-solved plateau value, but far smaller than any real layer/wall
-    // spacing this codebase produces.
-    let epsilon = order_value.abs().max(1.0) * 1e-6;
-
-    #[derive(Clone, Copy, PartialEq)]
-    enum Side {
-        Invalid,
-        Below,
-        On,
-        Above,
-    }
-    let side = |v: f64| -> Side {
-        if !v.is_finite() {
-            Side::Invalid
-        } else if (v - order_value).abs() <= epsilon {
-            Side::On
-        } else if v < order_value {
-            Side::Below
-        } else {
-            Side::Above
-        }
-    };
-
     let mut segments: Vec<(DVec3, DVec3)> = Vec::new();
+
+    // Deterministic infinitesimal perturbation (Simulation of Simplicity).
+    // Offsets the slicing isovalue by 1e-5 to prevent flat horizontal plateaus
+    // from fracturing into dozens of degenerate micro-triangles due to floating-point noise.
+    let target_order = order_value + 1e-5 * order_value.abs().max(1.0);
 
     for (tri, v_chunk) in triangle_positions
         .chunks_exact(3)
@@ -947,33 +927,35 @@ pub fn extract_order_contours_on_mesh_with_debug(
     {
         let p = [tri[0], tri[1], tri[2]];
         let v = [v_chunk[0], v_chunk[1], v_chunk[2]];
-        let s = [side(v[0]), side(v[1]), side(v[2])];
+
+        if !v[0].is_finite() || !v[1].is_finite() || !v[2].is_finite() {
+            continue;
+        }
+
+        let above = [
+            v[0] > target_order,
+            v[1] > target_order,
+            v[2] > target_order,
+        ];
+
+        if (above[0] == above[1]) && (above[1] == above[2]) {
+            continue;
+        }
 
         let mut crossing_points: Vec<DVec3> = Vec::with_capacity(2);
         for &(i0, i1) in &[(0, 1), (1, 2), (2, 0)] {
-            let point = match (s[i0], s[i1]) {
-                (Side::On, Side::On) => None,
-                (Side::On, _) => Some(p[i0]),
-                (_, Side::On) => Some(p[i1]),
-                (Side::Below, Side::Above) | (Side::Above, Side::Below) => {
-                    let edge_len = p[i0].distance(p[i1]);
-                    if edge_len > 1e-6 {
-                        Some(lerp_crossing(p[i0], v[i0], p[i1], v[i1], order_value))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            if let Some(point) = point {
-                if !crossing_points
-                    .iter()
-                    .any(|&existing| point_key(existing) == point_key(point))
-                {
-                    crossing_points.push(point);
+            if above[i0] != above[i1] {
+                let p0 = p[i0];
+                let p1 = p[i1];
+                let v0 = v[i0];
+                let v1 = v[i1];
+                let edge_len = p0.distance(p1);
+                if edge_len > 1e-6 {
+                    crossing_points.push(lerp_crossing(p0, v0, p1, v1, target_order));
                 }
             }
         }
+
         if crossing_points.len() == 2 {
             let ka = point_key(crossing_points[0]);
             let kb = point_key(crossing_points[1]);
