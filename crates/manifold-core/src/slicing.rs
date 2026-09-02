@@ -2649,25 +2649,42 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             continue;
         }
 
-        let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
-            .par_iter()
-            .map(|&pos| {
-                let infill = &layers[pos].infill_boundary;
-                if infill.is_empty() {
+            let outer_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
+                .par_iter()
+                .map(|&pos| {
                     let wall0: Vec<Vec<DVec3>> = layers[pos]
                         .loops
                         .iter()
                         .filter(|w| w.wall_index == 0)
                         .map(|w| w.points.clone())
                         .collect();
-                    let wall0_2d = polygon2d::to_2d(&wall0, basis1, basis2, origin);
-                    polygon2d::inward_offset(&wall0_2d, config.wall_line_width)
-                } else {
-                    polygon2d::to_2d(infill, basis1, basis2, origin)
-                }
-            })
-            .collect();
-        let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+                    if wall0.is_empty() {
+                        polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin)
+                    } else {
+                        polygon2d::to_2d(&wall0, basis1, basis2, origin)
+                    }
+                })
+                .collect();
+
+            let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
+                .par_iter()
+                .map(|&pos| {
+                    let infill = &layers[pos].infill_boundary;
+                    if infill.is_empty() {
+                        let wall0: Vec<Vec<DVec3>> = layers[pos]
+                            .loops
+                            .iter()
+                            .filter(|w| w.wall_index == 0)
+                            .map(|w| w.points.clone())
+                            .collect();
+                        let wall0_2d = polygon2d::to_2d(&wall0, basis1, basis2, origin);
+                        polygon2d::inward_offset(&wall0_2d, config.wall_line_width)
+                    } else {
+                        polygon2d::to_2d(infill, basis1, basis2, origin)
+                    }
+                })
+                .collect();
+            let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
 
         // Determine whether layer index `k` increases with physical height (Z)
         // or decreases (HeightOrderField has `order = -z`, so index 0 is top;
@@ -2719,11 +2736,11 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
-                    let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
-                    let exp = if next.is_empty() {
+                    let next_outer = outer_2d.get(k + 1).unwrap_or(&empty_2d);
+                    let exp = if next_outer.is_empty() {
                         boundaries_2d[k].clone()
                     } else {
-                        polygon2d::difference(&boundaries_2d[k], next)
+                        polygon2d::difference(&boundaries_2d[k], next_outer)
                     };
                     let filtered = polygon2d::filter_min_area(&exp, min_solid_area);
                     if let Some(sdf) = &layers[positions[k]].mesh_sdf {
@@ -2768,10 +2785,11 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
-                    let exp = if k == 0 {
+                    let prev_outer = if k == 0 { &empty_2d } else { &outer_2d[k - 1] };
+                    let exp = if prev_outer.is_empty() {
                         boundaries_2d[k].clone()
                     } else {
-                        polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
+                        polygon2d::difference(&boundaries_2d[k], prev_outer)
                     };
                     let filtered = polygon2d::filter_min_area(&exp, min_solid_area);
                     if let Some(sdf) = &layers[positions[k]].mesh_sdf {
@@ -2845,10 +2863,11 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
-                    let exp = if k == 0 {
+                    let prev_outer = if k == 0 { &empty_2d } else { &outer_2d[k - 1] };
+                    let exp = if prev_outer.is_empty() {
                         boundaries_2d[k].clone()
                     } else {
-                        polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
+                        polygon2d::difference(&boundaries_2d[k], prev_outer)
                     };
                     polygon2d::filter_min_area(&exp, min_solid_area)
                 })
@@ -2856,11 +2875,11 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
                 .into_par_iter()
                 .map(|k| {
-                    let next = boundaries_2d.get(k + 1).unwrap_or(&empty_2d);
-                    let exp = if next.is_empty() {
+                    let next_outer = outer_2d.get(k + 1).unwrap_or(&empty_2d);
+                    let exp = if next_outer.is_empty() {
                         boundaries_2d[k].clone()
                     } else {
-                        polygon2d::difference(&boundaries_2d[k], next)
+                        polygon2d::difference(&boundaries_2d[k], next_outer)
                     };
                     polygon2d::filter_min_area(&exp, min_solid_area)
                 })
