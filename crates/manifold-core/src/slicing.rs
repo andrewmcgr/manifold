@@ -828,12 +828,6 @@ pub fn slice_mesh_with_progress(
                     islands.push(island);
                 }
 
-                for (h_idx, hole) in holes.into_iter().enumerate() {
-                    if !assigned_holes[h_idx] {
-                        islands.push(vec![hole]);
-                    }
-                }
-
                 for island_2d in &islands {
                     let partitioned = polygon2d::partition_walls_adaptive(
                         island_2d,
@@ -875,20 +869,6 @@ pub fn slice_mesh_with_progress(
                             }
                         }));
                         previous_loops = reconstructed;
-                    }
-                }
-                if curved_infill_2d.is_empty() {
-                    // If channel was too narrow for wall_count+1, fallback to innermost wall
-                    for island_2d in &islands {
-                        let partitioned = polygon2d::partition_walls_adaptive(
-                            island_2d,
-                            config.wall_line_width,
-                            config.min_bead_width(),
-                            wall_count,
-                        );
-                        if let Some(deepest) = partitioned.last() {
-                            curved_infill_2d.extend(deepest.loops_2d.clone());
-                        }
                     }
                 }
             }
