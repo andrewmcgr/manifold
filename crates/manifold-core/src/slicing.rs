@@ -529,7 +529,6 @@ pub fn slice_mesh_with_progress(
     ));
     on_progress(0.04);
     let is_height = matches!(config.order_field, order_field::OrderFieldKind::Height);
-    let is_dual_iso = matches!(config.order_field, order_field::OrderFieldKind::DualIso);
 
     // `order_range_over_bbox` samples 27 points on the mesh's axis-aligned
     // bounding box (corners, edge midpoints, face center). That's exact for
@@ -612,38 +611,8 @@ pub fn slice_mesh_with_progress(
     // fast path unchanged; anything else (e.g. `Conical`) uses the
     // generalized "contour-on-mesh" path, which extracts each wall pass's
     // isosurface once (not once per layer) and walks it per layer.
-    #[allow(clippy::type_complexity)]
-    let (outer_wall_mesh, outer_wall_mesh_orders, dual_wall_meshes, dual_wall_orders): (
-        Vec<DVec3>,
-        Vec<f64>,
-        Vec<Vec<DVec3>>,
-        Vec<Vec<f64>>,
-    ) = if is_height {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-    } else if is_dual_iso {
-        let cell_size = (config.wall_offset / 2.0)
-            .min(config.wall_line_width / 4.0)
-            .clamp(0.04, 0.10);
-        let pad = DVec3::splat(cell_size * 2.0);
-        let mut meshes = Vec::with_capacity(wall_count + 1);
-        let mut orders = Vec::with_capacity(wall_count + 1);
-        for w in 0..=wall_count {
-            let iso = -(config.wall_offset + w as f64 * config.wall_line_width);
-            let positions = extract_sparse_isosurface_positions::<MeshSdf>(
-                &*floor_extended_sdf,
-                min - pad,
-                max + pad,
-                cell_size,
-                iso,
-            );
-            let ords: Vec<f64> = positions.par_iter().map(|&p| field.order(p)).collect();
-            meshes.push(positions);
-            orders.push(ords);
-            on_progress(0.05 + 0.05 * ((w + 1) as f64 / (wall_count + 1) as f64));
-        }
-        let wall0_pos = meshes.first().cloned().unwrap_or_default();
-        let wall0_ords = orders.first().cloned().unwrap_or_default();
-        (wall0_pos, wall0_ords, meshes, orders)
+    let (outer_wall_mesh, outer_wall_mesh_orders): (Vec<DVec3>, Vec<f64>) = if is_height {
+        (Vec::new(), Vec::new())
     } else {
         // Sparse narrow-band marching cubes: target a cell size proportional
         // to bead dimensions (~0.20-0.35mm) to accurately extract the outer perimeter
@@ -664,7 +633,7 @@ pub fn slice_mesh_with_progress(
         on_progress(0.08);
         let orders: Vec<f64> = positions.par_iter().map(|&p| field.order(p)).collect();
         on_progress(0.10);
-        (positions, orders, Vec::new(), Vec::new())
+        (positions, orders)
     };
 
     let effective_order_max = if !is_height && !outer_wall_mesh_orders.is_empty() {
@@ -717,45 +686,7 @@ pub fn slice_mesh_with_progress(
                 bbox_center + BUILD_DIRECTION * (order_value - bbox_center.dot(BUILD_DIRECTION));
             let mut loops = Vec::new();
             let mut curved_infill_2d: Vec<Vec<[f64; 2]>> = Vec::new();
-            if is_dual_iso {
-                for w in 0..wall_count {
-                    let (w_loops, w_open) = extract_order_contours_on_mesh_with_debug(
-                        &dual_wall_meshes[w],
-                        &dual_wall_orders[w],
-                        order_value,
-                        BUILD_DIRECTION,
-                    );
-                    for pts in w_loops {
-                        let arc_fraction = compute_arc_fractions(&pts);
-                        let n_pts = pts.len();
-                        loops.push(WallLoop {
-                            wall_index: w,
-                            is_open: false,
-                            unsupported: vec![false; n_pts],
-                            top_surface: Vec::new(),
-                            arc_fraction,
-                            line_widths: vec![config.wall_line_width; n_pts],
-                            points: pts,
-                        });
-                    }
-                    for pts in w_open {
-                        let total_len: f64 = pts.windows(2).map(|w| w[0].distance(w[1])).sum();
-                        if total_len >= config.nozzle_diameter * 0.75 && pts.len() >= 2 {
-                            let arc_fraction = compute_arc_fractions(&pts);
-                            let n_pts = pts.len();
-                            loops.push(WallLoop {
-                                wall_index: w,
-                                is_open: true,
-                                unsupported: vec![false; n_pts],
-                                top_surface: Vec::new(),
-                                arc_fraction,
-                                line_widths: vec![config.wall_line_width; n_pts],
-                                points: pts,
-                            });
-                        }
-                    }
-                }
-            } else if is_height {
+            if is_height {
                 for wall_index in 0..wall_count {
                     // Negative iso = inward (see `MeshSdf::sign_at`: positive
                     // outside, negative inside). Wall 0 sits `wall_offset` in
@@ -926,54 +857,7 @@ pub fn slice_mesh_with_progress(
                 .map(|wall| wall.points.clone())
                 .collect();
 
-            let infill_boundary = if is_dual_iso {
-                let (infill_loops, _) = extract_order_contours_on_mesh_with_debug(
-                    &dual_wall_meshes[wall_count],
-                    &dual_wall_orders[wall_count],
-                    order_value,
-                    BUILD_DIRECTION,
-                );
-                if !infill_loops.is_empty() {
-                    infill_loops
-                } else {
-                    let mut candidate_inset = Vec::new();
-                    for target_wall_idx in (1..=2).rev() {
-                        let target_loops: Vec<Vec<DVec3>> = loops
-                            .iter()
-                            .filter(|w| w.wall_index == target_wall_idx)
-                            .map(|w| w.points.clone())
-                            .collect();
-                        if !target_loops.is_empty() {
-                            let target_2d = polygon2d::to_2d(&target_loops, basis1, basis2, origin);
-                            let inset_2d =
-                                polygon2d::inward_offset(&target_2d, config.wall_line_width);
-                            if !inset_2d.is_empty() {
-                                let offset_3d =
-                                    polygon2d::from_2d(inset_2d, basis1, basis2, origin);
-                                let offset_2d =
-                                    polygon2d::to_2d(&offset_3d, basis1, basis2, origin);
-                                let max_along = (config.layer_height * 20.0).max(5.0);
-                                let reconstructed = order_field::reconstruct_on_order_field_near(
-                                    offset_2d,
-                                    &target_loops,
-                                    basis1,
-                                    basis2,
-                                    BUILD_DIRECTION,
-                                    origin,
-                                    order_value,
-                                    max_along,
-                                    &*field,
-                                );
-                                if !reconstructed.is_empty() {
-                                    candidate_inset = reconstructed;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    candidate_inset
-                }
-            } else if wall0_loops.is_empty() {
+            let infill_boundary = if wall0_loops.is_empty() {
                 Vec::new()
             } else if is_height {
                 let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
