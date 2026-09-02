@@ -607,7 +607,7 @@ pub fn slice_mesh_with_progress(
         let pad = DVec3::splat(cell_size * 2.0);
         on_progress(0.05);
         let positions = extract_sparse_isosurface_positions::<MeshSdf>(
-            &*side_sdf,
+            &*sdf,
             min - pad,
             max + pad,
             cell_size,
