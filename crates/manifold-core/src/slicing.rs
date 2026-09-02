@@ -724,50 +724,53 @@ pub fn slice_mesh_with_progress(
                 // for a layer whose cross-section is too small to fit every
                 // configured wall (e.g. near a tapered tip) rather than
                 // producing garbage from an empty/degenerate offset.
-                let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
-                let canonical_2d = polygon2d::canonicalize_with_sdf(
-                    &loops_2d,
-                    basis1,
-                    basis2,
-                    BUILD_DIRECTION,
-                    origin,
-                    order_value,
-                    &*field,
-                    Some(&*sdf),
-                );
-                let partitioned = polygon2d::partition_walls_adaptive(
-                    &canonical_2d,
-                    config.wall_line_width,
-                    config.min_bead_width(),
-                    wall_count,
-                );
-
-                let mut previous_loops = wall0_loops.clone();
-                for p_wall in partitioned.into_iter().skip(1) {
-                    let reconstructed = order_field::reconstruct_on_order_field_near(
-                        p_wall.loops_2d,
-                        &previous_loops,
+                for island in &wall0_loops {
+                    let island_2d =
+                        polygon2d::to_2d(std::slice::from_ref(island), basis1, basis2, origin);
+                    let canonical_island_2d = polygon2d::canonicalize_with_sdf(
+                        &island_2d,
                         basis1,
                         basis2,
                         BUILD_DIRECTION,
                         origin,
                         order_value,
-                        order_field::max_along_for(config),
                         &*field,
+                        Some(&*sdf),
                     );
-                    loops.extend(reconstructed.iter().cloned().map(|points| {
-                        let arc_fraction = compute_arc_fractions(&points);
-                        let n_pts = points.len();
-                        WallLoop {
-                            wall_index: p_wall.wall_index,
-                            unsupported: vec![false; n_pts],
-                            top_surface: Vec::new(),
-                            arc_fraction,
-                            line_widths: vec![p_wall.line_width; n_pts],
-                            points,
-                        }
-                    }));
-                    previous_loops = reconstructed;
+                    let partitioned = polygon2d::partition_walls_adaptive(
+                        &canonical_island_2d,
+                        config.wall_line_width,
+                        config.min_bead_width(),
+                        wall_count,
+                    );
+
+                    let mut previous_loops = vec![island.clone()];
+                    for p_wall in partitioned.into_iter().skip(1) {
+                        let reconstructed = order_field::reconstruct_on_order_field_near(
+                            p_wall.loops_2d,
+                            &previous_loops,
+                            basis1,
+                            basis2,
+                            BUILD_DIRECTION,
+                            origin,
+                            order_value,
+                            order_field::max_along_for(config),
+                            &*field,
+                        );
+                        loops.extend(reconstructed.iter().cloned().map(|points| {
+                            let arc_fraction = compute_arc_fractions(&points);
+                            let n_pts = points.len();
+                            WallLoop {
+                                wall_index: p_wall.wall_index,
+                                unsupported: vec![false; n_pts],
+                                top_surface: Vec::new(),
+                                arc_fraction,
+                                line_widths: vec![p_wall.line_width; n_pts],
+                                points,
+                            }
+                        }));
+                        previous_loops = reconstructed;
+                    }
                 }
             }
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2575,7 +2578,42 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                     } else {
                         polygon2d::difference(&boundaries_2d[k], next)
                     };
-                    polygon2d::filter_min_area(&exp, min_solid_area)
+                    let filtered = polygon2d::filter_min_area(&exp, min_solid_area);
+                    if let Some(sdf) = &layers[positions[k]].mesh_sdf {
+                        let field = &layers[positions[k]].order_field;
+                        let order = layers[positions[k]].order;
+                        let h = config.layer_height.max(0.1);
+                        filtered
+                            .into_iter()
+                            .filter(|loop_| {
+                                let mut c_u = 0.0;
+                                let mut c_v = 0.0;
+                                for &[u, v] in loop_ {
+                                    c_u += u;
+                                    c_v += v;
+                                }
+                                let len = loop_.len().max(1) as f64;
+                                let c_u = c_u / len;
+                                let c_v = c_v / len;
+                                if let Some(p_3d) =
+                                    crate::order_field::reconstruct_point_on_order_field(
+                                        apex + basis1 * c_u + basis2 * c_v,
+                                        axis,
+                                        order,
+                                        50.0,
+                                        field.as_ref(),
+                                    )
+                                {
+                                    let probe = p_3d + DVec3::Z * (config.top_layers as f64 * h);
+                                    sdf.sample(probe).value > 0.0
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect()
+                    } else {
+                        filtered
+                    }
                 })
                 .collect();
             let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
@@ -2586,7 +2624,42 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                     } else {
                         polygon2d::difference(&boundaries_2d[k], &boundaries_2d[k - 1])
                     };
-                    polygon2d::filter_min_area(&exp, min_solid_area)
+                    let filtered = polygon2d::filter_min_area(&exp, min_solid_area);
+                    if let Some(sdf) = &layers[positions[k]].mesh_sdf {
+                        let field = &layers[positions[k]].order_field;
+                        let order = layers[positions[k]].order;
+                        let h = config.layer_height.max(0.1);
+                        filtered
+                            .into_iter()
+                            .filter(|loop_| {
+                                let mut c_u = 0.0;
+                                let mut c_v = 0.0;
+                                for &[u, v] in loop_ {
+                                    c_u += u;
+                                    c_v += v;
+                                }
+                                let len = loop_.len().max(1) as f64;
+                                let c_u = c_u / len;
+                                let c_v = c_v / len;
+                                if let Some(p_3d) =
+                                    crate::order_field::reconstruct_point_on_order_field(
+                                        apex + basis1 * c_u + basis2 * c_v,
+                                        axis,
+                                        order,
+                                        50.0,
+                                        field.as_ref(),
+                                    )
+                                {
+                                    let probe = p_3d - DVec3::Z * (config.bottom_layers as f64 * h);
+                                    sdf.sample(probe).value > 0.0
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect()
+                    } else {
+                        filtered
+                    }
                 })
                 .collect();
 
