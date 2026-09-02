@@ -496,6 +496,21 @@ pub fn slice_mesh_with_progress(
         ))
     };
 
+    // For 3D narrow-band marching cubes (DualIso / Eikonal), construct a watertight
+    // SDF where the bed-contact floor (z <= min.z + 0.01) is extended downward so that
+    // inner wall passes and infill boundaries extend cleanly down through layer 0 (z = 0.20mm)
+    // without being pushed upward by the bottom floor, while preserving all top ceilings,
+    // tabs, and summit crowns completely closed up to true max order.
+    let floor_extended_sdf = {
+        let mut ext_vertices = mesh.vertices.clone();
+        for v in &mut ext_vertices {
+            if v.z <= min.z + 0.02 {
+                v.z = min.z - 5.0;
+            }
+        }
+        Arc::new(MeshSdf::new(ext_vertices, faces.clone()))
+    };
+
     // Resolve the configured order field once per slice (defaults to a
     // `HeightOrderField` along `BUILD_DIRECTION`, matching pre-existing
     // behavior exactly). `order_range_over_bbox` generically replaces the
@@ -613,7 +628,7 @@ pub fn slice_mesh_with_progress(
         for w in 0..=wall_count {
             let iso = -(config.wall_offset + w as f64 * config.wall_line_width);
             let positions = extract_sparse_isosurface_positions::<MeshSdf>(
-                &*side_sdf,
+                &*floor_extended_sdf,
                 min - pad,
                 max + pad,
                 cell_size,
@@ -638,7 +653,7 @@ pub fn slice_mesh_with_progress(
         let pad = DVec3::splat(cell_size * 2.0);
         on_progress(0.05);
         let positions = extract_sparse_isosurface_positions::<MeshSdf>(
-            &*sdf,
+            &*floor_extended_sdf,
             min - pad,
             max + pad,
             cell_size,
