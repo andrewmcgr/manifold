@@ -233,7 +233,7 @@ impl MotionModel for StandardMotionModel {
             MoveKind::WallInner => self.inner_wall_speed,
             MoveKind::Infill => self.infill_speed,
             MoveKind::TopSurface => self.solid_infill_speed,
-            MoveKind::Bridge | MoveKind::Overhang => self.bridge_speed,
+            MoveKind::Bridge | MoveKind::Overhang | MoveKind::DebugExcluded => self.bridge_speed,
             MoveKind::Travel => self.travel_speed,
         };
         if is_first_layer && kind != MoveKind::Travel {
@@ -251,7 +251,9 @@ impl MotionModel for StandardMotionModel {
             MoveKind::WallOuter => self.outer_wall_acceleration,
             MoveKind::WallInner => self.inner_wall_acceleration,
             MoveKind::Infill | MoveKind::TopSurface => self.infill_acceleration,
-            MoveKind::Bridge | MoveKind::Overhang => self.outer_wall_acceleration,
+            MoveKind::Bridge | MoveKind::Overhang | MoveKind::DebugExcluded => {
+                self.outer_wall_acceleration
+            }
             MoveKind::Travel => self.travel_acceleration,
         }
     }
@@ -883,6 +885,7 @@ pub fn apply_wipe_moves(
         support_fraction: last_seg.support_fraction,
         line_width: 0.0,
         is_scarf: false,
+        id: 0,
     };
 
     points.push(p_wipe);
@@ -1618,6 +1621,7 @@ mod tests {
                 extrusion_length: 1.0,
                 line_width: 0.4,
                 is_scarf: false,
+                id: 0,
             };
             4
         ];
@@ -1661,6 +1665,7 @@ mod tests {
                 extrusion_length: 10.0,
                 line_width: 0.4,
                 is_scarf: false,
+                id: 0,
             };
             4
         ];

@@ -187,7 +187,10 @@ pub fn segment_extrusion_length(distance: f64, bead_area: f64, filament_area: f6
 #[must_use]
 pub fn line_width_for_kind(kind: MoveKind, config: &SlicerConfig) -> f64 {
     match kind {
-        MoveKind::WallOuter | MoveKind::WallInner | MoveKind::TopSurface => config.wall_line_width,
+        MoveKind::WallOuter
+        | MoveKind::WallInner
+        | MoveKind::TopSurface
+        | MoveKind::DebugExcluded => config.wall_line_width,
         MoveKind::Infill | MoveKind::Bridge => config.infill_line_width,
         MoveKind::Overhang => config.wall_line_width.min(config.nozzle_diameter),
         MoveKind::Travel => 0.0,

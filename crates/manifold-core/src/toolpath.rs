@@ -63,7 +63,7 @@ const CONTAINMENT_OUTSIDE_FRACTION: f64 = 0.2;
 /// synthetic/test [`Layer`] has no ground truth to check against, so
 /// containment is treated as unknown rather than enforced.
 fn retain_contained_paths(
-    paths: Vec<Path>,
+    mut paths: Vec<Path>,
     mesh_sdf: Option<&Arc<MeshSdf>>,
     order: f64,
     gross_tolerance: f64,
@@ -73,56 +73,55 @@ fn retain_contained_paths(
     };
 
     let total = paths.len();
-    let mut dropped_paths = 0usize;
-    let mut dropped_points = 0usize;
-    let retained: Vec<Path> = paths
-        .into_iter()
-        .filter(|path| {
-            if path
-                .segments
-                .iter()
-                .all(|segment| segment.kind == MoveKind::Travel)
-            {
-                return true;
+    let mut debug_paths = 0usize;
+    let mut debug_points = 0usize;
+    for path in &mut paths {
+        if path
+            .segments
+            .iter()
+            .all(|segment| segment.kind == MoveKind::Travel)
+        {
+            continue;
+        }
+        let mut max_distance = f64::NEG_INFINITY;
+        let mut outside_points = 0usize;
+        for &p in &path.points {
+            let d = mesh_sdf.sample(p).value;
+            max_distance = max_distance.max(d);
+            if d > CONTAINMENT_POINT_SLACK {
+                outside_points += 1;
             }
-            let mut max_distance = f64::NEG_INFINITY;
-            let mut outside_points = 0usize;
-            for &p in &path.points {
-                let d = mesh_sdf.sample(p).value;
-                max_distance = max_distance.max(d);
-                if d > CONTAINMENT_POINT_SLACK {
-                    outside_points += 1;
-                }
+        }
+        let outside_fraction = outside_points as f64 / path.points.len().max(1) as f64;
+        let contained =
+            max_distance <= gross_tolerance && outside_fraction <= CONTAINMENT_OUTSIDE_FRACTION;
+        if !contained {
+            debug_paths += 1;
+            debug_points += path.points.len();
+            for seg in &mut path.segments {
+                seg.kind = MoveKind::DebugExcluded;
             }
-            let outside_fraction = outside_points as f64 / path.points.len().max(1) as f64;
-            let contained =
-                max_distance <= gross_tolerance && outside_fraction <= CONTAINMENT_OUTSIDE_FRACTION;
-            if !contained {
-                dropped_paths += 1;
-                dropped_points += path.points.len();
-                tracing::debug!(
-                    layer.order = order,
-                    points = path.points.len(),
-                    max_distance,
-                    outside_fraction,
-                    "dropping uncontained path"
-                );
-            }
-            contained
-        })
-        .collect();
+            tracing::debug!(
+                layer.order = order,
+                points = path.points.len(),
+                max_distance,
+                outside_fraction,
+                "tagging uncontained path as DebugExcluded"
+            );
+        }
+    }
 
-    if dropped_paths > 0 {
+    if debug_paths > 0 {
         tracing::warn!(
             layer.order = order,
-            dropped_paths,
-            dropped_points,
+            debug_paths,
+            debug_points,
             total_paths = total,
-            "dropped extruding path(s) not contained in the solid mesh"
+            "tagged extruding path(s) outside solid mesh as DebugExcluded"
         );
     }
 
-    retained
+    paths
 }
 
 /// Applies configurable Z-hop (lift-before-travel / lower-after-arrival) to
@@ -1161,6 +1160,7 @@ fn route_travel_moves(
                     extrusion_length: 0.0,
                     line_width: 0.0,
                     is_scarf: false,
+                    id: 0,
                 })
                 .collect();
             Some((
@@ -1481,6 +1481,9 @@ pub enum MoveKind {
     /// `plan`'s segment-classification loop.
     TopSurface,
     Travel,
+    /// Debug moves preserved for visualization only (not emitted to G-code).
+    /// E.g. loops/paths excluded by mesh containment checks or unclosed contour fragments.
+    DebugExcluded,
 }
 
 /// Per-segment motion metadata for one `points[i] -> points[i+1]` edge of a
@@ -1508,6 +1511,8 @@ pub struct Segment {
     pub line_width: f64,
     /// Whether this segment is part of a non-planar scarf joint seam ramp.
     pub is_scarf: bool,
+    /// Unique sequential extrusion index across the slice job.
+    pub id: u32,
 }
 
 /// A single continuous toolpath (e.g. one perimeter or infill pass).
@@ -1677,7 +1682,10 @@ pub fn plan_with_progress(
                 // classification (outer vs. inner) is derived from the loop's
                 // wall index; fixed sane defaults are used for the rest since
                 // they aren't yet meaningfully configurable.
-                let base_kind = if wall_loop.wall_index == 0 {
+                let is_debug_loop = wall_loop.wall_index >= 990;
+                let base_kind = if is_debug_loop {
+                    MoveKind::DebugExcluded
+                } else if wall_loop.wall_index == 0 {
                     MoveKind::WallOuter
                 } else {
                     MoveKind::WallInner
@@ -1706,7 +1714,9 @@ pub fn plan_with_progress(
                                     .and_then(|w| w.get(dest))
                                     .copied()
                                     .unwrap_or(false);
-                        let kind = if is_unsupported {
+                        let kind = if is_debug_loop {
+                            MoveKind::DebugExcluded
+                        } else if is_unsupported {
                             MoveKind::Overhang
                         } else if wall_loop.top_surface.get(dest).copied().unwrap_or(false) {
                             MoveKind::TopSurface
@@ -1727,6 +1737,7 @@ pub fn plan_with_progress(
                             extrusion_length: 0.0,
                             line_width: line_w,
                             is_scarf: false,
+                            id: 0,
                         }
                     })
                     .collect();
@@ -2106,6 +2117,14 @@ pub fn plan_with_progress(
         }
     }
 
+    let mut segment_id = 1u32;
+    for path in &mut all_paths {
+        for seg in &mut path.segments {
+            seg.id = segment_id;
+            segment_id += 1;
+        }
+    }
+
     if let Ok(mut on_progress) = on_progress.lock() {
         on_progress(1.0);
     }
@@ -2265,6 +2284,7 @@ mod tests {
                 extrusion_length: 0.0,
                 line_width: 0.4,
                 is_scarf: false,
+                id: 0,
             })
             .collect();
         Path {
@@ -2972,6 +2992,7 @@ mod tests {
             extrusion_length: 1.23,
             line_width: 0.4,
             is_scarf: false,
+            id: 0,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -2982,6 +3003,7 @@ mod tests {
             extrusion_length: 0.0,
             line_width: 0.0,
             is_scarf: false,
+            id: 0,
         };
         let path = Path {
             points: vec![p0, p1, p2, p3],
@@ -3057,6 +3079,7 @@ mod tests {
             extrusion_length: 1.0,
             line_width: 0.4,
             is_scarf: false,
+            id: 0,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -3067,6 +3090,7 @@ mod tests {
             extrusion_length: 0.0,
             line_width: 0.0,
             is_scarf: false,
+            id: 0,
         };
         let path = Path {
             points: vec![p0, p1, p2, p3],
@@ -3111,6 +3135,7 @@ mod tests {
             extrusion_length: 0.0,
             line_width: 0.0,
             is_scarf: false,
+            id: 0,
         };
         let infill_segment = Segment {
             kind: MoveKind::Infill,
@@ -3121,6 +3146,7 @@ mod tests {
             extrusion_length: 1.0,
             line_width: 0.4,
             is_scarf: false,
+            id: 0,
         };
         let path = Path {
             points: vec![p0, p1, p2],
@@ -3158,6 +3184,7 @@ mod tests {
             extrusion_length: 1.23,
             line_width: 0.4,
             is_scarf: false,
+            id: 0,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -3168,6 +3195,7 @@ mod tests {
             extrusion_length: 0.0,
             line_width: 0.0,
             is_scarf: false,
+            id: 0,
         };
         // Only 2 segments for 3 points: no closing edge.
         let path = Path {
@@ -3224,6 +3252,7 @@ mod tests {
             extrusion_length: 1.23,
             line_width: 0.4,
             is_scarf: false,
+            id: 0,
         };
         let travel_segment = Segment {
             kind: MoveKind::Travel,
@@ -3234,6 +3263,7 @@ mod tests {
             extrusion_length: 0.0,
             line_width: 0.0,
             is_scarf: false,
+            id: 0,
         };
         let path = Path {
             points: vec![p0, p1, p2],
@@ -3293,6 +3323,7 @@ mod tests {
                 extrusion_length: 0.0,
                 line_width: 0.4,
                 is_scarf: false,
+                id: 0,
             })
             .collect();
         Path {
@@ -3314,6 +3345,7 @@ mod tests {
                 extrusion_length: 0.0,
                 line_width: 0.4,
                 is_scarf: false,
+                id: 0,
             })
             .collect();
         Path {

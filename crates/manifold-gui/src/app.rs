@@ -2403,8 +2403,10 @@ impl ManifoldApp {
                             &manifold_core::toolpath::Segment,
                             glam::DVec3,
                             glam::DVec3,
+                            usize,
+                            usize,
                         )> = None;
-                        for path in toolpaths {
+                        for (path_idx, path) in toolpaths.iter().enumerate() {
                             let count = path.points.len();
                             for i in 0..path.segments.len() {
                                 let segment = &path.segments[i];
@@ -2422,15 +2424,27 @@ impl ManifoldApp {
                                 let dist = point_segment_distance(hover_pos, screen_a, screen_b);
                                 if nearest
                                     .as_ref()
-                                    .is_none_or(|(best_dist, _, _, _)| dist < *best_dist)
+                                    .is_none_or(|(best_dist, _, _, _, _, _)| dist < *best_dist)
                                 {
-                                    nearest = Some((dist, segment, a, b));
+                                    nearest = Some((dist, segment, a, b, path_idx, i));
                                 }
                             }
                         }
-                        if let Some((dist, segment, a, b)) = nearest {
+                        if let Some((dist, segment, a, b, path_idx, seg_idx)) = nearest {
                             if dist <= PICK_THRESHOLD_PX {
                                 response.clone().show_tooltip_ui(|ui| {
+                                    ui.heading(format!(
+                                        "Extrusion #{} (Path #{}, Seg #{})",
+                                        segment.id, path_idx, seg_idx
+                                    ));
+                                    if segment.kind
+                                        == manifold_core::toolpath::MoveKind::DebugExcluded
+                                    {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 30, 230),
+                                            "DEBUG / EXCLUDED (Not in G-code)",
+                                        );
+                                    }
                                     ui.label(format!("kind: {:?}", segment.kind));
                                     ui.label(format!(
                                         "speed (cmd): {:.1} mm/s",

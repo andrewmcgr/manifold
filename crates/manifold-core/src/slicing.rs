@@ -5,7 +5,7 @@ use crate::{
 };
 use glam::DVec3;
 use manifold_fidget::contour::{
-    extract_contours, extract_order_contours_on_mesh_with_orders, plane_basis,
+    extract_contours, extract_order_contours_on_mesh_with_debug, plane_basis,
 };
 use manifold_fidget::marching_cubes::extract_sparse_isosurface_positions;
 use manifold_fidget::mesh_sdf::MeshSdf;
@@ -696,12 +696,24 @@ pub fn slice_mesh_with_progress(
             } else {
                 // Wall 0: straight from the mesh's actual isosurface (see
                 // `outer_wall_mesh`'s doc comment above).
-                let wall0_loops = extract_order_contours_on_mesh_with_orders(
+                let (wall0_loops, debug_unclosed) = extract_order_contours_on_mesh_with_debug(
                     &outer_wall_mesh,
                     &outer_wall_mesh_orders,
                     order_value,
                     BUILD_DIRECTION,
                 );
+                for debug_pts in debug_unclosed {
+                    let arc_fraction = compute_arc_fractions(&debug_pts);
+                    let n_pts = debug_pts.len();
+                    loops.push(WallLoop {
+                        wall_index: 999,
+                        unsupported: vec![false; n_pts],
+                        top_surface: Vec::new(),
+                        arc_fraction,
+                        line_widths: vec![config.wall_line_width; n_pts],
+                        points: debug_pts,
+                    });
+                }
                 loops.extend(wall0_loops.iter().cloned().map(|points| {
                     let arc_fraction = compute_arc_fractions(&points);
                     let n_pts = points.len();

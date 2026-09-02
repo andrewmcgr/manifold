@@ -366,6 +366,71 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
         }
     }
 
+    stitch_loops_with_debug(segments).0
+}
+
+/// Stitches unordered line segments into closed polylines and returns both
+/// `(closed_loops, unclosed_debug_fragments)`.
+pub fn stitch_loops_with_debug(
+    segments: Vec<(DVec3, DVec3)>,
+) -> (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) {
+    // Deduplicate undirected segments and drop degenerate zero-length segments:
+    // duplicate edges (e.g. from adjacent triangles sharing an On-On plateau edge
+    // in `extract_order_contours_on_mesh`) create false degree-3+ vertices that
+    // cause loop-tracing to self-intersect or terminate prematurely.
+    let mut seen = HashSet::new();
+    let mut segments: Vec<(DVec3, DVec3)> = segments
+        .into_iter()
+        .filter(|&(a, b)| {
+            let ka = point_key(a);
+            let kb = point_key(b);
+            if ka == kb {
+                return false;
+            }
+            let seg_key = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            seen.insert(seg_key)
+        })
+        .collect();
+
+    // Prune dangling degree-1 endpoints (open-ended hair/spurs with no exact or
+    // repair-tolerance partner): any segment with an unpartnered endpoint cannot belong
+    // to a closed cycle, and walking into a dangling spur causes loop-stitching to fail
+    // to close and falsely mark entire valid cycles as dead starts.
+    loop {
+        let mut by_point: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+        for (i, &(a, b)) in segments.iter().enumerate() {
+            by_point.entry(point_key(a)).or_default().push(i);
+            by_point.entry(point_key(b)).or_default().push(i);
+        }
+        let before_len = segments.len();
+        let has_partner = |idx: usize, pt: DVec3, segs: &[(DVec3, DVec3)]| -> bool {
+            if let Some(cand) = by_point.get(&point_key(pt)) {
+                if cand.iter().any(|&i| i != idx) {
+                    return true;
+                }
+            }
+            segs.iter().enumerate().any(|(i, &(a, b))| {
+                i != idx
+                    && (a.distance(pt) <= STITCH_REPAIR_TOLERANCE
+                        || b.distance(pt) <= STITCH_REPAIR_TOLERANCE)
+            })
+        };
+        let keep_mask: Vec<bool> = segments
+            .iter()
+            .enumerate()
+            .map(|(i, &(a, b))| has_partner(i, a, &segments) && has_partner(i, b, &segments))
+            .collect();
+        let mut idx = 0;
+        segments.retain(|_| {
+            let keep = keep_mask[idx];
+            idx += 1;
+            keep
+        });
+        if segments.len() == before_len {
+            break;
+        }
+    }
+
     // Map from a (quantized) endpoint key to the indices of segments
     // touching that point (a segment appears under both of its endpoints'
     // keys, unless they collide, e.g. a degenerate zero-length segment).
@@ -378,6 +443,7 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
     let mut dead_start = vec![false; segments.len()];
 
     let mut loops = Vec::new();
+    let mut debug_unclosed = Vec::new();
     let mut dropped_fragments = 0usize;
     let mut dropped_points = 0usize;
 
@@ -407,10 +473,6 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
                     used[next_idx] = true;
                     trail.push(next_idx);
                     let (a, b) = segments[next_idx];
-                    // Continue from whichever endpoint of the matched
-                    // segment is *not* the one we arrived on (nearest, so
-                    // this also works for widened-tolerance matches where
-                    // the arrival point isn't bit-exact).
                     let other = if a.distance(current_point) <= b.distance(current_point) {
                         b
                     } else {
@@ -420,8 +482,6 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
                     current_point = other;
                 }
                 None => {
-                    // Open chain under exact/unused search: check if the endpoint
-                    // lands within widened repair tolerance of the start point to close.
                     if current_point.distance(first_point) <= STITCH_REPAIR_TOLERANCE {
                         closed = true;
                     } else {
@@ -435,15 +495,15 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
         if closed && loop_points.len() >= MIN_LOOP_POINTS {
             loops.push(loop_points);
         } else {
-            // Unclosed: un-mark all trail segments so a start index on the
-            // real closed cycle can use them, but mark start_idx as a dead start
-            // so we don't attempt to initiate another walk from it.
             for &idx in &trail {
                 used[idx] = false;
             }
             dead_start[start_idx] = true;
             dropped_fragments += 1;
             dropped_points += loop_points.len();
+            if loop_points.len() >= 2 {
+                debug_unclosed.push(loop_points);
+            }
         }
     }
 
@@ -451,13 +511,12 @@ fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
         tracing::warn!(
             dropped_fragments,
             dropped_points,
-            "stitch_loops: discarded {dropped_fragments} open/degenerate contour \
-             fragment(s) ({dropped_points} points total) instead of emitting them \
-             as printable wall loops",
+            "stitch_loops: preserved {dropped_fragments} open/degenerate contour \
+             fragment(s) ({dropped_points} points total) as debug paths",
         );
     }
 
-    loops
+    (loops, debug_unclosed)
 }
 
 /// Fixes up loop winding so nesting parity determines orientation: a loop
@@ -816,13 +875,12 @@ pub fn extract_order_contours_on_mesh<O: OrderField + ?Sized>(
     extract_order_contours_on_mesh_with_orders(triangle_positions, &orders, order_value, reference)
 }
 
-/// Extracts polylines at `order_value` from `triangle_positions` with precomputed per-vertex `triangle_orders`.
-pub fn extract_order_contours_on_mesh_with_orders(
+pub fn extract_order_contours_on_mesh_with_debug(
     triangle_positions: &[DVec3],
     triangle_orders: &[f64],
     order_value: f64,
     reference: DVec3,
-) -> Vec<Vec<DVec3>> {
+) -> (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) {
     // Relative epsilon: generous enough to absorb floating-point noise from
     // marching-cubes' isosurface interpolation landing a hair off an
     // FMM-solved plateau value, but far smaller than any real layer/wall
@@ -884,7 +942,27 @@ pub fn extract_order_contours_on_mesh_with_orders(
         }
     }
 
-    canonicalize_orientation_per_loop_basis(stitch_loops(segments), reference)
+    let (closed, debug_unclosed) = stitch_loops_with_debug(segments);
+    (
+        canonicalize_orientation_per_loop_basis(closed, reference),
+        debug_unclosed,
+    )
+}
+
+/// Extracts polylines at `order_value` from `triangle_positions` with precomputed per-vertex `triangle_orders`.
+pub fn extract_order_contours_on_mesh_with_orders(
+    triangle_positions: &[DVec3],
+    triangle_orders: &[f64],
+    order_value: f64,
+    reference: DVec3,
+) -> Vec<Vec<DVec3>> {
+    extract_order_contours_on_mesh_with_debug(
+        triangle_positions,
+        triangle_orders,
+        order_value,
+        reference,
+    )
+    .0
 }
 
 /// Builds an orthonormal in-plane basis (`basis1`, `basis2`) perpendicular

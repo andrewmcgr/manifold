@@ -92,6 +92,7 @@ pub const COLOR_BRIDGE: [f32; 4] = [0.9, 0.2, 0.75, 1.0];
 pub const COLOR_OVERHANG: [f32; 4] = [0.9, 0.15, 0.15, 1.0];
 pub const COLOR_TOP_SURFACE: [f32; 4] = [0.2, 0.85, 0.4, 1.0];
 pub const COLOR_SCARF_JOINT: [f32; 4] = [1.0, 0.80, 0.25, 1.0];
+pub const COLOR_DEBUG_EXCLUDED: [f32; 4] = [1.0, 0.1, 0.9, 1.0];
 pub const COLOR_TRAVEL: [f32; 4] = [0.35, 0.55, 0.75, 0.65];
 
 /// Identifiers for toggling individual line types on and off in the viewport.
@@ -105,6 +106,7 @@ pub enum LineTypeKey {
     TopSurface,
     ScarfJoint,
     Travel,
+    DebugExcluded,
 }
 
 /// Available data view color-coding modes for the toolpath preview.
@@ -337,6 +339,7 @@ pub fn data_view_range(
                     extrusion_length: 0.0,
                     line_width: 0.0,
                     is_scarf: false,
+                    id: 0,
                 };
                 let val = segment_scalar_value(
                     &travel_segment,
@@ -468,6 +471,11 @@ pub fn line_type_legend() -> &'static [LegendEntry] {
             label: "Travel",
             color: COLOR_TRAVEL,
         },
+        LegendEntry {
+            key: LineTypeKey::DebugExcluded,
+            label: "Debug / Excluded",
+            color: COLOR_DEBUG_EXCLUDED,
+        },
     ]
 }
 
@@ -485,6 +493,7 @@ pub fn palette_color(kind: MoveKind, is_scarf: bool) -> [f32; 4] {
             MoveKind::Overhang => COLOR_OVERHANG,
             MoveKind::TopSurface => COLOR_TOP_SURFACE,
             MoveKind::Travel => COLOR_TRAVEL,
+            MoveKind::DebugExcluded => COLOR_DEBUG_EXCLUDED,
         }
     }
 }
@@ -548,6 +557,7 @@ pub fn build_toolpath_lines_filtered(
                     extrusion_length: 0.0,
                     line_width: 0.0,
                     is_scarf: false,
+                    id: 0,
                 };
                 let color = match data_view {
                     ToolpathDataView::LineType
@@ -608,6 +618,7 @@ pub fn build_toolpath_lines_filtered(
                     MoveKind::Overhang => LineTypeKey::Overhang,
                     MoveKind::TopSurface => LineTypeKey::TopSurface,
                     MoveKind::Travel => LineTypeKey::Travel,
+                    MoveKind::DebugExcluded => LineTypeKey::DebugExcluded,
                 }
             };
             if hidden_line_types.contains(&key) {
@@ -736,6 +747,7 @@ mod tests {
                 extrusion_length: 0.0,
                 line_width: 0.4,
                 is_scarf: false,
+                id: 0,
             })
             .collect();
         Path {
@@ -832,6 +844,7 @@ mod tests {
                     extrusion_length: 1.0,
                     line_width: 0.4,
                     is_scarf: false,
+                    id: 0,
                 },
                 Segment {
                     kind: MoveKind::WallOuter,
@@ -842,6 +855,7 @@ mod tests {
                     extrusion_length: 1.0,
                     line_width: 0.4,
                     is_scarf: false,
+                    id: 0,
                 },
             ],
             tool: ToolId(0),
@@ -858,6 +872,7 @@ mod tests {
                     extrusion_length: 1.0,
                     line_width: 0.4,
                     is_scarf: false,
+                    id: 0,
                 },
                 Segment {
                     kind: MoveKind::WallOuter,
@@ -868,6 +883,7 @@ mod tests {
                     extrusion_length: 1.0,
                     line_width: 0.4,
                     is_scarf: false,
+                    id: 0,
                 },
             ],
             tool: ToolId(0),
@@ -922,7 +938,7 @@ mod tests {
     #[test]
     fn line_type_legend_covers_all_line_types_and_has_valid_colors() {
         let legend = line_type_legend();
-        assert_eq!(legend.len(), 8);
+        assert_eq!(legend.len(), 9);
         for entry in legend {
             assert!(!entry.label.is_empty());
             assert!(entry.color[3] > 0.0);
@@ -940,6 +956,7 @@ mod tests {
             extrusion_length: 0.5,
             line_width: 0.4,
             is_scarf: true,
+            id: 0,
         };
         assert_eq!(palette_color(seg.kind, seg.is_scarf), COLOR_SCARF_JOINT);
         seg.is_scarf = false;
@@ -983,6 +1000,7 @@ mod tests {
                 extrusion_length: 0.3,
                 line_width: 0.4,
                 is_scarf: false,
+                id: 0,
             },
             Segment {
                 kind: MoveKind::Infill,
@@ -993,6 +1011,7 @@ mod tests {
                 extrusion_length: 0.3,
                 line_width: 0.4,
                 is_scarf: false,
+                id: 0,
             },
             Segment {
                 kind: MoveKind::Travel,
@@ -1003,6 +1022,7 @@ mod tests {
                 extrusion_length: 0.0,
                 line_width: 0.0,
                 is_scarf: false,
+                id: 0,
             },
         ];
         let path = Path {

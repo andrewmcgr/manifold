@@ -314,6 +314,14 @@ pub fn emit_with_machine(
         .fold(f64::INFINITY, f64::min);
 
     for path in paths {
+        if !path.segments.is_empty()
+            && path
+                .segments
+                .iter()
+                .all(|s| s.kind == MoveKind::DebugExcluded)
+        {
+            continue;
+        }
         let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
         let is_first_layer = (path_order - min_order).abs() < 1e-4;
         if !seen_orders.iter().any(|&o| (o - path_order).abs() < 1e-4) {
@@ -345,12 +353,15 @@ pub fn emit_with_machine(
             // The very first point has no incoming edge in `path.segments` - it is
             // an inter-path positioning travel move (G0) from the previous position.
             let incoming_segment = if i > 0 {
-                path.segments.get(i - 1)
+                path.segments
+                    .get(i - 1)
+                    .filter(|s| s.kind != MoveKind::DebugExcluded)
             } else {
                 None
             };
-            let extruding =
-                incoming_segment.is_some_and(|segment| segment.kind != MoveKind::Travel);
+            let extruding = incoming_segment.is_some_and(|segment| {
+                segment.kind != MoveKind::Travel && segment.kind != MoveKind::DebugExcluded
+            });
             let move_kind = incoming_segment.map_or(MoveKind::Travel, |s| s.kind);
             let move_speed = incoming_segment.map_or_else(
                 || motion_model.max_feedrate(MoveKind::Travel, is_first_layer),
