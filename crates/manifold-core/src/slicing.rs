@@ -2600,10 +2600,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                         .map(|w| w.points.clone())
                         .collect();
                     let wall0_2d = polygon2d::to_2d(&wall0, basis1, basis2, origin);
-                    polygon2d::inward_offset(
-                        &wall0_2d,
-                        config.wall_count() as f64 * config.wall_line_width,
-                    )
+                    polygon2d::inward_offset(&wall0_2d, config.wall_line_width)
                 } else {
                     polygon2d::to_2d(infill, basis1, basis2, origin)
                 }

@@ -262,7 +262,7 @@ fn point_key(p: DVec3) -> (i64, i64, i64) {
 /// apart -- far tighter than any real, distinct topological gap on typical
 /// mesh scales, so widening this far does not risk bridging a genuine
 /// stitching gap.
-const STITCH_REPAIR_TOLERANCE: f64 = 0.05;
+const STITCH_REPAIR_TOLERANCE: f64 = 0.25;
 
 /// Minimum point count for a stitched chain to be a plausible closed
 /// contour: a real closed polygon needs at least 3 distinct points/segments
@@ -957,8 +957,7 @@ pub fn extract_order_contours_on_mesh_with_debug(
                 (_, Side::On) => Some(p[i1]),
                 (Side::Below, Side::Above) | (Side::Above, Side::Below) => {
                     let edge_len = p[i0].distance(p[i1]);
-                    let order_diff = (v[i0] - v[i1]).abs();
-                    if edge_len > 1e-6 && (order_diff / edge_len) <= 3.5 {
+                    if edge_len > 1e-6 {
                         Some(lerp_crossing(p[i0], v[i0], p[i1], v[i1], order_value))
                     } else {
                         None
