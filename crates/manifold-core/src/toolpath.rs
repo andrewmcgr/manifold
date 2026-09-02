@@ -83,18 +83,24 @@ fn retain_contained_paths(
         {
             continue;
         }
-        let mut max_distance = f64::NEG_INFINITY;
+        let mut gross_outside_points = 0usize;
         let mut outside_points = 0usize;
+        let mut max_distance = f64::NEG_INFINITY;
         for &p in &path.points {
             let d = mesh_sdf.sample(p).value;
             max_distance = max_distance.max(d);
+            if d > gross_tolerance {
+                gross_outside_points += 1;
+            }
             if d > CONTAINMENT_POINT_SLACK {
                 outside_points += 1;
             }
         }
-        let outside_fraction = outside_points as f64 / path.points.len().max(1) as f64;
+        let total_pts = path.points.len().max(1);
+        let outside_fraction = outside_points as f64 / total_pts as f64;
+        let gross_outside_fraction = gross_outside_points as f64 / total_pts as f64;
         let contained =
-            max_distance <= gross_tolerance && outside_fraction <= CONTAINMENT_OUTSIDE_FRACTION;
+            gross_outside_fraction <= 0.02 && outside_fraction <= CONTAINMENT_OUTSIDE_FRACTION;
         if !contained {
             debug_paths += 1;
             debug_points += path.points.len();

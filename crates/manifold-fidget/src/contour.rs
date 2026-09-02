@@ -956,7 +956,13 @@ pub fn extract_order_contours_on_mesh_with_debug(
                 (Side::On, _) => Some(p[i0]),
                 (_, Side::On) => Some(p[i1]),
                 (Side::Below, Side::Above) | (Side::Above, Side::Below) => {
-                    Some(lerp_crossing(p[i0], v[i0], p[i1], v[i1], order_value))
+                    let edge_len = p[i0].distance(p[i1]);
+                    let order_diff = (v[i0] - v[i1]).abs();
+                    if edge_len > 1e-6 && (order_diff / edge_len) <= 3.5 {
+                        Some(lerp_crossing(p[i0], v[i0], p[i1], v[i1], order_value))
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             };

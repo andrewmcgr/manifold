@@ -2638,20 +2638,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
 
         let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
             .par_iter()
-            .map(|&pos| {
-                let infill = &layers[pos].infill_boundary;
-                if infill.is_empty() {
-                    let wall0_loops: Vec<Vec<DVec3>> = layers[pos]
-                        .loops
-                        .iter()
-                        .filter(|w| w.wall_index == 0)
-                        .map(|w| w.points.clone())
-                        .collect();
-                    polygon2d::to_2d(&wall0_loops, basis1, basis2, origin)
-                } else {
-                    polygon2d::to_2d(infill, basis1, basis2, origin)
-                }
-            })
+            .map(|&pos| polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin))
             .collect();
         let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
 
