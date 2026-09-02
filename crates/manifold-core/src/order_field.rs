@@ -617,7 +617,7 @@ pub fn reconstruct_on_order_field_near<F: OrderField + ?Sized>(
     axis: DVec3,
     apex: DVec3,
     target_order: f64,
-    max_along: f64,
+    _max_along: f64,
     field: &F,
 ) -> Vec<Vec<DVec3>> {
     // Project references once into (u, v, along) triples.
@@ -629,18 +629,6 @@ pub fn reconstruct_on_order_field_near<F: OrderField + ?Sized>(
             (rel.dot(basis1), rel.dot(basis2), rel.dot(axis))
         })
         .collect();
-    if refs.is_empty() {
-        return reconstruct_on_order_field(
-            contours,
-            basis1,
-            basis2,
-            axis,
-            apex,
-            target_order,
-            max_along,
-            field,
-        );
-    }
 
     contours
         .into_iter()
@@ -657,18 +645,14 @@ pub fn reconstruct_on_order_field_near<F: OrderField + ?Sized>(
                         })
                         .map(|&(_, _, along)| along)
                         .unwrap_or(0.0);
-                    let seed = apex + basis1 * u + basis2 * v + axis * nearest_along;
-                    let seed_residual = field.order(seed) - target_order;
-                    if !seed_residual.is_finite() {
-                        return seed;
+                    let planar = apex + basis1 * u + basis2 * v + axis * nearest_along;
+                    let bracket = 2.0;
+                    match solve_along(field, planar, axis, target_order, bracket) {
+                        Some(SolveAlong::Exact(t)) | Some(SolveAlong::ClosestObserved(t)) => {
+                            planar + axis * t
+                        }
+                        None => planar,
                     }
-                    // Small absolute slack on top of the residual-derived
-                    // bound: `max_along` is 50 layer heights (see
-                    // `max_along_for`), so 0.04x of it is ~2 layer heights.
-                    let accept = seed_residual.abs() * 4.0 + max_along * 0.04;
-                    project_onto_isosurface(field, seed, target_order, max_along)
-                        .filter(|p| (*p - seed).length() <= accept)
-                        .unwrap_or(seed)
                 })
                 .collect()
         })
