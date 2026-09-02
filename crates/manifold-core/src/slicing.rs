@@ -2599,7 +2599,16 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                         .filter(|w| w.wall_index == 0)
                         .map(|w| w.points.clone())
                         .collect();
-                    polygon2d::to_2d(&wall0, basis1, basis2, origin)
+                    let wall0_2d = polygon2d::to_2d(&wall0, basis1, basis2, origin);
+                    let inner_cavity = polygon2d::inward_offset(
+                        &wall0_2d,
+                        config.wall_count() as f64 * config.wall_line_width,
+                    );
+                    if inner_cavity.is_empty() {
+                        wall0_2d
+                    } else {
+                        inner_cavity
+                    }
                 } else {
                     polygon2d::to_2d(infill, basis1, basis2, origin)
                 }
