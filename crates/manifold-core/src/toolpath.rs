@@ -2263,6 +2263,16 @@ fn defer_unsupported_paths(
         let field = layer.order_field.as_ref();
         let sdf = layer.mesh_sdf.as_deref();
         for path in paths {
+            let is_infill = path
+                .segments
+                .iter()
+                .any(|s| s.kind == MoveKind::Infill || s.kind == MoveKind::TopSurface);
+            if !is_infill {
+                keyed.push((layer.order, flat_index, path));
+                flat_index += 1;
+                continue;
+            }
+
             let n = path.points.len();
             let mut total = 0.0;
             let mut unsupported = 0.0;

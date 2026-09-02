@@ -758,16 +758,7 @@ pub fn slice_mesh_with_progress(
                 // configured wall (e.g. near a tapered tip) rather than
                 // producing garbage from an empty/degenerate offset.
                 let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
-                let canonical_2d = polygon2d::canonicalize_with_sdf(
-                    &loops_2d,
-                    basis1,
-                    basis2,
-                    BUILD_DIRECTION,
-                    origin,
-                    order_value,
-                    &*field,
-                    Some(&*sdf),
-                );
+                let canonical_2d = polygon2d::canonicalize(&loops_2d);
 
                 let mut outers: Vec<Vec<[f64; 2]>> = Vec::new();
                 let mut holes: Vec<Vec<[f64; 2]>> = Vec::new();
@@ -804,7 +795,6 @@ pub fn slice_mesh_with_progress(
                         wall_count + 1,
                     );
 
-                    let mut previous_loops = wall0_loops.clone();
                     for p_wall in partitioned {
                         if p_wall.wall_index == 0 {
                             continue;
@@ -813,15 +803,15 @@ pub fn slice_mesh_with_progress(
                             curved_infill_2d.extend(p_wall.loops_2d);
                             continue;
                         }
-                        let reconstructed = order_field::reconstruct_on_order_field_near(
+                        let max_along = (config.layer_height * 20.0).max(5.0);
+                        let reconstructed = order_field::reconstruct_on_order_field(
                             p_wall.loops_2d,
-                            &previous_loops,
                             basis1,
                             basis2,
                             BUILD_DIRECTION,
                             origin,
                             order_value,
-                            order_field::max_along_for(config),
+                            max_along,
                             &*field,
                         );
                         loops.extend(reconstructed.iter().cloned().map(|points| {
@@ -837,7 +827,6 @@ pub fn slice_mesh_with_progress(
                                 points,
                             }
                         }));
-                        previous_loops = reconstructed;
                     }
                 }
             }
@@ -861,16 +850,7 @@ pub fn slice_mesh_with_progress(
                 Vec::new()
             } else if is_height {
                 let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
-                let canonical_2d = polygon2d::canonicalize_with_sdf(
-                    &loops_2d,
-                    basis1,
-                    basis2,
-                    BUILD_DIRECTION,
-                    origin,
-                    order_value,
-                    &*field,
-                    Some(&*sdf),
-                );
+                let canonical_2d = polygon2d::canonicalize(&loops_2d);
                 let partitioned = polygon2d::partition_walls_adaptive(
                     &canonical_2d,
                     config.wall_line_width,
@@ -892,9 +872,8 @@ pub fn slice_mesh_with_progress(
                 let offset_3d = polygon2d::from_2d(curved_infill_2d, basis1, basis2, origin);
                 let offset_2d = polygon2d::to_2d(&offset_3d, basis1, basis2, origin);
                 let max_along = (config.layer_height * 20.0).max(5.0);
-                order_field::reconstruct_on_order_field_near(
+                order_field::reconstruct_on_order_field(
                     offset_2d,
-                    &wall0_loops,
                     basis1,
                     basis2,
                     BUILD_DIRECTION,
