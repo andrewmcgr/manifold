@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 /// exact surface, and inter-layer stitch points are deliberately allowed
 /// up to one bead radius outside (see `slicing::chord_stays_in_solid`) —
 /// neither must count as a containment violation.
-const CONTAINMENT_POINT_SLACK: f64 = 0.2;
+const CONTAINMENT_POINT_SLACK: f64 = 0.35;
 
 /// Fraction of a path's points that may sit beyond
 /// [`CONTAINMENT_POINT_SLACK`] before the whole path is treated as bogus
@@ -29,7 +29,7 @@ const CONTAINMENT_POINT_SLACK: f64 = 0.2;
 /// genuine wall loop has thousands of points with at most a handful of
 /// outliers; the spurious fragment loops contour extraction shatters off
 /// near topology changes are small and mostly-outside.
-const CONTAINMENT_OUTSIDE_FRACTION: f64 = 0.2;
+const CONTAINMENT_OUTSIDE_FRACTION: f64 = 0.40;
 
 /// Drops any non-[`MoveKind::Travel`] path in `paths` that isn't contained
 /// in the real solid, using `mesh_sdf` (built directly from the mesh --
@@ -1856,7 +1856,7 @@ pub fn plan_with_progress(
                 paths,
                 layer.mesh_sdf.as_ref(),
                 layer.order,
-                config.nozzle_diameter,
+                config.nozzle_diameter * 1.5,
             );
             let paths = compensate_flat_nozzle(paths, layer, config, tools);
             let paths = simplify_paths(paths, config);

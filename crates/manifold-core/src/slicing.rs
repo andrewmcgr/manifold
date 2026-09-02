@@ -2728,10 +2728,9 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             _ => false,
         };
 
-        // Minimum printable solid-fill area: 1.0 * nozzle_diameter^2 (~0.16 mm^2 for a 0.4mm nozzle).
-        // Discarding sub-bead microscopic slivers prevents exponential polygon fragmentation
-        // during multi-layer boolean differences and unions.
-        let min_solid_area = 1.0 * config.nozzle_diameter * config.nozzle_diameter;
+        // Minimum printable solid-fill area: 0.25 * nozzle_diameter^2 (~0.04 mm^2 for a 0.4mm nozzle).
+        // Preserves narrow top-flange crowns and rims while filtering microscopic numerical noise.
+        let min_solid_area = 0.25 * config.nozzle_diameter * config.nozzle_diameter;
 
         let solid_2d_per_k: Vec<Vec<Vec<[f64; 2]>>> = if z_increases {
             // Index increases with height: k + 1 is above k, k - 1 is below k.
