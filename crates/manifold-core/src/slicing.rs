@@ -613,7 +613,7 @@ pub fn slice_mesh_with_progress(
         for w in 0..=wall_count {
             let iso = -(config.wall_offset + w as f64 * config.wall_line_width);
             let positions = extract_sparse_isosurface_positions::<MeshSdf>(
-                &*sdf,
+                &*side_sdf,
                 min - pad,
                 max + pad,
                 cell_size,
