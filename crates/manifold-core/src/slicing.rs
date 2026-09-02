@@ -715,7 +715,28 @@ pub fn slice_mesh_with_progress(
                 bbox_center + BUILD_DIRECTION * (order_value - bbox_center.dot(BUILD_DIRECTION));
             let mut loops = Vec::new();
             let mut curved_infill_2d: Vec<Vec<[f64; 2]>> = Vec::new();
-            if is_height {
+            if is_dual_iso {
+                for w in 0..wall_count {
+                    let (w_loops, _dbg) = extract_order_contours_on_mesh_with_debug(
+                        &dual_wall_meshes[w],
+                        &dual_wall_orders[w],
+                        order_value,
+                        BUILD_DIRECTION,
+                    );
+                    for pts in w_loops {
+                        let arc_fraction = compute_arc_fractions(&pts);
+                        let n_pts = pts.len();
+                        loops.push(WallLoop {
+                            wall_index: w,
+                            unsupported: vec![false; n_pts],
+                            top_surface: Vec::new(),
+                            arc_fraction,
+                            line_widths: vec![config.wall_line_width; n_pts],
+                            points: pts,
+                        });
+                    }
+                }
+            } else if is_height {
                 for wall_index in 0..wall_count {
                     // Negative iso = inward (see `MeshSdf::sign_at`: positive
                     // outside, negative inside). Wall 0 sits `wall_offset` in
