@@ -49,6 +49,11 @@ pub enum OrderFieldKind {
     /// no mesh in scope reuse the field cached on `slicing::Layer` instead
     /// of re-resolving this variant.
     Eikonal,
+    /// Direct dual-field isosurface slicing: extracts the layer manifold at
+    /// `OrderField(p) == order_value`, then directly extracts wall perimeters and
+    /// infill boundaries as level sets of the 3D solid MeshSdf `S(p) == -wall_offset`.
+    /// Completely avoids 2D projection, 2D insetting errors across voids, and mid-air reprojection.
+    DualIso,
 }
 
 /// Resolve a config-level [`OrderFieldKind`] to a concrete
@@ -89,7 +94,9 @@ pub fn order_field_for_with_sdf(
             config.order_field_axis,
             config.order_field_slope,
         )),
-        OrderFieldKind::Eikonal => Box::new(eikonal_field_for(config, mesh, slope_profile, sdf)),
+        OrderFieldKind::Eikonal | OrderFieldKind::DualIso => {
+            Box::new(eikonal_field_for(config, mesh, slope_profile, sdf))
+        }
     }
 }
 
@@ -491,7 +498,7 @@ pub fn resolve_axis_apex_slope(kind: OrderFieldKind, config: &SlicerConfig) -> (
         // the *actual* cached `EikonalOrderField` (not this closed-form
         // triple) is what makes the reconstructed geometry correct
         // regardless of this choice.
-        OrderFieldKind::Eikonal => (BUILD_DIRECTION, DVec3::ZERO, 0.0),
+        OrderFieldKind::Eikonal | OrderFieldKind::DualIso => (BUILD_DIRECTION, DVec3::ZERO, 0.0),
     }
 }
 

@@ -172,6 +172,7 @@ enum OrderFieldArg {
     Height,
     Conical,
     Eikonal,
+    DualIso,
 }
 
 impl From<OrderFieldArg> for OrderFieldKind {
@@ -180,6 +181,7 @@ impl From<OrderFieldArg> for OrderFieldKind {
             OrderFieldArg::Height => OrderFieldKind::Height,
             OrderFieldArg::Conical => OrderFieldKind::Conical,
             OrderFieldArg::Eikonal => OrderFieldKind::Eikonal,
+            OrderFieldArg::DualIso => OrderFieldKind::DualIso,
         }
     }
 }

@@ -1201,6 +1201,11 @@ impl ManifoldApp {
                     OrderFieldKind::Eikonal,
                     "Eikonal",
                 );
+                ui.selectable_value(
+                    &mut self.config.order_field,
+                    OrderFieldKind::DualIso,
+                    "DualIso",
+                );
             });
         if previous_order_field != OrderFieldKind::Conical
             && self.config.order_field == OrderFieldKind::Conical
@@ -1234,7 +1239,9 @@ impl ManifoldApp {
                 egui::Slider::new(&mut self.config.order_field_slope, 0.0..=2.0).text("Cone slope"),
             );
         }
-        if self.config.order_field == OrderFieldKind::Eikonal {
+        if self.config.order_field == OrderFieldKind::Eikonal
+            || self.config.order_field == OrderFieldKind::DualIso
+        {
             let mut surface_weight = self.config.eikonal_surface_order_weight();
             if ui
                 .add(
