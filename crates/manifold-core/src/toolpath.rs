@@ -1416,11 +1416,12 @@ fn rdp_mark(points: &[DVec3], chain: &[usize], tolerance: f64, keep: &mut [bool]
 fn perpendicular_distance(p: DVec3, a: DVec3, b: DVec3) -> f64 {
     let ab = b - a;
     let ab_len_sq = ab.length_squared();
-    if ab_len_sq < f64::EPSILON {
+    if ab_len_sq < 1e-12 {
         return p.distance(a);
     }
-    let ap = p - a;
-    ap.cross(ab).length() / ab_len_sq.sqrt()
+    let t = ((p - a).dot(ab) / ab_len_sq).clamp(0.0, 1.0);
+    let proj = a + ab * t;
+    p.distance(proj)
 }
 
 /// Validates that every point of every planned path in `paths` lies within

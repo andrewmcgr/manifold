@@ -771,6 +771,32 @@ pub fn plan_wave_overhangs(
             }
 
             for shape in &shapes {
+                // 3D Solid Mesh Validation: Ensure the overhang shape is actually part of the solid model
+                // and not an empty internal hole void.
+                if let Some(sdf) = &layers[k].mesh_sdf {
+                    let mut c_u = 0.0;
+                    let mut c_v = 0.0;
+                    for &[u, v] in &shape.outer {
+                        c_u += u;
+                        c_v += v;
+                    }
+                    let len = shape.outer.len().max(1) as f64;
+                    let c_u = c_u / len;
+                    let c_v = c_v / len;
+                    if let Some(p_3d) = order_field::reconstruct_point_on_order_field(
+                        apex + basis1 * c_u + basis2 * c_v,
+                        axis,
+                        layers[k].order,
+                        max_along,
+                        layers[k].order_field.as_ref(),
+                    ) {
+                        if sdf.sample(p_3d).value > 0.0 {
+                            // In open air or inside a hole void - do not generate wave overhang in holes!
+                            continue;
+                        }
+                    }
+                }
+
                 // Extract seed contact segments: edges of outer boundary bordering prev_b or other loops in cur_b
                 let mut seed_segments = Vec::new();
                 let n = shape.outer.len();
