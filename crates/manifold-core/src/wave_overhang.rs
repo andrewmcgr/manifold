@@ -931,6 +931,7 @@ mod tests {
             object: ObjectId(0),
             order,
             loops: vec![WallLoop {
+    is_open: false,
                 wall_index: 0,
                 points: loop_points.clone(),
                 unsupported: vec![false; loop_points.len()],

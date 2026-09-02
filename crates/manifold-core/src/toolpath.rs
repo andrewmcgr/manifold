@@ -1730,28 +1730,25 @@ pub fn plan_with_progress(
                     MoveKind::WallInner
                 };
                 let point_count = wall_loop.points.len();
-                let segments = (0..point_count)
+                let seg_count = if wall_loop.is_open {
+                    point_count.saturating_sub(1)
+                } else {
+                    point_count
+                };
+                let segments = (0..seg_count)
                     .map(|i| {
-                        // Segment `i` is the move `points[i] -> points[(i + 1) %
-                        // point_count]` (see `Path`'s doc comment on the
-                        // `points`/`segments` parallel-array convention, which
-                        // also applies here to `WallLoop::points`/`unsupported`).
-                        // We classify a segment as `Overhang` when its
-                        // *destination* point is `unsupported == true`, rather
-                        // than either endpoint: a stitched or wave-overhang
-                        // point is unsupported because there's no order-field/mesh
-                        // surface directly beneath it, and that lack of support
-                        // applies to the bead being laid down as the nozzle
-                        // arrives at (i.e. extrudes into) that point.
-                        let dest = (i + 1) % point_count.max(1);
+                        let dest = if wall_loop.is_open {
+                            i + 1
+                        } else {
+                            (i + 1) % point_count.max(1)
+                        };
                         let is_unsupported =
                             wall_loop.unsupported.get(dest).copied().unwrap_or(false)
                                 || wave_overhang_plan
                                     .wall_overhang_tags_by_layer
                                     .get(layer.index)
                                     .and_then(|l| l.get(w_idx))
-                                    .and_then(|w| w.get(dest))
-                                    .copied()
+                                    .and_then(|w| w.get(dest).copied())
                                     .unwrap_or(false);
                         let kind = if is_debug_loop {
                             MoveKind::DebugExcluded
@@ -2427,6 +2424,7 @@ mod tests {
                 object: ObjectId(1),
                 order: 0.0,
                 loops: vec![WallLoop {
+    is_open: false,
                     wall_index: 0,
                     points: loop_a.clone(),
                     ..Default::default()
@@ -2441,6 +2439,7 @@ mod tests {
                 object: ObjectId(0),
                 order: 0.0,
                 loops: vec![WallLoop {
+    is_open: false,
                     wall_index: 0,
                     points: loop_b.clone(),
                     ..Default::default()
@@ -2512,6 +2511,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.75,
             loops: vec![WallLoop {
+    is_open: false,
                 wall_index: 0,
                 points: vec![
                     DVec3::ZERO,
@@ -2586,6 +2586,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.0,
             loops: vec![WallLoop {
+    is_open: false,
                 wall_index: 0,
                 points: vec![
                     DVec3::ZERO,
@@ -2622,6 +2623,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.25,
             loops: vec![WallLoop {
+    is_open: false,
                 wall_index: 0,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.25),
@@ -2640,6 +2642,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.50,
             loops: vec![WallLoop {
+    is_open: false,
                 wall_index: 0,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.50),
@@ -2690,6 +2693,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.20,
             loops: vec![WallLoop {
+    is_open: false,
                 wall_index: 0,
                 points: vec![DVec3::new(0.0, 0.0, 0.20), DVec3::new(20.0, 0.0, 0.20)],
                 ..Default::default()
@@ -2852,6 +2856,7 @@ mod tests {
             order: 0.0,
             loops: vec![
                 WallLoop {
+    is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -2860,6 +2865,7 @@ mod tests {
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
+    is_open: false,
                     wall_index: 1,
                     points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -2898,6 +2904,7 @@ mod tests {
             order: 0.0,
             loops: vec![
                 WallLoop {
+    is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -2906,6 +2913,7 @@ mod tests {
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
+    is_open: false,
                     wall_index: 1,
                     points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -2914,6 +2922,7 @@ mod tests {
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
+    is_open: false,
                     wall_index: 2,
                     points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -2969,6 +2978,7 @@ mod tests {
                 // wrap-around segment 3: points[3] -> points[0], whose
                 // destination is supported) should remain `WallOuter`.
                 WallLoop {
+    is_open: false,
                     wall_index: 0,
                     points: vec![
                         DVec3::ZERO,
@@ -2984,6 +2994,7 @@ mod tests {
                 // wall_index 1: no unsupported points -- must be unaffected
                 // (no regression to plain `WallInner` classification).
                 WallLoop {
+    is_open: false,
                     wall_index: 1,
                     points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
                     unsupported: vec![false, false],
@@ -3774,6 +3785,7 @@ mod tests {
             object: ObjectId(0),
             order: 0.0,
             loops: vec![WallLoop {
+    is_open: false,
                 wall_index: 0,
                 points: loop_points,
                 ..Default::default()
@@ -4240,6 +4252,7 @@ mod tests {
             index: 0,
             order: 0.2,
             loops: vec![WallLoop {
+    is_open: false,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.2),
                     DVec3::new(10.0, 0.0, 0.2),
@@ -4263,6 +4276,7 @@ mod tests {
             index: 5,
             order: 5.0,
             loops: vec![WallLoop {
+    is_open: false,
                 points: vec![p0, p1, p2, p3],
                 wall_index: 0,
                 top_surface: vec![false; 4],
@@ -4321,6 +4335,7 @@ mod tests {
             index: 0,
             order: 0.0,
             loops: vec![WallLoop {
+    is_open: false,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.0),
                     DVec3::new(10.0, 0.0, 0.0),
@@ -4344,6 +4359,7 @@ mod tests {
             index: 1,
             order: 1.0,
             loops: vec![WallLoop {
+    is_open: false,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.0),
                     DVec3::new(10.0, 0.0, 10.0),
