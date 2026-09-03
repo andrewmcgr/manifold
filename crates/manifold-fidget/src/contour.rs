@@ -262,7 +262,7 @@ fn point_key(p: DVec3) -> (i64, i64, i64) {
 /// apart -- far tighter than any real, distinct topological gap on typical
 /// mesh scales, so widening this far does not risk bridging a genuine
 /// stitching gap.
-const STITCH_REPAIR_TOLERANCE: f64 = 0.25;
+const STITCH_REPAIR_TOLERANCE: f64 = 1.0;
 
 /// Minimum point count for a stitched chain to be a plausible closed
 /// contour: a real closed polygon needs at least 3 distinct points/segments
@@ -392,45 +392,6 @@ pub fn stitch_loops_with_debug(
         })
         .collect();
 
-    // Prune dangling degree-1 endpoints (open-ended hair/spurs with no exact or
-    // repair-tolerance partner): any segment with an unpartnered endpoint cannot belong
-    // to a closed cycle, and walking into a dangling spur causes loop-stitching to fail
-    // to close and falsely mark entire valid cycles as dead starts.
-    loop {
-        let mut by_point: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
-        for (i, &(a, b)) in segments.iter().enumerate() {
-            by_point.entry(point_key(a)).or_default().push(i);
-            by_point.entry(point_key(b)).or_default().push(i);
-        }
-        let before_len = segments.len();
-        let has_partner = |idx: usize, pt: DVec3, segs: &[(DVec3, DVec3)]| -> bool {
-            if let Some(cand) = by_point.get(&point_key(pt)) {
-                if cand.iter().any(|&i| i != idx) {
-                    return true;
-                }
-            }
-            segs.iter().enumerate().any(|(i, &(a, b))| {
-                i != idx
-                    && (a.distance(pt) <= STITCH_REPAIR_TOLERANCE
-                        || b.distance(pt) <= STITCH_REPAIR_TOLERANCE)
-            })
-        };
-        let keep_mask: Vec<bool> = segments
-            .iter()
-            .enumerate()
-            .map(|(i, &(a, b))| has_partner(i, a, &segments) && has_partner(i, b, &segments))
-            .collect();
-        let mut idx = 0;
-        segments.retain(|_| {
-            let keep = keep_mask[idx];
-            idx += 1;
-            keep
-        });
-        if segments.len() == before_len {
-            break;
-        }
-    }
-
     // Map from a (quantized) endpoint key to the indices of segments
     // touching that point (a segment appears under both of its endpoints'
     // keys, unless they collide, e.g. a degenerate zero-length segment).
@@ -458,8 +419,15 @@ pub fn stitch_loops_with_debug(
         let mut closed = false;
 
         loop {
-            if point_key(current_point) == point_key(first_point) {
-                closed = true;
+            if let Some(pos) = loop_points
+                .iter()
+                .position(|&p| point_key(p) == point_key(current_point))
+            {
+                let cycle: Vec<DVec3> = loop_points[pos..].to_vec();
+                if cycle.len() >= MIN_LOOP_POINTS {
+                    loops.push(cycle);
+                    closed = true;
+                }
                 break;
             }
 
@@ -482,8 +450,14 @@ pub fn stitch_loops_with_debug(
                     current_point = other;
                 }
                 None => {
-                    if current_point.distance(first_point) <= STITCH_REPAIR_TOLERANCE {
-                        closed = true;
+                    if let Some(pos) = loop_points.iter().position(|&p| {
+                        p.distance(current_point) <= STITCH_REPAIR_TOLERANCE
+                    }) {
+                        let cycle: Vec<DVec3> = loop_points[pos..].to_vec();
+                        if cycle.len() >= MIN_LOOP_POINTS {
+                            loops.push(cycle);
+                            closed = true;
+                        }
                     } else {
                         loop_points.push(current_point);
                     }
@@ -492,9 +466,7 @@ pub fn stitch_loops_with_debug(
             }
         }
 
-        if closed && loop_points.len() >= MIN_LOOP_POINTS {
-            loops.push(loop_points);
-        } else {
+        if !closed {
             for &idx in &trail {
                 used[idx] = false;
             }
