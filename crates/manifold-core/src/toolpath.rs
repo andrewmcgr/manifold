@@ -1,7 +1,6 @@
 //! Toolpath planning: layers -> ordered extrusion moves.
 
 use crate::infill::{self, InfillRegion};
-use crate::order_field::OrderFieldKind;
 use crate::{
     bounds::BoundingVolume, extrusion, ids::ToolId, object::Object, slicing::Layer, tool::Tool,
     Error, Result, SlicerConfig,
@@ -1785,77 +1784,47 @@ pub fn plan_with_progress(
                 });
             }
 
-            let is_dual_iso = matches!(config.order_field, OrderFieldKind::DualIso);
-            if is_dual_iso && !layer.infill_boundary.is_empty() {
-                for pts in &layer.infill_boundary {
-                    if pts.len() >= 2 {
-                        let segments: Vec<Segment> = (0..pts.len())
-                            .map(|_| Segment {
-                                kind: MoveKind::Infill,
-                                speed: speed_for_kind(MoveKind::Infill, config),
-                                extrusion_rate: 1.0,
-                                support_fraction: 0.0,
-                                order: layer.order,
-                                extrusion_length: 0.0,
-                                line_width: config.infill_line_width,
-                                is_scarf: false,
-                                id: 0,
-                            })
-                            .collect();
-                        paths.push(Path {
-                            points: pts.clone(),
-                            segments,
-                            tool: object.tool,
-                        });
+            let region = InfillRegion::from_layer(layer, config);
+            let (sparse_loops, narrow_solid_loops): (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) =
+                region.loops.into_iter().partition(|l| {
+                    let mut min = glam::DVec3::splat(f64::INFINITY);
+                    let mut max = glam::DVec3::splat(f64::NEG_INFINITY);
+                    for p in l {
+                        min = min.min(*p);
+                        max = max.max(*p);
                     }
+                    let extent = (max - min).length();
+                    extent >= config.nozzle_diameter * 15.0
+                });
+
+            if !sparse_loops.is_empty() {
+                let sparse_region = InfillRegion {
+                    loops: sparse_loops,
+                };
+                for mut infill_path in sparse_generator.generate(
+                    &sparse_region,
+                    config,
+                    layer,
+                    &object.transform,
+                    config.infill_density,
+                ) {
+                    infill_path.tool = object.tool;
+                    paths.push(infill_path);
                 }
-            } else {
-                let region = InfillRegion::from_layer(layer, config);
-                let (sparse_loops, narrow_solid_loops): (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) =
-                    region.loops.into_iter().partition(|l| {
-                        let mut min = glam::DVec3::splat(f64::INFINITY);
-                        let mut max = glam::DVec3::splat(f64::NEG_INFINITY);
-                        for p in l {
-                            min = min.min(*p);
-                            max = max.max(*p);
-                        }
-                        let extent = (max - min).length();
-                        extent >= config.nozzle_diameter * 15.0
-                    });
+            }
 
-                if !sparse_loops.is_empty() {
-                    let sparse_region = InfillRegion {
-                        loops: sparse_loops,
-                    };
-                    for mut infill_path in sparse_generator.generate(
-                        &sparse_region,
-                        config,
-                        layer,
-                        &object.transform,
-                        config.infill_density,
-                    ) {
-                        infill_path.tool = object.tool;
-                        paths.push(infill_path);
-                    }
-                }
+            let mut all_solid_loops = layer.solid_fill_boundary.clone();
+            all_solid_loops.extend(narrow_solid_loops);
 
-                let mut all_solid_loops = layer.solid_fill_boundary.clone();
-                all_solid_loops.extend(narrow_solid_loops);
-
-                if !all_solid_loops.is_empty() {
-                    let solid_region = InfillRegion {
-                        loops: all_solid_loops,
-                    };
-                    for mut infill_path in solid_generator.generate(
-                        &solid_region,
-                        config,
-                        layer,
-                        &object.transform,
-                        1.0,
-                    ) {
-                        infill_path.tool = object.tool;
-                        paths.push(infill_path);
-                    }
+            if !all_solid_loops.is_empty() {
+                let solid_region = InfillRegion {
+                    loops: all_solid_loops,
+                };
+                for mut infill_path in
+                    solid_generator.generate(&solid_region, config, layer, &object.transform, 1.0)
+                {
+                    infill_path.tool = object.tool;
+                    paths.push(infill_path);
                 }
             }
 
