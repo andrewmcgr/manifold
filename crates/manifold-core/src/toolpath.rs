@@ -29,7 +29,7 @@ const CONTAINMENT_POINT_SLACK: f64 = 0.35;
 /// genuine wall loop has thousands of points with at most a handful of
 /// outliers; the spurious fragment loops contour extraction shatters off
 /// near topology changes are small and mostly-outside.
-const CONTAINMENT_OUTSIDE_FRACTION: f64 = 0.40;
+const CONTAINMENT_OUTSIDE_FRACTION: f64 = 0.80;
 
 /// Drops any non-[`MoveKind::Travel`] path in `paths` that isn't contained
 /// in the real solid, using `mesh_sdf` (built directly from the mesh --
@@ -83,31 +83,16 @@ fn retain_contained_paths(
         {
             continue;
         }
-        let is_infill = path
-            .segments
-            .iter()
-            .any(|segment| segment.kind == MoveKind::Infill);
-        let allowed_point_slack = if is_infill {
-            0.20
-        } else {
-            CONTAINMENT_POINT_SLACK
-        };
-        let allowed_gross = if is_infill {
-            0.40
-        } else {
-            gross_tolerance
-        };
-
         let mut gross_outside_points = 0usize;
         let mut outside_points = 0usize;
         let mut max_distance = f64::NEG_INFINITY;
         for &p in &path.points {
             let d = mesh_sdf.sample(p).value;
             max_distance = max_distance.max(d);
-            if d > allowed_gross {
+            if d > gross_tolerance {
                 gross_outside_points += 1;
             }
-            if d > allowed_point_slack {
+            if d > CONTAINMENT_POINT_SLACK {
                 outside_points += 1;
             }
         }
