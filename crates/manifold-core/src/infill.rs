@@ -111,7 +111,9 @@ impl InfillRegion {
             basis2,
             apex,
         ));
-        let sparse_2d = polygon2d::difference(&infill_2d, &solid_2d);
+        let min_area = 0.25 * config.nozzle_diameter * config.nozzle_diameter;
+        let sparse_2d =
+            polygon2d::filter_min_area(&polygon2d::difference(&infill_2d, &solid_2d), min_area);
         if sparse_2d.is_empty() {
             return Self { loops: Vec::new() };
         }
@@ -728,140 +730,174 @@ fn generate_tpms_infill(
         return Vec::new();
     }
 
-    let mut min_u = f64::INFINITY;
-    let mut max_u = f64::NEG_INFINITY;
-    let mut min_v = f64::INFINITY;
-    let mut max_v = f64::NEG_INFINITY;
-
-    for loop_pts in &loops_2d {
-        for &[u, v] in loop_pts {
-            min_u = min_u.min(u);
-            max_u = max_u.max(u);
-            min_v = min_v.min(v);
-            max_v = max_v.max(v);
+    // Process each disconnected island independently so infill paths can never
+    // jump across central voids, hollow slots, or between disjoint islands.
+    let mut outers: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut holes: Vec<Vec<[f64; 2]>> = Vec::new();
+    for loop_2d in loops_2d {
+        if polygon2d::signed_area(&loop_2d) > 0.0 {
+            outers.push(loop_2d);
+        } else {
+            holes.push(loop_2d);
         }
     }
 
-    let step = (config.infill_line_width * 0.75).clamp(0.1, 1.5);
-    let nu = (((max_u - min_u) / step).ceil() as usize).max(2);
-    let nv = (((max_v - min_v) / step).ceil() as usize).max(2);
-    let du = (max_u - min_u) / nu as f64;
-    let dv = (max_v - min_v) / nv as f64;
+    let mut islands: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
+    let mut assigned_holes = vec![false; holes.len()];
 
-    let mut grid_vals = vec![0.0f64; (nu + 1) * (nv + 1)];
-    for j in 0..=nv {
-        let v = min_v + j as f64 * dv;
-        for i in 0..=nu {
-            let u = min_u + i as f64 * du;
-            let world_p = apex + basis1 * u + basis2 * v + axis * layer.order;
-            grid_vals[j * (nu + 1) + i] = tpms_field.sample(world_p).value;
+    for outer in outers {
+        let mut island = vec![outer.clone()];
+        for (h_idx, hole) in holes.iter().enumerate() {
+            if !assigned_holes[h_idx]
+                && !hole.is_empty()
+                && polygon2d::point_in_polygon(hole[0], &outer)
+            {
+                island.push(hole.clone());
+                assigned_holes[h_idx] = true;
+            }
         }
+        islands.push(island);
     }
 
-    let mut segments_2d: Vec<([f64; 2], [f64; 2])> = Vec::new();
-    for j in 0..nv {
-        let v0 = min_v + j as f64 * dv;
-        let v1 = v0 + dv;
-        for i in 0..nu {
-            let u0 = min_u + i as f64 * du;
-            let u1 = u0 + du;
+    let mut all_world_polylines: Vec<Vec<DVec3>> = Vec::new();
 
-            let c0 = [u0, v0];
-            let c1 = [u1, v0];
-            let c2 = [u1, v1];
-            let c3 = [u0, v1];
+    for island_loops in &islands {
+        let mut min_u = f64::INFINITY;
+        let mut max_u = f64::NEG_INFINITY;
+        let mut min_v = f64::INFINITY;
+        let mut max_v = f64::NEG_INFINITY;
 
-            let val0 = grid_vals[j * (nu + 1) + i];
-            let val1 = grid_vals[j * (nu + 1) + (i + 1)];
-            let val2 = grid_vals[(j + 1) * (nu + 1) + (i + 1)];
-            let val3 = grid_vals[(j + 1) * (nu + 1) + i];
+        for loop_pts in island_loops {
+            for &[u, v] in loop_pts {
+                min_u = min_u.min(u);
+                max_u = max_u.max(u);
+                min_v = min_v.min(v);
+                max_v = max_v.max(v);
+            }
+        }
 
-            let mut mask = 0u8;
-            if val0 < 0.0 {
-                mask |= 1;
-            }
-            if val1 < 0.0 {
-                mask |= 2;
-            }
-            if val2 < 0.0 {
-                mask |= 4;
-            }
-            if val3 < 0.0 {
-                mask |= 8;
-            }
+        let step = (config.infill_line_width * 0.75).clamp(0.1, 1.5);
+        let nu = (((max_u - min_u) / step).ceil() as usize).max(2);
+        let nv = (((max_v - min_v) / step).ceil() as usize).max(2);
+        let du = (max_u - min_u) / nu as f64;
+        let dv = (max_v - min_v) / nv as f64;
 
-            let lerp_e = |pa: [f64; 2], va: f64, pb: [f64; 2], vb: f64| -> [f64; 2] {
-                let denom = vb - va;
-                let t = if denom.abs() < 1e-7 {
-                    0.5
-                } else {
-                    (-va / denom).clamp(0.0, 1.0)
+        let mut grid_vals = vec![0.0f64; (nu + 1) * (nv + 1)];
+        for j in 0..=nv {
+            let v = min_v + j as f64 * dv;
+            for i in 0..=nu {
+                let u = min_u + i as f64 * du;
+                let world_p = apex + basis1 * u + basis2 * v + axis * layer.order;
+                grid_vals[j * (nu + 1) + i] = tpms_field.sample(world_p).value;
+            }
+        }
+
+        let mut segments_2d: Vec<([f64; 2], [f64; 2])> = Vec::new();
+        for j in 0..nv {
+            let v0 = min_v + j as f64 * dv;
+            let v1 = v0 + dv;
+            for i in 0..nu {
+                let u0 = min_u + i as f64 * du;
+                let u1 = u0 + du;
+
+                let c0 = [u0, v0];
+                let c1 = [u1, v0];
+                let c2 = [u1, v1];
+                let c3 = [u0, v1];
+
+                let val0 = grid_vals[j * (nu + 1) + i];
+                let val1 = grid_vals[j * (nu + 1) + (i + 1)];
+                let val2 = grid_vals[(j + 1) * (nu + 1) + (i + 1)];
+                let val3 = grid_vals[(j + 1) * (nu + 1) + i];
+
+                let mut mask = 0u8;
+                if val0 < 0.0 {
+                    mask |= 1;
+                }
+                if val1 < 0.0 {
+                    mask |= 2;
+                }
+                if val2 < 0.0 {
+                    mask |= 4;
+                }
+                if val3 < 0.0 {
+                    mask |= 8;
+                }
+
+                let lerp_e = |pa: [f64; 2], va: f64, pb: [f64; 2], vb: f64| -> [f64; 2] {
+                    let denom = vb - va;
+                    let t = if denom.abs() < 1e-7 {
+                        0.5
+                    } else {
+                        (-va / denom).clamp(0.0, 1.0)
+                    };
+                    [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t]
                 };
-                [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t]
-            };
 
-            let e0 = lerp_e(c0, val0, c1, val1);
-            let e1 = lerp_e(c1, val1, c2, val2);
-            let e2 = lerp_e(c2, val2, c3, val3);
-            let e3 = lerp_e(c3, val3, c0, val0);
+                let e0 = lerp_e(c0, val0, c1, val1);
+                let e1 = lerp_e(c1, val1, c2, val2);
+                let e2 = lerp_e(c2, val2, c3, val3);
+                let e3 = lerp_e(c3, val3, c0, val0);
 
-            match mask {
-                1 | 14 => segments_2d.push((e3, e0)),
-                2 | 13 => segments_2d.push((e0, e1)),
-                3 | 12 => segments_2d.push((e3, e1)),
-                4 | 11 => segments_2d.push((e1, e2)),
-                5 => {
-                    segments_2d.push((e3, e0));
-                    segments_2d.push((e1, e2));
+                match mask {
+                    1 | 14 => segments_2d.push((e3, e0)),
+                    2 | 13 => segments_2d.push((e0, e1)),
+                    3 | 12 => segments_2d.push((e3, e1)),
+                    4 | 11 => segments_2d.push((e1, e2)),
+                    5 => {
+                        segments_2d.push((e3, e0));
+                        segments_2d.push((e1, e2));
+                    }
+                    6 | 9 => segments_2d.push((e0, e2)),
+                    7 | 8 => segments_2d.push((e2, e3)),
+                    10 => {
+                        segments_2d.push((e0, e1));
+                        segments_2d.push((e2, e3));
+                    }
+                    _ => {}
                 }
-                6 | 9 => segments_2d.push((e0, e2)),
-                7 | 8 => segments_2d.push((e2, e3)),
-                10 => {
-                    segments_2d.push((e0, e1));
-                    segments_2d.push((e2, e3));
-                }
-                _ => {}
             }
         }
-    }
 
-    if segments_2d.is_empty() {
-        return Vec::new();
-    }
-
-    let mut filtered_segments: Vec<([f64; 2], [f64; 2])> = Vec::new();
-    for (p0, p1) in segments_2d {
-        let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
-        if polygon2d::contains_point(&loops_2d, p0)
-            && polygon2d::contains_point(&loops_2d, p1)
-            && polygon2d::contains_point(&loops_2d, mid)
-        {
-            filtered_segments.push((p0, p1));
+        if segments_2d.is_empty() {
+            continue;
         }
+
+        let mut filtered_segments: Vec<([f64; 2], [f64; 2])> = Vec::new();
+        for (p0, p1) in segments_2d {
+            let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
+            if polygon2d::contains_point(island_loops, p0)
+                && polygon2d::contains_point(island_loops, p1)
+                && polygon2d::contains_point(island_loops, mid)
+            {
+                filtered_segments.push((p0, p1));
+            }
+        }
+
+        if filtered_segments.is_empty() {
+            continue;
+        }
+
+        let tol = (step * 0.5).max(0.01);
+        let polylines_2d = stitch_segments_into_polylines_2d(filtered_segments, tol);
+
+        let world_polylines = order_field::reconstruct_on_order_field_near(
+            polylines_2d,
+            &region.loops,
+            basis1,
+            basis2,
+            axis,
+            apex,
+            layer.order,
+            order_field::max_along_for(config),
+            layer.order_field.as_ref(),
+        );
+        all_world_polylines.extend(world_polylines);
     }
-
-    if filtered_segments.is_empty() {
-        return Vec::new();
-    }
-
-    let tol = (step * 0.5).max(0.01);
-    let polylines_2d = stitch_segments_into_polylines_2d(filtered_segments, tol);
-
-    let world_polylines = order_field::reconstruct_on_order_field_near(
-        polylines_2d,
-        &region.loops,
-        basis1,
-        basis2,
-        axis,
-        apex,
-        layer.order,
-        order_field::max_along_for(config),
-        layer.order_field.as_ref(),
-    );
 
     let mut last_end: Option<DVec3> = None;
     let mut paths = Vec::new();
-    for mut points in world_polylines.into_iter().filter(|pts| pts.len() >= 2) {
+    for mut points in all_world_polylines.into_iter().filter(|pts| pts.len() >= 2) {
         if let Some(prev) = last_end {
             let start = points.first().copied().unwrap();
             let end = points.last().copied().unwrap();

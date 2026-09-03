@@ -1,6 +1,5 @@
 //! Non-planar slicing: mesh -> ordered layers of cross-section curves.
 
-use crate::infill::InfillPatternKind;
 use crate::{
     ids::ObjectId, mesh::Mesh, object::Object, order_field, polygon2d, Error, Result, SlicerConfig,
 };
@@ -612,75 +611,8 @@ pub fn slice_mesh_with_progress(
     // fast path unchanged; anything else (e.g. `Conical`) uses the
     // generalized "contour-on-mesh" path, which extracts each wall pass's
     // isosurface once (not once per layer) and walks it per layer.
-    let is_dual_iso = matches!(config.order_field, order_field::OrderFieldKind::DualIso);
-    let (outer_wall_mesh, outer_wall_mesh_orders, dual_tpms_mesh, dual_tpms_orders): (
-        Vec<DVec3>,
-        Vec<f64>,
-        Vec<DVec3>,
-        Vec<f64>,
-    ) = if is_height {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-    } else if is_dual_iso {
-        let cell_size = (config.wall_offset / 2.0)
-            .min(config.wall_line_width / 4.0)
-            .clamp(0.04, 0.10);
-        let iso = -config.wall_offset;
-        let pad = DVec3::splat(cell_size * 2.0);
-        on_progress(0.05);
-        let wall0_pos = extract_sparse_isosurface_positions::<MeshSdf>(
-            &*floor_extended_sdf,
-            min - pad,
-            max + pad,
-            cell_size,
-            iso,
-        );
-        let wall0_orders: Vec<f64> = wall0_pos.par_iter().map(|&p| field.order(p)).collect();
-        on_progress(0.08);
-
-        let tpms_kind = match config.sparse_infill_pattern() {
-            InfillPatternKind::Gyroid => Some(manifold_fidget::tpms::TpmsKind::Gyroid),
-            InfillPatternKind::SchwarzD | InfillPatternKind::Cubic => {
-                Some(manifold_fidget::tpms::TpmsKind::SchwarzD)
-            }
-            InfillPatternKind::SchwarzP => Some(manifold_fidget::tpms::TpmsKind::SchwarzP),
-            _ => None,
-        };
-        let (tpms_pos, tpms_orders) = if let Some(kind) = tpms_kind {
-            let wavelength = manifold_fidget::tpms::TpmsField::wavelength_for_density(
-                config.infill_line_width,
-                config.infill_density,
-            );
-            let tpms = manifold_fidget::tpms::TpmsField::new(kind, wavelength, 0.0);
-            let infill_iso =
-                -(config.wall_offset + config.wall_count() as f64 * config.wall_line_width);
-            let csg = manifold_fidget::tpms::ClippedTpmsField::new(
-                tpms,
-                &*floor_extended_sdf,
-                infill_iso,
-            );
-            let raw_mesh = extract_sparse_isosurface_positions::<
-                manifold_fidget::tpms::ClippedTpmsField<MeshSdf>,
-            >(&csg, min - pad, max + pad, cell_size, 0.0);
-            let mut strictly_contained = Vec::new();
-            for tri in raw_mesh.chunks_exact(3) {
-                let (p0, p1, p2) = (tri[0], tri[1], tri[2]);
-                let d0 = floor_extended_sdf.sample(p0).value;
-                let d1 = floor_extended_sdf.sample(p1).value;
-                let d2 = floor_extended_sdf.sample(p2).value;
-                if d0 <= infill_iso + 0.05 && d1 <= infill_iso + 0.05 && d2 <= infill_iso + 0.05 {
-                    strictly_contained.extend_from_slice(&[p0, p1, p2]);
-                }
-            }
-            let ords: Vec<f64> = strictly_contained
-                .par_iter()
-                .map(|&p| field.order(p))
-                .collect();
-            (strictly_contained, ords)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        on_progress(0.10);
-        (wall0_pos, wall0_orders, tpms_pos, tpms_orders)
+    let (outer_wall_mesh, outer_wall_mesh_orders): (Vec<DVec3>, Vec<f64>) = if is_height {
+        (Vec::new(), Vec::new())
     } else {
         // Sparse narrow-band marching cubes: target a cell size proportional
         // to bead dimensions (~0.20-0.35mm) to accurately extract the outer perimeter
@@ -701,7 +633,7 @@ pub fn slice_mesh_with_progress(
         on_progress(0.08);
         let orders: Vec<f64> = positions.par_iter().map(|&p| field.order(p)).collect();
         on_progress(0.10);
-        (positions, orders, Vec::new(), Vec::new())
+        (positions, orders)
     };
 
     let effective_order_max = order_max;
@@ -914,14 +846,6 @@ pub fn slice_mesh_with_progress(
 
             let infill_boundary = if wall0_loops.is_empty() {
                 Vec::new()
-            } else if is_dual_iso && !dual_tpms_mesh.is_empty() {
-                let (infill_loops, _) = extract_order_contours_on_mesh_with_debug(
-                    &dual_tpms_mesh,
-                    &dual_tpms_orders,
-                    order_value,
-                    BUILD_DIRECTION,
-                );
-                infill_loops
             } else if is_height {
                 let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
                 let canonical_2d = polygon2d::canonicalize(&loops_2d);
@@ -2626,7 +2550,8 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                         inset
                     }
                 } else {
-                    polygon2d::to_2d(infill, basis1, basis2, origin)
+                    let raw = polygon2d::to_2d(infill, basis1, basis2, origin);
+                    polygon2d::canonicalize(&raw)
                 }
             })
             .collect();
@@ -5428,5 +5353,54 @@ mod tests {
          position (worst error {rotation_search_worst_error}), unlike single-point alignment \
          (worst error {naive_worst_error})"
         );
+    }
+
+    #[test]
+    fn slice_mesh_dual_iso_generates_solid_skin_and_no_sparse_infill_at_bottom_and_top_layers() {
+        let mesh = big_cube_mesh();
+        let config = SlicerConfig {
+            layer_height: 0.5,
+            wall_line_width: 0.4,
+            shell_thickness: 0.8,
+            top_layers: 3,
+            bottom_layers: 3,
+            order_field: order_field::OrderFieldKind::DualIso,
+            ..SlicerConfig::default()
+        };
+        let object = Object::new(ObjectId(0), mesh, crate::ids::ToolId(0));
+        let layers =
+            slice_object(&object, &config).expect("slicing dual_iso big cube must succeed");
+        assert!(layers.len() >= 6);
+
+        // Bottom layers must have non-empty solid fill and empty sparse region.
+        for l in &layers[..3] {
+            assert!(
+                !l.solid_fill_boundary.is_empty(),
+                "bottom layer {} must have solid_fill_boundary",
+                l.index
+            );
+            let sparse = crate::infill::InfillRegion::from_layer(l, &config);
+            assert!(
+                sparse.loops.is_empty(),
+                "bottom layer {} must have no sparse infill",
+                l.index
+            );
+        }
+
+        // Top layers must have non-empty solid fill and empty sparse region.
+        let n = layers.len();
+        for l in &layers[n - 3..] {
+            assert!(
+                !l.solid_fill_boundary.is_empty(),
+                "top layer {} must have solid_fill_boundary",
+                l.index
+            );
+            let sparse = crate::infill::InfillRegion::from_layer(l, &config);
+            assert!(
+                sparse.loops.is_empty(),
+                "top layer {} must have no sparse infill",
+                l.index
+            );
+        }
     }
 }
