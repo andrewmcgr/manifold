@@ -91,6 +91,39 @@ impl ScalarField for TpmsField {
     }
 }
 
+/// A 3D Constructive Solid Geometry (CSG) intersection field that clips a TPMS
+/// implicit surface strictly inside a solid volume signed-distance field:
+/// $$F(\mathbf{x}) = \max(T_{\text{TPMS}}(\mathbf{x}), \; S(\mathbf{x}) - \text{infill\_iso})$$
+#[derive(Debug, Clone, Copy)]
+pub struct ClippedTpmsField<'a, S: ScalarField> {
+    pub tpms: TpmsField,
+    pub sdf: &'a S,
+    pub infill_iso: f64,
+}
+
+impl<'a, S: ScalarField> ClippedTpmsField<'a, S> {
+    #[must_use]
+    pub fn new(tpms: TpmsField, sdf: &'a S, infill_iso: f64) -> Self {
+        Self {
+            tpms,
+            sdf,
+            infill_iso,
+        }
+    }
+}
+
+impl<'a, S: ScalarField> ScalarField for ClippedTpmsField<'a, S> {
+    fn sample(&self, p: DVec3) -> FieldSample {
+        let sdf_val = self.sdf.sample(p).value;
+        let tpms_val = self.tpms.sample(p).value;
+        let csg_val = tpms_val.max(sdf_val - self.infill_iso);
+        FieldSample {
+            value: csg_val,
+            gradient: DVec3::ZERO,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
