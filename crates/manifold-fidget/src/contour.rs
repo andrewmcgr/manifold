@@ -379,7 +379,7 @@ pub fn stitch_loops_with_debug(
     // in `extract_order_contours_on_mesh`) create false degree-3+ vertices that
     // cause loop-tracing to self-intersect or terminate prematurely.
     let mut seen = HashSet::new();
-    let mut segments: Vec<(DVec3, DVec3)> = segments
+    let segments: Vec<(DVec3, DVec3)> = segments
         .into_iter()
         .filter(|&(a, b)| {
             let ka = point_key(a);
@@ -450,9 +450,10 @@ pub fn stitch_loops_with_debug(
                     current_point = other;
                 }
                 None => {
-                    if let Some(pos) = loop_points.iter().position(|&p| {
-                        p.distance(current_point) <= STITCH_REPAIR_TOLERANCE
-                    }) {
+                    if let Some(pos) = loop_points
+                        .iter()
+                        .position(|&p| p.distance(current_point) <= STITCH_REPAIR_TOLERANCE)
+                    {
                         let cycle: Vec<DVec3> = loop_points[pos..].to_vec();
                         if cycle.len() >= MIN_LOOP_POINTS {
                             loops.push(cycle);
