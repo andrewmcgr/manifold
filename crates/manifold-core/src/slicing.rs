@@ -2723,6 +2723,15 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                             regions.push(exposed.clone());
                         }
                     }
+
+                    // Near-tangent skin closure: if layer k is within `top_layers` of the top apex
+                    // or within `bottom_layers` of the bottom floor, its entire inner cavity is solid skin.
+                    if (config.top_layers > 0 && k + config.top_layers >= n)
+                        || (config.bottom_layers > 0 && k < config.bottom_layers)
+                    {
+                        regions.push(boundaries_2d[k].clone());
+                    }
+
                     let exposed_union =
                         polygon2d::filter_min_area(&polygon2d::union(&regions), min_solid_area);
                     let solid = polygon2d::intersection(&exposed_union, &boundaries_2d[k]);
@@ -2772,6 +2781,14 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                             regions.push(exposed.clone());
                         }
                     }
+
+                    // Near-tangent skin closure:
+                    if (config.top_layers > 0 && k < config.top_layers)
+                        || (config.bottom_layers > 0 && k + config.bottom_layers >= n)
+                    {
+                        regions.push(boundaries_2d[k].clone());
+                    }
+
                     let exposed_union =
                         polygon2d::filter_min_area(&polygon2d::union(&regions), min_solid_area);
                     let solid = polygon2d::intersection(&exposed_union, &boundaries_2d[k]);
