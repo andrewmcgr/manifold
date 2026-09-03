@@ -791,7 +791,13 @@ pub fn slice_mesh_with_progress(
                             continue;
                         }
                         if p_wall.wall_index == wall_count {
-                            curved_infill_2d.extend(p_wall.loops_2d);
+                            let check = polygon2d::inward_offset(
+                                &p_wall.loops_2d,
+                                config.min_bead_width() * 0.5,
+                            );
+                            if !check.is_empty() {
+                                curved_infill_2d.extend(p_wall.loops_2d);
+                            }
                             continue;
                         }
                         let max_along = (config.layer_height * 20.0).max(5.0);

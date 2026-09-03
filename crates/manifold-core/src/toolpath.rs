@@ -83,16 +83,27 @@ fn retain_contained_paths(
         {
             continue;
         }
+        let is_infill = path
+            .segments
+            .iter()
+            .any(|segment| segment.kind == MoveKind::Infill);
+        let allowed_point_slack = if is_infill {
+            -0.10
+        } else {
+            CONTAINMENT_POINT_SLACK
+        };
+        let allowed_gross = if is_infill { 0.0 } else { gross_tolerance };
+
         let mut gross_outside_points = 0usize;
         let mut outside_points = 0usize;
         let mut max_distance = f64::NEG_INFINITY;
         for &p in &path.points {
             let d = mesh_sdf.sample(p).value;
             max_distance = max_distance.max(d);
-            if d > gross_tolerance {
+            if d > allowed_gross {
                 gross_outside_points += 1;
             }
-            if d > CONTAINMENT_POINT_SLACK {
+            if d > allowed_point_slack {
                 outside_points += 1;
             }
         }
