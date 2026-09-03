@@ -832,7 +832,10 @@ fn generate_tpms_infill(
     let mut filtered_segments: Vec<([f64; 2], [f64; 2])> = Vec::new();
     for (p0, p1) in segments_2d {
         let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
-        if polygon2d::contains_point(&loops_2d, mid) {
+        if polygon2d::contains_point(&loops_2d, p0)
+            && polygon2d::contains_point(&loops_2d, p1)
+            && polygon2d::contains_point(&loops_2d, mid)
+        {
             filtered_segments.push((p0, p1));
         }
     }

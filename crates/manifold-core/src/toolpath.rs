@@ -1835,17 +1835,16 @@ pub fn plan_with_progress(
                 }
             }
 
-            let min_infill_len = config.nozzle_diameter * 2.0;
+            let min_open_path_len = config.nozzle_diameter * 2.0;
             paths.retain(|p| {
-                let is_infill = p
-                    .segments
-                    .iter()
-                    .any(|s| s.kind == MoveKind::Infill || s.kind == MoveKind::TopSurface);
-                if is_infill && p.points.len() <= 4 {
-                    let total_len: f64 = (0..p.points.len())
-                        .map(|i| p.points[i].distance(p.points[(i + 1) % p.points.len()]))
-                        .sum();
-                    if total_len < min_infill_len {
+                let is_open_extrusion = p.segments.iter().any(|s| {
+                    s.kind == MoveKind::Infill
+                        || s.kind == MoveKind::TopSurface
+                        || s.kind == MoveKind::Overhang
+                });
+                if is_open_extrusion && p.points.len() <= 6 {
+                    let total_len: f64 = p.points.windows(2).map(|w| w[0].distance(w[1])).sum();
+                    if total_len < min_open_path_len {
                         return false;
                     }
                 }
