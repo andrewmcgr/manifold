@@ -2516,11 +2516,12 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                     .filter(|w| w.wall_index == 0)
                     .map(|w| w.points.clone())
                     .collect();
-                if wall0.is_empty() {
+                let raw_2d = if wall0.is_empty() {
                     polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin)
                 } else {
                     polygon2d::to_2d(&wall0, basis1, basis2, origin)
-                }
+                };
+                polygon2d::canonicalize(&raw_2d)
             })
             .collect();
 
@@ -2599,44 +2600,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                     } else {
                         polygon2d::difference(&boundaries_2d[k], next_outer)
                     };
-                    let filtered = polygon2d::filter_min_area(&exp, min_solid_area);
-                    if let Some(sdf) = &layers[positions[k]].mesh_sdf {
-                        let field = &layers[positions[k]].order_field;
-                        let order = layers[positions[k]].order;
-                        let h = config.layer_height.max(0.1);
-                        filtered
-                            .into_iter()
-                            .filter(|loop_| {
-                                let mut c_u = 0.0;
-                                let mut c_v = 0.0;
-                                for &[u, v] in loop_ {
-                                    c_u += u;
-                                    c_v += v;
-                                }
-                                let len = loop_.len().max(1) as f64;
-                                let c_u = c_u / len;
-                                let c_v = c_v / len;
-                                if let Some(p_3d) =
-                                    crate::order_field::reconstruct_point_on_order_field(
-                                        apex + basis1 * c_u + basis2 * c_v,
-                                        axis,
-                                        order,
-                                        50.0,
-                                        field.as_ref(),
-                                    )
-                                {
-                                    let self_val = sdf.sample(p_3d).value;
-                                    let probe = p_3d + DVec3::Z * (config.top_layers as f64 * h);
-                                    let probe_val = sdf.sample(probe).value;
-                                    self_val <= 0.0 && probe_val > 0.0
-                                } else {
-                                    false
-                                }
-                            })
-                            .collect()
-                    } else {
-                        filtered
-                    }
+                    polygon2d::filter_min_area(&exp, min_solid_area)
                 })
                 .collect();
             let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
@@ -2648,44 +2612,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                     } else {
                         polygon2d::difference(&boundaries_2d[k], prev_outer)
                     };
-                    let filtered = polygon2d::filter_min_area(&exp, min_solid_area);
-                    if let Some(sdf) = &layers[positions[k]].mesh_sdf {
-                        let field = &layers[positions[k]].order_field;
-                        let order = layers[positions[k]].order;
-                        let h = config.layer_height.max(0.1);
-                        filtered
-                            .into_iter()
-                            .filter(|loop_| {
-                                let mut c_u = 0.0;
-                                let mut c_v = 0.0;
-                                for &[u, v] in loop_ {
-                                    c_u += u;
-                                    c_v += v;
-                                }
-                                let len = loop_.len().max(1) as f64;
-                                let c_u = c_u / len;
-                                let c_v = c_v / len;
-                                if let Some(p_3d) =
-                                    crate::order_field::reconstruct_point_on_order_field(
-                                        apex + basis1 * c_u + basis2 * c_v,
-                                        axis,
-                                        order,
-                                        50.0,
-                                        field.as_ref(),
-                                    )
-                                {
-                                    let self_val = sdf.sample(p_3d).value;
-                                    let probe = p_3d - DVec3::Z * (config.bottom_layers as f64 * h);
-                                    let probe_val = sdf.sample(probe).value;
-                                    self_val <= 0.0 && probe_val > 0.0
-                                } else {
-                                    false
-                                }
-                            })
-                            .collect()
-                    } else {
-                        filtered
-                    }
+                    polygon2d::filter_min_area(&exp, min_solid_area)
                 })
                 .collect();
 
