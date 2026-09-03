@@ -88,11 +88,15 @@ fn retain_contained_paths(
             .iter()
             .any(|segment| segment.kind == MoveKind::Infill);
         let allowed_point_slack = if is_infill {
-            -0.10
+            0.20
         } else {
             CONTAINMENT_POINT_SLACK
         };
-        let allowed_gross = if is_infill { 0.0 } else { gross_tolerance };
+        let allowed_gross = if is_infill {
+            0.40
+        } else {
+            gross_tolerance
+        };
 
         let mut gross_outside_points = 0usize;
         let mut outside_points = 0usize;
