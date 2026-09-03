@@ -262,7 +262,7 @@ fn point_key(p: DVec3) -> (i64, i64, i64) {
 /// apart -- far tighter than any real, distinct topological gap on typical
 /// mesh scales, so widening this far does not risk bridging a genuine
 /// stitching gap.
-const STITCH_REPAIR_TOLERANCE: f64 = 1.0;
+const STITCH_REPAIR_TOLERANCE: f64 = 2.5;
 
 /// Minimum point count for a stitched chain to be a plausible closed
 /// contour: a real closed polygon needs at least 3 distinct points/segments

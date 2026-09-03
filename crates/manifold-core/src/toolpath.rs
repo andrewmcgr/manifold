@@ -111,7 +111,7 @@ fn retain_contained_paths(
         let outside_fraction = outside_points as f64 / total_pts as f64;
         let gross_outside_fraction = gross_outside_points as f64 / total_pts as f64;
         let contained =
-            gross_outside_fraction <= 0.02 && outside_fraction <= CONTAINMENT_OUTSIDE_FRACTION;
+            gross_outside_fraction <= 0.10 && outside_fraction <= CONTAINMENT_OUTSIDE_FRACTION;
         if !contained {
             debug_paths += 1;
             debug_points += path.points.len();
