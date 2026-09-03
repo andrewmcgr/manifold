@@ -192,6 +192,24 @@ fn lerp_crossing(p0: DVec3, v0: f64, p1: DVec3, v1: f64, iso: f64) -> DVec3 {
     p0.lerp(p1, t)
 }
 
+/// Canonicalizes an edge between two points and interpolates the crossing point.
+/// Both orientations `(p0, v0, p1, v1)` and `(p1, v1, p0, v0)` will produce
+/// bitwise identical output.
+fn canonical_lerp_crossing(p0: DVec3, v0: f64, p1: DVec3, v1: f64, iso: f64) -> DVec3 {
+    let swap = if p0.x != p1.x {
+        p0.x > p1.x
+    } else if p0.y != p1.y {
+        p0.y > p1.y
+    } else {
+        p0.z > p1.z
+    };
+    if swap {
+        lerp_crossing(p1, v1, p0, v0, iso)
+    } else {
+        lerp_crossing(p0, v0, p1, v1, iso)
+    }
+}
+
 /// Returns the edge-pair segments for a marching-squares cell configuration,
 /// given its 4 corner values (needed only to resolve the two ambiguous
 /// saddle cases, 5 and 10, via the average-of-corners heuristic).
@@ -262,110 +280,81 @@ fn point_key(p: DVec3) -> (i64, i64, i64) {
 /// apart -- far tighter than any real, distinct topological gap on typical
 /// mesh scales, so widening this far does not risk bridging a genuine
 /// stitching gap.
-const STITCH_REPAIR_TOLERANCE: f64 = 4.0;
+const STITCH_REPAIR_TOLERANCE: f64 = 0.35;
 
 /// Minimum point count for a stitched chain to be a plausible closed
 /// contour: a real closed polygon needs at least 3 distinct points/segments
 /// to bound any area (a triangle).
 const MIN_LOOP_POINTS: usize = 3;
 
-/// Finds the nearest not-yet-used segment with an endpoint within
-/// [`STITCH_REPAIR_TOLERANCE`] of `point`, used only after the exact-match
-/// lookup in [`stitch_loops`] fails.
-fn find_nearest_unused_endpoint(
+/// Quantization scale used to key segment endpoints for spatial neighbor lookups
+/// (grid cell size 1.0mm, so 27-neighborhood search strictly covers all points within 0.5mm).
+const SPATIAL_BUCKET_SIZE: f64 = 1.0;
+
+fn spatial_point_key(p: DVec3) -> (i64, i64, i64) {
+    let scale = 1.0 / SPATIAL_BUCKET_SIZE;
+    (
+        (p.x * scale).round() as i64,
+        (p.y * scale).round() as i64,
+        (p.z * scale).round() as i64,
+    )
+}
+
+/// Finds the best continuation segment connected to `point` within `max_dist`.
+/// If multiple candidates exist, picks the one that continues `prev_dir` most smoothly
+/// (smallest distance, then highest dot product $(p_{next} - point) \cdot prev\_dir$).
+fn find_best_continuation(
+    by_point: &HashMap<(i64, i64, i64), Vec<usize>>,
     segments: &[(DVec3, DVec3)],
     used: &[bool],
+    visited_in_trail: &HashSet<usize>,
     point: DVec3,
+    prev_dir: DVec3,
+    max_dist: f64,
 ) -> Option<usize> {
-    let mut best: Option<(usize, f64)> = None;
-    for (i, &(a, b)) in segments.iter().enumerate() {
-        if used[i] {
-            continue;
-        }
-        let d = a.distance(point).min(b.distance(point));
-        if d <= STITCH_REPAIR_TOLERANCE && best.is_none_or(|(_, best_d)| d < best_d) {
-            best = Some((i, d));
+    let (kx, ky, kz) = spatial_point_key(point);
+    let mut best: Option<(usize, f64, f64)> = None;
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if let Some(candidates) = by_point.get(&(kx + dx, ky + dy, kz + dz)) {
+                    for &idx in candidates {
+                        if used.get(idx).copied().unwrap_or(false)
+                            || visited_in_trail.contains(&idx)
+                        {
+                            continue;
+                        }
+                        let (a, b) = segments[idx];
+                        let (d, far) = if a.distance(point) <= b.distance(point) {
+                            (a.distance(point), b)
+                        } else {
+                            (b.distance(point), a)
+                        };
+                        if d <= max_dist {
+                            let dir = (far - point).normalize_or_zero();
+                            let alignment = if prev_dir != DVec3::ZERO && dir != DVec3::ZERO {
+                                prev_dir.dot(dir)
+                            } else {
+                                1.0
+                            };
+                            let score = (d, -alignment);
+                            if best.is_none_or(|(_, best_d, best_neg_align)| {
+                                score < (best_d, best_neg_align)
+                            }) {
+                                best = Some((idx, d, -alignment));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
-    best.map(|(i, _)| i)
+    best.map(|(idx, _, _)| idx)
 }
 
 /// Stitches unordered line segments (from [`extract_contours`]'s
 /// marching-squares pass) into closed polylines.
-///
-/// Segments are treated as undirected: a marching-squares case's segment
-/// orientation is not guaranteed to be consistent between adjacent cells
-/// (e.g. one cell's edge walk can produce a segment in the opposite
-/// direction from its neighbor's matching segment), so stitching matches
-/// on *either* endpoint of the next candidate segment, not just its start.
-///
-/// If the exact-match stitch cannot find a partner for the current chain
-/// endpoint, a widened-tolerance repair pass (see
-/// [`STITCH_REPAIR_TOLERANCE`]) is tried before giving up. Chains that
-/// still cannot be closed -- or that close with too few points to bound
-/// any area (see [`MIN_LOOP_POINTS`]) -- are dropped rather than emitted
-/// as printable geometry: a degenerate 1-3 point "loop" reaching
-/// `toolpath::plan` as a `WallLoop` produces a nonsensical G-code path,
-/// which is worse than an omission that is at least visible via the
-/// `tracing::warn!` below.
 fn stitch_loops(segments: Vec<(DVec3, DVec3)>) -> Vec<Vec<DVec3>> {
-    // Deduplicate undirected segments and drop degenerate zero-length segments:
-    // duplicate edges (e.g. from adjacent triangles sharing an On-On plateau edge
-    // in `extract_order_contours_on_mesh`) create false degree-3+ vertices that
-    // cause loop-tracing to self-intersect or terminate prematurely.
-    let mut seen = HashSet::new();
-    let mut segments: Vec<(DVec3, DVec3)> = segments
-        .into_iter()
-        .filter(|&(a, b)| {
-            let ka = point_key(a);
-            let kb = point_key(b);
-            if ka == kb {
-                return false;
-            }
-            let seg_key = if ka <= kb { (ka, kb) } else { (kb, ka) };
-            seen.insert(seg_key)
-        })
-        .collect();
-
-    // Prune dangling degree-1 endpoints (open-ended hair/spurs with no exact or
-    // repair-tolerance partner): any segment with an unpartnered endpoint cannot belong
-    // to a closed cycle, and walking into a dangling spur causes loop-stitching to fail
-    // to close and falsely mark entire valid cycles as dead starts.
-    loop {
-        let mut by_point: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
-        for (i, &(a, b)) in segments.iter().enumerate() {
-            by_point.entry(point_key(a)).or_default().push(i);
-            by_point.entry(point_key(b)).or_default().push(i);
-        }
-        let before_len = segments.len();
-        let has_partner = |idx: usize, pt: DVec3, segs: &[(DVec3, DVec3)]| -> bool {
-            if let Some(cand) = by_point.get(&point_key(pt)) {
-                if cand.iter().any(|&i| i != idx) {
-                    return true;
-                }
-            }
-            segs.iter().enumerate().any(|(i, &(a, b))| {
-                i != idx
-                    && (a.distance(pt) <= STITCH_REPAIR_TOLERANCE
-                        || b.distance(pt) <= STITCH_REPAIR_TOLERANCE)
-            })
-        };
-        let keep_mask: Vec<bool> = segments
-            .iter()
-            .enumerate()
-            .map(|(i, &(a, b))| has_partner(i, a, &segments) && has_partner(i, b, &segments))
-            .collect();
-        let mut idx = 0;
-        segments.retain(|_| {
-            let keep = keep_mask[idx];
-            idx += 1;
-            keep
-        });
-        if segments.len() == before_len {
-            break;
-        }
-    }
-
     stitch_loops_with_debug(segments).0
 }
 
@@ -392,93 +381,121 @@ pub fn stitch_loops_with_debug(
         })
         .collect();
 
-    // Map from a (quantized) endpoint key to the indices of segments
-    // touching that point (a segment appears under both of its endpoints'
-    // keys, unless they collide, e.g. a degenerate zero-length segment).
+    if segments.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Map from a spatial endpoint key to the indices of segments touching that bucket.
     let mut by_point: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
     for (i, &(a, b)) in segments.iter().enumerate() {
-        by_point.entry(point_key(a)).or_default().push(i);
-        by_point.entry(point_key(b)).or_default().push(i);
+        by_point.entry(spatial_point_key(a)).or_default().push(i);
+        by_point.entry(spatial_point_key(b)).or_default().push(i);
     }
+
     let mut used = vec![false; segments.len()];
-    let mut dead_start = vec![false; segments.len()];
-
     let mut loops = Vec::new();
-    let mut debug_unclosed = Vec::new();
-    let mut dropped_fragments = 0usize;
-    let mut dropped_points = 0usize;
 
+    // Pass 1: Extract all closed cycles
     for start_idx in 0..segments.len() {
-        if used[start_idx] || dead_start[start_idx] {
+        if used[start_idx] {
             continue;
         }
         let mut trail = vec![start_idx];
-        used[start_idx] = true;
+        let mut visited_in_trail = HashSet::new();
+        visited_in_trail.insert(start_idx);
+
         let (first_point, mut current_point) = segments[start_idx];
         let mut loop_points = vec![first_point];
-        let mut closed = false;
+        let mut prev_dir = (current_point - first_point).normalize_or_zero();
 
         loop {
-            if let Some(pos) = loop_points
-                .iter()
-                .position(|&p| point_key(p) == point_key(current_point))
-            {
-                let cycle: Vec<DVec3> = loop_points[pos..].to_vec();
-                if cycle.len() >= MIN_LOOP_POINTS {
-                    loops.push(cycle);
-                    closed = true;
+            // Check if current_point closes back on any prior point in the trail
+            if loop_points.len() >= 2 {
+                let close_match = loop_points[..loop_points.len() - 1]
+                    .iter()
+                    .enumerate()
+                    .find(|(_, &p)| {
+                        p.distance(current_point) <= 1e-4
+                            || point_key(p) == point_key(current_point)
+                    })
+                    .map(|(pos, _)| pos);
+
+                if let Some(pos) = close_match {
+                    let cycle: Vec<DVec3> = loop_points[pos..].to_vec();
+                    if cycle.len() >= MIN_LOOP_POINTS {
+                        loops.push(cycle);
+                        let cycle_start = pos.min(trail.len().saturating_sub(1));
+                        for &idx in &trail[cycle_start..] {
+                            used[idx] = true;
+                        }
+                        break;
+                    }
                 }
-                break;
             }
 
-            let next = by_point
-                .get(&point_key(current_point))
-                .and_then(|candidates| candidates.iter().copied().find(|&i| !used[i]))
-                .or_else(|| find_nearest_unused_endpoint(&segments, &used, current_point));
+            // Look for next segment using 27-bucket neighborhood first, then repair tolerance
+            let next = find_best_continuation(
+                &by_point,
+                &segments,
+                &used,
+                &visited_in_trail,
+                current_point,
+                prev_dir,
+                1e-4,
+            )
+            .or_else(|| {
+                find_best_continuation(
+                    &by_point,
+                    &segments,
+                    &used,
+                    &visited_in_trail,
+                    current_point,
+                    prev_dir,
+                    STITCH_REPAIR_TOLERANCE,
+                )
+            });
 
             match next {
                 Some(next_idx) => {
-                    used[next_idx] = true;
+                    visited_in_trail.insert(next_idx);
                     trail.push(next_idx);
                     let (a, b) = segments[next_idx];
-                    let other = if a.distance(current_point) <= b.distance(current_point) {
-                        b
+                    let (near, far) = if a.distance(current_point) <= b.distance(current_point) {
+                        (a, b)
                     } else {
-                        a
+                        (b, a)
                     };
+                    prev_dir = (far - near).normalize_or_zero();
                     loop_points.push(current_point);
-                    current_point = other;
+                    current_point = far;
                 }
                 None => {
-                    if let Some(pos) = loop_points
-                        .iter()
-                        .position(|&p| p.distance(current_point) <= STITCH_REPAIR_TOLERANCE)
-                    {
-                        let cycle: Vec<DVec3> = loop_points[pos..].to_vec();
-                        if cycle.len() >= MIN_LOOP_POINTS {
-                            loops.push(cycle);
-                            closed = true;
+                    // Reached end of connected chain: check if current_point can close back within repair tolerance
+                    if loop_points.len() >= MIN_LOOP_POINTS {
+                        if let Some(pos) = loop_points[..loop_points.len() - 1]
+                            .iter()
+                            .enumerate()
+                            .find(|(_, &p)| p.distance(current_point) <= STITCH_REPAIR_TOLERANCE)
+                            .map(|(pos, _)| pos)
+                        {
+                            let cycle: Vec<DVec3> = loop_points[pos..].to_vec();
+                            if cycle.len() >= MIN_LOOP_POINTS {
+                                loops.push(cycle);
+                                let cycle_start = pos.min(trail.len().saturating_sub(1));
+                                for &idx in &trail[cycle_start..] {
+                                    used[idx] = true;
+                                }
+                            }
                         }
-                    } else {
-                        loop_points.push(current_point);
                     }
                     break;
                 }
             }
         }
-
-        if !closed {
-            for &idx in &trail {
-                used[idx] = false;
-            }
-            dead_start[start_idx] = true;
-            dropped_fragments += 1;
-            dropped_points += loop_points.len();
-        }
     }
 
-    // Second pass: any remaining unused segments that could not form closed loops
-    // are collected once as unclosed debug chains (each segment visited exactly once).
+    // Pass 2: Collect any remaining unused segments as unclosed debug chains
+    let mut debug_unclosed = Vec::new();
     for start_idx in 0..segments.len() {
         if used[start_idx] {
             continue;
@@ -486,21 +503,45 @@ pub fn stitch_loops_with_debug(
         used[start_idx] = true;
         let (first_point, mut current_point) = segments[start_idx];
         let mut chain = vec![first_point];
+        let mut prev_dir = (current_point - first_point).normalize_or_zero();
+        let mut visited = HashSet::new();
+        visited.insert(start_idx);
+
         loop {
-            let next = by_point
-                .get(&point_key(current_point))
-                .and_then(|candidates| candidates.iter().copied().find(|&i| !used[i]));
+            let next = find_best_continuation(
+                &by_point,
+                &segments,
+                &used,
+                &visited,
+                current_point,
+                prev_dir,
+                1e-4,
+            )
+            .or_else(|| {
+                find_best_continuation(
+                    &by_point,
+                    &segments,
+                    &used,
+                    &visited,
+                    current_point,
+                    prev_dir,
+                    STITCH_REPAIR_TOLERANCE,
+                )
+            });
+
             match next {
                 Some(next_idx) => {
                     used[next_idx] = true;
+                    visited.insert(next_idx);
                     let (a, b) = segments[next_idx];
-                    let other = if a.distance(current_point) <= b.distance(current_point) {
-                        b
+                    let (near, far) = if a.distance(current_point) <= b.distance(current_point) {
+                        (a, b)
                     } else {
-                        a
+                        (b, a)
                     };
+                    prev_dir = (far - near).normalize_or_zero();
                     chain.push(current_point);
-                    current_point = other;
+                    current_point = far;
                 }
                 None => {
                     chain.push(current_point);
@@ -511,15 +552,6 @@ pub fn stitch_loops_with_debug(
         if chain.len() >= 2 {
             debug_unclosed.push(chain);
         }
-    }
-
-    if dropped_fragments > 0 {
-        tracing::warn!(
-            dropped_fragments,
-            dropped_points,
-            "stitch_loops: preserved {dropped_fragments} open/degenerate contour \
-             fragment(s) ({dropped_points} points total) as debug paths",
-        );
     }
 
     (loops, debug_unclosed)
@@ -924,7 +956,7 @@ pub fn extract_order_contours_on_mesh_with_debug(
                 let v1 = v[i1];
                 let edge_len = p0.distance(p1);
                 if edge_len > 1e-6 {
-                    crossing_points.push(lerp_crossing(p0, v0, p1, v1, target_order));
+                    crossing_points.push(canonical_lerp_crossing(p0, v0, p1, v1, target_order));
                 }
             }
         }

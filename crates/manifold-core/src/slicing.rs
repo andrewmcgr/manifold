@@ -498,19 +498,43 @@ pub fn slice_mesh_with_progress(
         ))
     };
 
-    // For 3D narrow-band marching cubes (DualIso / Eikonal), construct a watertight
-    // SDF where the bed-contact floor (z <= min.z + 0.01) is extended downward so that
-    // inner wall passes and infill boundaries extend cleanly down through layer 0 (z = 0.20mm)
+    // For 3D narrow-band marching cubes (DualIso / Eikonal), construct an SDF
+    // where downward-facing horizontal triangles resting on the build plate (z <= min.z + 0.02)
+    // are excluded from distance evaluation (see `MeshSdf::new_with_distance_faces`).
+    // This allows wall passes and infill boundaries to extend cleanly down to the bed (layer 0)
     // without being pushed upward by the bottom floor, while preserving all top ceilings,
-    // tabs, and summit crowns completely closed up to true max order.
-    let floor_extended_sdf = {
-        let mut ext_vertices = mesh.vertices.clone();
-        for v in &mut ext_vertices {
-            if v.z <= min.z + 0.02 {
-                v.z = min.z - 5.0;
+    // roofs, and side walls 100% closed and watertight, and avoiding 3D vertex-stretching distortions.
+    let non_bed_floor_faces: Vec<[usize; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .filter_map(|chunk| {
+            let [i0, i1, i2] = [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
+            let v0 = mesh.vertices[i0];
+            let v1 = mesh.vertices[i1];
+            let v2 = mesh.vertices[i2];
+            let normal = (v1 - v0).cross(v2 - v0);
+            let normal_len_sq = normal.length_squared();
+            if normal_len_sq > 1e-12
+                && normal.z < 0.0
+                && (v0.z <= min.z + 0.02 || v1.z <= min.z + 0.02 || v2.z <= min.z + 0.02)
+            {
+                let nz_sq = normal.z * normal.z;
+                if nz_sq >= 0.998 * normal_len_sq {
+                    return None;
+                }
             }
-        }
-        Arc::new(MeshSdf::new(ext_vertices, faces.clone()))
+            Some([i0, i1, i2])
+        })
+        .collect();
+
+    let bed_open_sdf = if non_bed_floor_faces.len() == faces.len() {
+        Arc::clone(&sdf)
+    } else {
+        Arc::new(MeshSdf::new_with_distance_faces(
+            mesh.vertices.clone(),
+            faces.clone(),
+            non_bed_floor_faces,
+        ))
     };
 
     // Resolve the configured order field once per slice (defaults to a
@@ -624,7 +648,7 @@ pub fn slice_mesh_with_progress(
         let pad = DVec3::splat(cell_size * 2.0);
         on_progress(0.05);
         let positions = extract_sparse_isosurface_positions::<MeshSdf>(
-            &*floor_extended_sdf,
+            &*bed_open_sdf,
             min - pad,
             max + pad,
             cell_size,
