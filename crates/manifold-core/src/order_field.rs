@@ -584,6 +584,103 @@ pub fn reconstruct_on_order_field<F: OrderField + ?Sized>(
         .collect()
 }
 
+/// Solves `field.order(seed + axis * along) == target` for `along`, centered around
+/// `along = 0.0` (the seed point itself) within `[-bracket, +bracket]`.
+fn solve_along_near<F: OrderField + ?Sized>(
+    field: &F,
+    seed: DVec3,
+    axis: DVec3,
+    target: f64,
+    bracket: f64,
+) -> Option<SolveAlong> {
+    const TOLERANCE: f64 = 1e-9;
+    const MAX_BISECT_ITERS: u32 = 64;
+
+    let bracket = bracket.abs().max(f64::EPSILON);
+    let residual = |along: f64| field.order(seed + axis * along) - target;
+
+    let f_zero = residual(0.0);
+    if f_zero.abs() <= TOLERANCE {
+        return Some(SolveAlong::Exact(0.0));
+    }
+
+    let min_bound = -bracket;
+    let max_bound = bracket;
+
+    let mut best_along = 0.0_f64;
+    let mut best_residual = if f_zero.is_finite() {
+        f_zero.abs()
+    } else {
+        f64::INFINITY
+    };
+    let mut found_any_finite = f_zero.is_finite();
+
+    let mut consider = |along: f64, r: f64| {
+        if r.is_finite() {
+            found_any_finite = true;
+            if r.abs() < best_residual {
+                best_residual = r.abs();
+                best_along = along;
+            }
+        }
+    };
+
+    let steps = 16;
+    let mut lo = 0.0;
+    let mut hi = 0.0;
+    let mut f_lo = f_zero;
+    let mut f_hi = f_zero;
+    let mut bracketed = false;
+
+    for i in 0..=steps {
+        let t = min_bound + (max_bound - min_bound) * (i as f64 / steps as f64);
+        let r = residual(t);
+        consider(t, r);
+        if r.is_finite() {
+            if !bracketed {
+                lo = t;
+                f_lo = r;
+                bracketed = true;
+            } else if (f_lo > 0.0 && r <= 0.0) || (f_lo < 0.0 && r >= 0.0) {
+                hi = t;
+                f_hi = r;
+                break;
+            } else {
+                lo = t;
+                f_lo = r;
+            }
+        }
+    }
+
+    if bracketed
+        && f_lo.is_finite()
+        && f_hi.is_finite()
+        && ((f_lo <= 0.0 && f_hi >= 0.0) || (f_lo >= 0.0 && f_hi <= 0.0))
+    {
+        for _ in 0..MAX_BISECT_ITERS {
+            let mid = (lo + hi) * 0.5;
+            let f_mid = residual(mid);
+            consider(mid, f_mid);
+            if f_mid.abs() <= TOLERANCE || (hi - lo).abs() <= TOLERANCE {
+                return Some(SolveAlong::Exact(mid));
+            }
+            if (f_lo <= 0.0 && f_mid <= 0.0) || (f_lo >= 0.0 && f_mid >= 0.0) {
+                lo = mid;
+                f_lo = f_mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return Some(SolveAlong::Exact((lo + hi) * 0.5));
+    }
+
+    if found_any_finite && best_residual.is_finite() {
+        Some(SolveAlong::ClosestObserved(best_along))
+    } else {
+        None
+    }
+}
+
 /// Like [`reconstruct_on_order_field`], but seeds every point's height
 /// from the nearest (in `(u, v)`) point of `references` -- 3D loops already
 /// known to lie on (or very near) the layer's `target_order` isosurface,
@@ -647,7 +744,7 @@ pub fn reconstruct_on_order_field_near<F: OrderField + ?Sized>(
                         .unwrap_or(0.0);
                     let planar = apex + basis1 * u + basis2 * v + axis * nearest_along;
                     let bracket = 2.0;
-                    match solve_along(field, planar, axis, target_order, bracket) {
+                    match solve_along_near(field, planar, axis, target_order, bracket) {
                         Some(SolveAlong::Exact(t)) | Some(SolveAlong::ClosestObserved(t)) => {
                             planar + axis * t
                         }

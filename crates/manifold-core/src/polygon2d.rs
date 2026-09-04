@@ -231,8 +231,16 @@ pub fn canonicalize(loops2d: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
         .cloned()
         .collect();
 
-    if loops2d.len() <= 1 {
-        return loops2d;
+    if loops2d.is_empty() {
+        return Vec::new();
+    }
+    if loops2d.len() == 1 {
+        let is_ccw = signed_area(&loops2d[0]) > 0.0;
+        if is_ccw {
+            return loops2d;
+        } else {
+            return vec![loops2d[0].iter().copied().rev().collect()];
+        }
     }
 
     let depths: Vec<usize> = loops2d

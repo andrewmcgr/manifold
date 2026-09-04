@@ -802,6 +802,13 @@ pub fn slice_mesh_with_progress(
                     islands.push(island);
                 }
 
+                for (h_idx, hole) in holes.into_iter().enumerate() {
+                    if !assigned_holes[h_idx] && !hole.is_empty() {
+                        let reversed: Vec<[f64; 2]> = hole.into_iter().rev().collect();
+                        islands.push(vec![reversed]);
+                    }
+                }
+
                 for island_2d in &islands {
                     let partitioned = polygon2d::partition_walls_adaptive(
                         island_2d,
