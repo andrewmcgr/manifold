@@ -1016,10 +1016,19 @@ impl SlicerConfig {
     }
 
     /// Returns the resolved fluid dynamics engine, if configured.
+    ///
+    /// `live_nozzle_temp_c` overrides the heater block temperature with the
+    /// active tool's actual configured nozzle temperature (multi-tool setups
+    /// can have per-tool temps that differ from the default); pass `None` to
+    /// fall back to `default_nozzle_temperature()`.
     #[must_use]
-    pub fn fluid_dynamics_engine(&self) -> Option<fluid_dynamics::FluidDynamicsEngine> {
+    pub fn fluid_dynamics_engine(
+        &self,
+        live_nozzle_temp_c: Option<f64>,
+    ) -> Option<fluid_dynamics::FluidDynamicsEngine> {
         self.fluid_dynamics.map(|mut cfg| {
-            cfg.heater_block_temp_c = self.default_nozzle_temperature();
+            cfg.heater_block_temp_c =
+                live_nozzle_temp_c.unwrap_or_else(|| self.default_nozzle_temperature());
             fluid_dynamics::FluidDynamicsEngine::new(cfg)
         })
     }

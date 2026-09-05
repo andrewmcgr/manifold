@@ -304,7 +304,12 @@ pub fn emit_with_machine(
     let motion_model = config.resolved_motion_model(machine);
     let speed_deadband = config.speed_deadband_percent() / 100.0;
     let accel_deadband = config.acceleration_deadband_percent() / 100.0;
-    let fluid_engine = config.fluid_dynamics_engine();
+    let mut fluid_engine = config.fluid_dynamics_engine(
+        paths
+            .first()
+            .and_then(|p| machine.and_then(|m| m.tools.iter().find(|t| t.id == p.tool)))
+            .map(crate::tool::Tool::nozzle_temperature),
+    );
     let filament_area = std::f64::consts::PI * (config.filament_diameter / 2.0).powi(2);
 
     let min_order = paths
@@ -336,6 +341,10 @@ pub fn emit_with_machine(
             out.push_str("G92 E0\n");
             current_tool = Some(path.tool);
             retracted = true;
+            let tool_temp = machine
+                .and_then(|m| m.tools.iter().find(|t| t.id == path.tool))
+                .map(crate::tool::Tool::nozzle_temperature);
+            fluid_engine = config.fluid_dynamics_engine(tool_temp);
         }
 
         let profiles = crate::kinematics::plan_path_velocities(

@@ -1887,6 +1887,10 @@ pub fn plan_with_progress(
                 .iter()
                 .find(|tool| tool.id == object.tool)
                 .map_or(1.0, |tool| tool.extrusion_multiplier);
+            let active_tool_temp = tools
+                .iter()
+                .find(|tool| tool.id == object.tool)
+                .map(crate::tool::Tool::nozzle_temperature);
             for path in &mut paths {
                 let point_count = path.points.len();
                 if point_count == 0 {
@@ -2045,7 +2049,7 @@ pub fn plan_with_progress(
                         }
                     };
 
-                    let fluid_engine = config.fluid_dynamics_engine();
+                    let fluid_engine = config.fluid_dynamics_engine(active_tool_temp);
                     let motion_model = config.resolved_motion_model(machine);
                     let nominal_speed = if is_overhang {
                         config.wave_overhang_speed()
@@ -2092,7 +2096,7 @@ pub fn plan_with_progress(
                 } else {
                     config.layer_height
                 };
-                let fluid_engine = config.fluid_dynamics_engine();
+                let fluid_engine = config.fluid_dynamics_engine(active_tool_temp);
                 for path in &mut paths {
                     crate::kinematics::apply_scarf_joint(
                         &mut path.points,
