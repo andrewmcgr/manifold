@@ -172,9 +172,43 @@ impl MeshSdf {
             })
             .collect();
 
-        let vertex_pseudonormals =
-            Self::compute_vertex_pseudonormals(&vertices, &distance_faces, &face_normals);
-        let edge_pseudonormals = Self::compute_edge_pseudonormals(&distance_faces, &face_normals);
+        // Vertex/edge pseudonormals are deliberately computed from the full
+        // `watertight_faces` set, not `distance_faces` (see below), even
+        // though `face_normals`/the BVH/`face_vertex_indices` above must stay
+        // built from `distance_faces` for distance-query consistency.
+        // `sign_at`'s `feature_normal` lookup indexes `vertex_pseudonormals`
+        // by global vertex id and `edge_pseudonormals` by vertex-id pairs
+        // (not by position in either face list), so this is a safe swap that
+        // doesn't break that indexing. It matters because faces are excluded
+        // from `distance_faces` precisely at boundaries (e.g. bed-contact
+        // floor triangles) where the nearest *included* triangle can be far
+        // from a query point near that boundary; if the vertex/edge normals
+        // used for its sign were also only averaged over the reduced face
+        // set, they'd be biased away from the true local surface orientation
+        // right at that boundary, compounding the coverage-hole risk in
+        // callers (like sparse marching cubes) that assume this field is
+        // close to a true signed distance function everywhere.
+        let watertight_face_normals: Vec<DVec3> = watertight_faces
+            .iter()
+            .map(|f| {
+                let a = vertices[f[0]];
+                let b = vertices[f[1]];
+                let c = vertices[f[2]];
+                let n = (b - a).cross(c - a);
+                if n.length_squared() > DEGENERATE_EPSILON {
+                    n.normalize()
+                } else {
+                    DVec3::ZERO
+                }
+            })
+            .collect();
+        let vertex_pseudonormals = Self::compute_vertex_pseudonormals(
+            &vertices,
+            &watertight_faces,
+            &watertight_face_normals,
+        );
+        let edge_pseudonormals =
+            Self::compute_edge_pseudonormals(&watertight_faces, &watertight_face_normals);
 
         let bvh = TriangleBvh::build(triangles);
 
@@ -423,6 +457,32 @@ impl MeshSdf {
         }
     }
 
+    /// Determines the sign (±1) for a query point `p` whose nearest
+    /// distance-face is `face_idx` with closest surface point `closest`.
+    ///
+    /// For [`SignMethod::Pseudonormal`], a single triangle's own angle test
+    /// (`cos_angle` vs. its feature normal) can look confidently
+    /// unambiguous in isolation yet still disagree with the true
+    /// inside/outside state at a **reflex corner formed by large
+    /// near-coplanar sliver faces** (e.g. a knife-edge notch/slot tip):
+    /// the BVH's nearest-face argmin can flip discontinuously between two
+    /// triangles whose own flat normals point in very different
+    /// directions as `p` crosses the boundary between their Voronoi
+    /// regions, even though neither triangle's *own* angle test fires the
+    /// pre-existing near-perpendicular ambiguity check. Two triangles that
+    /// individually look confident can still be a globally inconsistent
+    /// pair right at that seam.
+    ///
+    /// To catch this, every pseudonormal classification (confident or not)
+    /// is cross-checked against [`MeshSdf::fast_parity_sign`] — a
+    /// topology-aware, BVH-accelerated ray-parity vote that doesn't suffer
+    /// from single-triangle nearest-argmin discontinuities. On agreement,
+    /// the (already confidently classified) pseudonormal sign is kept; on
+    /// disagreement, the parity vote wins, since it reflects the mesh's
+    /// actual enclosed topology rather than one triangle's local plane.
+    /// This trades a constant per-query ray-cast cost (already used
+    /// elsewhere as the ambiguous-angle fallback) for eliminating sign
+    /// discontinuities that a purely local angle test cannot detect.
     fn sign_at(&self, face_idx: usize, closest: DVec3, p: DVec3) -> f64 {
         match self.sign_method {
             SignMethod::Pseudonormal => {
@@ -434,15 +494,29 @@ impl MeshSdf {
                     return 1.0;
                 }
 
-                if face_idx < self.face_vertex_indices.len() {
+                let pseudonormal_sign = if face_idx < self.face_vertex_indices.len() {
                     let fnorm = self.feature_normal(face_idx, closest);
                     let cos_angle = diff.dot(fnorm) / dist;
                     if cos_angle.abs() >= 0.05 {
-                        return if cos_angle > 0.0 { 1.0 } else { -1.0 };
+                        Some(if cos_angle > 0.0 { 1.0 } else { -1.0 })
+                    } else {
+                        None
                     }
-                }
+                } else {
+                    None
+                };
 
-                self.fast_parity_sign(p)
+                match pseudonormal_sign {
+                    Some(sign) => {
+                        let parity_sign = self.fast_parity_sign(p);
+                        if parity_sign == sign {
+                            sign
+                        } else {
+                            parity_sign
+                        }
+                    }
+                    None => self.fast_parity_sign(p),
+                }
             }
             SignMethod::WindingNumber => self.winding_number_sign(p),
         }

@@ -23,6 +23,7 @@ tracing-subscriber.workspace = true
 # verify_wall_gap_stitching) that check slicing output directly against
 # the mesh SDF; the `manifold` binary itself never depends on it.
 manifold-fidget.workspace = true
+serde.workspace = true
 # Used only by scratch diagnostic examples (e.g.
 # diagnose_missing_overhang) that load a real saved machine+config
 # profile.json (the same shape manifold-gui's Profile serializes); the

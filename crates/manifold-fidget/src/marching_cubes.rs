@@ -308,12 +308,26 @@ pub fn extract_isosurface<F: ScalarField + Sync>(
 /// leaf blocks within the narrow band of the surface ($O(N^2)$ surface area). This enables
 /// sub-0.1mm cell resolution across large meshes without memory exhaustion or thin-feature
 /// voxel aliasing voids.
+///
+/// `extra_margin` widens the super-block/leaf-block culling bound beyond the plain
+/// Lipschitz-1 assumption (`|sample(center) - iso| <= radius + cell_diag`). Pass `0.0`
+/// for a field known to be a true 1-Lipschitz signed distance function everywhere. Pass a
+/// positive value for fields that only satisfy that bound *away* from certain regions —
+/// e.g. an SDF built from a reduced subset of a mesh's faces (such as one that excludes
+/// bed-contact floor triangles so wall passes can reach the bed cleanly): near the
+/// boundary between an excluded face and an included one, the "nearest included face"
+/// (and its pseudonormal-derived sign) can change discontinuously as position moves
+/// smoothly, producing a real jump in `sample(p).value` larger than physical distance
+/// moved. Without a margin covering that worst-case jump, blocks that do contain a true
+/// isosurface crossing can be wrongly culled as "provably empty", leaving coverage holes
+/// in the extracted mesh near those exclusion boundaries.
 pub fn extract_sparse_isosurface_positions<F: ScalarField + Sync>(
     field: &F,
     min: DVec3,
     max: DVec3,
     cell_size: f64,
     iso: f64,
+    extra_margin: f64,
 ) -> Vec<DVec3> {
     if cell_size <= 0.0 || min.x >= max.x || min.y >= max.y || min.z >= max.z {
         return Vec::new();
@@ -364,7 +378,7 @@ pub fn extract_sparse_isosurface_positions<F: ScalarField + Sync>(
             let sb_radius = (sb_max - sb_min).length() * 0.5;
 
             // Bounding test: Lipschitz / distance-field bound with margin
-            if (field.sample(sb_center).value - iso).abs() > sb_radius + cell_diag {
+            if (field.sample(sb_center).value - iso).abs() > sb_radius + cell_diag + extra_margin {
                 return Vec::new();
             }
 
@@ -394,7 +408,9 @@ pub fn extract_sparse_isosurface_positions<F: ScalarField + Sync>(
                         let b_center = (b_min + b_max) * 0.5;
                         let b_radius = (b_max - b_min).length() * 0.5;
 
-                        if (field.sample(b_center).value - iso).abs() <= b_radius + cell_diag {
+                        if (field.sample(b_center).value - iso).abs()
+                            <= b_radius + cell_diag + extra_margin
+                        {
                             local_blocks.push([bx, by, bz]);
                         }
                     }
@@ -809,6 +825,7 @@ mod tests {
             DVec3::splat(-2.0),
             DVec3::splat(2.0),
             0.1,
+            0.0,
             0.0,
         );
         assert!(!positions.is_empty());

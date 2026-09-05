@@ -647,16 +647,28 @@ pub fn slice_mesh_with_progress(
         let iso = -config.wall_offset;
         let pad = DVec3::splat(cell_size * 2.0);
         on_progress(0.05);
+        // `bed_open_sdf` excludes bed-contact floor triangles from its distance/
+        // pseudonormal computation (see its construction above), so it is not a
+        // true 1-Lipschitz signed distance function near the boundary between an
+        // excluded floor triangle and an included wall triangle: the "nearest
+        // included face" (and its sign) can jump discontinuously there. Widen the
+        // block-culling margin by `config.wall_offset` (the same scale as the
+        // excluded region) so blocks near those boundaries aren't wrongly culled
+        // as "provably empty", closing coverage holes on thin bed-adjacent
+        // features (e.g. vent slots) without reverting to a dense full-grid pass.
+        let extra_margin = config.wall_offset.abs();
         let positions = extract_sparse_isosurface_positions::<MeshSdf>(
             &*bed_open_sdf,
             min - pad,
             max + pad,
             cell_size,
             iso,
+            extra_margin,
         );
         on_progress(0.08);
         let orders: Vec<f64> = positions.par_iter().map(|&p| field.order(p)).collect();
         on_progress(0.10);
+
         (positions, orders)
     };
 

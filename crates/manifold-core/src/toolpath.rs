@@ -28,8 +28,12 @@ const CONTAINMENT_POINT_SLACK: f64 = 0.35;
 /// geometry rather than a real path with local reprojection excursions. A
 /// genuine wall loop has thousands of points with at most a handful of
 /// outliers; the spurious fragment loops contour extraction shatters off
-/// near topology changes are small and mostly-outside.
-const CONTAINMENT_OUTSIDE_FRACTION: f64 = 0.85;
+/// near topology changes are small and mostly-outside. Kept low (rather
+/// than a majority-vote threshold) because a fragment loop anchored at
+/// both ends to real surface can otherwise have most of its interior
+/// points floating in open air near an arch/topology intersection while
+/// still averaging under a lenient fraction.
+const CONTAINMENT_OUTSIDE_FRACTION: f64 = 0.25;
 
 /// Drops any non-[`MoveKind::Travel`] path in `paths` that isn't contained
 /// in the real solid, using `mesh_sdf` (built directly from the mesh --
@@ -1864,7 +1868,7 @@ pub fn plan_with_progress(
                 paths,
                 layer.mesh_sdf.as_ref(),
                 layer.order,
-                config.nozzle_diameter * 1.5,
+                config.nozzle_diameter,
             );
             let paths = compensate_flat_nozzle(paths, layer, config, tools);
             let paths = simplify_paths(paths, config);
