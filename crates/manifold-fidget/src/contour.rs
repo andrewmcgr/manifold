@@ -300,6 +300,71 @@ fn spatial_point_key(p: DVec3) -> (i64, i64, i64) {
     )
 }
 
+/// Finds the continuation segment that shares an *exact* quantized endpoint
+/// (`point_key`) with `point`, preferring this over any coordinate-proximity
+/// search. On a well-formed manifold isocontour, `canonical_lerp_crossing`
+/// produces bitwise-identical crossing points for segments derived from a
+/// shared triangle edge, so the true next segment on the loop almost always
+/// has an exact-key match here -- and there is exactly one such match at a
+/// normal degree-2 vertex.
+///
+/// This exists because the old code fell straight through to a
+/// coordinate-proximity search (`find_best_continuation` below, with a
+/// widened `STITCH_REPAIR_TOLERANCE` fallback) for *every* step, not just
+/// genuine gaps. In a locally dense mesh region (many small triangles near
+/// a single isovalue crossing), that wide tolerance can easily contain
+/// several *topologically unrelated* crossing points, and the old
+/// closest-then-most-aligned heuristic has no way to tell them apart from
+/// geometry alone -- silently mis-routing the walk into the wrong local
+/// cluster and shattering one true loop into many tiny false ones. Trying
+/// the exact match first removes that ambiguity for the common case;
+/// coordinate-proximity search remains only as a repair fallback for
+/// genuine floating-point-drift gaps (see `STITCH_REPAIR_TOLERANCE`'s
+/// doc-comment) when no exact match exists.
+///
+/// If more than one *other* unused segment happens to share the exact same
+/// quantized point (a real degree>2 junction -- e.g. from touching
+/// separate loops, or a non-manifold mesh region), falls back to the same
+/// alignment tie-break as `find_best_continuation` among just those exact
+/// candidates, which is still strictly less ambiguous than searching the
+/// full spatial neighborhood.
+fn exact_continuation(
+    by_exact_point: &HashMap<(i64, i64, i64), Vec<usize>>,
+    segments: &[(DVec3, DVec3)],
+    used: &[bool],
+    visited_in_trail: &HashSet<usize>,
+    point: DVec3,
+    prev_dir: DVec3,
+) -> Option<usize> {
+    let candidates = by_exact_point.get(&point_key(point))?;
+    let mut best: Option<(usize, f64)> = None;
+    for &idx in candidates {
+        if used.get(idx).copied().unwrap_or(false) || visited_in_trail.contains(&idx) {
+            continue;
+        }
+        let (a, b) = segments[idx];
+        // This segment must actually touch `point` exactly (by key), not just
+        // share a bucket -- `by_exact_point` is keyed per-endpoint so this
+        // always holds, but pick the *other* endpoint as the far point.
+        let far = if point_key(a) == point_key(point) {
+            b
+        } else {
+            a
+        };
+        let dir = (far - point).normalize_or_zero();
+        let alignment = if prev_dir != DVec3::ZERO && dir != DVec3::ZERO {
+            prev_dir.dot(dir)
+        } else {
+            1.0
+        };
+        let neg_align = -alignment;
+        if best.is_none_or(|(_, best_neg_align)| neg_align < best_neg_align) {
+            best = Some((idx, neg_align));
+        }
+    }
+    best.map(|(idx, _)| idx)
+}
+
 /// Finds the best continuation segment connected to `point` within `max_dist`.
 /// If multiple candidates exist, picks the one that continues `prev_dir` most smoothly
 /// (smallest distance, then highest dot product $(p_{next} - point) \cdot prev\_dir$).
@@ -392,6 +457,65 @@ pub fn stitch_loops_with_debug(
         by_point.entry(spatial_point_key(b)).or_default().push(i);
     }
 
+    // Map from an *exact* quantized endpoint key to the indices of segments
+    // touching that precise point -- see `exact_continuation`'s doc-comment
+    // for why this takes priority over the coordinate-proximity `by_point`
+    // search above.
+    let mut by_exact_point: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (i, &(a, b)) in segments.iter().enumerate() {
+        by_exact_point.entry(point_key(a)).or_default().push(i);
+        by_exact_point.entry(point_key(b)).or_default().push(i);
+    }
+
+    if std::env::var("MANIFOLD_DEBUG_CORNER").is_ok() && segments.len() > 500 {
+        let mut degree_hist: HashMap<usize, usize> = HashMap::new();
+        for v in by_exact_point.values() {
+            *degree_hist.entry(v.len()).or_default() += 1;
+        }
+        let mut hist: Vec<(usize, usize)> = degree_hist.into_iter().collect();
+        hist.sort();
+        tracing::warn!(
+            ?hist,
+            total_segments = segments.len(),
+            "CORNER-DEBUG exact-point degree histogram"
+        );
+    }
+
+    if std::env::var("MANIFOLD_DEBUG_CORNER").is_ok() {
+        if let Some((minx, maxx, miny, maxy, minz, maxz)) =
+            segments
+                .iter()
+                .fold(None::<(f64, f64, f64, f64, f64, f64)>, |acc, (a, b)| {
+                    let mut acc =
+                        acc.unwrap_or((f64::MAX, f64::MIN, f64::MAX, f64::MIN, f64::MAX, f64::MIN));
+                    for p in [a, b] {
+                        acc.0 = acc.0.min(p.x);
+                        acc.1 = acc.1.max(p.x);
+                        acc.2 = acc.2.min(p.y);
+                        acc.3 = acc.3.max(p.y);
+                        acc.4 = acc.4.min(p.z);
+                        acc.5 = acc.5.max(p.z);
+                    }
+                    Some(acc)
+                })
+        {
+            tracing::warn!(minx, maxx, miny, maxy, minz, maxz, "CORNER-DEBUG bounds");
+        }
+        let region: Vec<&(DVec3, DVec3)> = segments
+            .iter()
+            .filter(|(a, b)| {
+                let in_region = |p: DVec3| p.x < 90.0 && p.y < 90.0 && p.z > 11.9 && p.z < 12.1;
+                in_region(*a) || in_region(*b)
+            })
+            .collect();
+        if !region.is_empty() {
+            tracing::warn!(count = region.len(), "CORNER-DEBUG segments in region");
+            for (a, b) in &region {
+                tracing::warn!(?a, ?b, len = a.distance(*b), "CORNER-DEBUG segment");
+            }
+        }
+    }
+
     let mut used = vec![false; segments.len()];
     let mut loops = Vec::new();
 
@@ -433,16 +557,29 @@ pub fn stitch_loops_with_debug(
                 }
             }
 
-            // Look for next segment using 27-bucket neighborhood first, then repair tolerance
-            let next = find_best_continuation(
-                &by_point,
+            // Look for next segment: try an exact-endpoint-key match first
+            // (unambiguous on a well-formed manifold isocontour), then fall
+            // back to the 27-bucket spatial neighborhood, then the widened
+            // repair tolerance for genuine floating-point-drift gaps.
+            let next = exact_continuation(
+                &by_exact_point,
                 &segments,
                 &used,
                 &visited_in_trail,
                 current_point,
                 prev_dir,
-                1e-4,
             )
+            .or_else(|| {
+                find_best_continuation(
+                    &by_point,
+                    &segments,
+                    &used,
+                    &visited_in_trail,
+                    current_point,
+                    prev_dir,
+                    1e-4,
+                )
+            })
             .or_else(|| {
                 find_best_continuation(
                     &by_point,
@@ -508,15 +645,25 @@ pub fn stitch_loops_with_debug(
         visited.insert(start_idx);
 
         loop {
-            let next = find_best_continuation(
-                &by_point,
+            let next = exact_continuation(
+                &by_exact_point,
                 &segments,
                 &used,
                 &visited,
                 current_point,
                 prev_dir,
-                1e-4,
             )
+            .or_else(|| {
+                find_best_continuation(
+                    &by_point,
+                    &segments,
+                    &used,
+                    &visited,
+                    current_point,
+                    prev_dir,
+                    1e-4,
+                )
+            })
             .or_else(|| {
                 find_best_continuation(
                     &by_point,
@@ -549,7 +696,17 @@ pub fn stitch_loops_with_debug(
                 }
             }
         }
-        if chain.len() >= 2 {
+        // Pass 2 does not re-check other trails' interior points the way Pass 1
+        // does, so a chain whose walk happens to loop back on itself (first and
+        // last points coincide within repair tolerance) was previously always
+        // dropped into debug_unclosed even when it is actually a fully closed
+        // loop. Mirror Pass 1's self-closing check here so these are promoted
+        // to real loops instead of being discarded/excluded.
+        if chain.len() >= MIN_LOOP_POINTS
+            && chain[0].distance(*chain.last().unwrap()) <= STITCH_REPAIR_TOLERANCE
+        {
+            loops.push(chain);
+        } else if chain.len() >= 2 {
             debug_unclosed.push(chain);
         }
     }
