@@ -614,15 +614,24 @@ fn compensate_wall_loop_points(
 /// moves that jump across the whole layer to print one short line, then
 /// jump straight back.
 ///
+/// `fixed_prefix_len` paths at the front of `paths` (at minimum 1, so
+/// there's always a starting anchor) are left completely untouched --
+/// neither reordered nor reversed -- and every other path is greedily
+/// appended after them. `plan_with_progress` passes the number of
+/// wall-loop paths it just pushed (see `wall_print_order`) here, so this
+/// pass only ever reshuffles infill/solid-fill/wave-overhang paths
+/// around a layer's walls, never the walls themselves: wall print order
+/// is a deliberate print-quality choice (island grouping, then
+/// Inner/Outer/Inner wall-depth sequencing), and a greedy geometric
+/// nearest-neighbor search has no way to know that and would happily
+/// undo it chasing a shorter travel move.
+///
 /// Uses a simple greedy nearest-neighbor heuristic (not an optimal
 /// TSP solve -- that's overkill for a per-layer path list and would cost
-/// far more than it saves): the first path in `paths` is kept as the
-/// fixed starting anchor (its own point order/direction is never
-/// touched, and there's no prior-layer nozzle position available here --
-/// layers are planned independently in parallel, see [`plan_with_progress`]'s
-/// docs), then each subsequent step picks whichever *remaining* path has
-/// an entry point closest to the current position and appends it,
-/// updating the current position to that path's exit point.
+/// far more than it saves): after the fixed prefix, each step picks
+/// whichever *remaining* path has an entry point closest to the current
+/// position and appends it, updating the current position to that
+/// path's exit point.
 ///
 /// A path with no closing segment (`segments.len() + 1 == points.len()`,
 /// i.e. an open path such as an infill scan-line pass -- see [`Path`]'s
@@ -637,7 +646,10 @@ fn compensate_wall_loop_points(
 /// changes). Closed loops (walls) are never reversed or start-rotated:
 /// their `points[0]` is meaningful (indexed by the upstream wall-gap
 /// stitching/arc-length-correspondence passes), so only their position in
-/// the overall path order is changed, never their internal orientation.
+/// the overall path order is changed, never their internal orientation --
+/// in practice this never comes up post-prefix-fix since wall paths now
+/// always land inside the fixed prefix, but the reordering pool may still
+/// contain other closed loops (e.g. concentric infill rings).
 ///
 /// This is an O(n²) scan over the remaining paths at each step, which is
 /// fine for the tens-to-low-hundreds of paths typical of a single layer;
@@ -648,14 +660,23 @@ fn optimize_travel_order(
     mut paths: Vec<Path>,
     config: &SlicerConfig,
     z_travel_penalty: f64,
+    fixed_prefix_len: usize,
 ) -> Vec<Path> {
     if !config.travel_order_optimization_enabled || paths.len() <= 1 {
         return paths;
     }
 
-    let mut ordered = Vec::with_capacity(paths.len());
-    ordered.push(paths.remove(0));
-    let mut current = ordered[0].points.last().copied().unwrap_or(DVec3::ZERO);
+    let prefix_len = fixed_prefix_len.clamp(1, paths.len());
+    let mut ordered: Vec<Path> = paths.drain(0..prefix_len).collect();
+    let mut current = ordered
+        .last()
+        .and_then(|p| p.points.last())
+        .copied()
+        .unwrap_or(DVec3::ZERO);
+
+    if paths.is_empty() {
+        return ordered;
+    }
 
     let z_scale = z_travel_penalty.max(1.0);
     let kinematic_cost = |a: DVec3, b: DVec3| -> f64 {
@@ -1205,6 +1226,113 @@ fn route_travel_moves(
     routed
 }
 
+/// Computes a per-layer wall print order over `loops` (indices into the
+/// slice, i.e. into [`crate::slicing::Layer::loops`]) that groups every
+/// [`crate::slicing::WallLoop::island`] contiguously and, within each
+/// island, sequences wall depths in Inner/Outer/Inner order rather than
+/// the raw `wall_index` ordering (0, 1, 2, ... = outer-to-inner) that
+/// [`crate::slicing::Layer::loops`] is stored in.
+///
+/// Without this pass, `plan`'s wall-loop push loop emits every island's
+/// wall 0 first (mesh/order-field extraction naturally groups by
+/// `wall_index`, not by island), then each island's inner walls in
+/// island order -- so on a layer with two islands the nozzle prints both
+/// outer walls, then jumps back to finish island A's inner walls, then
+/// jumps again all the way over to island B's inner walls. That's both a
+/// wasted-travel problem (which [`optimize_travel_order`] and
+/// [`route_travel_moves`] can only partially undo -- they reorder whole
+/// paths, not fix a bad grouping upstream of them) and a print-quality
+/// problem (an island's walls are no longer printed back-to-back, so its
+/// thermal history and seam placement are disturbed by an unrelated
+/// island in between).
+///
+/// Within an island of `n` wall depths (`0..n`, `n` = `max(wall_index) +
+/// 1` over that island's loops), the Inner/Outer/Inner order printed
+/// is:
+/// - `n <= 1`: just `[0]` (nothing to reorder).
+/// - `n == 2`: `[1, 0]` -- the lone inner wall, then the outer wall.
+/// - `n >= 3`: `[n-1, n-2, ..., 2, 0, 1]` -- innermost-to-second-wall
+///   first, then the outer wall, then the second wall (the one
+///   immediately backing the outer wall) last. Printing the outer wall
+///   before its immediate backing neighbor, instead of right after it,
+///   gives the outer bead a moment to firm up before the second wall's
+///   heat and pressure act right behind it, reducing bulging/witness
+///   lines on the visible surface -- the same rationale as Cura's
+///   Inner/Outer/Inner Walls print order.
+///
+/// Loops with more than one instance at the same `(island, wall_index)`
+/// (e.g. multiple holes at the same wall depth) keep their original
+/// relative order (this is a stable sort). Debug polylines
+/// (`wall_index >= 990`, see `plan`'s wall-loop push loop) are excluded
+/// from island grouping entirely and appended at the end in their
+/// original relative order -- they're diagnostic overlays, not part of
+/// the printed wall stack, so there's no print-quality reason to
+/// interleave them with real walls.
+///
+/// Returns a permutation of `0..loops.len()` (every index appears
+/// exactly once); callers index back into the original `loops` slice
+/// with it rather than this function returning reordered data directly,
+/// so callers keyed by original loop position (e.g. `plan`'s
+/// `wave_overhang_plan.wall_overhang_tags_by_layer[layer][w_idx]` lookup)
+/// keep using that same original index unchanged.
+fn wall_print_order(loops: &[crate::slicing::WallLoop]) -> Vec<usize> {
+    const DEBUG_WALL_INDEX: usize = 990;
+
+    let mut islands: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut debug_indices: Vec<usize> = Vec::new();
+
+    for (idx, wall_loop) in loops.iter().enumerate() {
+        if wall_loop.wall_index >= DEBUG_WALL_INDEX {
+            debug_indices.push(idx);
+            continue;
+        }
+        match islands
+            .iter_mut()
+            .find(|(island, _)| *island == wall_loop.island)
+        {
+            Some((_, members)) => members.push(idx),
+            None => islands.push((wall_loop.island, vec![idx])),
+        }
+    }
+
+    let mut order = Vec::with_capacity(loops.len());
+    for (_, members) in &mut islands {
+        let wall_count = members
+            .iter()
+            .map(|&idx| loops[idx].wall_index + 1)
+            .max()
+            .unwrap_or(0);
+        let rank = inner_outer_inner_rank_table(wall_count);
+        members.sort_by_key(|&idx| rank[loops[idx].wall_index]);
+        order.extend(members.iter().copied());
+    }
+    order.extend(debug_indices);
+    order
+}
+
+/// Builds `rank[wall_index] = print-order position` for an island with
+/// `wall_count` wall depths, per [`wall_print_order`]'s Inner/Outer/Inner
+/// scheme. `rank` is a permutation of `0..wall_count`.
+fn inner_outer_inner_rank_table(wall_count: usize) -> Vec<usize> {
+    let mut print_sequence = Vec::with_capacity(wall_count);
+    if wall_count <= 2 {
+        // n=0: empty; n=1: [0]; n=2: [1, 0].
+        print_sequence.extend((0..wall_count).rev());
+    } else {
+        // Innermost (n-1) down to the second wall (2), then outer (0),
+        // then the second wall (1) last.
+        print_sequence.extend((2..wall_count).rev());
+        print_sequence.push(0);
+        print_sequence.push(1);
+    }
+
+    let mut rank = vec![0usize; wall_count];
+    for (position, &wall_index) in print_sequence.iter().enumerate() {
+        rank[wall_index] = position;
+    }
+    rank
+}
+
 /// Reverses an open [`Path`]'s traversal direction in place: `points` and
 /// `segments` both reversed. Self-inverse and metadata-preserving -- see
 /// [`optimize_travel_order`]'s doc comment for why this works for the
@@ -1699,7 +1827,9 @@ pub fn plan_with_progress(
 
             let is_layer_0 = layer.index == 0 || (layer.order - order_min).abs() < 1e-6;
             let mut paths = Vec::new();
-            for (w_idx, wall_loop) in layer.loops.iter().enumerate() {
+            let wall_order = wall_print_order(&layer.loops);
+            for w_idx in wall_order {
+                let wall_loop = &layer.loops[w_idx];
                 // Placeholder metadata: real support/bridge/overhang
                 // classification and speed/extrusion-rate planning is future
                 // work (see toolpath-metadata-phase12 subtask 03). Wall
@@ -1796,6 +1926,7 @@ pub fn plan_with_progress(
                     tool: object.tool,
                 });
             }
+            let wall_path_count = paths.len();
 
             let region = InfillRegion::from_layer(layer, config);
             let (sparse_loops, narrow_solid_loops): (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) =
@@ -1858,20 +1989,37 @@ pub fn plan_with_progress(
             }
 
             let min_open_path_len = config.nozzle_diameter * 2.0;
-            paths.retain(|p| {
-                let is_open_extrusion = p.segments.iter().any(|s| {
-                    s.kind == MoveKind::Infill
-                        || s.kind == MoveKind::TopSurface
-                        || s.kind == MoveKind::Overhang
-                });
-                if is_open_extrusion {
-                    let total_len: f64 = p.points.windows(2).map(|w| w[0].distance(w[1])).sum();
-                    if total_len < min_open_path_len {
-                        return false;
+            let mut wall_path_count = wall_path_count;
+            let paths: Vec<Path> = paths
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, p)| {
+                    let is_open_extrusion = p.segments.iter().any(|s| {
+                        s.kind == MoveKind::Infill
+                            || s.kind == MoveKind::TopSurface
+                            || s.kind == MoveKind::Overhang
+                    });
+                    if is_open_extrusion {
+                        let total_len: f64 = p.points.windows(2).map(|w| w[0].distance(w[1])).sum();
+                        if total_len < min_open_path_len {
+                            // Keep `wall_path_count` in sync with survivors
+                            // so it still bounds exactly the wall-loop
+                            // prefix passed to `optimize_travel_order` --
+                            // dropping any of the fixed-order wall paths
+                            // here (e.g. a wall loop whose only segments
+                            // are a too-short overhang stub) must shrink
+                            // the prefix by one, not leave it pointing
+                            // past the end of the surviving wall paths.
+                            if *idx < wall_path_count {
+                                wall_path_count -= 1;
+                            }
+                            return false;
+                        }
                     }
-                }
-                true
-            });
+                    true
+                })
+                .map(|(_, p)| p)
+                .collect();
 
             let paths = retain_contained_paths(
                 paths,
@@ -1881,7 +2029,7 @@ pub fn plan_with_progress(
             );
             let paths = compensate_flat_nozzle(paths, layer, config, tools);
             let paths = simplify_paths(paths, config);
-            let paths = optimize_travel_order(paths, config, z_travel_penalty);
+            let paths = optimize_travel_order(paths, config, z_travel_penalty, wall_path_count);
             let paths = route_travel_moves(
                 paths,
                 layer.mesh_sdf.as_deref(),
@@ -3011,14 +3159,18 @@ mod tests {
             })
             .collect();
         assert_eq!(wall_paths.len(), 3);
+        // Inner/Outer/Inner print order for a 3-wall island (see
+        // `wall_print_order`): innermost (wall_index 2) first, then the
+        // outer wall (wall_index 0), then the second wall (wall_index 1)
+        // last -- not raw outer-to-inner `wall_index` order.
         assert!(wall_paths[0]
             .segments
             .iter()
-            .all(|segment| segment.kind == MoveKind::WallOuter));
+            .all(|segment| segment.kind == MoveKind::WallInner));
         assert!(wall_paths[1]
             .segments
             .iter()
-            .all(|segment| segment.kind == MoveKind::WallInner));
+            .all(|segment| segment.kind == MoveKind::WallOuter));
         assert!(wall_paths[2]
             .segments
             .iter()
@@ -3091,18 +3243,21 @@ mod tests {
             .collect();
         assert_eq!(wall_paths.len(), 2);
 
-        let outer = &wall_paths[0];
+        // Inner/Outer/Inner print order for a 2-wall island: the lone
+        // inner wall (wall_index 1) is printed before the outer wall
+        // (wall_index 0) -- see `wall_print_order`.
+        let inner = &wall_paths[0];
+        assert!(inner
+            .segments
+            .iter()
+            .all(|segment| segment.kind == MoveKind::WallInner));
+
+        let outer = &wall_paths[1];
         assert_eq!(outer.segments.len(), 4);
         assert_eq!(outer.segments[0].kind, MoveKind::WallOuter);
         assert_eq!(outer.segments[1].kind, MoveKind::Overhang);
         assert_eq!(outer.segments[2].kind, MoveKind::WallOuter);
         assert_eq!(outer.segments[3].kind, MoveKind::WallOuter);
-
-        let inner = &wall_paths[1];
-        assert!(inner
-            .segments
-            .iter()
-            .all(|segment| segment.kind == MoveKind::WallInner));
     }
 
     #[test]
@@ -3514,7 +3669,7 @@ mod tests {
             ..SlicerConfig::default()
         };
         let original_starts: Vec<DVec3> = paths.iter().map(|p| p.points[0]).collect();
-        let result = optimize_travel_order(paths, &config, config.z_travel_penalty);
+        let result = optimize_travel_order(paths, &config, config.z_travel_penalty, 1);
         let result_starts: Vec<DVec3> = result.iter().map(|p| p.points[0]).collect();
         assert_eq!(result_starts, original_starts);
     }
@@ -3541,7 +3696,7 @@ mod tests {
         );
         let config = SlicerConfig::default();
         let result =
-            optimize_travel_order(vec![anchor, far, near], &config, config.z_travel_penalty);
+            optimize_travel_order(vec![anchor, far, near], &config, config.z_travel_penalty, 1);
 
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].points[0], DVec3::new(0.0, 0.0, 0.0));
@@ -3565,7 +3720,7 @@ mod tests {
         );
         let config = SlicerConfig::default();
         let result =
-            optimize_travel_order(vec![anchor, candidate], &config, config.z_travel_penalty);
+            optimize_travel_order(vec![anchor, candidate], &config, config.z_travel_penalty, 1);
 
         assert_eq!(result.len(), 2);
         // Reversed: now starts at 1.2 (close to anchor's exit at 1.0) and
@@ -3594,7 +3749,7 @@ mod tests {
         );
         let original_points = wall.points.clone();
         let config = SlicerConfig::default();
-        let result = optimize_travel_order(vec![anchor, wall], &config, config.z_travel_penalty);
+        let result = optimize_travel_order(vec![anchor, wall], &config, config.z_travel_penalty, 1);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[1].points, original_points);
@@ -3626,6 +3781,7 @@ mod tests {
             vec![anchor, path_z_near, path_xy_far],
             &config,
             config.z_travel_penalty,
+            1,
         );
         assert_eq!(result.len(), 3);
         // path_xy_far (at z=0) selected before path_z_near (at z=1) due to z_penalty
