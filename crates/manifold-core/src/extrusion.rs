@@ -101,11 +101,14 @@ pub fn blended_bead_cross_section_area(
 /// closer to the surface than the same lateral offset at the current layer
 /// means a ceiling is genuinely converging/closing in from above -- the
 /// achievable height is clamped down to how far below that intrusion the
-/// land can actually reach. Returns `nominal_height` unclamped (a no-op)
-/// when nothing intrudes, when the surface there is no closer than it is
-/// at the current layer (e.g. an ordinary vertical, untapered wall, whose
-/// cross-section doesn't change with Z), or when `mesh_sdf` is unavailable
-/// (e.g. hand-built test layers) -- flat/convex terrain never gets clamped.
+/// land can actually reach, floored at a quarter of `nominal_height` --
+/// this measurement may thin a bead but must never collapse it to a
+/// fully discontinuous 0.0 mm gap. Returns `nominal_height` unclamped
+/// (a no-op) when nothing intrudes, when the surface there is no closer
+/// than it is at the current layer (e.g. an ordinary vertical, untapered
+/// wall, whose cross-section doesn't change with Z), or when `mesh_sdf`
+/// is unavailable (e.g. hand-built test layers) -- flat/convex terrain
+/// never gets clamped.
 #[must_use]
 pub fn z_land_clearance(
     p: DVec3,
@@ -158,10 +161,20 @@ pub fn z_land_clearance(
         // has to actually be closing in, not just present, to constrain
         // this land.
         const CONVERGENCE_EPS: f64 = 1e-6;
+        // A land-clearance intrusion can shrink the achievable bead height,
+        // but must never collapse it all the way to zero: a fully-crushed
+        // bead (0.0 mm) means the wall goes physically discontinuous at
+        // that point (a real gap/hole), which is worse than a thinner but
+        // still-continuous bead. Floor the clamp at a quarter of the
+        // nominal layer height -- any further shortfall should be resolved
+        // by skipping/deferring the segment or narrowing an adjacent
+        // extrusion upstream, not by extrapolating this measurement to
+        // nothing.
+        const MIN_HEIGHT_FRACTION: f64 = 0.25;
         let distance_now = sdf.sample(p + lateral).value;
         if distance < 0.0 && distance > -nominal_height && distance > distance_now + CONVERGENCE_EPS
         {
-            let clearance = (nominal_height + distance).max(0.0);
+            let clearance = (nominal_height + distance).max(MIN_HEIGHT_FRACTION * nominal_height);
             achievable_height = achievable_height.min(clearance);
         }
     }
@@ -417,6 +430,35 @@ mod tests {
         );
         assert!(h < nominal_height, "expected clamp, got {h}");
         assert!(h >= 0.0);
+    }
+
+    #[test]
+    fn z_land_clearance_never_collapses_below_quarter_of_nominal_height() {
+        // A bead whose nominal top sits almost exactly at the intruding
+        // solid surface (deepest possible shallow-negative reading, just
+        // shy of -nominal_height) would, pre-floor, clamp achievable
+        // height down to ~0.0mm -- a fully discontinuous gap in the wall.
+        // The clamp must instead floor at a quarter of nominal_height so
+        // the bead thins but never fully severs.
+        let sdf = cube_sdf_fixture();
+        let nominal_height = 0.2;
+        let land_radius = 0.1;
+        // Top face at z=1.0; nominal top (p.z + nominal_height) sampled
+        // just below the face for the deepest non-bulk shallow reading.
+        let p = DVec3::new(0.5, 0.5, 1.0 - nominal_height - 1e-4);
+        let h = z_land_clearance(
+            p,
+            DVec3::X,
+            DVec3::Z,
+            nominal_height,
+            land_radius,
+            Some(&sdf),
+        );
+        assert!(
+            h >= 0.25 * nominal_height - 1e-9,
+            "expected floor at quarter nominal height, got {h}"
+        );
+        assert!(h < nominal_height, "expected some clamp to occur, got {h}");
     }
 
     #[test]
