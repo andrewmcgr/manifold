@@ -81,7 +81,7 @@ A `Profile` JSON bundles two top-level objects:
     "wave_overhang_flow": 1.05,
     "min_bead_width_ratio": 0.70,
     "max_bead_width_ratio": 1.60,
-    "curvature_compensation_enabled": true,
+    "bead_clearance_compensation_enabled": true,
     "scarf_joint_enabled": true,
     "scarf_joint_length": 8.0,
     "scarf_joint_steps": 9,

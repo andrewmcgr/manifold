@@ -887,6 +887,7 @@ pub fn apply_wipe_moves(
         is_scarf: false,
         id: 0,
         island: last_seg.island,
+        channel_width: last_seg.channel_width,
     };
 
     points.push(p_wipe);
@@ -1624,6 +1625,7 @@ mod tests {
                 line_width: 0.4,
                 is_scarf: false,
                 id: 0,
+                channel_width: f64::INFINITY,
             };
             4
         ];
@@ -1669,6 +1671,7 @@ mod tests {
                 line_width: 0.4,
                 is_scarf: false,
                 id: 0,
+                channel_width: f64::INFINITY,
             };
             4
         ];

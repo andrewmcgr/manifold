@@ -1193,6 +1193,7 @@ fn route_travel_moves(
                     is_scarf: false,
                     id: 0,
                     island: 0,
+                    channel_width: f64::INFINITY,
                 })
                 .collect();
             Some((
@@ -1634,7 +1635,7 @@ pub enum MoveKind {
 
 /// Per-segment motion metadata for one `points[i] -> points[i+1]` edge of a
 /// [`Path]` (including the closing edge of a closed loop).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Segment {
     pub kind: MoveKind,
     pub speed: f64,
@@ -1665,6 +1666,36 @@ pub struct Segment {
     /// island's walls independently (inner-outer-inner print order) and
     /// lets the GUI hover card show which island a segment belongs to.
     pub island: usize,
+    /// Local 2D channel width (mm) at this segment's destination vertex --
+    /// copied from `slicing::WallLoop::channel_width` (see
+    /// `polygon2d::channel_widths`). `f64::INFINITY` for non-wall paths
+    /// (infill/debug) where no opposing boundary constrains flow. Used by
+    /// `plan` to clamp `line_width` down to actually-available room via
+    /// `extrusion::clamped_bead_cross_section_area` when
+    /// `config.bead_clearance_compensation_enabled()`.
+    pub channel_width: f64,
+}
+
+impl Default for Segment {
+    /// `channel_width` defaults to `f64::INFINITY` (no constraint) rather
+    /// than the `f64` zero-default a `#[derive(Default)]` would produce --
+    /// a derived `0.0` would silently clamp every unset-fixture segment's
+    /// bead area to nothing wherever `channel_width` actually gets read.
+    fn default() -> Self {
+        Self {
+            kind: MoveKind::default(),
+            speed: 0.0,
+            extrusion_rate: 0.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 0.0,
+            line_width: 0.0,
+            is_scarf: false,
+            id: 0,
+            island: 0,
+            channel_width: f64::INFINITY,
+        }
+    }
 }
 
 /// A single continuous toolpath (e.g. one perimeter or infill pass).
@@ -1852,6 +1883,7 @@ pub fn plan_with_progress(
                                 is_scarf: false,
                                 id: 0,
                                 island: wall_loop.island,
+                                channel_width: f64::INFINITY,
                             })
                             .collect();
                         paths.push(Path {
@@ -1906,6 +1938,11 @@ pub fn plan_with_progress(
                             .get(dest)
                             .copied()
                             .unwrap_or(config.wall_line_width);
+                        let seg_channel_width = wall_loop
+                            .channel_width
+                            .get(dest)
+                            .copied()
+                            .unwrap_or(f64::INFINITY);
                         Segment {
                             kind,
                             speed: speed_for_kind(kind, config),
@@ -1917,6 +1954,7 @@ pub fn plan_with_progress(
                             is_scarf: false,
                             id: 0,
                             island: wall_loop.island,
+                            channel_width: seg_channel_width,
                         }
                     })
                     .collect();
@@ -1927,6 +1965,9 @@ pub fn plan_with_progress(
                 });
             }
             let wall_path_count = paths.len();
+            if layer.order < 3.0 {
+                eprintln!("DBG layer.order={} after wall build: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
+            }
 
             let region = InfillRegion::from_layer(layer, config);
             let (sparse_loops, narrow_solid_loops): (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) =
@@ -1989,6 +2030,9 @@ pub fn plan_with_progress(
             }
 
             let min_open_path_len = config.nozzle_diameter * 2.0;
+            if layer.order < 3.0 {
+                eprintln!("DBG layer.order={} before min_open_path_len filter: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
+            }
             let mut wall_path_count = wall_path_count;
             let paths: Vec<Path> = paths
                 .into_iter()
@@ -2027,9 +2071,21 @@ pub fn plan_with_progress(
                 layer.order,
                 config.nozzle_diameter,
             );
+            if layer.order < 3.0 {
+                eprintln!("DBG layer.order={} after retain_contained_paths: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
+            }
             let paths = compensate_flat_nozzle(paths, layer, config, tools);
+            if layer.order < 3.0 {
+                eprintln!("DBG layer.order={} after compensate_flat_nozzle: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
+            }
             let paths = simplify_paths(paths, config);
+            if layer.order < 3.0 {
+                eprintln!("DBG layer.order={} after simplify_paths: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
+            }
             let paths = optimize_travel_order(paths, config, z_travel_penalty, wall_path_count);
+            if layer.order < 3.0 {
+                eprintln!("DBG layer.order={} after optimize_travel_order: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
+            }
             let paths = route_travel_moves(
                 paths,
                 layer.mesh_sdf.as_deref(),
@@ -2038,6 +2094,9 @@ pub fn plan_with_progress(
                 config,
                 z_travel_penalty,
             );
+            if layer.order < 3.0 {
+                eprintln!("DBG layer.order={} after route_travel_moves: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
+            }
             let mut paths = insert_z_hops(paths, config);
 
             let extrusion_multiplier = tools
@@ -2119,8 +2178,6 @@ pub fn plan_with_progress(
                         1.0
                     };
                     let is_overhang = segment.kind == MoveKind::Overhang;
-                    let p_prev = path.points[(i + point_count - 1) % point_count];
-                    let r_curvature = extrusion::in_plane_radius_of_curvature(p_prev, start, end);
                     let raw_bead_area = if is_overhang {
                         let track_w = config.nozzle_diameter - config.wave_overhang_overlap();
                         track_w * effective_layer_height * config.wave_overhang_flow()
@@ -2133,53 +2190,31 @@ pub fn plan_with_progress(
                             bed_fraction,
                         )
                     };
-                    let bead_area = if config.curvature_compensation_enabled() && !is_overhang {
-                        let r_curv_area = extrusion::curvature_compensated_bead_area(
-                            raw_bead_area,
-                            effective_line_width,
-                            r_curvature,
-                        );
-                        // Transverse concavity / V-groove compensation:
+                    let bead_area = if config.bead_clearance_compensation_enabled() && !is_overhang
+                    {
+                        // Measured land-clearance clamp: how much vertical room
+                        // is actually there across the flat nozzle land's
+                        // transverse footprint, given real solid geometry
+                        // (replaces the old differential-normal heuristic).
                         let mid_pt = (start + end) * 0.5;
-                        if let Some(normal) =
-                            crate::order_field::numeric_gradient(layer.order_field.as_ref(), mid_pt)
-                                .and_then(|g| g.try_normalize().map(|n| -n))
-                        {
-                            let u_perp = unit_dir
-                                .cross(normal)
-                                .try_normalize()
-                                .unwrap_or(DVec3::ZERO);
-                            if u_perp.length_squared() > 0.5 {
-                                let r_flat = config.nozzle_flat_diameter() * 0.5;
-                                let n_plus = crate::order_field::numeric_gradient(
-                                    layer.order_field.as_ref(),
-                                    mid_pt + u_perp * r_flat,
-                                )
-                                .and_then(|g| g.try_normalize().map(|n| -n));
-                                let n_minus = crate::order_field::numeric_gradient(
-                                    layer.order_field.as_ref(),
-                                    mid_pt - u_perp * r_flat,
-                                )
-                                .and_then(|g| g.try_normalize().map(|n| -n));
-                                if let (Some(np), Some(nm)) = (n_plus, n_minus) {
-                                    let sin_transverse =
-                                        ((np - nm).dot(u_perp) * 0.5).clamp(0.0, 1.0);
-                                    let flank_rise = r_flat * sin_transverse;
-                                    extrusion::concavity_compensated_bead_area(
-                                        r_curv_area,
-                                        effective_layer_height,
-                                        flank_rise,
-                                        sin_transverse,
-                                    )
-                                } else {
-                                    r_curv_area
-                                }
-                            } else {
-                                r_curv_area
-                            }
-                        } else {
-                            r_curv_area
-                        }
+                        let land_radius = config.nozzle_flat_diameter() * 0.5;
+                        let z_achievable_height = extrusion::z_land_clearance(
+                            mid_pt,
+                            unit_dir,
+                            crate::slicing::NOZZLE_DIRECTION,
+                            effective_layer_height,
+                            land_radius,
+                            layer.mesh_sdf.as_deref(),
+                        );
+                        extrusion::clamped_bead_cross_section_area(
+                            effective_line_width,
+                            effective_layer_height,
+                            config.nozzle_diameter,
+                            support_fraction,
+                            bed_fraction,
+                            segment.channel_width,
+                            z_achievable_height,
+                        )
                     } else {
                         raw_bead_area
                     };
@@ -2300,6 +2335,24 @@ pub fn plan_with_progress(
 
             // Drop unprintable micro-paths whose total extruding length is negligible (< 0.5 * nozzle_diameter or total E < 0.0005 mm)
             let min_extruding_distance = config.nozzle_diameter * 0.5;
+            if layer.order < 3.0 {
+                for (idx, path) in paths.iter().enumerate().take(5) {
+                    let n = path.points.len();
+                    let mut total_d = 0.0;
+                    let mut total_e = 0.0;
+                    for (i, segment) in path.segments.iter().enumerate() {
+                        if segment.kind != MoveKind::Travel {
+                            if n >= 2 {
+                                let p0 = path.points[i];
+                                let p1 = path.points[(i + 1) % n];
+                                total_d += p0.distance(p1);
+                            }
+                            total_e += segment.extrusion_length;
+                        }
+                    }
+                    eprintln!("DBG layer.order={} path[{}]: n_points={} n_segs={} total_d={} total_e={}", layer.order, idx, n, path.segments.len(), total_d, total_e);
+                }
+            }
             let mut paths: Vec<Path> = paths
                 .into_iter()
                 .filter(|path| {
@@ -2320,6 +2373,9 @@ pub fn plan_with_progress(
                     total_d >= min_extruding_distance && total_e >= 0.0005
                 })
                 .collect();
+            if layer.order < 3.0 {
+                eprintln!("DBG layer.order={} after min_extruding_distance filter: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
+            }
 
             // Ensure no planned points dip below the build bed floor (Z = 0.0)
             for path in &mut paths {
@@ -2542,6 +2598,7 @@ mod tests {
                 line_width: 0.4,
                 is_scarf: false,
                 id: 0,
+                channel_width: f64::INFINITY,
             })
             .collect();
         Path {
@@ -3068,6 +3125,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
+                    channel_width: Vec::new(),
                 },
                 WallLoop {
                     island: 0,
@@ -3078,6 +3136,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
+                    channel_width: Vec::new(),
                 },
             ],
             infill_boundary: Vec::new(),
@@ -3118,6 +3177,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
+                    channel_width: Vec::new(),
                 },
                 WallLoop {
                     island: 0,
@@ -3128,6 +3188,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
+                    channel_width: Vec::new(),
                 },
                 WallLoop {
                     island: 0,
@@ -3138,6 +3199,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
+                    channel_width: Vec::new(),
                 },
             ],
             infill_boundary: Vec::new(),
@@ -3204,6 +3266,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.25, 0.5, 0.75],
+                    channel_width: Vec::new(),
                 },
                 // wall_index 1: no unsupported points -- must be unaffected
                 // (no regression to plain `WallInner` classification).
@@ -3216,6 +3279,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0, 0.5],
+                    channel_width: Vec::new(),
                 },
             ],
             infill_boundary: Vec::new(),
@@ -3279,6 +3343,7 @@ mod tests {
             line_width: 0.4,
             is_scarf: false,
             id: 0,
+            channel_width: f64::INFINITY,
         };
         let travel_segment = Segment {
             island: 0,
@@ -3291,6 +3356,7 @@ mod tests {
             line_width: 0.0,
             is_scarf: false,
             id: 0,
+            channel_width: f64::INFINITY,
         };
         let path = Path {
             points: vec![p0, p1, p2, p3],
@@ -3368,6 +3434,7 @@ mod tests {
             line_width: 0.4,
             is_scarf: false,
             id: 0,
+            channel_width: f64::INFINITY,
         };
         let travel_segment = Segment {
             island: 0,
@@ -3380,6 +3447,7 @@ mod tests {
             line_width: 0.0,
             is_scarf: false,
             id: 0,
+            channel_width: f64::INFINITY,
         };
         let path = Path {
             points: vec![p0, p1, p2, p3],
@@ -3426,6 +3494,7 @@ mod tests {
             line_width: 0.0,
             is_scarf: false,
             id: 0,
+            channel_width: f64::INFINITY,
         };
         let infill_segment = Segment {
             island: 0,
@@ -3438,6 +3507,7 @@ mod tests {
             line_width: 0.4,
             is_scarf: false,
             id: 0,
+            channel_width: f64::INFINITY,
         };
         let path = Path {
             points: vec![p0, p1, p2],
@@ -3477,6 +3547,7 @@ mod tests {
             line_width: 0.4,
             is_scarf: false,
             id: 0,
+            channel_width: f64::INFINITY,
         };
         let travel_segment = Segment {
             island: 0,
@@ -3489,6 +3560,7 @@ mod tests {
             line_width: 0.0,
             is_scarf: false,
             id: 0,
+            channel_width: f64::INFINITY,
         };
         // Only 2 segments for 3 points: no closing edge.
         let path = Path {
@@ -3547,6 +3619,7 @@ mod tests {
             line_width: 0.4,
             is_scarf: false,
             id: 0,
+            channel_width: f64::INFINITY,
         };
         let travel_segment = Segment {
             island: 0,
@@ -3559,6 +3632,7 @@ mod tests {
             line_width: 0.0,
             is_scarf: false,
             id: 0,
+            channel_width: f64::INFINITY,
         };
         let path = Path {
             points: vec![p0, p1, p2],
@@ -3620,6 +3694,7 @@ mod tests {
                 line_width: 0.4,
                 is_scarf: false,
                 id: 0,
+                channel_width: f64::INFINITY,
             })
             .collect();
         Path {
@@ -3643,6 +3718,7 @@ mod tests {
                 line_width: 0.4,
                 is_scarf: false,
                 id: 0,
+                channel_width: f64::INFINITY,
             })
             .collect();
         Path {
@@ -4031,7 +4107,7 @@ mod tests {
             path_simplify_enabled: true,
             path_simplify_tolerance: 0.05,
             scarf_joint_enabled: false,
-            curvature_compensation_enabled: Some(false),
+            bead_clearance_compensation_enabled: Some(false),
             ..SlicerConfig::default()
         };
 
@@ -4496,6 +4572,7 @@ mod tests {
                 line_widths: Vec::new(),
                 arc_fraction: vec![0.0; 4],
                 unsupported: vec![false; 4],
+                channel_width: Vec::new(),
             }],
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
@@ -4516,6 +4593,7 @@ mod tests {
                 line_widths: Vec::new(),
                 arc_fraction: vec![0.0; 4],
                 unsupported: vec![false; 4],
+                channel_width: Vec::new(),
             }],
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
@@ -4528,7 +4606,7 @@ mod tests {
             path_simplify_enabled: false,
             travel_order_optimization_enabled: false,
             travel_collision_avoidance_enabled: false,
-            curvature_compensation_enabled: Some(false),
+            bead_clearance_compensation_enabled: Some(false),
             ..SlicerConfig::default()
         };
         let tools = vec![Tool::new(ToolId(0), 0.4)];
@@ -4581,6 +4659,7 @@ mod tests {
                 line_widths: Vec::new(),
                 arc_fraction: vec![0.0; 4],
                 unsupported: vec![false; 4],
+                channel_width: Vec::new(),
             }],
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),
@@ -4606,6 +4685,7 @@ mod tests {
                 line_widths: Vec::new(),
                 arc_fraction: vec![0.0; 4],
                 unsupported: vec![false; 4],
+                channel_width: Vec::new(),
             }],
             infill_boundary: Vec::new(),
             solid_fill_boundary: Vec::new(),

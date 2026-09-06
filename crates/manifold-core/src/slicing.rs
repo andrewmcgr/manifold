@@ -220,6 +220,20 @@ pub struct WallLoop {
     /// Per-point dynamic line width in mm (parallel to `points`).
     /// When empty, downstream toolpath planning falls back to nominal configured line width.
     pub line_widths: Vec<f64>,
+    /// Per-point local 2D channel width in mm (parallel to `points`,
+    /// mirroring `line_widths`'s "empty = fall back to nominal"
+    /// convention): `2 * min distance` from that point to the nearest
+    /// opposing 2D boundary on the same wall pass (the next island's
+    /// hole/inner-wall boundary, or the far side of the same loop for a
+    /// thin single-wall feature) -- see `polygon2d::channel_widths`.
+    /// `f64::INFINITY` at a point means "unconstrained", i.e. nothing
+    /// nearby narrows the available bead width there. Consumed by
+    /// `toolpath::plan`'s bead-clearance clamping
+    /// (`config.bead_clearance_compensation_enabled`) instead of the
+    /// removed curvature-radius heuristic. Empty for loops this pass
+    /// never touches (e.g. hand-built loops in tests), same as
+    /// `top_surface`.
+    pub channel_width: Vec<f64>,
 }
 
 /// Build/order direction: conventional planar slicing along
@@ -736,9 +750,16 @@ pub fn slice_mesh_with_progress(
                         &*side_sdf, origin, basis1, basis2, extent, extent, resolution, resolution,
                         iso,
                     );
-                    loops.extend(wall_loops.into_iter().map(|points| {
+                    let wall_loops_2d = polygon2d::to_2d(&wall_loops, basis1, basis2, origin);
+                    loops.extend(wall_loops.into_iter().enumerate().map(|(li, points)| {
                         let arc_fraction = compute_arc_fractions(&points);
                         let n_pts = points.len();
+                        let channel_width = wall_loops_2d
+                            .get(li)
+                            .map(|self_loop| {
+                                polygon2d::channel_widths(self_loop, &wall_loops_2d, li)
+                            })
+                            .unwrap_or_else(|| vec![f64::INFINITY; n_pts]);
                         WallLoop {
                             is_open: false,
                             wall_index,
@@ -747,6 +768,7 @@ pub fn slice_mesh_with_progress(
                             top_surface: Vec::new(),
                             arc_fraction,
                             line_widths: vec![config.wall_line_width; n_pts],
+                            channel_width,
                             points,
                         }
                     }));
@@ -771,6 +793,7 @@ pub fn slice_mesh_with_progress(
                         top_surface: Vec::new(),
                         arc_fraction,
                         line_widths: vec![config.wall_line_width; n_pts],
+                        channel_width: vec![f64::INFINITY; n_pts],
                         points: debug_pts,
                     });
                 }
@@ -862,6 +885,10 @@ pub fn slice_mesh_with_progress(
                 loops.extend(wall0_loops.iter().cloned().enumerate().map(|(i, points)| {
                     let arc_fraction = compute_arc_fractions(&points);
                     let n_pts = points.len();
+                    let channel_width = loops_2d
+                        .get(i)
+                        .map(|self_loop| polygon2d::channel_widths(self_loop, &loops_2d, i))
+                        .unwrap_or_else(|| vec![f64::INFINITY; n_pts]);
                     WallLoop {
                         is_open: false,
                         wall_index: 0,
@@ -870,6 +897,7 @@ pub fn slice_mesh_with_progress(
                         top_surface: Vec::new(),
                         arc_fraction,
                         line_widths: vec![config.wall_line_width; n_pts],
+                        channel_width,
                         points,
                     }
                 }));
@@ -897,6 +925,7 @@ pub fn slice_mesh_with_progress(
                             continue;
                         }
                         let max_along = (config.layer_height * 20.0).max(5.0);
+                        let loops_2d_for_measurement = p_wall.loops_2d.clone();
                         let reconstructed = order_field::reconstruct_on_order_field_near(
                             p_wall.loops_2d,
                             &wall0_loops,
@@ -908,20 +937,33 @@ pub fn slice_mesh_with_progress(
                             max_along,
                             &*field,
                         );
-                        loops.extend(reconstructed.iter().cloned().map(|points| {
-                            let arc_fraction = compute_arc_fractions(&points);
-                            let n_pts = points.len();
-                            WallLoop {
-                                is_open: false,
-                                wall_index: p_wall.wall_index,
-                                island: island_idx,
-                                unsupported: vec![false; n_pts],
-                                top_surface: Vec::new(),
-                                arc_fraction,
-                                line_widths: vec![p_wall.line_width; n_pts],
-                                points,
-                            }
-                        }));
+                        loops.extend(reconstructed.iter().cloned().enumerate().map(
+                            |(li, points)| {
+                                let arc_fraction = compute_arc_fractions(&points);
+                                let n_pts = points.len();
+                                let channel_width = loops_2d_for_measurement
+                                    .get(li)
+                                    .map(|self_loop| {
+                                        polygon2d::channel_widths(
+                                            self_loop,
+                                            &loops_2d_for_measurement,
+                                            li,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| vec![f64::INFINITY; n_pts]);
+                                WallLoop {
+                                    is_open: false,
+                                    wall_index: p_wall.wall_index,
+                                    island: island_idx,
+                                    unsupported: vec![false; n_pts],
+                                    top_surface: Vec::new(),
+                                    arc_fraction,
+                                    line_widths: vec![p_wall.line_width; n_pts],
+                                    channel_width,
+                                    points,
+                                }
+                            },
+                        ));
                     }
                 }
             }
@@ -4061,6 +4103,7 @@ mod tests {
                         DVec3::new(0.0, 0.0, 0.0),
                         DVec3::new(1.0, 0.0, 0.0),
                     ]),
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4080,6 +4123,7 @@ mod tests {
                         DVec3::new(0.01, 0.0, -0.05),
                         DVec3::new(1.01, 0.0, -0.05),
                     ]),
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4119,6 +4163,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0],
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4135,6 +4180,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0],
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4226,6 +4272,7 @@ mod tests {
                     line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&prev_points),
                     points: prev_points,
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4242,6 +4289,7 @@ mod tests {
                     line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&cur_points),
                     points: cur_points,
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4300,6 +4348,7 @@ mod tests {
                     line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&prev_points),
                     points: prev_points,
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4316,6 +4365,7 @@ mod tests {
                     line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&cur_points),
                     points: cur_points,
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4472,6 +4522,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     points: prev_points,
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4488,6 +4539,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     points: cur_points,
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4573,6 +4625,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0],
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4589,6 +4642,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0],
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -4780,6 +4834,7 @@ mod tests {
                         top_surface: Vec::new(),
                         line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
+                        channel_width: Vec::new(),
                     },
                     WallLoop {
                         island: 0,
@@ -4790,6 +4845,7 @@ mod tests {
                         top_surface: Vec::new(),
                         line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
+                        channel_width: Vec::new(),
                     },
                 ],
                 order_field: Arc::clone(&field),
@@ -4808,6 +4864,7 @@ mod tests {
                         top_surface: Vec::new(),
                         line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
+                        channel_width: Vec::new(),
                     },
                     WallLoop {
                         island: 0,
@@ -4818,6 +4875,7 @@ mod tests {
                         top_surface: Vec::new(),
                         line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
+                        channel_width: Vec::new(),
                     },
                 ],
                 order_field: Arc::clone(&field),
@@ -4874,6 +4932,7 @@ mod tests {
                         top_surface: Vec::new(),
                         line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
+                        channel_width: Vec::new(),
                     },
                     WallLoop {
                         island: 0,
@@ -4884,6 +4943,7 @@ mod tests {
                         top_surface: Vec::new(),
                         line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
+                        channel_width: Vec::new(),
                     },
                 ],
                 order_field: Arc::clone(&field),
@@ -4905,6 +4965,7 @@ mod tests {
                         top_surface: Vec::new(),
                         line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
+                        channel_width: Vec::new(),
                     },
                     WallLoop {
                         island: 0,
@@ -4915,6 +4976,7 @@ mod tests {
                         top_surface: Vec::new(),
                         line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
+                        channel_width: Vec::new(),
                     },
                 ],
                 order_field: Arc::clone(&field),
@@ -5039,6 +5101,7 @@ mod tests {
                     top_surface: Vec::new(),
                     line_widths: Vec::new(),
                     arc_fraction: vec![0.0],
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -5056,6 +5119,7 @@ mod tests {
                         top_surface: Vec::new(),
                         line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
+                        channel_width: Vec::new(),
                     },
                     WallLoop {
                         island: 0,
@@ -5066,6 +5130,7 @@ mod tests {
                         top_surface: Vec::new(),
                         line_widths: Vec::new(),
                         arc_fraction: vec![0.0],
+                        channel_width: Vec::new(),
                     },
                 ],
                 order_field: Arc::clone(&field),
@@ -5142,6 +5207,7 @@ mod tests {
                     line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&big_square),
                     points: big_square,
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -5158,6 +5224,7 @@ mod tests {
                     line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&small_square),
                     points: small_square.clone(),
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()
@@ -5255,6 +5322,7 @@ mod tests {
                         line_widths: Vec::new(),
                         arc_fraction: compute_arc_fractions(&prev_a),
                         points: prev_a,
+                        channel_width: Vec::new(),
                     },
                     WallLoop {
                         island: 0,
@@ -5265,6 +5333,7 @@ mod tests {
                         line_widths: Vec::new(),
                         arc_fraction: compute_arc_fractions(&prev_b),
                         points: prev_b,
+                        channel_width: Vec::new(),
                     },
                     WallLoop {
                         island: 0,
@@ -5275,6 +5344,7 @@ mod tests {
                         line_widths: Vec::new(),
                         arc_fraction: compute_arc_fractions(&prev_decoy),
                         points: prev_decoy,
+                        channel_width: Vec::new(),
                     },
                 ],
                 order_field: Arc::clone(&field),
@@ -5292,6 +5362,7 @@ mod tests {
                     line_widths: Vec::new(),
                     arc_fraction: compute_arc_fractions(&current),
                     points: current.clone(),
+                    channel_width: Vec::new(),
                 }],
                 order_field: Arc::clone(&field),
                 ..Layer::default()

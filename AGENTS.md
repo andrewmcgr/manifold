@@ -39,6 +39,9 @@ lists what an agent would otherwise guess wrong.
   boundaries. Don't mix the two the other way.
 - Logging via `tracing`; only binaries call
   `tracing_subscriber::fmt::init()`, never `manifold-core`.
-- No CI configured yet, no mesh-format loaders (STL/3MF) implemented yet
-  — `Mesh` construction in the CLI is currently a placeholder
-  (`Mesh::default()`).
+- No CI configured yet. `manifold-cli` loads real meshes via
+  `manifold_core::stl::load_stl` (`.stl`, binary or ASCII) and
+  `manifold_core::threemf::load_3mf` (`.3mf`), dispatched by file
+  extension in `load_objects` (`crates/manifold-cli/src/main.rs`).
+  `Mesh::default()` only appears in that file's own unit tests as a
+  stand-in placeholder mesh, never in the production load path.

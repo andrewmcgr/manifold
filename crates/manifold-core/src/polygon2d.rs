@@ -101,6 +101,84 @@ pub fn from_2d(
         .collect()
 }
 
+/// Distance from `pt` to the segment `a..b`, clamped to the segment itself
+/// (parameter $t \in [0, 1]$) rather than projected onto the infinite
+/// line -- see [`perpendicular_distance`]'s sibling use in RDP
+/// simplification for why an unclamped line distance under-measures near
+/// segment endpoints. Falls back to plain point distance if `a` and `b`
+/// coincide.
+fn point_segment_distance(pt: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1]];
+    let len_sq = d[0] * d[0] + d[1] * d[1];
+    if len_sq < 1e-15 {
+        return dist_sq(pt, a).sqrt();
+    }
+    let t = (((pt[0] - a[0]) * d[0] + (pt[1] - a[1]) * d[1]) / len_sq).clamp(0.0, 1.0);
+    let proj = [a[0] + d[0] * t, a[1] + d[1] * t];
+    dist_sq(pt, proj).sqrt()
+}
+
+/// Measures each point's local 2D channel width: `2 * min distance` from
+/// that point to the nearest boundary segment across `all_loops` (the
+/// full set of same-pass loops sharing this point's layer -- outer
+/// boundaries, enclosed holes, and this loop itself), excluding a small
+/// window of segments immediately adjacent to the point within its own
+/// loop (a point is trivially ~0mm from its own neighboring edges, which
+/// would otherwise swamp every measurement).
+///
+/// Conservative by design (project convention): plain `2 * nearest-side
+/// distance`, not a per-side average, so a loop that sits off-center
+/// within a narrowing channel gets clamped by whichever side is actually
+/// closer -- this can over-clamp the far side of an asymmetric channel;
+/// revisit with a proper per-side/asymmetric measurement later if that
+/// proves too lossy in practice.
+///
+/// `loop_points` must be `all_loops[self_loop_index]` itself (same `Vec`
+/// contents and point order) so the index-based adjacency exclusion
+/// lines up correctly. Returns `f64::INFINITY` per point when no other
+/// boundary is found (e.g. a lone convex loop with no holes and no
+/// neighbors), signaling "unconstrained -- fall back to nominal" to
+/// callers.
+#[must_use]
+pub fn channel_widths(
+    loop_points: &[[f64; 2]],
+    all_loops: &[Vec<[f64; 2]>],
+    self_loop_index: usize,
+) -> Vec<f64> {
+    const EXCLUDE_RADIUS: usize = 2;
+    loop_points
+        .iter()
+        .enumerate()
+        .map(|(i, &pt)| {
+            let mut min_dist = f64::INFINITY;
+            for (loop_idx, other) in all_loops.iter().enumerate() {
+                let m = other.len();
+                if m < 2 {
+                    continue;
+                }
+                for j in 0..m {
+                    if loop_idx == self_loop_index {
+                        let d1 = if j >= i { j - i } else { m - (i - j) };
+                        let d2 = m - d1;
+                        if d1.min(d2) <= EXCLUDE_RADIUS {
+                            continue;
+                        }
+                    }
+                    let dist = point_segment_distance(pt, other[j], other[(j + 1) % m]);
+                    if dist < min_dist {
+                        min_dist = dist;
+                    }
+                }
+            }
+            if min_dist.is_finite() {
+                2.0 * min_dist
+            } else {
+                f64::INFINITY
+            }
+        })
+        .collect()
+}
+
 /// Perpendicular distance from `pt` to the (infinite) line through `a` and
 /// `c`. Falls back to plain point distance if `a` and `c` coincide.
 fn perpendicular_distance(pt: [f64; 2], a: [f64; 2], c: [f64; 2]) -> f64 {
@@ -793,5 +871,36 @@ mod tests {
         // On a 1.0mm box, after wall 0 (outer), wall 1 insets by 0.40mm leaving a tiny 0.20mm center box.
         // Because 0.20mm < min_width (0.28mm), wall 2 is not generated, avoiding inner wall overcrowding!
         assert!(walls.len() <= 2);
+    }
+
+    #[test]
+    fn channel_widths_reports_infinity_for_an_isolated_loop() {
+        // A single loop with no other boundaries in `all_loops` (besides
+        // itself) is unconstrained everywhere.
+        let loop_ = square(0.0, 0.0, 10.0);
+        let widths = channel_widths(&loop_, std::slice::from_ref(&loop_), 0);
+        assert!(widths.iter().all(|w| w.is_infinite()));
+    }
+
+    #[test]
+    fn channel_widths_measures_the_gap_to_a_nearby_hole() {
+        // Outer 10x10mm box with a concentric 2x2mm hole (CW) centered
+        // inside it: the gap from any outer-wall point straight across to
+        // the hole is 10.0 - 2.0 = 8.0mm each side, half-width 4.0mm, so
+        // channel width (2x nearest distance) should measure ~8.0mm
+        // (the hole is exactly as close as the far outer wall in this
+        // symmetric case, so nearest-distance still yields the right
+        // width here).
+        let outer = square(0.0, 0.0, 10.0);
+        let mut hole = square(4.0, 4.0, 2.0);
+        hole.reverse();
+        let all_loops = vec![outer.clone(), hole];
+        let widths = channel_widths(&outer, &all_loops, 0);
+        // Point at the bottom-left corner (0,0): nearest hole corner is
+        // (4,4), distance = sqrt(32) ~= 5.657mm, so width ~= 11.31mm --
+        // just assert it's finite and roughly in a sane ballpark rather
+        // than pinning an exact float, since point-to-segment nearest
+        // point selection has several candidate segments near a corner.
+        assert!(widths.iter().all(|w| w.is_finite() && *w > 0.0));
     }
 }

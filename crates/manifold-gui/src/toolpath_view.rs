@@ -341,6 +341,7 @@ pub fn data_view_range(
                     is_scarf: false,
                     id: 0,
                     island: 0,
+                    channel_width: f64::INFINITY,
                 };
                 let val = segment_scalar_value(
                     &travel_segment,
@@ -560,6 +561,7 @@ pub fn build_toolpath_lines_filtered(
                     is_scarf: false,
                     id: 0,
                     island: 0,
+                    channel_width: f64::INFINITY,
                 };
                 let color = match data_view {
                     ToolpathDataView::LineType
@@ -751,6 +753,7 @@ mod tests {
                 line_width: 0.4,
                 is_scarf: false,
                 id: 0,
+                channel_width: f64::INFINITY,
             })
             .collect();
         Path {
@@ -849,6 +852,7 @@ mod tests {
                     line_width: 0.4,
                     is_scarf: false,
                     id: 0,
+                    channel_width: f64::INFINITY,
                 },
                 Segment {
                     island: 0,
@@ -861,6 +865,7 @@ mod tests {
                     line_width: 0.4,
                     is_scarf: false,
                     id: 0,
+                    channel_width: f64::INFINITY,
                 },
             ],
             tool: ToolId(0),
@@ -879,6 +884,7 @@ mod tests {
                     line_width: 0.4,
                     is_scarf: false,
                     id: 0,
+                    channel_width: f64::INFINITY,
                 },
                 Segment {
                     island: 0,
@@ -891,6 +897,7 @@ mod tests {
                     line_width: 0.4,
                     is_scarf: false,
                     id: 0,
+                    channel_width: f64::INFINITY,
                 },
             ],
             tool: ToolId(0),
@@ -965,6 +972,7 @@ mod tests {
             line_width: 0.4,
             is_scarf: true,
             id: 0,
+            channel_width: f64::INFINITY,
         };
         assert_eq!(palette_color(seg.kind, seg.is_scarf), COLOR_SCARF_JOINT);
         seg.is_scarf = false;
@@ -1010,6 +1018,7 @@ mod tests {
                 line_width: 0.4,
                 is_scarf: false,
                 id: 0,
+                channel_width: f64::INFINITY,
             },
             Segment {
                 island: 0,
@@ -1022,6 +1031,7 @@ mod tests {
                 line_width: 0.4,
                 is_scarf: false,
                 id: 0,
+                channel_width: f64::INFINITY,
             },
             Segment {
                 island: 0,
@@ -1034,6 +1044,7 @@ mod tests {
                 line_width: 0.0,
                 is_scarf: false,
                 id: 0,
+                channel_width: f64::INFINITY,
             },
         ];
         let path = Path {

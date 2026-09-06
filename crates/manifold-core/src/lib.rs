@@ -100,9 +100,16 @@ pub struct SlicerConfig {
     /// Maximum physical bead width ratio relative to nozzle diameter (default 1.60).
     #[serde(default)]
     pub max_bead_width_ratio: Option<f64>,
-    /// Whether tight-radius corner curvature compensation is enabled (default true).
-    #[serde(default)]
-    pub curvature_compensation_enabled: Option<bool>,
+    /// Whether the measured bead-clearance compensation system is enabled
+    /// (default true) -- clamps nominal bead width/height down to the
+    /// actually-measured XY channel width (`polygon2d::channel_widths`)
+    /// and Z land clearance (`extrusion::z_land_clearance`) wherever real
+    /// geometry constrains them, replacing the old unconditional
+    /// curvature/concavity heuristic multipliers. `#[serde(alias)]`
+    /// preserves compatibility with `profile.json` files saved under the
+    /// old field name.
+    #[serde(default, alias = "curvature_compensation_enabled")]
+    pub bead_clearance_compensation_enabled: Option<bool>,
     /// Infill pattern for sparse interior regions. Defaults to `InfillPatternKind::Cubic`.
     #[serde(default)]
     pub sparse_infill_pattern: Option<infill::InfillPatternKind>,
@@ -541,7 +548,7 @@ impl Default for SlicerConfig {
             min_bead_width_ratio: None,
             max_bead_width_ratio: None,
             slope_compensation_mode: None,
-            curvature_compensation_enabled: None,
+            bead_clearance_compensation_enabled: None,
             sparse_infill_pattern: Some(infill::InfillPatternKind::Cubic),
             solid_infill_pattern: Some(infill::InfillPatternKind::AllWalls),
             infill_pattern: infill::InfillPatternKind::Cubic,
@@ -837,10 +844,10 @@ impl SlicerConfig {
         self.max_bead_width_ratio() * self.nozzle_diameter
     }
 
-    /// Whether tight-radius corner curvature compensation is enabled (default `true`).
+    /// Whether measured bead-clearance compensation is enabled (default `true`).
     #[must_use]
-    pub fn curvature_compensation_enabled(&self) -> bool {
-        self.curvature_compensation_enabled.unwrap_or(true)
+    pub fn bead_clearance_compensation_enabled(&self) -> bool {
+        self.bead_clearance_compensation_enabled.unwrap_or(true)
     }
 
     /// Scarf joint overlap length (mm), defaulting to `8.0` mm when `None`.

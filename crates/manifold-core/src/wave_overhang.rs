@@ -877,6 +877,7 @@ pub fn plan_wave_overhangs(
                             is_scarf: false,
                             id: 0,
                             island: 0,
+                            channel_width: f64::INFINITY,
                         })
                         .collect();
 
@@ -940,6 +941,7 @@ mod tests {
                 top_surface: vec![false; loop_points.len()],
                 arc_fraction: vec![0.0; loop_points.len()],
                 line_widths: vec![0.4; loop_points.len()],
+                channel_width: Vec::new(),
             }],
             infill_boundary: vec![loop_points],
             solid_fill_boundary: Vec::new(),
