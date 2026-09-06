@@ -402,6 +402,7 @@ fn assemble_scanlines_into_paths(
                     line_width: config.infill_line_width,
                     is_scarf: false,
                     id: 0,
+                    island: 0,
                 });
             }
             points.push(world);
@@ -918,6 +919,7 @@ fn generate_tpms_infill(
                 line_width: config.infill_line_width,
                 is_scarf: false,
                 id: 0,
+                island: 0,
             })
             .collect();
         paths.push(Path {
@@ -1184,6 +1186,7 @@ impl InfillGenerator for ConcentricInfill {
                         line_width: config.infill_line_width,
                         is_scarf: false,
                         id: 0,
+                        island: 0,
                     })
                     .collect();
                 Path {
@@ -1286,6 +1289,7 @@ impl InfillGenerator for AllWallsInfill {
                         line_width: config.infill_line_width,
                         is_scarf: false,
                         id: 0,
+                        island: 0,
                     })
                     .collect();
                 Path {

@@ -1171,6 +1171,7 @@ fn route_travel_moves(
                     line_width: 0.0,
                     is_scarf: false,
                     id: 0,
+                    island: 0,
                 })
                 .collect();
             Some((
@@ -1530,6 +1531,12 @@ pub struct Segment {
     pub is_scarf: bool,
     /// Unique sequential extrusion index across the slice job.
     pub id: u32,
+    /// Copied from the source `slicing::WallLoop::island` this segment's
+    /// wall loop belonged to (`0` for segments with no meaningful island,
+    /// e.g. infill/debug paths). Lets `plan` group and reorder each
+    /// island's walls independently (inner-outer-inner print order) and
+    /// lets the GUI hover card show which island a segment belongs to.
+    pub island: usize,
 }
 
 /// A single continuous toolpath (e.g. one perimeter or infill pass).
@@ -1714,6 +1721,7 @@ pub fn plan_with_progress(
                                 line_width: config.wall_line_width,
                                 is_scarf: false,
                                 id: 0,
+                                island: wall_loop.island,
                             })
                             .collect();
                         paths.push(Path {
@@ -1778,6 +1786,7 @@ pub fn plan_with_progress(
                             line_width: line_w,
                             is_scarf: false,
                             id: 0,
+                            island: wall_loop.island,
                         }
                     })
                     .collect();
@@ -2375,6 +2384,7 @@ mod tests {
         let segments = points
             .iter()
             .map(|_| Segment {
+                island: 0,
                 kind: MoveKind::WallOuter,
                 speed: 60.0,
                 extrusion_rate: 1.0,
@@ -2902,6 +2912,7 @@ mod tests {
             order: 0.0,
             loops: vec![
                 WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
@@ -2911,6 +2922,7 @@ mod tests {
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 1,
                     points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
@@ -2950,6 +2962,7 @@ mod tests {
             order: 0.0,
             loops: vec![
                 WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
@@ -2959,6 +2972,7 @@ mod tests {
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 1,
                     points: vec![DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0)],
@@ -2968,6 +2982,7 @@ mod tests {
                     arc_fraction: vec![0.0, 0.5],
                 },
                 WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 2,
                     points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
@@ -3024,6 +3039,7 @@ mod tests {
                 // wrap-around segment 3: points[3] -> points[0], whose
                 // destination is supported) should remain `WallOuter`.
                 WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     points: vec![
@@ -3040,6 +3056,7 @@ mod tests {
                 // wall_index 1: no unsupported points -- must be unaffected
                 // (no regression to plain `WallInner` classification).
                 WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 1,
                     points: vec![DVec3::new(4.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
@@ -3097,6 +3114,7 @@ mod tests {
         let p2 = DVec3::new(5.0, 0.0, 0.0);
         let p3 = DVec3::new(6.0, 0.0, 0.0);
         let wall_segment = Segment {
+            island: 0,
             kind: MoveKind::WallOuter,
             speed: 60.0,
             extrusion_rate: 1.0,
@@ -3108,6 +3126,7 @@ mod tests {
             id: 0,
         };
         let travel_segment = Segment {
+            island: 0,
             kind: MoveKind::Travel,
             speed: 150.0,
             extrusion_rate: 1.0,
@@ -3184,6 +3203,7 @@ mod tests {
         let p2 = DVec3::new(2.0, 0.0, 0.0);
         let p3 = DVec3::new(3.0, 0.0, 0.0);
         let infill_segment = Segment {
+            island: 0,
             kind: MoveKind::Infill,
             speed: 60.0,
             extrusion_rate: 1.0,
@@ -3195,6 +3215,7 @@ mod tests {
             id: 0,
         };
         let travel_segment = Segment {
+            island: 0,
             kind: MoveKind::Travel,
             speed: 150.0,
             extrusion_rate: 1.0,
@@ -3240,6 +3261,7 @@ mod tests {
         let p1 = DVec3::new(5.0, 0.0, 0.0);
         let p2 = DVec3::new(6.0, 0.0, 0.0);
         let travel_segment = Segment {
+            island: 0,
             kind: MoveKind::Travel,
             speed: 150.0,
             extrusion_rate: 1.0,
@@ -3251,6 +3273,7 @@ mod tests {
             id: 0,
         };
         let infill_segment = Segment {
+            island: 0,
             kind: MoveKind::Infill,
             speed: 60.0,
             extrusion_rate: 1.0,
@@ -3289,6 +3312,7 @@ mod tests {
         let p1 = DVec3::new(1.0, 0.0, 0.0);
         let p2 = DVec3::new(5.0, 0.0, 0.0);
         let infill_segment = Segment {
+            island: 0,
             kind: MoveKind::Infill,
             speed: 60.0,
             extrusion_rate: 1.0,
@@ -3300,6 +3324,7 @@ mod tests {
             id: 0,
         };
         let travel_segment = Segment {
+            island: 0,
             kind: MoveKind::Travel,
             speed: 150.0,
             extrusion_rate: 1.0,
@@ -3357,6 +3382,7 @@ mod tests {
         let p1 = DVec3::new(1.0, 0.0, 0.0);
         let p2 = DVec3::new(5.0, 0.0, 0.0);
         let wall_segment = Segment {
+            island: 0,
             kind: MoveKind::WallOuter,
             speed: 60.0,
             extrusion_rate: 1.0,
@@ -3368,6 +3394,7 @@ mod tests {
             id: 0,
         };
         let travel_segment = Segment {
+            island: 0,
             kind: MoveKind::Travel,
             speed: 150.0,
             extrusion_rate: 1.0,
@@ -3428,6 +3455,7 @@ mod tests {
     fn open_path(points: Vec<DVec3>, kind: MoveKind) -> Path {
         let segments = (0..points.len().saturating_sub(1))
             .map(|_| Segment {
+                island: 0,
                 kind,
                 speed: 60.0,
                 extrusion_rate: 1.0,
@@ -3450,6 +3478,7 @@ mod tests {
         let segments = points
             .iter()
             .map(|_| Segment {
+                island: 0,
                 kind,
                 speed: 60.0,
                 extrusion_rate: 1.0,
@@ -4298,6 +4327,7 @@ mod tests {
             index: 0,
             order: 0.2,
             loops: vec![WallLoop {
+                island: 0,
                 is_open: false,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.2),
@@ -4322,6 +4352,7 @@ mod tests {
             index: 5,
             order: 5.0,
             loops: vec![WallLoop {
+                island: 0,
                 is_open: false,
                 points: vec![p0, p1, p2, p3],
                 wall_index: 0,
@@ -4381,6 +4412,7 @@ mod tests {
             index: 0,
             order: 0.0,
             loops: vec![WallLoop {
+                island: 0,
                 is_open: false,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.0),
@@ -4405,6 +4437,7 @@ mod tests {
             index: 1,
             order: 1.0,
             loops: vec![WallLoop {
+                island: 0,
                 is_open: false,
                 points: vec![
                     DVec3::new(0.0, 0.0, 0.0),

@@ -886,6 +886,7 @@ pub fn apply_wipe_moves(
         line_width: 0.0,
         is_scarf: false,
         id: 0,
+        island: last_seg.island,
     };
 
     points.push(p_wipe);
@@ -1613,6 +1614,7 @@ mod tests {
         ];
         let mut segments = vec![
             crate::toolpath::Segment {
+                island: 0,
                 kind: MoveKind::WallOuter,
                 speed: 60.0,
                 extrusion_rate: 1.0,
@@ -1657,6 +1659,7 @@ mod tests {
         ];
         let mut segments = vec![
             crate::toolpath::Segment {
+                island: 0,
                 kind: MoveKind::WallOuter,
                 speed: 60.0,
                 extrusion_rate: 1.0,

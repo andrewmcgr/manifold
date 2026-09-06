@@ -876,6 +876,7 @@ pub fn plan_wave_overhangs(
                             line_width: config.wall_line_width,
                             is_scarf: false,
                             id: 0,
+                            island: 0,
                         })
                         .collect();
 
@@ -931,6 +932,7 @@ mod tests {
             object: ObjectId(0),
             order,
             loops: vec![WallLoop {
+                island: 0,
                 is_open: false,
                 wall_index: 0,
                 points: loop_points.clone(),

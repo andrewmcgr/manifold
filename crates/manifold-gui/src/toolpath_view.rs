@@ -340,6 +340,7 @@ pub fn data_view_range(
                     line_width: 0.0,
                     is_scarf: false,
                     id: 0,
+                    island: 0,
                 };
                 let val = segment_scalar_value(
                     &travel_segment,
@@ -558,6 +559,7 @@ pub fn build_toolpath_lines_filtered(
                     line_width: 0.0,
                     is_scarf: false,
                     id: 0,
+                    island: 0,
                 };
                 let color = match data_view {
                     ToolpathDataView::LineType
@@ -739,6 +741,7 @@ mod tests {
         let segments = kinds
             .iter()
             .map(|&kind| Segment {
+                island: 0,
                 kind,
                 speed: 60.0,
                 extrusion_rate: 1.0,
@@ -836,6 +839,7 @@ mod tests {
             points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(10.0, 0.0, 0.0)],
             segments: vec![
                 Segment {
+                    island: 0,
                     kind: MoveKind::WallOuter,
                     speed: 60.0,
                     extrusion_rate: 1.0,
@@ -847,6 +851,7 @@ mod tests {
                     id: 0,
                 },
                 Segment {
+                    island: 0,
                     kind: MoveKind::WallOuter,
                     speed: 60.0,
                     extrusion_rate: 1.0,
@@ -864,6 +869,7 @@ mod tests {
             points: vec![DVec3::new(20.0, 20.0, 0.2), DVec3::new(30.0, 20.0, 0.2)],
             segments: vec![
                 Segment {
+                    island: 0,
                     kind: MoveKind::WallOuter,
                     speed: 60.0,
                     extrusion_rate: 1.0,
@@ -875,6 +881,7 @@ mod tests {
                     id: 0,
                 },
                 Segment {
+                    island: 0,
                     kind: MoveKind::WallOuter,
                     speed: 60.0,
                     extrusion_rate: 1.0,
@@ -948,6 +955,7 @@ mod tests {
     #[test]
     fn scarf_joint_segments_are_colored_with_scarf_palette() {
         let mut seg = Segment {
+            island: 0,
             kind: MoveKind::WallOuter,
             speed: 60.0,
             extrusion_rate: 1.0,
@@ -992,6 +1000,7 @@ mod tests {
         ];
         let segments = vec![
             Segment {
+                island: 0,
                 kind: MoveKind::WallOuter,
                 speed: 1200.0, // 20 mm/s (low)
                 extrusion_rate: 1.0,
@@ -1003,6 +1012,7 @@ mod tests {
                 id: 0,
             },
             Segment {
+                island: 0,
                 kind: MoveKind::Infill,
                 speed: 12000.0, // 200 mm/s (high)
                 extrusion_rate: 1.0,
@@ -1014,6 +1024,7 @@ mod tests {
                 id: 0,
             },
             Segment {
+                island: 0,
                 kind: MoveKind::Travel,
                 speed: 18000.0, // 300 mm/s (travel)
                 extrusion_rate: 0.0,

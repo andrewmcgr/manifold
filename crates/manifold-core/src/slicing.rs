@@ -143,6 +143,17 @@ pub struct WallLoop {
     /// `0` = outermost wall, increasing inward. Used by
     /// `toolpath::plan` to classify segments as `WallOuter`/`WallInner`.
     pub wall_index: usize,
+    /// Index grouping this wall loop with the other wall loops (across all
+    /// `wall_index` values) that belong to the same disconnected
+    /// outer-boundary-plus-enclosed-holes island on this layer (see the
+    /// island-partitioning pass in `slice_mesh_with_progress`). Distinct
+    /// islands on the same layer always get distinct indices; loops from
+    /// the same island (e.g. wall 0 and its nested wall 1/2/...) share the
+    /// same index. Used by `toolpath::plan` to group and reorder each
+    /// island's walls independently (inner-outer-inner print order)
+    /// without accidentally interleaving unrelated islands. Also surfaced
+    /// on `toolpath::Segment::island` for GUI hover-card diagnostics.
+    pub island: usize,
     /// Whether this wall is an open polyline (does not close back to `points[0]`).
     pub is_open: bool,
     /// Polyline in world space (see [`Layer::loops`]).
@@ -731,6 +742,7 @@ pub fn slice_mesh_with_progress(
                         WallLoop {
                             is_open: false,
                             wall_index,
+                            island: 0,
                             unsupported: vec![false; n_pts],
                             top_surface: Vec::new(),
                             arc_fraction,
@@ -754,6 +766,7 @@ pub fn slice_mesh_with_progress(
                     loops.push(WallLoop {
                         is_open: false,
                         wall_index: 999,
+                        island: 0,
                         unsupported: vec![false; n_pts],
                         top_surface: Vec::new(),
                         arc_fraction,
@@ -761,19 +774,6 @@ pub fn slice_mesh_with_progress(
                         points: debug_pts,
                     });
                 }
-                loops.extend(wall0_loops.iter().cloned().map(|points| {
-                    let arc_fraction = compute_arc_fractions(&points);
-                    let n_pts = points.len();
-                    WallLoop {
-                        is_open: false,
-                        wall_index: 0,
-                        unsupported: vec![false; n_pts],
-                        top_surface: Vec::new(),
-                        arc_fraction,
-                        line_widths: vec![config.wall_line_width; n_pts],
-                        points,
-                    }
-                }));
                 // Walls 1..wall_count: each one `wall_line_width` step
                 // further inward than the previous, derived by offsetting
                 // the previous wall's own loop in the tangent plane and
@@ -821,7 +821,60 @@ pub fn slice_mesh_with_progress(
                     }
                 }
 
-                for island_2d in &islands {
+                // Map each wall-0 loop (in its original extraction order) to
+                // the island index it was grouped into above, by matching 2D
+                // centroids -- invariant to `canonicalize`'s possible winding
+                // reversal (which never changes a loop's point *set*, only
+                // its start point/direction, so a plain first-point or
+                // ordered comparison would not survive it). Falls back to
+                // island `0` for a wall-0 loop `canonicalize` dropped as
+                // degenerate (near-zero area / <3 points -- see its doc
+                // comment), which cannot meaningfully belong to any island's
+                // print-order group anyway.
+                let loop_centroid = |loop_2d: &[[f64; 2]]| -> [f64; 2] {
+                    if loop_2d.is_empty() {
+                        return [0.0, 0.0];
+                    }
+                    let (sx, sy) = loop_2d
+                        .iter()
+                        .fold((0.0, 0.0), |(sx, sy), p| (sx + p[0], sy + p[1]));
+                    let n = loop_2d.len() as f64;
+                    [sx / n, sy / n]
+                };
+                const CENTROID_MATCH_EPS: f64 = 1e-6;
+                let wall0_island: Vec<usize> = loops_2d
+                    .iter()
+                    .map(|loop_2d| {
+                        let c = loop_centroid(loop_2d);
+                        islands
+                            .iter()
+                            .position(|island| {
+                                island.iter().any(|member| {
+                                    let mc = loop_centroid(member);
+                                    (mc[0] - c[0]).abs() < CENTROID_MATCH_EPS
+                                        && (mc[1] - c[1]).abs() < CENTROID_MATCH_EPS
+                                })
+                            })
+                            .unwrap_or(0)
+                    })
+                    .collect();
+
+                loops.extend(wall0_loops.iter().cloned().enumerate().map(|(i, points)| {
+                    let arc_fraction = compute_arc_fractions(&points);
+                    let n_pts = points.len();
+                    WallLoop {
+                        is_open: false,
+                        wall_index: 0,
+                        island: wall0_island.get(i).copied().unwrap_or(0),
+                        unsupported: vec![false; n_pts],
+                        top_surface: Vec::new(),
+                        arc_fraction,
+                        line_widths: vec![config.wall_line_width; n_pts],
+                        points,
+                    }
+                }));
+
+                for (island_idx, island_2d) in islands.iter().enumerate() {
                     let partitioned = polygon2d::partition_walls_adaptive(
                         island_2d,
                         config.wall_line_width,
@@ -861,6 +914,7 @@ pub fn slice_mesh_with_progress(
                             WallLoop {
                                 is_open: false,
                                 wall_index: p_wall.wall_index,
+                                island: island_idx,
                                 unsupported: vec![false; n_pts],
                                 top_surface: Vec::new(),
                                 arc_fraction,
@@ -3996,6 +4050,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
@@ -4014,6 +4069,7 @@ mod tests {
                 index: 1,
                 order: 0.05,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(0.01, 0.0, -0.05), DVec3::new(1.01, 0.0, -0.05)],
@@ -4055,6 +4111,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
@@ -4070,6 +4127,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(2.0, 0.0, -0.2)],
@@ -4160,6 +4218,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; prev_points.len()],
@@ -4175,6 +4234,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; cur_points.len()],
@@ -4232,6 +4292,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; prev_points.len()],
@@ -4247,6 +4308,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; cur_points.len()],
@@ -4402,6 +4464,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     arc_fraction: compute_arc_fractions(&prev_points),
@@ -4417,6 +4480,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     arc_fraction: compute_arc_fractions(&cur_points),
@@ -4501,6 +4565,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
@@ -4516,6 +4581,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(7.0, 0.0, -0.2)],
@@ -4706,6 +4772,7 @@ mod tests {
                 order: 0.0,
                 loops: vec![
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(0.0, 0.0, 0.0)],
@@ -4715,6 +4782,7 @@ mod tests {
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(100.0, 0.0, 0.0)],
@@ -4732,6 +4800,7 @@ mod tests {
                 order: 0.2,
                 loops: vec![
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
@@ -4741,6 +4810,7 @@ mod tests {
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(102.0, 0.0, -0.2)],
@@ -4796,6 +4866,7 @@ mod tests {
                 order: 0.0,
                 loops: vec![
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(0.0, 0.0, 0.0)],
@@ -4805,6 +4876,7 @@ mod tests {
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(100.0, 0.0, 0.0)],
@@ -4825,6 +4897,7 @@ mod tests {
                 // and vice versa.
                 loops: vec![
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(102.0, 0.0, -0.2)],
@@ -4834,6 +4907,7 @@ mod tests {
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
@@ -4957,6 +5031,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     points: vec![DVec3::new(0.0, 0.0, 0.0)],
@@ -4973,6 +5048,7 @@ mod tests {
                 order: 0.2,
                 loops: vec![
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(2.0, 0.0, -0.2)],
@@ -4982,6 +5058,7 @@ mod tests {
                         arc_fraction: vec![0.0],
                     },
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         points: vec![DVec3::new(1000.0, 0.0, -0.2)],
@@ -5057,6 +5134,7 @@ mod tests {
                 index: 0,
                 order: 0.0,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; big_square.len()],
@@ -5072,6 +5150,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; small_square.len()],
@@ -5168,6 +5247,7 @@ mod tests {
                 order: 0.0,
                 loops: vec![
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         unsupported: vec![false; prev_a.len()],
@@ -5177,6 +5257,7 @@ mod tests {
                         points: prev_a,
                     },
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         unsupported: vec![false; prev_b.len()],
@@ -5186,6 +5267,7 @@ mod tests {
                         points: prev_b,
                     },
                     WallLoop {
+                        island: 0,
                         is_open: false,
                         wall_index: 0,
                         unsupported: vec![false; prev_decoy.len()],
@@ -5202,6 +5284,7 @@ mod tests {
                 index: 1,
                 order: 0.2,
                 loops: vec![WallLoop {
+                    island: 0,
                     is_open: false,
                     wall_index: 0,
                     unsupported: vec![false; current.len()],
