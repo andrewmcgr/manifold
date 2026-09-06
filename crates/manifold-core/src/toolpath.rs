@@ -1965,9 +1965,6 @@ pub fn plan_with_progress(
                 });
             }
             let wall_path_count = paths.len();
-            if layer.order < 3.0 {
-                eprintln!("DBG layer.order={} after wall build: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
-            }
 
             let region = InfillRegion::from_layer(layer, config);
             let (sparse_loops, narrow_solid_loops): (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) =
@@ -2030,9 +2027,6 @@ pub fn plan_with_progress(
             }
 
             let min_open_path_len = config.nozzle_diameter * 2.0;
-            if layer.order < 3.0 {
-                eprintln!("DBG layer.order={} before min_open_path_len filter: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
-            }
             let mut wall_path_count = wall_path_count;
             let paths: Vec<Path> = paths
                 .into_iter()
@@ -2071,21 +2065,9 @@ pub fn plan_with_progress(
                 layer.order,
                 config.nozzle_diameter,
             );
-            if layer.order < 3.0 {
-                eprintln!("DBG layer.order={} after retain_contained_paths: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
-            }
             let paths = compensate_flat_nozzle(paths, layer, config, tools);
-            if layer.order < 3.0 {
-                eprintln!("DBG layer.order={} after compensate_flat_nozzle: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
-            }
             let paths = simplify_paths(paths, config);
-            if layer.order < 3.0 {
-                eprintln!("DBG layer.order={} after simplify_paths: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
-            }
             let paths = optimize_travel_order(paths, config, z_travel_penalty, wall_path_count);
-            if layer.order < 3.0 {
-                eprintln!("DBG layer.order={} after optimize_travel_order: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
-            }
             let paths = route_travel_moves(
                 paths,
                 layer.mesh_sdf.as_deref(),
@@ -2094,9 +2076,6 @@ pub fn plan_with_progress(
                 config,
                 z_travel_penalty,
             );
-            if layer.order < 3.0 {
-                eprintln!("DBG layer.order={} after route_travel_moves: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
-            }
             let mut paths = insert_z_hops(paths, config);
 
             let extrusion_multiplier = tools
@@ -2335,24 +2314,6 @@ pub fn plan_with_progress(
 
             // Drop unprintable micro-paths whose total extruding length is negligible (< 0.5 * nozzle_diameter or total E < 0.0005 mm)
             let min_extruding_distance = config.nozzle_diameter * 0.5;
-            if layer.order < 3.0 {
-                for (idx, path) in paths.iter().enumerate().take(5) {
-                    let n = path.points.len();
-                    let mut total_d = 0.0;
-                    let mut total_e = 0.0;
-                    for (i, segment) in path.segments.iter().enumerate() {
-                        if segment.kind != MoveKind::Travel {
-                            if n >= 2 {
-                                let p0 = path.points[i];
-                                let p1 = path.points[(i + 1) % n];
-                                total_d += p0.distance(p1);
-                            }
-                            total_e += segment.extrusion_length;
-                        }
-                    }
-                    eprintln!("DBG layer.order={} path[{}]: n_points={} n_segs={} total_d={} total_e={}", layer.order, idx, n, path.segments.len(), total_d, total_e);
-                }
-            }
             let mut paths: Vec<Path> = paths
                 .into_iter()
                 .filter(|path| {
@@ -2373,9 +2334,6 @@ pub fn plan_with_progress(
                     total_d >= min_extruding_distance && total_e >= 0.0005
                 })
                 .collect();
-            if layer.order < 3.0 {
-                eprintln!("DBG layer.order={} after min_extruding_distance filter: {} paths, {} total segs", layer.order, paths.len(), paths.iter().map(|p| p.segments.len()).sum::<usize>());
-            }
 
             // Ensure no planned points dip below the build bed floor (Z = 0.0)
             for path in &mut paths {

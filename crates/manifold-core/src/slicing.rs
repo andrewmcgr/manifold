@@ -757,7 +757,12 @@ pub fn slice_mesh_with_progress(
                         let channel_width = wall_loops_2d
                             .get(li)
                             .map(|self_loop| {
-                                polygon2d::channel_widths(self_loop, &wall_loops_2d, li)
+                                polygon2d::channel_widths(
+                                    self_loop,
+                                    &wall_loops_2d,
+                                    li,
+                                    2.0 * config.wall_line_width,
+                                )
                             })
                             .unwrap_or_else(|| vec![f64::INFINITY; n_pts]);
                         WallLoop {
@@ -887,7 +892,14 @@ pub fn slice_mesh_with_progress(
                     let n_pts = points.len();
                     let channel_width = loops_2d
                         .get(i)
-                        .map(|self_loop| polygon2d::channel_widths(self_loop, &loops_2d, i))
+                        .map(|self_loop| {
+                            polygon2d::channel_widths(
+                                self_loop,
+                                &loops_2d,
+                                i,
+                                2.0 * config.wall_line_width,
+                            )
+                        })
                         .unwrap_or_else(|| vec![f64::INFINITY; n_pts]);
                     WallLoop {
                         is_open: false,
@@ -948,6 +960,7 @@ pub fn slice_mesh_with_progress(
                                             self_loop,
                                             &loops_2d_for_measurement,
                                             li,
+                                            2.0 * config.wall_line_width,
                                         )
                                     })
                                     .unwrap_or_else(|| vec![f64::INFINITY; n_pts]);

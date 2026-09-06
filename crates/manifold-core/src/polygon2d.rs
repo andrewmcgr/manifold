@@ -121,10 +121,10 @@ fn point_segment_distance(pt: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
 /// Measures each point's local 2D channel width: `2 * min distance` from
 /// that point to the nearest boundary segment across `all_loops` (the
 /// full set of same-pass loops sharing this point's layer -- outer
-/// boundaries, enclosed holes, and this loop itself), excluding a small
-/// window of segments immediately adjacent to the point within its own
-/// loop (a point is trivially ~0mm from its own neighboring edges, which
-/// would otherwise swamp every measurement).
+/// boundaries, enclosed holes, and other islands), excluding a local
+/// neighborhood of segments immediately adjacent to the point *within its
+/// own loop*, measured by cumulative arc length along the loop rather
+/// than point-index count (see `exclude_arc_length` below for why).
 ///
 /// Conservative by design (project convention): plain `2 * nearest-side
 /// distance`, not a per-side average, so a loop that sits off-center
@@ -133,38 +133,99 @@ fn point_segment_distance(pt: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
 /// revisit with a proper per-side/asymmetric measurement later if that
 /// proves too lossy in practice.
 ///
+/// Same-loop (self) candidates are handled in two tiers:
+/// - When `all_loops` contains only this one loop (no hole, no other
+///   island on this layer), self-comparison is skipped entirely and
+///   every point reads `f64::INFINITY` -- a lone loop cannot form a
+///   "channel" with itself in the sense this function measures (that
+///   would require detecting a genuine concave/reflex self-fold, which
+///   this simple nearest-segment measurement cannot distinguish from an
+///   ordinary convex loop's own far side; see doc examples below).
+/// - Otherwise (a hole or another island is present), same-loop segments
+///   are still compared (to catch a real narrow reflex fold-back), but
+///   are excluded near `pt` by two independent, always-applied rules:
+///   the two segments directly touching `pt` (index distance <= 1, an
+///   exact zero-distance case for any loop) are always excluded, and
+///   `exclude_arc_length` extends that exclusion by physical distance
+///   along the perimeter (shorter direction) rather than point-index
+///   count. Callers should pass a physically meaningful bead-scale
+///   distance for `exclude_arc_length` (e.g. `2.0 * wall_line_width`). A
+///   fixed *index*-count window alone (the previous approach) is
+///   resolution-dependent: on a finely sampled, tightly-curved contour
+///   (small-radius cylindrical/threaded geometry, which needs many
+///   points per revolution to stay accurate), points only a few indices
+///   apart can still be a small fraction of a millimeter apart in real
+///   space -- purely an artifact of the contour's own curvature and
+///   sampling density, not an actual channel constraint. An index-based
+///   window mistook that self-curvature for a squeezing neighboring
+///   boundary and could clamp the bead almost to nothing (observed: 77%
+///   of samples on a finely sampled small-radius screw part measured
+///   `< 0.2mm`, with a minimum of exactly `0.0mm`). Measuring by
+///   physical arc length instead makes the exclusion window's *real
+///   size* invariant to how densely the loop happens to be sampled.
+///
 /// `loop_points` must be `all_loops[self_loop_index]` itself (same `Vec`
-/// contents and point order) so the index-based adjacency exclusion
-/// lines up correctly. Returns `f64::INFINITY` per point when no other
-/// boundary is found (e.g. a lone convex loop with no holes and no
-/// neighbors), signaling "unconstrained -- fall back to nominal" to
+/// contents and point order) so the adjacency exclusion lines up
+/// correctly. Returns `f64::INFINITY` per point when no other boundary
+/// is found, signaling "unconstrained -- fall back to nominal" to
 /// callers.
 #[must_use]
 pub fn channel_widths(
     loop_points: &[[f64; 2]],
     all_loops: &[Vec<[f64; 2]>],
     self_loop_index: usize,
+    exclude_arc_length: f64,
 ) -> Vec<f64> {
-    const EXCLUDE_RADIUS: usize = 2;
+    let m = loop_points.len();
+    let self_loop_is_alone = all_loops.len() <= 1;
+    // Cumulative arc length walking the loop forward from point 0, plus
+    // the closing segment back to point 0, so `cumulative[k]` is the
+    // perimeter distance from point 0 to point k, and `perimeter` is the
+    // loop's total closed-loop length.
+    let mut cumulative = vec![0.0; m.max(1)];
+    for k in 1..m {
+        cumulative[k] = cumulative[k - 1] + dist_sq(loop_points[k - 1], loop_points[k]).sqrt();
+    }
+    let perimeter = if m >= 2 {
+        cumulative[m - 1] + dist_sq(loop_points[m - 1], loop_points[0]).sqrt()
+    } else {
+        0.0
+    };
+    // Arc-length separation between points `i` and `j` on this loop,
+    // taking whichever direction around the closed loop is shorter.
+    let arc_distance = |i: usize, j: usize| -> f64 {
+        let forward = (cumulative[i] - cumulative[j]).abs();
+        forward.min(perimeter - forward)
+    };
+    // Index distance between `i` and `j` around an `m`-point closed loop,
+    // taking whichever direction is shorter -- used only for the
+    // always-on trivial-touch exclusion (the two segments literally
+    // incident to `pt`), which is exact regardless of arc length.
+    let index_distance = |i: usize, j: usize| -> usize {
+        let forward = if j >= i { j - i } else { m - (i - j) };
+        forward.min(m - forward)
+    };
+
     loop_points
         .iter()
         .enumerate()
         .map(|(i, &pt)| {
+            if self_loop_is_alone {
+                return f64::INFINITY;
+            }
             let mut min_dist = f64::INFINITY;
             for (loop_idx, other) in all_loops.iter().enumerate() {
-                let m = other.len();
-                if m < 2 {
+                let n = other.len();
+                if n < 2 {
                     continue;
                 }
-                for j in 0..m {
-                    if loop_idx == self_loop_index {
-                        let d1 = if j >= i { j - i } else { m - (i - j) };
-                        let d2 = m - d1;
-                        if d1.min(d2) <= EXCLUDE_RADIUS {
-                            continue;
-                        }
+                for j in 0..n {
+                    if loop_idx == self_loop_index
+                        && (index_distance(i, j) <= 1 || arc_distance(i, j) < exclude_arc_length)
+                    {
+                        continue;
                     }
-                    let dist = point_segment_distance(pt, other[j], other[(j + 1) % m]);
+                    let dist = point_segment_distance(pt, other[j], other[(j + 1) % n]);
                     if dist < min_dist {
                         min_dist = dist;
                     }
@@ -878,7 +939,7 @@ mod tests {
         // A single loop with no other boundaries in `all_loops` (besides
         // itself) is unconstrained everywhere.
         let loop_ = square(0.0, 0.0, 10.0);
-        let widths = channel_widths(&loop_, std::slice::from_ref(&loop_), 0);
+        let widths = channel_widths(&loop_, std::slice::from_ref(&loop_), 0, 0.8);
         assert!(widths.iter().all(|w| w.is_infinite()));
     }
 
@@ -895,7 +956,7 @@ mod tests {
         let mut hole = square(4.0, 4.0, 2.0);
         hole.reverse();
         let all_loops = vec![outer.clone(), hole];
-        let widths = channel_widths(&outer, &all_loops, 0);
+        let widths = channel_widths(&outer, &all_loops, 0, 0.8);
         // Point at the bottom-left corner (0,0): nearest hole corner is
         // (4,4), distance = sqrt(32) ~= 5.657mm, so width ~= 11.31mm --
         // just assert it's finite and roughly in a sane ballpark rather

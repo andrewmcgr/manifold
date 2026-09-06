@@ -673,6 +673,21 @@ impl ManifoldApp {
                 egui::Slider::new(&mut self.config.wall_line_width, 0.05..=1.5)
                     .text("Wall line width (mm)"),
             );
+            let mut bead_clearance_compensation = self.config.bead_clearance_compensation_enabled();
+            if ui
+                .checkbox(
+                    &mut bead_clearance_compensation,
+                    "Bead clearance compensation",
+                )
+                .on_hover_text(
+                    "Clamps bead width/height down to measured available room \
+                     (nearby wall/channel width, flat-nozzle-land clearance) \
+                     so extruded material never has nowhere to go.",
+                )
+                .changed()
+            {
+                self.config.bead_clearance_compensation_enabled = Some(bead_clearance_compensation);
+            }
             let mut slope_mode = self.config.slope_compensation_mode();
             egui::ComboBox::from_label("Slope compensation mode")
                 .selected_text(match slope_mode {

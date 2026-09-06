@@ -96,13 +96,16 @@ pub fn blended_bead_cross_section_area(
 /// (`concavity_compensated_bead_area`) with a direct measurement against
 /// the real solid geometry: samples `land_radius`-wide across the land,
 /// and at each transverse offset queries `mesh_sdf` at the bead's nominal
-/// top (`p + build_dir * nominal_height`). A negative (inside-solid)
-/// reading there means solid material already occupies space above where
-/// this bead's top would nominally sit -- the achievable height is
-/// clamped down to how far below that intrusion the land can actually
-/// reach. Returns `nominal_height` unclamped (a no-op) when nothing
-/// intrudes, or when `mesh_sdf` is unavailable (e.g. hand-built test
-/// layers) -- flat/convex terrain never gets clamped.
+/// top (`p + build_dir * nominal_height`). A reading there that is both
+/// shallowly negative (inside solid, but not deep bulk) *and* measurably
+/// closer to the surface than the same lateral offset at the current layer
+/// means a ceiling is genuinely converging/closing in from above -- the
+/// achievable height is clamped down to how far below that intrusion the
+/// land can actually reach. Returns `nominal_height` unclamped (a no-op)
+/// when nothing intrudes, when the surface there is no closer than it is
+/// at the current layer (e.g. an ordinary vertical, untapered wall, whose
+/// cross-section doesn't change with Z), or when `mesh_sdf` is unavailable
+/// (e.g. hand-built test layers) -- flat/convex terrain never gets clamped.
 #[must_use]
 pub fn z_land_clearance(
     p: DVec3,
@@ -126,16 +129,38 @@ pub fn z_land_clearance(
     let mut achievable_height = nominal_height;
     for i in 0..SAMPLE_COUNT {
         let t = (i as f64 / (SAMPLE_COUNT - 1) as f64).mul_add(2.0, -1.0); // [-1, 1]
-        let probe = top + perp * (t * land_radius);
+        let lateral = perp * (t * land_radius);
+        let probe = top + lateral;
         let distance = sdf.sample(probe).value;
         // A probe landing deep inside the solid bulk (far from any surface,
         // i.e. `distance <= -nominal_height`) means there is no nearby
         // intrusion above the land -- it's ordinary interior material, not
         // an overhang squeezing the land from above, so it must not affect
         // achievable_height at all. Only a shallow negative reading (a real
-        // nearby surface within one nominal layer height) represents an
-        // actual land-clearance constraint.
-        if distance < 0.0 && distance > -nominal_height {
+        // nearby surface within one nominal layer height) represents a
+        // *candidate* land-clearance constraint.
+        //
+        // That candidate is only a genuine overhang/converging ceiling
+        // closing in from above if the surface is measurably *closer* at
+        // `top` than it is at the current layer's own point at the same
+        // lateral offset (`p + lateral`) -- i.e. `distance` (at `top`) is
+        // shallower than `distance_now` (at `p`) by more than a small
+        // tolerance. A plain vertical (untapered) wall has an unchanging
+        // cross-section as Z increases, so `distance` and `distance_now`
+        // are the same value one nominal layer height apart on either side
+        // of it -- both shallow negative (a bead's own centerline sits
+        // `line_width / 2` inside its own solid, comparable in magnitude
+        // to a typical layer height), which the old "just check `distance`
+        // alone" logic couldn't distinguish from a real intrusion, and so
+        // clamped achievable height on almost every wall segment in the
+        // model. Comparing against the current layer's own reading at the
+        // same lateral offset restores the intended meaning: the surface
+        // has to actually be closing in, not just present, to constrain
+        // this land.
+        const CONVERGENCE_EPS: f64 = 1e-6;
+        let distance_now = sdf.sample(p + lateral).value;
+        if distance < 0.0 && distance > -nominal_height && distance > distance_now + CONVERGENCE_EPS
+        {
             let clearance = (nominal_height + distance).max(0.0);
             achievable_height = achievable_height.min(clearance);
         }
@@ -392,6 +417,43 @@ mod tests {
         );
         assert!(h < nominal_height, "expected clamp, got {h}");
         assert!(h >= 0.0);
+    }
+
+    #[test]
+    fn z_land_clearance_full_on_an_ordinary_untapered_vertical_wall() {
+        // Regression test for the global-underextrusion bug: a bead sitting
+        // right at the centerline near a *vertical* (untapered) face -- the
+        // ordinary case for the overwhelming majority of wall segments in
+        // any real print. The bead's own centerline is shallowly inside the
+        // solid (bead half-width, e.g. ~0.05mm from the face here), which is
+        // the same order of magnitude as a typical nominal_height -- exactly
+        // the shallow-negative range this function otherwise treats as a
+        // "candidate intrusion". Because the face is vertical, one nominal
+        // layer height straight up lands at the *same* shallow distance from
+        // the face, not a new, closer one -- this is the wall simply
+        // continuing upward, not a ceiling closing in from above, and must
+        // not clamp achievable height at all. Before the current-layer
+        // baseline check was added, this exact scenario clamped >50% of all
+        // wall segments across a real test mesh, crushing total extruded
+        // volume to ~60% of nominal.
+        let sdf = cube_sdf_fixture_sized(10.0);
+        // Just inside the x=0 face, deep in Z away from the top/bottom faces
+        // so only the vertical x=0 face is in play.
+        let p = DVec3::new(0.05, 5.0, 5.0);
+        let nominal_height = 0.2;
+        let land_radius = 0.1;
+        let h = z_land_clearance(
+            p,
+            DVec3::Y,
+            DVec3::Z,
+            nominal_height,
+            land_radius,
+            Some(&sdf),
+        );
+        assert_eq!(
+            h, nominal_height,
+            "an ordinary vertical wall must not self-clamp achievable height, got {h}"
+        );
     }
 
     #[test]
