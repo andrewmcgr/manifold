@@ -1836,12 +1836,13 @@ pub fn plan_with_progress(
     let on_progress = Mutex::new(on_progress);
     let z_travel_penalty = config.resolved_z_travel_penalty(machine);
 
+    let default_tool = objects.first().map(|o| o.tool).unwrap_or(ToolId(0));
     let wave_overhang_plan = if config.wave_overhangs_enabled() {
-        let default_tool = objects.first().map(|o| o.tool).unwrap_or(ToolId(0));
         crate::wave_overhang::plan_wave_overhangs(layers, config, default_tool)
     } else {
         crate::wave_overhang::WaveOverhangPlan::default()
     };
+    let bridge_plan = crate::bridge::plan_bridges(layers, config, default_tool);
 
     let per_layer: Vec<Vec<Path>> = layers
         .par_iter()
@@ -1857,6 +1858,29 @@ pub fn plan_with_progress(
                 })?;
 
             let is_layer_0 = layer.index == 0 || (layer.order - order_min).abs() < 1e-6;
+
+            let (axis, apex, _) =
+                crate::order_field::resolve_axis_apex_slope(config.order_field, config);
+            let (basis1, basis2) = manifold_fidget::contour::plane_basis(axis);
+            let origin = apex;
+
+            // Compute unsupported footprint for this layer (wave overhangs and bridges)
+            let mut unsupported_footprint_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+            if let Some(wf) = wave_overhang_plan
+                .overhang_footprints_by_layer
+                .get(layer.index)
+            {
+                unsupported_footprint_2d.extend(wf.iter().cloned());
+            }
+            if let Some(bf) = bridge_plan.bridge_footprints_by_layer.get(layer.index) {
+                unsupported_footprint_2d.extend(bf.iter().cloned());
+            }
+            let canonical_footprint = if !unsupported_footprint_2d.is_empty() {
+                crate::polygon2d::canonicalize(&unsupported_footprint_2d)
+            } else {
+                Vec::new()
+            };
+
             let mut paths = Vec::new();
             let wall_order = wall_print_order(&layer.loops);
             for w_idx in wall_order {
@@ -1895,6 +1919,72 @@ pub fn plan_with_progress(
                     continue;
                 }
 
+                // If inner wall and we have an unsupported void footprint, clip inner wall
+                // so it only extrudes on solid supported material and does not cross the void.
+                if wall_loop.wall_index > 0 && !canonical_footprint.is_empty() {
+                    let w_2d = crate::polygon2d::to_2d(
+                        std::slice::from_ref(&wall_loop.points),
+                        basis1,
+                        basis2,
+                        origin,
+                    );
+                    let diff = crate::polygon2d::difference(&w_2d, &canonical_footprint);
+                    if diff.is_empty() {
+                        continue;
+                    }
+                    let max_along = crate::order_field::max_along_for(config);
+                    let ref_loops: Vec<Vec<DVec3>> = layer
+                        .loops
+                        .iter()
+                        .filter(|w| w.wall_index == 0)
+                        .map(|w| w.points.clone())
+                        .collect();
+                    let clipped_pieces = crate::order_field::reconstruct_on_order_field_near(
+                        diff,
+                        &ref_loops,
+                        basis1,
+                        basis2,
+                        axis,
+                        apex,
+                        layer.order,
+                        max_along,
+                        layer.order_field.as_ref(),
+                    );
+                    for piece in clipped_pieces {
+                        if piece.len() < 2 {
+                            continue;
+                        }
+                        let point_count = piece.len();
+                        let is_closed = piece[0].distance(piece[point_count - 1]) < 1e-4;
+                        let seg_count = if is_closed {
+                            point_count
+                        } else {
+                            point_count - 1
+                        };
+                        let segments = (0..seg_count)
+                            .map(|_| Segment {
+                                kind: MoveKind::WallInner,
+                                speed: speed_for_kind(MoveKind::WallInner, config),
+                                extrusion_rate: 1.0,
+                                support_fraction: 0.0,
+                                order: layer.order,
+                                extrusion_length: 0.0,
+                                line_width: config.wall_line_width,
+                                is_scarf: false,
+                                id: 0,
+                                island: wall_loop.island,
+                                channel_width: f64::INFINITY,
+                            })
+                            .collect();
+                        paths.push(Path {
+                            points: piece,
+                            segments,
+                            tool: object.tool,
+                        });
+                    }
+                    continue;
+                }
+
                 let is_debug_loop = wall_loop.wall_index >= 990;
                 let base_kind = if is_debug_loop {
                     MoveKind::DebugExcluded
@@ -1916,14 +2006,23 @@ pub fn plan_with_progress(
                         } else {
                             (i + 1) % point_count.max(1)
                         };
-                        let is_unsupported =
-                            wall_loop.unsupported.get(dest).copied().unwrap_or(false)
-                                || wave_overhang_plan
-                                    .wall_overhang_tags_by_layer
-                                    .get(layer.index)
-                                    .and_then(|l| l.get(w_idx))
-                                    .and_then(|w| w.get(dest).copied())
-                                    .unwrap_or(false);
+                        let seg_mid_2d = [
+                            ((wall_loop.points[i] + wall_loop.points[dest]) * 0.5 - origin)
+                                .dot(basis1),
+                            ((wall_loop.points[i] + wall_loop.points[dest]) * 0.5 - origin)
+                                .dot(basis2),
+                        ];
+                        let is_in_void = !canonical_footprint.is_empty()
+                            && crate::polygon2d::contains_point(&canonical_footprint, seg_mid_2d);
+
+                        let is_unsupported = is_in_void
+                            || wall_loop.unsupported.get(dest).copied().unwrap_or(false)
+                            || wave_overhang_plan
+                                .wall_overhang_tags_by_layer
+                                .get(layer.index)
+                                .and_then(|l| l.get(w_idx))
+                                .and_then(|w| w.get(dest).copied())
+                                .unwrap_or(false);
                         let kind = if is_debug_loop {
                             MoveKind::DebugExcluded
                         } else if is_unsupported {
@@ -1967,7 +2066,7 @@ pub fn plan_with_progress(
             let wall_path_count = paths.len();
 
             let region = InfillRegion::from_layer(layer, config);
-            let (sparse_loops, narrow_solid_loops): (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) =
+            let (mut sparse_loops, narrow_solid_loops): (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) =
                 region.loops.into_iter().partition(|l| {
                     let mut min = glam::DVec3::splat(f64::INFINITY);
                     let mut max = glam::DVec3::splat(f64::NEG_INFINITY);
@@ -1978,6 +2077,64 @@ pub fn plan_with_progress(
                     let extent = (max - min).length();
                     extent >= config.nozzle_diameter * 15.0
                 });
+
+            let mut all_solid_loops = layer.solid_fill_boundary.clone();
+            all_solid_loops.extend(narrow_solid_loops);
+
+            // Mask infill and solid skin against wave overhang and bridge footprints
+            let mut unsupported_footprint_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+            if let Some(wf) = wave_overhang_plan
+                .overhang_footprints_by_layer
+                .get(layer.index)
+            {
+                unsupported_footprint_2d.extend(wf.iter().cloned());
+            }
+            if let Some(bf) = bridge_plan.bridge_footprints_by_layer.get(layer.index) {
+                unsupported_footprint_2d.extend(bf.iter().cloned());
+            }
+
+            if !unsupported_footprint_2d.is_empty() {
+                let (axis, apex, _) =
+                    crate::order_field::resolve_axis_apex_slope(config.order_field, config);
+                let (basis1, basis2) = manifold_fidget::contour::plane_basis(axis);
+                let origin = apex;
+                let canonical_footprint = crate::polygon2d::canonicalize(&unsupported_footprint_2d);
+
+                let max_along = crate::order_field::max_along_for(config);
+
+                if !sparse_loops.is_empty() {
+                    let sparse_2d = crate::polygon2d::to_2d(&sparse_loops, basis1, basis2, origin);
+                    let diff = crate::polygon2d::difference(&sparse_2d, &canonical_footprint);
+                    sparse_loops = crate::order_field::reconstruct_on_order_field_near(
+                        diff,
+                        &sparse_loops,
+                        basis1,
+                        basis2,
+                        axis,
+                        apex,
+                        layer.order,
+                        max_along,
+                        layer.order_field.as_ref(),
+                    );
+                }
+
+                if !all_solid_loops.is_empty() {
+                    let solid_2d =
+                        crate::polygon2d::to_2d(&all_solid_loops, basis1, basis2, origin);
+                    let diff = crate::polygon2d::difference(&solid_2d, &canonical_footprint);
+                    all_solid_loops = crate::order_field::reconstruct_on_order_field_near(
+                        diff,
+                        &all_solid_loops,
+                        basis1,
+                        basis2,
+                        axis,
+                        apex,
+                        layer.order,
+                        max_along,
+                        layer.order_field.as_ref(),
+                    );
+                }
+            }
 
             if !sparse_loops.is_empty() {
                 let sparse_region = InfillRegion {
@@ -1995,9 +2152,6 @@ pub fn plan_with_progress(
                 }
             }
 
-            let mut all_solid_loops = layer.solid_fill_boundary.clone();
-            all_solid_loops.extend(narrow_solid_loops);
-
             if !all_solid_loops.is_empty() {
                 let solid_region = InfillRegion {
                     loops: all_solid_loops,
@@ -2007,6 +2161,22 @@ pub fn plan_with_progress(
                 {
                     infill_path.tool = object.tool;
                     paths.push(infill_path);
+                }
+            }
+
+            if let Some(bridge_paths) = bridge_plan.paths_by_layer.get(layer.index) {
+                for mut bp in bridge_paths.clone() {
+                    let is_in_solid = bp.points.iter().all(|p| {
+                        if let Some(sdf) = layer.mesh_sdf.as_deref() {
+                            sdf.sample(*p).value <= CONTAINMENT_POINT_SLACK
+                        } else {
+                            true
+                        }
+                    });
+                    if is_in_solid {
+                        bp.tool = object.tool;
+                        paths.push(bp);
+                    }
                 }
             }
 
@@ -2036,6 +2206,7 @@ pub fn plan_with_progress(
                         s.kind == MoveKind::Infill
                             || s.kind == MoveKind::TopSurface
                             || s.kind == MoveKind::Overhang
+                            || s.kind == MoveKind::Bridge
                     });
                     if is_open_extrusion {
                         let total_len: f64 = p.points.windows(2).map(|w| w[0].distance(w[1])).sum();
@@ -2066,7 +2237,41 @@ pub fn plan_with_progress(
                 config.nozzle_diameter,
             );
             let paths = compensate_flat_nozzle(paths, layer, config, tools);
-            let paths = simplify_paths(paths, config);
+            let mut paths = simplify_paths(paths, config);
+            if !canonical_footprint.is_empty() {
+                for path in &mut paths {
+                    let point_count = path.points.len();
+                    if point_count < 2 {
+                        continue;
+                    }
+                    for (i, segment) in path.segments.iter_mut().enumerate() {
+                        if segment.kind == MoveKind::WallOuter
+                            || segment.kind == MoveKind::WallInner
+                        {
+                            let p0 = path.points[i];
+                            let p1 = path.points[(i + 1) % point_count];
+                            let mid = (p0 + p1) * 0.5;
+                            let p0_2d = [(p0 - origin).dot(basis1), (p0 - origin).dot(basis2)];
+                            let p1_2d = [(p1 - origin).dot(basis1), (p1 - origin).dot(basis2)];
+                            let mid_2d = [(mid - origin).dot(basis1), (mid - origin).dot(basis2)];
+                            let in_void =
+                                crate::polygon2d::contains_point(&canonical_footprint, mid_2d)
+                                    || crate::polygon2d::contains_point(
+                                        &canonical_footprint,
+                                        p0_2d,
+                                    )
+                                    || crate::polygon2d::contains_point(
+                                        &canonical_footprint,
+                                        p1_2d,
+                                    );
+                            if in_void {
+                                segment.kind = MoveKind::Overhang;
+                                segment.speed = speed_for_kind(MoveKind::Overhang, config);
+                            }
+                        }
+                    }
+                }
+            }
             let paths = optimize_travel_order(paths, config, z_travel_penalty, wall_path_count);
             let paths = route_travel_moves(
                 paths,

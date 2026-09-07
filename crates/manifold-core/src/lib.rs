@@ -5,6 +5,7 @@
 //! in a service) or be driven by the `manifold-cli` front-end.
 
 pub mod bounds;
+pub mod bridge;
 pub mod error;
 pub mod extrusion;
 pub mod fluid_dynamics;
@@ -979,6 +980,12 @@ impl SlicerConfig {
     #[must_use]
     pub fn wave_overhang_speed(&self) -> f64 {
         self.wave_overhang_speed.unwrap_or(1500.0)
+    }
+
+    /// Returns the printing speed (mm/min) for bridge moves, defaulting to 50% of print_speed.
+    #[must_use]
+    pub fn bridge_speed(&self) -> f64 {
+        self.bridge_speed.unwrap_or(self.print_speed * 0.5)
     }
 
     /// Returns the flow multiplier for wave overhang teardrop beads, defaulting to 1.05.

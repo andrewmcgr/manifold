@@ -592,6 +592,13 @@ fn simplify_polyline_collinear(pts: &[[f64; 2]], eps: f64) -> Vec<[f64; 2]> {
 pub struct WaveOverhangPlan {
     pub paths_by_layer: Vec<Vec<Path>>,
     pub wall_overhang_tags_by_layer: Vec<Vec<Vec<bool>>>,
+    pub overhang_footprints_by_layer: Vec<Vec<Vec<[f64; 2]>>>,
+}
+
+struct LayerWaveOutput {
+    wall_tags: Vec<Vec<bool>>,
+    paths: Vec<Path>,
+    footprints: Vec<Vec<[f64; 2]>>,
 }
 
 /// Detects unsupported overhang regions across layers and generates
@@ -606,6 +613,7 @@ pub fn plan_wave_overhangs(
         return WaveOverhangPlan {
             paths_by_layer: vec![Vec::new(); layers.len()],
             wall_overhang_tags_by_layer: vec![Vec::new(); layers.len()],
+            overhang_footprints_by_layer: vec![Vec::new(); layers.len()],
         };
     }
 
@@ -673,7 +681,11 @@ pub fn plan_wave_overhangs(
         })
         .collect();
 
-    let (wall_tags_result, paths_result): (Vec<_>, Vec<_>) = (0..layers.len())
+    let mut wall_tags_result = Vec::with_capacity(layers.len());
+    let mut paths_result = Vec::with_capacity(layers.len());
+    let mut footprints_result = Vec::with_capacity(layers.len());
+
+    let results: Vec<LayerWaveOutput> = (0..layers.len())
         .into_par_iter()
         .map(|k| {
             // Find the layer physically underneath layer k
@@ -719,15 +731,7 @@ pub fn plan_wave_overhangs(
                                 }
                             }
                             if !supported_3d {
-                                let solid_underneath =
-                                    layers[k].mesh_sdf.as_ref().is_some_and(|sdf| {
-                                        let probe_p =
-                                            *p - DVec3::Z * (config.nozzle_diameter * 0.75);
-                                        sdf.sample(probe_p).value <= config.nozzle_diameter * 0.5
-                                    });
-                                if !solid_underneath {
-                                    tags[i] = true;
-                                }
+                                tags[i] = true;
                             }
                         }
                     }
@@ -736,14 +740,22 @@ pub fn plan_wave_overhangs(
             }
 
             let Some(prev_k) = prev_idx else {
-                return (layer_wall_tags, Vec::new());
+                return LayerWaveOutput {
+                    wall_tags: layer_wall_tags,
+                    paths: Vec::new(),
+                    footprints: Vec::new(),
+                };
             };
 
             let cur_b = &boundaries_2d[k];
             let prev_b = &boundaries_2d[prev_k];
 
             if cur_b.is_empty() || prev_b.is_empty() {
-                return (layer_wall_tags, Vec::new());
+                return LayerWaveOutput {
+                    wall_tags: layer_wall_tags,
+                    paths: Vec::new(),
+                    footprints: Vec::new(),
+                };
             }
 
             // Unsupported overhang region: cur_layer \ prev_layer
@@ -751,7 +763,11 @@ pub fn plan_wave_overhangs(
             let overhang_filtered = polygon2d::filter_min_area(&raw_overhang, min_overhang_area);
 
             if overhang_filtered.is_empty() {
-                return (layer_wall_tags, Vec::new());
+                return LayerWaveOutput {
+                    wall_tags: layer_wall_tags,
+                    paths: Vec::new(),
+                    footprints: Vec::new(),
+                };
             }
 
             // Group loops into outer boundaries and holes
@@ -774,25 +790,34 @@ pub fn plan_wave_overhangs(
                 // 3D Solid Mesh Validation: Ensure the overhang shape is actually part of the solid model
                 // and not an empty internal hole void.
                 if let Some(sdf) = &layers[k].mesh_sdf {
-                    let mut c_u = 0.0;
-                    let mut c_v = 0.0;
-                    for &[u, v] in &shape.outer {
-                        c_u += u;
-                        c_v += v;
-                    }
-                    let len = shape.outer.len().max(1) as f64;
-                    let c_u = c_u / len;
-                    let c_v = c_v / len;
-                    if let Some(p_3d) = order_field::reconstruct_point_on_order_field(
-                        apex + basis1 * c_u + basis2 * c_v,
+                    let n = shape.outer.len();
+                    let step = (n / 8).max(1);
+                    let sample_pts: Vec<[f64; 2]> = (0..n)
+                        .step_by(step)
+                        .take(8)
+                        .map(|i| shape.outer[i])
+                        .collect();
+                    let reconstructed = order_field::reconstruct_on_order_field_near(
+                        vec![sample_pts],
+                        &references,
+                        basis1,
+                        basis2,
                         axis,
+                        apex,
                         layers[k].order,
                         max_along,
                         layers[k].order_field.as_ref(),
-                    ) {
-                        if sdf.sample(p_3d).value > 0.0 {
-                            // In open air or inside a hole void - do not generate wave overhang in holes!
-                            continue;
+                    );
+                    if let Some(pts_3d) = reconstructed.first() {
+                        if !pts_3d.is_empty() {
+                            let in_solid_count = pts_3d
+                                .iter()
+                                .filter(|p| sdf.sample(**p).value <= 0.35)
+                                .count();
+                            if in_solid_count == 0 {
+                                // All sample points land in open air or hole void
+                                continue;
+                            }
                         }
                     }
                 }
@@ -836,7 +861,11 @@ pub fn plan_wave_overhangs(
             }
 
             if layer_polylines_2d.is_empty() {
-                return (layer_wall_tags, Vec::new());
+                return LayerWaveOutput {
+                    wall_tags: layer_wall_tags,
+                    paths: Vec::new(),
+                    footprints: Vec::new(),
+                };
             }
 
             // Reconstruct 2D wave polylines to 3D on the layer's order field
@@ -889,13 +918,24 @@ pub fn plan_wave_overhangs(
                 }
             }
 
-            (layer_wall_tags, paths)
+            LayerWaveOutput {
+                wall_tags: layer_wall_tags,
+                paths,
+                footprints: overhang_filtered,
+            }
         })
-        .unzip();
+        .collect();
+
+    for out in results {
+        wall_tags_result.push(out.wall_tags);
+        paths_result.push(out.paths);
+        footprints_result.push(out.footprints);
+    }
 
     WaveOverhangPlan {
         paths_by_layer: paths_result,
         wall_overhang_tags_by_layer: wall_tags_result,
+        overhang_footprints_by_layer: footprints_result,
     }
 }
 
