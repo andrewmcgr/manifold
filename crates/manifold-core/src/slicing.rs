@@ -941,8 +941,10 @@ pub fn slice_mesh_with_progress(
                             continue;
                         }
                         let max_along = (config.layer_height * 20.0).max(5.0);
+                        let densified_2d =
+                            polygon2d::densify_loops(p_wall.loops_2d, config.nozzle_diameter);
                         let reconstructed = order_field::reconstruct_on_order_field_near(
-                            p_wall.loops_2d,
+                            densified_2d,
                             &wall0_loops,
                             basis1,
                             basis2,
@@ -1019,8 +1021,10 @@ pub fn slice_mesh_with_progress(
                 let offset_3d = polygon2d::from_2d(curved_infill_2d, basis1, basis2, origin);
                 let offset_2d = polygon2d::to_2d(&offset_3d, basis1, basis2, origin);
                 let max_along = (config.layer_height * 20.0).max(5.0);
+                let densified_infill_2d =
+                    polygon2d::densify_loops(offset_2d, config.nozzle_diameter);
                 order_field::reconstruct_on_order_field_near(
-                    offset_2d,
+                    densified_infill_2d,
                     &wall0_loops,
                     basis1,
                     basis2,

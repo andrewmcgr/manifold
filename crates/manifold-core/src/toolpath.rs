@@ -1932,6 +1932,8 @@ pub fn plan_with_progress(
                     if diff.is_empty() {
                         continue;
                     }
+                    let densified_diff =
+                        crate::polygon2d::densify_loops(diff, config.nozzle_diameter);
                     let max_along = crate::order_field::max_along_for(config);
                     let ref_loops: Vec<Vec<DVec3>> = layer
                         .loops
@@ -1940,7 +1942,7 @@ pub fn plan_with_progress(
                         .map(|w| w.points.clone())
                         .collect();
                     let clipped_pieces = crate::order_field::reconstruct_on_order_field_near(
-                        diff,
+                        densified_diff,
                         &ref_loops,
                         basis1,
                         basis2,
@@ -2105,8 +2107,10 @@ pub fn plan_with_progress(
                 if !sparse_loops.is_empty() {
                     let sparse_2d = crate::polygon2d::to_2d(&sparse_loops, basis1, basis2, origin);
                     let diff = crate::polygon2d::difference(&sparse_2d, &canonical_footprint);
+                    let densified_diff =
+                        crate::polygon2d::densify_loops(diff, config.nozzle_diameter);
                     sparse_loops = crate::order_field::reconstruct_on_order_field_near(
-                        diff,
+                        densified_diff,
                         &sparse_loops,
                         basis1,
                         basis2,
@@ -2122,8 +2126,10 @@ pub fn plan_with_progress(
                     let solid_2d =
                         crate::polygon2d::to_2d(&all_solid_loops, basis1, basis2, origin);
                     let diff = crate::polygon2d::difference(&solid_2d, &canonical_footprint);
+                    let densified_diff =
+                        crate::polygon2d::densify_loops(diff, config.nozzle_diameter);
                     all_solid_loops = crate::order_field::reconstruct_on_order_field_near(
-                        diff,
+                        densified_diff,
                         &all_solid_loops,
                         basis1,
                         basis2,

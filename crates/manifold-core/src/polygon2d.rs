@@ -750,6 +750,38 @@ pub fn difference(subj: &[Vec<[f64; 2]>], clip: &[Vec<[f64; 2]>]) -> Vec<Vec<[f6
         .collect()
 }
 
+/// Subdivides 2D loop segments longer than `max_step` so that reprojection
+/// onto a curved/non-planar order field captures the 3D surface variations
+/// between endpoints rather than spanning them with a flat chord.
+#[must_use]
+pub fn densify_loops(loops: Vec<Vec<[f64; 2]>>, max_step: f64) -> Vec<Vec<[f64; 2]>> {
+    let max_step = max_step.max(0.05);
+    loops
+        .into_iter()
+        .map(|loop_2d| {
+            let n = loop_2d.len();
+            if n < 2 {
+                return loop_2d;
+            }
+            let mut dense = Vec::with_capacity(n * 2);
+            for i in 0..n {
+                let p0 = loop_2d[i];
+                let p1 = loop_2d[(i + 1) % n];
+                dense.push(p0);
+                let dist = (p1[0] - p0[0]).hypot(p1[1] - p0[1]);
+                if dist > max_step {
+                    let steps = (dist / max_step).ceil() as usize;
+                    for s in 1..steps {
+                        let t = s as f64 / steps as f64;
+                        dense.push([p0[0] + t * (p1[0] - p0[0]), p0[1] + t * (p1[1] - p0[1])]);
+                    }
+                }
+            }
+            dense
+        })
+        .collect()
+}
+
 /// Unions all `regions` together into a single set of loops.
 pub fn union(regions: &[Vec<Vec<[f64; 2]>>]) -> Vec<Vec<[f64; 2]>> {
     let mut regions = regions.iter();
@@ -1096,5 +1128,13 @@ mod tests {
         // Closest point on the hole is (1.0, 5.0, 1.0) along segment (1,2,1)->(1,8,1),
         // at 3D distance sqrt(1 + 0 + 1) = sqrt(2). 2 * sqrt(2) ~= 2.8284.
         assert!((measured - 2.0 * std::f64::consts::SQRT_2).abs() < 1e-3);
+    }
+
+    #[test]
+    fn densify_loops_subdivides_long_segments() {
+        let input = vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]];
+        let dense = densify_loops(input, 1.0);
+        assert_eq!(dense.len(), 1);
+        assert_eq!(dense[0].len(), 40);
     }
 }

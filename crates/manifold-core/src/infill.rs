@@ -1160,8 +1160,9 @@ impl InfillGenerator for ConcentricInfill {
         // to the region's own already-reconstructed boundary loops, so
         // seeding from those avoids the wrong-branch axis-ray solves that
         // previously spiked Eikonal infill.
+        let dense_rings_2d = polygon2d::densify_loops(rings_2d, config.nozzle_diameter);
         let world_rings = order_field::reconstruct_on_order_field_near(
-            rings_2d,
+            dense_rings_2d,
             &region.loops,
             basis1,
             basis2,
@@ -1264,8 +1265,9 @@ impl InfillGenerator for AllWallsInfill {
             return Vec::new();
         }
 
+        let dense_rings_2d = polygon2d::densify_loops(rings_2d, config.nozzle_diameter);
         let world_rings = order_field::reconstruct_on_order_field_near(
-            rings_2d,
+            dense_rings_2d,
             &region.loops,
             basis1,
             basis2,
