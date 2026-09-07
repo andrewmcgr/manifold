@@ -366,7 +366,8 @@ pub fn generate_wave_overhang_paths_2d(
         }
     }
 
-    if max_dist < wavelength * 0.3 {
+    let min_propagation_dist = (wavelength * 0.25).min(config.nozzle_diameter * 0.25);
+    if max_dist < min_propagation_dist {
         return Vec::new();
     }
 
@@ -822,37 +823,78 @@ pub fn plan_wave_overhangs(
                     }
                 }
 
-                // Extract seed contact segments: edges of outer boundary bordering prev_b or other loops in cur_b
+                // Extract seed contact segments: edges of outer boundary directly bordering prev_b or other loops in cur_b.
+                // Uses topological cut interface tolerance (<= 0.02 mm): contact edges lie directly on the cut
+                // interface with prev_b created by boolean difference, while free overhang edges lie > 0.05 mm away.
                 let mut seed_segments = Vec::new();
                 let n = shape.outer.len();
-                let search_dist = (config.nozzle_diameter * 1.25).max(0.4);
+                let contact_tol_sq = 0.02 * 0.02;
                 for i in 0..n {
                     let p0 = shape.outer[i];
                     let p1 = shape.outer[(i + 1) % n];
                     let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
 
-                    if polygon2d_contains_or_near(mid, prev_b, search_dist) {
+                    let mut min_d_sq = f64::INFINITY;
+                    for l in prev_b {
+                        let ln = l.len();
+                        for j in 0..ln {
+                            let s = LineSegment2D {
+                                p0: l[j],
+                                p1: l[(j + 1) % ln],
+                            };
+                            min_d_sq = min_d_sq.min(s.dist_sq_to_point(mid));
+                        }
+                    }
+                    if min_d_sq <= contact_tol_sq {
                         seed_segments.push(LineSegment2D { p0, p1 });
                     }
                 }
 
-                // If no contact with prev_b, check for contact with other loops in current layer's boundary cur_b
-                if seed_segments.is_empty() && cur_b.len() > 1 {
+                // If no direct contact with prev_b (e.g. an unconnected overhanging island),
+                // anchor contact seeds to the edge of the patch closest to the adjacent support.
+                if seed_segments.is_empty() {
+                    let mut best_i = 0;
+                    let mut best_dist_sq = f64::INFINITY;
                     for i in 0..n {
                         let p0 = shape.outer[i];
                         let p1 = shape.outer[(i + 1) % n];
                         let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
-
-                        for other_loop in cur_b {
-                            let other_shape = [other_loop.clone()];
-                            if !point_in_single_loop(mid, other_loop)
-                                && polygon2d_contains_or_near(mid, &other_shape, search_dist)
-                            {
-                                seed_segments.push(LineSegment2D { p0, p1 });
-                                break;
+                        for l in prev_b {
+                            let ln = l.len();
+                            for j in 0..ln {
+                                let s = LineSegment2D {
+                                    p0: l[j],
+                                    p1: l[(j + 1) % ln],
+                                };
+                                let d_sq = s.dist_sq_to_point(mid);
+                                if d_sq < best_dist_sq {
+                                    best_dist_sq = d_sq;
+                                    best_i = i;
+                                }
+                            }
+                        }
+                        if cur_b.len() > 1 {
+                            for other_loop in cur_b {
+                                if !point_in_single_loop(mid, other_loop) {
+                                    for j in 0..other_loop.len() {
+                                        let s = LineSegment2D {
+                                            p0: other_loop[j],
+                                            p1: other_loop[(j + 1) % other_loop.len()],
+                                        };
+                                        let d_sq = s.dist_sq_to_point(mid);
+                                        if d_sq < best_dist_sq {
+                                            best_dist_sq = d_sq;
+                                            best_i = i;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
+                    seed_segments.push(LineSegment2D {
+                        p0: shape.outer[best_i],
+                        p1: shape.outer[(best_i + 1) % n],
+                    });
                 }
 
                 let polylines =

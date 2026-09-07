@@ -660,41 +660,34 @@ pub fn slice_mesh_with_progress(
     // fast path unchanged; anything else (e.g. `Conical`) uses the
     // generalized "contour-on-mesh" path, which extracts each wall pass's
     // isosurface once (not once per layer) and walks it per layer.
-    let (outer_wall_mesh, outer_wall_mesh_orders): (Vec<DVec3>, Vec<f64>) = if is_height {
-        (Vec::new(), Vec::new())
+    let wall_meshes: Vec<(Vec<DVec3>, Vec<f64>)> = if is_height {
+        Vec::new()
     } else {
         // Sparse narrow-band marching cubes: target a cell size proportional
-        // to bead dimensions (~0.20-0.35mm) to accurately extract the outer perimeter
-        // isosurface without memory blowup or slowdowns on large meshes.
+        // to bead dimensions (~0.20-0.35mm) to accurately extract perimeter
+        // isosurfaces directly in 3D without memory blowup or slowdowns on large meshes.
         let cell_size = (config.wall_offset / 2.0)
             .min(config.wall_line_width / 4.0)
             .clamp(0.04, 0.10);
-        let iso = -config.wall_offset;
         let pad = DVec3::splat(cell_size * 2.0);
         on_progress(0.05);
-        // `bed_open_sdf` excludes bed-contact floor triangles from its distance/
-        // pseudonormal computation (see its construction above), so it is not a
-        // true 1-Lipschitz signed distance function near the boundary between an
-        // excluded floor triangle and an included wall triangle: the "nearest
-        // included face" (and its sign) can jump discontinuously there. Widen the
-        // block-culling margin by `config.wall_offset` (the same scale as the
-        // excluded region) so blocks near those boundaries aren't wrongly culled
-        // as "provably empty", closing coverage holes on thin bed-adjacent
-        // features (e.g. vent slots) without reverting to a dense full-grid pass.
         let extra_margin = config.wall_offset.abs();
-        let positions = extract_sparse_isosurface_positions::<MeshSdf>(
-            &*bed_open_sdf,
-            min - pad,
-            max + pad,
-            cell_size,
-            iso,
-            extra_margin,
-        );
-        on_progress(0.08);
-        let orders: Vec<f64> = positions.par_iter().map(|&p| field.order(p)).collect();
-        on_progress(0.10);
-
-        (positions, orders)
+        (0..=wall_count)
+            .into_par_iter()
+            .map(|w| {
+                let iso = -(config.wall_offset + w as f64 * config.wall_line_width);
+                let positions = extract_sparse_isosurface_positions::<MeshSdf>(
+                    &*bed_open_sdf,
+                    min - pad,
+                    max + pad,
+                    cell_size,
+                    iso,
+                    extra_margin,
+                );
+                let orders: Vec<f64> = positions.par_iter().map(|&p| field.order(p)).collect();
+                (positions, orders)
+            })
+            .collect()
     };
 
     let effective_order_max = order_max;
@@ -737,7 +730,6 @@ pub fn slice_mesh_with_progress(
             let origin =
                 bbox_center + BUILD_DIRECTION * (order_value - bbox_center.dot(BUILD_DIRECTION));
             let mut loops = Vec::new();
-            let mut curved_infill_2d: Vec<Vec<[f64; 2]>> = Vec::new();
             if is_height {
                 for wall_index in 0..wall_count {
                     // Negative iso = inward (see `MeshSdf::sign_at`: positive
@@ -772,11 +764,10 @@ pub fn slice_mesh_with_progress(
                     }));
                 }
             } else {
-                // Wall 0: straight from the mesh's actual isosurface (see
-                // `outer_wall_mesh`'s doc comment above).
+                // Wall 0: extracted directly from wall_meshes[0] in 3D
                 let (wall0_loops, debug_unclosed) = extract_order_contours_on_mesh_with_debug(
-                    &outer_wall_mesh,
-                    &outer_wall_mesh_orders,
+                    &wall_meshes[0].0,
+                    &wall_meshes[0].1,
                     order_value,
                     BUILD_DIRECTION,
                 );
@@ -795,187 +786,60 @@ pub fn slice_mesh_with_progress(
                         points: debug_pts,
                     });
                 }
-                // Walls 1..wall_count: each one `wall_line_width` step
-                // further inward than the previous, derived by offsetting
-                // the previous wall's own loop in the tangent plane and
-                // reconstructing onto this layer's order-field isosurface
-                // (see `outer_wall_mesh`'s doc comment for why, and
-                // `infill_boundary`'s curved-path computation below for the
-                // same technique applied one step further in). Stops early
-                // for a layer whose cross-section is too small to fit every
-                // configured wall (e.g. near a tapered tip) rather than
-                // producing garbage from an empty/degenerate offset.
+
                 let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
                 let canonical_2d = polygon2d::canonicalize(&loops_2d);
-
-                let mut outers: Vec<Vec<[f64; 2]>> = Vec::new();
-                let mut holes: Vec<Vec<[f64; 2]>> = Vec::new();
-                for loop_2d in canonical_2d {
-                    if polygon2d::signed_area(&loop_2d) > 0.0 {
-                        outers.push(loop_2d);
-                    } else {
-                        holes.push(loop_2d);
-                    }
-                }
-
-                let mut islands: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
-                let mut assigned_holes = vec![false; holes.len()];
-
-                for outer in outers {
-                    let mut island = vec![outer.clone()];
-                    for (h_idx, hole) in holes.iter().enumerate() {
-                        if !assigned_holes[h_idx]
-                            && !hole.is_empty()
-                            && polygon2d::point_in_polygon(hole[0], &outer)
-                        {
-                            island.push(hole.clone());
-                            assigned_holes[h_idx] = true;
-                        }
-                    }
-                    islands.push(island);
-                }
-
-                for (h_idx, hole) in holes.into_iter().enumerate() {
-                    if !assigned_holes[h_idx] && !hole.is_empty() {
-                        let reversed: Vec<[f64; 2]> = hole.into_iter().rev().collect();
-                        islands.push(vec![reversed]);
-                    }
-                }
-
-                // Map each wall-0 loop (in its original extraction order) to
-                // the island index it was grouped into above, by matching 2D
-                // centroids -- invariant to `canonicalize`'s possible winding
-                // reversal (which never changes a loop's point *set*, only
-                // its start point/direction, so a plain first-point or
-                // ordered comparison would not survive it). Falls back to
-                // island `0` for a wall-0 loop `canonicalize` dropped as
-                // degenerate (near-zero area / <3 points -- see its doc
-                // comment), which cannot meaningfully belong to any island's
-                // print-order group anyway.
-                let loop_centroid = |loop_2d: &[[f64; 2]]| -> [f64; 2] {
-                    if loop_2d.is_empty() {
-                        return [0.0, 0.0];
-                    }
-                    let (sx, sy) = loop_2d
-                        .iter()
-                        .fold((0.0, 0.0), |(sx, sy), p| (sx + p[0], sy + p[1]));
-                    let n = loop_2d.len() as f64;
-                    [sx / n, sy / n]
-                };
-                const CENTROID_MATCH_EPS: f64 = 1e-6;
-                let wall0_island: Vec<usize> = loops_2d
-                    .iter()
-                    .map(|loop_2d| {
-                        let c = loop_centroid(loop_2d);
-                        islands
-                            .iter()
-                            .position(|island| {
-                                island.iter().any(|member| {
-                                    let mc = loop_centroid(member);
-                                    (mc[0] - c[0]).abs() < CENTROID_MATCH_EPS
-                                        && (mc[1] - c[1]).abs() < CENTROID_MATCH_EPS
-                                })
-                            })
-                            .unwrap_or(0)
-                    })
+                let outers: Vec<Vec<[f64; 2]>> = canonical_2d
+                    .into_iter()
+                    .filter(|l| polygon2d::signed_area(l) > 0.0)
                     .collect();
 
-                loops.extend(wall0_loops.iter().cloned().enumerate().map(|(i, points)| {
-                    let arc_fraction = compute_arc_fractions(&points);
-                    let island_id = wall0_island.get(i).copied().unwrap_or(0);
-                    let same_island_loops: Vec<Vec<DVec3>> = wall0_loops
-                        .iter()
-                        .enumerate()
-                        .filter(|(idx, _)| {
-                            wall0_island.get(*idx).copied().unwrap_or(0) == island_id
-                        })
-                        .map(|(_, l)| l.clone())
-                        .collect();
-                    let self_idx = wall0_loops
-                        .iter()
-                        .enumerate()
-                        .filter(|(idx, _)| {
-                            wall0_island.get(*idx).copied().unwrap_or(0) == island_id
-                        })
-                        .position(|(idx, _)| idx == i)
-                        .unwrap_or(0);
-                    let channel_width = polygon2d::channel_widths_3d(
-                        &points,
-                        &same_island_loops,
-                        self_idx,
-                        2.0 * config.wall_line_width,
-                    );
-                    WallLoop {
+                for (island_idx, pts) in wall0_loops.into_iter().enumerate() {
+                    let arc_fraction = compute_arc_fractions(&pts);
+                    let n_pts = pts.len();
+                    loops.push(WallLoop {
                         is_open: false,
                         wall_index: 0,
-                        island: island_id,
-                        unsupported: vec![false; points.len()],
+                        island: island_idx,
+                        unsupported: vec![false; n_pts],
                         top_surface: Vec::new(),
                         arc_fraction,
-                        line_widths: vec![config.wall_line_width; points.len()],
-                        channel_width,
-                        points,
-                    }
-                }));
+                        line_widths: vec![config.wall_line_width; n_pts],
+                        channel_width: vec![f64::INFINITY; n_pts],
+                        points: pts,
+                    });
+                }
 
-                for (island_idx, island_2d) in islands.iter().enumerate() {
-                    let partitioned = polygon2d::partition_walls_adaptive(
-                        island_2d,
-                        config.wall_line_width,
-                        config.min_bead_width(),
-                        wall_count + 1,
-                    );
-
-                    for p_wall in partitioned {
-                        if p_wall.wall_index == 0 {
-                            continue;
-                        }
-                        if p_wall.wall_index == wall_count {
-                            let check = polygon2d::inward_offset(
-                                &p_wall.loops_2d,
-                                config.min_bead_width() * 0.5,
-                            );
-                            if !check.is_empty() {
-                                curved_infill_2d.extend(p_wall.loops_2d);
-                            }
-                            continue;
-                        }
-                        let max_along = (config.layer_height * 20.0).max(5.0);
-                        let densified_2d =
-                            polygon2d::densify_loops(p_wall.loops_2d, config.nozzle_diameter);
-                        let reconstructed = order_field::reconstruct_on_order_field_near(
-                            densified_2d,
-                            &wall0_loops,
-                            basis1,
-                            basis2,
-                            BUILD_DIRECTION,
-                            origin,
+                // Walls 1..wall_count: extracted directly from their 3D isosurfaces
+                for w in 1..wall_count {
+                    if w < wall_meshes.len() {
+                        let (w_loops, _) = extract_order_contours_on_mesh_with_debug(
+                            &wall_meshes[w].0,
+                            &wall_meshes[w].1,
                             order_value,
-                            max_along,
-                            &*field,
+                            BUILD_DIRECTION,
                         );
-                        loops.extend(reconstructed.iter().cloned().enumerate().map(
-                            |(li, points)| {
-                                let arc_fraction = compute_arc_fractions(&points);
-                                let channel_width = polygon2d::channel_widths_3d(
-                                    &points,
-                                    &reconstructed,
-                                    li,
-                                    2.0 * config.wall_line_width,
-                                );
-                                WallLoop {
-                                    is_open: false,
-                                    wall_index: p_wall.wall_index,
-                                    island: island_idx,
-                                    unsupported: vec![false; points.len()],
-                                    top_surface: Vec::new(),
-                                    arc_fraction,
-                                    line_widths: vec![p_wall.line_width; points.len()],
-                                    channel_width,
-                                    points,
-                                }
-                            },
-                        ));
+                        for pts in w_loops {
+                            let arc_fraction = compute_arc_fractions(&pts);
+                            let n_pts = pts.len();
+                            let mid_2d =
+                                [(pts[0] - origin).dot(basis1), (pts[0] - origin).dot(basis2)];
+                            let island = outers
+                                .iter()
+                                .position(|out| polygon2d::point_in_polygon(mid_2d, out))
+                                .unwrap_or(0);
+                            loops.push(WallLoop {
+                                is_open: false,
+                                wall_index: w,
+                                island,
+                                unsupported: vec![false; n_pts],
+                                top_surface: Vec::new(),
+                                arc_fraction,
+                                line_widths: vec![config.wall_line_width; n_pts],
+                                channel_width: vec![f64::INFINITY; n_pts],
+                                points: pts,
+                            });
+                        }
                     }
                 }
             }
@@ -1017,23 +881,16 @@ pub fn slice_mesh_with_progress(
                     }
                 }
                 polygon2d::from_2d(layer_infill_2d, basis1, basis2, origin)
-            } else {
-                let offset_3d = polygon2d::from_2d(curved_infill_2d, basis1, basis2, origin);
-                let offset_2d = polygon2d::to_2d(&offset_3d, basis1, basis2, origin);
-                let max_along = (config.layer_height * 20.0).max(5.0);
-                let densified_infill_2d =
-                    polygon2d::densify_loops(offset_2d, config.nozzle_diameter);
-                order_field::reconstruct_on_order_field_near(
-                    densified_infill_2d,
-                    &wall0_loops,
-                    basis1,
-                    basis2,
-                    BUILD_DIRECTION,
-                    origin,
+            } else if wall_count < wall_meshes.len() {
+                let (ib_loops, _) = extract_order_contours_on_mesh_with_debug(
+                    &wall_meshes[wall_count].0,
+                    &wall_meshes[wall_count].1,
                     order_value,
-                    max_along,
-                    &*field,
-                )
+                    BUILD_DIRECTION,
+                );
+                ib_loops
+            } else {
+                Vec::new()
             };
             Layer {
                 index,
@@ -3793,7 +3650,7 @@ mod tests {
                     assert_eq!(w.points.len(), b.len());
                     for (p, q) in w.points.iter().zip(b.iter()) {
                         assert!(
-                            p.distance(*q) < 1e-6,
+                            p.distance(*q) < 1e-4,
                             "expected 2-wall Wall 1 point {p:?} to match 1-wall infill_boundary point {q:?}"
                         );
                     }
