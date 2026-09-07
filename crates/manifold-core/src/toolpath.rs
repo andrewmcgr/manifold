@@ -2269,6 +2269,17 @@ pub fn plan_with_progress(
                 }
             }
 
+            if config.seam_gap() > 1e-4 {
+                let seam_gap = config.seam_gap();
+                for path in &mut paths {
+                    crate::kinematics::apply_seam_gap(
+                        &mut path.points,
+                        &mut path.segments,
+                        seam_gap,
+                    );
+                }
+            }
+
             if let Some(taper_dist) = config.pre_retract_taper_distance {
                 if taper_dist > 0.0 {
                     for path in &mut paths {

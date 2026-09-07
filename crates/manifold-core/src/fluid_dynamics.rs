@@ -233,9 +233,14 @@ impl FluidDynamicsEngine {
     }
 
     /// Evaluates extra prime length $L_{\text{extra,prime}}$ (mm) to compensate for thermal ooze
-    /// accumulated during travel duration $t_{\text{travel}}$ (seconds) at fan speed fraction $F$.
+    /// or die swell relaxation accumulated during travel duration $t_{\text{travel}}$ (seconds)
+    /// at fan speed fraction $F$.
     ///
     /// $$L_{\text{extra,prime}} = L_{\text{max,scaled}} \cdot \left(1 - e^{-t_{\text{travel}} / \tau_{\text{scaled}}}\right)$$
+    ///
+    /// When `ooze_max_length_ref_mm` is positive, it compensates for forward thermal ooze by adding prime.
+    /// When negative, it models viscoelastic die swell relaxation during travel, intentionally reducing
+    /// unretract length ($L_{\text{extra,prime}} < 0$) to prevent start-of-move blobs.
     #[must_use]
     pub fn extra_prime_length(&self, travel_time_s: f64, fan_speed_fraction: f64) -> f64 {
         if travel_time_s <= 1e-4 {
@@ -243,10 +248,10 @@ impl FluidDynamicsEngine {
         }
         let dt = self.temperature_delta(fan_speed_fraction);
         let tau_scaled = (self.config.ooze_time_constant_ref_s * (-0.03 * dt).exp()).max(0.01);
-        let l_max_scaled = (self.config.ooze_max_length_ref_mm * (1.0 + 0.02 * dt)).max(0.0);
+        let l_max_scaled = self.config.ooze_max_length_ref_mm * (1.0 + 0.02 * dt);
 
         let ooze = l_max_scaled * (1.0 - (-travel_time_s / tau_scaled).exp());
-        ooze.clamp(0.0, 1.5)
+        ooze.clamp(-1.5, 1.5)
     }
 
     /// Evaluates unretract distance (mm) needed after a travel move of duration $t_{\text{travel}}$
@@ -258,7 +263,7 @@ impl FluidDynamicsEngine {
         travel_time_s: f64,
         fan_speed_fraction: f64,
     ) -> f64 {
-        retraction_len + self.extra_prime_length(travel_time_s, fan_speed_fraction)
+        (retraction_len + self.extra_prime_length(travel_time_s, fan_speed_fraction)).max(0.0)
     }
 
     /// Returns the active configuration.
@@ -366,6 +371,26 @@ mod tests {
         // At t = 200ms (4 time constants), ooze should approach ~98% of max (0.20 * 0.98 = 0.196)
         let prime_4tau = engine.extra_prime_length(0.20, 0.0);
         assert!((prime_4tau - 0.196).abs() < 0.01);
+    }
+
+    #[test]
+    fn negative_ooze_max_length_models_die_swell_relaxation() {
+        let config = FluidDynamicsConfig {
+            ooze_time_constant_ref_s: 1.0,
+            ooze_max_length_ref_mm: -0.20,
+            ..Default::default()
+        };
+        let engine = FluidDynamicsEngine::new(config);
+
+        let prime_instant = engine.extra_prime_length(0.0, 0.0);
+        let prime_long = engine.extra_prime_length(5.0, 0.0);
+
+        assert_eq!(prime_instant, 0.0);
+        assert!(prime_long < 0.0);
+        assert!((prime_long - (-0.20)).abs() < 0.01);
+
+        let unretract = engine.unretract_length(0.7, 5.0, 0.0);
+        assert!((unretract - 0.50).abs() < 0.01);
     }
 
     #[test]

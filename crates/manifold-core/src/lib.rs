@@ -323,6 +323,10 @@ pub struct SlicerConfig {
     /// Global flow multiplier applied across both scarf joint wedges (default 0.90, i.e. 90% combined volume).
     #[serde(default)]
     pub scarf_joint_flow_ratio: Option<f64>,
+    /// Seam gap distance (mm) left unextruded at the end of closed perimeter wall loops
+    /// to bleed residual nozzle pressure before retracting/wiping (default `None` / `0.0` mm).
+    #[serde(default)]
+    pub seam_gap: Option<f64>,
     /// Whether Z-hop (lift-before-travel / lower-after-arrival) is enabled.
     /// When `false`, `plan`/`emit` behave exactly as before this field
     /// existed: Z tracks `point.z` unmodified even across
@@ -601,6 +605,7 @@ impl Default for SlicerConfig {
             scarf_joint_steps: None,
             scarf_joint_start_height_fraction: None,
             scarf_joint_flow_ratio: None,
+            seam_gap: None,
             z_hop_enabled: false,
             z_hop_height: default_z_hop_height(),
             path_simplify_enabled: true,
@@ -876,6 +881,12 @@ impl SlicerConfig {
     #[must_use]
     pub fn scarf_joint_flow_ratio(&self) -> f64 {
         self.scarf_joint_flow_ratio.unwrap_or(0.90).clamp(0.10, 2.0)
+    }
+
+    /// Seam gap distance in millimeters, defaulting to `0.0` mm when `None`.
+    #[must_use]
+    pub fn seam_gap(&self) -> f64 {
+        self.seam_gap.unwrap_or(0.0)
     }
 
     /// First layer line width (mm), defaulting to `1.3 * nozzle_diameter`

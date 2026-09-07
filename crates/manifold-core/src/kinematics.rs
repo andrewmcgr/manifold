@@ -847,6 +847,105 @@ pub fn apply_pre_retract_taper(
     }
 }
 
+/// Leaves an unextruded coasting gap of length `seam_gap_mm` at the end of closed perimeter
+/// wall loops preceding loop closure back to the start point, bleeding residual nozzle pressure
+/// into the gap to eliminate seam blobs/zits.
+pub fn apply_seam_gap(
+    points: &mut Vec<DVec3>,
+    segments: &mut Vec<crate::toolpath::Segment>,
+    seam_gap_mm: f64,
+) {
+    if seam_gap_mm <= 1e-4 || points.len() < 3 || segments.is_empty() {
+        return;
+    }
+    // Only apply to closed wall loops
+    let is_wall_loop = segments
+        .first()
+        .is_some_and(|s| s.kind == MoveKind::WallOuter || s.kind == MoveKind::WallInner);
+    if !is_wall_loop {
+        return;
+    }
+
+    // Find the last extruding segment index
+    let mut last_extruding_idx = None;
+    for (i, seg) in segments.iter().enumerate().rev() {
+        if seg.kind != MoveKind::Travel {
+            last_extruding_idx = Some(i);
+            break;
+        }
+    }
+    let Some(last_idx) = last_extruding_idx else {
+        return;
+    };
+
+    let p_start = points[last_idx];
+    let p_end = points[(last_idx + 1) % points.len()];
+    let last_seg_len = (p_end - p_start).length();
+
+    if last_seg_len > seam_gap_mm + 0.05 {
+        // Split last segment into extruding lead-in + unextruded coasting tail
+        let split_ratio = (last_seg_len - seam_gap_mm) / last_seg_len;
+        let p_split = p_start.lerp(p_end, split_ratio);
+
+        let orig_seg = segments[last_idx];
+        let mut lead_seg = orig_seg;
+        let mut coast_seg = orig_seg;
+
+        lead_seg.extrusion_length = orig_seg.extrusion_length * split_ratio;
+        coast_seg.extrusion_length = 0.0;
+        coast_seg.extrusion_rate = 0.0;
+
+        points.insert(last_idx + 1, p_split);
+        segments[last_idx] = lead_seg;
+        segments.insert(last_idx + 1, coast_seg);
+        return;
+    }
+
+    let mut seg_lengths = Vec::new();
+    for i in 0..=last_idx {
+        let p0 = points[i];
+        let p1 = points[(i + 1) % points.len()];
+        seg_lengths.push((p1 - p0).length());
+    }
+
+    let mut dist_from_end = 0.0;
+    for i in (0..=last_idx).rev() {
+        let seg_len = seg_lengths[i];
+        if segments[i].kind == MoveKind::Travel {
+            break;
+        }
+        if dist_from_end + seg_len <= seam_gap_mm {
+            segments[i].extrusion_length = 0.0;
+            segments[i].extrusion_rate = 0.0;
+            dist_from_end += seg_len;
+        } else {
+            let needed = seam_gap_mm - dist_from_end;
+            if needed > 1e-4 && seg_len > needed + 0.05 {
+                let p_s = points[i];
+                let p_e = points[(i + 1) % points.len()];
+                let split_ratio = (seg_len - needed) / seg_len;
+                let p_split = p_s.lerp(p_e, split_ratio);
+
+                let orig_seg = segments[i];
+                let mut lead_seg = orig_seg;
+                let mut coast_seg = orig_seg;
+
+                lead_seg.extrusion_length = orig_seg.extrusion_length * split_ratio;
+                coast_seg.extrusion_length = 0.0;
+                coast_seg.extrusion_rate = 0.0;
+
+                points.insert(i + 1, p_split);
+                segments[i] = lead_seg;
+                segments.insert(i + 1, coast_seg);
+            } else {
+                segments[i].extrusion_length = 0.0;
+                segments[i].extrusion_rate = 0.0;
+            }
+            break;
+        }
+    }
+}
+
 /// Inserts an unextruded wipe segment at the end of closed perimeter wall loops
 /// to wipe the nozzle tip along the loop before lifting for travel / retracting.
 pub fn apply_wipe_moves(
@@ -1429,6 +1528,51 @@ mod tests {
     }
 
     #[test]
+    fn apply_seam_gap_zeroes_tail_extrusion() {
+        use crate::toolpath::Segment;
+
+        let mut points = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 0.0),
+            DVec3::new(10.0, 10.0, 0.0),
+            DVec3::new(0.0, 10.0, 0.0),
+        ];
+        let mut segments = vec![
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 5.0,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 5.0,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 5.0,
+                ..Segment::default()
+            },
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 5.0,
+                ..Segment::default()
+            },
+        ];
+
+        apply_seam_gap(&mut points, &mut segments, 1.0);
+
+        // Last segment (10mm) should be split into a 9mm extruding move + 1mm unextruded coast move
+        assert_eq!(points.len(), 5);
+        assert_eq!(segments.len(), 5);
+        let coast_seg = segments[4];
+        assert_eq!(coast_seg.extrusion_length, 0.0);
+        assert_eq!(coast_seg.extrusion_rate, 0.0);
+        // Split point should be 1mm before the end (0, 1, 0)
+        assert!((points[4].y - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
     fn apply_scarf_joint_creates_overlapping_ramps_on_closed_wall_loop() {
         use crate::toolpath::Segment;
 
@@ -1523,6 +1667,13 @@ mod tests {
             (total_scarf_e - expected_nominal_8mm_e).abs() < 1e-4,
             "Total scarf extrusion {total_scarf_e} must equal exact nominal volume {expected_nominal_8mm_e}"
         );
+
+        // Apply seam gap (1.0mm) to the scarf joint path:
+        // The tail of the scarf overlap must be coasted with zero extrusion.
+        apply_seam_gap(&mut points, &mut segments, 1.0);
+        let last_seg = segments.last().unwrap();
+        assert_eq!(last_seg.extrusion_length, 0.0);
+        assert_eq!(last_seg.extrusion_rate, 0.0);
     }
 
     #[test]

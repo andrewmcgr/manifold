@@ -877,7 +877,7 @@ impl ManifoldApp {
                     ui.separator();
                     ui.label("Thermal & Ooze Parameters:");
                     ui.add(
-                        egui::Slider::new(&mut fluid_cfg.static_retraction_mm, 0.05..=1.0)
+                        egui::Slider::new(&mut fluid_cfg.static_retraction_mm, 0.05..=3.0)
                             .text("Static break distance (mm)"),
                     );
                     ui.add(
@@ -889,8 +889,9 @@ impl ManifoldApp {
                             .text("Ooze time constant τ (s)"),
                     );
                     ui.add(
-                        egui::Slider::new(&mut fluid_cfg.ooze_max_length_ref_mm, 0.0..=2.0)
-                            .text("Max ooze prime (mm)"),
+                        egui::Slider::new(&mut fluid_cfg.ooze_max_length_ref_mm, -2.0..=2.0)
+                            .step_by(0.01)
+                            .text("Max ooze prime / swell (mm)"),
                     );
                     let mut b_low = fluid_cfg.swell_ratio_low();
                     if ui
@@ -921,36 +922,12 @@ impl ManifoldApp {
                 {
                     self.config.retraction_length = Some(r_len);
                 }
-                let mut u_extra = self.config.unretract_extra_length();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut u_extra, 0.0..=2.0)
-                            .text("Unretract extra length (mm)"),
-                    )
-                    .changed()
-                {
-                    self.config.unretract_extra_length = Some(u_extra);
-                }
                 let mut pa_val = self.config.pressure_advance.unwrap_or(0.0);
                 if ui
                     .add(egui::Slider::new(&mut pa_val, 0.0..=0.2).text("Pressure advance (s)"))
                     .changed()
                 {
                     self.config.pressure_advance = if pa_val > 0.0 { Some(pa_val) } else { None };
-                }
-                let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
-                if ui
-                    .add(
-                        egui::Slider::new(&mut taper_dist, 0.0..=10.0)
-                            .text("Pre-retract taper distance (mm)"),
-                    )
-                    .changed()
-                {
-                    self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
-                        Some(taper_dist)
-                    } else {
-                        None
-                    };
                 }
                 ui.checkbox(
                     &mut self.config.use_firmware_retraction,
@@ -967,6 +944,80 @@ impl ManifoldApp {
             {
                 self.config.retraction_speed = Some(r_spd_mms * 60.0);
             }
+
+            let mut u_spd_mms = (self.config.unretract_speed() / 60.0).round();
+            if ui
+                .add(egui::Slider::new(&mut u_spd_mms, 10.0..=150.0).text("Unretract speed (mm/s)"))
+                .changed()
+            {
+                self.config.unretract_speed = Some(u_spd_mms * 60.0);
+            }
+
+            let mut u_extra = self.config.unretract_extra_length();
+            if ui
+                .add(
+                    egui::Slider::new(&mut u_extra, -2.0..=2.0)
+                        .step_by(0.01)
+                        .text("Unretract extra length (mm)"),
+                )
+                .changed()
+            {
+                self.config.unretract_extra_length = Some(u_extra);
+            }
+
+            let mut min_travel_retract = self.config.min_travel_for_retract();
+            if ui
+                .add(
+                    egui::Slider::new(&mut min_travel_retract, 0.0..=10.0)
+                        .step_by(0.1)
+                        .text("Minimum travel for retract (mm)"),
+                )
+                .changed()
+            {
+                self.config.min_travel_for_retract = Some(min_travel_retract);
+            }
+
+            let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
+            if ui
+                .add(
+                    egui::Slider::new(&mut taper_dist, 0.0..=10.0)
+                        .text("Pre-retract taper distance (mm)"),
+                )
+                .changed()
+            {
+                self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
+                    Some(taper_dist)
+                } else {
+                    None
+                };
+            }
+
+            ui.separator();
+            ui.label("Seams & Surface Transitions:");
+
+            let mut s_gap = self.config.seam_gap();
+            if ui
+                .add(
+                    egui::Slider::new(&mut s_gap, 0.0..=5.0)
+                        .step_by(0.05)
+                        .text("Seam gap / coasting distance (mm)"),
+                )
+                .changed()
+            {
+                self.config.seam_gap = if s_gap > 1e-4 { Some(s_gap) } else { None };
+            }
+
+            ui.checkbox(&mut self.config.wipe_enabled, "Wipe on retraction");
+            if self.config.wipe_enabled {
+                let mut wipe_dist = self.config.wipe_distance();
+                if ui
+                    .add(egui::Slider::new(&mut wipe_dist, 0.1..=10.0).text("Wipe distance (mm)"))
+                    .changed()
+                {
+                    self.config.wipe_distance = Some(wipe_dist);
+                }
+            }
+
             ui.checkbox(&mut self.config.scarf_joint_enabled, "Scarf joint seams");
             if self.config.scarf_joint_enabled {
                 let mut scarf_len = self.config.scarf_joint_length();
@@ -1010,46 +1061,7 @@ impl ManifoldApp {
                 {
                     self.config.scarf_joint_flow_ratio = Some(scarf_flow);
                 }
-                let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
-                if ui
-                    .add(
-                        egui::Slider::new(&mut taper_dist, 0.0..=5.0)
-                            .text("Pre-retract taper distance (mm)"),
-                    )
-                    .changed()
-                {
-                    self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
-                        Some(taper_dist)
-                    } else {
-                        None
-                    };
-                }
             }
-            let mut min_travel_retract = self.config.min_travel_for_retract();
-            if ui
-                .add(
-                    egui::Slider::new(&mut min_travel_retract, 0.0..=10.0)
-                        .step_by(0.1)
-                        .text("Minimum travel for retract (mm)"),
-                )
-                .changed()
-            {
-                self.config.min_travel_for_retract = Some(min_travel_retract);
-            }
-            ui.checkbox(&mut self.config.wipe_enabled, "Wipe on retraction");
-            if self.config.wipe_enabled {
-                let mut wipe_dist = self.config.wipe_distance();
-                if ui
-                    .add(egui::Slider::new(&mut wipe_dist, 0.1..=10.0).text("Wipe distance (mm)"))
-                    .changed()
-                {
-                    self.config.wipe_distance = Some(wipe_dist);
-                }
-            }
-            ui.checkbox(
-                &mut self.config.use_firmware_retraction,
-                "Use firmware retraction (G10/G11)",
-            );
         });
 
         ui.collapsing("Travel & Simplification", |ui| {

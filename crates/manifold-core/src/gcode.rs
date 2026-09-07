@@ -522,13 +522,14 @@ pub fn emit_with_machine(
                         out.push_str("G11\n");
                     } else {
                         let u_len = if let Some(ref engine) = fluid_engine {
-                            engine.unretract_length(
+                            let fluid_unretract = engine.unretract_length(
                                 last_retraction_len,
                                 accumulated_travel_time_s,
                                 fan_fraction,
-                            )
+                            );
+                            (fluid_unretract + config.unretract_extra_length()).max(0.0)
                         } else {
-                            config.retraction_length() + config.unretract_extra_length()
+                            (config.retraction_length() + config.unretract_extra_length()).max(0.0)
                         };
                         let u_spd = config.unretract_speed();
                         out.push_str(&format!("G1 E{u_len:.5} F{u_spd:.0}\n"));
