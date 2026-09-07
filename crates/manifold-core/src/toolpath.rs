@@ -1666,9 +1666,9 @@ pub struct Segment {
     /// island's walls independently (inner-outer-inner print order) and
     /// lets the GUI hover card show which island a segment belongs to.
     pub island: usize,
-    /// Local 2D channel width (mm) at this segment's destination vertex --
+    /// Local channel width (mm) at this segment's destination vertex --
     /// copied from `slicing::WallLoop::channel_width` (see
-    /// `polygon2d::channel_widths`). `f64::INFINITY` for non-wall paths
+    /// `polygon2d::channel_widths_3d`). `f64::INFINITY` for non-wall paths
     /// (infill/debug) where no opposing boundary constrains flow. Used by
     /// `plan` to clamp `line_width` down to actually-available room via
     /// `extrusion::clamped_bead_cross_section_area` when
@@ -2171,20 +2171,6 @@ pub fn plan_with_progress(
                     };
                     let bead_area = if config.bead_clearance_compensation_enabled() && !is_overhang
                     {
-                        // Measured land-clearance clamp: how much vertical room
-                        // is actually there across the flat nozzle land's
-                        // transverse footprint, given real solid geometry
-                        // (replaces the old differential-normal heuristic).
-                        let mid_pt = (start + end) * 0.5;
-                        let land_radius = config.nozzle_flat_diameter() * 0.5;
-                        let z_achievable_height = extrusion::z_land_clearance(
-                            mid_pt,
-                            unit_dir,
-                            crate::slicing::NOZZLE_DIRECTION,
-                            effective_layer_height,
-                            land_radius,
-                            layer.mesh_sdf.as_deref(),
-                        );
                         extrusion::clamped_bead_cross_section_area(
                             effective_line_width,
                             effective_layer_height,
@@ -2192,7 +2178,6 @@ pub fn plan_with_progress(
                             support_fraction,
                             bed_fraction,
                             segment.channel_width,
-                            z_achievable_height,
                         )
                     } else {
                         raw_bead_area

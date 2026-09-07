@@ -6,9 +6,6 @@
 //! testable; `toolpath::plan` is the only caller, wiring these together
 //! per segment once a path's points/kind are known.
 
-use glam::DVec3;
-use manifold_fidget::ScalarField;
-
 use crate::{toolpath::MoveKind, SlicerConfig};
 
 /// Cross-sectional area (mm^2) of a single deposited bead, modeled as the
@@ -87,117 +84,15 @@ pub fn blended_bead_cross_section_area(
     airborne_blend + (rectangle - airborne_blend) * bed
 }
 
-/// Measures the actually-achievable extrusion height (mm) at `p` after
-/// checking for solid material intruding above this bead's nominal top
-/// across the flat nozzle land's transverse footprint (perpendicular to
-/// `travel_dir`, in the plane spanned by `travel_dir` and `build_dir`).
+/// Clamps nominal bead width down to whatever room is actually there before
+/// computing the support-aware blended cross-section ([`blended_bead_cross_section_area`]):
 ///
-/// Replaces the old differential-normal concavity heuristic
-/// (`concavity_compensated_bead_area`) with a direct measurement against
-/// the real solid geometry: samples `land_radius`-wide across the land,
-/// and at each transverse offset queries `mesh_sdf` at the bead's nominal
-/// top (`p + build_dir * nominal_height`). A reading there that is both
-/// shallowly negative (inside solid, but not deep bulk) *and* measurably
-/// closer to the surface than the same lateral offset at the current layer
-/// means a ceiling is genuinely converging/closing in from above -- the
-/// achievable height is clamped down to how far below that intrusion the
-/// land can actually reach, floored at a quarter of `nominal_height` --
-/// this measurement may thin a bead but must never collapse it to a
-/// fully discontinuous 0.0 mm gap. Returns `nominal_height` unclamped
-/// (a no-op) when nothing intrudes, when the surface there is no closer
-/// than it is at the current layer (e.g. an ordinary vertical, untapered
-/// wall, whose cross-section doesn't change with Z), or when `mesh_sdf`
-/// is unavailable (e.g. hand-built test layers) -- flat/convex terrain
-/// never gets clamped.
-#[must_use]
-pub fn z_land_clearance(
-    p: DVec3,
-    travel_dir: DVec3,
-    build_dir: DVec3,
-    nominal_height: f64,
-    land_radius: f64,
-    mesh_sdf: Option<&manifold_fidget::mesh_sdf::MeshSdf>,
-) -> f64 {
-    let Some(sdf) = mesh_sdf else {
-        return nominal_height;
-    };
-    if land_radius <= 1e-6 || nominal_height <= 1e-6 {
-        return nominal_height;
-    }
-    let Some(perp) = travel_dir.cross(build_dir).try_normalize() else {
-        return nominal_height;
-    };
-    const SAMPLE_COUNT: usize = 7;
-    let top = p + build_dir * nominal_height;
-    let mut achievable_height = nominal_height;
-    for i in 0..SAMPLE_COUNT {
-        let t = (i as f64 / (SAMPLE_COUNT - 1) as f64).mul_add(2.0, -1.0); // [-1, 1]
-        let lateral = perp * (t * land_radius);
-        let probe = top + lateral;
-        let distance = sdf.sample(probe).value;
-        // A probe landing deep inside the solid bulk (far from any surface,
-        // i.e. `distance <= -nominal_height`) means there is no nearby
-        // intrusion above the land -- it's ordinary interior material, not
-        // an overhang squeezing the land from above, so it must not affect
-        // achievable_height at all. Only a shallow negative reading (a real
-        // nearby surface within one nominal layer height) represents a
-        // *candidate* land-clearance constraint.
-        //
-        // That candidate is only a genuine overhang/converging ceiling
-        // closing in from above if the surface is measurably *closer* at
-        // `top` than it is at the current layer's own point at the same
-        // lateral offset (`p + lateral`) -- i.e. `distance` (at `top`) is
-        // shallower than `distance_now` (at `p`) by more than a small
-        // tolerance. A plain vertical (untapered) wall has an unchanging
-        // cross-section as Z increases, so `distance` and `distance_now`
-        // are the same value one nominal layer height apart on either side
-        // of it -- both shallow negative (a bead's own centerline sits
-        // `line_width / 2` inside its own solid, comparable in magnitude
-        // to a typical layer height), which the old "just check `distance`
-        // alone" logic couldn't distinguish from a real intrusion, and so
-        // clamped achievable height on almost every wall segment in the
-        // model. Comparing against the current layer's own reading at the
-        // same lateral offset restores the intended meaning: the surface
-        // has to actually be closing in, not just present, to constrain
-        // this land.
-        const CONVERGENCE_EPS: f64 = 1e-6;
-        // A land-clearance intrusion can shrink the achievable bead height,
-        // but must never collapse it all the way to zero: a fully-crushed
-        // bead (0.0 mm) means the wall goes physically discontinuous at
-        // that point (a real gap/hole), which is worse than a thinner but
-        // still-continuous bead. Floor the clamp at a quarter of the
-        // nominal layer height -- any further shortfall should be resolved
-        // by skipping/deferring the segment or narrowing an adjacent
-        // extrusion upstream, not by extrapolating this measurement to
-        // nothing.
-        const MIN_HEIGHT_FRACTION: f64 = 0.25;
-        let distance_now = sdf.sample(p + lateral).value;
-        if distance < 0.0 && distance > -nominal_height && distance > distance_now + CONVERGENCE_EPS
-        {
-            let clearance = (nominal_height + distance).max(MIN_HEIGHT_FRACTION * nominal_height);
-            achievable_height = achievable_height.min(clearance);
-        }
-    }
-    achievable_height
-}
-
-/// Clamps nominal bead width/height down to whatever room is actually
-/// there before computing the support-aware blended cross-section
-/// ([`blended_bead_cross_section_area`]), replacing the old
-/// curvature-radius and concavity heuristics with measured clamps:
+/// - `channel_width`: the local channel width (see `polygon2d::channel_widths_3d`) --
+///   `line_width` is clamped down to it when finite, so a bead squeezed into a
+///   narrow feature isn't fed as if it had the full nominal width.
 ///
-/// - `xy_channel_width`: the local 2D channel width (see
-///   `polygon2d::channel_widths`) -- `line_width` is clamped down to it
-///   when finite, so a bead squeezed into a narrow feature isn't fed as
-///   if it had the full nominal width.
-/// - `z_achievable_height` ([`z_land_clearance`]): `layer_height` is
-///   clamped down to it, so a land forced to float above nominal by a
-///   real transverse obstruction isn't fed as if it fully compressed.
-///
-/// Both clamps only ever shrink the bead (never widen it), and are
-/// no-ops (`f64::INFINITY` / `>= nominal`) when nothing constrains that
-/// axis -- so this never needlessly cuts flow when room *is* available,
-/// unlike the flat-percentage heuristics it replaces.
+/// Only ever shrinks the bead (never widens it), and is a no-op (`f64::INFINITY` /
+/// `>= nominal`) when nothing constrains that axis.
 #[must_use]
 pub fn clamped_bead_cross_section_area(
     line_width: f64,
@@ -205,18 +100,16 @@ pub fn clamped_bead_cross_section_area(
     nozzle_diameter: f64,
     support_fraction: f64,
     bed_fraction: f64,
-    xy_channel_width: f64,
-    z_achievable_height: f64,
+    channel_width: f64,
 ) -> f64 {
-    let clamped_width = if xy_channel_width.is_finite() {
-        line_width.min(xy_channel_width)
+    let clamped_width = if channel_width.is_finite() {
+        line_width.min(channel_width)
     } else {
         line_width
     };
-    let clamped_height = layer_height.min(z_achievable_height);
     blended_bead_cross_section_area(
         clamped_width,
-        clamped_height,
+        layer_height,
         nozzle_diameter,
         support_fraction,
         bed_fraction,
@@ -363,180 +256,11 @@ mod tests {
         assert_eq!(line_width_for_kind(MoveKind::Overhang, &config), 0.35);
     }
 
-    /// Cube of side `size` spanning `[0,size]^3`, as a ready-to-use `MeshSdf`
-    /// (parametrized version of the fixture pattern used by
-    /// `slicing::tests::cube_mesh` / `toolpath::tests::cube_sdf_fixture`).
-    fn cube_sdf_fixture_sized(size: f64) -> manifold_fidget::mesh_sdf::MeshSdf {
-        use manifold_fidget::mesh_sdf::MeshSdf;
-        let vertices = vec![
-            DVec3::new(0.0, 0.0, 0.0),
-            DVec3::new(size, 0.0, 0.0),
-            DVec3::new(size, size, 0.0),
-            DVec3::new(0.0, size, 0.0),
-            DVec3::new(0.0, 0.0, size),
-            DVec3::new(size, 0.0, size),
-            DVec3::new(size, size, size),
-            DVec3::new(0.0, size, size),
-        ];
-        let faces = vec![
-            [0, 2, 1],
-            [0, 3, 2], // -Z
-            [4, 5, 6],
-            [4, 6, 7], // +Z
-            [0, 1, 5],
-            [0, 5, 4], // -Y
-            [3, 7, 6],
-            [3, 6, 2], // +Y
-            [0, 4, 7],
-            [0, 7, 3], // -X
-            [1, 2, 6],
-            [1, 6, 5], // +X
-        ];
-        MeshSdf::new(vertices, faces)
-    }
-
-    /// Unit cube spanning [0,1]^3, as a ready-to-use `MeshSdf` (same fixture
-    /// pattern as `slicing::tests::cube_mesh` / `toolpath::tests::cube_sdf_fixture`).
-    fn cube_sdf_fixture() -> manifold_fidget::mesh_sdf::MeshSdf {
-        cube_sdf_fixture_sized(1.0)
-    }
-
     #[test]
-    fn z_land_clearance_is_nominal_without_mesh_sdf() {
-        let p = DVec3::new(0.5, 0.5, 0.5);
-        let h = z_land_clearance(p, DVec3::X, DVec3::Z, 0.2, 0.2, None);
-        assert_eq!(h, 0.2);
-    }
-
-    #[test]
-    fn z_land_clearance_clamps_when_solid_intrudes_above_nominal_top() {
-        // Unit cube spanning [0,1]^3: a bead whose nominal top sits just
-        // barely inside solid material (the cube's actual top face is only
-        // slightly above the nominal top) -- a genuine shallow intrusion,
-        // as opposed to being buried deep in the bulk. Clamp should shrink
-        // achievable height down slightly rather than reporting the full
-        // nominal height as if the land were floating in open air.
-        let sdf = cube_sdf_fixture();
-        let p = DVec3::new(0.5, 0.5, 0.78);
-        let nominal_height = 0.2;
-        let land_radius = 0.1;
-        let h = z_land_clearance(
-            p,
-            DVec3::X,
-            DVec3::Z,
-            nominal_height,
-            land_radius,
-            Some(&sdf),
-        );
-        assert!(h < nominal_height, "expected clamp, got {h}");
-        assert!(h >= 0.0);
-    }
-
-    #[test]
-    fn z_land_clearance_never_collapses_below_quarter_of_nominal_height() {
-        // A bead whose nominal top sits almost exactly at the intruding
-        // solid surface (deepest possible shallow-negative reading, just
-        // shy of -nominal_height) would, pre-floor, clamp achievable
-        // height down to ~0.0mm -- a fully discontinuous gap in the wall.
-        // The clamp must instead floor at a quarter of nominal_height so
-        // the bead thins but never fully severs.
-        let sdf = cube_sdf_fixture();
-        let nominal_height = 0.2;
-        let land_radius = 0.1;
-        // Top face at z=1.0; nominal top (p.z + nominal_height) sampled
-        // just below the face for the deepest non-bulk shallow reading.
-        let p = DVec3::new(0.5, 0.5, 1.0 - nominal_height - 1e-4);
-        let h = z_land_clearance(
-            p,
-            DVec3::X,
-            DVec3::Z,
-            nominal_height,
-            land_radius,
-            Some(&sdf),
-        );
-        assert!(
-            h >= 0.25 * nominal_height - 1e-9,
-            "expected floor at quarter nominal height, got {h}"
-        );
-        assert!(h < nominal_height, "expected some clamp to occur, got {h}");
-    }
-
-    #[test]
-    fn z_land_clearance_full_on_an_ordinary_untapered_vertical_wall() {
-        // Regression test for the global-underextrusion bug: a bead sitting
-        // right at the centerline near a *vertical* (untapered) face -- the
-        // ordinary case for the overwhelming majority of wall segments in
-        // any real print. The bead's own centerline is shallowly inside the
-        // solid (bead half-width, e.g. ~0.05mm from the face here), which is
-        // the same order of magnitude as a typical nominal_height -- exactly
-        // the shallow-negative range this function otherwise treats as a
-        // "candidate intrusion". Because the face is vertical, one nominal
-        // layer height straight up lands at the *same* shallow distance from
-        // the face, not a new, closer one -- this is the wall simply
-        // continuing upward, not a ceiling closing in from above, and must
-        // not clamp achievable height at all. Before the current-layer
-        // baseline check was added, this exact scenario clamped >50% of all
-        // wall segments across a real test mesh, crushing total extruded
-        // volume to ~60% of nominal.
-        let sdf = cube_sdf_fixture_sized(10.0);
-        // Just inside the x=0 face, deep in Z away from the top/bottom faces
-        // so only the vertical x=0 face is in play.
-        let p = DVec3::new(0.05, 5.0, 5.0);
-        let nominal_height = 0.2;
-        let land_radius = 0.1;
-        let h = z_land_clearance(
-            p,
-            DVec3::Y,
-            DVec3::Z,
-            nominal_height,
-            land_radius,
-            Some(&sdf),
-        );
-        assert_eq!(
-            h, nominal_height,
-            "an ordinary vertical wall must not self-clamp achievable height, got {h}"
-        );
-    }
-
-    #[test]
-    fn z_land_clearance_full_when_probe_is_deep_in_solid_bulk() {
-        // A large cube (side 10) with the probe centered deep in the
-        // interior: a full layer height above the sample point still lands
-        // far from any face (>> nominal_height away in every direction).
-        // This is ordinary interior solid, not an overhang squeezing the
-        // land from above -- it must NOT collapse achievable_height to
-        // near-zero, or every wall segment near the base of a solid part
-        // would get its bead area crushed and dropped as unprintable.
-        let sdf = cube_sdf_fixture_sized(10.0);
-        let p = DVec3::new(5.0, 5.0, 5.0);
-        let nominal_height = 0.2;
-        let land_radius = 0.1;
-        let h = z_land_clearance(
-            p,
-            DVec3::X,
-            DVec3::Z,
-            nominal_height,
-            land_radius,
-            Some(&sdf),
-        );
-        assert_eq!(
-            h, nominal_height,
-            "deep interior bulk must not clamp achievable height, got {h}"
-        );
-    }
-
-    #[test]
-    fn clamped_bead_cross_section_area_clamps_width_and_height() {
+    fn clamped_bead_cross_section_area_clamps_width() {
         let nozzle_diameter = 0.4;
-        let full = clamped_bead_cross_section_area(
-            0.4,
-            0.2,
-            nozzle_diameter,
-            1.0,
-            0.0,
-            f64::INFINITY,
-            0.2,
-        );
+        let full =
+            clamped_bead_cross_section_area(0.4, 0.2, nozzle_diameter, 1.0, 0.0, f64::INFINITY);
         let narrow = clamped_bead_cross_section_area(
             0.4,
             0.2,
@@ -544,20 +268,8 @@ mod tests {
             1.0,
             0.0,
             0.25, // channel narrower than nominal width
-            0.2,
         );
         assert!(narrow < full, "narrow channel should reduce area");
-
-        let shallow = clamped_bead_cross_section_area(
-            0.4,
-            0.2,
-            nozzle_diameter,
-            1.0,
-            0.0,
-            f64::INFINITY,
-            0.1, // less Z room than nominal height
-        );
-        assert!(shallow < full, "reduced Z clearance should reduce area");
     }
 
     #[test]

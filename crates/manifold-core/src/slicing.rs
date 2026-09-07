@@ -750,29 +750,22 @@ pub fn slice_mesh_with_progress(
                         &*side_sdf, origin, basis1, basis2, extent, extent, resolution, resolution,
                         iso,
                     );
-                    let wall_loops_2d = polygon2d::to_2d(&wall_loops, basis1, basis2, origin);
-                    loops.extend(wall_loops.into_iter().enumerate().map(|(li, points)| {
+                    loops.extend(wall_loops.iter().cloned().enumerate().map(|(li, points)| {
                         let arc_fraction = compute_arc_fractions(&points);
-                        let n_pts = points.len();
-                        let channel_width = wall_loops_2d
-                            .get(li)
-                            .map(|self_loop| {
-                                polygon2d::channel_widths(
-                                    self_loop,
-                                    &wall_loops_2d,
-                                    li,
-                                    2.0 * config.wall_line_width,
-                                )
-                            })
-                            .unwrap_or_else(|| vec![f64::INFINITY; n_pts]);
+                        let channel_width = polygon2d::channel_widths_3d(
+                            &points,
+                            &wall_loops,
+                            li,
+                            2.0 * config.wall_line_width,
+                        );
                         WallLoop {
                             is_open: false,
                             wall_index,
                             island: 0,
-                            unsupported: vec![false; n_pts],
+                            unsupported: vec![false; points.len()],
                             top_surface: Vec::new(),
                             arc_fraction,
-                            line_widths: vec![config.wall_line_width; n_pts],
+                            line_widths: vec![config.wall_line_width; points.len()],
                             channel_width,
                             points,
                         }
@@ -889,26 +882,37 @@ pub fn slice_mesh_with_progress(
 
                 loops.extend(wall0_loops.iter().cloned().enumerate().map(|(i, points)| {
                     let arc_fraction = compute_arc_fractions(&points);
-                    let n_pts = points.len();
-                    let channel_width = loops_2d
-                        .get(i)
-                        .map(|self_loop| {
-                            polygon2d::channel_widths(
-                                self_loop,
-                                &loops_2d,
-                                i,
-                                2.0 * config.wall_line_width,
-                            )
+                    let island_id = wall0_island.get(i).copied().unwrap_or(0);
+                    let same_island_loops: Vec<Vec<DVec3>> = wall0_loops
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| {
+                            wall0_island.get(*idx).copied().unwrap_or(0) == island_id
                         })
-                        .unwrap_or_else(|| vec![f64::INFINITY; n_pts]);
+                        .map(|(_, l)| l.clone())
+                        .collect();
+                    let self_idx = wall0_loops
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| {
+                            wall0_island.get(*idx).copied().unwrap_or(0) == island_id
+                        })
+                        .position(|(idx, _)| idx == i)
+                        .unwrap_or(0);
+                    let channel_width = polygon2d::channel_widths_3d(
+                        &points,
+                        &same_island_loops,
+                        self_idx,
+                        2.0 * config.wall_line_width,
+                    );
                     WallLoop {
                         is_open: false,
                         wall_index: 0,
-                        island: wall0_island.get(i).copied().unwrap_or(0),
-                        unsupported: vec![false; n_pts],
+                        island: island_id,
+                        unsupported: vec![false; points.len()],
                         top_surface: Vec::new(),
                         arc_fraction,
-                        line_widths: vec![config.wall_line_width; n_pts],
+                        line_widths: vec![config.wall_line_width; points.len()],
                         channel_width,
                         points,
                     }
@@ -937,7 +941,6 @@ pub fn slice_mesh_with_progress(
                             continue;
                         }
                         let max_along = (config.layer_height * 20.0).max(5.0);
-                        let loops_2d_for_measurement = p_wall.loops_2d.clone();
                         let reconstructed = order_field::reconstruct_on_order_field_near(
                             p_wall.loops_2d,
                             &wall0_loops,
@@ -952,26 +955,20 @@ pub fn slice_mesh_with_progress(
                         loops.extend(reconstructed.iter().cloned().enumerate().map(
                             |(li, points)| {
                                 let arc_fraction = compute_arc_fractions(&points);
-                                let n_pts = points.len();
-                                let channel_width = loops_2d_for_measurement
-                                    .get(li)
-                                    .map(|self_loop| {
-                                        polygon2d::channel_widths(
-                                            self_loop,
-                                            &loops_2d_for_measurement,
-                                            li,
-                                            2.0 * config.wall_line_width,
-                                        )
-                                    })
-                                    .unwrap_or_else(|| vec![f64::INFINITY; n_pts]);
+                                let channel_width = polygon2d::channel_widths_3d(
+                                    &points,
+                                    &reconstructed,
+                                    li,
+                                    2.0 * config.wall_line_width,
+                                );
                                 WallLoop {
                                     is_open: false,
                                     wall_index: p_wall.wall_index,
                                     island: island_idx,
-                                    unsupported: vec![false; n_pts],
+                                    unsupported: vec![false; points.len()],
                                     top_surface: Vec::new(),
                                     arc_fraction,
-                                    line_widths: vec![p_wall.line_width; n_pts],
+                                    line_widths: vec![p_wall.line_width; points.len()],
                                     channel_width,
                                     points,
                                 }

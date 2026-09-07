@@ -101,6 +101,98 @@ pub fn from_2d(
         .collect()
 }
 
+/// Distance from 3D point `p` to segment `a..b`, clamped to the segment itself ($t \in [0, 1]$).
+fn point_segment_distance_3d(p: DVec3, a: DVec3, b: DVec3) -> f64 {
+    let ab = b - a;
+    let len_sq = ab.length_squared();
+    if len_sq < 1e-15 {
+        return (p - a).length();
+    }
+    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
+/// Measures each point's local 3D channel width: `2 * min distance` from
+/// that point to the nearest boundary segment across `island_loops` (the
+/// set of loops belonging to the same island on this layer -- outer boundary
+/// and any enclosed holes), excluding a local neighborhood of segments
+/// immediately adjacent to the point within its own loop measured by 3D arc length.
+///
+/// Operating directly in 3D Euclidean space guarantees that:
+/// - Distances along sloped non-planar channels are measured without
+///   projection foreshortening ($\cos\theta$ loss).
+/// - Clearance measurements are independent of nozzle or layer alignment with the Z axis.
+/// - Loops from separate, disconnected islands are not compared against each other,
+///   preventing air gaps between distinct features from falsely constricting flow.
+///
+/// When `island_loops` contains only this one loop (no hole in this island),
+/// every point reads `f64::INFINITY` (unconstrained).
+#[must_use]
+pub fn channel_widths_3d(
+    loop_points: &[DVec3],
+    island_loops: &[Vec<DVec3>],
+    self_loop_index: usize,
+    exclude_arc_length: f64,
+) -> Vec<f64> {
+    let m = loop_points.len();
+    if m == 0 {
+        return Vec::new();
+    }
+    let self_loop_is_alone = island_loops.len() <= 1;
+    if self_loop_is_alone {
+        return vec![f64::INFINITY; m];
+    }
+
+    let mut cumulative = vec![0.0; m];
+    for k in 1..m {
+        cumulative[k] = cumulative[k - 1] + (loop_points[k] - loop_points[k - 1]).length();
+    }
+    let perimeter = if m >= 2 {
+        cumulative[m - 1] + (loop_points[m - 1] - loop_points[0]).length()
+    } else {
+        0.0
+    };
+
+    let arc_distance = |i: usize, j: usize| -> f64 {
+        let forward = (cumulative[i] - cumulative[j]).abs();
+        forward.min(perimeter - forward)
+    };
+    let index_distance = |i: usize, j: usize| -> usize {
+        let forward = if j >= i { j - i } else { m - (i - j) };
+        forward.min(m - forward)
+    };
+
+    loop_points
+        .iter()
+        .enumerate()
+        .map(|(i, &pt)| {
+            let mut min_dist = f64::INFINITY;
+            for (loop_idx, other) in island_loops.iter().enumerate() {
+                let n = other.len();
+                if n < 2 {
+                    continue;
+                }
+                for j in 0..n {
+                    if loop_idx == self_loop_index
+                        && (index_distance(i, j) <= 1 || arc_distance(i, j) < exclude_arc_length)
+                    {
+                        continue;
+                    }
+                    let dist = point_segment_distance_3d(pt, other[j], other[(j + 1) % n]);
+                    if dist < min_dist {
+                        min_dist = dist;
+                    }
+                }
+            }
+            if min_dist.is_finite() {
+                2.0 * min_dist
+            } else {
+                f64::INFINITY
+            }
+        })
+        .collect()
+}
+
 /// Distance from `pt` to the segment `a..b`, clamped to the segment itself
 /// (parameter $t \in [0, 1]$) rather than projected onto the infinite
 /// line -- see [`perpendicular_distance`]'s sibling use in RDP
@@ -963,5 +1055,46 @@ mod tests {
         // than pinning an exact float, since point-to-segment nearest
         // point selection has several candidate segments near a corner.
         assert!(widths.iter().all(|w| w.is_finite() && *w > 0.0));
+    }
+
+    #[test]
+    fn channel_widths_3d_reports_infinity_for_an_isolated_loop() {
+        let loop_ = vec![
+            DVec3::new(0.0, 0.0, 5.0),
+            DVec3::new(10.0, 0.0, 5.0),
+            DVec3::new(10.0, 10.0, 5.0),
+            DVec3::new(0.0, 10.0, 5.0),
+        ];
+        let widths = channel_widths_3d(&loop_, std::slice::from_ref(&loop_), 0, 0.8);
+        assert!(widths.iter().all(|w| w.is_infinite()));
+    }
+
+    #[test]
+    fn channel_widths_3d_measures_true_distance_on_a_sloped_surface() {
+        // A channel lying on a 45-degree sloped surface Z = X:
+        // Outer wall at X=0, Z=0; hole boundary at X=1, Z=1.
+        // True 3D Euclidean distance between them is sqrt(1^2 + 0^2 + 1^2) = sqrt(2) ~= 1.414mm.
+        // 2D XY projection would report distance 1.0mm, foreshortening by 30%.
+        // channel_widths_3d must report 2 * sqrt(2) ~= 2.828mm, invariant to the 45-degree slope.
+        let outer = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(0.0, 5.0, 0.0),
+            DVec3::new(0.0, 10.0, 0.0),
+            DVec3::new(5.0, 10.0, 5.0),
+            DVec3::new(5.0, 0.0, 5.0),
+        ];
+        let hole = vec![
+            DVec3::new(1.0, 2.0, 1.0),
+            DVec3::new(4.0, 2.0, 4.0),
+            DVec3::new(4.0, 8.0, 4.0),
+            DVec3::new(1.0, 8.0, 1.0),
+        ];
+        let island = vec![outer.clone(), hole];
+        let widths = channel_widths_3d(&outer, &island, 0, 0.8);
+        let measured = widths[1]; // at (0.0, 5.0, 0.0)
+        assert!(measured.is_finite());
+        // Closest point on the hole is (1.0, 5.0, 1.0) along segment (1,2,1)->(1,8,1),
+        // at 3D distance sqrt(1 + 0 + 1) = sqrt(2). 2 * sqrt(2) ~= 2.8284.
+        assert!((measured - 2.0 * std::f64::consts::SQRT_2).abs() < 1e-3);
     }
 }
