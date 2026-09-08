@@ -1838,7 +1838,7 @@ pub fn plan_with_progress(
 
     let default_tool = objects.first().map(|o| o.tool).unwrap_or(ToolId(0));
     let wave_overhang_plan = if config.wave_overhangs_enabled() {
-        crate::wave_overhang::plan_wave_overhangs(layers, config, default_tool)
+        crate::wave_overhang::plan_wave_overhangs(layers, objects, config, default_tool)
     } else {
         crate::wave_overhang::WaveOverhangPlan::default()
     };

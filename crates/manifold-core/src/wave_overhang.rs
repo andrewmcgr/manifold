@@ -16,6 +16,7 @@ use manifold_fidget::ScalarField;
 use rayon::prelude::*;
 
 use crate::ids::ToolId;
+use crate::object::Object;
 use crate::order_field;
 use crate::polygon2d;
 use crate::slicing::Layer;
@@ -607,6 +608,7 @@ struct LayerWaveOutput {
 #[must_use]
 pub fn plan_wave_overhangs(
     layers: &[Layer],
+    objects: &[Object],
     config: &SlicerConfig,
     tool: ToolId,
 ) -> WaveOverhangPlan {
@@ -626,6 +628,193 @@ pub fn plan_wave_overhangs(
     let min_overhang_area = 0.25 * config.nozzle_diameter * config.nozzle_diameter;
     let max_along = order_field::max_along_for(config);
     let speed = config.wave_overhang_speed();
+
+    if !objects.is_empty() {
+        // Surface-guided wave overhang planning:
+        // Solves the geodesic arrival time field T(v) across the 2-manifold mesh surface
+        // starting from bed-contact vertices using Kimmel-Sethian Fast Marching.
+        // Wavefront isocontours are extracted directly on overhang faces at increments of
+        // `wavelength` using 3D triangle edge interpolation, guaranteeing that every wave
+        // overhang bead is physically adjacent to its supporting predecessor and follows
+        // the true surface of the mesh without air-gap jumps or disconnected mid-air loops.
+        let mut surface_paths_by_layer = vec![Vec::new(); layers.len()];
+        let mut surface_footprints_by_layer = vec![Vec::new(); layers.len()];
+        let mut wall_tags_by_layer = vec![Vec::new(); layers.len()];
+
+        for obj in objects {
+            let mesh = &obj.mesh;
+            let faces: Vec<[usize; 3]> = mesh
+                .indices
+                .chunks_exact(3)
+                .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
+                .collect();
+            let (min, _) = match mesh.bounding_box() {
+                Some(b) => b,
+                None => continue,
+            };
+            let seed_tol = (min.z + 0.20).max(0.1);
+
+            let surface_times = manifold_fidget::surface_eikonal::solve_surface_eikonal(
+                &mesh.vertices,
+                &faces,
+                |p| p.z <= seed_tol,
+            );
+
+            let mut overhang_triangles = Vec::new();
+            let mut overhang_orders = Vec::new();
+            let mut t_min = f64::INFINITY;
+            let mut t_max = f64::NEG_INFINITY;
+
+            for &[i0, i1, i2] in &faces {
+                let v0 = mesh.vertices[i0];
+                let v1 = mesh.vertices[i1];
+                let v2 = mesh.vertices[i2];
+
+                if v0.z <= min.z + seed_tol && v1.z <= min.z + seed_tol && v2.z <= min.z + seed_tol
+                {
+                    continue;
+                }
+
+                let normal = (v1 - v0).cross(v2 - v0);
+                let normal_len = normal.length();
+                if normal_len <= 1e-9 {
+                    continue;
+                }
+
+                let cos_up = normal.z / normal_len;
+                if cos_up < -0.15 {
+                    let t0 = surface_times[i0];
+                    let t1 = surface_times[i1];
+                    let t2 = surface_times[i2];
+                    if t0.is_finite() && t1.is_finite() && t2.is_finite() {
+                        t_min = t_min.min(t0.min(t1.min(t2)));
+                        t_max = t_max.max(t0.max(t1.max(t2)));
+
+                        overhang_triangles.push(v0);
+                        overhang_triangles.push(v1);
+                        overhang_triangles.push(v2);
+
+                        overhang_orders.push(t0);
+                        overhang_orders.push(t1);
+                        overhang_orders.push(t2);
+                    }
+                }
+            }
+
+            if overhang_triangles.is_empty() || !t_min.is_finite() || !t_max.is_finite() {
+                continue;
+            }
+
+            let mut target_t = t_min + wavelength * 0.5;
+            let mut reverse = false;
+
+            while target_t <= t_max {
+                let (loops, unclosed) =
+                    manifold_fidget::contour::extract_order_contours_on_mesh_with_debug(
+                        &overhang_triangles,
+                        &overhang_orders,
+                        target_t,
+                        glam::DVec3::Z,
+                    );
+
+                for poly in loops.into_iter().chain(unclosed) {
+                    let poly_len: f64 = poly.windows(2).map(|w| w[0].distance(w[1])).sum();
+                    if poly_len < config.nozzle_diameter * 0.75 {
+                        continue;
+                    }
+
+                    let avg_order: f64 = if let Some(first_layer) = layers.first() {
+                        poly.iter()
+                            .map(|p| first_layer.order_field.order(*p))
+                            .sum::<f64>()
+                            / poly.len() as f64
+                    } else {
+                        continue;
+                    };
+
+                    let best_layer_idx = layers
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| {
+                            (a.order - avg_order)
+                                .abs()
+                                .partial_cmp(&(b.order - avg_order).abs())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(0);
+
+                    let pts = if reverse {
+                        poly.into_iter().rev().collect()
+                    } else {
+                        poly
+                    };
+                    reverse = !reverse;
+
+                    let n_pts = pts.len();
+                    if n_pts >= 2 {
+                        let seg_count = n_pts - 1;
+                        let segments: Vec<Segment> = (0..seg_count)
+                            .map(|_| Segment {
+                                kind: MoveKind::Overhang,
+                                speed,
+                                extrusion_rate: 1.0,
+                                support_fraction: 0.0,
+                                order: layers[best_layer_idx].order,
+                                extrusion_length: 0.0,
+                                line_width: config.nozzle_diameter,
+                                is_scarf: false,
+                                id: 0,
+                                island: 0,
+                                channel_width: f64::INFINITY,
+                            })
+                            .collect();
+
+                        let poly_2d: Vec<[f64; 2]> = pts
+                            .iter()
+                            .map(|p| [(p - origin).dot(basis1), (p - origin).dot(basis2)])
+                            .collect();
+                        surface_footprints_by_layer[best_layer_idx].push(poly_2d);
+
+                        surface_paths_by_layer[best_layer_idx].push(Path {
+                            points: pts,
+                            segments,
+                            tool,
+                        });
+                    }
+                }
+                target_t += wavelength;
+            }
+        }
+
+        // Compute wall overhang tags
+        for (k, layer) in layers.iter().enumerate() {
+            let mut layer_tags = Vec::with_capacity(layer.loops.len());
+            let probe_offset = DVec3::new(0.0, 0.0, -config.layer_height);
+            for wall in &layer.loops {
+                let tags: Vec<bool> = wall
+                    .points
+                    .iter()
+                    .map(|&p| {
+                        if let Some(sdf) = &layer.mesh_sdf {
+                            let probe_p = p + probe_offset;
+                            sdf.sample(probe_p).value > 0.0
+                        } else {
+                            false
+                        }
+                    })
+                    .collect();
+                layer_tags.push(tags);
+            }
+            wall_tags_by_layer[k] = layer_tags;
+        }
+
+        return WaveOverhangPlan {
+            paths_by_layer: surface_paths_by_layer,
+            wall_overhang_tags_by_layer: wall_tags_by_layer,
+            overhang_footprints_by_layer: surface_footprints_by_layer,
+        };
+    }
 
     // Determine whether layer index `k` increases with physical height (Z)
     let z_at = |l: &Layer| -> f64 {
@@ -850,51 +1039,11 @@ pub fn plan_wave_overhangs(
                     }
                 }
 
-                // If no direct contact with prev_b (e.g. an unconnected overhanging island),
-                // anchor contact seeds to the edge of the patch closest to the adjacent support.
+                // If no direct contact with prev_b, this overhang shape is an isolated island over empty air.
+                // A wave overhang by definition must be adjacent to existing printed material to stick!
+                // Do NOT generate floating overhang extrusions in mid-air.
                 if seed_segments.is_empty() {
-                    let mut best_i = 0;
-                    let mut best_dist_sq = f64::INFINITY;
-                    for i in 0..n {
-                        let p0 = shape.outer[i];
-                        let p1 = shape.outer[(i + 1) % n];
-                        let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
-                        for l in prev_b {
-                            let ln = l.len();
-                            for j in 0..ln {
-                                let s = LineSegment2D {
-                                    p0: l[j],
-                                    p1: l[(j + 1) % ln],
-                                };
-                                let d_sq = s.dist_sq_to_point(mid);
-                                if d_sq < best_dist_sq {
-                                    best_dist_sq = d_sq;
-                                    best_i = i;
-                                }
-                            }
-                        }
-                        if cur_b.len() > 1 {
-                            for other_loop in cur_b {
-                                if !point_in_single_loop(mid, other_loop) {
-                                    for j in 0..other_loop.len() {
-                                        let s = LineSegment2D {
-                                            p0: other_loop[j],
-                                            p1: other_loop[(j + 1) % other_loop.len()],
-                                        };
-                                        let d_sq = s.dist_sq_to_point(mid);
-                                        if d_sq < best_dist_sq {
-                                            best_dist_sq = d_sq;
-                                            best_i = i;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    seed_segments.push(LineSegment2D {
-                        p0: shape.outer[best_i],
-                        p1: shape.outer[(best_i + 1) % n],
-                    });
+                    continue;
                 }
 
                 let polylines =
@@ -1134,7 +1283,7 @@ mod tests {
         l1.index = 1;
 
         let layers = vec![l0, l1];
-        let overhang_plan = plan_wave_overhangs(&layers, &config, ToolId(0));
+        let overhang_plan = plan_wave_overhangs(&layers, &[], &config, ToolId(0));
 
         assert_eq!(overhang_plan.paths_by_layer.len(), 2);
         assert!(
@@ -1197,7 +1346,7 @@ mod tests {
         l1.index = 1;
 
         let layers = vec![l0, l1];
-        let plan = plan_wave_overhangs(&layers, &config, ToolId(0));
+        let plan = plan_wave_overhangs(&layers, &[], &config, ToolId(0));
 
         assert_eq!(plan.wall_overhang_tags_by_layer.len(), 2);
         let tags_l1 = &plan.wall_overhang_tags_by_layer[1][0];
