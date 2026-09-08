@@ -883,7 +883,7 @@ impl SlicerConfig {
     /// Scarf joint flow multiplier, defaulting to `0.90` (90% combined volume) when `None`.
     #[must_use]
     pub fn scarf_joint_flow_ratio(&self) -> f64 {
-        self.scarf_joint_flow_ratio.unwrap_or(0.90).clamp(0.10, 2.0)
+        self.scarf_joint_flow_ratio.unwrap_or(0.90).max(0.0)
     }
 
     /// Seam gap distance in millimeters, defaulting to `0.0` mm when `None`.
@@ -924,9 +924,7 @@ impl SlicerConfig {
     /// Defaults to `1.0`.
     #[must_use]
     pub fn eikonal_surface_order_weight(&self) -> f64 {
-        self.eikonal_surface_order_weight
-            .unwrap_or(1.0)
-            .clamp(0.0, 10.0)
+        self.eikonal_surface_order_weight.unwrap_or(1.0).max(0.0)
     }
 
     /// Detach angle (degrees from horizontal) for conformal top surface tracking.
@@ -935,7 +933,7 @@ impl SlicerConfig {
     pub fn eikonal_conformal_max_angle_deg(&self) -> f64 {
         self.eikonal_conformal_max_angle_deg
             .unwrap_or(45.0)
-            .clamp(5.0, 85.0)
+            .clamp(0.0, 90.0)
     }
 
     /// Detach angle (degrees from horizontal) for conformal bottom surface tracking.
@@ -944,16 +942,14 @@ impl SlicerConfig {
     pub fn eikonal_conformal_bottom_max_angle_deg(&self) -> f64 {
         self.eikonal_conformal_bottom_max_angle_deg
             .unwrap_or(30.0)
-            .clamp(5.0, 85.0)
+            .clamp(0.0, 90.0)
     }
 
     /// Subsurface skin layer depth (mm) for conformal top surface tracking.
     /// Defaults to `1.2 mm`.
     #[must_use]
     pub fn eikonal_conformal_skin_depth_mm(&self) -> f64 {
-        self.eikonal_conformal_skin_depth_mm
-            .unwrap_or(1.2)
-            .clamp(0.2, 10.0)
+        self.eikonal_conformal_skin_depth_mm.unwrap_or(1.2).max(0.0)
     }
 
     /// Diameter (mm) of the nozzle tip's flat land, used by

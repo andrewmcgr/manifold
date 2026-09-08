@@ -641,37 +641,73 @@ impl ManifoldApp {
             }
         }
     }
+}
 
+/// Helper widget for numeric input fields replacing fixed sliders: supports both
+/// dragging and direct numeric entry, without imposing artificial upper bounds.
+fn drag_num<T: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    speed: f64,
+    range: std::ops::RangeInclusive<T>,
+    label: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        let drag_resp = ui.add(egui::DragValue::new(value).speed(speed).range(range));
+        let label_resp = ui.label(label);
+        drag_resp | label_resp
+    })
+    .inner
+}
+
+impl ManifoldApp {
     fn settings_panel(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let config_before = self.config.clone();
         ui.heading("Settings");
 
         ui.collapsing("Layering", |ui| {
-            ui.add(
-                egui::Slider::new(&mut self.config.layer_height, 0.05..=1.0)
-                    .text("Layer height (mm)"),
+            drag_num(
+                ui,
+                &mut self.config.layer_height,
+                0.01,
+                0.001..=f64::INFINITY,
+                "Layer height (mm)",
             );
             let mut first_layer_h = self.config.first_layer_height();
-            if ui
-                .add(
-                    egui::Slider::new(&mut first_layer_h, 0.05..=1.0)
-                        .text("First layer height (mm)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut first_layer_h,
+                0.01,
+                0.001..=f64::INFINITY,
+                "First layer height (mm)",
+            )
+            .changed()
             {
                 self.config.first_layer_height = Some(first_layer_h);
             }
-            ui.add(egui::Slider::new(&mut self.config.top_layers, 0..=20).text("Top solid layers"));
-            ui.add(
-                egui::Slider::new(&mut self.config.bottom_layers, 0..=20)
-                    .text("Bottom solid layers"),
+            drag_num(
+                ui,
+                &mut self.config.top_layers,
+                1.0,
+                0..=usize::MAX,
+                "Top solid layers",
+            );
+            drag_num(
+                ui,
+                &mut self.config.bottom_layers,
+                1.0,
+                0..=usize::MAX,
+                "Bottom solid layers",
             );
         });
 
         ui.collapsing("Extrusion & Walls", |ui| {
-            ui.add(
-                egui::Slider::new(&mut self.config.wall_line_width, 0.05..=1.5)
-                    .text("Wall line width (mm)"),
+            drag_num(
+                ui,
+                &mut self.config.wall_line_width,
+                0.01,
+                0.01..=f64::INFINITY,
+                "Wall line width (mm)",
             );
             let mut bead_clearance_compensation = self.config.bead_clearance_compensation_enabled();
             if ui
@@ -711,41 +747,60 @@ impl ManifoldApp {
                     );
                 });
             self.config.slope_compensation_mode = Some(slope_mode);
-            ui.add(
-                egui::Slider::new(&mut self.config.shell_thickness, 0.0..=5.0)
-                    .text("Shell thickness (mm)"),
+            drag_num(
+                ui,
+                &mut self.config.shell_thickness,
+                0.01,
+                0.0..=f64::INFINITY,
+                "Shell thickness (mm)",
             );
-            ui.add(
-                egui::Slider::new(&mut self.config.wall_offset, 0.0..=1.0).text("Wall offset (mm)"),
+            drag_num(
+                ui,
+                &mut self.config.wall_offset,
+                0.01,
+                0.0..=f64::INFINITY,
+                "Wall offset (mm)",
             );
             let mut first_layer_w = self.config.first_layer_line_width();
-            if ui
-                .add(
-                    egui::Slider::new(&mut first_layer_w, 0.1..=1.5)
-                        .text("First layer line width (mm)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut first_layer_w,
+                0.01,
+                0.01..=f64::INFINITY,
+                "First layer line width (mm)",
+            )
+            .changed()
             {
                 self.config.first_layer_line_width = Some(first_layer_w);
             }
             let mut first_layer_mult = self.config.first_layer_extrusion_multiplier();
-            if ui
-                .add(
-                    egui::Slider::new(&mut first_layer_mult, 0.5..=2.0)
-                        .text("First layer flow multiplier"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut first_layer_mult,
+                0.01,
+                0.01..=f64::INFINITY,
+                "First layer flow multiplier",
+            )
+            .changed()
             {
                 self.config.first_layer_extrusion_multiplier = Some(first_layer_mult);
             }
-            ui.add(
-                egui::Slider::new(&mut self.config.filament_diameter, 1.0..=3.5)
-                    .text("Filament diameter (mm)"),
+            drag_num(
+                ui,
+                &mut self.config.filament_diameter,
+                0.01,
+                0.1..=f64::INFINITY,
+                "Filament diameter (mm)",
             );
             let mut density = self.config.filament_density();
-            if ui
-                .add(egui::Slider::new(&mut density, 0.5..=2.5).text("Filament density (g/cm³)"))
-                .changed()
+            if drag_num(
+                ui,
+                &mut density,
+                0.01,
+                0.01..=f64::INFINITY,
+                "Filament density (g/cm³)",
+            )
+            .changed()
             {
                 self.config.filament_density_g_cm3 = Some(density);
             }
@@ -753,29 +808,38 @@ impl ManifoldApp {
 
         ui.collapsing("Temperatures", |ui| {
             let mut def_nozzle = self.config.default_nozzle_temperature();
-            if ui
-                .add(
-                    egui::Slider::new(&mut def_nozzle, 150.0..=350.0)
-                        .text("Default nozzle temp (°C)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut def_nozzle,
+                1.0,
+                0.0..=f64::INFINITY,
+                "Default nozzle temp (°C)",
+            )
+            .changed()
             {
                 self.config.default_nozzle_temperature = Some(def_nozzle);
             }
             let mut bed_temp = self.config.bed_temperature();
-            if ui
-                .add(egui::Slider::new(&mut bed_temp, 0.0..=150.0).text("Bed temperature (°C)"))
-                .changed()
+            if drag_num(
+                ui,
+                &mut bed_temp,
+                1.0,
+                0.0..=f64::INFINITY,
+                "Bed temperature (°C)",
+            )
+            .changed()
             {
                 self.config.bed_temperature = Some(bed_temp);
             }
             let mut chamber_temp = self.config.chamber_temperature();
-            if ui
-                .add(
-                    egui::Slider::new(&mut chamber_temp, 0.0..=100.0)
-                        .text("Chamber temperature (°C)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut chamber_temp,
+                1.0,
+                0.0..=f64::INFINITY,
+                "Chamber temperature (°C)",
+            )
+            .changed()
             {
                 self.config.chamber_temperature = Some(chamber_temp);
             }
@@ -788,35 +852,36 @@ impl ManifoldApp {
             );
             if self.config.wave_overhangs_enabled {
                 let mut overlap = self.config.wave_overhang_overlap();
-                if ui
-                    .add(egui::Slider::new(&mut overlap, 0.01..=0.20).text("Track overlap (mm)"))
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut overlap,
+                    0.005,
+                    0.0..=f64::INFINITY,
+                    "Track overlap (mm)",
+                )
+                .changed()
                 {
                     self.config.wave_overhang_overlap = Some(overlap);
                 }
                 let mut speed_mms = (self.config.wave_overhang_speed() / 60.0).round();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut speed_mms, 5.0..=100.0)
-                            .text("Overhang speed (mm/s)"),
-                    )
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut speed_mms,
+                    1.0,
+                    0.1..=f64::INFINITY,
+                    "Overhang speed (mm/s)",
+                )
+                .changed()
                 {
                     self.config.wave_overhang_speed = Some(speed_mms * 60.0);
                 }
                 let mut flow = self.config.wave_overhang_flow();
-                if ui
-                    .add(egui::Slider::new(&mut flow, 0.5..=2.0).text("Flow multiplier"))
-                    .changed()
+                if drag_num(ui, &mut flow, 0.01, 0.01..=f64::INFINITY, "Flow multiplier").changed()
                 {
                     self.config.wave_overhang_flow = Some(flow);
                 }
                 let mut fan_pct = self.config.overhang_fan_speed_percent();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut fan_pct, 0.0..=100.0).text("Overhang fan speed (%)"),
-                    )
-                    .changed()
+                if drag_num(ui, &mut fan_pct, 1.0, 0.0..=100.0, "Overhang fan speed (%)").changed()
                 {
                     self.config.overhang_fan_speed_percent = Some(fan_pct);
                 }
@@ -846,86 +911,131 @@ impl ManifoldApp {
                     ui.label("2-Point Pressure Advance Calibration:");
                     let mut pa_low = fluid_cfg.pa_calibration_low.0;
                     let mut q_low = fluid_cfg.pa_calibration_low.1;
-                    if ui
-                        .add(egui::Slider::new(&mut pa_low, 0.005..=0.20).text("Low-flow PA (s)"))
-                        .changed()
+                    if drag_num(
+                        ui,
+                        &mut pa_low,
+                        0.001,
+                        0.0..=f64::INFINITY,
+                        "Low-flow PA (s)",
+                    )
+                    .changed()
                     {
                         fluid_cfg.pa_calibration_low.0 = pa_low;
                     }
-                    if ui
-                        .add(egui::Slider::new(&mut q_low, 0.5..=10.0).text("Low-flow Q (mm³/s)"))
-                        .changed()
+                    if drag_num(
+                        ui,
+                        &mut q_low,
+                        0.1,
+                        0.0..=f64::INFINITY,
+                        "Low-flow Q (mm³/s)",
+                    )
+                    .changed()
                     {
                         fluid_cfg.pa_calibration_low.1 = q_low;
                     }
 
                     let mut pa_high = fluid_cfg.pa_calibration_high.0;
                     let mut q_high = fluid_cfg.pa_calibration_high.1;
-                    if ui
-                        .add(egui::Slider::new(&mut pa_high, 0.005..=0.20).text("High-flow PA (s)"))
-                        .changed()
+                    if drag_num(
+                        ui,
+                        &mut pa_high,
+                        0.001,
+                        0.0..=f64::INFINITY,
+                        "High-flow PA (s)",
+                    )
+                    .changed()
                     {
                         fluid_cfg.pa_calibration_high.0 = pa_high;
                     }
-                    if ui
-                        .add(egui::Slider::new(&mut q_high, 5.0..=50.0).text("High-flow Q (mm³/s)"))
-                        .changed()
+                    if drag_num(
+                        ui,
+                        &mut q_high,
+                        0.5,
+                        0.0..=f64::INFINITY,
+                        "High-flow Q (mm³/s)",
+                    )
+                    .changed()
                     {
                         fluid_cfg.pa_calibration_high.1 = q_high;
                     }
 
                     ui.separator();
                     ui.label("Thermal & Ooze Parameters:");
-                    ui.add(
-                        egui::Slider::new(&mut fluid_cfg.static_retraction_mm, 0.05..=3.0)
-                            .text("Static break distance (mm)"),
+                    drag_num(
+                        ui,
+                        &mut fluid_cfg.static_retraction_mm,
+                        0.01,
+                        0.0..=f64::INFINITY,
+                        "Static break distance (mm)",
                     );
-                    ui.add(
-                        egui::Slider::new(&mut fluid_cfg.max_fan_temp_drop_c, 0.0..=25.0)
-                            .text("Max fan temp drop (°C)"),
+                    drag_num(
+                        ui,
+                        &mut fluid_cfg.max_fan_temp_drop_c,
+                        0.5,
+                        0.0..=f64::INFINITY,
+                        "Max fan temp drop (°C)",
                     );
-                    ui.add(
-                        egui::Slider::new(&mut fluid_cfg.ooze_time_constant_ref_s, 0.05..=10.0)
-                            .text("Ooze time constant τ (s)"),
+                    drag_num(
+                        ui,
+                        &mut fluid_cfg.ooze_time_constant_ref_s,
+                        0.05,
+                        0.001..=f64::INFINITY,
+                        "Ooze time constant τ (s)",
                     );
-                    ui.add(
-                        egui::Slider::new(&mut fluid_cfg.ooze_max_length_ref_mm, -2.0..=2.0)
-                            .step_by(0.01)
-                            .text("Max ooze prime / swell (mm)"),
+                    drag_num(
+                        ui,
+                        &mut fluid_cfg.ooze_max_length_ref_mm,
+                        0.01,
+                        -f64::INFINITY..=f64::INFINITY,
+                        "Max ooze prime / swell (mm)",
                     );
                     let mut b_low = fluid_cfg.swell_ratio_low();
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut b_low, 1.0..=1.5)
-                                .text("Swell ratio @ low flow (B_low)"),
-                        )
-                        .changed()
+                    if drag_num(
+                        ui,
+                        &mut b_low,
+                        0.01,
+                        1.0..=f64::INFINITY,
+                        "Swell ratio @ low flow (B_low)",
+                    )
+                    .changed()
                     {
                         fluid_cfg.swell_ratio_low = Some(b_low);
                     }
                     let mut b_high = fluid_cfg.swell_ratio_high();
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut b_high, 1.0..=1.5)
-                                .text("Swell ratio @ high flow (B_high)"),
-                        )
-                        .changed()
+                    if drag_num(
+                        ui,
+                        &mut b_high,
+                        0.01,
+                        1.0..=f64::INFINITY,
+                        "Swell ratio @ high flow (B_high)",
+                    )
+                    .changed()
                     {
                         fluid_cfg.swell_ratio_high = Some(b_high);
                     }
                 });
             } else {
                 let mut r_len = self.config.retraction_length();
-                if ui
-                    .add(egui::Slider::new(&mut r_len, 0.0..=10.0).text("Retraction distance (mm)"))
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut r_len,
+                    0.1,
+                    0.0..=f64::INFINITY,
+                    "Retraction distance (mm)",
+                )
+                .changed()
                 {
                     self.config.retraction_length = Some(r_len);
                 }
                 let mut pa_val = self.config.pressure_advance.unwrap_or(0.0);
-                if ui
-                    .add(egui::Slider::new(&mut pa_val, 0.0..=0.2).text("Pressure advance (s)"))
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut pa_val,
+                    0.001,
+                    0.0..=f64::INFINITY,
+                    "Pressure advance (s)",
+                )
+                .changed()
                 {
                     self.config.pressure_advance = if pa_val > 0.0 { Some(pa_val) } else { None };
                 }
@@ -936,54 +1046,66 @@ impl ManifoldApp {
             }
 
             let mut r_spd_mms = (self.config.retraction_speed() / 60.0).round();
-            if ui
-                .add(
-                    egui::Slider::new(&mut r_spd_mms, 10.0..=150.0).text("Retraction speed (mm/s)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut r_spd_mms,
+                1.0,
+                0.1..=f64::INFINITY,
+                "Retraction speed (mm/s)",
+            )
+            .changed()
             {
                 self.config.retraction_speed = Some(r_spd_mms * 60.0);
             }
 
             let mut u_spd_mms = (self.config.unretract_speed() / 60.0).round();
-            if ui
-                .add(egui::Slider::new(&mut u_spd_mms, 10.0..=150.0).text("Unretract speed (mm/s)"))
-                .changed()
+            if drag_num(
+                ui,
+                &mut u_spd_mms,
+                1.0,
+                0.1..=f64::INFINITY,
+                "Unretract speed (mm/s)",
+            )
+            .changed()
             {
                 self.config.unretract_speed = Some(u_spd_mms * 60.0);
             }
 
             let mut u_extra = self.config.unretract_extra_length();
-            if ui
-                .add(
-                    egui::Slider::new(&mut u_extra, -2.0..=2.0)
-                        .step_by(0.01)
-                        .text("Unretract extra length (mm)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut u_extra,
+                0.01,
+                -f64::INFINITY..=f64::INFINITY,
+                "Unretract extra length (mm)",
+            )
+            .changed()
             {
                 self.config.unretract_extra_length = Some(u_extra);
             }
 
             let mut min_travel_retract = self.config.min_travel_for_retract();
-            if ui
-                .add(
-                    egui::Slider::new(&mut min_travel_retract, 0.0..=10.0)
-                        .step_by(0.1)
-                        .text("Minimum travel for retract (mm)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut min_travel_retract,
+                0.1,
+                0.0..=f64::INFINITY,
+                "Minimum travel for retract (mm)",
+            )
+            .changed()
             {
                 self.config.min_travel_for_retract = Some(min_travel_retract);
             }
 
             let mut taper_dist = self.config.pre_retract_taper_distance.unwrap_or(0.0);
-            if ui
-                .add(
-                    egui::Slider::new(&mut taper_dist, 0.0..=10.0)
-                        .text("Pre-retract taper distance (mm)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut taper_dist,
+                0.1,
+                0.0..=f64::INFINITY,
+                "Pre-retract taper distance (mm)",
+            )
+            .changed()
             {
                 self.config.pre_retract_taper_distance = if taper_dist > 0.0 {
                     Some(taper_dist)
@@ -996,13 +1118,14 @@ impl ManifoldApp {
             ui.label("Seams & Surface Transitions:");
 
             let mut s_gap = self.config.seam_gap();
-            if ui
-                .add(
-                    egui::Slider::new(&mut s_gap, 0.0..=5.0)
-                        .step_by(0.05)
-                        .text("Seam gap / coasting distance (mm)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut s_gap,
+                0.05,
+                0.0..=f64::INFINITY,
+                "Seam gap / coasting distance (mm)",
+            )
+            .changed()
             {
                 self.config.seam_gap = if s_gap > 1e-4 { Some(s_gap) } else { None };
             }
@@ -1010,9 +1133,14 @@ impl ManifoldApp {
             ui.checkbox(&mut self.config.wipe_enabled, "Wipe on retraction");
             if self.config.wipe_enabled {
                 let mut wipe_dist = self.config.wipe_distance();
-                if ui
-                    .add(egui::Slider::new(&mut wipe_dist, 0.1..=10.0).text("Wipe distance (mm)"))
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut wipe_dist,
+                    0.1,
+                    0.0..=f64::INFINITY,
+                    "Wipe distance (mm)",
+                )
+                .changed()
                 {
                     self.config.wipe_distance = Some(wipe_dist);
                 }
@@ -1021,43 +1149,45 @@ impl ManifoldApp {
             ui.checkbox(&mut self.config.scarf_joint_enabled, "Scarf joint seams");
             if self.config.scarf_joint_enabled {
                 let mut scarf_len = self.config.scarf_joint_length();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut scarf_len, 1.0..=25.0)
-                            .text("Scarf overlap length (mm)"),
-                    )
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut scarf_len,
+                    0.5,
+                    0.0..=f64::INFINITY,
+                    "Scarf overlap length (mm)",
+                )
+                .changed()
                 {
                     self.config.scarf_joint_length = Some(scarf_len);
                 }
 
                 let mut scarf_steps = self.config.scarf_joint_steps();
-                if ui
-                    .add(egui::Slider::new(&mut scarf_steps, 2..=20).text("Scarf steps"))
-                    .changed()
-                {
+                if drag_num(ui, &mut scarf_steps, 1.0, 2..=usize::MAX, "Scarf steps").changed() {
                     self.config.scarf_joint_steps = Some(scarf_steps);
                 }
 
                 let mut scarf_start_h = self.config.scarf_joint_start_height_fraction() * 100.0;
-                if ui
-                    .add(
-                        egui::Slider::new(&mut scarf_start_h, 5.0..=50.0)
-                            .text("Scarf start height (%)"),
-                    )
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut scarf_start_h,
+                    1.0,
+                    0.0..=100.0,
+                    "Scarf start height (%)",
+                )
+                .changed()
                 {
                     self.config.scarf_joint_start_height_fraction = Some(scarf_start_h / 100.0);
                 }
 
                 let mut scarf_flow = self.config.scarf_joint_flow_ratio();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut scarf_flow, 0.50..=1.20)
-                            .step_by(0.01)
-                            .text("Scarf joint flow multiplier"),
-                    )
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut scarf_flow,
+                    0.01,
+                    0.01..=f64::INFINITY,
+                    "Scarf joint flow multiplier",
+                )
+                .changed()
                 {
                     self.config.scarf_joint_flow_ratio = Some(scarf_flow);
                 }
@@ -1067,9 +1197,12 @@ impl ManifoldApp {
         ui.collapsing("Travel & Simplification", |ui| {
             ui.checkbox(&mut self.config.z_hop_enabled, "Z-hop on travel");
             if self.config.z_hop_enabled {
-                ui.add(
-                    egui::Slider::new(&mut self.config.z_hop_height, 0.0..=2.0)
-                        .text("Z-hop height (mm)"),
+                drag_num(
+                    ui,
+                    &mut self.config.z_hop_height,
+                    0.05,
+                    0.0..=f64::INFINITY,
+                    "Z-hop height (mm)",
                 );
             }
             ui.checkbox(
@@ -1077,9 +1210,12 @@ impl ManifoldApp {
                 "Simplify wall toolpaths",
             );
             if self.config.path_simplify_enabled {
-                ui.add(
-                    egui::Slider::new(&mut self.config.path_simplify_tolerance, 0.0..=0.5)
-                        .text("Simplification tolerance (mm)"),
+                drag_num(
+                    ui,
+                    &mut self.config.path_simplify_tolerance,
+                    0.005,
+                    0.0..=f64::INFINITY,
+                    "Simplification tolerance (mm)",
                 );
             }
         });
@@ -1195,16 +1331,26 @@ impl ManifoldApp {
         {
             self.config.solid_infill_pattern = Some(solid_pattern);
         }
-        ui.add(
-            egui::Slider::new(&mut self.config.infill_line_width, 0.05..=1.5)
-                .text("Infill line width (mm)"),
+        drag_num(
+            ui,
+            &mut self.config.infill_line_width,
+            0.01,
+            0.01..=f64::INFINITY,
+            "Infill line width (mm)",
         );
-        ui.add(
-            egui::Slider::new(&mut self.config.infill_angle_deg, 0.0..=180.0)
-                .text("Infill angle (deg)"),
+        drag_num(
+            ui,
+            &mut self.config.infill_angle_deg,
+            1.0,
+            0.0..=360.0,
+            "Infill angle (deg)",
         );
-        ui.add(
-            egui::Slider::new(&mut self.config.infill_density, 0.0..=1.0).text("Infill density"),
+        drag_num(
+            ui,
+            &mut self.config.infill_density,
+            0.01,
+            0.0..=1.0,
+            "Infill density",
         );
 
         ui.separator();
@@ -1262,24 +1408,29 @@ impl ManifoldApp {
                 ui.add(egui::DragValue::new(&mut self.config.order_field_apex.y).prefix("y: "));
                 ui.add(egui::DragValue::new(&mut self.config.order_field_apex.z).prefix("z: "));
             });
-            ui.add(
-                egui::Slider::new(&mut self.config.order_field_slope, 0.0..=2.0).text("Cone slope"),
+            drag_num(
+                ui,
+                &mut self.config.order_field_slope,
+                0.01,
+                0.0..=f64::INFINITY,
+                "Cone slope",
             );
         }
         if self.config.order_field == OrderFieldKind::Eikonal
             || self.config.order_field == OrderFieldKind::DualIso
         {
             let mut surface_weight = self.config.eikonal_surface_order_weight();
-            if ui
-                .add(
-                    egui::Slider::new(&mut surface_weight, 0.0..=2.0)
-                        .text("Surface order weight")
-                        .step_by(0.05),
-                )
-                .on_hover_text(
-                    "Weight multiplier (0.0 to 2.0) for the geodesic SurfaceEikonal lower bound on the model skin. 1.0 enforces the exact surface arrival time to eliminate surface local minima; 0.0 disables it.",
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut surface_weight,
+                0.05,
+                0.0..=f64::INFINITY,
+                "Surface order weight",
+            )
+            .on_hover_text(
+                "Weight multiplier for the geodesic SurfaceEikonal lower bound on the model skin. 1.0 enforces the exact surface arrival time to eliminate surface local minima; 0.0 disables it.",
+            )
+            .changed()
             {
                 self.config.eikonal_surface_order_weight = Some(surface_weight);
             }
@@ -1289,12 +1440,14 @@ impl ManifoldApp {
             );
             if self.config.eikonal_conform_top_surfaces {
                 let mut max_angle = self.config.eikonal_conformal_max_angle_deg();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut max_angle, 5.0..=75.0)
-                            .text("Top conform detach angle (°)"),
-                    )
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut max_angle,
+                    0.5,
+                    0.0..=90.0,
+                    "Top conform detach angle (°)",
+                )
+                .changed()
                 {
                     self.config.eikonal_conformal_max_angle_deg = Some(max_angle);
                 }
@@ -1305,12 +1458,14 @@ impl ManifoldApp {
             );
             if self.config.eikonal_conform_bottom_surfaces {
                 let mut bottom_angle = self.config.eikonal_conformal_bottom_max_angle_deg();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut bottom_angle, 5.0..=75.0)
-                            .text("Bottom conform detach angle (°)"),
-                    )
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut bottom_angle,
+                    0.5,
+                    0.0..=90.0,
+                    "Bottom conform detach angle (°)",
+                )
+                .changed()
                 {
                     self.config.eikonal_conformal_bottom_max_angle_deg = Some(bottom_angle);
                 }
@@ -1319,12 +1474,14 @@ impl ManifoldApp {
                 || self.config.eikonal_conform_bottom_surfaces
             {
                 let mut skin_depth = self.config.eikonal_conformal_skin_depth_mm();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut skin_depth, 0.4..=5.0)
-                            .text("Conformal skin depth (mm)"),
-                    )
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut skin_depth,
+                    0.1,
+                    0.0..=f64::INFINITY,
+                    "Conformal skin depth (mm)",
+                )
+                .changed()
                 {
                     self.config.eikonal_conformal_skin_depth_mm = Some(skin_depth);
                 }
@@ -1345,14 +1502,14 @@ impl ManifoldApp {
                             egui::DragValue::new(x)
                                 .prefix("x: ")
                                 .suffix(" mm")
-                                .range(0.001..=500.0)
+                                .range(0.001..=f64::INFINITY)
                                 .speed(0.1),
                         );
                         ui.add(
                             egui::DragValue::new(z)
                                 .prefix("z: ")
                                 .suffix(" mm")
-                                .range(0.0..=1000.0)
+                                .range(0.0..=f64::INFINITY)
                                 .speed(0.1),
                         );
                         let angle = if *z > 0.0 && *x > 0.0 {
@@ -1390,12 +1547,14 @@ impl ManifoldApp {
 
         ui.collapsing("Speeds (mm/s)", |ui| {
             let mut print_speed_mms = (self.config.print_speed / 60.0).round();
-            if ui
-                .add(
-                    egui::Slider::new(&mut print_speed_mms, 20.0..=400.0)
-                        .text("Print speed (mm/s)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut print_speed_mms,
+                1.0,
+                0.1..=f64::INFINITY,
+                "Print speed (mm/s)",
+            )
+            .changed()
             {
                 self.config.print_speed = print_speed_mms * 60.0;
             }
@@ -1404,12 +1563,14 @@ impl ManifoldApp {
                     (self.config.print_speed * 0.6).min(self.config.print_speed)
                 }) / 60.0)
                     .round();
-            if ui
-                .add(
-                    egui::Slider::new(&mut outer_wall_speed_mms, 10.0..=400.0)
-                        .text("Outer wall speed (mm/s)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut outer_wall_speed_mms,
+                1.0,
+                0.1..=f64::INFINITY,
+                "Outer wall speed (mm/s)",
+            )
+            .changed()
             {
                 self.config.outer_wall_speed = Some(outer_wall_speed_mms * 60.0);
             }
@@ -1419,23 +1580,27 @@ impl ManifoldApp {
                 .unwrap_or(self.config.print_speed)
                 / 60.0)
                 .round();
-            if ui
-                .add(
-                    egui::Slider::new(&mut inner_wall_speed_mms, 20.0..=400.0)
-                        .text("Inner wall speed (mm/s)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut inner_wall_speed_mms,
+                1.0,
+                0.1..=f64::INFINITY,
+                "Inner wall speed (mm/s)",
+            )
+            .changed()
             {
                 self.config.inner_wall_speed = Some(inner_wall_speed_mms * 60.0);
             }
             let mut infill_speed_mms =
                 (self.config.infill_speed.unwrap_or(self.config.print_speed) / 60.0).round();
-            if ui
-                .add(
-                    egui::Slider::new(&mut infill_speed_mms, 20.0..=500.0)
-                        .text("Infill speed (mm/s)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut infill_speed_mms,
+                1.0,
+                0.1..=f64::INFINITY,
+                "Infill speed (mm/s)",
+            )
+            .changed()
             {
                 self.config.infill_speed = Some(infill_speed_mms * 60.0);
             }
@@ -1444,12 +1609,14 @@ impl ManifoldApp {
                     (self.config.print_speed * 0.8).min(self.config.print_speed)
                 }) / 60.0)
                     .round();
-            if ui
-                .add(
-                    egui::Slider::new(&mut solid_infill_speed_mms, 20.0..=400.0)
-                        .text("Solid infill speed (mm/s)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut solid_infill_speed_mms,
+                1.0,
+                0.1..=f64::INFINITY,
+                "Solid infill speed (mm/s)",
+            )
+            .changed()
             {
                 self.config.solid_infill_speed = Some(solid_infill_speed_mms * 60.0);
             }
@@ -1458,43 +1625,51 @@ impl ManifoldApp {
                     (self.config.print_speed * 0.5).min(self.config.print_speed)
                 }) / 60.0)
                     .round();
-            if ui
-                .add(
-                    egui::Slider::new(&mut bridge_speed_mms, 10.0..=200.0)
-                        .text("Bridge speed (mm/s)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut bridge_speed_mms,
+                1.0,
+                0.1..=f64::INFINITY,
+                "Bridge speed (mm/s)",
+            )
+            .changed()
             {
                 self.config.bridge_speed = Some(bridge_speed_mms * 60.0);
             }
             let mut first_layer_speed_mms = (self.config.first_layer_print_speed() / 60.0).round();
-            if ui
-                .add(
-                    egui::Slider::new(&mut first_layer_speed_mms, 10.0..=200.0)
-                        .text("First layer speed (mm/s)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut first_layer_speed_mms,
+                1.0,
+                0.1..=f64::INFINITY,
+                "First layer speed (mm/s)",
+            )
+            .changed()
             {
                 self.config.first_layer_print_speed = Some(first_layer_speed_mms * 60.0);
             }
             let mut travel_speed_mms = (self.config.travel_speed / 60.0).round();
-            if ui
-                .add(
-                    egui::Slider::new(&mut travel_speed_mms, 50.0..=1000.0)
-                        .text("Travel speed (mm/s)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut travel_speed_mms,
+                1.0,
+                0.1..=f64::INFINITY,
+                "Travel speed (mm/s)",
+            )
+            .changed()
             {
                 self.config.travel_speed = travel_speed_mms * 60.0;
             }
 
             let mut max_vol_speed = self.config.max_volumetric_speed.unwrap_or(0.0);
-            if ui
-                .add(
-                    egui::Slider::new(&mut max_vol_speed, 0.0..=60.0)
-                        .text("Max volumetric speed (mm³/s) (0=off)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut max_vol_speed,
+                0.5,
+                0.0..=f64::INFINITY,
+                "Max volumetric speed (mm³/s) (0=off)",
+            )
+            .changed()
             {
                 self.config.max_volumetric_speed = if max_vol_speed > 0.0 {
                     Some(max_vol_speed)
@@ -1503,9 +1678,14 @@ impl ManifoldApp {
                 };
             }
             let mut spd_deadband = self.config.speed_deadband_percent();
-            if ui
-                .add(egui::Slider::new(&mut spd_deadband, 0.0..=30.0).text("Speed deadband (%)"))
-                .changed()
+            if drag_num(
+                ui,
+                &mut spd_deadband,
+                0.5,
+                0.0..=100.0,
+                "Speed deadband (%)",
+            )
+            .changed()
             {
                 self.config.speed_deadband_percent = Some(spd_deadband);
             }
@@ -1513,78 +1693,98 @@ impl ManifoldApp {
 
         ui.collapsing("Accelerations (mm/s²)", |ui| {
             let mut def_accel = self.config.default_acceleration.unwrap_or(5000.0);
-            if ui
-                .add(
-                    egui::Slider::new(&mut def_accel, 500.0..=30000.0).text("Default acceleration"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut def_accel,
+                50.0,
+                1.0..=f64::INFINITY,
+                "Default acceleration",
+            )
+            .changed()
             {
                 self.config.default_acceleration = Some(def_accel);
             }
             let mut outer_wall_accel = self.config.outer_wall_acceleration.unwrap_or(2500.0);
-            if ui
-                .add(
-                    egui::Slider::new(&mut outer_wall_accel, 500.0..=30000.0)
-                        .text("Outer wall acceleration"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut outer_wall_accel,
+                50.0,
+                1.0..=f64::INFINITY,
+                "Outer wall acceleration",
+            )
+            .changed()
             {
                 self.config.outer_wall_acceleration = Some(outer_wall_accel);
             }
             let mut inner_wall_accel = self.config.inner_wall_acceleration.unwrap_or(5000.0);
-            if ui
-                .add(
-                    egui::Slider::new(&mut inner_wall_accel, 500.0..=30000.0)
-                        .text("Inner wall acceleration"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut inner_wall_accel,
+                50.0,
+                1.0..=f64::INFINITY,
+                "Inner wall acceleration",
+            )
+            .changed()
             {
                 self.config.inner_wall_acceleration = Some(inner_wall_accel);
             }
             let mut infill_accel = self.config.infill_acceleration.unwrap_or(7000.0);
-            if ui
-                .add(
-                    egui::Slider::new(&mut infill_accel, 500.0..=30000.0)
-                        .text("Infill acceleration"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut infill_accel,
+                50.0,
+                1.0..=f64::INFINITY,
+                "Infill acceleration",
+            )
+            .changed()
             {
                 self.config.infill_acceleration = Some(infill_accel);
             }
             let mut travel_accel = self.config.travel_acceleration.unwrap_or(10000.0);
-            if ui
-                .add(
-                    egui::Slider::new(&mut travel_accel, 500.0..=40000.0)
-                        .text("Travel acceleration"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut travel_accel,
+                50.0,
+                1.0..=f64::INFINITY,
+                "Travel acceleration",
+            )
+            .changed()
             {
                 self.config.travel_acceleration = Some(travel_accel);
             }
             let mut first_layer_accel = self.config.first_layer_acceleration.unwrap_or(2000.0);
-            if ui
-                .add(
-                    egui::Slider::new(&mut first_layer_accel, 500.0..=10000.0)
-                        .text("First layer acceleration"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut first_layer_accel,
+                50.0,
+                1.0..=f64::INFINITY,
+                "First layer acceleration",
+            )
+            .changed()
             {
                 self.config.first_layer_acceleration = Some(first_layer_accel);
             }
             let mut scv = self.config.square_corner_velocity();
-            if ui
-                .add(egui::Slider::new(&mut scv, 1.0..=30.0).text("Square corner velocity (mm/s)"))
-                .changed()
+            if drag_num(
+                ui,
+                &mut scv,
+                0.5,
+                0.1..=f64::INFINITY,
+                "Square corner velocity (mm/s)",
+            )
+            .changed()
             {
                 self.config.square_corner_velocity = Some(scv);
             }
             let mut accel_deadband = self.config.acceleration_deadband_percent();
-            if ui
-                .add(
-                    egui::Slider::new(&mut accel_deadband, 0.0..=50.0)
-                        .text("Acceleration deadband (%)"),
-                )
-                .changed()
+            if drag_num(
+                ui,
+                &mut accel_deadband,
+                0.5,
+                0.0..=100.0,
+                "Acceleration deadband (%)",
+            )
+            .changed()
             {
                 self.config.acceleration_deadband_percent = Some(accel_deadband);
             }
@@ -1593,26 +1793,30 @@ impl ManifoldApp {
         ui.separator();
         ui.heading("Cooling & Fan");
         let mut fan_pct = self.config.fan_speed_percent();
-        if ui
-            .add(egui::Slider::new(&mut fan_pct, 0.0..=100.0).text("Fan speed (%)"))
-            .changed()
-        {
+        if drag_num(ui, &mut fan_pct, 1.0, 0.0..=100.0, "Fan speed (%)").changed() {
             self.config.fan_speed_percent = Some(fan_pct);
         }
         let mut overhang_fan_pct = self.config.overhang_fan_speed_percent();
-        if ui
-            .add(
-                egui::Slider::new(&mut overhang_fan_pct, 0.0..=100.0)
-                    .text("Overhang fan speed (%)"),
-            )
-            .changed()
+        if drag_num(
+            ui,
+            &mut overhang_fan_pct,
+            1.0,
+            0.0..=100.0,
+            "Overhang fan speed (%)",
+        )
+        .changed()
         {
             self.config.overhang_fan_speed_percent = Some(overhang_fan_pct);
         }
         let mut fan_delay = self.config.fan_layer_delay();
-        if ui
-            .add(egui::Slider::new(&mut fan_delay, 0..=10).text("Fan disabled initial layers"))
-            .changed()
+        if drag_num(
+            ui,
+            &mut fan_delay,
+            1.0,
+            0..=u32::MAX,
+            "Fan disabled initial layers",
+        )
+        .changed()
         {
             self.config.fan_layer_delay = Some(fan_delay);
         }
@@ -1621,15 +1825,16 @@ impl ManifoldApp {
         ui.heading("Machine");
         let (min, mut max) = self.machine.build_volume.bounding_box();
         let mut bed_changed = false;
-        bed_changed |= ui
-            .add(egui::Slider::new(&mut max.x, 50.0..=1000.0).text("Bed X (mm)"))
-            .changed();
-        bed_changed |= ui
-            .add(egui::Slider::new(&mut max.y, 50.0..=1000.0).text("Bed Y (mm)"))
-            .changed();
-        bed_changed |= ui
-            .add(egui::Slider::new(&mut max.z, 50.0..=1000.0).text("Build height (mm)"))
-            .changed();
+        bed_changed |= drag_num(ui, &mut max.x, 1.0, 1.0..=f64::INFINITY, "Bed X (mm)").changed();
+        bed_changed |= drag_num(ui, &mut max.y, 1.0, 1.0..=f64::INFINITY, "Bed Y (mm)").changed();
+        bed_changed |= drag_num(
+            ui,
+            &mut max.z,
+            1.0,
+            1.0..=f64::INFINITY,
+            "Build height (mm)",
+        )
+        .changed();
         if bed_changed {
             self.machine.build_volume = BoundingVolume::Aabb { min, max };
             let device = frame
@@ -1650,27 +1855,34 @@ impl ManifoldApp {
                             remove_idx = Some(i);
                         }
                     });
-                    ui.add(
-                        egui::Slider::new(&mut tool.nozzle_diameter, 0.1..=1.5)
-                            .text("Nozzle diameter (mm)"),
+                    drag_num(
+                        ui,
+                        &mut tool.nozzle_diameter,
+                        0.01,
+                        0.01..=f64::INFINITY,
+                        "Nozzle diameter (mm)",
                     );
                     let mut flat_diam = tool.nozzle_flat_diameter();
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut flat_diam, 0.0..=3.0)
-                                .text("Nozzle flat land diameter (mm)"),
-                        )
-                        .changed()
+                    if drag_num(
+                        ui,
+                        &mut flat_diam,
+                        0.05,
+                        0.0..=f64::INFINITY,
+                        "Nozzle flat land diameter (mm)",
+                    )
+                    .changed()
                     {
                         tool.nozzle_flat_diameter = Some(flat_diam);
                     }
-                    ui.add(
-                        egui::Slider::new(&mut tool.extrusion_multiplier, 0.5..=1.5)
-                            .text("Extrusion multiplier"),
+                    drag_num(
+                        ui,
+                        &mut tool.extrusion_multiplier,
+                        0.01,
+                        0.01..=f64::INFINITY,
+                        "Extrusion multiplier",
                     );
                     let mut temp = tool.nozzle_temperature();
-                    if ui
-                        .add(egui::Slider::new(&mut temp, 150.0..=350.0).text("Nozzle temp (°C)"))
+                    if drag_num(ui, &mut temp, 1.0, 0.0..=f64::INFINITY, "Nozzle temp (°C)")
                         .changed()
                     {
                         tool.nozzle_temperature = Some(temp);
@@ -1695,42 +1907,53 @@ impl ManifoldApp {
         if self.machine.use_stepper_dynamics {
             ui.collapsing("Global Stepper Dynamics", |ui| {
                 let mut a0 = self.machine.zero_speed_acceleration();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut a0, 1000.0..=50000.0)
-                            .text("Zero-speed acceleration (a₀, mm/s²)"),
-                    )
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut a0,
+                    50.0,
+                    1.0..=f64::INFINITY,
+                    "Zero-speed acceleration (a₀, mm/s²)",
+                )
+                .changed()
                 {
                     self.machine.zero_speed_acceleration = Some(a0);
                 }
 
                 let mut vmax = self.machine.max_available_speed();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut vmax, 100.0..=2000.0)
-                            .text("Max available speed (v_max, mm/s)"),
-                    )
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut vmax,
+                    5.0,
+                    1.0..=f64::INFINITY,
+                    "Max available speed (v_max, mm/s)",
+                )
+                .changed()
                 {
                     self.machine.max_available_speed = Some(vmax);
                 }
 
                 let mut a_limit = self.machine.acceleration_limit();
-                if ui
-                    .add(
-                        egui::Slider::new(&mut a_limit, 500.0..=30000.0)
-                            .text("Acceleration limit (mm/s²)"),
-                    )
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut a_limit,
+                    50.0,
+                    1.0..=f64::INFINITY,
+                    "Acceleration limit (mm/s²)",
+                )
+                .changed()
                 {
                     self.machine.acceleration_limit = Some(a_limit);
                 }
 
                 let mut v_limit = self.machine.speed_limit();
-                if ui
-                    .add(egui::Slider::new(&mut v_limit, 50.0..=1500.0).text("Speed limit (mm/s)"))
-                    .changed()
+                if drag_num(
+                    ui,
+                    &mut v_limit,
+                    5.0,
+                    1.0..=f64::INFINITY,
+                    "Speed limit (mm/s)",
+                )
+                .changed()
                 {
                     self.machine.speed_limit = Some(v_limit);
                 }
@@ -1772,12 +1995,14 @@ impl ManifoldApp {
                             manifold_core::kinematics::Axis::Z => 40.0,
                             _ => global_speed,
                         });
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut spd, 1.0..=1000.0)
-                                    .text("Max speed limit (mm/s)"),
-                            )
-                            .changed()
+                        if drag_num(
+                            ui,
+                            &mut spd,
+                            1.0,
+                            0.1..=f64::INFINITY,
+                            "Max speed limit (mm/s)",
+                        )
+                        .changed()
                         {
                             limits.speed_limit = Some(spd);
                         }
@@ -1786,12 +2011,14 @@ impl ManifoldApp {
                             manifold_core::kinematics::Axis::Z => 1500.0,
                             _ => global_accel,
                         });
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut accel, 100.0..=30000.0)
-                                    .text("Max acceleration (mm/s²)"),
-                            )
-                            .changed()
+                        if drag_num(
+                            ui,
+                            &mut accel,
+                            50.0,
+                            1.0..=f64::INFINITY,
+                            "Max acceleration (mm/s²)",
+                        )
+                        .changed()
                         {
                             limits.acceleration_limit = Some(accel);
                         }
@@ -1805,12 +2032,14 @@ impl ManifoldApp {
                                 manifold_core::kinematics::Axis::Z => 3000.0,
                                 _ => global_a0,
                             });
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut a0, 500.0..=50000.0)
-                                        .text("Zero-speed accel (a₀, mm/s²)"),
-                                )
-                                .changed()
+                            if drag_num(
+                                ui,
+                                &mut a0,
+                                50.0,
+                                1.0..=f64::INFINITY,
+                                "Zero-speed accel (a₀, mm/s²)",
+                            )
+                            .changed()
                             {
                                 limits.zero_speed_acceleration = Some(a0);
                             }
@@ -1819,12 +2048,14 @@ impl ManifoldApp {
                                 manifold_core::kinematics::Axis::Z => 60.0,
                                 _ => global_vmax,
                             });
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut vmax, 10.0..=2000.0)
-                                        .text("Max available speed (v_max, mm/s)"),
-                                )
-                                .changed()
+                            if drag_num(
+                                ui,
+                                &mut vmax,
+                                5.0,
+                                1.0..=f64::INFINITY,
+                                "Max available speed (v_max, mm/s)",
+                            )
+                            .changed()
                             {
                                 limits.max_available_speed = Some(vmax);
                             }
@@ -2108,7 +2339,13 @@ impl ManifoldApp {
         });
 
         ui.separator();
-        ui.add(egui::Slider::new(&mut self.sdf_iso_level, -2.0..=2.0).text("Iso level (mm)"));
+        drag_num(
+            ui,
+            &mut self.sdf_iso_level,
+            0.05,
+            -f64::INFINITY..=f64::INFINITY,
+            "Iso level (mm)",
+        );
 
         ui.separator();
         if ui
@@ -2133,7 +2370,13 @@ impl ManifoldApp {
                     ui.selectable_value(&mut self.sdf_slice_plane, SlicePlane::Xz, "XZ");
                     ui.selectable_value(&mut self.sdf_slice_plane, SlicePlane::Yz, "YZ");
                 });
-            ui.add(egui::Slider::new(&mut self.sdf_slice_offset, -50.0..=50.0).text("Offset (mm)"));
+            drag_num(
+                ui,
+                &mut self.sdf_slice_offset,
+                0.5,
+                -f64::INFINITY..=f64::INFINITY,
+                "Offset (mm)",
+            );
         });
         if ui
             .add_enabled(
