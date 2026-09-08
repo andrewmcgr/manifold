@@ -1969,6 +1969,17 @@ pub fn plan_with_progress(
                 } else {
                     point_count
                 };
+                let gap_ctx = crate::gap_fill::GapFillContext {
+                    config,
+                    canonical_tangent_footprint: &canonical_tangent_footprint,
+                    basis1,
+                    basis2,
+                    origin,
+                    tool: object.tool,
+                };
+                let (gap_line_widths, gap_paths) =
+                    crate::gap_fill::plan_gap_fill_for_wall(wall_loop, layer, &gap_ctx);
+
                 let segments = (0..seg_count)
                     .map(|i| {
                         let dest = if wall_loop.is_open {
@@ -2010,59 +2021,13 @@ pub fn plan_with_progress(
                         } else {
                             base_kind
                         };
-                        let adaptive_w = if wall_loop.wall_index > 0
-                            && !is_unsupported
-                            && !is_debug_loop
-                        {
-                            if let Some(sdf) = layer.mesh_sdf.as_deref() {
-                                let eps = 0.02;
-                                let dx = sdf.sample(seg_mid_3d + glam::DVec3::X * eps).value
-                                    - sdf.sample(seg_mid_3d - glam::DVec3::X * eps).value;
-                                let dy = sdf.sample(seg_mid_3d + glam::DVec3::Y * eps).value
-                                    - sdf.sample(seg_mid_3d - glam::DVec3::Y * eps).value;
-                                let dz = sdf.sample(seg_mid_3d + glam::DVec3::Z * eps).value
-                                    - sdf.sample(seg_mid_3d - glam::DVec3::Z * eps).value;
-                                let g_cad = glam::DVec3::new(dx, dy, dz);
-                                let g_len = g_cad.length();
-
-                                let odx = layer
-                                    .order_field
-                                    .order(seg_mid_3d + glam::DVec3::X * eps)
-                                    - layer.order_field.order(seg_mid_3d - glam::DVec3::X * eps);
-                                let ody = layer
-                                    .order_field
-                                    .order(seg_mid_3d + glam::DVec3::Y * eps)
-                                    - layer.order_field.order(seg_mid_3d - glam::DVec3::Y * eps);
-                                let odz = layer
-                                    .order_field
-                                    .order(seg_mid_3d + glam::DVec3::Z * eps)
-                                    - layer.order_field.order(seg_mid_3d - glam::DVec3::Z * eps);
-                                let g_order = glam::DVec3::new(odx, ody, odz);
-                                let o_len = g_order.length();
-
-                                if g_len > 1e-6 && o_len > 1e-6 {
-                                    let n_cad = g_cad / g_len;
-                                    let n_order = g_order / o_len;
-                                    crate::extrusion::adaptive_wall_line_width(
-                                        config.wall_line_width,
-                                        config.min_bead_width(),
-                                        config.max_bead_width(),
-                                        n_cad,
-                                        n_order,
-                                    )
-                                } else {
-                                    config.wall_line_width
-                                }
-                            } else {
-                                config.wall_line_width
-                            }
-                        } else {
-                            config.wall_line_width
-                        };
 
                         let line_w =
                             if wall_loop.wall_index > 0 && !is_unsupported && !is_debug_loop {
-                                adaptive_w
+                                gap_line_widths
+                                    .get(dest)
+                                    .copied()
+                                    .unwrap_or(config.wall_line_width)
                             } else {
                                 wall_loop
                                     .line_widths
@@ -2095,6 +2060,7 @@ pub fn plan_with_progress(
                     segments,
                     tool: object.tool,
                 });
+                paths.extend(gap_paths);
             }
             let wall_path_count = paths.len();
 

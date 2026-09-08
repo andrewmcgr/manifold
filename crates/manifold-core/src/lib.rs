@@ -9,6 +9,7 @@ pub mod bridge;
 pub mod error;
 pub mod extrusion;
 pub mod fluid_dynamics;
+pub mod gap_fill;
 pub mod gcode;
 pub mod ids;
 pub mod infill;
