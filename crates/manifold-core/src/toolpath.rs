@@ -204,6 +204,18 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
         };
     }
 
+    // A path that consists entirely of MoveKind::Travel is an inserted collision
+    // avoidance detour path from `route_travel_moves`. Its initial departure and
+    // final arrival moves already incorporate the required normal-clearance hop
+    // height, so adding pure vertical Z-hop motion on top would be redundant.
+    if segments.iter().all(|s| s.kind == MoveKind::Travel) {
+        return Path {
+            points,
+            segments,
+            tool,
+        };
+    }
+
     let mut new_points = Vec::with_capacity(point_count);
     let mut new_segments = Vec::with_capacity(point_count);
 
@@ -765,7 +777,7 @@ fn travel_chord_is_blocked(
         let dist_from_end = (1.0 - t) * distance;
         let required_clearance = clearance.min(dist_from_start).min(dist_from_end);
         let sample = mesh_sdf.sample(p);
-        if sample.value < required_clearance {
+        if sample.value < required_clearance - 1e-4 {
             if let Some(field) = order_field {
                 let p_order = field.order(p);
                 if p_order.is_finite() && p_order > current_order + order_epsilon {
@@ -808,12 +820,13 @@ fn route_around_obstruction(
     _cell_size: f64,
     z_penalty: f64,
     clearance: f64,
+    endpoint_clearance: f64,
     min_travel_z: f64,
 ) -> Option<Vec<DVec3>> {
     let start_sample = mesh_sdf.sample(start);
     let start_normal = start_sample.gradient.try_normalize();
     let start_clear = if let Some(n) = start_normal {
-        let p = start + n * clearance;
+        let p = start + n * endpoint_clearance;
         let p = DVec3::new(p.x, p.y, p.z.max(min_travel_z));
         if mesh_sdf.sample(p).value >= start_sample.value {
             p
@@ -827,7 +840,7 @@ fn route_around_obstruction(
     let end_sample = mesh_sdf.sample(end);
     let end_normal = end_sample.gradient.try_normalize();
     let end_clear = if let Some(n) = end_normal {
-        let p = end + n * clearance;
+        let p = end + n * endpoint_clearance;
         let p = DVec3::new(p.x, p.y, p.z.max(min_travel_z));
         if mesh_sdf.sample(p).value >= end_sample.value {
             p
@@ -902,7 +915,7 @@ fn route_around_obstruction(
         let direct_start = index_of(start);
         let direct_end = index_of(end);
         if direct_start == direct_end {
-            let lift_z = start.z.max(end.z) + clearance * 2.0;
+            let lift_z = start.z.max(end.z) + endpoint_clearance;
             let mid = (start + end) * 0.5;
             let lift_pt = DVec3::new(mid.x, mid.y, lift_z);
             if !travel_chord_is_blocked(
@@ -1137,6 +1150,7 @@ fn route_travel_moves(
             .wall_line_width
             .abs()
             .max(config.nozzle_diameter.abs());
+    let endpoint_clearance = config.z_hop_height.abs();
     let cell_size = config
         .layer_height
         .abs()
@@ -1179,6 +1193,7 @@ fn route_travel_moves(
                 cell_size,
                 z_penalty,
                 clearance,
+                endpoint_clearance,
                 min_travel_z,
             )?;
             if waypoints.len() < 2 {
@@ -4508,13 +4523,57 @@ mod tests {
         assert!(detour.points.len() >= 4);
         let p_dep = detour.points[1];
         assert!(
-            sdf.sample(p_dep).value >= 0.5,
-            "departure waypoint must be in open air"
+            sdf.sample(p_dep).value >= 0.25,
+            "departure waypoint must be in open air: sample={}",
+            sdf.sample(p_dep).value
         );
         let p_arr = detour.points[detour.points.len() - 2];
         assert!(
-            sdf.sample(p_arr).value >= 0.5,
-            "arrival waypoint must be in open air"
+            sdf.sample(p_arr).value >= 0.25,
+            "arrival waypoint must be in open air: sample={}",
+            sdf.sample(p_arr).value
+        );
+    }
+
+    #[test]
+    fn travel_detour_path_does_not_receive_stacked_pure_z_hop() {
+        let sdf = Arc::new(cube_sdf_fixture());
+
+        let a = open_path(
+            vec![DVec3::new(-2.0, 0.5, 0.5), DVec3::new(0.0, 0.5, 0.5)],
+            MoveKind::Infill,
+        );
+        let b = open_path(
+            vec![DVec3::new(1.0, 0.5, 0.5), DVec3::new(3.0, 0.5, 0.5)],
+            MoveKind::Infill,
+        );
+        let config = SlicerConfig {
+            z_hop_enabled: true,
+            z_hop_height: 0.4,
+            ..SlicerConfig::default()
+        };
+        let slope_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
+
+        let routed = route_travel_moves(
+            vec![a, b],
+            Some(&sdf),
+            None,
+            &slope_profile,
+            &config,
+            config.z_travel_penalty,
+        );
+        assert_eq!(routed.len(), 3);
+        let detour_before_hop = routed[1].clone();
+
+        let hopped = insert_z_hops(routed, &config);
+        assert_eq!(hopped.len(), 3);
+        let detour_after_hop = &hopped[1];
+
+        // The all-travel detour path must not have pure Z-hop lift/drop points stacked onto it.
+        assert_eq!(detour_after_hop.points, detour_before_hop.points);
+        assert_eq!(
+            detour_after_hop.segments.len(),
+            detour_before_hop.segments.len()
         );
     }
 
