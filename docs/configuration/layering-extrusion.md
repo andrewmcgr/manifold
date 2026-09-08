@@ -20,6 +20,7 @@ This section describes all slicing parameters governing layer heights, perimeter
 | Key in JSON | Type | Default | Description |
 |---|---|---|---|
 | `wall_line_width` | `f64` | `0.40` | Advisory target extrusion line width for perimeter walls. |
+| `wall_order` | `String` | `"InnerOuterInner"` | Perimeter print sequence within each island: `"InnerOuterInner"` (innermost to wall 2, outer wall 0, then backing wall 1 last to prevent bulging) or `"OutsideIn"` (outer wall 0 first, then inner walls inward). |
 | `slope_compensation_mode` | `String` | `"GeometricOffset"` | Strategy for non-planar slope clearance: `"GeometricOffset"` (+Z elevation) or `"VolumetricModulation"` (hydrodynamic flow modulation at nominal height). |
 | `shell_thickness` | `f64` | `0.80` | Total perimeter shell thickness ($N_{\text{walls}} = \text{round}(\text{thickness} / \text{width})$). |
 | `min_bead_width_ratio` | `Option<f64>` | `0.70` | Physical minimum bead width multiplier ($0.70 \times d_{\text{nozzle}}$) preventing starve-out on narrow features. |

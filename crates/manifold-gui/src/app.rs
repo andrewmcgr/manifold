@@ -747,6 +747,25 @@ impl ManifoldApp {
                     );
                 });
             self.config.slope_compensation_mode = Some(slope_mode);
+            let mut wall_order = self.config.wall_order();
+            egui::ComboBox::from_label("Wall order")
+                .selected_text(match wall_order {
+                    manifold_core::WallOrder::InnerOuterInner => "Inner / Outer / Inner",
+                    manifold_core::WallOrder::OutsideIn => "Outside-In",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut wall_order,
+                        manifold_core::WallOrder::InnerOuterInner,
+                        "Inner / Outer / Inner",
+                    );
+                    ui.selectable_value(
+                        &mut wall_order,
+                        manifold_core::WallOrder::OutsideIn,
+                        "Outside-In",
+                    );
+                });
+            self.config.wall_order = Some(wall_order);
             drag_num(
                 ui,
                 &mut self.config.shell_thickness,

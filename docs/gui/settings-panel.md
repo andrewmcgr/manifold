@@ -14,6 +14,7 @@ The left sidebar in `manifold-gui` organizes slicing and machine parameters into
 
 ## 2. Extrusion & Walls
 - **Wall Line Width (mm)**: Nominal extrusion line width for perimeter walls.
+- **Wall Order**: Perimeter print sequence within each island: **Inner / Outer / Inner** (default, prints innermost to wall 2, outer wall 0, then backing wall 1 last to prevent witness lines and surface bulging) or **Outside-In** (outer wall 0 first, then inner walls inward).
 - **Shell Thickness (mm)**: Total thickness of solid perimeter walls ($N_{\text{walls}} = \text{round}(\text{thickness} / \text{width})$).
 - **Wall Offset (mm)**: Outward perimeter offset ($0.5 \times d_{\text{nozzle}}$ default).
 - **First Layer Line Width (mm)**: Lateral line width for bed contact squish ($1.3 \times d_{\text{nozzle}}$ default).

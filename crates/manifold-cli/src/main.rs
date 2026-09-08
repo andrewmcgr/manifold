@@ -53,6 +53,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = InfillPatternArg::Cubic)]
     infill_pattern: InfillPatternArg,
 
+    /// Wall/perimeter printing order within each island.
+    #[arg(long, value_enum)]
+    wall_order: Option<WallOrderArg>,
+
     /// Slope-limit profile for the `eikonal` order field, as comma-separated
     /// `height_mm:max_degrees` breakpoints (height measured above the
     /// mesh's build-plate contact surface), e.g. `0:45,4:2` for a tight
@@ -216,6 +220,23 @@ impl From<InfillPatternArg> for InfillPatternKind {
     }
 }
 
+/// CLI-mirror of `manifold_core::WallOrder` so `clap` can derive argument parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum WallOrderArg {
+    #[default]
+    InnerOuterInner,
+    OutsideIn,
+}
+
+impl From<WallOrderArg> for manifold_core::WallOrder {
+    fn from(arg: WallOrderArg) -> Self {
+        match arg {
+            WallOrderArg::InnerOuterInner => manifold_core::WallOrder::InnerOuterInner,
+            WallOrderArg::OutsideIn => manifold_core::WallOrder::OutsideIn,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
@@ -266,6 +287,7 @@ fn main() -> Result<()> {
         sparse_infill_pattern: cli.sparse_infill_pattern.map(Into::into),
         solid_infill_pattern: cli.solid_infill_pattern.map(Into::into),
         infill_pattern: cli.infill_pattern.into(),
+        wall_order: cli.wall_order.map(Into::into),
         ..SlicerConfig::default()
     };
 

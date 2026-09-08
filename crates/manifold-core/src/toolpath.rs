@@ -1295,7 +1295,10 @@ fn route_travel_moves(
 /// so callers keyed by original loop position (e.g. `plan`'s
 /// `wave_overhang_plan.wall_overhang_tags_by_layer[layer][w_idx]` lookup)
 /// keep using that same original index unchanged.
-fn wall_print_order(loops: &[crate::slicing::WallLoop]) -> Vec<usize> {
+fn wall_print_order(
+    loops: &[crate::slicing::WallLoop],
+    wall_order: crate::WallOrder,
+) -> Vec<usize> {
     const DEBUG_WALL_INDEX: usize = 990;
 
     let mut islands: Vec<(usize, Vec<usize>)> = Vec::new();
@@ -1317,13 +1320,20 @@ fn wall_print_order(loops: &[crate::slicing::WallLoop]) -> Vec<usize> {
 
     let mut order = Vec::with_capacity(loops.len());
     for (_, members) in &mut islands {
-        let wall_count = members
-            .iter()
-            .map(|&idx| loops[idx].wall_index + 1)
-            .max()
-            .unwrap_or(0);
-        let rank = inner_outer_inner_rank_table(wall_count);
-        members.sort_by_key(|&idx| rank[loops[idx].wall_index]);
+        match wall_order {
+            crate::WallOrder::InnerOuterInner => {
+                let wall_count = members
+                    .iter()
+                    .map(|&idx| loops[idx].wall_index + 1)
+                    .max()
+                    .unwrap_or(0);
+                let rank = inner_outer_inner_rank_table(wall_count);
+                members.sort_by_key(|&idx| rank[loops[idx].wall_index]);
+            }
+            crate::WallOrder::OutsideIn => {
+                members.sort_by_key(|&idx| loops[idx].wall_index);
+            }
+        }
         order.extend(members.iter().copied());
     }
     order.extend(debug_indices);
@@ -1927,7 +1937,7 @@ pub fn plan_with_progress(
             };
 
             let mut paths = Vec::new();
-            let wall_order = wall_print_order(&layer.loops);
+            let wall_order = wall_print_order(&layer.loops, config.wall_order());
             for w_idx in wall_order {
                 let wall_loop = &layer.loops[w_idx];
                 if wall_loop.points.is_empty() {
@@ -3449,6 +3459,91 @@ mod tests {
             .segments
             .iter()
             .all(|segment| segment.kind == MoveKind::WallInner));
+    }
+
+    #[test]
+    fn plan_respects_outside_in_wall_order() {
+        let objects = vec![Object::new(ObjectId(0), Mesh::default(), ToolId(0))];
+        let p0 = DVec3::new(0.0, 0.0, 0.0);
+        let p1 = DVec3::new(1.0, 0.0, 0.0);
+        let p2 = DVec3::new(1.0, 1.0, 0.0);
+        let make_loop = |wall_index: usize| crate::slicing::WallLoop {
+            island: 0,
+            wall_index,
+            is_open: false,
+            points: vec![p0, p1, p2],
+            ..crate::slicing::WallLoop::default()
+        };
+
+        let layers = vec![Layer {
+            index: 0,
+            object: ObjectId(0),
+            order: 0.0,
+            loops: vec![make_loop(0), make_loop(1), make_loop(2)],
+            order_field: Arc::new(HeightOrderField::new(BUILD_DIRECTION)),
+            ..Layer::default()
+        }];
+
+        let tools = vec![Tool::new(ToolId(0), 0.4)];
+        let config = SlicerConfig {
+            wall_order: Some(crate::WallOrder::OutsideIn),
+            ..SlicerConfig::default()
+        };
+
+        let paths = plan(&layers, &objects, &tools, &config).expect("plan succeeds");
+        let wall_paths: Vec<_> = paths
+            .into_iter()
+            .filter(|p| {
+                p.segments.iter().all(|segment| {
+                    matches!(segment.kind, MoveKind::WallOuter | MoveKind::WallInner)
+                })
+            })
+            .collect();
+        assert_eq!(wall_paths.len(), 3);
+        // Outside-in print order: wall 0 (outer) first, then wall 1, then wall 2.
+        assert!(wall_paths[0]
+            .segments
+            .iter()
+            .all(|segment| segment.kind == MoveKind::WallOuter));
+        assert!(wall_paths[1]
+            .segments
+            .iter()
+            .all(|segment| segment.kind == MoveKind::WallInner));
+        assert!(wall_paths[2]
+            .segments
+            .iter()
+            .all(|segment| segment.kind == MoveKind::WallInner));
+    }
+
+    #[test]
+    fn wall_print_order_respects_wall_order_setting() {
+        let p = vec![DVec3::ZERO, DVec3::X, DVec3::Y];
+        let make_loop = |island: usize, wall_index: usize| crate::slicing::WallLoop {
+            island,
+            wall_index,
+            is_open: false,
+            points: p.clone(),
+            ..crate::slicing::WallLoop::default()
+        };
+        let loops = vec![
+            make_loop(0, 0),
+            make_loop(0, 1),
+            make_loop(0, 2),
+            make_loop(1, 0),
+            make_loop(1, 1),
+        ];
+
+        // Inner/Outer/Inner:
+        // Island 0 (3 walls): [2, 0, 1] -> indices [2, 0, 1]
+        // Island 1 (2 walls): [1, 0] -> indices [4, 3]
+        let ioi = wall_print_order(&loops, crate::WallOrder::InnerOuterInner);
+        assert_eq!(ioi, vec![2, 0, 1, 4, 3]);
+
+        // Outside-In:
+        // Island 0 (3 walls): [0, 1, 2] -> indices [0, 1, 2]
+        // Island 1 (2 walls): [0, 1] -> indices [3, 4]
+        let oi = wall_print_order(&loops, crate::WallOrder::OutsideIn);
+        assert_eq!(oi, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]

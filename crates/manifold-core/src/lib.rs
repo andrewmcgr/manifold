@@ -49,6 +49,18 @@ pub enum SlopeCompensationMode {
     VolumetricModulation,
 }
 
+/// Order in which perimeter wall passes are printed within each island.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum WallOrder {
+    /// Inner-to-second-wall first, then outer wall (0), then backing wall (1) last (default).
+    /// Gives the outer bead a moment to firm up before the second wall's heat and pressure
+    /// act behind it, reducing bulging/witness lines on visible surfaces.
+    #[default]
+    InnerOuterInner,
+    /// Print outer wall (0) first, then inner walls inward (1, 2, ..., n-1).
+    OutsideIn,
+}
+
 /// Slicer configuration shared across the pipeline.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SlicerConfig {
@@ -97,6 +109,10 @@ pub struct SlicerConfig {
     /// Defaults to [`SlopeCompensationMode::GeometricOffset`].
     #[serde(default)]
     pub slope_compensation_mode: Option<SlopeCompensationMode>,
+    /// Order in which perimeter wall passes are printed within each island.
+    /// Defaults to [`WallOrder::InnerOuterInner`].
+    #[serde(default)]
+    pub wall_order: Option<WallOrder>,
     /// Minimum physical bead width ratio relative to nozzle diameter (default 0.70).
     #[serde(default)]
     pub min_bead_width_ratio: Option<f64>,
@@ -628,6 +644,7 @@ impl Default for SlicerConfig {
             bed_temperature: None,
             chamber_temperature: None,
             fluid_dynamics: None,
+            wall_order: None,
         }
     }
 }
@@ -862,6 +879,12 @@ impl SlicerConfig {
     #[must_use]
     pub fn slope_compensation_mode(&self) -> SlopeCompensationMode {
         self.slope_compensation_mode.unwrap_or_default()
+    }
+
+    /// Returns the configured wall print order, defaulting to [`WallOrder::InnerOuterInner`].
+    #[must_use]
+    pub fn wall_order(&self) -> WallOrder {
+        self.wall_order.unwrap_or_default()
     }
 
     pub fn scarf_joint_length(&self) -> f64 {
