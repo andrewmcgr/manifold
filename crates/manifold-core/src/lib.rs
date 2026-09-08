@@ -23,6 +23,7 @@ pub mod polygon2d;
 pub mod slicing;
 pub mod statistics;
 pub mod stl;
+pub mod tangent_surface;
 pub mod threemf;
 pub mod tool;
 pub mod toolpath;

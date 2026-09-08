@@ -638,7 +638,7 @@ pub fn plan_wave_overhangs(
         // overhang bead is physically adjacent to its supporting predecessor and follows
         // the true surface of the mesh without air-gap jumps or disconnected mid-air loops.
         let mut surface_paths_by_layer = vec![Vec::new(); layers.len()];
-        let mut surface_footprints_by_layer = vec![Vec::new(); layers.len()];
+        let surface_footprints_by_layer = vec![Vec::new(); layers.len()];
         let mut wall_tags_by_layer = vec![Vec::new(); layers.len()];
 
         for obj in objects {
@@ -769,12 +769,6 @@ pub fn plan_wave_overhangs(
                                 channel_width: f64::INFINITY,
                             })
                             .collect();
-
-                        let poly_2d: Vec<[f64; 2]> = pts
-                            .iter()
-                            .map(|p| [(p - origin).dot(basis1), (p - origin).dot(basis2)])
-                            .collect();
-                        surface_footprints_by_layer[best_layer_idx].push(poly_2d);
 
                         surface_paths_by_layer[best_layer_idx].push(Path {
                             points: pts,

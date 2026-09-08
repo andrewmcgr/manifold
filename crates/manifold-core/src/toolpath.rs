@@ -106,6 +106,10 @@ fn retain_contained_paths(
         let contained =
             gross_outside_fraction <= 0.10 && outside_fraction <= CONTAINMENT_OUTSIDE_FRACTION;
         if !contained {
+            if path.segments.iter().all(|s| s.kind == MoveKind::Infill) {
+                // Drop uncontained infill paths entirely - never print infill in open air
+                continue;
+            }
             debug_paths += 1;
             debug_points += path.points.len();
             for seg in &mut path.segments {
@@ -1843,6 +1847,8 @@ pub fn plan_with_progress(
         crate::wave_overhang::WaveOverhangPlan::default()
     };
     let bridge_plan = crate::bridge::plan_bridges(layers, config, default_tool);
+    let tangent_surface_plan =
+        crate::tangent_surface::plan_tangent_surfaces(layers, config, default_tool);
 
     let per_layer: Vec<Vec<Path>> = layers
         .par_iter()
@@ -1864,7 +1870,18 @@ pub fn plan_with_progress(
             let (basis1, basis2) = manifold_fidget::contour::plane_basis(axis);
             let origin = apex;
 
-            // Compute unsupported footprint for this layer (wave overhangs and bridges)
+            // Compute tangent surface footprint for this layer
+            let mut tangent_footprint_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+            if let Some(tf) = tangent_surface_plan.footprints_by_layer.get(layer.index) {
+                tangent_footprint_2d.extend(tf.iter().cloned());
+            }
+            let canonical_tangent_footprint = if !tangent_footprint_2d.is_empty() {
+                crate::polygon2d::canonicalize(&tangent_footprint_2d)
+            } else {
+                Vec::new()
+            };
+
+            // Compute unsupported VOID footprint for this layer (wave overhangs, bridges, and DOWNWARD tangent surfaces only)
             let mut unsupported_footprint_2d: Vec<Vec<[f64; 2]>> = Vec::new();
             if let Some(wf) = wave_overhang_plan
                 .overhang_footprints_by_layer
@@ -1874,6 +1891,12 @@ pub fn plan_with_progress(
             }
             if let Some(bf) = bridge_plan.bridge_footprints_by_layer.get(layer.index) {
                 unsupported_footprint_2d.extend(bf.iter().cloned());
+            }
+            if let Some(df) = tangent_surface_plan
+                .downward_footprints_by_layer
+                .get(layer.index)
+            {
+                unsupported_footprint_2d.extend(df.iter().cloned());
             }
             let canonical_footprint = if !unsupported_footprint_2d.is_empty() {
                 crate::polygon2d::canonicalize(&unsupported_footprint_2d)
@@ -1885,6 +1908,19 @@ pub fn plan_with_progress(
             let wall_order = wall_print_order(&layer.loops);
             for w_idx in wall_order {
                 let wall_loop = &layer.loops[w_idx];
+                if wall_loop.points.is_empty() {
+                    continue;
+                }
+                // Tangent surfaces should not have inner walls or bulk infill, only the wave fill.
+                if wall_loop.wall_index > 0 && !canonical_tangent_footprint.is_empty() {
+                    let is_inside_tangent = wall_loop.points.iter().any(|p| {
+                        let p_2d = [(p - origin).dot(basis1), (p - origin).dot(basis2)];
+                        crate::polygon2d::contains_point(&canonical_tangent_footprint, p_2d)
+                    });
+                    if is_inside_tangent {
+                        continue;
+                    }
+                }
                 // Placeholder metadata: real support/bridge/overhang
                 // classification and speed/extrusion-rate planning is future
                 // work (see toolpath-metadata-phase12 subtask 03). Wall
@@ -1940,16 +1976,24 @@ pub fn plan_with_progress(
                         } else {
                             (i + 1) % point_count.max(1)
                         };
+                        let seg_mid_3d = (wall_loop.points[i] + wall_loop.points[dest]) * 0.5;
                         let seg_mid_2d = [
-                            ((wall_loop.points[i] + wall_loop.points[dest]) * 0.5 - origin)
-                                .dot(basis1),
-                            ((wall_loop.points[i] + wall_loop.points[dest]) * 0.5 - origin)
-                                .dot(basis2),
+                            (seg_mid_3d - origin).dot(basis1),
+                            (seg_mid_3d - origin).dot(basis2),
                         ];
                         let is_in_void = !canonical_footprint.is_empty()
                             && crate::polygon2d::contains_point(&canonical_footprint, seg_mid_2d);
+                        let is_supported_below = layer
+                            .mesh_sdf
+                            .as_deref()
+                            .map(|sdf| {
+                                let probe_p =
+                                    seg_mid_3d - glam::DVec3::new(0.0, 0.0, config.layer_height);
+                                sdf.sample(probe_p).value <= 0.0
+                            })
+                            .unwrap_or(false);
 
-                        let is_unsupported = is_in_void
+                        let is_unsupported = (is_in_void && !is_supported_below)
                             || wall_loop.unsupported.get(dest).copied().unwrap_or(false)
                             || wave_overhang_plan
                                 .wall_overhang_tags_by_layer
@@ -2015,7 +2059,7 @@ pub fn plan_with_progress(
             let mut all_solid_loops = layer.solid_fill_boundary.clone();
             all_solid_loops.extend(narrow_solid_loops);
 
-            // Mask infill and solid skin against wave overhang and bridge footprints
+            // Mask infill and solid skin against wave overhang, bridge, and tangent surface footprints
             let mut unsupported_footprint_2d: Vec<Vec<[f64; 2]>> = Vec::new();
             if let Some(wf) = wave_overhang_plan
                 .overhang_footprints_by_layer
@@ -2025,6 +2069,9 @@ pub fn plan_with_progress(
             }
             if let Some(bf) = bridge_plan.bridge_footprints_by_layer.get(layer.index) {
                 unsupported_footprint_2d.extend(bf.iter().cloned());
+            }
+            if !canonical_tangent_footprint.is_empty() {
+                unsupported_footprint_2d.extend(canonical_tangent_footprint.iter().cloned());
             }
 
             if !unsupported_footprint_2d.is_empty() {
@@ -2134,6 +2181,22 @@ pub fn plan_with_progress(
                 }
             }
 
+            if let Some(tangent_paths) = tangent_surface_plan.paths_by_layer.get(layer.index) {
+                for mut tp in tangent_paths.clone() {
+                    let is_in_solid = tp.points.iter().all(|p| {
+                        if let Some(sdf) = layer.mesh_sdf.as_deref() {
+                            sdf.sample(*p).value <= CONTAINMENT_POINT_SLACK
+                        } else {
+                            true
+                        }
+                    });
+                    if is_in_solid {
+                        tp.tool = object.tool;
+                        paths.push(tp);
+                    }
+                }
+            }
+
             let min_open_path_len = config.nozzle_diameter * 2.0;
             let mut wall_path_count = wall_path_count;
             let paths: Vec<Path> = paths
@@ -2202,7 +2265,16 @@ pub fn plan_with_progress(
                                         &canonical_footprint,
                                         p1_2d,
                                     );
-                            if in_void {
+                            let is_supported_below = layer
+                                .mesh_sdf
+                                .as_deref()
+                                .map(|sdf| {
+                                    let probe_p =
+                                        mid - glam::DVec3::new(0.0, 0.0, config.layer_height);
+                                    sdf.sample(probe_p).value <= 0.0
+                                })
+                                .unwrap_or(false);
+                            if in_void && !is_supported_below {
                                 segment.kind = MoveKind::Overhang;
                                 segment.speed = speed_for_kind(MoveKind::Overhang, config);
                             }
