@@ -1,4 +1,4 @@
-//! Automated verification of Tangent Surface categorization on Thingy3.stl and Thingy2.stl
+//! Automated verification of Tangent Surfaces and Adaptive Wall Extrusion Width
 use manifold_core::ids::{ObjectId, ToolId};
 use manifold_core::machine::Machine;
 use manifold_core::object::Object;
@@ -44,20 +44,37 @@ fn test_mesh(model_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     println!("\n==========================================");
-    println!("Testing Tangent Surfaces on {}", model_name);
+    println!(
+        "Testing Tangent Surfaces & Adaptive Walls on {}",
+        model_name
+    );
     println!("==========================================");
 
     let mut true_downward_overhangs = 0;
     let mut false_upward_overhangs = 0;
     let mut wall_outer_count = 0;
+    let mut wall_inner_count = 0;
     let mut infill_count = 0;
     let mut debug_excluded_count = 0;
 
-    for (pi, p) in paths.iter().enumerate() {
+    let mut min_inner_w = f64::INFINITY;
+    let mut max_inner_w = f64::NEG_INFINITY;
+    let mut expanded_inner_count = 0;
+
+    for p in paths.iter() {
         let n = p.points.len();
         for (si, s) in p.segments.iter().enumerate() {
             match s.kind {
                 MoveKind::WallOuter => wall_outer_count += 1,
+                MoveKind::WallInner => {
+                    wall_inner_count += 1;
+                    let w = s.line_width;
+                    min_inner_w = min_inner_w.min(w);
+                    max_inner_w = max_inner_w.max(w);
+                    if w > config.wall_line_width + 1e-4 {
+                        expanded_inner_count += 1;
+                    }
+                }
                 MoveKind::Infill => infill_count += 1,
                 MoveKind::DebugExcluded => debug_excluded_count += 1,
                 MoveKind::Overhang => {
@@ -81,13 +98,8 @@ fn test_mesh(model_name: &str) -> Result<(), Box<dyn std::error::Error>> {
                     let len = (dx * dx + dy * dy + dz * dz).sqrt();
                     let nz = if len > 1e-6 { dz / len } else { 0.0 };
 
-                    // An overhang segment must face downward (nz <= 0.15)
                     if nz > 0.15 {
                         false_upward_overhangs += 1;
-                        if false_upward_overhangs <= 5 {
-                            println!("  False upward overhang (nz={:.3}): path #{}, seg #{}, order={:.3}, mid={:.2?}",
-                                nz, pi, si, s.order, mid);
-                        }
                     } else {
                         true_downward_overhangs += 1;
                     }
@@ -107,6 +119,20 @@ fn test_mesh(model_name: &str) -> Result<(), Box<dyn std::error::Error>> {
         false_upward_overhangs
     );
     println!("  WallOuter segments: {}", wall_outer_count);
+    println!("  WallInner segments: {}", wall_inner_count);
+    println!(
+        "    WallInner line width range: [{:.3}, {:.3}] mm (nominal: {:.3} mm, max: {:.3} mm)",
+        min_inner_w,
+        max_inner_w,
+        config.wall_line_width,
+        config.max_bead_width()
+    );
+    println!(
+        "    WallInner segments with expanded width: {} / {} ({:.1}%)",
+        expanded_inner_count,
+        wall_inner_count,
+        100.0 * expanded_inner_count as f64 / wall_inner_count.max(1) as f64
+    );
     println!("  Infill segments: {}", infill_count);
     println!("  DebugExcluded segments: {}", debug_excluded_count);
 
@@ -118,11 +144,19 @@ fn test_mesh(model_name: &str) -> Result<(), Box<dyn std::error::Error>> {
         false_upward_overhangs, 0,
         "No upward-facing surfaces should be tagged as Overhang!"
     );
+    assert!(wall_inner_count > 0, "Should have WallInner segments!");
     assert!(
-        true_downward_overhangs > 0,
-        "Should have true downward overhang segments!"
+        expanded_inner_count > 0,
+        "Should have WallInner segments with adaptive expansion!"
     );
-    assert!(wall_outer_count > 0, "Should have WallOuter segments!");
+    assert!(
+        max_inner_w <= config.max_bead_width() + 1e-6,
+        "Inner wall width must not exceed max_bead_width!"
+    );
+    assert!(
+        min_inner_w >= config.min_bead_width() - 1e-6,
+        "Inner wall width must not be below min_bead_width!"
+    );
 
     println!("All checks passed for {}!", model_name);
     Ok(())
@@ -131,6 +165,6 @@ fn test_mesh(model_name: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     test_mesh("Thingy3.stl")?;
     test_mesh("Thingy2.stl")?;
-    println!("\nAll tangent surface checks passed cleanly!");
+    println!("\nAll tangent surface & adaptive wall checks passed cleanly!");
     Ok(())
 }

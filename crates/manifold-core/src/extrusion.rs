@@ -7,6 +7,7 @@
 //! per segment once a path's points/kind are known.
 
 use crate::{toolpath::MoveKind, SlicerConfig};
+use glam::DVec3;
 
 /// Cross-sectional area (mm^2) of a single deposited bead, modeled as the
 /// standard "stadium" (rounded-rectangle) shape used by Slic3r/
@@ -162,6 +163,33 @@ pub fn line_width_for_kind(kind: MoveKind, config: &SlicerConfig) -> f64 {
     }
 }
 
+/// Computes the adaptive in-surface line width for a wall segment on a non-planar layer.
+///
+/// In 3D, adjacent wall passes are separated by nominal CAD-normal distance `nominal_width`.
+/// Along the layer's 3D print surface, the distance between passes expands to:
+///
+/// $$\Delta s = \frac{\text{nominal\_width}}{\sin\theta}$$
+///
+/// where $\sin\theta = \|\hat{n}_{\text{CAD}} \times \hat{n}_{\text{order}}\|$ is the sine of the
+/// contact angle between the CAD surface normal and the slicing order field normal.
+/// The resulting width is clamped to `[min_width, max_width]`.
+#[must_use]
+pub fn adaptive_wall_line_width(
+    nominal_width: f64,
+    min_width: f64,
+    max_width: f64,
+    n_cad: DVec3,
+    n_order: DVec3,
+) -> f64 {
+    let cross_len = n_cad.cross(n_order).length();
+    // Guard against parallel or degenerate normals
+    if cross_len <= 1e-4 || !cross_len.is_finite() {
+        return max_width;
+    }
+    let target = nominal_width / cross_len;
+    target.clamp(min_width, max_width)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +306,50 @@ mod tests {
             line_width_for_kind(MoveKind::Travel, &SlicerConfig::default()),
             0.0
         );
+    }
+
+    #[test]
+    fn adaptive_wall_line_width_at_90_degrees_returns_nominal() {
+        let nominal = 0.45;
+        let min = 0.28;
+        let max = 0.64;
+        let n_cad = DVec3::X;
+        let n_order = DVec3::Z;
+        let width = adaptive_wall_line_width(nominal, min, max, n_cad, n_order);
+        assert!((width - nominal).abs() < 1e-6);
+    }
+
+    #[test]
+    fn adaptive_wall_line_width_at_45_degrees_expands_width() {
+        let nominal = 0.45;
+        let min = 0.28;
+        let max = 0.80; // allow expansion to inspect value
+        let n_cad = (DVec3::X + DVec3::Z).normalize();
+        let n_order = DVec3::Z;
+        let width = adaptive_wall_line_width(nominal, min, max, n_cad, n_order);
+        let expected = nominal * std::f64::consts::SQRT_2;
+        assert!((width - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn adaptive_wall_line_width_at_shallow_angle_clamps_to_max() {
+        let nominal = 0.45;
+        let min = 0.28;
+        let max = 0.64;
+        let n_cad = (DVec3::X * 0.1 + DVec3::Z).normalize();
+        let n_order = DVec3::Z;
+        let width = adaptive_wall_line_width(nominal, min, max, n_cad, n_order);
+        assert_eq!(width, max);
+    }
+
+    #[test]
+    fn adaptive_wall_line_width_with_parallel_normals_clamps_to_max() {
+        let nominal = 0.45;
+        let min = 0.28;
+        let max = 0.64;
+        let n_cad = DVec3::Z;
+        let n_order = DVec3::Z;
+        let width = adaptive_wall_line_width(nominal, min, max, n_cad, n_order);
+        assert_eq!(width, max);
     }
 }
