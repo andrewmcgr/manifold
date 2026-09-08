@@ -1841,14 +1841,21 @@ pub fn plan_with_progress(
     let z_travel_penalty = config.resolved_z_travel_penalty(machine);
 
     let default_tool = objects.first().map(|o| o.tool).unwrap_or(ToolId(0));
-    let wave_overhang_plan = if config.wave_overhangs_enabled() {
-        crate::wave_overhang::plan_wave_overhangs(layers, objects, config, default_tool)
-    } else {
-        crate::wave_overhang::WaveOverhangPlan::default()
-    };
-    let bridge_plan = crate::bridge::plan_bridges(layers, config, default_tool);
-    let tangent_surface_plan =
-        crate::tangent_surface::plan_tangent_surfaces(layers, config, default_tool);
+    let (wave_overhang_plan, (bridge_plan, tangent_surface_plan)) = rayon::join(
+        || {
+            if config.wave_overhangs_enabled() {
+                crate::wave_overhang::plan_wave_overhangs(layers, objects, config, default_tool)
+            } else {
+                crate::wave_overhang::WaveOverhangPlan::default()
+            }
+        },
+        || {
+            rayon::join(
+                || crate::bridge::plan_bridges(layers, config, default_tool),
+                || crate::tangent_surface::plan_tangent_surfaces(layers, config, default_tool),
+            )
+        },
+    );
 
     let per_layer: Vec<Vec<Path>> = layers
         .par_iter()

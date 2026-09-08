@@ -639,7 +639,6 @@ pub fn plan_wave_overhangs(
         // the true surface of the mesh without air-gap jumps or disconnected mid-air loops.
         let mut surface_paths_by_layer = vec![Vec::new(); layers.len()];
         let surface_footprints_by_layer = vec![Vec::new(); layers.len()];
-        let mut wall_tags_by_layer = vec![Vec::new(); layers.len()];
 
         for obj in objects {
             let mesh = &obj.mesh;
@@ -705,18 +704,27 @@ pub fn plan_wave_overhangs(
                 continue;
             }
 
-            let mut target_t = t_min + wavelength * 0.5;
-            let mut reverse = false;
+            let mut target_ts = Vec::new();
+            let mut t = t_min + wavelength * 0.5;
+            while t <= t_max {
+                target_ts.push(t);
+                t += wavelength;
+            }
 
-            while target_t <= t_max {
-                let (loops, unclosed) =
+            let contours_by_target: Vec<_> = target_ts
+                .into_par_iter()
+                .map(|target_t| {
                     manifold_fidget::contour::extract_order_contours_on_mesh_with_debug(
                         &overhang_triangles,
                         &overhang_orders,
                         target_t,
                         glam::DVec3::Z,
-                    );
+                    )
+                })
+                .collect();
 
+            let mut reverse = false;
+            for (loops, unclosed) in contours_by_target {
                 for poly in loops.into_iter().chain(unclosed) {
                     let poly_len: f64 = poly.windows(2).map(|w| w[0].distance(w[1])).sum();
                     if poly_len < config.nozzle_diameter * 0.75 {
@@ -777,31 +785,33 @@ pub fn plan_wave_overhangs(
                         });
                     }
                 }
-                target_t += wavelength;
             }
         }
 
-        // Compute wall overhang tags
-        for (k, layer) in layers.iter().enumerate() {
-            let mut layer_tags = Vec::with_capacity(layer.loops.len());
-            let probe_offset = DVec3::new(0.0, 0.0, -config.layer_height);
-            for wall in &layer.loops {
-                let tags: Vec<bool> = wall
-                    .points
+        // Compute wall overhang tags in parallel across all layers
+        let wall_tags_by_layer: Vec<Vec<Vec<bool>>> = layers
+            .par_iter()
+            .map(|layer| {
+                let probe_offset = DVec3::new(0.0, 0.0, -config.layer_height);
+                layer
+                    .loops
                     .iter()
-                    .map(|&p| {
-                        if let Some(sdf) = &layer.mesh_sdf {
-                            let probe_p = p + probe_offset;
-                            sdf.sample(probe_p).value > 0.0
-                        } else {
-                            false
-                        }
+                    .map(|wall| {
+                        wall.points
+                            .iter()
+                            .map(|&p| {
+                                if let Some(sdf) = &layer.mesh_sdf {
+                                    let probe_p = p + probe_offset;
+                                    sdf.sample(probe_p).value > 0.0
+                                } else {
+                                    false
+                                }
+                            })
+                            .collect()
                     })
-                    .collect();
-                layer_tags.push(tags);
-            }
-            wall_tags_by_layer[k] = layer_tags;
-        }
+                    .collect()
+            })
+            .collect();
 
         return WaveOverhangPlan {
             paths_by_layer: surface_paths_by_layer,
