@@ -2648,7 +2648,7 @@ impl ManifoldApp {
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Import…").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("Mesh files", &["stl", "3mf"])
