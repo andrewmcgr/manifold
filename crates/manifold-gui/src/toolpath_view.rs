@@ -804,6 +804,56 @@ mod tests {
     }
 
     #[test]
+    fn open_path_does_not_wrap_around_to_closing_edge() {
+        // Open polyline: 3 points, 2 segments (N points -> N - 1 segments).
+        let points = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(2.0, 1.0, 0.0),
+        ];
+        let segments = vec![
+            manifold_core::toolpath::Segment {
+                kind: MoveKind::Infill,
+                speed: 60.0,
+                extrusion_rate: 1.0,
+                support_fraction: 0.0,
+                order: 0.0,
+                extrusion_length: 0.0,
+                line_width: 0.4,
+                is_scarf: false,
+                id: 0,
+                island: 0,
+                channel_width: f64::INFINITY,
+            },
+            manifold_core::toolpath::Segment {
+                kind: MoveKind::Infill,
+                speed: 60.0,
+                extrusion_rate: 1.0,
+                support_fraction: 0.0,
+                order: 0.0,
+                extrusion_length: 0.0,
+                line_width: 0.4,
+                is_scarf: false,
+                id: 0,
+                island: 0,
+                channel_width: f64::INFINITY,
+            },
+        ];
+        let path = Path {
+            points,
+            segments,
+            tool: manifold_core::ids::ToolId::default(),
+        };
+        let instances = build_lines_default(&[path], f64::INFINITY);
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].start, [0.0, 0.0, 0.0]);
+        assert_eq!(instances[0].end, [1.0, 0.0, 0.0]);
+        assert_eq!(instances[1].start, [1.0, 0.0, 0.0]);
+        assert_eq!(instances[1].end, [2.0, 1.0, 0.0]);
+        // Crucially: no closing move from [2.0, 1.0, 0.0] back to [0.0, 0.0, 0.0].
+    }
+
+    #[test]
     fn color_mapping_matches_palette_per_move_kind() {
         let cases = [
             (MoveKind::WallOuter, COLOR_WALL_OUTER),

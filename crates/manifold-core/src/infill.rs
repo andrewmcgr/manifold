@@ -908,8 +908,7 @@ fn generate_tpms_infill(
             }
         }
         last_end = points.last().copied();
-        let segments = points
-            .iter()
+        let segments = (0..points.len() - 1)
             .map(|_| Segment {
                 kind: MoveKind::Infill,
                 speed: speed_for_kind(MoveKind::Infill, config),
@@ -2208,6 +2207,37 @@ mod tests {
         let paths =
             SchwarzDInfill.generate(&region, &config(), &layer, &Transform::identity(), 0.2);
         assert!(!paths.is_empty(), "expected schwarz d infill paths");
+        for path in &paths {
+            assert!(
+                path.segments.len() + 1 == path.points.len(),
+                "open infill path must carry N-1 segments for N points: points={}, segments={}",
+                path.points.len(),
+                path.segments.len()
+            );
+        }
+    }
+
+    #[test]
+    fn tpms_infill_paths_have_open_path_segment_counts() {
+        let layer = square_layer(5.0);
+        let region = InfillRegion::from_layer(&layer, &config());
+        for kind in [
+            InfillPatternKind::Gyroid,
+            InfillPatternKind::SchwarzD,
+            InfillPatternKind::SchwarzP,
+        ] {
+            let gen = generator_for(kind);
+            let paths = gen.generate(&region, &config(), &layer, &Transform::identity(), 0.2);
+            assert!(!paths.is_empty(), "expected {kind:?} paths");
+            for path in &paths {
+                assert!(
+                    path.segments.len() + 1 == path.points.len(),
+                    "{kind:?} open infill path must carry N-1 segments for N points: points={}, segments={}",
+                    path.points.len(),
+                    path.segments.len()
+                );
+            }
+        }
     }
 
     #[test]
