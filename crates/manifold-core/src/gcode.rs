@@ -339,6 +339,7 @@ pub fn emit_with_machine(
         if current_tool != Some(path.tool) {
             out.push_str(&format!("T{}\n", path.tool));
             out.push_str("G92 E0\n");
+            out.push_str("M83\n");
             current_tool = Some(path.tool);
             retracted = true;
             let tool_temp = machine

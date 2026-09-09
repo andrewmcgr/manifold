@@ -161,12 +161,18 @@ impl FluidDynamicsEngine {
     /// and part cooling fan speed fraction $F \in [0.0, 1.0]$.
     ///
     /// $$C_{\text{PA,dynamic}} = C_{\text{PA,zero}} \cdot Q^{-\alpha} \cdot e^{-0.02 \cdot \Delta T}$$
+    ///
+    /// Below $Q_{\text{low}}$, the fluid enters a Newtonian zero-shear viscosity plateau $\eta_0$,
+    /// preventing unphysical divergence to infinite PA at low flow rates (e.g. scarf ramps, corners).
     #[must_use]
     pub fn dynamic_pressure_advance(&self, flow_rate_q: f64, fan_speed_fraction: f64) -> f64 {
-        let q = flow_rate_q.max(0.01);
+        let (c_pa_low, q_low) = self.config.pa_calibration_low;
+        let (c_pa_high, _) = self.config.pa_calibration_high;
+        let q = flow_rate_q.max(q_low.max(0.1));
         let base_pa = self.c_pa_zero * q.powf(-self.alpha);
         let dt = self.temperature_delta(fan_speed_fraction);
-        (base_pa * (-0.02 * dt).exp()).clamp(0.0, 1.0)
+        let max_pa = (c_pa_low * 1.5).max(c_pa_high * 1.5);
+        (base_pa * (-0.02 * dt).exp()).clamp(0.0, max_pa)
     }
 
     /// Evaluates the dynamic viscoelastic extrudate swell ratio $B(Q, T) = \frac{D_{\text{extrudate}}}{D_{\text{die}}}$
@@ -291,6 +297,27 @@ mod tests {
 
         assert!((pa_low - 0.040).abs() < 1e-4, "pa_low was {pa_low}");
         assert!((pa_high - 0.025).abs() < 1e-4, "pa_high was {pa_high}");
+    }
+
+    #[test]
+    fn dynamic_pa_plateaus_at_low_flow_rates_without_diverging() {
+        // High-speed calibration points simulating direct drive
+        let config = FluidDynamicsConfig {
+            pa_calibration_low: (0.025, 16.1),
+            pa_calibration_high: (0.010, 32.0),
+            ..Default::default()
+        };
+        let engine = FluidDynamicsEngine::new(config);
+
+        // At low flow rates (e.g. scarf ramps, corners), PA must plateau at c_pa_low
+        // instead of diverging towards infinity or 1.0.
+        let pa_micro = engine.dynamic_pressure_advance(0.01, 0.0);
+        let pa_slow = engine.dynamic_pressure_advance(1.0, 0.0);
+        let pa_low = engine.dynamic_pressure_advance(16.1, 0.0);
+
+        assert!((pa_micro - 0.025).abs() < 1e-4, "pa_micro was {pa_micro}");
+        assert!((pa_slow - 0.025).abs() < 1e-4, "pa_slow was {pa_slow}");
+        assert!((pa_low - 0.025).abs() < 1e-4, "pa_low was {pa_low}");
     }
 
     #[test]
