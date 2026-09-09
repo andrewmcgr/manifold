@@ -32,10 +32,12 @@ The GUI is arranged into three primary visual zones:
 
 | Action | Mouse / Keyboard Gesture | Description |
 |---|---|---|
-| **Orbit Camera** | Left-click + Drag on 3D canvas | Rotates view around the target center. |
-| **Pan Camera** | Right-click + Drag (or Middle-click + Drag) | Translates camera across the build plane. |
+| **Drag View / Pan** | Left-click + Drag (on bed/skybox with no object selected), or Right-click + Drag | Translates camera across the build plane (1:1 motion tracking). |
+| **Select & Drag Object (XY)** | Left-click on object + Drag, or Drag with object selected | Translates the object across the horizontal build plane ($Z$ locked). |
+| **Deselect Object** | Left-click (single click) away from gizmo on bed/skybox | Deselects the current object. |
+| **Transform Gizmo** | Left-click + Drag on gizmo handles | Moves along axes, rotates, or scales using the 3D gizmo. |
+| **Orbit Camera** | Middle-click + Drag (or Shift + Left-click + Drag) | Rotates view around the hovered pivot or in place. |
 | **Zoom** | Mouse Scroll Wheel (or Pinch gesture) | Zooms smoothly in/out toward the cursor. |
-| **Frame All Objects** | `F` key (or click "Frame All") | Resets camera to encapsulate all loaded geometry. |
 | **Delete Selected Object** | `Delete` or `Backspace` key | Removes the currently selected part from the workspace. |
 | **Inspect Segment** | Hover cursor over any toolpath | Opens the HUD card with instantaneous velocity, flow, duration, and order. |
 

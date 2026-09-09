@@ -86,6 +86,8 @@ pub struct ManifoldApp {
     drag_pivot: Option<DVec3>,
     /// Depth along the camera forward axis anchored on drag start for 1:1 pan.
     drag_depth: f64,
+    /// Active drag interaction mode for the viewport canvas.
+    active_drag: Option<DragMode>,
     /// Gcode from the last successful "Slice" action (Phase 8, see
     /// ROADMAP.md), previewed in the settings panel and written out by
     /// "Export…".
@@ -225,6 +227,7 @@ impl ManifoldApp {
             gizmo: Gizmo::default(),
             drag_pivot: None,
             drag_depth: 0.0,
+            active_drag: None,
             gcode: None,
             toolpaths: None,
             toolpath_data_view: ToolpathDataView::default(),
@@ -395,9 +398,10 @@ impl ManifoldApp {
         let mut closest_t = f64::INFINITY;
         let mut hit_surface = false;
         let mut hit_point = DVec3::ZERO;
+        let mut hit_index = 0;
 
         // 1. Check loaded objects
-        for object in &self.objects {
+        for (idx, object) in self.objects.iter().enumerate() {
             let Some((local_min, local_max)) = object.mesh.bounding_box() else {
                 continue;
             };
@@ -430,13 +434,17 @@ impl ManifoldApp {
                         closest_t = t_world;
                         hit_point = ray_orig + ray_dir * t_world;
                         hit_surface = true;
+                        hit_index = idx;
                     }
                 }
             }
         }
 
         if hit_surface {
-            return SceneRayHit::Object(hit_point);
+            return SceneRayHit::Object {
+                index: hit_index,
+                point: hit_point,
+            };
         }
 
         // 2. Check print bed
@@ -612,6 +620,7 @@ impl ManifoldApp {
         view_proj: glam::Mat4,
         origin: glam::DVec3,
         targets: &[GizmoTransform],
+        allow_interaction: bool,
     ) -> Option<(GizmoResult, Vec<GizmoTransform>)> {
         const HOVER_RADIUS_PX: f32 = 220.0;
 
@@ -625,7 +634,7 @@ impl ManifoldApp {
         let near_gizmo = self.gizmo.is_focused()
             || world_to_screen(view_proj, rect, origin)
                 .is_some_and(|screen_pos| screen_pos.distance(cursor_pos) < HOVER_RADIUS_PX);
-        let hovered = ui.rect_contains_pointer(rect) && near_gizmo;
+        let hovered = allow_interaction && ui.rect_contains_pointer(rect) && near_gizmo;
 
         let gizmo_result = self.gizmo.update(
             GizmoInteraction {
@@ -2792,34 +2801,111 @@ impl ManifoldApp {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
-            if response.drag_started() && !self.gizmo.is_focused() {
+            // Single click handling (select or deselect without dragging)
+            if response.clicked() && !self.gizmo.is_focused() {
                 if let Some(cursor_pos) = response
                     .interact_pointer_pos()
                     .or_else(|| ui.input(|i| i.pointer.latest_pos()))
                 {
                     let hit = self.cast_scene_ray(rect, cursor_pos);
                     match hit {
-                        SceneRayHit::Object(p) => {
-                            let forward =
-                                (self.camera.target - self.camera.eye()).normalize_or_zero();
-                            let depth = (p - self.camera.eye()).dot(forward).abs();
-                            self.drag_depth =
-                                depth.clamp(self.camera.min_distance, self.camera.max_distance);
-                            self.drag_pivot = Some(p);
+                        SceneRayHit::Object { index, .. } => {
+                            self.selected = Some(index);
                         }
-                        SceneRayHit::Bed(p) => {
-                            let forward =
-                                (self.camera.target - self.camera.eye()).normalize_or_zero();
-                            let depth = (p - self.camera.eye()).dot(forward).abs();
-                            self.drag_depth =
-                                depth.clamp(self.camera.min_distance, self.camera.max_distance);
-                            // For pivots, treat the bed the same as the skybox:
-                            // rotate the camera in place around eye.
-                            self.drag_pivot = Some(self.camera.eye());
+                        SceneRayHit::Bed(_) | SceneRayHit::Skybox(_) => {
+                            // Rule 4: If an object is selected and it's a single click not on the gizmo rather than a drag, deselect the object.
+                            self.selected = None;
                         }
-                        SceneRayHit::Skybox(_) => {
-                            self.drag_depth = self.camera.distance;
-                            self.drag_pivot = Some(self.camera.eye());
+                    }
+                }
+            }
+
+            if response.drag_started() && !self.gizmo.is_focused() {
+                if let Some(cursor_pos) = response
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+                {
+                    let hit = self.cast_scene_ray(rect, cursor_pos);
+                    let is_secondary = ui.input(|i| i.pointer.secondary_down());
+                    let is_middle = ui.input(|i| i.pointer.middle_down());
+
+                    if is_middle || ui.input(|i| i.modifiers.shift) {
+                        let pivot = match hit {
+                            SceneRayHit::Object { point, .. } => point,
+                            SceneRayHit::Bed(_) | SceneRayHit::Skybox(_) => self.camera.eye(),
+                        };
+                        self.drag_pivot = Some(pivot);
+                        self.active_drag = None;
+                    } else if is_secondary {
+                        let point = match hit {
+                            SceneRayHit::Object { point, .. } => point,
+                            SceneRayHit::Bed(point) => point,
+                            SceneRayHit::Skybox(_) => self.camera.target,
+                        };
+                        let forward = (self.camera.target - self.camera.eye()).normalize_or_zero();
+                        let depth = (point - self.camera.eye()).dot(forward).abs();
+                        self.drag_depth =
+                            depth.clamp(self.camera.min_distance, self.camera.max_distance);
+                        self.active_drag = Some(DragMode::ViewPan);
+                    } else {
+                        // Left click (Primary button)
+                        match hit {
+                            SceneRayHit::Object { index, .. } => {
+                                // Rule 2: If the click is on an object, select it and drag it in the XY plane.
+                                self.selected = Some(index);
+                                if let Some(object) = self.objects.get(index) {
+                                    let (_, _, trans) =
+                                        object.transform.0.to_scale_rotation_translation();
+                                    let start_plane = intersect_horizontal_plane(
+                                        &self.camera,
+                                        rect,
+                                        cursor_pos,
+                                        trans.z,
+                                    );
+                                    self.active_drag = Some(DragMode::ObjectXy {
+                                        index,
+                                        init_translation: trans,
+                                        start_plane_pos: start_plane,
+                                    });
+                                }
+                            }
+                            SceneRayHit::Bed(p) | SceneRayHit::Skybox(p) => {
+                                if let Some(selected_index) = self.selected {
+                                    if let Some(object) = self.objects.get(selected_index) {
+                                        // Rule 3: If an object is selected and not on the gizmo, drag it in the XY plane.
+                                        let (_, _, trans) =
+                                            object.transform.0.to_scale_rotation_translation();
+                                        let start_plane = intersect_horizontal_plane(
+                                            &self.camera,
+                                            rect,
+                                            cursor_pos,
+                                            trans.z,
+                                        );
+                                        self.active_drag = Some(DragMode::ObjectXy {
+                                            index: selected_index,
+                                            init_translation: trans,
+                                            start_plane_pos: start_plane,
+                                        });
+                                    } else {
+                                        let forward = (self.camera.target - self.camera.eye())
+                                            .normalize_or_zero();
+                                        let depth = (p - self.camera.eye()).dot(forward).abs();
+                                        self.drag_depth = depth.clamp(
+                                            self.camera.min_distance,
+                                            self.camera.max_distance,
+                                        );
+                                        self.active_drag = Some(DragMode::ViewPan);
+                                    }
+                                } else {
+                                    // Rule 1: If no object selected and the click is not on an object, same as right click (i.e. drag the view).
+                                    let forward = (self.camera.target - self.camera.eye())
+                                        .normalize_or_zero();
+                                    let depth = (p - self.camera.eye()).dot(forward).abs();
+                                    self.drag_depth = depth
+                                        .clamp(self.camera.min_distance, self.camera.max_distance);
+                                    self.active_drag = Some(DragMode::ViewPan);
+                                }
+                            }
                         }
                     }
                 }
@@ -2827,23 +2913,64 @@ impl ManifoldApp {
 
             if response.dragged() {
                 let delta = response.drag_delta();
-                if ui.input(|i| i.pointer.secondary_down()) {
-                    let depth = if self.drag_depth > 0.0 {
-                        self.drag_depth
-                    } else {
-                        self.camera.distance
-                    };
-                    self.camera
-                        .pan_with_depth(delta.x, delta.y, rect.height(), depth);
-                } else {
+                if ui.input(|i| i.pointer.middle_down() || i.modifiers.shift) {
                     let pivot = self.drag_pivot.unwrap_or(self.camera.target);
                     self.camera.orbit_around(pivot, delta.x, delta.y);
+                } else if let Some(active) = self.active_drag {
+                    match active {
+                        DragMode::ViewPan => {
+                            let depth = if self.drag_depth > 0.0 {
+                                self.drag_depth
+                            } else {
+                                self.camera.distance
+                            };
+                            self.camera
+                                .pan_with_depth(delta.x, delta.y, rect.height(), depth);
+                        }
+                        DragMode::ObjectXy {
+                            index,
+                            init_translation,
+                            start_plane_pos,
+                        } => {
+                            if let Some(cursor_pos) = ui.input(|i| i.pointer.latest_pos()) {
+                                if let Some(object) = self.objects.get_mut(index) {
+                                    let curr_plane = intersect_horizontal_plane(
+                                        &self.camera,
+                                        rect,
+                                        cursor_pos,
+                                        init_translation.z,
+                                    );
+                                    let delta_x = curr_plane.x - start_plane_pos.x;
+                                    let delta_y = curr_plane.y - start_plane_pos.y;
+                                    let (scale, rotation, _) =
+                                        object.transform.0.to_scale_rotation_translation();
+                                    object.transform = Transform::from_scale_rotation_translation(
+                                        scale,
+                                        rotation,
+                                        DVec3::new(
+                                            init_translation.x + delta_x,
+                                            init_translation.y + delta_y,
+                                            init_translation.z,
+                                        ),
+                                    );
+                                    let device = frame
+                                        .wgpu_render_state()
+                                        .expect("wgpu renderer is required")
+                                        .device
+                                        .clone();
+                                    self.update_camera_bounds();
+                                    self.reupload(&device);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
             if response.drag_stopped() {
                 self.drag_pivot = None;
                 self.drag_depth = 0.0;
+                self.active_drag = None;
             }
             if response.hovered() {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -3020,9 +3147,15 @@ impl ManifoldApp {
                         translation,
                     );
 
-                    if let Some((_, mut new_transforms)) =
-                        self.gizmo_interact(ui, rect, view_proj, translation, &[gizmo_transform])
-                    {
+                    let allow_gizmo = self.active_drag.is_none();
+                    if let Some((_, mut new_transforms)) = self.gizmo_interact(
+                        ui,
+                        rect,
+                        view_proj,
+                        translation,
+                        &[gizmo_transform],
+                        allow_gizmo,
+                    ) {
                         if let Some(new_transform) = new_transforms.pop() {
                             let scale: mint::Vector3<f64> = new_transform.scale;
                             let rotation: mint::Quaternion<f64> = new_transform.rotation;
@@ -3241,12 +3374,43 @@ impl ManifoldApp {
 /// Ray intersection result against the 3D scene.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SceneRayHit {
-    /// Hit a loaded object mesh in the scene.
-    Object(DVec3),
+    /// Hit a loaded object mesh in the scene at `index`.
+    Object { index: usize, point: DVec3 },
     /// Hit the print bed.
     Bed(DVec3),
     /// Missed all surfaces and intersected the invisible enclosing skybox.
     Skybox(DVec3),
+}
+
+/// Active drag interaction mode for the viewport canvas.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DragMode {
+    /// Dragging the camera view (1:1 pan).
+    ViewPan,
+    /// Dragging an object constrained to the horizontal XY plane.
+    ObjectXy {
+        index: usize,
+        init_translation: DVec3,
+        start_plane_pos: DVec3,
+    },
+}
+
+/// Intersects a camera ray through `cursor_pos` with a horizontal plane $Z = \text{plane\_z}$.
+fn intersect_horizontal_plane(
+    camera: &OrbitCamera,
+    rect: egui::Rect,
+    cursor_pos: egui::Pos2,
+    plane_z: f64,
+) -> DVec3 {
+    let (ray_orig, ray_dir) = camera.unproject_ray(rect, cursor_pos);
+    if ray_dir.z.abs() > 1e-9 {
+        let t = (plane_z - ray_orig.z) / ray_dir.z;
+        if t > 0.0 {
+            return ray_orig + ray_dir * t;
+        }
+    }
+    let p = ray_orig + ray_dir * camera.distance;
+    DVec3::new(p.x, p.y, plane_z)
 }
 
 /// Slab-based ray-AABB intersection test returning the nearest $t \ge 0$.
