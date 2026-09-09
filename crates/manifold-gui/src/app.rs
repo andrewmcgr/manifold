@@ -3284,6 +3284,10 @@ impl ManifoldApp {
                                     self.cached_hull = None;
                                 }
                             }
+                        } else {
+                            // Clicked off the object: exit lay on face
+                            self.lay_on_face_active = false;
+                            self.cached_hull = None;
                         }
                     }
 

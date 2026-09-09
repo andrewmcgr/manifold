@@ -50,7 +50,7 @@ The GUI is arranged into three primary visual zones:
 - **Per-Object Tool Assignment**: Change the assigned tool ID (`0`, `1`, `2`...) per part.
 - **Auto-center on bed**: Positions all loaded parts centered on the build plate.
 - **Drop to Bed**: Drops the selected object along $Z$ so its lowest point rests flush on the build plate at $Z = \text{bed\_min.z}$, preserving current orientation.
-- **Lay on Face**: Visualizes a simplified convex hull ($\le 26$ facets, each with $\ge 3$ contact points for tripod stability). Hovering highlights a facet; clicking rotates the object so that facet faces down and drops it flush to the bed. Press `Escape` or click "Done Lay on Face" to exit.
+- **Lay on Face**: Visualizes a simplified convex hull ($\le 26$ facets, each with $\ge 3$ contact points for tripod stability). Hovering highlights a facet; clicking rotates the object so that facet faces down and drops it flush to the bed. Press `Escape`, click off the object, or click "Done Lay on Face" to exit.
 - **Mesh Overlay Visualizers**: Switch the top bar **Mesh Overlay** to preview conformal seed boundaries or geodesic surface arrival order gradients before slicing.
 - **Remove Objects**: Click the inline **Remove** button on an object row or use the **Clear all objects** button.
 
