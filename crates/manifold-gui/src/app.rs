@@ -3267,11 +3267,9 @@ impl ManifoldApp {
                             if let Some((_, hull)) = &self.cached_hull {
                                 if let Some(object) = self.objects.get_mut(index) {
                                     let (bed_min, _) = self.machine.build_volume.bounding_box();
-                                    let facet_normal = hull.facets[facet_idx].normal;
+                                    let facet = &hull.facets[facet_idx];
                                     object.transform = crate::lay_on_face::orient_facet_to_bed(
-                                        object,
-                                        facet_normal,
-                                        bed_min.z,
+                                        object, facet, bed_min.z,
                                     );
                                     let device = frame
                                         .wgpu_render_state()

@@ -2,20 +2,32 @@
 
 use eframe::egui::{self, Color32, Pos2, Stroke};
 use glam::{DQuat, DVec3, Mat4};
-use manifold_core::convex_hull::SimplifiedHull;
+use manifold_core::convex_hull::{ConvexFacet, SimplifiedHull};
 use manifold_core::object::Object;
 use manifold_core::transform::Transform;
 
 /// Computes the alignment transform to orient a facet flat on the bed.
 ///
-/// Rotates the object so `facet_normal_local` points in the $-\mathbf{Z}$ direction
-/// (downwards into the bed), and translates along $+Z$ so the lowest contact
-/// point rests exactly at `bed_z`.
-pub fn orient_facet_to_bed(object: &Object, facet_normal_local: DVec3, bed_z: f64) -> Transform {
-    let (scale, rotation, translation) = object.transform.0.to_scale_rotation_translation();
+/// Rotates the object so the facet's normal points in the $-\mathbf{Z}$ direction
+/// (downwards into the bed), translates along $+Z$ so the contact points rest
+/// flush at `bed_z`, and preserves the facet centroid's position in the XY plane.
+pub fn orient_facet_to_bed(object: &Object, facet: &ConvexFacet, bed_z: f64) -> Transform {
+    let (scale, rotation, _) = object.transform.0.to_scale_rotation_translation();
+
+    // Compute facet centroid in local coordinates
+    let centroid_local = if !facet.contact_points.is_empty() {
+        facet.contact_points.iter().copied().sum::<DVec3>() / facet.contact_points.len() as f64
+    } else if !facet.boundary.is_empty() {
+        facet.boundary.iter().copied().sum::<DVec3>() / facet.boundary.len() as f64
+    } else {
+        DVec3::ZERO
+    };
+
+    // Original world-space XY location of the centroid
+    let orig_world_centroid = object.transform.transform_point(centroid_local);
 
     // World-space facet normal
-    let world_normal = (rotation * facet_normal_local).normalize_or_zero();
+    let world_normal = (rotation * facet.normal).normalize_or_zero();
 
     // Rotation arc to align world_normal -> -Z
     let target_dir = -DVec3::Z;
@@ -28,23 +40,30 @@ pub fn orient_facet_to_bed(object: &Object, facet_normal_local: DVec3, bed_z: f6
 
     let new_rotation = align_rot * rotation;
 
-    // Drop to bed: find minimum Z among all mesh vertices under new rotation & scale
-    let mut min_z = f64::INFINITY;
+    // Offset of the centroid under new_rotation and scale
+    let rotated_centroid_offset = new_rotation * (centroid_local * scale);
+
+    // Keep the centroid at the exact same location in the XY plane
+    let new_tx = orig_world_centroid.x - rotated_centroid_offset.x;
+    let new_ty = orig_world_centroid.y - rotated_centroid_offset.y;
+
+    // Drop to bed: find minimum Z among all mesh vertices under new_rotation & scale
+    let mut min_z_offset = f64::INFINITY;
     for &v in &object.mesh.vertices {
-        let world_v = new_rotation * (v * scale) + translation;
-        min_z = min_z.min(world_v.z);
+        let rot_v = new_rotation * (v * scale);
+        min_z_offset = min_z_offset.min(rot_v.z);
     }
 
-    let delta_z = if min_z.is_finite() {
-        bed_z - min_z
+    let new_tz = if min_z_offset.is_finite() {
+        bed_z - min_z_offset
     } else {
-        0.0
+        bed_z
     };
 
     Transform::from_scale_rotation_translation(
         scale,
         new_rotation,
-        DVec3::new(translation.x, translation.y, translation.z + delta_z),
+        DVec3::new(new_tx, new_ty, new_tz),
     )
 }
 
@@ -237,5 +256,70 @@ mod tests {
             .map(|&v| dropped_transform.transform_point(v).z)
             .fold(f64::INFINITY, f64::min);
         assert!((lowest - bed_z).abs() < 1e-6);
+    }
+
+    #[test]
+    fn orient_facet_to_bed_preserves_xy_centroid() {
+        let vertices = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(20.0, 0.0, 0.0),
+            DVec3::new(20.0, 20.0, 0.0),
+            DVec3::new(0.0, 20.0, 0.0),
+            DVec3::new(0.0, 0.0, 20.0),
+            DVec3::new(20.0, 0.0, 20.0),
+            DVec3::new(20.0, 20.0, 20.0),
+            DVec3::new(0.0, 20.0, 20.0),
+        ];
+        let mesh = Mesh::new(vertices.clone(), vec![0, 1, 2]);
+        let mut object = Object::new(ObjectId(0), mesh, ToolId(0));
+        object.transform = Transform::from_translation(DVec3::new(100.0, 50.0, 15.0));
+
+        // Facet along +X (x = 20)
+        let facet = ConvexFacet {
+            normal: DVec3::X,
+            plane_d: 20.0,
+            contact_points: vec![
+                DVec3::new(20.0, 0.0, 0.0),
+                DVec3::new(20.0, 20.0, 0.0),
+                DVec3::new(20.0, 20.0, 20.0),
+                DVec3::new(20.0, 0.0, 20.0),
+            ],
+            boundary: vec![
+                DVec3::new(20.0, 0.0, 0.0),
+                DVec3::new(20.0, 20.0, 0.0),
+                DVec3::new(20.0, 20.0, 20.0),
+                DVec3::new(20.0, 0.0, 20.0),
+            ],
+            area: 400.0,
+        };
+
+        let orig_world_centroid = object
+            .transform
+            .transform_point(DVec3::new(20.0, 10.0, 10.0));
+        let bed_z = 0.0;
+
+        let oriented_transform = orient_facet_to_bed(&object, &facet, bed_z);
+
+        // Under oriented transform, the facet contacts the bed at bed_z
+        let new_world_centroid = oriented_transform.transform_point(DVec3::new(20.0, 10.0, 10.0));
+
+        // The XY position of the centroid must not move
+        assert!(
+            (new_world_centroid.x - orig_world_centroid.x).abs() < 1e-6,
+            "centroid X shifted from {} to {}",
+            orig_world_centroid.x,
+            new_world_centroid.x
+        );
+        assert!(
+            (new_world_centroid.y - orig_world_centroid.y).abs() < 1e-6,
+            "centroid Y shifted from {} to {}",
+            orig_world_centroid.y,
+            new_world_centroid.y
+        );
+        assert!(
+            (new_world_centroid.z - bed_z).abs() < 1e-6,
+            "centroid Z should be at bed_z {}",
+            bed_z
+        );
     }
 }
