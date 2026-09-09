@@ -19,6 +19,8 @@ pub struct Object {
     pub transform: Transform,
     /// The tool assigned to print this object.
     pub tool: ToolId,
+    /// Name or filename stem of the object, if known.
+    pub name: Option<String>,
 }
 
 impl Object {
@@ -29,7 +31,21 @@ impl Object {
             mesh,
             transform: Transform::identity(),
             tool,
+            name: None,
         }
+    }
+
+    /// Set an explicit name for this object.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Display name of the object: the explicit name if set, or `Object {id}`.
+    pub fn display_name(&self) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| format!("Object {}", self.id.0))
     }
 }
 
@@ -96,6 +112,14 @@ mod tests {
     fn new_object_is_placed_at_identity_transform() {
         let object = Object::new(ObjectId(1), Mesh::default(), ToolId(1));
         assert_eq!(object.transform, Transform::identity());
+        assert_eq!(object.display_name(), "Object 1");
+    }
+
+    #[test]
+    fn object_with_name_tracks_display_name() {
+        let object = Object::new(ObjectId(1), Mesh::default(), ToolId(1)).with_name("benchy");
+        assert_eq!(object.name.as_deref(), Some("benchy"));
+        assert_eq!(object.display_name(), "benchy");
     }
 
     #[test]

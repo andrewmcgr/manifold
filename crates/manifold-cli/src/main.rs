@@ -350,14 +350,28 @@ fn load_objects(path: &Path, tool: ToolId, next_object_id: &mut u32) -> Result<V
         .unwrap_or_default()
         .to_ascii_lowercase();
 
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("object")
+        .to_string();
+
     match extension.as_str() {
         "3mf" => {
             let file =
                 File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
             let mut objects = threemf::load_3mf(file, tool)?;
-            for object in &mut objects {
+            let multiple = objects.len() > 1;
+            for (idx, object) in objects.iter_mut().enumerate() {
                 object.id = ObjectId(*next_object_id);
                 *next_object_id += 1;
+                if object.name.is_none() {
+                    object.name = Some(if multiple {
+                        format!("{} #{}", stem, idx + 1)
+                    } else {
+                        stem.clone()
+                    });
+                }
             }
             Ok(objects)
         }
@@ -367,7 +381,9 @@ fn load_objects(path: &Path, tool: ToolId, next_object_id: &mut u32) -> Result<V
             let mesh = stl::load_stl(BufReader::new(file))?;
             let id = ObjectId(*next_object_id);
             *next_object_id += 1;
-            Ok(vec![Object::new(id, mesh, tool)])
+            let mut obj = Object::new(id, mesh, tool);
+            obj.name = Some(stem);
+            Ok(vec![obj])
         }
         other => bail!(
             "unsupported input format {:?} for {}: only .3mf and .stl are supported today",

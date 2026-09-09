@@ -2373,8 +2373,8 @@ impl ManifoldApp {
             for (index, object) in self.objects.iter_mut().enumerate() {
                 let selected = self.selected == Some(index);
                 let label = format!(
-                    "Object {} — {} triangles",
-                    object.id.0,
+                    "{} — {} triangles",
+                    object.display_name(),
                     object.mesh.triangle_count()
                 );
                 ui.horizontal(|ui| {
@@ -2799,9 +2799,16 @@ impl ManifoldApp {
                 .add_enabled(self.gcode.is_some(), egui::Button::new("Export…"))
                 .clicked()
             {
+                let default_gcode_name = self
+                    .objects
+                    .first()
+                    .and_then(|obj| obj.name.as_ref())
+                    .map(|name| format!("{name}.gcode"))
+                    .unwrap_or_else(|| "out.gcode".to_string());
+
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("Gcode", &["gcode"])
-                    .set_file_name("out.gcode")
+                    .set_file_name(&default_gcode_name)
                     .save_file()
                 {
                     if let Some(gcode) = &self.gcode {
@@ -3840,13 +3847,27 @@ fn load_objects(path: &Path, next_object_id: &mut u32) -> anyhow::Result<Vec<Obj
         .unwrap_or_default()
         .to_ascii_lowercase();
 
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("object")
+        .to_string();
+
     match extension.as_str() {
         "3mf" => {
             let file = File::open(path)?;
             let mut objects = threemf::load_3mf(file, ToolId(0))?;
-            for object in &mut objects {
+            let multiple = objects.len() > 1;
+            for (idx, object) in objects.iter_mut().enumerate() {
                 object.id = ObjectId(*next_object_id);
                 *next_object_id += 1;
+                if object.name.is_none() {
+                    object.name = Some(if multiple {
+                        format!("{} #{}", stem, idx + 1)
+                    } else {
+                        stem.clone()
+                    });
+                }
             }
             Ok(objects)
         }
@@ -3855,7 +3876,9 @@ fn load_objects(path: &Path, next_object_id: &mut u32) -> anyhow::Result<Vec<Obj
             let mesh: Mesh = stl::load_stl(BufReader::new(file))?;
             let id = ObjectId(*next_object_id);
             *next_object_id += 1;
-            Ok(vec![Object::new(id, mesh, ToolId(0))])
+            let mut obj = Object::new(id, mesh, ToolId(0));
+            obj.name = Some(stem);
+            Ok(vec![obj])
         }
         other => anyhow::bail!(
             "unsupported input format {:?} for {}: only .3mf and .stl are supported today",
