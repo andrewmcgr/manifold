@@ -435,22 +435,21 @@ impl ManifoldApp {
             }
         }
 
+        if hit_surface {
+            return SceneRayHit::Object(hit_point);
+        }
+
         // 2. Check print bed
         let (bed_min, bed_max) = self.machine.build_volume.bounding_box();
         let bed_z = bed_min.z;
         if ray_dir.z.abs() > 1e-6 {
             let t_bed = (bed_z - ray_orig.z) / ray_dir.z;
-            if t_bed > 1e-4 && t_bed < closest_t {
+            if t_bed > 1e-4 {
                 let p = ray_orig + ray_dir * t_bed;
                 if p.x >= bed_min.x && p.x <= bed_max.x && p.y >= bed_min.y && p.y <= bed_max.y {
-                    hit_point = p;
-                    hit_surface = true;
+                    return SceneRayHit::Bed(p);
                 }
             }
-        }
-
-        if hit_surface {
-            return SceneRayHit::Surface(hit_point);
         }
 
         // 3. Invisible skybox sphere enclosing the scene
@@ -2800,13 +2799,23 @@ impl ManifoldApp {
                 {
                     let hit = self.cast_scene_ray(rect, cursor_pos);
                     match hit {
-                        SceneRayHit::Surface(p) => {
+                        SceneRayHit::Object(p) => {
                             let forward =
                                 (self.camera.target - self.camera.eye()).normalize_or_zero();
                             let depth = (p - self.camera.eye()).dot(forward).abs();
                             self.drag_depth =
                                 depth.clamp(self.camera.min_distance, self.camera.max_distance);
                             self.drag_pivot = Some(p);
+                        }
+                        SceneRayHit::Bed(p) => {
+                            let forward =
+                                (self.camera.target - self.camera.eye()).normalize_or_zero();
+                            let depth = (p - self.camera.eye()).dot(forward).abs();
+                            self.drag_depth =
+                                depth.clamp(self.camera.min_distance, self.camera.max_distance);
+                            // For pivots, treat the bed the same as the skybox:
+                            // rotate the camera in place around eye.
+                            self.drag_pivot = Some(self.camera.eye());
                         }
                         SceneRayHit::Skybox(_) => {
                             self.drag_depth = self.camera.distance;
@@ -3232,8 +3241,10 @@ impl ManifoldApp {
 /// Ray intersection result against the 3D scene.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SceneRayHit {
-    /// Hit a physical surface (an object mesh or the print bed).
-    Surface(DVec3),
+    /// Hit a loaded object mesh in the scene.
+    Object(DVec3),
+    /// Hit the print bed.
+    Bed(DVec3),
     /// Missed all surfaces and intersected the invisible enclosing skybox.
     Skybox(DVec3),
 }

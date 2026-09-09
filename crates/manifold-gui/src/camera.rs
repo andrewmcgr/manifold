@@ -73,7 +73,7 @@ impl OrbitCamera {
         let right = forward.cross(DVec3::Z).normalize_or_zero();
 
         let q_yaw = glam::DQuat::from_axis_angle(DVec3::Z, -delta_x as f64 * SENSITIVITY);
-        let q_pitch = glam::DQuat::from_axis_angle(right, delta_y as f64 * SENSITIVITY);
+        let q_pitch = glam::DQuat::from_axis_angle(right, -delta_y as f64 * SENSITIVITY);
         let q = q_yaw * q_pitch;
 
         let to_eye = eye - pivot;
