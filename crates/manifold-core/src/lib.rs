@@ -6,6 +6,7 @@
 
 pub mod bounds;
 pub mod bridge;
+pub mod convex_hull;
 pub mod error;
 pub mod extrusion;
 pub mod fluid_dynamics;

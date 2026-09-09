@@ -88,6 +88,10 @@ pub struct ManifoldApp {
     drag_depth: f64,
     /// Active drag interaction mode for the viewport canvas.
     active_drag: Option<DragMode>,
+    /// Whether "Lay on Face" facet inspection mode is active.
+    lay_on_face_active: bool,
+    /// Cached simplified convex hull for the currently selected object `(object_index, hull)`.
+    cached_hull: Option<(usize, manifold_core::convex_hull::SimplifiedHull)>,
     /// Gcode from the last successful "Slice" action (Phase 8, see
     /// ROADMAP.md), previewed in the settings panel and written out by
     /// "Export…".
@@ -228,6 +232,8 @@ impl ManifoldApp {
             drag_pivot: None,
             drag_depth: 0.0,
             active_drag: None,
+            lay_on_face_active: false,
+            cached_hull: None,
             gcode: None,
             toolpaths: None,
             toolpath_data_view: ToolpathDataView::default(),
@@ -510,6 +516,8 @@ impl ManifoldApp {
             if let Some(selected) = self.selected {
                 if selected == index {
                     self.selected = None;
+                    self.lay_on_face_active = false;
+                    self.cached_hull = None;
                 } else if selected > index {
                     self.selected = Some(selected - 1);
                 }
@@ -2670,6 +2678,43 @@ impl ManifoldApp {
             }
             ui.label(format!("{} object(s) loaded", self.objects.len()));
 
+            if ui
+                .add_enabled(self.selected.is_some(), egui::Button::new("Drop to Bed"))
+                .on_hover_text("Drop the selected object flush to the print bed")
+                .clicked()
+            {
+                if let Some(index) = self.selected {
+                    if let Some(object) = self.objects.get_mut(index) {
+                        let (bed_min, _) = self.machine.build_volume.bounding_box();
+                        object.transform =
+                            crate::lay_on_face::drop_object_to_bed(object, bed_min.z);
+                        let device = frame
+                            .wgpu_render_state()
+                            .expect("wgpu renderer is required")
+                            .device
+                            .clone();
+                        self.update_camera_bounds();
+                        self.reupload(&device);
+                    }
+                }
+            }
+
+            let lay_text = if self.lay_on_face_active {
+                "Done Lay on Face"
+            } else {
+                "Lay on Face"
+            };
+            if ui
+                .add_enabled(self.selected.is_some(), egui::Button::new(lay_text))
+                .on_hover_text("Click a facet on the convex hull overlay to orient that face flat against the bed")
+                .clicked()
+            {
+                self.lay_on_face_active = !self.lay_on_face_active;
+                if !self.lay_on_face_active {
+                    self.cached_hull = None;
+                }
+            }
+
             ui.separator();
             let slicing_in_progress = self.slicing.is_some();
             if ui
@@ -2802,7 +2847,7 @@ impl ManifoldApp {
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
             // Single click handling (select or deselect without dragging)
-            if response.clicked() && !self.gizmo.is_focused() {
+            if response.clicked() && !self.gizmo.is_focused() && !self.lay_on_face_active {
                 if let Some(cursor_pos) = response
                     .interact_pointer_pos()
                     .or_else(|| ui.input(|i| i.pointer.latest_pos()))
@@ -2815,6 +2860,8 @@ impl ManifoldApp {
                         SceneRayHit::Bed(_) | SceneRayHit::Skybox(_) => {
                             // Rule 4: If an object is selected and it's a single click not on the gizmo rather than a drag, deselect the object.
                             self.selected = None;
+                            self.lay_on_face_active = false;
+                            self.cached_hull = None;
                         }
                     }
                 }
@@ -3129,53 +3176,138 @@ impl ManifoldApp {
             // it must run after the wgpu scene/mesh paint callbacks above to
             // composite on top of them (see ROADMAP.md Phase 7).
             if let Some(index) = self.selected {
-                if let Some(object) = self.objects.get(index) {
-                    self.gizmo.update_config(GizmoConfig {
-                        view_matrix: self.camera.view_matrix_f64().into(),
-                        projection_matrix: self.camera.projection_matrix_f64(aspect_ratio).into(),
-                        viewport: rect,
-                        modes: GizmoMode::all(),
-                        orientation: GizmoOrientation::Local,
-                        ..Default::default()
-                    });
+                if !self.lay_on_face_active {
+                    if let Some(object) = self.objects.get(index) {
+                        self.gizmo.update_config(GizmoConfig {
+                            view_matrix: self.camera.view_matrix_f64().into(),
+                            projection_matrix: self
+                                .camera
+                                .projection_matrix_f64(aspect_ratio)
+                                .into(),
+                            viewport: rect,
+                            modes: GizmoMode::all(),
+                            orientation: GizmoOrientation::Local,
+                            ..Default::default()
+                        });
 
-                    let (scale, rotation, translation) =
-                        object.transform.0.to_scale_rotation_translation();
-                    let gizmo_transform = GizmoTransform::from_scale_rotation_translation(
-                        scale,
-                        rotation,
-                        translation,
-                    );
+                        let (scale, rotation, translation) =
+                            object.transform.0.to_scale_rotation_translation();
+                        let gizmo_transform = GizmoTransform::from_scale_rotation_translation(
+                            scale,
+                            rotation,
+                            translation,
+                        );
 
-                    let allow_gizmo = self.active_drag.is_none();
-                    if let Some((_, mut new_transforms)) = self.gizmo_interact(
-                        ui,
-                        rect,
-                        view_proj,
-                        translation,
-                        &[gizmo_transform],
-                        allow_gizmo,
-                    ) {
-                        if let Some(new_transform) = new_transforms.pop() {
-                            let scale: mint::Vector3<f64> = new_transform.scale;
-                            let rotation: mint::Quaternion<f64> = new_transform.rotation;
-                            let translation: mint::Vector3<f64> = new_transform.translation;
-                            self.objects[index].transform =
-                                Transform::from_scale_rotation_translation(
-                                    scale.into(),
-                                    rotation.into(),
-                                    translation.into(),
-                                );
+                        let allow_gizmo = self.active_drag.is_none();
+                        if let Some((_, mut new_transforms)) = self.gizmo_interact(
+                            ui,
+                            rect,
+                            view_proj,
+                            translation,
+                            &[gizmo_transform],
+                            allow_gizmo,
+                        ) {
+                            if let Some(new_transform) = new_transforms.pop() {
+                                let scale: mint::Vector3<f64> = new_transform.scale;
+                                let rotation: mint::Quaternion<f64> = new_transform.rotation;
+                                let translation: mint::Vector3<f64> = new_transform.translation;
+                                self.objects[index].transform =
+                                    Transform::from_scale_rotation_translation(
+                                        scale.into(),
+                                        rotation.into(),
+                                        translation.into(),
+                                    );
 
-                            let device = frame
-                                .wgpu_render_state()
-                                .expect("wgpu renderer is required")
-                                .device
-                                .clone();
-                            self.update_camera_bounds();
-                            self.reupload(&device);
+                                let device = frame
+                                    .wgpu_render_state()
+                                    .expect("wgpu renderer is required")
+                                    .device
+                                    .clone();
+                                self.update_camera_bounds();
+                                self.reupload(&device);
+                            }
                         }
                     }
+                }
+            }
+
+            if self.lay_on_face_active {
+                if let Some(index) = self.selected {
+                    if self.cached_hull.as_ref().map(|(idx, _)| *idx) != Some(index) {
+                        if let Some(object) = self.objects.get(index) {
+                            if let Some(hull) =
+                                manifold_core::convex_hull::compute_simplified_convex_hull(
+                                    &object.mesh.vertices,
+                                    manifold_core::convex_hull::DEFAULT_MAX_FACETS,
+                                    manifold_core::convex_hull::DEFAULT_VOLUME_THRESHOLD_RATIO,
+                                )
+                            {
+                                self.cached_hull = Some((index, hull));
+                            }
+                        }
+                    }
+
+                    let hovered_facet = if let Some((_, hull)) = &self.cached_hull {
+                        if let Some(cursor_pos) = response.hover_pos() {
+                            let (ray_orig, ray_dir) = self.camera.unproject_ray(rect, cursor_pos);
+                            if let Some(object) = self.objects.get(index) {
+                                crate::lay_on_face::pick_hull_facet(hull, object, ray_orig, ray_dir)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if response.clicked() {
+                        if let Some(facet_idx) = hovered_facet {
+                            if let Some((_, hull)) = &self.cached_hull {
+                                if let Some(object) = self.objects.get_mut(index) {
+                                    let (bed_min, _) = self.machine.build_volume.bounding_box();
+                                    let facet_normal = hull.facets[facet_idx].normal;
+                                    object.transform = crate::lay_on_face::orient_facet_to_bed(
+                                        object,
+                                        facet_normal,
+                                        bed_min.z,
+                                    );
+                                    let device = frame
+                                        .wgpu_render_state()
+                                        .expect("wgpu renderer is required")
+                                        .device
+                                        .clone();
+                                    self.update_camera_bounds();
+                                    self.reupload(&device);
+                                    self.lay_on_face_active = false;
+                                    self.cached_hull = None;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some((_, hull)) = &self.cached_hull {
+                        if let Some(object) = self.objects.get(index) {
+                            crate::lay_on_face::render_hull_overlay(
+                                ui.painter(),
+                                hull,
+                                object,
+                                view_proj,
+                                rect,
+                                self.camera.eye(),
+                                hovered_facet,
+                            );
+                        }
+                    }
+                } else {
+                    self.lay_on_face_active = false;
+                    self.cached_hull = None;
+                }
+
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.lay_on_face_active = false;
+                    self.cached_hull = None;
                 }
             }
 

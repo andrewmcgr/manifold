@@ -8,6 +8,7 @@
 
 mod app;
 mod camera;
+mod lay_on_face;
 #[cfg(feature = "mcp-server")]
 mod mcp;
 mod profile;
