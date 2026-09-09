@@ -166,12 +166,13 @@ fn retain_contained_paths(
 /// closing segment present is left untouched at the end, preserving
 /// whichever parallel-array shape the path already had.
 fn insert_z_hops(paths: Vec<Path>, config: &SlicerConfig) -> Vec<Path> {
-    if !config.z_hop_enabled {
+    let hop_height = config.resolved_z_hop_height();
+    if hop_height <= 0.0 {
         return paths;
     }
     paths
         .into_par_iter()
-        .map(|path| insert_z_hops_into_path(path, config.z_hop_height))
+        .map(|path| insert_z_hops_into_path(path, hop_height))
         .collect()
 }
 
@@ -196,7 +197,8 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
     } = path;
     let point_count = points.len();
     // Fewer than 2 points means no edges at all -- nothing to hop around.
-    if point_count < 2 {
+    // Zero or negative hop height means hopping is disabled or inert -- return unchanged.
+    if point_count < 2 || hop_height <= 0.0 {
         return Path {
             points,
             segments,
@@ -1150,7 +1152,7 @@ fn route_travel_moves(
             .wall_line_width
             .abs()
             .max(config.nozzle_diameter.abs());
-    let endpoint_clearance = config.z_hop_height.abs();
+    let endpoint_clearance = config.resolved_z_hop_height();
     let cell_size = config
         .layer_height
         .abs()
@@ -3967,6 +3969,63 @@ mod tests {
     }
 
     #[test]
+    fn insert_z_hops_is_a_noop_when_z_hop_height_is_zero() {
+        let p0 = DVec3::new(0.0, 0.0, 0.0);
+        let p1 = DVec3::new(1.0, 0.0, 0.0);
+        let p2 = DVec3::new(2.0, 0.0, 0.0);
+        let wall_segment = Segment {
+            island: 0,
+            kind: MoveKind::WallOuter,
+            speed: 50.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 1.0,
+            line_width: 0.4,
+            is_scarf: false,
+            id: 0,
+            channel_width: f64::INFINITY,
+        };
+        let travel_segment = Segment {
+            island: 0,
+            kind: MoveKind::Travel,
+            speed: 150.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 0.0,
+            line_width: 0.0,
+            is_scarf: false,
+            id: 0,
+            channel_width: f64::INFINITY,
+        };
+        let path = Path {
+            points: vec![p0, p1, p2],
+            segments: vec![wall_segment, travel_segment, wall_segment],
+            tool: ToolId(0),
+        };
+
+        // When z_hop_enabled is true, but height is 0.0, it must be a no-op identical to disabled.
+        let config = SlicerConfig {
+            z_hop_enabled: true,
+            z_hop_height: 0.0,
+            ..SlicerConfig::default()
+        };
+
+        let result = insert_z_hops(vec![path.clone()], &config);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].points, path.points);
+        assert_eq!(
+            result[0]
+                .segments
+                .iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>(),
+            path.segments.iter().map(|s| s.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn plan_rejects_layer_with_unknown_object() {
         let objects = vec![Object::new(ObjectId(0), Mesh::default(), ToolId(0))];
         let layers = vec![Layer {
@@ -4601,7 +4660,11 @@ mod tests {
             vec![DVec3::new(1.0, 0.5, 0.5), DVec3::new(3.0, 0.5, 0.5)],
             MoveKind::Infill,
         );
-        let config = SlicerConfig::default();
+        let config = SlicerConfig {
+            z_hop_enabled: true,
+            z_hop_height: 0.4,
+            ..SlicerConfig::default()
+        };
         let slope_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
 
         let routed = route_travel_moves(
@@ -4670,6 +4733,63 @@ mod tests {
             detour_after_hop.segments.len(),
             detour_before_hop.segments.len()
         );
+    }
+
+    #[test]
+    fn z_hop_disabled_is_completely_identical_to_z_hop_enabled_with_zero_height() {
+        let sdf = Arc::new(cube_sdf_fixture());
+
+        let a = open_path(
+            vec![DVec3::new(-2.0, 0.5, 0.5), DVec3::new(0.0, 0.5, 0.5)],
+            MoveKind::Infill,
+        );
+        let b = open_path(
+            vec![DVec3::new(1.0, 0.5, 0.5), DVec3::new(3.0, 0.5, 0.5)],
+            MoveKind::Infill,
+        );
+        let slope_profile = manifold_fidget::slope_profile::SlopeProfile::new(Vec::new());
+
+        let config_disabled = SlicerConfig {
+            z_hop_enabled: false,
+            z_hop_height: 0.4,
+            ..SlicerConfig::default()
+        };
+        let config_zero_height = SlicerConfig {
+            z_hop_enabled: true,
+            z_hop_height: 0.0,
+            ..SlicerConfig::default()
+        };
+
+        let routed_disabled = route_travel_moves(
+            vec![a.clone(), b.clone()],
+            Some(&sdf),
+            None,
+            &slope_profile,
+            &config_disabled,
+            config_disabled.z_travel_penalty,
+        );
+        let hopped_disabled = insert_z_hops(routed_disabled, &config_disabled);
+
+        let routed_zero = route_travel_moves(
+            vec![a, b],
+            Some(&sdf),
+            None,
+            &slope_profile,
+            &config_zero_height,
+            config_zero_height.z_travel_penalty,
+        );
+        let hopped_zero = insert_z_hops(routed_zero, &config_zero_height);
+
+        assert_eq!(hopped_disabled.len(), hopped_zero.len());
+        for (p_dis, p_zero) in hopped_disabled.iter().zip(hopped_zero.iter()) {
+            assert_eq!(p_dis.points, p_zero.points);
+            assert_eq!(p_dis.segments.len(), p_zero.segments.len());
+            for (s_dis, s_zero) in p_dis.segments.iter().zip(p_zero.segments.iter()) {
+                assert_eq!(s_dis.kind, s_zero.kind);
+                assert_eq!(s_dis.extrusion_length, s_zero.extrusion_length);
+                assert_eq!(s_dis.speed, s_zero.speed);
+            }
+        }
     }
 
     #[test]

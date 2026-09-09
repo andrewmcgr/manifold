@@ -788,6 +788,18 @@ impl SlicerConfig {
         base_penalty.max(speed_ratio).max(accel_ratio)
     }
 
+    /// Effective Z-hop height (mm). If `z_hop_enabled` is `false`, or if
+    /// `z_hop_height <= 0.0`, returns `0.0`. Ensures that disabling Z-hop
+    /// is completely equivalent to enabling Z-hop with a distance of zero.
+    #[must_use]
+    pub fn resolved_z_hop_height(&self) -> f64 {
+        if self.z_hop_enabled && self.z_hop_height > 0.0 {
+            self.z_hop_height
+        } else {
+            0.0
+        }
+    }
+
     /// First layer extrusion multiplier, defaulting to `1.0` when `None`.
     #[must_use]
     pub fn first_layer_extrusion_multiplier(&self) -> f64 {
