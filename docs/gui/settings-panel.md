@@ -4,7 +4,15 @@ The left sidebar in `manifold-gui` organizes slicing and machine parameters into
 
 ---
 
-## 1. Layering
+## 1. Profile
+- **File**: Displays the currently loaded or saved profile JSON filename.
+- **Description**: Single-line free text field for notes or profile titles.
+- **Save Profile…**: Serializes the printer `Machine` definition and `SlicerConfig` to a `.json` file.
+- **Load Profile…**: Loads a previously saved `.json` profile and updates viewport geometry.
+
+---
+
+## 2. Layering
 - **Layer Height (mm)**: Nominal non-planar layer thickness.
 - **First Layer Height (mm)**: Thickness of the initial bed-contact layer.
 - **Top Solid Layers**: Number of solid shell layers covering upward-exposed surfaces.

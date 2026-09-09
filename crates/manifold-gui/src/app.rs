@@ -88,6 +88,8 @@ pub struct ManifoldApp {
     drag_depth: f64,
     /// Active drag interaction mode for the viewport canvas.
     active_drag: Option<DragMode>,
+    /// Path to the currently loaded or saved profile file.
+    profile_path: Option<std::path::PathBuf>,
     /// Whether "Lay on Face" facet inspection mode is active.
     lay_on_face_active: bool,
     /// Cached simplified convex hull for the currently selected object `(object_index, hull)`.
@@ -232,6 +234,7 @@ impl ManifoldApp {
             drag_pivot: None,
             drag_depth: 0.0,
             active_drag: None,
+            profile_path: None,
             lay_on_face_active: false,
             cached_hull: None,
             gcode: None,
@@ -821,6 +824,100 @@ impl ManifoldApp {
     fn settings_panel(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let config_before = self.config.clone();
         ui.heading("Settings");
+
+        egui::CollapsingHeader::new("Profile")
+            .default_open(true)
+            .show(ui, |ui| {
+                let filename = self
+                    .profile_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("(unsaved profile)");
+                ui.horizontal(|ui| {
+                    ui.label("File:");
+                    ui.strong(filename);
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Description:");
+                    ui.text_edit_singleline(&mut self.config.description);
+                });
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save Profile…").clicked() {
+                        let mut dialog = rfd::FileDialog::new()
+                            .add_filter("Profile", &["json"])
+                            .set_file_name(
+                                self.profile_path
+                                    .as_ref()
+                                    .and_then(|p| p.file_name())
+                                    .and_then(|f| f.to_str())
+                                    .unwrap_or("profile.json"),
+                            );
+                        if let Some(parent) = self.profile_path.as_ref().and_then(|p| p.parent()) {
+                            dialog = dialog.set_directory(parent);
+                        }
+                        if let Some(path) = dialog.save_file() {
+                            let profile = Profile {
+                                machine: self.machine.clone(),
+                                config: self.config.clone(),
+                            };
+                            match profile.save(&path) {
+                                Ok(()) => {
+                                    self.profile_path = Some(path);
+                                    self.profile_error = None;
+                                }
+                                Err(error) => {
+                                    self.profile_error = Some(error.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if ui.button("Load Profile…").clicked() {
+                        let mut dialog = rfd::FileDialog::new().add_filter("Profile", &["json"]);
+                        if let Some(parent) = self.profile_path.as_ref().and_then(|p| p.parent()) {
+                            dialog = dialog.set_directory(parent);
+                        }
+                        if let Some(path) = dialog.pick_file() {
+                            match Profile::load(&path) {
+                                Ok(profile) => {
+                                    self.machine = profile.machine;
+                                    self.config = profile.config;
+                                    self.next_tool_id = self
+                                        .machine
+                                        .tools
+                                        .iter()
+                                        .map(|tool| tool.id.0)
+                                        .max()
+                                        .map_or(0, |max_id| max_id + 1);
+                                    self.profile_path = Some(path);
+                                    self.profile_error = None;
+
+                                    let device = frame
+                                        .wgpu_render_state()
+                                        .expect("wgpu renderer is required")
+                                        .device
+                                        .clone();
+                                    self.update_camera_bounds();
+                                    self.uploaded_scene =
+                                        Arc::new(Self::build_scene(&device, &self.machine));
+                                }
+                                Err(error) => {
+                                    self.profile_error = Some(error.to_string());
+                                }
+                            }
+                        }
+                    }
+                });
+
+                if let Some(err) = &self.profile_error {
+                    ui.colored_label(egui::Color32::RED, format!("Profile failed: {err}"));
+                }
+            });
+
+        ui.separator();
 
         ui.collapsing("Layering", |ui| {
             drag_num(
@@ -2266,55 +2363,6 @@ impl ManifoldApp {
             );
         });
 
-        ui.horizontal(|ui| {
-            if ui.button("Save Profile…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Profile", &["json"])
-                    .set_file_name("profile.json")
-                    .save_file()
-                {
-                    let profile = Profile {
-                        machine: self.machine.clone(),
-                        config: self.config.clone(),
-                    };
-                    match profile.save(&path) {
-                        Ok(()) => self.profile_error = None,
-                        Err(error) => self.profile_error = Some(error.to_string()),
-                    }
-                }
-            }
-            if ui.button("Load Profile…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Profile", &["json"])
-                    .pick_file()
-                {
-                    match Profile::load(&path) {
-                        Ok(profile) => {
-                            self.machine = profile.machine;
-                            self.config = profile.config;
-                            self.next_tool_id = self
-                                .machine
-                                .tools
-                                .iter()
-                                .map(|tool| tool.id.0)
-                                .max()
-                                .map_or(0, |max_id| max_id + 1);
-                            self.profile_error = None;
-
-                            let device = frame
-                                .wgpu_render_state()
-                                .expect("wgpu renderer is required")
-                                .device
-                                .clone();
-                            self.uploaded_scene =
-                                Arc::new(Self::build_scene(&device, &self.machine));
-                        }
-                        Err(error) => self.profile_error = Some(error.to_string()),
-                    }
-                }
-            }
-        });
-
         ui.separator();
         ui.heading("Objects");
         if self.objects.is_empty() {
@@ -2375,10 +2423,6 @@ impl ManifoldApp {
         if let Some(err) = &self.slice_error {
             ui.separator();
             ui.colored_label(egui::Color32::RED, format!("Slice failed: {err}"));
-        }
-        if let Some(err) = &self.profile_error {
-            ui.separator();
-            ui.colored_label(egui::Color32::RED, format!("Profile failed: {err}"));
         }
 
         ui.separator();

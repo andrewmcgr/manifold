@@ -65,6 +65,9 @@ pub enum WallOrder {
 /// Slicer configuration shared across the pipeline.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SlicerConfig {
+    /// Optional one-line free text description for this configuration/profile.
+    #[serde(default)]
+    pub description: String,
     pub layer_height: f64,
     /// First layer height (mm) for the initial layer touching the print bed.
     /// When `None` (the default), defaults to `layer_height`.
@@ -556,6 +559,7 @@ impl Default for SlicerConfig {
         let nozzle_diameter = 0.4;
         let wall_line_width = nozzle_diameter;
         Self {
+            description: String::new(),
             layer_height: 0.2,
             first_layer_height: None,
             first_layer_print_speed: None,
