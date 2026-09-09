@@ -2678,6 +2678,7 @@ impl ManifoldApp {
             }
             ui.label(format!("{} object(s) loaded", self.objects.len()));
 
+            ensure_row_space(ui, 95.0);
             if ui
                 .add_enabled(self.selected.is_some(), egui::Button::new("Drop to Bed"))
                 .on_hover_text("Drop the selected object flush to the print bed")
@@ -2704,6 +2705,7 @@ impl ManifoldApp {
             } else {
                 "Lay on Face"
             };
+            ensure_row_space(ui, 130.0);
             if ui
                 .add_enabled(self.selected.is_some(), egui::Button::new(lay_text))
                 .on_hover_text("Click a facet on the convex hull overlay to orient that face flat against the bed")
@@ -2717,6 +2719,7 @@ impl ManifoldApp {
 
             ui.separator();
             let slicing_in_progress = self.slicing.is_some();
+            ensure_row_space(ui, 80.0);
             if ui
                 .add_enabled(
                     !self.objects.is_empty() && !slicing_in_progress,
@@ -2727,6 +2730,7 @@ impl ManifoldApp {
                 self.start_slice();
             }
             if slicing_in_progress {
+                ensure_row_space(ui, 150.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
                     // `plan_toolpaths_with_progress` splits `0.0..=1.0` evenly
@@ -2746,6 +2750,7 @@ impl ManifoldApp {
                     );
                 });
             }
+            ensure_row_space(ui, 80.0);
             if ui
                 .add_enabled(self.gcode.is_some(), egui::Button::new("Export…"))
                 .clicked()
@@ -2762,7 +2767,9 @@ impl ManifoldApp {
                     }
                 }
             }
+            ensure_row_space(ui, 130.0);
             ui.checkbox(&mut self.show_toolpaths, "Show toolpaths");
+            ensure_row_space(ui, 190.0);
             let mode_before = self.mesh_overlay_mode;
             egui::ComboBox::from_label("Mesh Overlay")
                 .selected_text(match self.mesh_overlay_mode {
@@ -2796,6 +2803,7 @@ impl ManifoldApp {
                 self.reupload(&device);
             }
             if let Some(stats) = &self.print_statistics {
+                ensure_row_space(ui, 250.0);
                 ui.separator();
                 ui.label(format!(
                     "⏱ {}  |  🧵 {:.2} m ({:.1} g)  |  📦 {} layers",
@@ -2814,6 +2822,7 @@ impl ManifoldApp {
             // tradeoff versus a shader-side discard).
             let (slider_min, slider_max) = self.toolpath_order_range.unwrap_or((0.0, 0.0));
             let mut slider_value = self.scrub_order.min(slider_max).max(slider_min);
+            ensure_row_space(ui, 240.0);
             let slider_response = ui.add_enabled(
                 self.toolpaths.is_some(),
                 egui::Slider::new(&mut slider_value, slider_min..=slider_max).text("Scrub order"),
@@ -3502,6 +3511,15 @@ impl ManifoldApp {
                     });
             }
         });
+    }
+}
+
+/// Wrap to the next line in a horizontal layout if the remaining available width
+/// is less than `needed_width` and at least one item has already been placed on this row.
+fn ensure_row_space(ui: &mut egui::Ui, needed_width: f32) {
+    let row_used = ui.cursor().min.x - ui.max_rect().min.x;
+    if row_used > 5.0 && ui.available_width() < needed_width {
+        ui.end_row();
     }
 }
 
