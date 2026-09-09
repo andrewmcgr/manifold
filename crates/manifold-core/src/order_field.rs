@@ -12,6 +12,8 @@
 
 use glam::DVec3;
 use manifold_fidget::eikonal::EikonalOrderField;
+use manifold_fidget::fsm::AnisotropicFsmOrderField;
+use manifold_fidget::fsm_tensor::TensorGrid;
 use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{ConicalOrderField, HeightOrderField, OrderField};
 use rayon::prelude::*;
@@ -54,6 +56,10 @@ pub enum OrderFieldKind {
     /// infill boundaries as level sets of the 3D solid MeshSdf `S(p) == -wall_offset`.
     /// Completely avoids 2D projection, 2D insetting errors across voids, and mid-air reprojection.
     DualIso,
+    /// Anisotropic Fast Sweeping Method (FSM) order field: evaluates the anisotropic
+    /// Eikonal equation with metric tensors steered into near-tangency or near-orthogonality
+    /// with surface boundaries.
+    AnisotropicFsm,
 }
 
 /// Resolve a config-level [`OrderFieldKind`] to a concrete
@@ -97,6 +103,7 @@ pub fn order_field_for_with_sdf(
         OrderFieldKind::Eikonal | OrderFieldKind::DualIso => {
             Box::new(eikonal_field_for(config, mesh, slope_profile, sdf))
         }
+        OrderFieldKind::AnisotropicFsm => Box::new(fsm_field_for(config, mesh, sdf)),
     }
 }
 
@@ -399,6 +406,91 @@ fn eikonal_field_for(
     )
 }
 
+/// Builds the [`OrderFieldKind::AnisotropicFsm`] field for `mesh`:
+/// constructs a background metric tensor grid steered toward near-tangency or
+/// near-orthogonality along surface boundaries, and solves the anisotropic
+/// Eikonal equation using multi-directional Fast Sweeping Method (FSM).
+fn fsm_field_for(
+    config: &SlicerConfig,
+    mesh: &Mesh,
+    existing_sdf: Option<&MeshSdf>,
+) -> AnisotropicFsmOrderField {
+    let Some((min, max)) = mesh.bounding_box() else {
+        return AnisotropicFsmOrderField::new_isotropic(
+            DVec3::ZERO,
+            DVec3::ONE,
+            1.0,
+            &|_| true,
+            &|_| false,
+        );
+    };
+
+    let layer_height = config.layer_height.abs().max(f64::EPSILON);
+    let nozzle_diameter = config.nozzle_diameter.abs().max(f64::EPSILON);
+    let requested_cell_size = layer_height.min(nozzle_diameter) / 4.0;
+    let cell_size = clamp_cell_size_to_node_budget(max - min, requested_cell_size);
+
+    let seed_tolerance = cell_size * 0.5;
+    let is_seed_region = move |p: DVec3| p.z <= min.z + seed_tolerance;
+
+    let faces: Vec<[usize; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
+        .collect();
+
+    if faces.is_empty() {
+        let is_solid = |_p: DVec3| true;
+        return AnisotropicFsmOrderField::new_isotropic(
+            min,
+            max,
+            cell_size,
+            &is_solid,
+            &is_seed_region,
+        );
+    }
+
+    let owned_sdf;
+    let sdf = match existing_sdf {
+        Some(sdf) => sdf,
+        None => {
+            owned_sdf = MeshSdf::new(mesh.vertices.clone(), faces);
+            &owned_sdf
+        }
+    };
+    let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
+
+    let (dims, h, actual_min) = AnisotropicFsmOrderField::compute_grid_dims(min, max, cell_size);
+    let mut tensor_grid = TensorGrid::new_isotropic(actual_min, dims, h);
+
+    let top_tangency = config.fsm_top_tangency_aspect();
+    let wall_ortho = config.fsm_wall_ortho_aspect();
+    let skin_depth = config.fsm_skin_depth_mm();
+
+    if skin_depth > 0.0 && ((top_tangency - 1.0).abs() > 1e-4 || (wall_ortho - 1.0).abs() > 1e-4) {
+        tensor_grid.blend_surface_tensors(
+            |p| {
+                let sample = sdf.sample(p);
+                (sample.value, sample.gradient.normalize_or_zero())
+            },
+            top_tangency,
+            wall_ortho,
+            skin_depth,
+        );
+    }
+
+    let max_sweeps = config.fsm_max_sweeps();
+    AnisotropicFsmOrderField::solve_with_tensor_grid(
+        actual_min,
+        dims,
+        h,
+        &tensor_grid,
+        &is_solid,
+        &is_seed_region,
+        max_sweeps,
+    )
+}
+
 /// Hard cap on the dense Eikonal grid's total node count (`dims[0] *
 /// dims[1] * dims[2]`). At 8 bytes/node this bounds the `distances` buffer
 /// alone to ~8MB, but the real driver of this number is
@@ -498,7 +590,9 @@ pub fn resolve_axis_apex_slope(kind: OrderFieldKind, config: &SlicerConfig) -> (
         // the *actual* cached `EikonalOrderField` (not this closed-form
         // triple) is what makes the reconstructed geometry correct
         // regardless of this choice.
-        OrderFieldKind::Eikonal | OrderFieldKind::DualIso => (BUILD_DIRECTION, DVec3::ZERO, 0.0),
+        OrderFieldKind::Eikonal | OrderFieldKind::DualIso | OrderFieldKind::AnisotropicFsm => {
+            (BUILD_DIRECTION, DVec3::ZERO, 0.0)
+        }
     }
 }
 

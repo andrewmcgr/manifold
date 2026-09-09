@@ -1688,6 +1688,11 @@ impl ManifoldApp {
                     OrderFieldKind::DualIso,
                     "DualIso",
                 );
+                ui.selectable_value(
+                    &mut self.config.order_field,
+                    OrderFieldKind::AnisotropicFsm,
+                    "Anisotropic FSM",
+                );
             });
         if previous_order_field != OrderFieldKind::Conical
             && self.config.order_field == OrderFieldKind::Conical
@@ -1724,6 +1729,71 @@ impl ManifoldApp {
                 0.0..=f64::INFINITY,
                 "Cone slope",
             );
+        }
+        if self.config.order_field == OrderFieldKind::AnisotropicFsm {
+            let mut top_aspect = self.config.fsm_top_tangency_aspect();
+            if drag_num(
+                ui,
+                &mut top_aspect,
+                0.05,
+                0.01..=f64::INFINITY,
+                "Top tangency aspect ratio",
+            )
+            .on_hover_text(
+                "Metric tensor aspect ratio along top surface normals. Values > 1.0 curve layers into near-tangency; values < 1.0 curve layers into orthogonality.",
+            )
+            .changed()
+            {
+                self.config.fsm_top_tangency_aspect = Some(top_aspect);
+            }
+
+            let mut wall_aspect = self.config.fsm_wall_ortho_aspect();
+            if drag_num(
+                ui,
+                &mut wall_aspect,
+                0.05,
+                0.01..=f64::INFINITY,
+                "Wall orthogonality aspect ratio",
+            )
+            .on_hover_text(
+                "Metric tensor aspect ratio along vertical wall surfaces. Values > 1.0 curve layers into perpendicular (orthogonal) intersections; values < 1.0 curve layers into tangency.",
+            )
+            .changed()
+            {
+                self.config.fsm_wall_ortho_aspect = Some(wall_aspect);
+            }
+
+            let mut skin_depth = self.config.fsm_skin_depth_mm();
+            if drag_num(
+                ui,
+                &mut skin_depth,
+                0.1,
+                0.0..=f64::INFINITY,
+                "Tensor skin depth (mm)",
+            )
+            .on_hover_text(
+                "Subsurface depth (mm) within which surface anisotropic metric tensors are blended with the isotropic background.",
+            )
+            .changed()
+            {
+                self.config.fsm_skin_depth_mm = Some(skin_depth);
+            }
+
+            let mut sweeps = self.config.fsm_max_sweeps();
+            if drag_num(
+                ui,
+                &mut sweeps,
+                1.0,
+                1..=64,
+                "FSM sweep iterations",
+            )
+            .on_hover_text(
+                "Number of multi-directional Gauss-Seidel coordinate sweep iterations (typically 8 to 16).",
+            )
+            .changed()
+            {
+                self.config.fsm_max_sweeps = Some(sweeps);
+            }
         }
         if self.config.order_field == OrderFieldKind::Eikonal
             || self.config.order_field == OrderFieldKind::DualIso

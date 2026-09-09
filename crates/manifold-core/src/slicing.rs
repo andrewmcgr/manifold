@@ -3511,6 +3511,27 @@ mod tests {
     }
 
     #[test]
+    fn slice_mesh_anisotropic_fsm_order_field_produces_nonempty_layer_output() {
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            order_field: crate::order_field::OrderFieldKind::AnisotropicFsm,
+            fsm_top_tangency_aspect: Some(4.0),
+            fsm_wall_ortho_aspect: Some(4.0),
+            fsm_skin_depth_mm: Some(1.0),
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&cube_mesh(), &config).unwrap();
+        assert!(!layers.is_empty() && layers.len() >= 4);
+        for layer in &layers[0..layers.len().saturating_sub(1)] {
+            assert!(!layer.loops.is_empty(), "expected nonempty contour loops");
+            for l in &layer.loops {
+                assert!(!l.points.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn slice_mesh_conformal_eikonal_order_field_produces_nonempty_layer_output() {
         let config = SlicerConfig {
             layer_height: 0.25,

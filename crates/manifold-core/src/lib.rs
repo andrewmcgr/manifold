@@ -500,6 +500,24 @@ pub struct SlicerConfig {
     /// Defaults to 400.0 Hz to prevent Klipper serial buffer starvation.
     #[serde(default)]
     pub slicer_pa_max_frequency_hz: Option<f64>,
+    /// Anisotropic FSM order field: aspect ratio for top cosmetic surface tangency.
+    /// Values > 1.0 curve the order field into near-tangency with upward surfaces.
+    /// Defaults to 4.0.
+    #[serde(default)]
+    pub fsm_top_tangency_aspect: Option<f64>,
+    /// Anisotropic FSM order field: aspect ratio for wall surface orthogonality.
+    /// Values > 1.0 curve the order field into near-orthogonality with vertical walls.
+    /// Defaults to 4.0.
+    #[serde(default)]
+    pub fsm_wall_ortho_aspect: Option<f64>,
+    /// Anisotropic FSM order field: subsurface skin depth (mm) for tensor field blending.
+    /// Defaults to 2.0 mm.
+    #[serde(default)]
+    pub fsm_skin_depth_mm: Option<f64>,
+    /// Anisotropic FSM order field: maximum multi-directional sweep iterations.
+    /// Defaults to 8.
+    #[serde(default)]
+    pub fsm_max_sweeps: Option<usize>,
 }
 
 /// Static serde-deserialize fallback for [`SlicerConfig::wall_offset`]: `0.20` mm.
@@ -675,6 +693,10 @@ impl Default for SlicerConfig {
             slicer_pa_tolerance_mm: None,
             slicer_pa_min_segment_length: None,
             slicer_pa_max_frequency_hz: None,
+            fsm_top_tangency_aspect: None,
+            fsm_wall_ortho_aspect: None,
+            fsm_skin_depth_mm: None,
+            fsm_max_sweeps: None,
             wall_order: None,
         }
     }
@@ -1126,6 +1148,30 @@ impl SlicerConfig {
     #[must_use]
     pub fn slicer_pa_max_frequency_hz(&self) -> f64 {
         self.slicer_pa_max_frequency_hz.unwrap_or(400.0).max(10.0)
+    }
+
+    /// Returns the anisotropic FSM top surface tangency aspect ratio, defaulting to 4.0.
+    #[must_use]
+    pub fn fsm_top_tangency_aspect(&self) -> f64 {
+        self.fsm_top_tangency_aspect.unwrap_or(4.0).max(1e-3)
+    }
+
+    /// Returns the anisotropic FSM wall surface orthogonality aspect ratio, defaulting to 4.0.
+    #[must_use]
+    pub fn fsm_wall_ortho_aspect(&self) -> f64 {
+        self.fsm_wall_ortho_aspect.unwrap_or(4.0).max(1e-3)
+    }
+
+    /// Returns the anisotropic FSM subsurface tensor skin depth (mm), defaulting to 2.0 mm.
+    #[must_use]
+    pub fn fsm_skin_depth_mm(&self) -> f64 {
+        self.fsm_skin_depth_mm.unwrap_or(2.0).max(0.0)
+    }
+
+    /// Returns the anisotropic FSM maximum sweep iterations, defaulting to 8.
+    #[must_use]
+    pub fn fsm_max_sweeps(&self) -> usize {
+        self.fsm_max_sweeps.unwrap_or(8).max(1)
     }
 
     /// Returns the resolved fluid dynamics engine, if configured.
