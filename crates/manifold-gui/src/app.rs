@@ -82,10 +82,10 @@ pub struct ManifoldApp {
     /// The move/rotate/scale gizmo, reused across frames so drag state
     /// persists between `interact()` calls.
     gizmo: Gizmo,
-    /// Whether the active drag interaction hit the invisible skybox rather
-    /// than a physical scene surface (bed or object mesh). When true, orbit
-    /// drags rotate the camera in place rather than orbiting a target.
-    drag_hit_skybox: bool,
+    /// 3D pivot point anchored on drag start for orbit rotation.
+    drag_pivot: Option<DVec3>,
+    /// Depth along the camera forward axis anchored on drag start for 1:1 pan.
+    drag_depth: f64,
     /// Gcode from the last successful "Slice" action (Phase 8, see
     /// ROADMAP.md), previewed in the settings panel and written out by
     /// "Export…".
@@ -223,7 +223,8 @@ impl ManifoldApp {
             import_error: None,
             selected: None,
             gizmo: Gizmo::default(),
-            drag_hit_skybox: false,
+            drag_pivot: None,
+            drag_depth: 0.0,
             gcode: None,
             toolpaths: None,
             toolpath_data_view: ToolpathDataView::default(),
@@ -2800,11 +2801,16 @@ impl ManifoldApp {
                     let hit = self.cast_scene_ray(rect, cursor_pos);
                     match hit {
                         SceneRayHit::Surface(p) => {
-                            self.camera.set_target_preserving_eye(p);
-                            self.drag_hit_skybox = false;
+                            let forward =
+                                (self.camera.target - self.camera.eye()).normalize_or_zero();
+                            let depth = (p - self.camera.eye()).dot(forward).abs();
+                            self.drag_depth =
+                                depth.clamp(self.camera.min_distance, self.camera.max_distance);
+                            self.drag_pivot = Some(p);
                         }
                         SceneRayHit::Skybox(_) => {
-                            self.drag_hit_skybox = true;
+                            self.drag_depth = self.camera.distance;
+                            self.drag_pivot = Some(self.camera.eye());
                         }
                     }
                 }
@@ -2813,12 +2819,22 @@ impl ManifoldApp {
             if response.dragged() {
                 let delta = response.drag_delta();
                 if ui.input(|i| i.pointer.secondary_down()) {
-                    self.camera.pan(delta.x, delta.y, rect.height());
-                } else if self.drag_hit_skybox {
-                    self.camera.rotate_camera(delta.x, delta.y);
+                    let depth = if self.drag_depth > 0.0 {
+                        self.drag_depth
+                    } else {
+                        self.camera.distance
+                    };
+                    self.camera
+                        .pan_with_depth(delta.x, delta.y, rect.height(), depth);
                 } else {
-                    self.camera.orbit(delta.x, delta.y);
+                    let pivot = self.drag_pivot.unwrap_or(self.camera.target);
+                    self.camera.orbit_around(pivot, delta.x, delta.y);
                 }
+            }
+
+            if response.drag_stopped() {
+                self.drag_pivot = None;
+                self.drag_depth = 0.0;
             }
             if response.hovered() {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);

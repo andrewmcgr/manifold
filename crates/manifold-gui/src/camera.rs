@@ -50,18 +50,61 @@ impl OrbitCamera {
         self.target + DVec3::new(x, y, z)
     }
 
-    /// Apply a drag delta (in points) to orbit rotation.
+    /// Apply a drag delta (in points) to orbit rotation around [`Self::target`].
+    #[allow(dead_code)]
     pub fn orbit(&mut self, delta_x: f32, delta_y: f32) {
+        self.orbit_around(self.target, delta_x, delta_y);
+    }
+
+    /// Orbit the camera around an arbitrary world-space `pivot` point by
+    /// `delta_x` (yaw) and `delta_y` (pitch).
+    ///
+    /// - If `pivot == self.eye()`, this rotates the camera in place (first-person look).
+    /// - If `pivot == self.target`, this is standard orbit around target.
+    /// - For any surface hit point, this orbits around that surface point without
+    ///   snapping the point to the center of the screen or jumping the view on drag start.
+    pub fn orbit_around(&mut self, pivot: DVec3, delta_x: f32, delta_y: f32) {
+        if delta_x == 0.0 && delta_y == 0.0 {
+            return;
+        }
         const SENSITIVITY: f64 = 0.01;
-        self.yaw -= delta_x as f64 * SENSITIVITY;
-        self.pitch = (self.pitch + delta_y as f64 * SENSITIVITY).clamp(MIN_PITCH, MAX_PITCH);
+        let eye = self.eye();
+        let forward = (self.target - eye).normalize_or_zero();
+        let right = forward.cross(DVec3::Z).normalize_or_zero();
+
+        let q_yaw = glam::DQuat::from_axis_angle(DVec3::Z, -delta_x as f64 * SENSITIVITY);
+        let q_pitch = glam::DQuat::from_axis_angle(right, delta_y as f64 * SENSITIVITY);
+        let q = q_yaw * q_pitch;
+
+        let to_eye = eye - pivot;
+        let to_target = self.target - pivot;
+
+        let new_eye = pivot + q * to_eye;
+        let new_target = pivot + q * to_target;
+
+        let new_forward = (new_target - new_eye).normalize_or_zero();
+        let new_pitch = (-new_forward.z)
+            .clamp(-1.0, 1.0)
+            .asin()
+            .clamp(MIN_PITCH, MAX_PITCH);
+        let new_yaw = (-new_forward.y).atan2(-new_forward.x);
+
+        self.pitch = new_pitch;
+        self.yaw = new_yaw;
+
+        let offset = DVec3::new(
+            self.distance * self.pitch.cos() * self.yaw.cos(),
+            self.distance * self.pitch.cos() * self.yaw.sin(),
+            self.distance * self.pitch.sin(),
+        );
+        self.target = new_eye - offset;
     }
 
     /// Apply a pan delta (in points) in the camera's local right/up plane,
-    /// scaled to match `viewport_height` so screen motion tracks 1:1 with the cursor.
-    pub fn pan(&mut self, delta_x: f32, delta_y: f32, viewport_height: f32) {
+    /// scaled to match `viewport_height` at depth `depth` so screen motion tracks 1:1.
+    pub fn pan_with_depth(&mut self, delta_x: f32, delta_y: f32, viewport_height: f32, depth: f64) {
         let half_fov = (self.fov_y_radians as f64 * 0.5).tan();
-        let units_per_point = 2.0 * self.distance * half_fov / (viewport_height.max(1.0) as f64);
+        let units_per_point = 2.0 * depth * half_fov / (viewport_height.max(1.0) as f64);
         let forward = (self.target - self.eye()).normalize_or_zero();
         let right = forward.cross(DVec3::Z).normalize_or_zero();
         let up = right.cross(forward).normalize_or_zero();
@@ -69,9 +112,16 @@ impl OrbitCamera {
         self.target += up * (delta_y as f64 * units_per_point);
     }
 
+    /// Apply a pan delta (in points) in the camera's local right/up plane at [`Self::distance`] depth.
+    #[allow(dead_code)]
+    pub fn pan(&mut self, delta_x: f32, delta_y: f32, viewport_height: f32) {
+        self.pan_with_depth(delta_x, delta_y, viewport_height, self.distance);
+    }
+
     /// Retarget the camera to `new_target` while keeping [`Self::eye`]
     /// in the exact same world-space position. Updates `distance`, `yaw`,
     /// and `pitch` accordingly.
+    #[allow(dead_code)]
     pub fn set_target_preserving_eye(&mut self, new_target: DVec3) {
         let eye = self.eye();
         let to_eye = eye - new_target;
@@ -91,15 +141,9 @@ impl OrbitCamera {
 
     /// Rotate the camera in place around its current [`Self::eye`] position
     /// (first-person look), keeping `eye` fixed and moving `target`.
+    #[allow(dead_code)]
     pub fn rotate_camera(&mut self, delta_x: f32, delta_y: f32) {
-        let eye = self.eye();
-        const SENSITIVITY: f64 = 0.01;
-        self.yaw -= delta_x as f64 * SENSITIVITY;
-        self.pitch = (self.pitch + delta_y as f64 * SENSITIVITY).clamp(MIN_PITCH, MAX_PITCH);
-        let x = self.distance * self.pitch.cos() * self.yaw.cos();
-        let y = self.distance * self.pitch.cos() * self.yaw.sin();
-        let z = self.distance * self.pitch.sin();
-        self.target = eye - DVec3::new(x, y, z);
+        self.orbit_around(self.eye(), delta_x, delta_y);
     }
 
     /// Cast a world-space ray `(origin, direction)` through a screen-space cursor
@@ -259,17 +303,49 @@ mod tests {
     }
 
     #[test]
-    fn rotate_camera_keeps_eye_position_identical() {
+    fn orbit_around_with_zero_delta_leaves_camera_completely_unchanged() {
         let mut camera = OrbitCamera::default();
         let orig_eye = camera.eye();
-        camera.rotate_camera(25.0, -15.0);
-        let new_eye = camera.eye();
+        let orig_target = camera.target;
+        let orig_yaw = camera.yaw;
+        let orig_pitch = camera.pitch;
+
+        let pivot = DVec3::new(45.0, -120.0, 15.0);
+        camera.orbit_around(pivot, 0.0, 0.0);
+
+        assert!((camera.eye() - orig_eye).length() < 1e-12);
+        assert!((camera.target - orig_target).length() < 1e-12);
+        assert!((camera.yaw - orig_yaw).abs() < 1e-12);
+        assert!((camera.pitch - orig_pitch).abs() < 1e-12);
+    }
+
+    #[test]
+    fn orbit_around_surface_point_rotates_around_pivot() {
+        let mut camera = OrbitCamera::default();
+        let pivot = DVec3::new(50.0, 50.0, 0.0);
+        let orig_dist_to_pivot = (camera.eye() - pivot).length();
+
+        camera.orbit_around(pivot, 10.0, 5.0);
+
+        let new_dist_to_pivot = (camera.eye() - pivot).length();
         assert!(
-            (new_eye - orig_eye).length() < 1e-6,
-            "eye drifted from {:?} to {:?}",
-            orig_eye,
-            new_eye
+            (new_dist_to_pivot - orig_dist_to_pivot).abs() < 1e-6,
+            "distance to pivot changed from {} to {}",
+            orig_dist_to_pivot,
+            new_dist_to_pivot
         );
+    }
+
+    #[test]
+    fn pan_with_depth_does_not_change_yaw_or_pitch() {
+        let mut camera = OrbitCamera::default();
+        let orig_yaw = camera.yaw;
+        let orig_pitch = camera.pitch;
+
+        camera.pan_with_depth(50.0, -30.0, 800.0, 150.0);
+
+        assert_eq!(camera.yaw, orig_yaw);
+        assert_eq!(camera.pitch, orig_pitch);
     }
 
     #[test]
