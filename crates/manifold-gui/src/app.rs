@@ -10,6 +10,7 @@ use crate::render::{
 use crate::scene;
 use crate::toolpath_view::{self, ToolpathDataView};
 use eframe::egui;
+use glam::DVec3;
 use manifold_core::bounds::BoundingVolume;
 use manifold_core::infill::InfillPatternKind;
 use manifold_core::machine::Machine;
@@ -289,6 +290,7 @@ impl ManifoldApp {
                             rotation,
                             glam::DVec3::new(x, y, z),
                         );
+                        self.update_camera_bounds();
                         let device = frame
                             .wgpu_render_state()
                             .expect("wgpu renderer is required")
@@ -342,6 +344,39 @@ impl ManifoldApp {
         UploadedScene::upload(device, &lines, &triangles)
     }
 
+    /// Combined axis-aligned bounding box enclosing the machine build volume
+    /// and every loaded object (transformed to world space).
+    fn scene_bounding_box(&self) -> (DVec3, DVec3) {
+        let (mut min, mut max) = self.machine.build_volume.bounding_box();
+        for object in &self.objects {
+            if let Some((local_min, local_max)) = object.mesh.bounding_box() {
+                for corner in [
+                    DVec3::new(local_min.x, local_min.y, local_min.z),
+                    DVec3::new(local_max.x, local_min.y, local_min.z),
+                    DVec3::new(local_min.x, local_max.y, local_min.z),
+                    DVec3::new(local_max.x, local_max.y, local_min.z),
+                    DVec3::new(local_min.x, local_min.y, local_max.z),
+                    DVec3::new(local_max.x, local_min.y, local_max.z),
+                    DVec3::new(local_min.x, local_max.y, local_max.z),
+                    DVec3::new(local_max.x, local_max.y, local_max.z),
+                ] {
+                    let world = object.transform.transform_point(corner);
+                    min = min.min(world);
+                    max = max.max(world);
+                }
+            }
+        }
+        (min, max)
+    }
+
+    /// Update the camera's zoom limits ([`OrbitCamera::max_distance`]) so
+    /// that everything in the scene occupies approximately 1/3 of the screen
+    /// height at maximum zoom-out.
+    fn update_camera_bounds(&mut self) {
+        let (min, max) = self.scene_bounding_box();
+        self.camera.update_max_distance(min, max);
+    }
+
     /// Load every object from `path`, dispatching on its file extension
     /// (mirrors `manifold-cli`'s `load_objects`).
     fn import(&mut self, path: &Path, device: &eframe::egui_wgpu::wgpu::Device) {
@@ -349,6 +384,7 @@ impl ManifoldApp {
             Ok(mut new_objects) => {
                 object::center_on_bed(&mut new_objects, &self.machine.build_volume);
                 self.objects.append(&mut new_objects);
+                self.update_camera_bounds();
                 self.reupload(device);
                 self.import_error = None;
             }
@@ -360,6 +396,7 @@ impl ManifoldApp {
     fn remove_object(&mut self, index: usize, device: &eframe::egui_wgpu::wgpu::Device) {
         if index < self.objects.len() {
             self.objects.remove(index);
+            self.update_camera_bounds();
             if let Some(selected) = self.selected {
                 if selected == index {
                     self.selected = None;
@@ -393,6 +430,7 @@ impl ManifoldApp {
     fn clear_objects(&mut self, device: &eframe::egui_wgpu::wgpu::Device) {
         self.objects.clear();
         self.selected = None;
+        self.update_camera_bounds();
         self.gcode = None;
         self.toolpaths = None;
         self.uploaded_toolpaths = None;
@@ -1856,6 +1894,7 @@ impl ManifoldApp {
         .changed();
         if bed_changed {
             self.machine.build_volume = BoundingVolume::Aabb { min, max };
+            self.update_camera_bounds();
             let device = frame
                 .wgpu_render_state()
                 .expect("wgpu renderer is required")
@@ -2659,9 +2698,11 @@ impl ManifoldApp {
                     self.camera.orbit(delta.x, delta.y);
                 }
             }
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                self.camera.zoom(scroll);
+            if response.hovered() {
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0 {
+                    self.camera.zoom(scroll);
+                }
             }
 
             let aspect_ratio = rect.width() / rect.height().max(1.0);
@@ -2851,6 +2892,7 @@ impl ManifoldApp {
                                 .expect("wgpu renderer is required")
                                 .device
                                 .clone();
+                            self.update_camera_bounds();
                             self.reupload(&device);
                         }
                     }

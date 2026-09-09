@@ -16,6 +16,8 @@ pub struct OrbitCamera {
     pub fov_y_radians: f32,
     pub near: f32,
     pub far: f32,
+    pub min_distance: f64,
+    pub max_distance: f64,
 }
 
 impl Default for OrbitCamera {
@@ -26,15 +28,18 @@ impl Default for OrbitCamera {
             yaw: -std::f64::consts::FRAC_PI_4,
             pitch: std::f64::consts::FRAC_PI_6,
             fov_y_radians: 45.0_f32.to_radians(),
-            near: 0.1,
+            near: 0.01,
             far: 10_000.0,
+            min_distance: MIN_DISTANCE,
+            max_distance: DEFAULT_MAX_DISTANCE,
         }
     }
 }
 
 const MIN_PITCH: f64 = -std::f64::consts::FRAC_PI_2 + 0.01;
 const MAX_PITCH: f64 = std::f64::consts::FRAC_PI_2 - 0.01;
-const MIN_DISTANCE: f64 = 1.0;
+pub const MIN_DISTANCE: f64 = 0.05;
+pub const DEFAULT_MAX_DISTANCE: f64 = 2000.0;
 
 impl OrbitCamera {
     /// Current eye (camera) position in world space.
@@ -62,23 +67,40 @@ impl OrbitCamera {
         self.target += up * (delta_y as f64 * sensitivity);
     }
 
-    /// Apply a scroll delta to zoom in/out.
+    /// Apply a scroll delta to zoom in/out, clamped to `[min_distance, max_distance]`.
     pub fn zoom(&mut self, delta: f32) {
         const SENSITIVITY: f64 = 0.002;
         let factor = (-delta as f64 * SENSITIVITY).exp();
-        self.distance = (self.distance * factor).max(MIN_DISTANCE);
+        self.distance = (self.distance * factor).clamp(self.min_distance, self.max_distance);
     }
 
     /// Re-center and re-distance the camera so the axis-aligned box
     /// `min..max` (e.g. the machine's build volume) fits in view, keeping
     /// the current `yaw`/`pitch`/`fov_y_radians`. Used to frame the whole
     /// bed on startup instead of defaulting to a view of the origin.
+    ///
+    /// Also updates [`Self::max_distance`] so that the scene occupies
+    /// approximately 1/3 of the vertical screen height at maximum zoom-out.
     pub fn frame(&mut self, min: DVec3, max: DVec3) {
         const FIT_MARGIN: f64 = 1.3;
         self.target = (min + max) * 0.5;
+        self.update_max_distance(min, max);
         let radius = (max - min).length() * 0.5;
         let half_fov = self.fov_y_radians as f64 * 0.5;
-        self.distance = (radius / half_fov.tan() * FIT_MARGIN).max(MIN_DISTANCE);
+        let fit_distance = radius / half_fov.tan();
+        self.distance = (fit_distance * FIT_MARGIN).clamp(self.min_distance, self.max_distance);
+    }
+
+    /// Update [`Self::max_distance`] from an axis-aligned bounding box `min..max`
+    /// so that the bounding sphere occupies approximately 1/3 of the screen height
+    /// at maximum zoom-out (`3.0 * radius / tan(fov_y / 2)`).
+    pub fn update_max_distance(&mut self, min: DVec3, max: DVec3) {
+        let radius = (max - min).length() * 0.5;
+        let half_fov = self.fov_y_radians as f64 * 0.5;
+        let fit_distance = radius / half_fov.tan();
+        // At 3.0 * fit_distance, the scene subtends 1/3 of the vertical FOV.
+        self.max_distance = (fit_distance * 3.0).max(self.min_distance);
+        self.distance = self.distance.clamp(self.min_distance, self.max_distance);
     }
 
     /// The camera-space view matrix (world -> camera).
@@ -146,6 +168,36 @@ mod tests {
     fn frame_never_goes_below_minimum_distance_for_a_tiny_box() {
         let mut camera = OrbitCamera::default();
         camera.frame(DVec3::ZERO, DVec3::splat(1e-9));
-        assert!(camera.distance >= MIN_DISTANCE);
+        assert!(camera.distance >= camera.min_distance);
+    }
+
+    #[test]
+    fn zoom_clamps_to_max_distance_derived_from_bounds() {
+        let mut camera = OrbitCamera::default();
+        let min = DVec3::ZERO;
+        let max = DVec3::new(200.0, 200.0, 200.0);
+        camera.frame(min, max);
+
+        // Zoom out aggressively with large negative scroll deltas
+        for _ in 0..100 {
+            camera.zoom(-100.0);
+        }
+        assert!((camera.distance - camera.max_distance).abs() < 1e-6);
+
+        let radius = (max - min).length() * 0.5;
+        let half_fov = camera.fov_y_radians as f64 * 0.5;
+        let fit_distance = radius / half_fov.tan();
+        // At max_distance, it should be approximately 3.0 * fit_distance (scene is 1/3 screen)
+        assert!((camera.max_distance - fit_distance * 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zoom_clamps_to_sub_millimeter_min_distance() {
+        let mut camera = OrbitCamera::default();
+        for _ in 0..100 {
+            camera.zoom(100.0);
+        }
+        assert_eq!(camera.distance, camera.min_distance);
+        assert!(camera.min_distance < 0.1);
     }
 }
