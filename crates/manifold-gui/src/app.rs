@@ -1309,6 +1309,51 @@ impl ManifoldApp {
                 );
             }
 
+            ui.checkbox(
+                &mut self.config.enable_slicer_pressure_advance,
+                "Slicer-side adaptive pressure advance",
+            );
+            if self.config.enable_slicer_pressure_advance {
+                let mut tol = self.config.slicer_pa_tolerance_mm();
+                if drag_num(
+                    ui,
+                    &mut tol,
+                    0.0005,
+                    0.0001..=f64::INFINITY,
+                    "PA tolerance (mm)",
+                )
+                .changed()
+                {
+                    self.config.slicer_pa_tolerance_mm = Some(tol);
+                }
+
+                let mut min_seg = self.config.slicer_pa_min_segment_length();
+                if drag_num(
+                    ui,
+                    &mut min_seg,
+                    0.05,
+                    0.01..=f64::INFINITY,
+                    "PA min segment length (mm)",
+                )
+                .changed()
+                {
+                    self.config.slicer_pa_min_segment_length = Some(min_seg);
+                }
+
+                let mut max_freq = self.config.slicer_pa_max_frequency_hz();
+                if drag_num(
+                    ui,
+                    &mut max_freq,
+                    10.0,
+                    10.0..=f64::INFINITY,
+                    "PA max frequency (Hz)",
+                )
+                .changed()
+                {
+                    self.config.slicer_pa_max_frequency_hz = Some(max_freq);
+                }
+            }
+
             let mut r_spd_mms = (self.config.retraction_speed() / 60.0).round();
             if drag_num(
                 ui,
@@ -2052,6 +2097,18 @@ impl ManifoldApp {
             {
                 self.config.acceleration_deadband_percent = Some(accel_deadband);
             }
+            let mut cruise_ratio = self.config.minimum_cruise_ratio();
+            if drag_num(
+                ui,
+                &mut cruise_ratio,
+                0.05,
+                0.0..=1.0,
+                "Minimum cruise ratio",
+            )
+            .changed()
+            {
+                self.config.minimum_cruise_ratio = Some(cruise_ratio);
+            }
         });
 
         ui.separator();
@@ -2221,6 +2278,19 @@ impl ManifoldApp {
                 .changed()
                 {
                     self.machine.speed_limit = Some(v_limit);
+                }
+
+                let mut mach_cruise = self.machine.minimum_cruise_ratio();
+                if drag_num(
+                    ui,
+                    &mut mach_cruise,
+                    0.05,
+                    0.0..=1.0,
+                    "Minimum cruise ratio",
+                )
+                .changed()
+                {
+                    self.machine.minimum_cruise_ratio = Some(mach_cruise);
                 }
             });
         }

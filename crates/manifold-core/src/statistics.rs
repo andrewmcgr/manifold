@@ -106,7 +106,8 @@ pub fn compute_print_statistics_with_machine(
             &path.segments,
             &*model,
             is_first_layer,
-            5.0, // 5 mm/s Klipper default SCV
+            config.square_corner_velocity(),
+            config.minimum_cruise_ratio(),
         );
 
         for (i, seg) in path.segments.iter().enumerate() {

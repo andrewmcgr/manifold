@@ -264,7 +264,9 @@ pub fn emit_with_machine(
     // so M83 must be the last word on extrusion mode before the first extruding move.
     out.push_str("M83\n");
 
-    if let Some(pa) = config.pressure_advance {
+    if config.enable_slicer_pressure_advance {
+        out.push_str("SET_PRESSURE_ADVANCE ADVANCE=0\n");
+    } else if let Some(pa) = config.pressure_advance {
         if pa > 0.0 && !config.use_fluid_dynamics() {
             out.push_str(&format!("SET_PRESSURE_ADVANCE ADVANCE={pa:.4}\n"));
         }
@@ -348,13 +350,34 @@ pub fn emit_with_machine(
             fluid_engine = config.fluid_dynamics_engine(tool_temp);
         }
 
-        let profiles = crate::kinematics::plan_path_velocities(
+        let initial_profiles = crate::kinematics::plan_path_velocities(
             &path.points,
             &path.segments,
             motion_model.as_ref(),
             is_first_layer,
             config.square_corner_velocity(),
+            config.minimum_cruise_ratio(),
         );
+
+        let (path, profiles) = if config.enable_slicer_pressure_advance {
+            let subdivided = crate::subdivide_pa::subdivide_path_for_pressure_advance(
+                path.clone(),
+                &initial_profiles,
+                config,
+                fluid_engine.as_ref(),
+            );
+            let sub_profiles = crate::kinematics::plan_path_velocities(
+                &subdivided.points,
+                &subdivided.segments,
+                motion_model.as_ref(),
+                is_first_layer,
+                config.square_corner_velocity(),
+                config.minimum_cruise_ratio(),
+            );
+            (subdivided, sub_profiles)
+        } else {
+            (path.clone(), initial_profiles)
+        };
 
         for (i, p) in path.points.iter().enumerate() {
             // `segments[i]` describes the edge `points[i] -> points[i + 1]`
@@ -1575,6 +1598,44 @@ mod tests {
         let out = emit(&[], &config);
 
         assert!(out.contains("SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=8.5\n"));
+    }
+
+    #[test]
+    fn emit_slicer_side_pressure_advance_disables_firmware_pa_and_subdivides() {
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        let path = Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.2), DVec3::new(50.0, 0.0, 0.2)],
+            segments: vec![Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 2.0,
+                speed: 6000.0,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            enable_slicer_pressure_advance: true,
+            pressure_advance: Some(0.05),
+            slicer_pa_tolerance_mm: Some(0.002),
+            slicer_pa_min_segment_length: Some(0.5),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&[path], &config);
+
+        // Header must disable firmware PA
+        assert!(out.contains("SET_PRESSURE_ADVANCE ADVANCE=0\n"));
+        // Never emit the static advance when slicer PA is active
+        assert!(!out.contains("SET_PRESSURE_ADVANCE ADVANCE=0.0500\n"));
+        // The move should have been subdivided into multiple G1 extrusion moves
+        let g1_count = out.lines().filter(|l| l.starts_with("G1 X")).count();
+        assert!(
+            g1_count > 1,
+            "expected multiple subdivided moves, got {g1_count}"
+        );
     }
 
     #[test]

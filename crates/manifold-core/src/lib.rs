@@ -25,6 +25,7 @@ pub mod polygon2d;
 pub mod slicing;
 pub mod statistics;
 pub mod stl;
+pub mod subdivide_pa;
 pub mod tangent_surface;
 pub mod threemf;
 pub mod tool;
@@ -479,6 +480,26 @@ pub struct SlicerConfig {
     /// and adaptive retraction. When present, enables dynamic fluid state modeling.
     #[serde(default)]
     pub fluid_dynamics: Option<fluid_dynamics::FluidDynamicsConfig>,
+    /// Klipper minimum cruise ratio (fraction 0.0..=1.0 of move distance dedicated to cruising).
+    /// Defaults to 0.5 when None (matching modern Klipper defaults).
+    #[serde(default)]
+    pub minimum_cruise_ratio: Option<f64>,
+    /// Whether to model non-Newtonian fluid pressure advance directly in the slicer via error-bounded
+    /// adaptive subdivision of acceleration/deceleration zones.
+    #[serde(default)]
+    pub enable_slicer_pressure_advance: bool,
+    /// Extrusion length error tolerance (mm of filament) for slicer-side pressure advance subdivision.
+    /// Defaults to 0.005 mm.
+    #[serde(default)]
+    pub slicer_pa_tolerance_mm: Option<f64>,
+    /// Minimum printable segment length (mm) for slicer-side pressure advance subdivision.
+    /// Defaults to 0.35 mm.
+    #[serde(default)]
+    pub slicer_pa_min_segment_length: Option<f64>,
+    /// Maximum segment frequency (Hz) for slicer-side pressure advance subdivision.
+    /// Defaults to 400.0 Hz to prevent Klipper serial buffer starvation.
+    #[serde(default)]
+    pub slicer_pa_max_frequency_hz: Option<f64>,
 }
 
 /// Static serde-deserialize fallback for [`SlicerConfig::wall_offset`]: `0.20` mm.
@@ -649,6 +670,11 @@ impl Default for SlicerConfig {
             bed_temperature: None,
             chamber_temperature: None,
             fluid_dynamics: None,
+            minimum_cruise_ratio: None,
+            enable_slicer_pressure_advance: false,
+            slicer_pa_tolerance_mm: None,
+            slicer_pa_min_segment_length: None,
+            slicer_pa_max_frequency_hz: None,
             wall_order: None,
         }
     }
@@ -1078,6 +1104,30 @@ impl SlicerConfig {
         self.fluid_dynamics.is_some()
     }
 
+    /// Returns Klipper minimum cruise ratio (0.0..=1.0), defaulting to 0.5.
+    #[must_use]
+    pub fn minimum_cruise_ratio(&self) -> f64 {
+        self.minimum_cruise_ratio.unwrap_or(0.5).clamp(0.0, 1.0)
+    }
+
+    /// Extruder displacement error tolerance for slicer-side pressure advance subdivision (mm), defaulting to 0.005 mm.
+    #[must_use]
+    pub fn slicer_pa_tolerance_mm(&self) -> f64 {
+        self.slicer_pa_tolerance_mm.unwrap_or(0.005).max(1e-5)
+    }
+
+    /// Minimum segment length for slicer-side pressure advance subdivision (mm), defaulting to 0.35 mm.
+    #[must_use]
+    pub fn slicer_pa_min_segment_length(&self) -> f64 {
+        self.slicer_pa_min_segment_length.unwrap_or(0.35).max(0.05)
+    }
+
+    /// Maximum segment frequency for slicer-side pressure advance subdivision (Hz), defaulting to 400.0 Hz.
+    #[must_use]
+    pub fn slicer_pa_max_frequency_hz(&self) -> f64 {
+        self.slicer_pa_max_frequency_hz.unwrap_or(400.0).max(10.0)
+    }
+
     /// Returns the resolved fluid dynamics engine, if configured.
     ///
     /// `live_nozzle_temp_c` overrides the heater block temperature with the
@@ -1182,7 +1232,7 @@ pub fn plan_toolpaths_with_progress(
         &workspace.machine.slope_profile(),
         &mut |fraction: f64| on_progress(fraction * 0.5),
     )?;
-    let paths = toolpath::plan_with_progress(
+    let mut paths = toolpath::plan_with_progress(
         &layers,
         &workspace.objects,
         &workspace.machine.tools,
@@ -1192,6 +1242,41 @@ pub fn plan_toolpaths_with_progress(
         &mut |fraction: f64| on_progress(0.5 + fraction * 0.5),
     )?;
 
+    if workspace.config.enable_slicer_pressure_advance {
+        let motion_model = workspace
+            .config
+            .resolved_motion_model(Some(&workspace.machine));
+        paths = paths
+            .into_iter()
+            .map(|path| {
+                let is_first_layer = path.segments.first().is_some_and(|s| {
+                    (s.order - workspace.config.first_layer_height()).abs() < 1e-4
+                        || s.order <= workspace.config.first_layer_height()
+                });
+                let profiles = kinematics::plan_path_velocities(
+                    &path.points,
+                    &path.segments,
+                    motion_model.as_ref(),
+                    is_first_layer,
+                    workspace.config.square_corner_velocity(),
+                    workspace.config.minimum_cruise_ratio(),
+                );
+                let tool_temp = workspace
+                    .machine
+                    .tools
+                    .iter()
+                    .find(|t| t.id == path.tool)
+                    .map(tool::Tool::nozzle_temperature);
+                let fluid_engine = workspace.config.fluid_dynamics_engine(tool_temp);
+                subdivide_pa::subdivide_path_for_pressure_advance(
+                    path,
+                    &profiles,
+                    &workspace.config,
+                    fluid_engine.as_ref(),
+                )
+            })
+            .collect();
+    }
     toolpath::validate_within_bounds(&paths, &workspace.machine.build_volume)?;
 
     Ok(paths)

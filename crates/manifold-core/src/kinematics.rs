@@ -610,12 +610,44 @@ pub fn klipper_corner_velocity(
 /// Kinematic motion profile for a single move segment.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlannedMotionProfile {
-    pub entry_speed: f64,  // mm/min
-    pub cruise_speed: f64, // mm/min
-    pub exit_speed: f64,   // mm/min
+    pub entry_speed: f64,     // mm/min
+    pub cruise_speed: f64,    // mm/min
+    pub exit_speed: f64,      // mm/min
+    pub accel_distance: f64,  // mm
+    pub cruise_distance: f64, // mm
+    pub decel_distance: f64,  // mm
     pub duration_seconds: f64,
 }
 
+impl PlannedMotionProfile {
+    /// Evaluates the instantaneous speed (mm/s) at distance `s` (mm) from move start along total distance `total_d`.
+    #[must_use]
+    pub fn speed_at_distance(&self, s: f64, total_d: f64) -> f64 {
+        let s = s.clamp(0.0, total_d.max(0.0));
+        let v_entry = self.entry_speed / 60.0;
+        let v_cruise = self.cruise_speed / 60.0;
+        let v_exit = self.exit_speed / 60.0;
+
+        if s <= self.accel_distance && self.accel_distance > 1e-6 {
+            let t = (s / self.accel_distance).clamp(0.0, 1.0);
+            (v_entry * v_entry + t * (v_cruise * v_cruise - v_entry * v_entry))
+                .max(0.0)
+                .sqrt()
+        } else if s <= self.accel_distance + self.cruise_distance {
+            v_cruise
+        } else {
+            let decel_s = s - (self.accel_distance + self.cruise_distance);
+            if self.decel_distance > 1e-6 {
+                let t = (decel_s / self.decel_distance).clamp(0.0, 1.0);
+                (v_cruise * v_cruise + t * (v_exit * v_exit - v_cruise * v_cruise))
+                    .max(0.0)
+                    .sqrt()
+            } else {
+                v_exit
+            }
+        }
+    }
+}
 /// Plans time-optimal velocity profiles along a polyline path using forward and backward
 /// acceleration passes constrained by Klipper SCV and stepper torque limits.
 #[must_use]
@@ -625,6 +657,7 @@ pub fn plan_path_velocities(
     model: &dyn MotionModel,
     is_first_layer: bool,
     square_corner_velocity_mm_s: f64,
+    minimum_cruise_ratio: f64,
 ) -> Vec<PlannedMotionProfile> {
     let n = segments.len();
     if n == 0 || points.len() < 2 {
@@ -706,22 +739,64 @@ pub fn plan_path_velocities(
 
     // 4. Construct motion profiles
     let mut profiles = Vec::with_capacity(n);
+    let cruise_ratio = minimum_cruise_ratio.clamp(0.0, 0.999);
     for i in 0..n {
         let v_entry = entry_speeds[i];
         let v_exit = exit_speeds[i];
-        let v_cruise = nominal_speeds[i].min(v_entry.max(v_exit));
+        let d = distances[i];
+        let dir = directions[i];
+        let accel = model
+            .available_directional_acceleration(segments[i].kind, is_first_layer, v_entry, dir)
+            .max(10.0);
+
+        let v_cruise = if d > 1e-6 {
+            let max_ramp_dist = (1.0 - cruise_ratio) * d;
+            let v_cruise_sq =
+                (2.0 * accel * max_ramp_dist + v_entry * v_entry + v_exit * v_exit) * 0.5;
+            let v_cruise_limit = v_cruise_sq.max(0.0).sqrt();
+            nominal_speeds[i]
+                .min(v_cruise_limit)
+                .max(v_entry)
+                .max(v_exit)
+        } else {
+            nominal_speeds[i].min(v_entry.max(v_exit))
+        };
+
+        let mut d_accel = if accel > 1e-6 && v_cruise > v_entry {
+            ((v_cruise * v_cruise - v_entry * v_entry) / (2.0 * accel)).max(0.0)
+        } else {
+            0.0
+        };
+
+        let mut d_decel = if accel > 1e-6 && v_cruise > v_exit {
+            ((v_cruise * v_cruise - v_exit * v_exit) / (2.0 * accel)).max(0.0)
+        } else {
+            0.0
+        };
+
+        if d_accel + d_decel > d && d > 1e-6 {
+            let scale = d / (d_accel + d_decel);
+            d_accel *= scale;
+            d_decel *= scale;
+        }
+
+        let d_cruise = (d - d_accel - d_decel).max(0.0);
+
         let duration = model.directional_move_duration(
             segments[i].kind,
             is_first_layer,
-            distances[i],
+            d,
             v_entry,
             v_exit,
-            directions[i],
+            dir,
         );
         profiles.push(PlannedMotionProfile {
             entry_speed: v_entry * 60.0,
             cruise_speed: v_cruise * 60.0,
             exit_speed: v_exit * 60.0,
+            accel_distance: d_accel,
+            cruise_distance: d_cruise,
+            decel_distance: d_decel,
             duration_seconds: duration,
         });
     }
@@ -1446,7 +1521,7 @@ mod tests {
             },
         ];
         let model = StandardMotionModel::default();
-        let profiles = plan_path_velocities(&points, &segments, &model, false, 5.0);
+        let profiles = plan_path_velocities(&points, &segments, &model, false, 5.0, 0.5);
 
         assert_eq!(profiles.len(), 3);
         // First segment starts from entry 0.0
@@ -1454,7 +1529,41 @@ mod tests {
         // Exit speed at 90° corner is bounded by Klipper SCV (5 mm/s = 300 mm/min)
         assert!((profiles[0].exit_speed - 300.0).abs() < 10.0);
         // Last segment finishes at exit 0.0
+        // Last segment finishes at exit 0.0
         assert_eq!(profiles[2].exit_speed, 0.0);
+    }
+
+    #[test]
+    fn minimum_cruise_ratio_caps_peak_velocity_and_reserves_cruise_distance() {
+        use crate::toolpath::Segment;
+
+        let points = vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.6, 0.0, 0.0)];
+        let segments = vec![Segment {
+            kind: MoveKind::WallOuter,
+            speed: 60000.0, // very high requested speed (1000 mm/s)
+            ..Segment::default()
+        }];
+        let model = StandardMotionModel::default();
+
+        // With minimum_cruise_ratio = 0.5, at least 50% of the 0.6mm move (0.3mm) must be cruise
+        let profiles = plan_path_velocities(&points, &segments, &model, false, 5.0, 0.5);
+        assert_eq!(profiles.len(), 1);
+        let p = profiles[0];
+        assert!(
+            p.cruise_distance >= 0.29,
+            "expected cruise >= 0.3, got {}",
+            p.cruise_distance
+        );
+        assert!(p.accel_distance + p.decel_distance <= 0.31);
+
+        // With minimum_cruise_ratio = 0.0, the move can use the entire 0.6mm for ramp
+        let profiles_zero = plan_path_velocities(&points, &segments, &model, false, 5.0, 0.0);
+        assert_eq!(profiles_zero.len(), 1);
+        let p_zero = profiles_zero[0];
+        assert!(p_zero.cruise_speed > p.cruise_speed);
+        assert!(
+            p_zero.accel_distance + p_zero.decel_distance > p.accel_distance + p.decel_distance
+        );
     }
 
     #[test]

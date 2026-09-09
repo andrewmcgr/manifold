@@ -292,12 +292,16 @@ fn plan_path_motion_profiles(
             || s.order <= config.first_layer_height()
     });
     let scv = config.square_corner_velocity.unwrap_or(5.0);
+    let cruise_ratio = machine
+        .and_then(|m| m.minimum_cruise_ratio)
+        .unwrap_or_else(|| config.minimum_cruise_ratio());
     manifold_core::kinematics::plan_path_velocities(
         &path.points,
         &path.segments,
         &*motion_model,
         is_first_layer,
         scv,
+        cruise_ratio,
     )
 }
 

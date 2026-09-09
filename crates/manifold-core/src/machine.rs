@@ -68,9 +68,21 @@ pub struct Machine {
     /// Hard upper bound on velocity (mm/s). Defaults to 75% of max_available_speed (750 mm/s).
     #[serde(default)]
     pub speed_limit: Option<f64>,
+    /// Klipper minimum cruise ratio (fraction 0.0..=1.0 of move distance dedicated to cruising).
+    /// Defaults to 0.5 when None (matching modern Klipper defaults).
+    #[serde(default)]
+    pub minimum_cruise_ratio: Option<f64>,
     /// Per-axis kinematic overrides and dedicated stepper dynamics models.
     #[serde(default)]
     pub axis_limits: HashMap<Axis, AxisLimits>,
+}
+
+impl Machine {
+    /// Returns the configured Klipper minimum cruise ratio (defaulting to 0.5 when not set).
+    #[must_use]
+    pub fn minimum_cruise_ratio(&self) -> f64 {
+        self.minimum_cruise_ratio.unwrap_or(0.5).clamp(0.0, 1.0)
+    }
 }
 
 impl Default for Machine {
@@ -99,6 +111,7 @@ impl Machine {
             max_available_speed: None,
             acceleration_limit: None,
             speed_limit: None,
+            minimum_cruise_ratio: None,
             axis_limits: HashMap::new(),
         }
     }
