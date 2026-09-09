@@ -758,6 +758,7 @@ fn travel_chord_is_blocked(
     mesh_sdf: &MeshSdf,
     order_field: Option<&dyn OrderField>,
     current_order: f64,
+    max_layer_z: f64,
     a: DVec3,
     b: DVec3,
     clearance: f64,
@@ -766,12 +767,21 @@ fn travel_chord_is_blocked(
     if distance <= f64::EPSILON {
         return false;
     }
+    // If both endpoints and the chord stay strictly above the physical printed ceiling,
+    // it is impossible for the chord to collide with any printed material.
+    let z_ceiling = max_layer_z.max(a.z).max(b.z);
+    if a.z > z_ceiling + 1e-4 && b.z > z_ceiling + 1e-4 {
+        return false;
+    }
     let step = (clearance * 0.5).max(0.1);
     let samples = ((distance / step).ceil() as usize).clamp(4, 64);
     let order_epsilon = 1e-4;
     (0..=samples).any(|s| {
         let t = s as f64 / samples as f64;
         let p = a.lerp(b, t);
+        if p.z > z_ceiling + order_epsilon {
+            return false;
+        }
         let dist_from_start = t * distance;
         let dist_from_end = (1.0 - t) * distance;
         let required_clearance = clearance.min(dist_from_start).min(dist_from_end);
@@ -779,7 +789,7 @@ fn travel_chord_is_blocked(
         if sample.value < required_clearance - 1e-4 {
             if let Some(field) = order_field {
                 let p_order = field.order(p);
-                if p_order.is_finite() && p_order > current_order + order_epsilon {
+                if !p_order.is_finite() || p_order > current_order + order_epsilon {
                     return false;
                 }
             }
@@ -881,6 +891,7 @@ fn shortcut_waypoints(
     mesh_sdf: &MeshSdf,
     order_field: Option<&dyn OrderField>,
     current_order: f64,
+    max_layer_z: f64,
     clearance: f64,
 ) -> Vec<DVec3> {
     if waypoints.len() <= 2 {
@@ -895,6 +906,7 @@ fn shortcut_waypoints(
                 mesh_sdf,
                 order_field,
                 current_order,
+                max_layer_z,
                 waypoints[cur],
                 waypoints[next],
                 clearance,
@@ -912,16 +924,19 @@ fn shortcut_waypoints(
 /// Tier 1 Router: Searches a 2D planar horizontal grid at fixed Z elevation
 /// through open physical air around already-printed solid geometry with exactly
 /// 0 mm vertical excursion.
+#[allow(clippy::too_many_arguments)]
 fn route_planar_xy_detour(
     mesh_sdf: &MeshSdf,
     order_field: Option<&dyn OrderField>,
     current_order: f64,
+    max_layer_z: f64,
     start: DVec3,
     end: DVec3,
     clearance: f64,
     min_travel_z: f64,
 ) -> Option<Vec<DVec3>> {
     let z_travel = start.z.max(end.z).max(min_travel_z);
+    let z_ceiling = max_layer_z.max(start.z).max(end.z);
     let chord_dist = start.distance(end);
     let margin = (chord_dist * 0.75).max(clearance * 6.0).max(10.0);
 
@@ -1048,11 +1063,12 @@ fn route_planar_xy_detour(
                 let status = clearance_memo[neighbor_flat];
                 if status == 0 {
                     let sample = mesh_sdf.sample(neighbor_point);
-                    let clear = if sample.value >= clearance {
+                    let clear = if sample.value >= clearance || neighbor_point.z > z_ceiling + 1e-4
+                    {
                         true
                     } else if let Some(field) = order_field {
                         let p_order = field.order(neighbor_point);
-                        p_order.is_finite() && p_order > current_order + 1e-4
+                        !p_order.is_finite() || p_order > current_order + 1e-4
                     } else {
                         false
                     };
@@ -1122,6 +1138,7 @@ fn route_planar_xy_detour(
         mesh_sdf,
         order_field,
         current_order,
+        max_layer_z,
         clearance,
     );
 
@@ -1138,10 +1155,12 @@ fn route_planar_xy_detour(
 /// is impossible or excessive, raymarches along the direct chord to find the peak
 /// printed obstacle height, performing exactly one vertical lift, one horizontal transit,
 /// and one descent.
+#[allow(clippy::too_many_arguments)]
 fn route_single_flyover(
     mesh_sdf: &MeshSdf,
     order_field: Option<&dyn OrderField>,
     current_order: f64,
+    max_layer_z: f64,
     start: DVec3,
     end: DVec3,
     clearance: f64,
@@ -1152,6 +1171,8 @@ fn route_single_flyover(
         return None;
     }
 
+    // Physical ceiling: nothing printed so far can exceed max_layer_z (or start/end Z).
+    let z_ceiling = max_layer_z.max(start.z).max(end.z);
     let step = (clearance * 0.5).max(0.2);
     let sample_count = ((distance / step).ceil() as usize).clamp(8, 64);
     let mut max_solid_z = f64::NEG_INFINITY;
@@ -1163,22 +1184,35 @@ fn route_single_flyover(
         if sample.value < clearance {
             let is_solid = if let Some(field) = order_field {
                 let p_order = field.order(p);
-                !p_order.is_finite() || p_order <= current_order + 1e-4
+                p_order.is_finite() && p_order <= current_order + 1e-4
             } else {
-                true
+                p.z <= z_ceiling + 1e-4
             };
             if is_solid {
                 max_solid_z = max_solid_z.max(p.z);
-                // Raymarch upwards along +Z from this solid sample to locate the obstacle ceiling
-                let z_limit = p.z + 50.0;
+                // Raymarch upwards along +Z from this solid sample to locate the obstacle ceiling.
+                // Stop as soon as we exit CAD mesh (sample.value >= clearance),
+                // enter unprinted future geometry (order > current_order),
+                // or reach the physical printed ceiling (z_ceiling).
+                let z_limit = (p.z + 5.0).min(z_ceiling);
                 while p.z < z_limit {
                     let s_up = mesh_sdf.sample(p);
                     if s_up.value >= clearance {
                         max_solid_z = max_solid_z.max(p.z);
                         break;
                     }
-                    let advance = (-s_up.value).clamp(0.2, 2.0);
+                    if let Some(field) = order_field {
+                        let p_ord = field.order(p);
+                        if !p_ord.is_finite() || p_ord > current_order + 1e-4 {
+                            max_solid_z = max_solid_z.max(p.z);
+                            break;
+                        }
+                    }
+                    let advance = (-s_up.value).clamp(0.2, 1.0);
                     p.z += advance;
+                }
+                if p.z >= z_limit {
+                    max_solid_z = max_solid_z.max(z_limit);
                 }
             }
         }
@@ -1186,11 +1220,15 @@ fn route_single_flyover(
 
     let fly_z = if max_solid_z.is_finite() {
         (max_solid_z + clearance)
+            .min(z_ceiling + clearance)
             .max(start.z)
             .max(end.z)
             .max(min_travel_z)
     } else {
-        start.z.max(end.z).max(min_travel_z)
+        (z_ceiling + clearance)
+            .max(start.z)
+            .max(end.z)
+            .max(min_travel_z)
     };
 
     let p_lift = DVec3::new(start.x, start.y, fly_z);
@@ -1200,6 +1238,7 @@ fn route_single_flyover(
         mesh_sdf,
         order_field,
         current_order,
+        max_layer_z,
         p_lift,
         p_drop,
         clearance,
@@ -1207,12 +1246,16 @@ fn route_single_flyover(
         let mut elevated_z = fly_z;
         for _ in 0..10 {
             elevated_z += clearance;
+            if elevated_z > z_ceiling + 2.0 * clearance {
+                break;
+            }
             let el_lift = DVec3::new(start.x, start.y, elevated_z);
             let el_drop = DVec3::new(end.x, end.y, elevated_z);
             if !travel_chord_is_blocked(
                 mesh_sdf,
                 order_field,
                 current_order,
+                max_layer_z,
                 el_lift,
                 el_drop,
                 clearance,
@@ -1247,6 +1290,7 @@ fn route_around_obstruction(
     mesh_sdf: &MeshSdf,
     order_field: Option<&dyn OrderField>,
     current_order: f64,
+    max_layer_z: f64,
     _slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     start: DVec3,
     end: DVec3,
@@ -1282,6 +1326,7 @@ fn route_around_obstruction(
         mesh_sdf,
         order_field,
         current_order,
+        max_layer_z,
         start_clear,
         end_clear,
         clearance,
@@ -1304,6 +1349,7 @@ fn route_around_obstruction(
         mesh_sdf,
         order_field,
         current_order,
+        max_layer_z,
         start_clear,
         end_clear,
         clearance,
@@ -1326,6 +1372,7 @@ fn route_around_obstruction(
         mesh_sdf,
         order_field,
         current_order,
+        max_layer_z,
         start_clear,
         end_clear,
         clearance,
@@ -1370,6 +1417,7 @@ fn route_travel_moves(
     paths: Vec<Path>,
     layer_mesh_sdf: Option<&MeshSdf>,
     order_field: Option<&dyn OrderField>,
+    max_layer_z: Option<f64>,
     slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     config: &SlicerConfig,
     z_penalty: f64,
@@ -1454,7 +1502,16 @@ fn route_travel_moves(
                  a_dir,
                  b_dir,
              }| {
-                if !travel_chord_is_blocked(mesh_sdf, order_field, order, a, b, clearance) {
+                let chord_max_z = max_layer_z.unwrap_or_else(|| a.z.max(b.z));
+                if !travel_chord_is_blocked(
+                    mesh_sdf,
+                    order_field,
+                    order,
+                    chord_max_z,
+                    a,
+                    b,
+                    clearance,
+                ) {
                     return None;
                 }
                 let min_travel_z = a.z.min(b.z).max(min_bed_clearance);
@@ -1462,6 +1519,7 @@ fn route_travel_moves(
                     mesh_sdf,
                     order_field,
                     order,
+                    chord_max_z,
                     slope_profile,
                     a,
                     b,
@@ -2613,11 +2671,23 @@ pub fn plan_with_progress(
                     }
                 }
             }
+            let layer_max_z = layer
+                .loops
+                .iter()
+                .flat_map(|w| &w.points)
+                .map(|p| p.z)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let effective_layer_max_z = if layer_max_z.is_finite() {
+                Some(layer_max_z)
+            } else {
+                Some(layer.order)
+            };
             let paths = optimize_travel_order(paths, config, z_travel_penalty, wall_path_count);
             let paths = route_travel_moves(
                 paths,
                 layer.mesh_sdf.as_deref(),
                 Some(layer.order_field.as_ref()),
+                effective_layer_max_z,
                 slope_profile,
                 config,
                 z_travel_penalty,
@@ -2903,6 +2973,7 @@ pub fn plan_with_progress(
         all_paths,
         global_mesh_sdf,
         global_order_field,
+        None,
         slope_profile,
         config,
         z_travel_penalty,
@@ -4833,6 +4904,7 @@ mod tests {
             &sdf,
             None,
             0.0,
+            1.0,
             DVec3::new(-1.0, 0.5, 0.5),
             DVec3::new(2.0, 0.5, 0.5),
             clearance,
@@ -4843,6 +4915,7 @@ mod tests {
             &sdf,
             None,
             0.0,
+            1.0,
             DVec3::new(-1.0, 5.0, 5.0),
             DVec3::new(2.0, 5.0, 5.0),
             clearance,
@@ -4862,6 +4935,7 @@ mod tests {
             &sdf,
             Some(&field),
             0.2,
+            0.2,
             DVec3::new(-1.0, 0.5, 0.8),
             DVec3::new(2.0, 0.5, 0.8),
             clearance,
@@ -4872,6 +4946,7 @@ mod tests {
         assert!(travel_chord_is_blocked(
             &sdf,
             Some(&field),
+            0.9,
             0.9,
             DVec3::new(-1.0, 0.5, 0.8),
             DVec3::new(2.0, 0.5, 0.8),
@@ -4898,6 +4973,7 @@ mod tests {
             vec![a, b],
             Some(&sdf),
             None,
+            Some(1.0),
             &slope_profile,
             &config,
             config.z_travel_penalty,
@@ -4919,7 +4995,7 @@ mod tests {
         let clearance = 2.0 * config.wall_line_width;
         for pair in detour.points.windows(2) {
             assert!(!travel_chord_is_blocked(
-                &sdf, None, 0.0, pair[0], pair[1], clearance
+                &sdf, None, 0.0, 1.0, pair[0], pair[1], clearance
             ));
         }
     }
@@ -4947,6 +5023,7 @@ mod tests {
             vec![a, b],
             Some(&sdf),
             None,
+            Some(1.0),
             &slope_profile,
             &config,
             config.z_travel_penalty,
@@ -4992,6 +5069,7 @@ mod tests {
             vec![a, b],
             Some(&sdf),
             None,
+            Some(1.0),
             &slope_profile,
             &config,
             config.z_travel_penalty,
@@ -5040,6 +5118,7 @@ mod tests {
             vec![a.clone(), b.clone()],
             Some(&sdf),
             None,
+            Some(1.0),
             &slope_profile,
             &config_disabled,
             config_disabled.z_travel_penalty,
@@ -5050,6 +5129,7 @@ mod tests {
             vec![a, b],
             Some(&sdf),
             None,
+            Some(1.0),
             &slope_profile,
             &config_zero_height,
             config_zero_height.z_travel_penalty,
@@ -5089,6 +5169,7 @@ mod tests {
             vec![a, b],
             Some(&sdf),
             None,
+            Some(1.0),
             &slope_profile,
             &config,
             config.z_travel_penalty,
@@ -5102,7 +5183,7 @@ mod tests {
         let clearance = 2.0 * config.wall_line_width;
         for pair in detour.points.windows(2) {
             assert!(!travel_chord_is_blocked(
-                &sdf, None, 0.0, pair[0], pair[1], clearance
+                &sdf, None, 0.0, 1.0, pair[0], pair[1], clearance
             ));
         }
     }
@@ -5127,6 +5208,7 @@ mod tests {
             vec![a, b],
             Some(&sdf),
             None,
+            Some(1.0),
             &slope_profile,
             &config,
             config.z_travel_penalty,
@@ -5168,6 +5250,7 @@ mod tests {
             vec![a, b],
             Some(&sdf),
             None,
+            Some(1.0),
             &slope_profile,
             &config,
             config.z_travel_penalty,
@@ -5224,6 +5307,7 @@ mod tests {
             vec![a, b],
             Some(&sdf),
             None,
+            Some(1.0),
             &slope_profile,
             &config,
             config.z_travel_penalty,
@@ -5251,7 +5335,7 @@ mod tests {
         let start = DVec3::new(-0.4, 0.5, 0.5);
         let end = DVec3::new(1.4, 0.5, 0.5);
 
-        let flyover = route_single_flyover(&sdf, None, 0.0, start, end, clearance, min_z);
+        let flyover = route_single_flyover(&sdf, None, 0.0, 1.0, start, end, clearance, min_z);
         assert!(flyover.is_some(), "expected single flyover to succeed");
         let pts = flyover.unwrap();
 
@@ -5263,6 +5347,39 @@ mod tests {
         assert_eq!(pts[1].z, pts[2].z, "flyover plateau must be level");
         assert_eq!(pts[1].x, start.x);
         assert_eq!(pts[2].x, end.x);
+    }
+
+    #[test]
+    fn flyover_does_not_exceed_current_layer_ceiling_on_tall_model() {
+        let sdf = cube_sdf_fixture();
+        let field = HeightOrderField::new(DVec3::Z);
+        let clearance = 0.4;
+        let min_z = 0.05;
+
+        // The cube is 1.0mm tall in total.
+        // But the current layer is only at z = 0.2 (max_layer_z = 0.2, current_order = 0.2).
+        // Material from z = 0.2 to z = 1.0 is in the unprinted future.
+        let start = DVec3::new(-0.4, 0.5, 0.2);
+        let end = DVec3::new(1.4, 0.5, 0.2);
+
+        let flyover =
+            route_single_flyover(&sdf, Some(&field), 0.2, 0.2, start, end, clearance, min_z);
+        assert!(flyover.is_some(), "expected single flyover to succeed");
+        let pts = flyover.unwrap();
+
+        // Must consist of exactly [start, lift, drop, end]
+        assert_eq!(pts.len(), 4);
+        assert_eq!(pts[0], start);
+        assert_eq!(pts[3], end);
+        // The flyover height MUST clear the current layer (0.2 + clearance = 0.6mm),
+        // and MUST NOT jump over the entire 1.0mm tall part (1.0 + clearance = 1.4mm).
+        let expected_fly_z = 0.2 + clearance;
+        assert!(
+            (pts[1].z - expected_fly_z).abs() < 1e-4,
+            "flyover height must match current layer ceiling + clearance ({expected_fly_z}), but was: {}",
+            pts[1].z
+        );
+        assert_eq!(pts[1].z, pts[2].z, "flyover plateau must be level");
     }
 
     #[test]
