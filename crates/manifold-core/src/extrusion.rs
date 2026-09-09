@@ -190,9 +190,76 @@ pub fn adaptive_wall_line_width(
     target.clamp(min_width, max_width)
 }
 
+/// Evaluates the local layer thickness and surface unit normal at point `p`
+/// from the order field.
+///
+/// Returns `(local_thickness_mm, surface_normal)`:
+/// - `local_thickness_mm`: physical distance along the normal between adjacent layers.
+///   Near folds or convergence regions where $\|\nabla \phi\| > 1.0$, the layers are compressed,
+///   so $h_{\text{local}} = h_{\text{nominal}} / \|\nabla \phi\| < h_{\text{nominal}}$.
+///   Bounded within $[0.1 \times h_{\text{nominal}}, 1.5 \times h_{\text{nominal}}]$.
+/// - `surface_normal`: outward/upward unit normal of the layer isosurface.
+#[must_use]
+pub fn local_layer_geometry(
+    field: &dyn manifold_fidget::order::OrderField,
+    p: DVec3,
+    nominal_layer_height: f64,
+) -> (f64, DVec3) {
+    let h_nom = nominal_layer_height.abs().max(1e-4);
+    if let Some(grad) = crate::order_field::numeric_gradient(field, p) {
+        let grad_len = grad.length();
+        if grad_len > 1e-4 && grad_len.is_finite() {
+            let normal = grad / grad_len;
+            let h_local = (h_nom / grad_len).clamp(0.1 * h_nom, 1.5 * h_nom);
+            return (h_local, normal);
+        }
+    }
+    (h_nom, DVec3::Z)
+}
+
+/// Evaluates the surface inclination flow modulation factor for a flat horizontal nozzle tip.
+///
+/// When a flat nozzle tip moves over a surface with unit normal $\mathbf{n}_{\text{surface}}$,
+/// the horizontal projected capacity scales as $|\mathbf{n}_{\text{surface}} \cdot \mathbf{e}_z| = \cos\theta$.
+/// As the surface inclines from horizontal ($\theta = 0^\circ$) toward steep slopes ($\theta \to 90^\circ$),
+/// the cross-sectional capacity under the flat nozzle land contracts by $\cos\theta$.
+///
+/// Clamped to $[0.15, 1.0]$ to prevent complete flow starvation on near-vertical walls.
+#[must_use]
+pub fn surface_inclination_flow_factor(normal: DVec3) -> f64 {
+    normal.dot(DVec3::Z).abs().clamp(0.15, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_layer_geometry_flat_field_returns_nominal_height_and_z_normal() {
+        let field = manifold_fidget::order::HeightOrderField::new(DVec3::Z);
+        let p = DVec3::new(10.0, 20.0, 5.0);
+        let (h_local, normal) = local_layer_geometry(&field, p, 0.2);
+
+        assert!((h_local - 0.2).abs() < 1e-4);
+        assert!((normal.x).abs() < 1e-4);
+        assert!((normal.y).abs() < 1e-4);
+        assert!((normal.z - 1.0).abs() < 1e-4);
+        assert!((surface_inclination_flow_factor(normal) - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn surface_inclination_flow_factor_scales_with_cosine_of_tilt_angle() {
+        // 45 degree tilted normal
+        let n_45 = DVec3::new(1.0, 0.0, 1.0).normalize();
+        let factor_45 = surface_inclination_flow_factor(n_45);
+        let expected = 1.0 / 2.0f64.sqrt();
+        assert!((factor_45 - expected).abs() < 1e-4);
+
+        // Vertical wall normal: clamped to minimum 0.15
+        let n_wall = DVec3::new(1.0, 0.0, 0.0);
+        let factor_wall = surface_inclination_flow_factor(n_wall);
+        assert!((factor_wall - 0.15).abs() < 1e-4);
+    }
 
     #[test]
     fn bead_cross_section_area_matches_stadium_formula_for_a_wide_bead() {

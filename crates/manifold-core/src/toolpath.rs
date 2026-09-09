@@ -619,6 +619,95 @@ fn compensate_wall_loop_points(
         .collect()
 }
 
+/// Subdivides long traverse moves (infill, solid skin, bridge) that cross regions
+/// of varying surface inclination or order gradient compression.
+///
+/// Ensures that long chords crossing over arched structures or folds sample the local
+/// layer gap and surface normal rather than evaluating extrusion from distant endpoints alone.
+fn subdivide_long_traverses(
+    paths: Vec<Path>,
+    field: &dyn manifold_fidget::order::OrderField,
+    nominal_layer_height: f64,
+) -> Vec<Path> {
+    const MAX_SEG_LEN: f64 = 2.5; // mm
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let needs_check = path.segments.iter().any(|s| {
+                matches!(
+                    s.kind,
+                    MoveKind::Infill | MoveKind::TopSurface | MoveKind::Bridge
+                )
+            });
+            if !needs_check {
+                return path;
+            }
+
+            let point_count = path.points.len();
+            if point_count < 2 {
+                return path;
+            }
+
+            let mut new_points = Vec::with_capacity(point_count * 2);
+            let mut new_segments = Vec::with_capacity(path.segments.len() * 2);
+            let is_open = path.segments.len() + 1 == point_count;
+
+            for (i, segment) in path.segments.into_iter().enumerate() {
+                let start = path.points[i];
+                let end = if is_open {
+                    path.points[i + 1]
+                } else {
+                    path.points[(i + 1) % point_count]
+                };
+
+                let dist = (end - start).length();
+                let is_infill_like = matches!(
+                    segment.kind,
+                    MoveKind::Infill | MoveKind::TopSurface | MoveKind::Bridge
+                );
+
+                if is_infill_like && dist > MAX_SEG_LEN {
+                    let (h_s, n_s) =
+                        crate::extrusion::local_layer_geometry(field, start, nominal_layer_height);
+                    let (h_e, n_e) =
+                        crate::extrusion::local_layer_geometry(field, end, nominal_layer_height);
+
+                    let h_diff = (h_s - h_e).abs();
+                    let n_diff = (n_s.dot(DVec3::Z).abs() - n_e.dot(DVec3::Z).abs()).abs();
+
+                    if h_diff > 0.02 || n_diff > 0.05 || dist > 6.0 {
+                        let num_subsegs = ((dist / MAX_SEG_LEN).ceil() as usize).clamp(2, 16);
+                        new_points.push(start);
+                        for step in 1..num_subsegs {
+                            let t = step as f64 / num_subsegs as f64;
+                            new_points.push(start.lerp(end, t));
+                            new_segments.push(segment);
+                        }
+                        new_segments.push(segment);
+                        continue;
+                    }
+                }
+
+                new_points.push(start);
+                new_segments.push(segment);
+            }
+
+            if is_open {
+                if let Some(&last) = path.points.last() {
+                    new_points.push(last);
+                }
+            }
+
+            Path {
+                points: new_points,
+                segments: new_segments,
+                tool: path.tool,
+            }
+        })
+        .collect()
+}
+
 /// Greedily reorders `paths` to reduce travel-move distance between them,
 /// controlled by `config.travel_order_optimization_enabled` (no-op,
 /// `paths` unchanged, when `false`).
@@ -2692,7 +2781,9 @@ pub fn plan_with_progress(
                 config,
                 z_travel_penalty,
             );
-            let mut paths = insert_z_hops(paths, config);
+            let paths = insert_z_hops(paths, config);
+            let mut paths =
+                subdivide_long_traverses(paths, layer.order_field.as_ref(), config.layer_height);
 
             let extrusion_multiplier = tools
                 .iter()
@@ -2724,17 +2815,45 @@ pub fn plan_with_progress(
                     let nozzle_parallel_comp = unit_dir.dot(crate::slicing::NOZZLE_DIRECTION);
                     let climb_slope = unit_dir.dot(crate::slicing::BUILD_DIRECTION);
 
-                    // Trajectory slope cosine compensation:
-                    // A nozzle oriented along NOZZLE_DIRECTION sweeps a volume proportional to its
-                    // orthogonal cross-section (distance * cos(beta)).
-                    // On sloped moves, 3D arc length L_3D is inflated by 1 / cos(beta) = sec(beta),
-                    // which causes severe overextrusion if uncompensated.
-                    // Multiplying by cos(beta) = sqrt(1 - (dir . NOZZLE_DIRECTION)^2) preserves exact
-                    // volumetric consistency across all slope angles.
-                    let slope_cosine = (1.0 - nozzle_parallel_comp * nozzle_parallel_comp)
+                    let mid_point = (start + end) * 0.5;
+                    let (support_fraction, bed_fraction) = support_fractions_at(
+                        mid_point,
+                        segment.order,
+                        layer.order_field.as_ref(),
+                        layer.mesh_sdf.as_deref(),
+                        bed_z,
+                        config,
+                    );
+                    segment.support_fraction = support_fraction.max(bed_fraction);
+                    let is_first_layer =
+                        bed_fraction > 0.0 || (layer.order - order_min).abs() < 1e-6;
+
+                    // Physical surface-geometry and layer-gap compensation:
+                    // 1. Local layer height: adapts to order field gradient compression ||grad phi||
+                    //    near folds, summits, and converging wavefronts (h_local = h_nom / ||grad phi||).
+                    // 2. Surface inclination: a flat horizontal nozzle tip over a sloped surface
+                    //    at angle theta sweeps an effective normal gap contracted by cos(theta).
+                    // 3. Trajectory climb: a move climbing vertically sweeps an orthogonal cross-section
+                    //    scaled by sqrt(1 - (dir . NOZZLE_DIRECTION)^2).
+                    let (local_layer_height, surface_normal) = if is_first_layer {
+                        (config.first_layer_height(), DVec3::Z)
+                    } else {
+                        crate::extrusion::local_layer_geometry(
+                            layer.order_field.as_ref(),
+                            mid_point,
+                            config.layer_height,
+                        )
+                    };
+
+                    let surface_cos = if is_first_layer {
+                        1.0
+                    } else {
+                        crate::extrusion::surface_inclination_flow_factor(surface_normal)
+                    };
+                    let trajectory_cos = (1.0 - nozzle_parallel_comp * nozzle_parallel_comp)
                         .max(0.0)
-                        .sqrt()
-                        .clamp(0.05, 1.0);
+                        .sqrt();
+                    let slope_cosine = surface_cos.min(trajectory_cos).clamp(0.15, 1.0);
                     let effective_distance = distance * slope_cosine;
 
                     let line_width = if segment.line_width > 1e-4 {
@@ -2742,31 +2861,12 @@ pub fn plan_with_progress(
                     } else {
                         extrusion::line_width_for_kind(segment.kind, config)
                     };
-                    let (support_fraction, bed_fraction) = support_fractions_at(
-                        (start + end) * 0.5,
-                        segment.order,
-                        layer.order_field.as_ref(),
-                        layer.mesh_sdf.as_deref(),
-                        bed_z,
-                        config,
-                    );
-                    // Stored for downstream consumers (flow visualization,
-                    // future speed planning): the effective "how supported is
-                    // this bead" figure actually used for its flow, with bed
-                    // contact counting as full support.
-                    segment.support_fraction = support_fraction.max(bed_fraction);
-                    let is_first_layer =
-                        bed_fraction > 0.0 || (layer.order - order_min).abs() < 1e-6;
                     let effective_line_width = if is_first_layer {
                         config.first_layer_line_width()
                     } else {
                         line_width
                     };
-                    let effective_layer_height = if is_first_layer {
-                        config.first_layer_height()
-                    } else {
-                        config.layer_height
-                    };
+                    let effective_layer_height = local_layer_height;
                     let first_layer_mult = if is_first_layer {
                         config.first_layer_extrusion_multiplier()
                     } else {
@@ -5582,6 +5682,145 @@ mod tests {
             (actual_e - expected_climbing_e).abs() < 1e-4,
             "Actual extrusion length ({actual_e}) should match horizontal projection ({expected_climbing_e})"
         );
+    }
+
+    #[test]
+    fn plan_applies_surface_inclination_flow_reduction_to_horizontal_moves_on_slopes() {
+        let obj_id = ObjectId(1);
+        let object = Object::new(obj_id, Mesh::default(), ToolId(0));
+        // A conical order field creates an order surface sloped at 45 degrees (slope = 1.0)
+        let field: Arc<dyn manifold_fidget::order::OrderField> = Arc::new(
+            manifold_fidget::order::ConicalOrderField::new(DVec3::ZERO, BUILD_DIRECTION, 1.0),
+        );
+
+        // Horizontal perimeter contour loop at radius R = 10, Z = 10
+        let p0 = DVec3::new(10.0, 0.0, 10.0);
+        let p1 = DVec3::new(0.0, 10.0, 10.0);
+        let p2 = DVec3::new(-10.0, 0.0, 10.0);
+        let p3 = DVec3::new(0.0, -10.0, 10.0);
+
+        let layer0 = Layer {
+            object: obj_id,
+            index: 0,
+            order: 0.2,
+            loops: vec![WallLoop {
+                island: 0,
+                is_open: false,
+                points: vec![
+                    DVec3::new(0.0, 0.0, 0.2),
+                    DVec3::new(10.0, 0.0, 0.2),
+                    DVec3::new(10.0, 10.0, 0.2),
+                    DVec3::new(0.0, 10.0, 0.2),
+                ],
+                wall_index: 0,
+                top_surface: vec![false; 4],
+                line_widths: vec![0.4; 4],
+                arc_fraction: vec![0.0; 4],
+                unsupported: vec![false; 4],
+                channel_width: vec![],
+            }],
+            infill_boundary: vec![],
+            solid_fill_boundary: vec![],
+            order_field: Arc::clone(&field),
+            mesh_sdf: None,
+        };
+
+        let layer = Layer {
+            object: obj_id,
+            index: 5,
+            order: 5.0,
+            loops: vec![WallLoop {
+                island: 0,
+                is_open: false,
+                points: vec![p0, p1, p2, p3],
+                wall_index: 0,
+                top_surface: vec![false; 4],
+                line_widths: vec![0.4; 4],
+                arc_fraction: vec![0.0; 4],
+                unsupported: vec![false; 4],
+                channel_width: vec![],
+            }],
+            infill_boundary: vec![],
+            solid_fill_boundary: vec![],
+            order_field: Arc::clone(&field),
+            mesh_sdf: None,
+        };
+
+        let config = SlicerConfig {
+            scarf_joint_enabled: false,
+            path_simplify_enabled: false,
+            travel_order_optimization_enabled: false,
+            travel_collision_avoidance_enabled: false,
+            bead_clearance_compensation_enabled: Some(false),
+            wave_overhangs_enabled: false,
+            ..SlicerConfig::default()
+        };
+        let tools = vec![Tool::new(ToolId(0), 0.4)];
+
+        let planned = plan(&[layer0, layer], &[object], &tools, &config).unwrap();
+        let path = planned
+            .iter()
+            .rev()
+            .find(|p| {
+                p.segments
+                    .first()
+                    .is_some_and(|s| matches!(s.kind, MoveKind::WallOuter))
+            })
+            .expect("should find wall outer path for layer");
+        let seg = &path.segments[0];
+
+        // Surface normal is tilted at 45 degrees => cos(45 deg) = 1/sqrt(2) ~= 0.7071
+        // The move is horizontal (p0 -> p1, length ~= 14.14 mm), but because the substrate is tilted,
+        // extrusion volume must be scaled down by cos(theta) ~= 0.7071
+        let bead_area =
+            extrusion::bead_cross_section_area(config.wall_line_width, config.layer_height);
+        let fil_area = extrusion::filament_cross_section_area(config.filament_diameter);
+        let uncompensated_e =
+            extrusion::segment_extrusion_length((p1 - p0).length(), bead_area, fil_area);
+
+        assert!(
+            seg.extrusion_length < uncompensated_e * 0.85,
+            "Horizontal move on sloped surface must be throttled by surface inclination (got {}, uncompensated {})",
+            seg.extrusion_length,
+            uncompensated_e
+        );
+    }
+
+    #[test]
+    fn subdivide_long_traverses_subdivides_infill_chords_across_slopes() {
+        let field =
+            manifold_fidget::order::ConicalOrderField::new(DVec3::ZERO, BUILD_DIRECTION, 1.0);
+
+        // A long infill chord (20mm) crossing from (-10, 0, 10) to (10, 0, 10)
+        let path = Path {
+            points: vec![DVec3::new(-10.0, 0.0, 10.0), DVec3::new(10.0, 0.0, 10.0)],
+            segments: vec![Segment {
+                kind: MoveKind::Infill,
+                speed: 3000.0,
+                extrusion_rate: 1.0,
+                support_fraction: 1.0,
+                extrusion_length: 0.0,
+                channel_width: f64::INFINITY,
+                order: 10.0,
+                line_width: 0.4,
+                is_scarf: false,
+                id: 0,
+                island: 0,
+            }],
+            tool: ToolId(0),
+        };
+
+        let subdivided = subdivide_long_traverses(vec![path], &field, 0.2);
+        assert_eq!(subdivided.len(), 1);
+        let sub_path = &subdivided[0];
+
+        // Should be split into multiple sub-segments
+        assert!(
+            sub_path.segments.len() >= 4,
+            "Long infill chord must be subdivided into smaller segments, got {}",
+            sub_path.segments.len()
+        );
+        assert_eq!(sub_path.points.len(), sub_path.segments.len() + 1);
     }
 
     #[test]
