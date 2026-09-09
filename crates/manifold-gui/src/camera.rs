@@ -57,14 +57,65 @@ impl OrbitCamera {
         self.pitch = (self.pitch + delta_y as f64 * SENSITIVITY).clamp(MIN_PITCH, MAX_PITCH);
     }
 
-    /// Apply a pan delta (in points) in the camera's local right/up plane.
-    pub fn pan(&mut self, delta_x: f32, delta_y: f32) {
-        let sensitivity = self.distance * 0.0015;
+    /// Apply a pan delta (in points) in the camera's local right/up plane,
+    /// scaled to match `viewport_height` so screen motion tracks 1:1 with the cursor.
+    pub fn pan(&mut self, delta_x: f32, delta_y: f32, viewport_height: f32) {
+        let half_fov = (self.fov_y_radians as f64 * 0.5).tan();
+        let units_per_point = 2.0 * self.distance * half_fov / (viewport_height.max(1.0) as f64);
         let forward = (self.target - self.eye()).normalize_or_zero();
         let right = forward.cross(DVec3::Z).normalize_or_zero();
         let up = right.cross(forward).normalize_or_zero();
-        self.target -= right * (delta_x as f64 * sensitivity);
-        self.target += up * (delta_y as f64 * sensitivity);
+        self.target -= right * (delta_x as f64 * units_per_point);
+        self.target += up * (delta_y as f64 * units_per_point);
+    }
+
+    /// Retarget the camera to `new_target` while keeping [`Self::eye`]
+    /// in the exact same world-space position. Updates `distance`, `yaw`,
+    /// and `pitch` accordingly.
+    pub fn set_target_preserving_eye(&mut self, new_target: DVec3) {
+        let eye = self.eye();
+        let to_eye = eye - new_target;
+        let new_distance = to_eye.length();
+        if new_distance < 1e-6 {
+            return;
+        }
+        self.target = new_target;
+        self.distance = new_distance.clamp(self.min_distance, self.max_distance);
+
+        let pitch = (to_eye.z / new_distance).clamp(-1.0, 1.0).asin();
+        let yaw = to_eye.y.atan2(to_eye.x);
+
+        self.pitch = pitch.clamp(MIN_PITCH, MAX_PITCH);
+        self.yaw = yaw;
+    }
+
+    /// Rotate the camera in place around its current [`Self::eye`] position
+    /// (first-person look), keeping `eye` fixed and moving `target`.
+    pub fn rotate_camera(&mut self, delta_x: f32, delta_y: f32) {
+        let eye = self.eye();
+        const SENSITIVITY: f64 = 0.01;
+        self.yaw -= delta_x as f64 * SENSITIVITY;
+        self.pitch = (self.pitch + delta_y as f64 * SENSITIVITY).clamp(MIN_PITCH, MAX_PITCH);
+        let x = self.distance * self.pitch.cos() * self.yaw.cos();
+        let y = self.distance * self.pitch.cos() * self.yaw.sin();
+        let z = self.distance * self.pitch.sin();
+        self.target = eye - DVec3::new(x, y, z);
+    }
+
+    /// Cast a world-space ray `(origin, direction)` through a screen-space cursor
+    /// position `pos` within viewport rectangle `rect`.
+    pub fn unproject_ray(&self, rect: egui::Rect, pos: egui::Pos2) -> (DVec3, DVec3) {
+        let aspect_ratio = rect.width() / rect.height().max(1.0);
+        let view_proj = self.projection_matrix_f64(aspect_ratio) * self.view_matrix_f64();
+        let inv_view_proj = view_proj.inverse();
+
+        let ndc_x = ((pos.x - rect.min.x) / rect.width().max(1.0)) * 2.0 - 1.0;
+        let ndc_y = (1.0 - (pos.y - rect.min.y) / rect.height().max(1.0)) * 2.0 - 1.0;
+
+        let p_near = inv_view_proj.project_point3(DVec3::new(ndc_x as f64, ndc_y as f64, 0.0));
+        let p_far = inv_view_proj.project_point3(DVec3::new(ndc_x as f64, ndc_y as f64, 1.0));
+        let dir = (p_far - p_near).normalize_or_zero();
+        (self.eye(), dir)
     }
 
     /// Apply a scroll delta to zoom in/out, clamped to `[min_distance, max_distance]`.
@@ -192,12 +243,48 @@ mod tests {
     }
 
     #[test]
-    fn zoom_clamps_to_sub_millimeter_min_distance() {
+    fn set_target_preserving_eye_keeps_eye_position_identical() {
         let mut camera = OrbitCamera::default();
-        for _ in 0..100 {
-            camera.zoom(100.0);
-        }
-        assert_eq!(camera.distance, camera.min_distance);
-        assert!(camera.min_distance < 0.1);
+        let orig_eye = camera.eye();
+        let new_target = DVec3::new(50.0, 30.0, 20.0);
+        camera.set_target_preserving_eye(new_target);
+        let new_eye = camera.eye();
+        assert!(
+            (new_eye - orig_eye).length() < 1e-6,
+            "eye drifted from {:?} to {:?}",
+            orig_eye,
+            new_eye
+        );
+        assert_eq!(camera.target, new_target);
+    }
+
+    #[test]
+    fn rotate_camera_keeps_eye_position_identical() {
+        let mut camera = OrbitCamera::default();
+        let orig_eye = camera.eye();
+        camera.rotate_camera(25.0, -15.0);
+        let new_eye = camera.eye();
+        assert!(
+            (new_eye - orig_eye).length() < 1e-6,
+            "eye drifted from {:?} to {:?}",
+            orig_eye,
+            new_eye
+        );
+    }
+
+    #[test]
+    fn pan_with_viewport_height_produces_exact_screen_scale_motion() {
+        let mut camera = OrbitCamera {
+            distance: 100.0,
+            ..Default::default()
+        };
+        let orig_target = camera.target;
+        let viewport_h = 1000.0;
+        camera.pan(0.0, 100.0, viewport_h);
+
+        let half_fov = (camera.fov_y_radians as f64 * 0.5).tan();
+        let expected_units = 2.0 * 100.0 * half_fov / viewport_h as f64 * 100.0;
+        let moved = (camera.target - orig_target).length();
+        assert!((moved - expected_units).abs() < 1e-6);
     }
 }

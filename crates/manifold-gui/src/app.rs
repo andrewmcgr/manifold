@@ -82,6 +82,10 @@ pub struct ManifoldApp {
     /// The move/rotate/scale gizmo, reused across frames so drag state
     /// persists between `interact()` calls.
     gizmo: Gizmo,
+    /// Whether the active drag interaction hit the invisible skybox rather
+    /// than a physical scene surface (bed or object mesh). When true, orbit
+    /// drags rotate the camera in place rather than orbiting a target.
+    drag_hit_skybox: bool,
     /// Gcode from the last successful "Slice" action (Phase 8, see
     /// ROADMAP.md), previewed in the settings panel and written out by
     /// "Export…".
@@ -219,6 +223,7 @@ impl ManifoldApp {
             import_error: None,
             selected: None,
             gizmo: Gizmo::default(),
+            drag_hit_skybox: false,
             gcode: None,
             toolpaths: None,
             toolpath_data_view: ToolpathDataView::default(),
@@ -375,6 +380,103 @@ impl ManifoldApp {
     fn update_camera_bounds(&mut self) {
         let (min, max) = self.scene_bounding_box();
         self.camera.update_max_distance(min, max);
+    }
+
+    /// Cast a ray from the camera through `cursor_pos` into the scene.
+    ///
+    /// Intersects against:
+    /// 1. Loaded object meshes (closest forward triangle hit).
+    /// 2. Print bed plane (within bed dimensions).
+    /// 3. Invisible skybox sphere enclosing the scene, if no surface was hit.
+    fn cast_scene_ray(&self, rect: egui::Rect, cursor_pos: egui::Pos2) -> SceneRayHit {
+        let (ray_orig, ray_dir) = self.camera.unproject_ray(rect, cursor_pos);
+
+        let mut closest_t = f64::INFINITY;
+        let mut hit_surface = false;
+        let mut hit_point = DVec3::ZERO;
+
+        // 1. Check loaded objects
+        for object in &self.objects {
+            let Some((local_min, local_max)) = object.mesh.bounding_box() else {
+                continue;
+            };
+
+            let inv = object.transform.0.inverse();
+            let local_ray_orig = inv.transform_point3(ray_orig);
+            let local_ray_dir = inv.transform_vector3(ray_dir);
+            let local_dir_len = local_ray_dir.length();
+            if local_dir_len < 1e-12 {
+                continue;
+            }
+            let local_dir_norm = local_ray_dir / local_dir_len;
+
+            // Fast AABB rejection
+            if ray_aabb_intersect(local_ray_orig, local_dir_norm, local_min, local_max).is_none() {
+                continue;
+            }
+
+            // Triangle intersection
+            for chunk in object.mesh.indices.chunks_exact(3) {
+                let v0 = object.mesh.vertices[chunk[0] as usize];
+                let v1 = object.mesh.vertices[chunk[1] as usize];
+                let v2 = object.mesh.vertices[chunk[2] as usize];
+
+                if let Some(t_local) =
+                    ray_triangle_intersect(local_ray_orig, local_dir_norm, v0, v1, v2)
+                {
+                    let t_world = t_local / local_dir_len;
+                    if t_world > 1e-4 && t_world < closest_t {
+                        closest_t = t_world;
+                        hit_point = ray_orig + ray_dir * t_world;
+                        hit_surface = true;
+                    }
+                }
+            }
+        }
+
+        // 2. Check print bed
+        let (bed_min, bed_max) = self.machine.build_volume.bounding_box();
+        let bed_z = bed_min.z;
+        if ray_dir.z.abs() > 1e-6 {
+            let t_bed = (bed_z - ray_orig.z) / ray_dir.z;
+            if t_bed > 1e-4 && t_bed < closest_t {
+                let p = ray_orig + ray_dir * t_bed;
+                if p.x >= bed_min.x && p.x <= bed_max.x && p.y >= bed_min.y && p.y <= bed_max.y {
+                    hit_point = p;
+                    hit_surface = true;
+                }
+            }
+        }
+
+        if hit_surface {
+            return SceneRayHit::Surface(hit_point);
+        }
+
+        // 3. Invisible skybox sphere enclosing the scene
+        let (scene_min, scene_max) = self.scene_bounding_box();
+        let scene_center = (scene_min + scene_max) * 0.5;
+        let scene_radius = (scene_max - scene_min).length() * 0.5;
+        let skybox_radius = (scene_radius * 2.5).max(self.camera.max_distance);
+
+        let m = ray_orig - scene_center;
+        let b = m.dot(ray_dir);
+        let c = m.length_squared() - skybox_radius * skybox_radius;
+        let disc = b * b - c;
+        if disc >= 0.0 {
+            let sqrt_disc = disc.sqrt();
+            let t1 = -b - sqrt_disc;
+            let t2 = -b + sqrt_disc;
+            let t = if t1 > 1e-4 {
+                t1
+            } else if t2 > 1e-4 {
+                t2
+            } else {
+                self.camera.distance
+            };
+            SceneRayHit::Skybox(ray_orig + ray_dir * t)
+        } else {
+            SceneRayHit::Skybox(ray_orig + ray_dir * self.camera.distance)
+        }
     }
 
     /// Load every object from `path`, dispatching on its file extension
@@ -2690,10 +2792,30 @@ impl ManifoldApp {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
+            if response.drag_started() && !self.gizmo.is_focused() {
+                if let Some(cursor_pos) = response
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+                {
+                    let hit = self.cast_scene_ray(rect, cursor_pos);
+                    match hit {
+                        SceneRayHit::Surface(p) => {
+                            self.camera.set_target_preserving_eye(p);
+                            self.drag_hit_skybox = false;
+                        }
+                        SceneRayHit::Skybox(_) => {
+                            self.drag_hit_skybox = true;
+                        }
+                    }
+                }
+            }
+
             if response.dragged() {
                 let delta = response.drag_delta();
                 if ui.input(|i| i.pointer.secondary_down()) {
-                    self.camera.pan(delta.x, delta.y);
+                    self.camera.pan(delta.x, delta.y, rect.height());
+                } else if self.drag_hit_skybox {
+                    self.camera.rotate_camera(delta.x, delta.y);
                 } else {
                     self.camera.orbit(delta.x, delta.y);
                 }
@@ -3088,6 +3210,79 @@ impl ManifoldApp {
                     });
             }
         });
+    }
+}
+
+/// Ray intersection result against the 3D scene.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SceneRayHit {
+    /// Hit a physical surface (an object mesh or the print bed).
+    Surface(DVec3),
+    /// Missed all surfaces and intersected the invisible enclosing skybox.
+    Skybox(DVec3),
+}
+
+/// Slab-based ray-AABB intersection test returning the nearest $t \ge 0$.
+fn ray_aabb_intersect(orig: DVec3, dir: DVec3, min: DVec3, max: DVec3) -> Option<f64> {
+    let mut tmin = f64::NEG_INFINITY;
+    let mut tmax = f64::INFINITY;
+
+    for i in 0..3 {
+        let (o, d, bmin, bmax) = match i {
+            0 => (orig.x, dir.x, min.x, max.x),
+            1 => (orig.y, dir.y, min.y, max.y),
+            _ => (orig.z, dir.z, min.z, max.z),
+        };
+        if d.abs() < 1e-12 {
+            if o < bmin || o > bmax {
+                return None;
+            }
+        } else {
+            let inv_d = 1.0 / d;
+            let mut t1 = (bmin - o) * inv_d;
+            let mut t2 = (bmax - o) * inv_d;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            tmin = tmin.max(t1);
+            tmax = tmax.min(t2);
+            if tmin > tmax {
+                return None;
+            }
+        }
+    }
+    if tmax < 1e-6 {
+        return None;
+    }
+    Some(tmin.max(0.0))
+}
+
+/// Möller–Trumbore ray-triangle intersection test returning $t > 0$.
+fn ray_triangle_intersect(orig: DVec3, dir: DVec3, v0: DVec3, v1: DVec3, v2: DVec3) -> Option<f64> {
+    const EPS: f64 = 1e-9;
+    let edge1 = v1 - v0;
+    let edge2 = v2 - v0;
+    let h = dir.cross(edge2);
+    let det = edge1.dot(h);
+    if det.abs() < EPS {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let s = orig - v0;
+    let u = s.dot(h) * inv_det;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(edge1);
+    let v = dir.dot(q) * inv_det;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = edge2.dot(q) * inv_det;
+    if t > EPS {
+        Some(t)
+    } else {
+        None
     }
 }
 
