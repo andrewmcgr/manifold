@@ -50,12 +50,6 @@ impl OrbitCamera {
         self.target + DVec3::new(x, y, z)
     }
 
-    /// Apply a drag delta (in points) to orbit rotation around [`Self::target`].
-    #[allow(dead_code)]
-    pub fn orbit(&mut self, delta_x: f32, delta_y: f32) {
-        self.orbit_around(self.target, delta_x, delta_y);
-    }
-
     /// Orbit the camera around an arbitrary world-space `pivot` point by
     /// `delta_x` (yaw) and `delta_y` (pitch).
     ///
@@ -137,13 +131,6 @@ impl OrbitCamera {
 
         self.pitch = pitch.clamp(MIN_PITCH, MAX_PITCH);
         self.yaw = yaw;
-    }
-
-    /// Rotate the camera in place around its current [`Self::eye`] position
-    /// (first-person look), keeping `eye` fixed and moving `target`.
-    #[allow(dead_code)]
-    pub fn rotate_camera(&mut self, delta_x: f32, delta_y: f32) {
-        self.orbit_around(self.eye(), delta_x, delta_y);
     }
 
     /// Cast a world-space ray `(origin, direction)` through a screen-space cursor

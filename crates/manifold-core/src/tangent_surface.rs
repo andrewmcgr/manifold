@@ -60,60 +60,8 @@ pub fn plan_tangent_surfaces(
     let min_tangent_area = 0.25 * config.nozzle_diameter * config.nozzle_diameter;
     let max_along = order_field::max_along_for(config);
 
-    // Determine whether layer index `k` increases with physical height (Z)
-    let z_at = |l: &Layer| -> f64 {
-        let mut sum_z = 0.0;
-        let mut count = 0usize;
-        for pts in &l.infill_boundary {
-            for p in pts {
-                sum_z += p.z;
-                count += 1;
-            }
-        }
-        if count == 0 {
-            for wall in &l.loops {
-                for p in &wall.points {
-                    sum_z += p.z;
-                    count += 1;
-                }
-            }
-        }
-        if count > 0 {
-            sum_z / count as f64
-        } else {
-            0.0
-        }
-    };
-
-    let first_pos = layers
-        .iter()
-        .find(|l| !l.infill_boundary.is_empty() || !l.loops.is_empty());
-    let last_pos = layers
-        .iter()
-        .rfind(|l| !l.infill_boundary.is_empty() || !l.loops.is_empty());
-    let z_increases = match (first_pos, last_pos) {
-        (Some(f), Some(l)) if f.index != l.index => z_at(l) >= z_at(f),
-        _ => true,
-    };
-
-    // Compute 2D outer wall boundaries for all layers in parallel
-    let outer_2d: Vec<Vec<Vec<[f64; 2]>>> = layers
-        .par_iter()
-        .map(|layer| {
-            let wall0_loops: Vec<Vec<DVec3>> = layer
-                .loops
-                .iter()
-                .filter(|w| w.wall_index == 0)
-                .map(|w| w.points.clone())
-                .collect();
-            let raw_2d = if wall0_loops.is_empty() {
-                polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, origin)
-            } else {
-                polygon2d::to_2d(&wall0_loops, basis1, basis2, origin)
-            };
-            polygon2d::canonicalize(&raw_2d)
-        })
-        .collect();
+    let z_increases = crate::slicing::layer_z_increases(layers);
+    let outer_2d = crate::slicing::layers_outer_boundaries_2d(layers, basis1, basis2, origin);
 
     let results: Vec<_> = (0..layers.len())
         .into_par_iter()

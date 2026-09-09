@@ -201,6 +201,55 @@ struct Crossing {
 /// One infill scan-line segment: `(start, end)` world points.
 type ScanSegment = (DVec3, DVec3);
 
+fn find_scanline_crossings(
+    projected: &[Vec<(f64, f64, DVec3)>],
+    v: f64,
+    layer: &Layer,
+    config: &SlicerConfig,
+    max_along: f64,
+) -> Vec<ScanSegment> {
+    let mut crossings: Vec<Crossing> = Vec::new();
+    for loop_points in projected {
+        let n = loop_points.len();
+        if n < 2 {
+            continue;
+        }
+        for i in 0..n {
+            let (u0, v0, p0) = loop_points[i];
+            let (u1, v1, p1) = loop_points[(i + 1) % n];
+            let crosses = (v0 <= v && v1 > v) || (v1 <= v && v0 > v);
+            if !crosses {
+                continue;
+            }
+            let t = (v - v0) / (v1 - v0);
+            let u = u0 + t * (u1 - u0);
+            let seed = p0.lerp(p1, t);
+            let seed_residual = layer.order_field.order(seed) - layer.order;
+            let point = if seed_residual.is_finite() {
+                let accept = seed_residual.abs() * 4.0 + 2.0 * config.layer_height.abs();
+                order_field::refine_point_onto_order_field(
+                    seed,
+                    layer.order,
+                    max_along,
+                    layer.order_field.as_ref(),
+                )
+                .filter(|p| (*p - seed).length() <= accept)
+                .unwrap_or(seed)
+            } else {
+                seed
+            };
+            crossings.push(Crossing { u, point });
+        }
+    }
+    crossings.sort_by(|a, b| a.u.total_cmp(&b.u));
+
+    let mut pairs: Vec<ScanSegment> = Vec::new();
+    for pair in crossings.chunks_exact(2) {
+        pairs.push((pair[0].point, pair[1].point));
+    }
+    pairs
+}
+
 impl InfillGenerator for MonotonicInfill {
     fn generate(
         &self,
@@ -288,85 +337,7 @@ impl InfillGenerator for MonotonicInfill {
         let mut v = v_min + spacing / 2.0;
         let mut scan_index = 0usize;
         while v <= v_max {
-            let mut crossings: Vec<Crossing> = Vec::new();
-            for loop_points in &projected {
-                let n = loop_points.len();
-                if n < 2 {
-                    continue;
-                }
-                for i in 0..n {
-                    let (u0, v0, p0) = loop_points[i];
-                    let (u1, v1, p1) = loop_points[(i + 1) % n];
-                    let crosses = (v0 <= v && v1 > v) || (v1 <= v && v0 > v);
-                    if !crosses {
-                        continue;
-                    }
-                    let t = (v - v0) / (v1 - v0);
-                    let u = u0 + t * (u1 - u0);
-                    // Re-solve this crossing's true world height against
-                    // the order field rather than interpolating between
-                    // the crossed edge's endpoint heights (see
-                    // `Crossing`'s doc for why linear interpolation is
-                    // wrong for a curved field).
-                    //
-                    // The refinement starts from the *lerped edge point*,
-                    // not from the bare in-plane column `u_dir * u +
-                    // v_dir * v` (which sits at `along == 0`, i.e. the
-                    // world `axis == 0` plane). Projection into the fill
-                    // frame is linear, so the lerp has exactly the same
-                    // `(u, v)` — and it already sits approximately at the
-                    // right height on the *correct branch* of the
-                    // isosurface. A non-monotonic field (`Eikonal` on
-                    // reentrant/threaded geometry) crosses `order ==
-                    // layer.order` at several heights along one vertical
-                    // column, and the previous axis-ray solve from the
-                    // `along == 0` plane could bracket a different, wrong
-                    // branch and return it as an "exact" root up to
-                    // `max_along_for` (50 layer heights) away — exactly
-                    // the steep near-vertical infill spikes anchored
-                    // around `Z ~= 0`. Newton-style gradient refinement
-                    // from the near-surface seed inherently converges to
-                    // the local branch instead (see
-                    // `refine_point_onto_order_field`'s doc).
-                    //
-                    // Acceptance is field-adaptive: the distance the seed
-                    // truly needs to move is roughly its own residual
-                    // over the local gradient magnitude (~1 for
-                    // distance-like fields such as `Eikonal`), so a
-                    // result that wandered much farther than the seed's
-                    // residual (slope slack factor of 4, plus a couple of
-                    // layer heights of absolute slack) is rejected in
-                    // favor of the lerp — a bounded, locally-sane
-                    // approximation built from two real,
-                    // already-reconstructed boundary points. Likewise if
-                    // the field has no information at the seed at all
-                    // (non-finite `order`, e.g. an `Eikonal` front that
-                    // never reached this column), keep the lerp.
-                    let seed = p0.lerp(p1, t);
-                    let seed_residual = layer.order_field.order(seed) - layer.order;
-                    let point = if seed_residual.is_finite() {
-                        let accept = seed_residual.abs() * 4.0 + 2.0 * config.layer_height.abs();
-                        order_field::refine_point_onto_order_field(
-                            seed,
-                            layer.order,
-                            max_along,
-                            layer.order_field.as_ref(),
-                        )
-                        .filter(|p| (*p - seed).length() <= accept)
-                        .unwrap_or(seed)
-                    } else {
-                        seed
-                    };
-                    crossings.push(Crossing { u, point });
-                }
-            }
-            crossings.sort_by(|a, b| a.u.total_cmp(&b.u));
-
-            let mut pairs: Vec<ScanSegment> = Vec::new();
-            let mut pair_iter = crossings.chunks_exact(2);
-            for pair in &mut pair_iter {
-                pairs.push((pair[0].point, pair[1].point));
-            }
+            let pairs = find_scanline_crossings(&projected, v, layer, config, max_along);
             if !pairs.is_empty() {
                 scanlines.push((scan_index, v, pairs));
             }
@@ -649,65 +620,6 @@ impl InfillGenerator for SchwarzPInfill {
     }
 }
 
-/// Stitches disconnected 2D line segments into continuous polyline chains.
-fn stitch_segments_into_polylines_2d(
-    mut segments: Vec<([f64; 2], [f64; 2])>,
-    tolerance: f64,
-) -> Vec<Vec<[f64; 2]>> {
-    let tol_sq = tolerance * tolerance;
-    let mut polylines: Vec<Vec<[f64; 2]>> = Vec::new();
-
-    while let Some((p0, p1)) = segments.pop() {
-        let mut chain = vec![p0, p1];
-
-        // Extend forward
-        let mut extended = true;
-        while extended {
-            extended = false;
-            let tip = *chain.last().unwrap();
-            for i in (0..segments.len()).rev() {
-                let (s0, s1) = segments[i];
-                if (tip[0] - s0[0]).powi(2) + (tip[1] - s0[1]).powi(2) <= tol_sq {
-                    chain.push(s1);
-                    segments.swap_remove(i);
-                    extended = true;
-                    break;
-                } else if (tip[0] - s1[0]).powi(2) + (tip[1] - s1[1]).powi(2) <= tol_sq {
-                    chain.push(s0);
-                    segments.swap_remove(i);
-                    extended = true;
-                    break;
-                }
-            }
-        }
-
-        // Extend backward
-        let mut extended_back = true;
-        while extended_back {
-            extended_back = false;
-            let base = chain[0];
-            for i in (0..segments.len()).rev() {
-                let (s0, s1) = segments[i];
-                if (base[0] - s1[0]).powi(2) + (base[1] - s1[1]).powi(2) <= tol_sq {
-                    chain.insert(0, s0);
-                    segments.swap_remove(i);
-                    extended_back = true;
-                    break;
-                } else if (base[0] - s0[0]).powi(2) + (base[1] - s0[1]).powi(2) <= tol_sq {
-                    chain.insert(0, s1);
-                    segments.swap_remove(i);
-                    extended_back = true;
-                    break;
-                }
-            }
-        }
-
-        polylines.push(chain);
-    }
-
-    polylines
-}
-
 fn generate_tpms_infill(
     kind: manifold_fidget::tpms::TpmsKind,
     region: &InfillRegion,
@@ -881,7 +793,7 @@ fn generate_tpms_infill(
         }
 
         let tol = (step * 0.5).max(0.01);
-        let polylines_2d = stitch_segments_into_polylines_2d(filtered_segments, tol);
+        let polylines_2d = polygon2d::stitch_segments_into_polylines(filtered_segments, tol);
 
         let world_polylines = order_field::reconstruct_on_order_field_near(
             polylines_2d,
@@ -1034,45 +946,7 @@ fn generate_scanlines_at_angle(
     let mut scan_index = 0usize;
 
     while v <= v_max {
-        let mut crossings: Vec<Crossing> = Vec::new();
-        for loop_points in &projected {
-            let n = loop_points.len();
-            if n < 2 {
-                continue;
-            }
-            for i in 0..n {
-                let (u0, v0, p0) = loop_points[i];
-                let (u1, v1, p1) = loop_points[(i + 1) % n];
-                let crosses = (v0 <= v && v1 > v) || (v1 <= v && v0 > v);
-                if !crosses {
-                    continue;
-                }
-                let t = (v - v0) / (v1 - v0);
-                let u = u0 + t * (u1 - u0);
-                let seed = p0.lerp(p1, t);
-                let seed_residual = layer.order_field.order(seed) - layer.order;
-                let point = if seed_residual.is_finite() {
-                    let accept = seed_residual.abs() * 4.0 + 2.0 * config.layer_height.abs();
-                    order_field::refine_point_onto_order_field(
-                        seed,
-                        layer.order,
-                        max_along,
-                        layer.order_field.as_ref(),
-                    )
-                    .filter(|p| (*p - seed).length() <= accept)
-                    .unwrap_or(seed)
-                } else {
-                    seed
-                };
-                crossings.push(Crossing { u, point });
-            }
-        }
-        crossings.sort_by(|a, b| a.u.total_cmp(&b.u));
-
-        let mut row_pairs: Vec<ScanSegment> = Vec::new();
-        for pair in crossings.chunks_exact(2) {
-            row_pairs.push((pair[0].point, pair[1].point));
-        }
+        let row_pairs = find_scanline_crossings(&projected, v, layer, config, max_along);
         if !row_pairs.is_empty() {
             scanlines.push((scan_index, v, row_pairs));
         }

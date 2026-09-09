@@ -565,17 +565,6 @@ pub fn reconstruct_on_order_field<F: OrderField + ?Sized>(
                 .into_iter()
                 .map(|[u, v]| {
                     let planar = apex + basis1 * u + basis2 * v;
-                    // Contour points come from real isosurface extraction
-                    // on the mesh (see `contour::extract_order_contours_on_mesh`),
-                    // so `reconstruct_point_on_order_field` (which now tries
-                    // both an axis-only search and, if that fails to
-                    // bracket -- e.g. a steep isosurface -- a full 3D
-                    // gradient projection) is expected to actually succeed.
-                    // Falling back to `planar` itself here would mean the
-                    // field has literally no information anywhere near a
-                    // point already known to sit on its own isosurface,
-                    // which should not happen in practice; kept only as a
-                    // best-effort last resort, not a proof obligation.
                     reconstruct_point_on_order_field(planar, axis, target_order, max_along, field)
                         .unwrap_or(planar)
                 })
@@ -756,39 +745,6 @@ pub fn reconstruct_on_order_field_near<F: OrderField + ?Sized>(
         .collect()
 }
 
-/// Single-point building block behind [`reconstruct_on_order_field`]: given
-/// a transverse (perpendicular-to-`axis`) reference position `planar`,
-/// solves for the `axis`-offset that lands on `field`'s `target_order`
-/// isosurface and returns the resulting 3D world point, or `None` if no
-/// finite `field.order` sample was ever observed anywhere along the search
-/// (see [`solve_along`]'s doc) -- i.e. `planar`'s whole column is outside
-/// the region `field` has any information about at all (e.g. a straight
-/// ray from a synthetic, not-necessarily-on-the-mesh `(u, v)` location,
-/// such as an infill scan-line/loop-edge crossing, that passes entirely
-/// through empty space next to reentrant/threaded geometry an `Eikonal`
-/// front never reached). Callers must not treat `None` as "assume
-/// `along == 0`" -- that previously produced exactly the flat, badly-wrong
-/// spike-plane bug this return type exists to prevent; see this function's
-/// callers for their fallback strategy when reconstruction fails.
-///
-/// `planar` need not be `apex + basis1 * u + basis2 * v` specifically — any
-/// point with the desired transverse `(u, v)` location works, regardless of
-/// its own `axis` component, since [`solve_along`] searches `along` freely
-/// in either direction from `planar` and only the final `planar + axis *
-/// along` (not `planar` itself) needs to land on the isosurface. This lets
-/// callers reconstruct at points derived purely from an orthonormal
-/// `(u_dir, v_dir, axis)` frame (e.g. a rotated infill-scan frame) without
-/// re-deriving `apex`'s original `basis1`/`basis2` coordinates — see
-/// `infill::MonotonicInfill::generate`'s per-scan-crossing reconstruction,
-/// which needs this exact single-point form: unlike a loop's own vertices
-/// (already reconstructed once by `reconstruct_on_order_field`), a
-/// scan-line/loop-edge *crossing* is a new `(u, v)` location that does not
-/// coincide with any already-reconstructed vertex, so its true `axis`
-/// height must be re-solved from the field rather than linearly
-/// interpolated between the edge's two endpoint heights — linear
-/// interpolation is only exact for a `HeightOrderField` (`w` independent of
-/// `(u, v)`), not for a curved field like `Eikonal`/`Conical` where `w` can
-/// vary sharply across a short edge near curved/threaded geometry.
 pub(crate) fn reconstruct_point_on_order_field<F: OrderField + ?Sized>(
     planar: DVec3,
     axis: DVec3,
@@ -799,15 +755,6 @@ pub(crate) fn reconstruct_point_on_order_field<F: OrderField + ?Sized>(
     match solve_along(field, planar, axis, target_order, max_along)? {
         SolveAlong::Exact(along) => Some(planar + axis * along),
         SolveAlong::ClosestObserved(along) => {
-            // The axis-only ray search never actually bracketed the
-            // target (see `solve_along`'s doc) -- this is typically a
-            // *steep* isosurface, where `order` changes fast in-plane but
-            // slowly along `axis`, so the true nearest isosurface point
-            // needs a lateral shift the axis-only search can never make
-            // no matter how far it travels along `axis` alone. Try a full
-            // 3D gradient projection from the same starting point first;
-            // only fall back to the cruder axis-only closest-observed
-            // sample if that also fails to converge.
             project_onto_isosurface(field, planar, target_order, max_along)
                 .or(Some(planar + axis * along))
         }

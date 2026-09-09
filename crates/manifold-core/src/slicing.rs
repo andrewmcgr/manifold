@@ -136,6 +136,76 @@ impl Default for Layer {
     }
 }
 
+impl Layer {
+    /// Average physical Z height across all infill boundaries and loops on this layer.
+    #[must_use]
+    pub fn average_z(&self) -> f64 {
+        let mut sum_z = 0.0;
+        let mut count = 0usize;
+        for pts in &self.infill_boundary {
+            for p in pts {
+                sum_z += p.z;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            for wall in &self.loops {
+                for p in &wall.points {
+                    sum_z += p.z;
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            sum_z / count as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Determines whether layer index `k` increases with physical height (Z).
+#[must_use]
+pub fn layer_z_increases(layers: &[Layer]) -> bool {
+    let first_pos = layers
+        .iter()
+        .find(|l| !l.infill_boundary.is_empty() || !l.loops.is_empty());
+    let last_pos = layers
+        .iter()
+        .rfind(|l| !l.infill_boundary.is_empty() || !l.loops.is_empty());
+    match (first_pos, last_pos) {
+        (Some(f), Some(l)) if f.index != l.index => l.average_z() >= f.average_z(),
+        _ => true,
+    }
+}
+
+/// Computes 2D outer wall boundaries (canonicalized) for all layers in parallel.
+#[must_use]
+pub fn layers_outer_boundaries_2d(
+    layers: &[Layer],
+    basis1: DVec3,
+    basis2: DVec3,
+    origin: DVec3,
+) -> Vec<Vec<Vec<[f64; 2]>>> {
+    layers
+        .par_iter()
+        .map(|layer| {
+            let wall0_loops: Vec<Vec<DVec3>> = layer
+                .loops
+                .iter()
+                .filter(|w| w.wall_index == 0)
+                .map(|w| w.points.clone())
+                .collect();
+            let raw_2d = if wall0_loops.is_empty() {
+                polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, origin)
+            } else {
+                polygon2d::to_2d(&wall0_loops, basis1, basis2, origin)
+            };
+            polygon2d::canonicalize(&raw_2d)
+        })
+        .collect()
+}
+
 /// One contour loop belonging to a specific wall/perimeter pass within a
 /// [`Layer`] (see [`SlicerConfig::wall_count`]).
 #[derive(Debug, Clone, Default)]
@@ -2777,16 +2847,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
 /// the old (buggy) full-3D-diagonal computation used, so behavior for
 /// mostly-flat meshes (where footprint ~= 3D diagonal) is unchanged.
 fn in_plane_extent(min: DVec3, max: DVec3, basis1: DVec3, basis2: DVec3) -> f64 {
-    let corners = [
-        DVec3::new(min.x, min.y, min.z),
-        DVec3::new(max.x, min.y, min.z),
-        DVec3::new(min.x, max.y, min.z),
-        DVec3::new(min.x, min.y, max.z),
-        DVec3::new(max.x, max.y, min.z),
-        DVec3::new(max.x, min.y, max.z),
-        DVec3::new(min.x, max.y, max.z),
-        DVec3::new(max.x, max.y, max.z),
-    ];
+    let corners = crate::mesh::bounding_box_corners(min, max);
 
     let mut u_min = f64::INFINITY;
     let mut u_max = f64::NEG_INFINITY;

@@ -368,16 +368,7 @@ impl ManifoldApp {
         let (mut min, mut max) = self.machine.build_volume.bounding_box();
         for object in &self.objects {
             if let Some((local_min, local_max)) = object.mesh.bounding_box() {
-                for corner in [
-                    DVec3::new(local_min.x, local_min.y, local_min.z),
-                    DVec3::new(local_max.x, local_min.y, local_min.z),
-                    DVec3::new(local_min.x, local_max.y, local_min.z),
-                    DVec3::new(local_max.x, local_max.y, local_min.z),
-                    DVec3::new(local_min.x, local_min.y, local_max.z),
-                    DVec3::new(local_max.x, local_min.y, local_max.z),
-                    DVec3::new(local_min.x, local_max.y, local_max.z),
-                    DVec3::new(local_max.x, local_max.y, local_max.z),
-                ] {
+                for corner in manifold_core::mesh::bounding_box_corners(local_min, local_max) {
                     let world = object.transform.transform_point(corner);
                     min = min.min(world);
                     max = max.max(world);

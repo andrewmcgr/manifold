@@ -12,7 +12,7 @@ use crate::order_field;
 use crate::polygon2d;
 use crate::slicing::Layer;
 use crate::toolpath::{MoveKind, Path, Segment};
-use crate::wave_overhang::{group_loops_into_polygon_shapes, LineSegment2D, PolygonShape2D};
+use crate::wave_overhang::{group_loops_into_polygon_shapes, PolygonShape2D};
 use crate::SlicerConfig;
 
 /// Result of bridge path planning across all layers.
@@ -44,60 +44,8 @@ pub fn plan_bridges(layers: &[Layer], config: &SlicerConfig, tool: ToolId) -> Br
     let bridge_speed = config.bridge_speed();
     let bridge_line_width = config.infill_line_width.max(0.1);
 
-    // Determine whether layer index `k` increases with physical height (Z)
-    let z_at = |l: &Layer| -> f64 {
-        let mut sum_z = 0.0;
-        let mut count = 0usize;
-        for pts in &l.infill_boundary {
-            for p in pts {
-                sum_z += p.z;
-                count += 1;
-            }
-        }
-        if count == 0 {
-            for wall in &l.loops {
-                for p in &wall.points {
-                    sum_z += p.z;
-                    count += 1;
-                }
-            }
-        }
-        if count > 0 {
-            sum_z / count as f64
-        } else {
-            0.0
-        }
-    };
-
-    let first_pos = layers
-        .iter()
-        .find(|l| !l.infill_boundary.is_empty() || !l.loops.is_empty());
-    let last_pos = layers
-        .iter()
-        .rfind(|l| !l.infill_boundary.is_empty() || !l.loops.is_empty());
-    let z_increases = match (first_pos, last_pos) {
-        (Some(f), Some(l)) if f.index != l.index => z_at(l) >= z_at(f),
-        _ => true,
-    };
-
-    // Compute 2D outer wall boundaries for all layers in parallel
-    let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = layers
-        .par_iter()
-        .map(|layer| {
-            let wall0_loops: Vec<Vec<DVec3>> = layer
-                .loops
-                .iter()
-                .filter(|w| w.wall_index == 0)
-                .map(|w| w.points.clone())
-                .collect();
-            let raw_2d = if wall0_loops.is_empty() {
-                polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, origin)
-            } else {
-                polygon2d::to_2d(&wall0_loops, basis1, basis2, origin)
-            };
-            polygon2d::canonicalize(&raw_2d)
-        })
-        .collect();
+    let z_increases = crate::slicing::layer_z_increases(layers);
+    let boundaries_2d = crate::slicing::layers_outer_boundaries_2d(layers, basis1, basis2, origin);
 
     let (paths_result, footprints_result): (Vec<_>, Vec<_>) = (0..layers.len())
         .into_par_iter()
@@ -164,7 +112,7 @@ pub fn plan_bridges(layers: &[Layer], config: &SlicerConfig, tool: ToolId) -> Br
                     let p0 = shape.outer[i];
                     let p1 = shape.outer[(i + 1) % n];
                     let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
-                    let near = polygon2d_contains_or_near(mid, prev_b, search_dist);
+                    let near = polygon2d::contains_point_or_near(prev_b, mid, search_dist);
                     if near {
                         current_run.push(i);
                         in_contact = true;
@@ -418,8 +366,9 @@ pub fn generate_straight_bridge_paths_2d(
 
             // Verify that endpoints actually land on or near preexisting material (prev_b)
             let start_supported =
-                polygon2d_contains_or_near(p_start, prev_b, nozzle_diameter * 1.5);
-            let end_supported = polygon2d_contains_or_near(p_end, prev_b, nozzle_diameter * 1.5);
+                polygon2d::contains_point_or_near(prev_b, p_start, nozzle_diameter * 1.5);
+            let end_supported =
+                polygon2d::contains_point_or_near(prev_b, p_end, nozzle_diameter * 1.5);
 
             if start_supported && end_supported {
                 lines_2d.push(vec![p_start, p_end]);
@@ -430,45 +379,6 @@ pub fn generate_straight_bridge_paths_2d(
     }
 
     lines_2d
-}
-
-fn polygon2d_contains_or_near(pt: [f64; 2], loops: &[Vec<[f64; 2]>], eps: f64) -> bool {
-    let eps_sq = eps * eps;
-    for loop_ in loops {
-        if point_in_single_loop(pt, loop_) {
-            return true;
-        }
-        let n = loop_.len();
-        for i in 0..n {
-            let seg = LineSegment2D {
-                p0: loop_[i],
-                p1: loop_[(i + 1) % n],
-            };
-            if seg.dist_sq_to_point(pt) <= eps_sq {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn point_in_single_loop(pt: [f64; 2], loop_: &[[f64; 2]]) -> bool {
-    if loop_.len() < 3 {
-        return false;
-    }
-    let [x, y] = pt;
-    let mut inside = false;
-    let mut j = loop_.len() - 1;
-    for i in 0..loop_.len() {
-        let [xi, yi] = loop_[i];
-        let [xj, yj] = loop_[j];
-        let intersect = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
-        if intersect {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
 }
 
 #[cfg(test)]

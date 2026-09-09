@@ -37,6 +37,21 @@ impl Mesh {
     }
 }
 
+/// Returns the 8 corner vertices of the axis-aligned bounding box defined by `min` and `max`.
+#[must_use]
+pub fn bounding_box_corners(min: DVec3, max: DVec3) -> [DVec3; 8] {
+    [
+        DVec3::new(min.x, min.y, min.z),
+        DVec3::new(max.x, min.y, min.z),
+        DVec3::new(min.x, max.y, min.z),
+        DVec3::new(max.x, max.y, min.z),
+        DVec3::new(min.x, min.y, max.z),
+        DVec3::new(max.x, min.y, max.z),
+        DVec3::new(min.x, max.y, max.z),
+        DVec3::new(max.x, max.y, max.z),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

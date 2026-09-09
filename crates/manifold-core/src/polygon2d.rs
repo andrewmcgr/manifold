@@ -18,7 +18,6 @@ use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::float::single::SingleFloatOverlay;
 use i_overlay::mesh::outline::offset::OutlineOffset;
 use i_overlay::mesh::style::OutlineStyle;
-use manifold_fidget::ScalarField;
 
 /// The fill rule used for every boolean/offset operation in this module.
 ///
@@ -500,90 +499,6 @@ pub fn canonicalize(loops2d: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
         .collect()
 }
 
-/// Reorients 2D loops using both topological nesting parity and 3D mesh SDF containment.
-///
-/// If a loop encloses open air (`sdf.sample > 0`), it is classified as a hole (CW winding).
-/// If it encloses solid material (`sdf.sample <= 0`), it is classified as a solid island (CCW winding).
-#[allow(clippy::too_many_arguments)]
-pub fn canonicalize_with_sdf(
-    loops2d: &[Vec<[f64; 2]>],
-    basis1: DVec3,
-    basis2: DVec3,
-    axis: DVec3,
-    apex: DVec3,
-    order_value: f64,
-    field: &dyn manifold_fidget::order::OrderField,
-    mesh_sdf: Option<&manifold_fidget::mesh_sdf::MeshSdf>,
-) -> Vec<Vec<[f64; 2]>> {
-    let loops2d: Vec<Vec<[f64; 2]>> = loops2d
-        .iter()
-        .filter(|loop_| loop_.len() >= 3 && signed_area(loop_).abs() > DEGENERATE_AREA_EPSILON)
-        .cloned()
-        .collect();
-
-    if loops2d.is_empty() {
-        return Vec::new();
-    }
-
-    let depths: Vec<usize> = loops2d
-        .iter()
-        .enumerate()
-        .map(|(i, loop_)| {
-            let test = loop_[0];
-            (0..loops2d.len())
-                .filter(|&j| j != i && point_in_polygon(test, &loops2d[j]))
-                .count()
-        })
-        .collect();
-
-    loops2d
-        .iter()
-        .zip(depths)
-        .map(|(loop_, depth)| {
-            let mut c_u = 0.0;
-            let mut c_v = 0.0;
-            for &[u, v] in loop_ {
-                c_u += u;
-                c_v += v;
-            }
-            let n = loop_.len() as f64;
-            let c_u = c_u / n;
-            let c_v = c_v / n;
-            let is_ccw = signed_area(loop_) > 0.0;
-
-            let want_ccw = if let Some(sdf) = mesh_sdf {
-                let planar = apex + basis1 * c_u + basis2 * c_v;
-                if let Some(p_3d) = crate::order_field::reconstruct_point_on_order_field(
-                    planar,
-                    axis,
-                    order_value,
-                    50.0,
-                    field,
-                ) {
-                    let d = sdf.sample(p_3d).value;
-                    if d > 0.05 {
-                        false // Hole in air -> CW
-                    } else if d < -0.05 {
-                        true // Solid interior -> CCW
-                    } else {
-                        depth % 2 == 0
-                    }
-                } else {
-                    depth % 2 == 0
-                }
-            } else {
-                depth % 2 == 0
-            };
-
-            if want_ccw == is_ccw {
-                loop_.clone()
-            } else {
-                loop_.iter().copied().rev().collect()
-            }
-        })
-        .collect()
-}
-
 /// Drops any loop whose absolute shoelace area is strictly less than `min_area`.
 pub fn filter_min_area(loops: &[Vec<[f64; 2]>], min_area: f64) -> Vec<Vec<[f64; 2]>> {
     loops
@@ -637,6 +552,35 @@ pub fn contains_point(loops_2d: &[Vec<[f64; 2]>], point: [f64; 2]) -> bool {
         }
     }
     inside
+}
+
+/// Tests whether `point` is inside any loop in `loops_2d` or within `eps` distance of any boundary segment.
+pub fn contains_point_or_near(loops_2d: &[Vec<[f64; 2]>], point: [f64; 2], eps: f64) -> bool {
+    let eps_sq = eps * eps;
+    for l in loops_2d {
+        if point_in_polygon(point, l) {
+            return true;
+        }
+        let n = l.len();
+        for i in 0..n {
+            let p0 = l[i];
+            let p1 = l[(i + 1) % n];
+            let d = [p1[0] - p0[0], p1[1] - p0[1]];
+            let len_sq = d[0] * d[0] + d[1] * d[1];
+            let d_sq = if len_sq < 1e-15 {
+                (point[0] - p0[0]).powi(2) + (point[1] - p0[1]).powi(2)
+            } else {
+                let t = (((point[0] - p0[0]) * d[0] + (point[1] - p0[1]) * d[1]) / len_sq)
+                    .clamp(0.0, 1.0);
+                let proj = [p0[0] + d[0] * t, p0[1] + d[1] * t];
+                (point[0] - proj[0]).powi(2) + (point[1] - proj[1]).powi(2)
+            };
+            if d_sq <= eps_sq {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A partitioned wall ring with its local bead width.
@@ -808,6 +752,65 @@ pub fn intersection(subj: &[Vec<[f64; 2]>], clip: &[Vec<[f64; 2]>]) -> Vec<Vec<[
         .into_iter()
         .flatten()
         .collect()
+}
+
+/// Stitches disconnected 2D line segments into continuous polyline chains.
+pub fn stitch_segments_into_polylines(
+    mut segments: Vec<([f64; 2], [f64; 2])>,
+    tolerance: f64,
+) -> Vec<Vec<[f64; 2]>> {
+    let tol_sq = tolerance * tolerance;
+    let mut polylines: Vec<Vec<[f64; 2]>> = Vec::new();
+
+    while let Some((p0, p1)) = segments.pop() {
+        let mut chain = vec![p0, p1];
+
+        // Extend forward
+        let mut extended = true;
+        while extended {
+            extended = false;
+            let tip = *chain.last().unwrap();
+            for i in (0..segments.len()).rev() {
+                let (s0, s1) = segments[i];
+                if (tip[0] - s0[0]).powi(2) + (tip[1] - s0[1]).powi(2) <= tol_sq {
+                    chain.push(s1);
+                    segments.swap_remove(i);
+                    extended = true;
+                    break;
+                } else if (tip[0] - s1[0]).powi(2) + (tip[1] - s1[1]).powi(2) <= tol_sq {
+                    chain.push(s0);
+                    segments.swap_remove(i);
+                    extended = true;
+                    break;
+                }
+            }
+        }
+
+        // Extend backward
+        let mut extended_back = true;
+        while extended_back {
+            extended_back = false;
+            let base = chain[0];
+            for i in (0..segments.len()).rev() {
+                let (s0, s1) = segments[i];
+                if (base[0] - s1[0]).powi(2) + (base[1] - s1[1]).powi(2) <= tol_sq {
+                    chain.insert(0, s0);
+                    segments.swap_remove(i);
+                    extended_back = true;
+                    break;
+                } else if (base[0] - s0[0]).powi(2) + (base[1] - s0[1]).powi(2) <= tol_sq {
+                    chain.insert(0, s1);
+                    segments.swap_remove(i);
+                    extended_back = true;
+                    break;
+                }
+            }
+        }
+
+        polylines.push(chain);
+    }
+
+    polylines
 }
 
 #[cfg(test)]

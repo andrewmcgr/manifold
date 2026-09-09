@@ -97,11 +97,11 @@ impl PolygonShape2D {
     /// Tests whether `pt` lies strictly inside the polygon's outer boundary and outside all its holes.
     #[must_use]
     pub fn contains_point(&self, pt: [f64; 2]) -> bool {
-        if !point_in_single_loop(pt, &self.outer) {
+        if !polygon2d::point_in_polygon(pt, &self.outer) {
             return false;
         }
         for hole in &self.holes {
-            if point_in_single_loop(pt, hole) {
+            if polygon2d::point_in_polygon(pt, hole) {
                 return false;
             }
         }
@@ -139,7 +139,7 @@ pub fn group_loops_into_polygon_shapes(loops2d: &[Vec<[f64; 2]>]) -> Vec<Polygon
         }
         let sample_pt = hole[0];
         for shape in &mut shapes {
-            if point_in_single_loop(sample_pt, &shape.outer) {
+            if polygon2d::point_in_polygon(sample_pt, &shape.outer) {
                 shape.holes.push(hole);
                 break;
             }
@@ -147,25 +147,6 @@ pub fn group_loops_into_polygon_shapes(loops2d: &[Vec<[f64; 2]>]) -> Vec<Polygon
     }
 
     shapes
-}
-
-fn point_in_single_loop(pt: [f64; 2], loop_: &[[f64; 2]]) -> bool {
-    if loop_.len() < 3 {
-        return false;
-    }
-    let [x, y] = pt;
-    let mut inside = false;
-    let mut j = loop_.len() - 1;
-    for i in 0..loop_.len() {
-        let [xi, yi] = loop_[i];
-        let [xj, yj] = loop_[j];
-        let intersect = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
-        if intersect {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
 }
 
 /// Generates wave overhang toolpaths in 2D for an unsupported overhang polygon
@@ -388,7 +369,8 @@ pub fn generate_wave_overhang_paths_2d(
         let isocontour_segments = extract_marching_squares_segments(
             &dist, &tag, nx, ny, u_start, v_start, grid_step, target_d,
         );
-        let polylines = stitch_segments_into_polylines(isocontour_segments, grid_step * 1.5);
+        let polylines =
+            polygon2d::stitch_segments_into_polylines(isocontour_segments, grid_step * 1.5);
         for poly in polylines {
             if poly.len() >= 2 {
                 let simplified = simplify_polyline_collinear(&poly, 0.015);
@@ -493,65 +475,6 @@ fn extract_marching_squares_segments(
     }
 
     segments
-}
-
-/// Stitches disconnected line segments into continuous polyline chains.
-fn stitch_segments_into_polylines(
-    mut segments: Vec<([f64; 2], [f64; 2])>,
-    tolerance: f64,
-) -> Vec<Vec<[f64; 2]>> {
-    let tol_sq = tolerance * tolerance;
-    let mut polylines: Vec<Vec<[f64; 2]>> = Vec::new();
-
-    while let Some((p0, p1)) = segments.pop() {
-        let mut chain = vec![p0, p1];
-
-        // Extend forward
-        let mut extended = true;
-        while extended {
-            extended = false;
-            let tip = *chain.last().unwrap();
-            for i in (0..segments.len()).rev() {
-                let (s0, s1) = segments[i];
-                if (tip[0] - s0[0]).powi(2) + (tip[1] - s0[1]).powi(2) <= tol_sq {
-                    chain.push(s1);
-                    segments.swap_remove(i);
-                    extended = true;
-                    break;
-                } else if (tip[0] - s1[0]).powi(2) + (tip[1] - s1[1]).powi(2) <= tol_sq {
-                    chain.push(s0);
-                    segments.swap_remove(i);
-                    extended = true;
-                    break;
-                }
-            }
-        }
-
-        // Extend backward
-        let mut extended_back = true;
-        while extended_back {
-            extended_back = false;
-            let base = chain[0];
-            for i in (0..segments.len()).rev() {
-                let (s0, s1) = segments[i];
-                if (base[0] - s1[0]).powi(2) + (base[1] - s1[1]).powi(2) <= tol_sq {
-                    chain.insert(0, s0);
-                    segments.swap_remove(i);
-                    extended_back = true;
-                    break;
-                } else if (base[0] - s0[0]).powi(2) + (base[1] - s0[1]).powi(2) <= tol_sq {
-                    chain.insert(0, s1);
-                    segments.swap_remove(i);
-                    extended_back = true;
-                    break;
-                }
-            }
-        }
-
-        polylines.push(chain);
-    }
-
-    polylines
 }
 
 fn polyline_length(pts: &[[f64; 2]]) -> f64 {
@@ -820,60 +743,8 @@ pub fn plan_wave_overhangs(
         };
     }
 
-    // Determine whether layer index `k` increases with physical height (Z)
-    let z_at = |l: &Layer| -> f64 {
-        let mut sum_z = 0.0;
-        let mut count = 0usize;
-        for pts in &l.infill_boundary {
-            for p in pts {
-                sum_z += p.z;
-                count += 1;
-            }
-        }
-        if count == 0 {
-            for wall in &l.loops {
-                for p in &wall.points {
-                    sum_z += p.z;
-                    count += 1;
-                }
-            }
-        }
-        if count > 0 {
-            sum_z / count as f64
-        } else {
-            0.0
-        }
-    };
-
-    let first_pos = layers
-        .iter()
-        .find(|l| !l.infill_boundary.is_empty() || !l.loops.is_empty());
-    let last_pos = layers
-        .iter()
-        .rfind(|l| !l.infill_boundary.is_empty() || !l.loops.is_empty());
-    let z_increases = match (first_pos, last_pos) {
-        (Some(f), Some(l)) if f.index != l.index => z_at(l) >= z_at(f),
-        _ => true,
-    };
-
-    // Compute 2D outer wall boundaries for all layers in parallel
-    let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = layers
-        .par_iter()
-        .map(|layer| {
-            let wall0_loops: Vec<Vec<DVec3>> = layer
-                .loops
-                .iter()
-                .filter(|w| w.wall_index == 0)
-                .map(|w| w.points.clone())
-                .collect();
-            let raw_2d = if wall0_loops.is_empty() {
-                polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, origin)
-            } else {
-                polygon2d::to_2d(&wall0_loops, basis1, basis2, origin)
-            };
-            polygon2d::canonicalize(&raw_2d)
-        })
-        .collect();
+    let z_increases = crate::slicing::layer_z_increases(layers);
+    let boundaries_2d = crate::slicing::layers_outer_boundaries_2d(layers, basis1, basis2, origin);
 
     let mut wall_tags_result = Vec::with_capacity(layers.len());
     let mut paths_result = Vec::with_capacity(layers.len());
@@ -912,7 +783,7 @@ pub fn plan_wave_overhangs(
 
                         let p_2d = [(p - origin).dot(basis1), (p - origin).dot(basis2)];
                         let in_prev_2d = !prev_b.is_empty()
-                            && polygon2d_contains_or_near(p_2d, prev_b, support_dist);
+                            && polygon2d::contains_point_or_near(prev_b, p_2d, support_dist);
 
                         if !in_prev_2d {
                             let mut supported_3d = false;
@@ -1132,26 +1003,6 @@ pub fn plan_wave_overhangs(
         wall_overhang_tags_by_layer: wall_tags_result,
         overhang_footprints_by_layer: footprints_result,
     }
-}
-
-fn polygon2d_contains_or_near(pt: [f64; 2], loops: &[Vec<[f64; 2]>], eps: f64) -> bool {
-    let eps_sq = eps * eps;
-    for loop_ in loops {
-        if point_in_single_loop(pt, loop_) {
-            return true;
-        }
-        let n = loop_.len();
-        for i in 0..n {
-            let seg = LineSegment2D {
-                p0: loop_[i],
-                p1: loop_[(i + 1) % n],
-            };
-            if seg.dist_sq_to_point(pt) <= eps_sq {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 #[cfg(test)]

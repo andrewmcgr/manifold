@@ -66,7 +66,7 @@ pub fn center_on_bed(objects: &mut [Object], build_volume: &BoundingVolume) {
             continue;
         };
         any = true;
-        for corner in bounding_box_corners(local_min, local_max) {
+        for corner in crate::mesh::bounding_box_corners(local_min, local_max) {
             let world = object.transform.transform_point(corner);
             min = min.min(world);
             max = max.max(world);
@@ -89,19 +89,6 @@ pub fn center_on_bed(objects: &mut [Object], build_volume: &BoundingVolume) {
     for object in objects.iter_mut() {
         object.transform = object.transform.then_translate(offset);
     }
-}
-
-fn bounding_box_corners(min: DVec3, max: DVec3) -> [DVec3; 8] {
-    [
-        DVec3::new(min.x, min.y, min.z),
-        DVec3::new(max.x, min.y, min.z),
-        DVec3::new(min.x, max.y, min.z),
-        DVec3::new(max.x, max.y, min.z),
-        DVec3::new(min.x, min.y, max.z),
-        DVec3::new(max.x, min.y, max.z),
-        DVec3::new(min.x, max.y, max.z),
-        DVec3::new(max.x, max.y, max.z),
-    ]
 }
 
 #[cfg(test)]
