@@ -890,6 +890,10 @@ pub fn slice_mesh_with_progress(
                             BUILD_DIRECTION,
                         );
                         for pts in w_loops {
+                            if pts.len() < 3 || loop_perimeter(&pts) < 3.0 * config.nozzle_diameter
+                            {
+                                continue;
+                            }
                             let arc_fraction = compute_arc_fractions(&pts);
                             let n_pts = pts.len();
                             let mid_2d =

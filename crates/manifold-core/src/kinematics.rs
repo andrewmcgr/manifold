@@ -1121,7 +1121,7 @@ pub fn apply_scarf_joint(
         cum_dist.push(total_len);
     }
 
-    if total_len <= 1e-4 {
+    if total_len <= 1e-4 || total_len < 2.5 * scarf_length_mm {
         return;
     }
 
@@ -1132,6 +1132,9 @@ pub fn apply_scarf_joint(
 
     let k_steps = steps.max(1);
     let delta_s = effective_scarf_len / (k_steps as f64);
+    if delta_s < 0.20 {
+        return;
+    }
     let h_start = start_height_fraction.clamp(0.0, 0.95);
 
     let sample_at_distance = |d: f64| -> (DVec3, crate::toolpath::Segment, f64) {

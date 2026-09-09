@@ -61,6 +61,10 @@ pub fn compute_gap_point(
     let u_hat = u_vec / u_len;
     let dir = if inward { -u_hat } else { u_hat };
     let step = 0.5 * target_ds;
+    // Cap step: gap fill should never jump further than 1.5x nominal line width
+    if step > 1.5 * config.wall_line_width {
+        return None;
+    }
     let p_raw = p + dir * step;
 
     // Refine point onto the order field isosurface
@@ -72,9 +76,13 @@ pub fn compute_gap_point(
     )
     .unwrap_or(p_raw);
 
-    // Verify point is inside or on the solid CAD model
+    // Verify point and chord are inside or on the solid CAD model
     if let Some(sdf) = layer.mesh_sdf.as_deref() {
         if sdf.sample(p_refined).value > 0.05 {
+            return None;
+        }
+        let p_mid = (p + p_refined) * 0.5;
+        if sdf.sample(p_mid).value > 0.05 {
             return None;
         }
     }
@@ -271,6 +279,15 @@ pub fn plan_gap_fill_for_wall(
                 .iter()
                 .map(|&idx| gap_points[idx].unwrap().point)
                 .collect();
+
+            // Discard chains with any excessive jump between consecutive vertices
+            let max_edge_len = 3.0 * config.wall_line_width;
+            let has_void_jump = (0..num_pts.saturating_sub(1))
+                .any(|j| pts[j].distance(pts[j + 1]) > max_edge_len)
+                || (is_closed_chain && pts[num_pts - 1].distance(pts[0]) > max_edge_len);
+            if has_void_jump {
+                continue;
+            }
 
             // Check total path length
             let mut total_len = 0.0;
