@@ -71,6 +71,10 @@ struct Cli {
     #[arg(long, default_value_t = true)]
     wave_overhangs: bool,
 
+    /// Whether anisotropic FSM boundary metric tensor blending is enabled.
+    #[arg(long, default_value_t = false)]
+    fsm_boundary_metrics: bool,
+
     /// Aspect ratio for top surface tangency under the anisotropic FSM order field.
     #[arg(long)]
     fsm_top_tangency: Option<f64>,
@@ -284,6 +288,7 @@ fn main() -> Result<()> {
         solid_infill_pattern: cli.solid_infill_pattern.map(Into::into),
         infill_pattern: cli.infill_pattern.into(),
         wall_order: cli.wall_order.map(Into::into),
+        fsm_boundary_metrics_enabled: cli.fsm_boundary_metrics,
         fsm_top_tangency_aspect: cli.fsm_top_tangency,
         fsm_wall_ortho_aspect: cli.fsm_wall_ortho,
         fsm_skin_depth_mm: cli.fsm_skin_depth,

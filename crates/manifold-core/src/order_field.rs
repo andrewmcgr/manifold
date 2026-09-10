@@ -102,7 +102,7 @@ pub fn order_field_for_with_sdf(
         OrderFieldKind::Eikonal | OrderFieldKind::DualIso => {
             Box::new(eikonal_field_for(config, mesh, slope_profile, sdf))
         }
-        OrderFieldKind::AnisotropicFsm => Box::new(fsm_field_for(config, mesh, sdf)),
+        OrderFieldKind::AnisotropicFsm => Box::new(fsm_field_for(config, mesh, slope_profile, sdf)),
     }
 }
 
@@ -275,6 +275,7 @@ fn eikonal_field_for(
 fn fsm_field_for(
     config: &SlicerConfig,
     mesh: &Mesh,
+    slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     existing_sdf: Option<&MeshSdf>,
 ) -> AnisotropicFsmOrderField {
     let Some((min, max)) = mesh.bounding_box() else {
@@ -329,7 +330,10 @@ fn fsm_field_for(
     let wall_ortho = config.fsm_wall_ortho_aspect();
     let skin_depth = config.fsm_skin_depth_mm();
 
-    if skin_depth > 0.0 && ((top_tangency - 1.0).abs() > 1e-4 || (wall_ortho - 1.0).abs() > 1e-4) {
+    if config.fsm_boundary_metrics_enabled()
+        && skin_depth > 0.0
+        && ((top_tangency - 1.0).abs() > 1e-4 || (wall_ortho - 1.0).abs() > 1e-4)
+    {
         tensor_grid.blend_surface_tensors(
             |p| {
                 let sample = sdf.sample(p);
@@ -341,6 +345,7 @@ fn fsm_field_for(
         );
     }
 
+    let height_along = ConstantAxisHeight::new(BUILD_DIRECTION, min);
     let max_sweeps = config.fsm_max_sweeps();
     AnisotropicFsmOrderField::solve_with_tensor_grid(
         actual_min,
@@ -350,6 +355,8 @@ fn fsm_field_for(
         &is_solid,
         &is_seed_region,
         max_sweeps,
+        Some(slope_profile),
+        Some(&height_along),
     )
 }
 

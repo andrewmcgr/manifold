@@ -9,9 +9,39 @@
 
 use crate::fsm_simplex::solve_anisotropic_octant_simplex;
 use crate::fsm_tensor::{MetricTensor3, TensorGrid};
+use crate::height_along::HeightAlong;
 use crate::order::OrderField;
+use crate::slope_profile::SlopeProfile;
 use glam::DVec3;
 use rayon::prelude::*;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+
+/// Min-heap entry for label-correcting Lipschitz slope relaxation.
+#[derive(Copy, Clone, PartialEq)]
+struct HeapEntry {
+    value: f64,
+    x: usize,
+    y: usize,
+    z: usize,
+}
+
+impl Eq for HeapEntry {}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .value
+            .partial_cmp(&self.value)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// 8 canonical coordinate sweeping directions: $(s_x, s_y, s_z) \in \{-1.0, +1.0\}^3$.
 const SWEEP_DIRECTIONS: [(f64, f64, f64); 8] = [
@@ -47,10 +77,21 @@ impl AnisotropicFsmOrderField {
         let (dims, h, actual_min) =
             Self::compute_grid_dims(min_corner, max_corner, requested_cell_size);
         let tensor_grid = TensorGrid::new_isotropic(actual_min, dims, h);
-        Self::solve_with_tensor_grid(actual_min, dims, h, &tensor_grid, is_solid, is_seed, 8)
+        Self::solve_with_tensor_grid(
+            actual_min,
+            dims,
+            h,
+            &tensor_grid,
+            is_solid,
+            is_seed,
+            8,
+            None,
+            None,
+        )
     }
 
     /// Solves the anisotropic order field using the specified [`TensorGrid`].
+    #[allow(clippy::too_many_arguments)]
     pub fn solve_with_tensor_grid(
         min_corner: DVec3,
         dims: [usize; 3],
@@ -59,6 +100,8 @@ impl AnisotropicFsmOrderField {
         is_solid: &(dyn Fn(DVec3) -> bool + Sync),
         is_seed: &(dyn Fn(DVec3) -> bool + Sync),
         max_sweeps: usize,
+        slope_profile: Option<&SlopeProfile>,
+        height_along: Option<&dyn HeightAlong>,
     ) -> Self {
         let [nx, ny, nz] = dims;
         let total = nx * ny * nz;
@@ -137,15 +180,123 @@ impl AnisotropicFsmOrderField {
             }
         }
 
-        // Compute Hermite gradients
-        let gradients = Self::compute_gradients(dims, h, &distances, &occupied);
-
-        Self {
+        let mut field = Self {
             min_corner,
             dims,
             h,
             distances,
-            gradients,
+            gradients: Vec::new(),
+        };
+
+        if let Some(profile) = slope_profile {
+            let default_height =
+                crate::height_along::ConstantAxisHeight::new(glam::DVec3::Z, min_corner);
+            let ha: &dyn HeightAlong = height_along.unwrap_or(&default_height);
+            field.relax_with_slope_limit(profile, ha, &occupied);
+        }
+
+        // Compute Hermite gradients
+        field.gradients = Self::compute_gradients(dims, h, &field.distances, &occupied);
+        field
+    }
+
+    /// Enforces the machine's slope limit profile (Lipschitz extension) post-sweep:
+    /// `|phi(p) - phi(q)| <= tan(max_angle) * h` for every pair of horizontally
+    /// adjacent grid nodes `(p, q)`.
+    fn relax_with_slope_limit(
+        &mut self,
+        profile: &SlopeProfile,
+        height_along: &dyn HeightAlong,
+        occupied: &[bool],
+    ) {
+        let [nx, ny, nz] = self.dims;
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let idx = x + y * nx + z * nx * ny;
+                    if occupied[idx] && self.distances[idx].is_finite() {
+                        heap.push(HeapEntry {
+                            value: self.distances[idx],
+                            x,
+                            y,
+                            z,
+                        });
+                    }
+                }
+            }
+        }
+
+        const NEAR_VERTICAL_ANGLE_DEG: f64 = 89.999;
+        const NEIGHBOR_OFFSETS: [(isize, isize, isize); 6] = [
+            (-1, 0, 0),
+            (1, 0, 0),
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+        ];
+
+        while let Some(HeapEntry { value, x, y, z }) = heap.pop() {
+            let idx = x + y * nx + z * nx * ny;
+            if self.distances[idx] < value {
+                continue;
+            }
+            let t_p = self.distances[idx];
+
+            let p = DVec3::new(
+                self.min_corner.x + x as f64 * self.h,
+                self.min_corner.y + y as f64 * self.h,
+                self.min_corner.z + z as f64 * self.h,
+            );
+            let height = height_along.height(p);
+            if height.is_nan() {
+                continue;
+            }
+            let max_angle = profile.max_slope_at(height);
+            if !max_angle.is_finite() || max_angle >= NEAR_VERTICAL_ANGLE_DEG {
+                continue;
+            }
+            let slope_multiplier = max_angle.to_radians().tan();
+            if !slope_multiplier.is_finite() {
+                continue;
+            }
+
+            for (dx, dy, dz) in NEIGHBOR_OFFSETS {
+                if dx == 0 && dy == 0 {
+                    // Pure vertical neighbor: leave unconstrained so vertical progression is not throttled
+                    continue;
+                }
+                let nxp = x as isize + dx;
+                let nyp = y as isize + dy;
+                let nzp = z as isize + dz;
+                if nxp < 0
+                    || nyp < 0
+                    || nzp < 0
+                    || nxp as usize >= nx
+                    || nyp as usize >= ny
+                    || nzp as usize >= nz
+                {
+                    continue;
+                }
+                let (nxu, nyu, nzu) = (nxp as usize, nyp as usize, nzp as usize);
+                let nidx = nxu + nyu * nx + nzu * nx * ny;
+                if !occupied[nidx] {
+                    continue;
+                }
+
+                let candidate = t_p + slope_multiplier * self.h;
+                if candidate < self.distances[nidx] {
+                    self.distances[nidx] = candidate;
+                    heap.push(HeapEntry {
+                        value: candidate,
+                        x: nxu,
+                        y: nyu,
+                        z: nzu,
+                    });
+                }
+            }
         }
     }
 
@@ -633,6 +784,8 @@ mod tests {
             &is_solid,
             &is_seed,
             8,
+            None,
+            None,
         );
 
         // Distance = 4.0 along X: speed is 2.0 => arrival time ~ 2.0
@@ -650,6 +803,69 @@ mod tests {
             "Expected ~4.0 along Y, got {}",
             t_y
         );
+    }
+
+    #[test]
+    fn fsm_respects_slope_limit_profile() {
+        let min = DVec3::new(0.0, 0.0, 0.0);
+        let h = 0.5;
+        let dims = [21, 21, 21];
+
+        let tensor_grid = TensorGrid::new_isotropic(min, dims, h);
+        let is_solid = |_p: DVec3| true;
+        let is_seed = |p: DVec3| p.distance(DVec3::ZERO) < 0.25;
+
+        let max_angle_deg = 15.0;
+        let profile = SlopeProfile::from_angle(max_angle_deg);
+        let height_along = crate::height_along::ConstantAxisHeight::new(glam::DVec3::Z, min);
+
+        let field = AnisotropicFsmOrderField::solve_with_tensor_grid(
+            min,
+            dims,
+            h,
+            &tensor_grid,
+            &is_solid,
+            &is_seed,
+            8,
+            Some(&profile),
+            Some(&height_along),
+        );
+
+        let [nx, ny, nz] = dims;
+        let tan_bound = max_angle_deg.to_radians().tan();
+        let max_allowed_h_step = tan_bound * h + 1e-4;
+
+        for z in 1..nz - 1 {
+            for y in 1..ny - 1 {
+                for x in 1..nx - 1 {
+                    let idx = x + y * nx + z * nx * ny;
+                    let val = field.distances[idx];
+                    if !val.is_finite() {
+                        continue;
+                    }
+                    let right = field.distances[idx + 1];
+                    let up = field.distances[idx + nx];
+                    if right.is_finite() {
+                        let diff = (val - right).abs();
+                        assert!(
+                            diff <= max_allowed_h_step,
+                            "Horizontal step X exceeded slope bound: diff={}, max={}",
+                            diff,
+                            max_allowed_h_step
+                        );
+                    }
+                    if up.is_finite() {
+                        let diff = (val - up).abs();
+                        assert!(
+                            diff <= max_allowed_h_step,
+                            "Horizontal step Y exceeded slope bound: diff={}, max={}",
+                            diff,
+                            max_allowed_h_step
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

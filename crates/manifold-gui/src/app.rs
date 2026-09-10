@@ -1731,52 +1731,62 @@ impl ManifoldApp {
             );
         }
         if self.config.order_field == OrderFieldKind::AnisotropicFsm {
-            let mut top_aspect = self.config.fsm_top_tangency_aspect();
-            if drag_num(
-                ui,
-                &mut top_aspect,
-                0.05,
-                0.01..=f64::INFINITY,
-                "Top tangency aspect ratio",
+            ui.checkbox(
+                &mut self.config.fsm_boundary_metrics_enabled,
+                "Enable boundary metrics",
             )
             .on_hover_text(
-                "Metric tensor aspect ratio along top surface normals. Values > 1.0 curve layers into near-tangency; values < 1.0 curve layers into orthogonality.",
-            )
-            .changed()
-            {
-                self.config.fsm_top_tangency_aspect = Some(top_aspect);
-            }
+                "When checked, blends directional metric tensors near top cosmetic and wall boundaries. When unchecked (default), solves isotropic front propagation with slope limit relaxation.",
+            );
 
-            let mut wall_aspect = self.config.fsm_wall_ortho_aspect();
-            if drag_num(
-                ui,
-                &mut wall_aspect,
-                0.05,
-                0.01..=f64::INFINITY,
-                "Wall orthogonality aspect ratio",
-            )
-            .on_hover_text(
-                "Metric tensor aspect ratio along vertical wall surfaces. Values > 1.0 curve layers into perpendicular (orthogonal) intersections; values < 1.0 curve layers into tangency.",
-            )
-            .changed()
-            {
-                self.config.fsm_wall_ortho_aspect = Some(wall_aspect);
-            }
+            if self.config.fsm_boundary_metrics_enabled {
+                let mut top_aspect = self.config.fsm_top_tangency_aspect();
+                if drag_num(
+                    ui,
+                    &mut top_aspect,
+                    0.05,
+                    0.01..=f64::INFINITY,
+                    "Top tangency aspect ratio",
+                )
+                .on_hover_text(
+                    "Metric tensor aspect ratio along top surface normals. Values > 1.0 curve layers into near-tangency; values < 1.0 curve layers into orthogonality.",
+                )
+                .changed()
+                {
+                    self.config.fsm_top_tangency_aspect = Some(top_aspect);
+                }
 
-            let mut skin_depth = self.config.fsm_skin_depth_mm();
-            if drag_num(
-                ui,
-                &mut skin_depth,
-                0.1,
-                0.0..=f64::INFINITY,
-                "Tensor skin depth (mm)",
-            )
-            .on_hover_text(
-                "Subsurface depth (mm) within which surface anisotropic metric tensors are blended with the isotropic background.",
-            )
-            .changed()
-            {
-                self.config.fsm_skin_depth_mm = Some(skin_depth);
+                let mut wall_aspect = self.config.fsm_wall_ortho_aspect();
+                if drag_num(
+                    ui,
+                    &mut wall_aspect,
+                    0.05,
+                    0.01..=f64::INFINITY,
+                    "Wall orthogonality aspect ratio",
+                )
+                .on_hover_text(
+                    "Metric tensor aspect ratio along vertical wall surfaces. Values > 1.0 curve layers into perpendicular (orthogonal) intersections; values < 1.0 curve layers into tangency.",
+                )
+                .changed()
+                {
+                    self.config.fsm_wall_ortho_aspect = Some(wall_aspect);
+                }
+
+                let mut skin_depth = self.config.fsm_skin_depth_mm();
+                if drag_num(
+                    ui,
+                    &mut skin_depth,
+                    0.1,
+                    0.0..=f64::INFINITY,
+                    "Tensor skin depth (mm)",
+                )
+                .on_hover_text(
+                    "Subsurface depth (mm) within which surface anisotropic metric tensors are blended with the isotropic background.",
+                )
+                .changed()
+                {
+                    self.config.fsm_skin_depth_mm = Some(skin_depth);
+                }
             }
 
             let mut sweeps = self.config.fsm_max_sweeps();

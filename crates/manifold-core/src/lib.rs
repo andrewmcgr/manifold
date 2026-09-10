@@ -500,6 +500,11 @@ pub struct SlicerConfig {
     /// Defaults to 400.0 Hz to prevent Klipper serial buffer starvation.
     #[serde(default)]
     pub slicer_pa_max_frequency_hz: Option<f64>,
+    /// Anisotropic FSM order field: whether to blend anisotropic metric tensors
+    /// along top cosmetic and wall boundaries.
+    /// When `false` (default), front propagation uses an isotropic metric with slope limit relaxation.
+    #[serde(default)]
+    pub fsm_boundary_metrics_enabled: bool,
     /// Anisotropic FSM order field: aspect ratio for top cosmetic surface tangency.
     /// Values > 1.0 curve the order field into near-tangency with upward surfaces.
     /// Defaults to 4.0.
@@ -693,6 +698,7 @@ impl Default for SlicerConfig {
             slicer_pa_tolerance_mm: None,
             slicer_pa_min_segment_length: None,
             slicer_pa_max_frequency_hz: None,
+            fsm_boundary_metrics_enabled: false,
             fsm_top_tangency_aspect: None,
             fsm_wall_ortho_aspect: None,
             fsm_skin_depth_mm: None,
@@ -1148,6 +1154,13 @@ impl SlicerConfig {
     #[must_use]
     pub fn slicer_pa_max_frequency_hz(&self) -> f64 {
         self.slicer_pa_max_frequency_hz.unwrap_or(400.0).max(10.0)
+    }
+
+    /// Returns whether anisotropic FSM boundary metric tensor blending is enabled.
+    /// Defaults to `false`.
+    #[must_use]
+    pub fn fsm_boundary_metrics_enabled(&self) -> bool {
+        self.fsm_boundary_metrics_enabled
     }
 
     /// Returns the anisotropic FSM top surface tangency aspect ratio, defaulting to 4.0.
