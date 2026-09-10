@@ -701,6 +701,7 @@ pub fn slice_mesh_with_progress(
     // CONTOUR_RESOLUTION grid on empty space for any object where height
     // dominates footprint, causing near-tip/near-base layers to fall
     // between grid samples and come back with zero contour loops.
+    let (axis, _apex, _) = order_field::resolve_axis_apex_slope(config.order_field, config);
     let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
     let extent = in_plane_extent(min, max, basis1, basis2);
 
@@ -793,12 +794,56 @@ pub fn slice_mesh_with_progress(
     // top of arches and domes. Planar Height mode is exempt as its flat layers already cover
     // planar ceilings up to order_max.
     if !is_height {
+        // Find intermediate feature summits in wall_meshes[0] (arches, spires, domes)
+        // that terminate between stepped layers, so each distinct feature receives a crown layer.
+        if let Some((positions, orders)) = wall_meshes.first() {
+            if !positions.is_empty() {
+                let mut sorted_indices: Vec<usize> = (0..positions.len())
+                    .filter(|&i| orders[i].is_finite() && orders[i] > order_min)
+                    .collect();
+                sorted_indices.sort_unstable_by(|&a, &b| orders[b].total_cmp(&orders[a]));
+
+                let mut accepted_peaks: Vec<(DVec3, f64)> = Vec::new();
+                let cluster_radius_sq = (config.wall_line_width * 10.0).powi(2);
+
+                for &idx in &sorted_indices {
+                    let p = positions[idx];
+                    let o = orders[idx];
+                    let is_new_peak = accepted_peaks
+                        .iter()
+                        .all(|&(peak_p, _)| peak_p.distance_squared(p) > cluster_radius_sq);
+                    if is_new_peak {
+                        accepted_peaks.push((p, o));
+                        if accepted_peaks.len() >= 32 {
+                            break;
+                        }
+                    }
+                }
+
+                for (_, peak_order) in accepted_peaks {
+                    if peak_order < effective_order_max - 0.05 * layer_height {
+                        if let Some(&below) = order_values.iter().rfind(|&&v| v < peak_order) {
+                            let gap = peak_order - below;
+                            if gap > 0.05 * layer_height {
+                                let layer_val = (peak_order - 0.005).max(below + 0.01);
+                                if !order_values.iter().any(|&v| (v - layer_val).abs() < 0.005) {
+                                    order_values.push(layer_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(&last) = order_values.last() {
             let remainder = effective_order_max - last;
             if remainder > 0.05 * layer_height {
                 order_values.push(effective_order_max);
             }
         }
+        order_values.sort_by(|a, b| a.total_cmp(b));
+        order_values.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
     }
 
     let total_steps = order_values.len().max(1);
@@ -893,8 +938,10 @@ pub fn slice_mesh_with_progress(
                     });
                 }
 
-                // Walls 1..wall_count: extracted directly from their 3D isosurfaces
+                // Walls 1..wall_count: extracted directly from their 3D isosurfaces,
+                // falling back to insetting from the previous wall pass (w - 1) if capped beneath a roof.
                 for w in 1..wall_count {
+                    let mut extracted_w_loops = Vec::new();
                     if w < wall_meshes.len() {
                         let (w_loops, _) = extract_order_contours_on_mesh_with_debug(
                             &wall_meshes[w].0,
@@ -903,30 +950,68 @@ pub fn slice_mesh_with_progress(
                             BUILD_DIRECTION,
                         );
                         for pts in w_loops {
-                            if pts.len() < 3 || loop_perimeter(&pts) < 3.0 * config.nozzle_diameter
+                            if pts.len() >= 3
+                                && loop_perimeter(&pts) >= 3.0 * config.nozzle_diameter
                             {
-                                continue;
+                                extracted_w_loops.push(pts);
                             }
-                            let arc_fraction = compute_arc_fractions(&pts);
-                            let n_pts = pts.len();
-                            let mid_2d =
-                                [(pts[0] - origin).dot(basis1), (pts[0] - origin).dot(basis2)];
-                            let island = outers
-                                .iter()
-                                .position(|out| polygon2d::point_in_polygon(mid_2d, out))
-                                .unwrap_or(0);
-                            loops.push(WallLoop {
-                                is_open: false,
-                                wall_index: w,
-                                island,
-                                unsupported: vec![false; n_pts],
-                                top_surface: Vec::new(),
-                                arc_fraction,
-                                line_widths: vec![config.wall_line_width; n_pts],
-                                channel_width: vec![f64::INFINITY; n_pts],
-                                points: pts,
-                            });
                         }
+                    }
+
+                    if extracted_w_loops.is_empty() {
+                        let prev_wall_pts: Vec<Vec<DVec3>> = loops
+                            .iter()
+                            .filter(|l| l.wall_index == w - 1)
+                            .map(|l| l.points.clone())
+                            .collect();
+                        if !prev_wall_pts.is_empty() {
+                            let prev_2d = polygon2d::to_2d(&prev_wall_pts, basis1, basis2, origin);
+                            let canonical_prev = polygon2d::canonicalize(&prev_2d);
+                            let inset =
+                                polygon2d::inward_offset(&canonical_prev, config.wall_line_width);
+                            if !inset.is_empty() {
+                                let max_along = (config.layer_height * 20.0).max(5.0);
+                                let inset_3d = order_field::reconstruct_on_order_field_near(
+                                    inset,
+                                    &prev_wall_pts,
+                                    basis1,
+                                    basis2,
+                                    axis,
+                                    origin,
+                                    order_value,
+                                    max_along,
+                                    field.as_ref(),
+                                );
+                                for pts in inset_3d {
+                                    if pts.len() >= 3
+                                        && loop_perimeter(&pts) >= 3.0 * config.nozzle_diameter
+                                    {
+                                        extracted_w_loops.push(pts);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    for pts in extracted_w_loops {
+                        let arc_fraction = compute_arc_fractions(&pts);
+                        let n_pts = pts.len();
+                        let mid_2d = [(pts[0] - origin).dot(basis1), (pts[0] - origin).dot(basis2)];
+                        let island = outers
+                            .iter()
+                            .position(|out| polygon2d::point_in_polygon(mid_2d, out))
+                            .unwrap_or(0);
+                        loops.push(WallLoop {
+                            is_open: false,
+                            wall_index: w,
+                            island,
+                            unsupported: vec![false; n_pts],
+                            top_surface: Vec::new(),
+                            arc_fraction,
+                            line_widths: vec![config.wall_line_width; n_pts],
+                            channel_width: vec![f64::INFINITY; n_pts],
+                            points: pts,
+                        });
                     }
                 }
             }
@@ -992,7 +1077,21 @@ pub fn slice_mesh_with_progress(
                     let canonical_2d = polygon2d::canonicalize(&loops_2d);
                     let inset = polygon2d::inward_offset(&canonical_2d, config.wall_line_width);
                     if !inset.is_empty() {
-                        found_ib = polygon2d::from_2d(inset, basis1, basis2, origin);
+                        let max_along = (config.layer_height * 20.0).max(5.0);
+                        let inset_3d = order_field::reconstruct_on_order_field_near(
+                            inset,
+                            &wall0_loops,
+                            basis1,
+                            basis2,
+                            axis,
+                            origin,
+                            order_value,
+                            max_along,
+                            field.as_ref(),
+                        );
+                        if !inset_3d.is_empty() {
+                            found_ib = inset_3d;
+                        }
                     }
                 }
                 found_ib

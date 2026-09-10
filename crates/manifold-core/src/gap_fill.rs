@@ -183,7 +183,15 @@ pub fn plan_gap_fill_for_wall(
     let mut gap_points_outer: Vec<Option<GapPoint>> = vec![None; point_count];
     let mut gap_points_inner: Vec<Option<GapPoint>> = vec![None; point_count];
 
-    let is_innermost = wall_loop.wall_index + 1 >= config.wall_count();
+    let max_w_on_island = layer
+        .loops
+        .iter()
+        .filter(|l| l.island == wall_loop.island)
+        .map(|l| l.wall_index)
+        .max()
+        .unwrap_or(0);
+    let is_innermost =
+        wall_loop.wall_index >= max_w_on_island || wall_loop.wall_index + 1 >= config.wall_count();
 
     for i in 0..point_count {
         let p = wall_loop.points[i];
