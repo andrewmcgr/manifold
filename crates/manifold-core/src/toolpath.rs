@@ -2898,6 +2898,39 @@ pub fn plan_with_progress(
                     let is_first_layer =
                         bed_fraction > 0.0 || (layer.order - order_min).abs() < 1e-6;
 
+                    // Reclassify severely unsupported perimeter moves (e.g. horizontal underside of arches)
+                    // as Overhang or Bridge based on physical substrate support from below.
+                    if !is_first_layer
+                        && layer.mesh_sdf.is_some()
+                        && (segment.kind == MoveKind::WallOuter
+                            || segment.kind == MoveKind::WallInner)
+                        && segment.support_fraction < 0.25
+                    {
+                        let (sup_start, _) = support_fractions_at(
+                            start,
+                            segment.order,
+                            layer.order_field.as_ref(),
+                            layer.mesh_sdf.as_deref(),
+                            bed_z,
+                            config,
+                        );
+                        let (sup_end, _) = support_fractions_at(
+                            end,
+                            segment.order,
+                            layer.order_field.as_ref(),
+                            layer.mesh_sdf.as_deref(),
+                            bed_z,
+                            config,
+                        );
+                        if sup_start >= 0.50 && sup_end >= 0.50 {
+                            segment.kind = MoveKind::Bridge;
+                            segment.speed = config.bridge_speed();
+                        } else {
+                            segment.kind = MoveKind::Overhang;
+                            segment.speed = speed_for_kind(MoveKind::Overhang, config);
+                        }
+                    }
+
                     // Physical surface-geometry and layer-gap compensation:
                     // 1. Local layer height: adapts to order field gradient compression ||grad phi||
                     //    near folds, summits, and converging wavefronts (h_local = h_nom / ||grad phi||).
@@ -2943,9 +2976,13 @@ pub fn plan_with_progress(
                         1.0
                     };
                     let is_overhang = segment.kind == MoveKind::Overhang;
+                    let is_bridge = segment.kind == MoveKind::Bridge;
                     let raw_bead_area = if is_overhang {
                         let track_w = config.nozzle_diameter - config.wave_overhang_overlap();
                         track_w * effective_layer_height * config.wave_overhang_flow()
+                    } else if is_bridge {
+                        let d_nozzle = config.nozzle_diameter;
+                        0.25 * std::f64::consts::PI * d_nozzle * d_nozzle * 0.90
                     } else {
                         extrusion::blended_bead_cross_section_area(
                             effective_line_width,
@@ -2955,7 +2992,9 @@ pub fn plan_with_progress(
                             bed_fraction,
                         )
                     };
-                    let bead_area = if config.bead_clearance_compensation_enabled() && !is_overhang
+                    let bead_area = if config.bead_clearance_compensation_enabled()
+                        && !is_overhang
+                        && !is_bridge
                     {
                         extrusion::clamped_bead_cross_section_area(
                             effective_line_width,
@@ -2995,6 +3034,8 @@ pub fn plan_with_progress(
                     let motion_model = config.resolved_motion_model(machine);
                     let nominal_speed = if is_overhang {
                         config.wave_overhang_speed()
+                    } else if is_bridge {
+                        config.bridge_speed()
                     } else {
                         motion_model.max_directional_feedrate(
                             segment.kind,

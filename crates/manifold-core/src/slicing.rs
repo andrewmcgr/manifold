@@ -804,7 +804,7 @@ pub fn slice_mesh_with_progress(
                 sorted_indices.sort_unstable_by(|&a, &b| orders[b].total_cmp(&orders[a]));
 
                 let mut accepted_peaks: Vec<(DVec3, f64)> = Vec::new();
-                let cluster_radius_sq = (config.wall_line_width * 10.0).powi(2);
+                let cluster_radius_sq = 15.0f64.powi(2);
 
                 for &idx in &sorted_indices {
                     let p = positions[idx];
@@ -824,8 +824,8 @@ pub fn slice_mesh_with_progress(
                     if peak_order < effective_order_max - 0.05 * layer_height {
                         if let Some(&below) = order_values.iter().rfind(|&&v| v < peak_order) {
                             let gap = peak_order - below;
-                            if gap > 0.05 * layer_height {
-                                let layer_val = (peak_order - 0.005).max(below + 0.01);
+                            if gap >= 0.10 * layer_height {
+                                let layer_val = (peak_order - 0.005).max(below + 0.02);
                                 if !order_values.iter().any(|&v| (v - layer_val).abs() < 0.005) {
                                     order_values.push(layer_val);
                                 }
