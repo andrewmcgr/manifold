@@ -2437,16 +2437,7 @@ pub fn plan_with_progress(
                 if wall_loop.points.is_empty() {
                     continue;
                 }
-                // Tangent surfaces should not have inner walls or bulk infill, only the wave fill.
-                if wall_loop.wall_index > 0 && !canonical_tangent_footprint.is_empty() {
-                    let is_inside_tangent = wall_loop.points.iter().any(|p| {
-                        let p_2d = [(p - origin).dot(basis1), (p - origin).dot(basis2)];
-                        crate::polygon2d::contains_point(&canonical_tangent_footprint, p_2d)
-                    });
-                    if is_inside_tangent {
-                        continue;
-                    }
-                }
+                // Walls 0..wall_count are structural perimeters and must always print.
                 // Placeholder metadata: real support/bridge/overhang
                 // classification and speed/extrusion-rate planning is future
                 // work (see toolpath-metadata-phase12 subtask 03). Wall
@@ -2648,7 +2639,8 @@ pub fn plan_with_progress(
                     );
                 }
 
-                if !all_solid_loops.is_empty() {
+                // Bottom solid layers must remain 100% solid base floors; never subtract them by overhang footprints.
+                if !all_solid_loops.is_empty() && layer.index >= config.bottom_layers {
                     let solid_2d =
                         crate::polygon2d::to_2d(&all_solid_loops, basis1, basis2, origin);
                     let diff = crate::polygon2d::difference(&solid_2d, &canonical_footprint);

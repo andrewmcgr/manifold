@@ -263,10 +263,12 @@ pub fn plan_tangent_surfaces(
                     let speed = crate::toolpath::speed_for_kind(kind, config);
 
                     let mut reverse = false;
+                    let mut generated_any_path = false;
                     for poly in wave_polylines_3d {
                         if poly.len() < 2 {
                             continue;
                         }
+                        generated_any_path = true;
                         let pts = if reverse {
                             poly.into_iter().rev().collect()
                         } else {
@@ -298,15 +300,17 @@ pub fn plan_tangent_surfaces(
                         });
                     }
 
-                    match true_orientation {
-                        TangentOrientation::Downward => {
-                            layer_downward_footprints.push(shape.outer.clone());
+                    if generated_any_path {
+                        match true_orientation {
+                            TangentOrientation::Downward => {
+                                layer_downward_footprints.push(shape.outer.clone());
+                            }
+                            TangentOrientation::Upward => {
+                                layer_upward_footprints.push(shape.outer.clone());
+                            }
                         }
-                        TangentOrientation::Upward => {
-                            layer_upward_footprints.push(shape.outer.clone());
-                        }
+                        layer_all_footprints.push(shape.outer);
                     }
-                    layer_all_footprints.push(shape.outer);
                 }
             }
 

@@ -117,19 +117,27 @@ fn main() -> anyhow::Result<()> {
         &mut |_| {},
     )?;
 
-    for layer in &layers {
+    for layer in &layers[0..=4] {
         let sliced_wall0 = layer.loops.iter().filter(|l| l.wall_index == 0).count();
         let mut kind_counts: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut path_count = 0usize;
         for p in &paths {
-            for s in &p.segments {
-                if (s.order - layer.order).abs() < 1e-9 {
-                    *kind_counts.entry(format!("{:?}", s.kind)).or_insert(0) += 1;
+            let matches_layer = p
+                .segments
+                .iter()
+                .any(|s| (s.order - layer.order).abs() < 1e-6);
+            if matches_layer {
+                path_count += 1;
+                for s in &p.segments {
+                    if (s.order - layer.order).abs() < 1e-6 {
+                        *kind_counts.entry(format!("{:?}", s.kind)).or_insert(0) += 1;
+                    }
                 }
             }
         }
         println!(
-            "layer {:3} order {:7.3}: sliced_wall0_loops={} segment_kinds={:?}",
-            layer.index, layer.order, sliced_wall0, kind_counts
+            "LAYER {:3} (order {:7.3}): paths={} sliced_wall0={} segment_kinds={:?}",
+            layer.index, layer.order, path_count, sliced_wall0, kind_counts
         );
     }
 
