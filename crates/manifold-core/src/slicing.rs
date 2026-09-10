@@ -787,6 +787,19 @@ pub fn slice_mesh_with_progress(
         order_values.push(order_value);
         order_value += layer_height;
     }
+    // If the model summit extends beyond the last stepped layer by more than a negligible
+    // fraction, emit a final layer at effective_order_max for non-planar fields (DualIso,
+    // Eikonal, Conical, FSM) to close the roof/crown and prevent leaving an open hole at the
+    // top of arches and domes. Planar Height mode is exempt as its flat layers already cover
+    // planar ceilings up to order_max.
+    if !is_height {
+        if let Some(&last) = order_values.last() {
+            let remainder = effective_order_max - last;
+            if remainder > 0.05 * layer_height {
+                order_values.push(effective_order_max);
+            }
+        }
+    }
 
     let total_steps = order_values.len().max(1);
 
@@ -955,16 +968,34 @@ pub fn slice_mesh_with_progress(
                     }
                 }
                 polygon2d::from_2d(layer_infill_2d, basis1, basis2, origin)
-            } else if wall_count < wall_meshes.len() {
-                let (ib_loops, _) = extract_order_contours_on_mesh_with_debug(
-                    &wall_meshes[wall_count].0,
-                    &wall_meshes[wall_count].1,
-                    order_value,
-                    BUILD_DIRECTION,
-                );
-                ib_loops
             } else {
-                Vec::new()
+                // Infill boundary for DualIso / Eikonal: try the deepest wall mesh (wall_count).
+                // If the interior cavity has narrowed or capped under a roof, fall back to the
+                // deepest inner wall mesh that exists on this layer, or inset from wall 0.
+                let mut found_ib = Vec::new();
+                for w in (1..=wall_count).rev() {
+                    if w < wall_meshes.len() {
+                        let (ib_loops, _) = extract_order_contours_on_mesh_with_debug(
+                            &wall_meshes[w].0,
+                            &wall_meshes[w].1,
+                            order_value,
+                            BUILD_DIRECTION,
+                        );
+                        if !ib_loops.is_empty() {
+                            found_ib = ib_loops;
+                            break;
+                        }
+                    }
+                }
+                if found_ib.is_empty() && !wall0_loops.is_empty() {
+                    let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
+                    let canonical_2d = polygon2d::canonicalize(&loops_2d);
+                    let inset = polygon2d::inward_offset(&canonical_2d, config.wall_line_width);
+                    if !inset.is_empty() {
+                        found_ib = polygon2d::from_2d(inset, basis1, basis2, origin);
+                    }
+                }
+                found_ib
             };
             Layer {
                 index,
@@ -2641,45 +2672,8 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             .collect();
         let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
 
-        // Determine whether layer index `k` increases with physical height (Z)
-        // or decreases (HeightOrderField has `order = -z`, so index 0 is top;
-        // EikonalOrderField seeds from bed, so index 0 is bottom).
-        let z_at = |pos: usize| -> f64 {
-            let mut sum_z = 0.0;
-            let mut count = 0usize;
-            for pts in &layers[pos].infill_boundary {
-                for p in pts {
-                    sum_z += p.z;
-                    count += 1;
-                }
-            }
-            if count == 0 {
-                for wall in &layers[pos].loops {
-                    for p in &wall.points {
-                        sum_z += p.z;
-                        count += 1;
-                    }
-                }
-            }
-            if count > 0 {
-                sum_z / count as f64
-            } else {
-                0.0
-            }
-        };
-
-        let first_real_pos = positions
-            .iter()
-            .copied()
-            .find(|&p| !layers[p].infill_boundary.is_empty() || !layers[p].loops.is_empty());
-        let last_real_pos = positions
-            .iter()
-            .copied()
-            .rfind(|&p| !layers[p].infill_boundary.is_empty() || !layers[p].loops.is_empty());
-        let z_increases = match (first_real_pos, last_real_pos) {
-            (Some(f), Some(l)) if f != l => z_at(l) >= z_at(f),
-            _ => false,
-        };
+        let group_layers: Vec<Layer> = positions.iter().map(|&p| layers[p].clone()).collect();
+        let z_increases = layer_z_increases(&group_layers);
 
         // Minimum printable solid-fill area: 0.25 * nozzle_diameter^2 (~0.04 mm^2 for a 0.4mm nozzle).
         // Preserves narrow top-flange crowns and rims while filtering microscopic numerical noise.
@@ -3533,6 +3527,44 @@ mod tests {
                 assert!(!l.points.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn slice_mesh_dual_iso_generates_final_summit_layer_for_fractional_height() {
+        let config = SlicerConfig {
+            layer_height: 0.20,
+            order_field: crate::order_field::OrderFieldKind::DualIso,
+            ..SlicerConfig::default()
+        };
+        // Cube of height 1.13 mm (fractional height not an exact multiple of 0.20)
+        let mesh = Mesh::new(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(5.0, 0.0, 0.0),
+                DVec3::new(5.0, 5.0, 0.0),
+                DVec3::new(0.0, 5.0, 0.0),
+                DVec3::new(0.0, 0.0, 1.13),
+                DVec3::new(5.0, 0.0, 1.13),
+                DVec3::new(5.0, 5.0, 1.13),
+                DVec3::new(0.0, 5.0, 1.13),
+            ],
+            vec![
+                0, 2, 1, 0, 3, 2, // -Z
+                4, 5, 6, 4, 6, 7, // +Z
+                0, 1, 5, 0, 5, 4, // -Y
+                3, 7, 6, 3, 6, 2, // +Y
+                0, 4, 7, 0, 7, 3, // -X
+                1, 2, 6, 1, 6, 5, // +X
+            ],
+        );
+        let layers = slice_mesh(&mesh, &config).unwrap();
+        assert!(!layers.is_empty());
+        let last_order = layers.last().unwrap().order;
+        assert!(
+            last_order >= 1.05,
+            "Last layer must cover the summit, got {}",
+            last_order
+        );
     }
 
     #[test]
