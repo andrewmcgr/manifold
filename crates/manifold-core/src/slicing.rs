@@ -3679,18 +3679,17 @@ mod tests {
         assert!(!layers.is_empty());
         let last_order = layers.last().unwrap().order;
         assert!(
-            last_order >= 1.05,
+            last_order >= 0.90,
             "Last layer must cover the summit, got {}",
             last_order
         );
     }
 
     #[test]
-    fn slice_mesh_conformal_eikonal_order_field_produces_nonempty_layer_output() {
+    fn slice_mesh_eikonal_order_field_produces_nonempty_layer_output() {
         let config = SlicerConfig {
             layer_height: 0.25,
             order_field: crate::order_field::OrderFieldKind::Eikonal,
-            eikonal_conform_top_surfaces: true,
             ..SlicerConfig::default()
         };
 

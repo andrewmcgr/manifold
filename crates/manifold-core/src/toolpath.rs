@@ -2977,11 +2977,8 @@ pub fn plan_with_progress(
                             let n_xy = (n_cad.x * n_cad.x + n_cad.y * n_cad.y).sqrt();
                             let angle_from_horiz_deg = n_xy.atan2(n_cad.z.abs()).to_degrees();
 
-                            let top_max_angle =
-                                config.eikonal_conformal_max_angle_deg.unwrap_or(10.0);
-                            let bottom_max_angle = config
-                                .eikonal_conformal_bottom_max_angle_deg
-                                .unwrap_or(10.0);
+                            let top_max_angle = 10.0;
+                            let bottom_max_angle = 10.0;
 
                             let p_above = mid_point + DVec3::new(0.0, 0.0, config.layer_height);
                             let is_air_above = sdf.sample(p_above).value > 0.02;

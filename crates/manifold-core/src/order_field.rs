@@ -16,7 +16,6 @@ use manifold_fidget::fsm::AnisotropicFsmOrderField;
 use manifold_fidget::fsm_tensor::TensorGrid;
 use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{ConicalOrderField, HeightOrderField, OrderField};
-use rayon::prelude::*;
 
 // Re-exported so downstream diagnostics (e.g. the manifold-cli
 // verification examples) can name the trait when calling helpers like
@@ -248,159 +247,22 @@ fn eikonal_field_for(
             Some(&height_along),
         );
     }
-    let conform_top = config.eikonal_conform_top_surfaces;
-    let conform_bottom = config.eikonal_conform_bottom_surfaces;
     let owned_sdf;
     let sdf = match existing_sdf {
         Some(sdf) => sdf,
         None => {
-            owned_sdf = MeshSdf::new(mesh.vertices.clone(), faces.clone());
+            owned_sdf = MeshSdf::new(mesh.vertices.clone(), faces);
             &owned_sdf
         }
     };
     let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
 
-    let skin_depth = config.eikonal_conformal_skin_depth_mm();
-    let top_detach_deg = config.eikonal_conformal_max_angle_deg();
-    let bottom_detach_deg = config.eikonal_conformal_bottom_max_angle_deg();
-    let surface_weight = config.eikonal_surface_order_weight();
-
-    if !conform_top && !conform_bottom && surface_weight <= 0.0 {
-        return EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
-            min,
-            max,
-            cell_size,
-            &is_solid,
-            &is_seed_region,
-            Some(slope_profile),
-            Some(&height_along),
-        );
-    }
-
-    let side_faces = |upward: bool, detach_deg: f64| -> Vec<[usize; 3]> {
-        let cos_limit = detach_deg.to_radians().cos();
-        mesh.indices
-            .chunks_exact(3)
-            .filter_map(|chunk| {
-                let [i0, i1, i2] = [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
-                let v0 = mesh.vertices[i0];
-                let v1 = mesh.vertices[i1];
-                let v2 = mesh.vertices[i2];
-                let normal = (v1 - v0).cross(v2 - v0);
-                let normal_len = normal.length();
-                if normal_len <= 1e-9 {
-                    return None;
-                }
-                let cos_up = normal.dot(BUILD_DIRECTION) / normal_len;
-                let facing = if upward {
-                    cos_up >= cos_limit
-                } else {
-                    let on_bed = v0.z <= min.z + seed_tolerance
-                        && v1.z <= min.z + seed_tolerance
-                        && v2.z <= min.z + seed_tolerance;
-                    cos_up <= -cos_limit && !on_bed
-                };
-                facing.then_some([i0, i1, i2])
-            })
-            .collect()
-    };
-
-    let build_side_sdf = |faces: Vec<[usize; 3]>| -> Option<MeshSdf> {
-        (!faces.is_empty()).then(|| MeshSdf::new(mesh.vertices.clone(), faces))
-    };
-    let top_sdf = conform_top
-        .then(|| build_side_sdf(side_faces(true, top_detach_deg)))
-        .flatten();
-    let bottom_sdf = conform_bottom
-        .then(|| build_side_sdf(side_faces(false, bottom_detach_deg)))
-        .flatten();
-
-    let is_top_seed = |p: DVec3| {
-        top_sdf
-            .as_ref()
-            .is_some_and(|s| s.sample(p).value.abs() <= cell_size)
-    };
-    let is_bottom_seed = |p: DVec3| {
-        bottom_sdf
-            .as_ref()
-            .is_some_and(|s| s.sample(p).value.abs() <= cell_size)
-    };
-
-    let surface_min_grid: Option<Vec<f64>> = if surface_weight > 0.0 {
-        let surface_times = manifold_fidget::surface_eikonal::solve_surface_eikonal(
-            &mesh.vertices,
-            &faces,
-            is_seed_region,
-        );
-        let nx = ((max.x - min.x) / cell_size).ceil() as usize + 1;
-        let ny = ((max.y - min.y) / cell_size).ceil() as usize + 1;
-        let nz = ((max.z - min.z) / cell_size).ceil() as usize + 1;
-        let total = nx * ny * nz;
-
-        Some(
-            (0..total)
-                .into_par_iter()
-                .map(|idx| {
-                    let z = idx / (nx * ny);
-                    let y = (idx / nx) % ny;
-                    let x = idx % nx;
-                    let p = min
-                        + DVec3::new(
-                            x as f64 * cell_size,
-                            y as f64 * cell_size,
-                            z as f64 * cell_size,
-                        );
-                    let sample = sdf.sample(p);
-                    if sample.value.abs() <= skin_depth {
-                        if let Some((face_idx, closest, _)) = sdf.nearest(p) {
-                            if face_idx < faces.len() {
-                                let [i0, i1, i2] = faces[face_idx];
-                                let t = manifold_fidget::surface_eikonal::interpolate_barycentric(
-                                    mesh.vertices[i0],
-                                    mesh.vertices[i1],
-                                    mesh.vertices[i2],
-                                    surface_times[i0],
-                                    surface_times[i1],
-                                    surface_times[i2],
-                                    closest,
-                                );
-                                if t.is_finite() {
-                                    return t * surface_weight;
-                                }
-                            }
-                        }
-                    }
-                    f64::NAN
-                })
-                .collect(),
-        )
-    } else {
-        None
-    };
-
-    let options = manifold_fidget::eikonal::ConformalSurfaceOptions {
-        is_top_seed_region: top_sdf
-            .is_some()
-            .then_some(&is_top_seed as &(dyn Fn(DVec3) -> bool + Sync)),
-        is_bottom_seed_region: bottom_sdf
-            .is_some()
-            .then_some(&is_bottom_seed as &(dyn Fn(DVec3) -> bool + Sync)),
-        skin_depth_mm: skin_depth,
-        top_detach_angle_deg: top_detach_deg,
-        bottom_detach_angle_deg: bottom_detach_deg,
-        detach_feather_mm: 2.0 * config.wall_line_width,
-        target_lipschitz_constant: 1.0,
-        surface_min_order: surface_min_grid.as_deref(),
-        enforce_monotonic_growth: config.eikonal_enforce_monotonic_growth,
-    };
-    let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
-    EikonalOrderField::new_conformal_with_occupancy_and_seed_regions_and_slope_limit(
+    EikonalOrderField::new_with_occupancy_and_seed_region_and_slope_limit(
         min,
         max,
         cell_size,
         &is_solid,
         &is_seed_region,
-        &options,
         Some(slope_profile),
         Some(&height_along),
     )

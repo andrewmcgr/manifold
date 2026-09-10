@@ -1814,58 +1814,6 @@ impl ManifoldApp {
                 self.config.eikonal_surface_order_weight = Some(surface_weight);
             }
             ui.checkbox(
-                &mut self.config.eikonal_conform_top_surfaces,
-                "Conform to top surfaces",
-            );
-            if self.config.eikonal_conform_top_surfaces {
-                let mut max_angle = self.config.eikonal_conformal_max_angle_deg();
-                if drag_num(
-                    ui,
-                    &mut max_angle,
-                    0.5,
-                    0.0..=90.0,
-                    "Top conform detach angle (°)",
-                )
-                .changed()
-                {
-                    self.config.eikonal_conformal_max_angle_deg = Some(max_angle);
-                }
-            }
-            ui.checkbox(
-                &mut self.config.eikonal_conform_bottom_surfaces,
-                "Conform to bottom surfaces",
-            );
-            if self.config.eikonal_conform_bottom_surfaces {
-                let mut bottom_angle = self.config.eikonal_conformal_bottom_max_angle_deg();
-                if drag_num(
-                    ui,
-                    &mut bottom_angle,
-                    0.5,
-                    0.0..=90.0,
-                    "Bottom conform detach angle (°)",
-                )
-                .changed()
-                {
-                    self.config.eikonal_conformal_bottom_max_angle_deg = Some(bottom_angle);
-                }
-            }
-            if self.config.eikonal_conform_top_surfaces
-                || self.config.eikonal_conform_bottom_surfaces
-            {
-                let mut skin_depth = self.config.eikonal_conformal_skin_depth_mm();
-                if drag_num(
-                    ui,
-                    &mut skin_depth,
-                    0.1,
-                    0.0..=f64::INFINITY,
-                    "Conformal skin depth (mm)",
-                )
-                .changed()
-                {
-                    self.config.eikonal_conformal_skin_depth_mm = Some(skin_depth);
-                }
-            }
-            ui.checkbox(
                 &mut self.config.eikonal_enforce_monotonic_growth,
                 "Enforce vertical monotonicity",
             )

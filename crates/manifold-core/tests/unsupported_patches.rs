@@ -157,7 +157,6 @@ fn bottom_conformal_eikonal_frustum_has_no_unsupported_patches() {
         layer_height: 0.4,
         nozzle_diameter: 0.8,
         order_field: OrderFieldKind::Eikonal,
-        eikonal_conform_bottom_surfaces: true,
         ..SlicerConfig::default()
     };
     // Underside slope: atan(height / (top_half - bottom_half))
@@ -201,7 +200,6 @@ fn diag_bottom_conformal_field_monotonicity() {
         layer_height: 0.4,
         nozzle_diameter: 0.8,
         order_field: OrderFieldKind::Eikonal,
-        eikonal_conform_bottom_surfaces: true,
         ..SlicerConfig::default()
     };
     let mesh = inverted_frustum_mesh(4.0, 15.0, 3.0);
@@ -270,7 +268,6 @@ fn diag_bottom_conformal_unsupported_reasons() {
         layer_height: 0.4,
         nozzle_diameter: 0.8,
         order_field: OrderFieldKind::Eikonal,
-        eikonal_conform_bottom_surfaces: true,
         ..SlicerConfig::default()
     };
     let mesh = inverted_frustum_mesh(4.0, 15.0, 3.0);

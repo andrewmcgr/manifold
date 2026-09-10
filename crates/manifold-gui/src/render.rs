@@ -135,7 +135,7 @@ impl UploadedMesh {
                 }
                 MeshOverlayMode::ConformalRegions => {
                     let color = match config {
-                        Some(cfg) => {
+                        Some(_cfg) => {
                             let on_bed = pa.z <= min_z + seed_tolerance
                                 && pb.z <= min_z + seed_tolerance
                                 && pc.z <= min_z + seed_tolerance;
@@ -143,45 +143,7 @@ impl UploadedMesh {
                             if on_bed {
                                 // Bed contact seed: Bright Green
                                 [0.2, 0.85, 0.3, 1.0]
-                            } else if normal.z > 1e-3 {
-                                // Upward-facing
-                                if !cfg.eikonal_conform_top_surfaces {
-                                    [0.65, 0.68, 0.72, 1.0]
-                                } else {
-                                    let beta_deg = normal.z.clamp(-1.0, 1.0).acos().to_degrees();
-                                    let top_detach = cfg.eikonal_conformal_max_angle_deg();
-                                    if beta_deg <= top_detach - 5.0 {
-                                        // Top Conforming: Cyan
-                                        [0.15, 0.65, 0.95, 1.0]
-                                    } else if beta_deg <= top_detach {
-                                        // Top Transition Band: Purple
-                                        [0.6, 0.35, 0.9, 1.0]
-                                    } else {
-                                        // Steep/Detached: Default Slate Gray
-                                        [0.65, 0.68, 0.72, 1.0]
-                                    }
-                                }
-                            } else if normal.z < -1e-3 {
-                                // Downward-facing
-                                if !cfg.eikonal_conform_bottom_surfaces {
-                                    [0.65, 0.68, 0.72, 1.0]
-                                } else {
-                                    let beta_deg = (-normal.z).clamp(-1.0, 1.0).acos().to_degrees();
-                                    let bottom_detach =
-                                        cfg.eikonal_conformal_bottom_max_angle_deg();
-                                    if beta_deg <= bottom_detach - 5.0 {
-                                        // Bottom Conforming: Orange
-                                        [0.95, 0.55, 0.1, 1.0]
-                                    } else if beta_deg <= bottom_detach {
-                                        // Bottom Transition Band: Gold/Yellow
-                                        [0.95, 0.75, 0.2, 1.0]
-                                    } else {
-                                        // Steep/Detached: Default Slate Gray
-                                        [0.65, 0.68, 0.72, 1.0]
-                                    }
-                                }
                             } else {
-                                // Vertical walls
                                 [0.65, 0.68, 0.72, 1.0]
                             }
                         }
