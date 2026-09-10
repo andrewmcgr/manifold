@@ -2913,20 +2913,44 @@ pub fn plan_with_progress(
                     let is_first_layer =
                         bed_fraction > 0.0 || (layer.order - order_min).abs() < 1e-6;
 
-                    // Reclassify perimeter moves on downward-facing CAD surfaces (underside of arches / overhangs)
-                    // using the true surface normal n_cad. If n_cad.z < 0, the surface faces downwards into open air.
+                    // Geometric surface classification based on true vertical overlap along gravity (Z):
+                    // 1. Top Surface: air directly above (d_above > 0), upward-facing CAD normal (n_cad.z > 0.15),
+                    //    and close to exterior surface. Applies to WallOuter, WallInner, and Infill.
+                    // 2. Bottom Surface (Overhang / Bridge): air directly below (d_below > 0), downward-facing
+                    //    CAD normal (n_cad.z < -0.15), and near exterior boundary (d_surface <= nozzle_diameter).
+                    //    Segments anchored at both ends are classified as Bridge; others as Overhang.
+                    // 3. Interior moves: solid material both above and below remain WallInner or Infill.
                     if !is_first_layer
                         && layer.mesh_sdf.is_some()
-                        && (segment.kind == MoveKind::WallOuter
-                            || segment.kind == MoveKind::WallInner)
+                        && segment.kind != MoveKind::DebugExcluded
                     {
                         let sdf = layer.mesh_sdf.as_deref().unwrap();
+                        let d_surface = -sdf.sample(mid_point).value; // positive inside solid
                         let grad = sdf.sample(mid_point).gradient;
                         let grad_len = grad.length();
-                        if grad_len > 1e-6 && grad_len.is_finite() {
+
+                        if grad_len > 1e-6 && grad_len.is_finite() && d_surface >= -0.05 {
                             let n_cad = grad / grad_len;
-                            if n_cad.z < -0.25 {
-                                if n_cad.z < -0.75 {
+                            let p_above = mid_point + DVec3::new(0.0, 0.0, config.layer_height);
+                            let d_above = sdf.sample(p_above).value;
+                            let p_below = mid_point - DVec3::new(0.0, 0.0, config.layer_height);
+                            let d_below = sdf.sample(p_below).value;
+
+                            if d_above > 0.0
+                                && n_cad.z > 0.15
+                                && d_surface <= config.layer_height + 0.15
+                            {
+                                segment.kind = MoveKind::TopSurface;
+                            } else if d_below > 0.0
+                                && n_cad.z < -0.15
+                                && d_surface <= config.nozzle_diameter + 0.15
+                            {
+                                let start_below = start - DVec3::new(0.0, 0.0, config.layer_height);
+                                let end_below = end - DVec3::new(0.0, 0.0, config.layer_height);
+                                let start_solid = sdf.sample(start_below).value <= 0.0;
+                                let end_solid = sdf.sample(end_below).value <= 0.0;
+
+                                if (start_solid && end_solid) || n_cad.z < -0.75 {
                                     segment.kind = MoveKind::Bridge;
                                     segment.speed = config.bridge_speed();
                                 } else {
