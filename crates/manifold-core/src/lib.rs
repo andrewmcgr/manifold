@@ -496,6 +496,10 @@ pub struct SlicerConfig {
     /// Defaults to 0.75.
     #[serde(default)]
     pub transient_pressure_min_multiplier: Option<f64>,
+    /// Sensitivity exponent beta for transient nozzle pressure flow compensation: (Q_target / P_avg)^beta.
+    /// Defaults to 1.0.
+    #[serde(default)]
+    pub transient_pressure_beta: Option<f64>,
     /// Whether to model non-Newtonian fluid pressure advance directly in the slicer via error-bounded
     /// adaptive subdivision of acceleration/deceleration zones.
     #[serde(default)]
@@ -718,6 +722,7 @@ impl Default for SlicerConfig {
             wall_order: None,
             enable_transient_pressure_compensation: false,
             transient_pressure_min_multiplier: None,
+            transient_pressure_beta: None,
         }
     }
 }
@@ -1158,6 +1163,12 @@ impl SlicerConfig {
         self.transient_pressure_min_multiplier
             .unwrap_or(0.75)
             .clamp(0.1, 1.0)
+    }
+
+    /// Sensitivity exponent beta for transient pressure flow compensation, defaulting to 1.0.
+    #[must_use]
+    pub fn transient_pressure_beta(&self) -> f64 {
+        self.transient_pressure_beta.unwrap_or(1.0).clamp(0.05, 5.0)
     }
 
     /// Extruder displacement error tolerance for slicer-side pressure advance subdivision (mm), defaulting to 0.005 mm.

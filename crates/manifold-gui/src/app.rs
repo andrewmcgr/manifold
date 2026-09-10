@@ -1377,6 +1377,22 @@ impl ManifoldApp {
                 {
                     self.config.transient_pressure_min_multiplier = Some(min_mult);
                 }
+
+                let mut beta = self.config.transient_pressure_beta();
+                if drag_num(
+                    ui,
+                    &mut beta,
+                    0.05,
+                    0.05..=5.00,
+                    "Sensitivity exponent (β)",
+                )
+                .on_hover_text(
+                    "Sensitivity power-law exponent β scaling the flow compensation ratio (Q_target / P_average)^β (default 1.00). Values < 1.0 attenuate reduction; values > 1.0 make it more aggressive.",
+                )
+                .changed()
+                {
+                    self.config.transient_pressure_beta = Some(beta);
+                }
             }
 
             let mut r_spd_mms = (self.config.retraction_speed() / 60.0).round();

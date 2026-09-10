@@ -40,6 +40,8 @@ pub struct PressureTracker {
     pub current_pressure: f64,
     /// Minimum allowed flow multiplier $M_{\text{min}} \in [0.1, 1.0]$ to prevent total starvation.
     pub min_multiplier: f64,
+    /// Sensitivity exponent $\beta$ scaling the flow compensation ratio $(Q_{\text{target}} / P_{\text{average}})^\beta$.
+    pub beta: f64,
     /// Physical pressure floor ($\text{mm}^3/\text{s}$) to prevent unbounded negative values during retractions.
     pub pressure_floor: f64,
 }
@@ -49,18 +51,21 @@ impl Default for PressureTracker {
         Self {
             current_pressure: 0.0,
             min_multiplier: 0.75,
+            beta: 1.0,
             pressure_floor: 0.0,
         }
     }
 }
 
 impl PressureTracker {
-    /// Creates a new `PressureTracker` with the given minimum compensation multiplier $M_{\text{min}}$.
+    /// Creates a new `PressureTracker` with the given minimum compensation multiplier $M_{\text{min}}$
+    /// and sensitivity exponent $\beta$.
     #[must_use]
-    pub fn new(min_multiplier: f64) -> Self {
+    pub fn new(min_multiplier: f64, beta: f64) -> Self {
         Self {
             current_pressure: 0.0,
             min_multiplier: min_multiplier.clamp(0.1, 1.0),
+            beta: beta.clamp(0.05, 5.0),
             pressure_floor: 0.0,
         }
     }
@@ -98,7 +103,8 @@ impl PressureTracker {
 
         // If average pressure exceeds target flow, nozzle is pre-pressurized from previous moves.
         let multiplier = if p_average > q_target && p_average > 1e-6 {
-            (q_target / p_average).clamp(self.min_multiplier, 1.0)
+            let ratio = q_target / p_average;
+            ratio.powf(self.beta).clamp(self.min_multiplier, 1.0)
         } else {
             1.0
         };
@@ -162,7 +168,8 @@ pub fn apply_transient_flow_compensation(
     }
 
     let min_mult = config.transient_pressure_min_multiplier();
-    let mut tracker = PressureTracker::new(min_mult);
+    let beta = config.transient_pressure_beta();
+    let mut tracker = PressureTracker::new(min_mult, beta);
 
     let motion_model = config.resolved_motion_model(machine);
     let filament_area =
@@ -287,7 +294,7 @@ mod tests {
 
     #[test]
     fn single_move_at_steady_state_preserves_full_flow() {
-        let mut tracker = PressureTracker::new(0.75);
+        let mut tracker = PressureTracker::new(0.75, 1.0);
         let k_pa = 0.04; // 40ms
         let q_target = 10.0; // 10 mm³/s
         let t_move = 0.10; // 100ms
@@ -304,7 +311,7 @@ mod tests {
 
     #[test]
     fn rapid_short_infill_accumulates_pressure_and_throttles_flow() {
-        let mut tracker = PressureTracker::new(0.75);
+        let mut tracker = PressureTracker::new(0.75, 1.0);
         let k_pa = 0.05; // 50ms
         let q_target = 15.0; // 15 mm³/s
         let t_move = 0.005; // 5ms per short zig-zag stroke (e.g. 0.5mm at 100mm/s)
@@ -332,7 +339,7 @@ mod tests {
 
     #[test]
     fn travel_move_decays_residual_pressure_exponentially() {
-        let mut tracker = PressureTracker::new(0.75);
+        let mut tracker = PressureTracker::new(0.75, 1.0);
         tracker.current_pressure = 20.0;
         let k_pa = 0.04;
         let t_travel = 0.08; // 2 time constants -> e^(-2) ≈ 0.1353
@@ -348,7 +355,7 @@ mod tests {
 
     #[test]
     fn retraction_relieves_pressure_and_clamps_to_floor() {
-        let mut tracker = PressureTracker::new(0.75);
+        let mut tracker = PressureTracker::new(0.75, 1.0);
         tracker.current_pressure = 10.0;
         let k_pa = 0.04;
         let v_retract = -2.0; // -2 mm³ retraction
@@ -356,5 +363,31 @@ mod tests {
 
         tracker.process_retraction(v_retract, t_retract, k_pa);
         assert!(tracker.current_pressure >= tracker.pressure_floor);
+    }
+
+    #[test]
+    fn beta_sensitivity_scales_compensation_nonlinearly() {
+        let k_pa = 0.04;
+        let q_target = 10.0;
+        let t_move = 0.01;
+        let v_nominal = q_target * t_move;
+
+        // Baseline beta = 1.0
+        let mut tracker_base = PressureTracker::new(0.50, 1.0);
+        tracker_base.current_pressure = 20.0;
+        let (_, mult_base) = tracker_base.process_extrusion(v_nominal, t_move, k_pa);
+
+        // Sublinear beta = 0.5 (less aggressive reduction)
+        let mut tracker_mild = PressureTracker::new(0.50, 0.5);
+        tracker_mild.current_pressure = 20.0;
+        let (_, mult_mild) = tracker_mild.process_extrusion(v_nominal, t_move, k_pa);
+
+        // Superlinear beta = 2.0 (more aggressive reduction)
+        let mut tracker_sharp = PressureTracker::new(0.50, 2.0);
+        tracker_sharp.current_pressure = 20.0;
+        let (_, mult_sharp) = tracker_sharp.process_extrusion(v_nominal, t_move, k_pa);
+
+        assert!(mult_sharp < mult_base);
+        assert!(mult_base < mult_mild);
     }
 }

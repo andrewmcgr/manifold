@@ -111,7 +111,7 @@ $$P_{\text{average}} = Q_{\text{target}} + (P_{\text{start}} - Q_{\text{target}}
 ### 3. Flow Compensation Multiplier
 When $P_{\text{average}} > Q_{\text{target}}$, trapped residual nozzle pressure forces extra material out of the nozzle. The slicer reduces commanded volume:
 
-$$M = \frac{Q_{\text{target}}}{P_{\text{average}}}, \quad M_{\text{effective}} = \operatorname{clamp}(M, M_{\text{min}}, 1.0)$$
+$$M = \left(\frac{Q_{\text{target}}}{P_{\text{average}}}\right)^\beta, \quad M_{\text{effective}} = \operatorname{clamp}(M, M_{\text{min}}, 1.0)$$
 
 $$V_{\text{compensated}} = V_{\text{nominal}} \cdot M_{\text{effective}}$$
 
@@ -120,6 +120,7 @@ During travel moves, residual pressure decays exponentially toward zero ($P_{\te
 ```json
 {
   "enable_transient_pressure_compensation": true,
-  "transient_pressure_min_multiplier": 0.75
+  "transient_pressure_min_multiplier": 0.75,
+  "transient_pressure_beta": 1.0
 }
 ```

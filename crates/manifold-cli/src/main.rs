@@ -151,6 +151,10 @@ struct Cli {
     #[arg(long)]
     transient_pressure_min_multiplier: Option<f64>,
 
+    /// Sensitivity exponent beta for transient nozzle pressure flow compensation.
+    #[arg(long)]
+    transient_pressure_beta: Option<f64>,
+
     /// Static mechanical retraction distance (mm) when fluid dynamics model is enabled.
     #[arg(long)]
     static_retraction: Option<f64>,
@@ -303,6 +307,7 @@ fn main() -> Result<()> {
         fsm_max_sweeps: cli.fsm_sweeps,
         enable_transient_pressure_compensation: cli.transient_pressure_compensation,
         transient_pressure_min_multiplier: cli.transient_pressure_min_multiplier,
+        transient_pressure_beta: cli.transient_pressure_beta,
         ..SlicerConfig::default()
     };
 
