@@ -2913,13 +2913,12 @@ pub fn plan_with_progress(
                     let is_first_layer =
                         bed_fraction > 0.0 || (layer.order - order_min).abs() < 1e-6;
 
-                    // Geometric surface classification based on true vertical overlap along gravity (Z):
-                    // 1. Top Surface: air directly above (d_above > 0), upward-facing CAD normal (n_cad.z > 0.15),
-                    //    and close to exterior surface. Applies to WallOuter, WallInner, and Infill.
-                    // 2. Bottom Surface (Overhang / Bridge): air directly below (d_below > 0), downward-facing
-                    //    CAD normal (n_cad.z < -0.15), and near exterior boundary (d_surface <= nozzle_diameter).
-                    //    Segments anchored at both ends are classified as Bridge; others as Overhang.
-                    // 3. Interior moves: solid material both above and below remain WallInner or Infill.
+                    // Geometric surface classification based on skin thickness (nozzle flat diameter * sqrt(2)):
+                    // 1. Top Surface: within skin thickness of an upward-facing CAD boundary (n_cad.z > 0.15).
+                    //    Applies to WallOuter, WallInner, and Solid Infill forming the top roof shell.
+                    // 2. Bottom Surface (Overhang / Bridge): within skin thickness of a downward-facing CAD boundary (n_cad.z < -0.15).
+                    //    Near-horizontal arch ceilings (n_cad.z < -0.75) are classified as Bridge; sloped undersides as Overhang.
+                    // 3. Interior moves: moves deeper than skin thickness remain WallInner or Infill.
                     if !is_first_layer
                         && layer.mesh_sdf.is_some()
                         && segment.kind != MoveKind::DebugExcluded
@@ -2931,26 +2930,13 @@ pub fn plan_with_progress(
 
                         if grad_len > 1e-6 && grad_len.is_finite() && d_surface >= -0.05 {
                             let n_cad = grad / grad_len;
-                            let p_above = mid_point + DVec3::new(0.0, 0.0, config.layer_height);
-                            let d_above = sdf.sample(p_above).value;
-                            let p_below = mid_point - DVec3::new(0.0, 0.0, config.layer_height);
-                            let d_below = sdf.sample(p_below).value;
+                            let skin_thickness =
+                                config.nozzle_flat_diameter() * std::f64::consts::SQRT_2;
 
-                            if d_above > 0.0
-                                && n_cad.z > 0.15
-                                && d_surface <= config.layer_height + 0.15
-                            {
+                            if n_cad.z > 0.50 && d_surface <= skin_thickness {
                                 segment.kind = MoveKind::TopSurface;
-                            } else if d_below > 0.0
-                                && n_cad.z < -0.15
-                                && d_surface <= config.nozzle_diameter + 0.15
-                            {
-                                let start_below = start - DVec3::new(0.0, 0.0, config.layer_height);
-                                let end_below = end - DVec3::new(0.0, 0.0, config.layer_height);
-                                let start_solid = sdf.sample(start_below).value <= 0.0;
-                                let end_solid = sdf.sample(end_below).value <= 0.0;
-
-                                if (start_solid && end_solid) || n_cad.z < -0.75 {
+                            } else if n_cad.z < -0.50 && d_surface <= skin_thickness {
+                                if n_cad.z < -0.80 {
                                     segment.kind = MoveKind::Bridge;
                                     segment.speed = config.bridge_speed();
                                 } else {
