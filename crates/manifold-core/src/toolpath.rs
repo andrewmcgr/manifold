@@ -1300,19 +1300,20 @@ fn route_planar_xy_detour(
         clearance,
     );
 
-    // Verify detour length is reasonable (<= 2.5x direct chord distance)
+    // Verify detour length is reasonable (<= 3.0x direct chord distance or <= 40mm)
     let total_detour_len: f64 = shortcutted.windows(2).map(|w| w[0].distance(w[1])).sum();
-    if total_detour_len > (chord_dist * 2.5).max(30.0) {
+    if total_detour_len > (chord_dist * 3.0).max(40.0) {
         return None;
     }
 
     Some(shortcutted)
 }
 
-/// Tier 2 Router: Single clean trapezoidal flyover fallback. When horizontal detour
-/// is impossible or excessive, raymarches along the direct chord to find the peak
-/// printed obstacle height, performing exactly one vertical lift, one horizontal transit,
-/// and one descent.
+/// Tier 2 Router: Sloped ramped flyover using 1D upper convex hull.
+/// When horizontal detour is impossible or excessive, samples the obstacle
+/// height profile along the direct chord and builds an upper convex hull
+/// (line-of-sight profile), executing simultaneous XY+Z ramping moves
+/// without stationary vertical stalls.
 #[allow(clippy::too_many_arguments)]
 fn route_single_flyover(
     mesh_sdf: &MeshSdf,
@@ -1333,12 +1334,18 @@ fn route_single_flyover(
     let z_ceiling = max_layer_z.max(start.z).max(end.z);
     let step = (clearance * 0.5).max(0.2);
     let sample_count = ((distance / step).ceil() as usize).clamp(8, 64);
-    let mut max_solid_z = f64::NEG_INFINITY;
+    let mut profile_points: Vec<(f64, f64)> = Vec::with_capacity(sample_count + 1);
+    profile_points.push((0.0, start.z));
 
-    for s in 0..=sample_count {
+    let mut has_obstacle = false;
+
+    for s in 1..sample_count {
         let t = s as f64 / sample_count as f64;
         let mut p = start.lerp(end, t);
         let sample = mesh_sdf.sample(p);
+        let baseline_z = start.z + t * (end.z - start.z);
+        let mut req_z = baseline_z;
+
         if sample.value < clearance {
             let is_solid = if let Some(field) = order_field {
                 let p_order = field.order(p);
@@ -1347,11 +1354,8 @@ fn route_single_flyover(
                 p.z <= z_ceiling + 1e-4
             };
             if is_solid {
-                max_solid_z = max_solid_z.max(p.z);
-                // Raymarch upwards along +Z from this solid sample to locate the obstacle ceiling.
-                // Stop as soon as we exit CAD mesh (sample.value >= clearance),
-                // enter unprinted future geometry (order > current_order),
-                // or reach the physical printed ceiling (z_ceiling).
+                has_obstacle = true;
+                let mut max_solid_z = p.z;
                 let z_limit = (p.z + 5.0).min(z_ceiling);
                 while p.z < z_limit {
                     let s_up = mesh_sdf.sample(p);
@@ -1372,27 +1376,92 @@ fn route_single_flyover(
                 if p.z >= z_limit {
                     max_solid_z = max_solid_z.max(z_limit);
                 }
+                req_z = (max_solid_z + clearance)
+                    .min(z_ceiling + clearance)
+                    .max(min_travel_z);
+            }
+        }
+        profile_points.push((t, req_z));
+    }
+    profile_points.push((1.0, end.z));
+
+    if !has_obstacle {
+        return Some(vec![start, end]);
+    }
+
+    // Upper convex hull (Andrew's Monotone Chain over (t, z) profile)
+    let mut hull: Vec<(f64, f64)> = Vec::new();
+    for &(t, z) in &profile_points {
+        while hull.len() >= 2 {
+            let p1 = hull[hull.len() - 2];
+            let p2 = hull[hull.len() - 1];
+            // Cross product: (p2.t - p1.t)*(z - p2.z) - (p2.z - p1.z)*(t - p2.t)
+            let cross = (p2.0 - p1.0) * (z - p2.1) - (p2.1 - p1.1) * (t - p2.0);
+            if cross >= -1e-9 {
+                hull.pop();
+            } else {
+                break;
+            }
+        }
+        hull.push((t, z));
+    }
+
+    let mut waypoints: Vec<DVec3> = hull
+        .into_iter()
+        .map(|(t, z)| {
+            let xy = start.lerp(end, t);
+            DVec3::new(xy.x, xy.y, z)
+        })
+        .collect();
+
+    // Verify all chords in the hull
+    let mut is_clear = waypoints.windows(2).all(|w| {
+        !travel_chord_is_blocked(
+            mesh_sdf,
+            order_field,
+            current_order,
+            max_layer_z,
+            w[0],
+            w[1],
+            clearance,
+        )
+    });
+
+    if !is_clear && waypoints.len() > 2 {
+        let n_pts = waypoints.len();
+        for _ in 0..3 {
+            for pt in &mut waypoints[1..n_pts - 1] {
+                pt.z = (pt.z + 0.5 * clearance).min(z_ceiling + 2.0 * clearance);
+            }
+            if waypoints.windows(2).all(|w| {
+                !travel_chord_is_blocked(
+                    mesh_sdf,
+                    order_field,
+                    current_order,
+                    max_layer_z,
+                    w[0],
+                    w[1],
+                    clearance,
+                )
+            }) {
+                is_clear = true;
+                break;
             }
         }
     }
 
-    let fly_z = if max_solid_z.is_finite() {
-        (max_solid_z + clearance)
-            .min(z_ceiling + clearance)
-            .max(start.z)
-            .max(end.z)
-            .max(min_travel_z)
-    } else {
-        (z_ceiling + clearance)
-            .max(start.z)
-            .max(end.z)
-            .max(min_travel_z)
-    };
+    if is_clear {
+        return Some(waypoints);
+    }
 
+    // Fallback: elevated horizontal cruise if sloped hull failed verification
+    let fly_z = (z_ceiling + clearance)
+        .max(start.z)
+        .max(end.z)
+        .max(min_travel_z);
     let p_lift = DVec3::new(start.x, start.y, fly_z);
     let p_drop = DVec3::new(end.x, end.y, fly_z);
-
-    if travel_chord_is_blocked(
+    if !travel_chord_is_blocked(
         mesh_sdf,
         order_field,
         current_order,
@@ -1401,42 +1470,21 @@ fn route_single_flyover(
         p_drop,
         clearance,
     ) {
-        let mut elevated_z = fly_z;
-        for _ in 0..10 {
-            elevated_z += clearance;
-            if elevated_z > z_ceiling + 2.0 * clearance {
-                break;
-            }
-            let el_lift = DVec3::new(start.x, start.y, elevated_z);
-            let el_drop = DVec3::new(end.x, end.y, elevated_z);
-            if !travel_chord_is_blocked(
-                mesh_sdf,
-                order_field,
-                current_order,
-                max_layer_z,
-                el_lift,
-                el_drop,
-                clearance,
-            ) {
-                return Some(vec![start, el_lift, el_drop, end]);
-            }
+        let mut waypoints = Vec::with_capacity(4);
+        waypoints.push(start);
+        if p_lift.distance(start) > 1e-4 {
+            waypoints.push(p_lift);
         }
-        return None;
+        if p_drop.distance(p_lift) > 1e-4 {
+            waypoints.push(p_drop);
+        }
+        if end.distance(*waypoints.last().unwrap()) > 1e-4 {
+            waypoints.push(end);
+        }
+        return Some(waypoints);
     }
 
-    let mut waypoints = Vec::with_capacity(4);
-    waypoints.push(start);
-    if p_lift.distance(start) > 1e-4 {
-        waypoints.push(p_lift);
-    }
-    if p_drop.distance(p_lift) > 1e-4 {
-        waypoints.push(p_drop);
-    }
-    if end.distance(*waypoints.last().unwrap()) > 1e-4 {
-        waypoints.push(end);
-    }
-
-    Some(waypoints)
+    None
 }
 
 /// Routes around an obstruction between `start` and `end`:
@@ -1661,6 +1709,7 @@ fn route_travel_moves(
                  b_dir,
              }| {
                 let chord_max_z = max_layer_z.unwrap_or_else(|| a.z.max(b.z));
+
                 if !travel_chord_is_blocked(
                     mesh_sdf,
                     order_field,
@@ -5582,8 +5631,8 @@ mod tests {
         assert_eq!(pts[3], end);
         assert!(pts[1].z >= 1.0 + clearance);
         assert_eq!(pts[1].z, pts[2].z, "flyover plateau must be level");
-        assert_eq!(pts[1].x, start.x);
-        assert_eq!(pts[2].x, end.x);
+        assert!(pts[1].x >= start.x && pts[1].x <= 0.05);
+        assert!(pts[2].x <= end.x && pts[2].x >= 0.95);
     }
 
     #[test]
