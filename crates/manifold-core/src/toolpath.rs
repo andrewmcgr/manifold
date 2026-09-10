@@ -2913,12 +2913,14 @@ pub fn plan_with_progress(
                     let is_first_layer =
                         bed_fraction > 0.0 || (layer.order - order_min).abs() < 1e-6;
 
-                    // Geometric surface classification based on skin thickness (nozzle flat diameter * sqrt(2)):
-                    // 1. Top Surface: within skin thickness of an upward-facing CAD boundary (n_cad.z > 0.15).
-                    //    Applies to WallOuter, WallInner, and Solid Infill forming the top roof shell.
-                    // 2. Bottom Surface (Overhang / Bridge): within skin thickness of a downward-facing CAD boundary (n_cad.z < -0.15).
-                    //    Near-horizontal arch ceilings (n_cad.z < -0.75) are classified as Bridge; sloped undersides as Overhang.
-                    // 3. Interior moves: moves deeper than skin thickness remain WallInner or Infill.
+                    // Geometric surface classification based on skin thickness (1.4 * nozzle_diameter)
+                    // and surface angle from horizontal:
+                    // 1. Top Surface: upward-facing CAD normal within top_max_angle (default 10 deg) of horizontal,
+                    //    and within 1.4 * nozzle_diameter skin thickness.
+                    // 2. Bottom Surface (Bridge): downward-facing CAD normal within bottom_max_angle (default 10 deg)
+                    //    of horizontal (near-horizontal arch underside/ceiling).
+                    // 3. Overhang: downward-facing CAD normal between bottom_max_angle and 45 deg from horizontal.
+                    // 4. Interior / vertical moves: deeper than skin thickness or steeper than threshold remain WallInner/WallOuter.
                     if !is_first_layer
                         && layer.mesh_sdf.is_some()
                         && segment.kind != MoveKind::DebugExcluded
@@ -2930,16 +2932,26 @@ pub fn plan_with_progress(
 
                         if grad_len > 1e-6 && grad_len.is_finite() && d_surface >= -0.05 {
                             let n_cad = grad / grad_len;
-                            let skin_thickness =
-                                config.nozzle_flat_diameter() * std::f64::consts::SQRT_2;
+                            let skin_thickness = 1.4 * config.nozzle_diameter;
+                            let n_xy = (n_cad.x * n_cad.x + n_cad.y * n_cad.y).sqrt();
+                            let angle_from_horiz_deg = n_xy.atan2(n_cad.z.abs()).to_degrees();
 
-                            if n_cad.z > 0.50 && d_surface <= skin_thickness {
+                            let top_max_angle =
+                                config.eikonal_conformal_max_angle_deg.unwrap_or(10.0);
+                            let bottom_max_angle = config
+                                .eikonal_conformal_bottom_max_angle_deg
+                                .unwrap_or(10.0);
+
+                            if n_cad.z > 0.0
+                                && angle_from_horiz_deg <= top_max_angle
+                                && d_surface <= skin_thickness
+                            {
                                 segment.kind = MoveKind::TopSurface;
-                            } else if n_cad.z < -0.50 && d_surface <= skin_thickness {
-                                if n_cad.z < -0.80 {
+                            } else if n_cad.z < 0.0 && d_surface <= skin_thickness {
+                                if angle_from_horiz_deg <= bottom_max_angle {
                                     segment.kind = MoveKind::Bridge;
                                     segment.speed = config.bridge_speed();
-                                } else {
+                                } else if angle_from_horiz_deg <= 45.0 {
                                     segment.kind = MoveKind::Overhang;
                                     segment.speed = speed_for_kind(MoveKind::Overhang, config);
                                 }
