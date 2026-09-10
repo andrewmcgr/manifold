@@ -31,6 +31,7 @@ pub mod threemf;
 pub mod tool;
 pub mod toolpath;
 pub mod transform;
+pub mod transient_pressure;
 pub mod verification;
 pub mod wave_overhang;
 pub mod workspace;
@@ -484,6 +485,15 @@ pub struct SlicerConfig {
     /// Defaults to 0.5 when None (matching modern Klipper defaults).
     #[serde(default)]
     pub minimum_cruise_ratio: Option<f64>,
+    /// Whether to enable time-based dynamic residual pressure flow compensation.
+    /// Models the hotend melt zone as a first-order differential system and scales down
+    /// commanded volume when average pressure exceeds target flow on short rapid moves.
+    #[serde(default)]
+    pub enable_transient_pressure_compensation: bool,
+    /// Minimum compensation multiplier M_min for transient nozzle pressure flow compensation.
+    /// Defaults to 0.75.
+    #[serde(default)]
+    pub transient_pressure_min_multiplier: Option<f64>,
     /// Whether to model non-Newtonian fluid pressure advance directly in the slicer via error-bounded
     /// adaptive subdivision of acceleration/deceleration zones.
     #[serde(default)]
@@ -704,6 +714,8 @@ impl Default for SlicerConfig {
             fsm_skin_depth_mm: None,
             fsm_max_sweeps: None,
             wall_order: None,
+            enable_transient_pressure_compensation: false,
+            transient_pressure_min_multiplier: None,
         }
     }
 }
@@ -1138,6 +1150,14 @@ impl SlicerConfig {
         self.minimum_cruise_ratio.unwrap_or(0.5).clamp(0.0, 1.0)
     }
 
+    /// Minimum compensation multiplier M_min for transient pressure flow compensation, defaulting to 0.75.
+    #[must_use]
+    pub fn transient_pressure_min_multiplier(&self) -> f64 {
+        self.transient_pressure_min_multiplier
+            .unwrap_or(0.75)
+            .clamp(0.1, 1.0)
+    }
+
     /// Extruder displacement error tolerance for slicer-side pressure advance subdivision (mm), defaulting to 0.005 mm.
     #[must_use]
     pub fn slicer_pa_tolerance_mm(&self) -> f64 {
@@ -1300,6 +1320,14 @@ pub fn plan_toolpaths_with_progress(
         &workspace.machine.slope_profile(),
         &mut |fraction: f64| on_progress(0.5 + fraction * 0.5),
     )?;
+
+    if workspace.config.enable_transient_pressure_compensation {
+        transient_pressure::apply_transient_flow_compensation(
+            &mut paths,
+            &workspace.config,
+            Some(&workspace.machine),
+        );
+    }
 
     if workspace.config.enable_slicer_pressure_advance {
         let motion_model = workspace

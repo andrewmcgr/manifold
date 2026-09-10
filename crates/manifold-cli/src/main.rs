@@ -143,6 +143,14 @@ struct Cli {
     #[arg(long)]
     fluid_dynamics: bool,
 
+    /// Enable time-based dynamic residual pressure flow compensation.
+    #[arg(long)]
+    transient_pressure_compensation: bool,
+
+    /// Minimum compensation multiplier M_min for transient nozzle pressure flow compensation.
+    #[arg(long)]
+    transient_pressure_min_multiplier: Option<f64>,
+
     /// Static mechanical retraction distance (mm) when fluid dynamics model is enabled.
     #[arg(long)]
     static_retraction: Option<f64>,
@@ -293,6 +301,8 @@ fn main() -> Result<()> {
         fsm_wall_ortho_aspect: cli.fsm_wall_ortho,
         fsm_skin_depth_mm: cli.fsm_skin_depth,
         fsm_max_sweeps: cli.fsm_sweeps,
+        enable_transient_pressure_compensation: cli.transient_pressure_compensation,
+        transient_pressure_min_multiplier: cli.transient_pressure_min_multiplier,
         ..SlicerConfig::default()
     };
 

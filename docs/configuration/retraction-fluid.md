@@ -93,3 +93,33 @@ Over travel duration $t_{\text{travel}}$, re-primes oozed polymer:
 $$L_{\text{unretract}} = L_{\text{retract}} + L_{\text{max,ooze}} \cdot \left(1 - e^{-t_{\text{travel}} / \tau}\right)$$
 
 with relaxation time constant $\tau$ tunable down to $50\text{ ms}$ ($0.05\text{ s}$) for fast direct-drive extruders.
+
+---
+
+## Time-Based Dynamic Residual Pressure Flow Compensation
+
+When printing dense monotonic scanlines, tiny gap fills, or rapid zig-zag solid fills, toolpath segments often execute in a few milliseconds ($t_{\text{move}} \approx 3\text{--}15\text{ ms}$), far faster than the hotend's pressure advance relaxation time constant ($K = C_{\text{PA}} \approx 30\text{--}60\text{ ms}$). Because the nozzle cannot reach steady-state equilibrium, melt pressure accumulates across consecutive moves.
+
+Standard slicers use spatial lookup tables (Small Area Flow Compensation) to bluntly reduce flow on short paths, ignoring velocity and acceleration. Manifold instead models the hotend melt zone as a continuous first-order differential system across consecutive toolpath segments:
+
+### 1. State Update
+$$P_{\text{end}} = Q_{\text{target}} + (P_{\text{start}} - Q_{\text{target}}) \cdot e^{-\frac{t_{\text{move}}}{K}}$$
+
+### 2. Time-Averaged Pressure
+$$P_{\text{average}} = Q_{\text{target}} + (P_{\text{start}} - Q_{\text{target}}) \cdot \left[\frac{K}{t_{\text{move}}} \left(1 - e^{-\frac{t_{\text{move}}}{K}}\right)\right]$$
+
+### 3. Flow Compensation Multiplier
+When $P_{\text{average}} > Q_{\text{target}}$, trapped residual nozzle pressure forces extra material out of the nozzle. The slicer reduces commanded volume:
+
+$$M = \frac{Q_{\text{target}}}{P_{\text{average}}}, \quad M_{\text{effective}} = \operatorname{clamp}(M, M_{\text{min}}, 1.0)$$
+
+$$V_{\text{compensated}} = V_{\text{nominal}} \cdot M_{\text{effective}}$$
+
+During travel moves, residual pressure decays exponentially toward zero ($P_{\text{end}} = P_{\text{start}} \cdot e^{-t_{\text{travel}} / K}$). During retractions, pressure drops toward the pressure floor.
+
+```json
+{
+  "enable_transient_pressure_compensation": true,
+  "transient_pressure_min_multiplier": 0.75
+}
+```

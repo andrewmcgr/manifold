@@ -1354,6 +1354,31 @@ impl ManifoldApp {
                 }
             }
 
+            ui.checkbox(
+                &mut self.config.enable_transient_pressure_compensation,
+                "Transient nozzle pressure compensation",
+            )
+            .on_hover_text(
+                "Models the hotend melt zone as a first-order differential system and scales down commanded volume when average pressure exceeds target flow on short rapid moves (e.g. dense zig-zag infill).",
+            );
+            if self.config.enable_transient_pressure_compensation {
+                let mut min_mult = self.config.transient_pressure_min_multiplier();
+                if drag_num(
+                    ui,
+                    &mut min_mult,
+                    0.01,
+                    0.10..=1.00,
+                    "Min flow multiplier (M_min)",
+                )
+                .on_hover_text(
+                    "Safety floor for the flow compensation multiplier M to prevent total starvation (default 0.75).",
+                )
+                .changed()
+                {
+                    self.config.transient_pressure_min_multiplier = Some(min_mult);
+                }
+            }
+
             let mut r_spd_mms = (self.config.retraction_speed() / 60.0).round();
             if drag_num(
                 ui,
