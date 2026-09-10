@@ -1830,6 +1830,11 @@ impl ManifoldApp {
             .on_hover_text(
                 "Enforces strictly increasing layer order along vertical columns (dOrder/dz >= 0.15) to prevent downward stalls or mid-air floating loops.",
             );
+        }
+        if self.config.order_field == OrderFieldKind::Eikonal
+            || self.config.order_field == OrderFieldKind::DualIso
+            || self.config.order_field == OrderFieldKind::AnisotropicFsm
+        {
             ui.collapsing("Toolhead clearance profile (XZ)", |ui| {
                 ui.label("Radial distance (X) and height (Z) from nozzle tip");
                 let mut remove_index: Option<usize> = None;
@@ -3177,6 +3182,8 @@ impl ManifoldApp {
 
             let aspect_ratio = rect.width() / rect.height().max(1.0);
             let view_proj = self.camera.view_proj(aspect_ratio);
+            let camera_pos = self.camera.eye().as_vec3();
+            let bed_z = self.machine.build_volume.bounding_box().0.z as f32;
 
             ui.painter()
                 .add(eframe::egui_wgpu::Callback::new_paint_callback(
@@ -3184,6 +3191,8 @@ impl ManifoldApp {
                     Viewport3dCallback {
                         rect,
                         view_proj,
+                        camera_pos,
+                        bed_z,
                         scene: self.uploaded_scene.clone(),
                         meshes: self.uploaded_meshes.clone(),
                         overlay: self.sdf_overlay_mesh.clone(),

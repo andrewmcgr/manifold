@@ -17,7 +17,7 @@ use crate::toolpath_view::ToolpathLineInstance;
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 use egui_wgpu::wgpu::util::DeviceExt as _;
-use glam::{DVec3, Mat4};
+use glam::{DVec3, Mat4, Vec3};
 use manifold_core::mesh::Mesh;
 use manifold_fidget::marching_cubes::Vertex as FieldVertex;
 
@@ -41,6 +41,8 @@ struct CameraUniform {
     viewport_size: [f32; 2],
     line_width: f32,
     render_mode: f32,
+    camera_pos: [f32; 3],
+    bed_z: f32,
 }
 
 /// One GPU vertex: position + flat face normal + RGBA color, all in world space.
@@ -372,7 +374,7 @@ impl MeshRenderResources {
                 label: Some("manifold camera bind group layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -505,6 +507,8 @@ impl MeshRenderResources {
                 viewport_size: [1.0, 1.0],
                 line_width: 1.4,
                 render_mode: 0.0,
+                camera_pos: [0.0, 0.0, 100.0],
+                bed_z: 0.0,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -548,14 +552,18 @@ impl MeshRenderResources {
                 module: &scene_shader,
                 entry_point: "fs_main",
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(target_format.into())],
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: Some(depth_stencil_state(true)),
+            depth_stencil: Some(depth_stencil_state(false)),
             multisample: multisample_state,
             multiview: None,
             cache: None,
@@ -584,7 +592,7 @@ impl MeshRenderResources {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: Some(depth_stencil_state(true)),
+            depth_stencil: Some(depth_stencil_state(false)),
             multisample: multisample_state,
             multiview: None,
             cache: None,
@@ -854,6 +862,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         egui_encoder: &mut wgpu::CommandEncoder,
         rect: egui::Rect,
         view_proj: Mat4,
+        camera_pos: Vec3,
+        bed_z: f32,
         scene: &UploadedScene,
         meshes: &[UploadedMesh],
         overlay: Option<&UploadedMesh>,
@@ -879,6 +889,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             viewport_size: [vp_w as f32, vp_h as f32],
             line_width,
             render_mode: 0.0,
+            camera_pos: camera_pos.to_array(),
+            bed_z,
         };
         queue.write_buffer(
             &self.camera_buffer,
@@ -915,36 +927,50 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         rpass.set_viewport(vp_x as f32, vp_y as f32, vp_w as f32, vp_h as f32, 0.0, 1.0);
         rpass.set_scissor_rect(vp_x, vp_y, vp_w, vp_h);
 
-        // 1. Draw scene dressing (bed quad + origin/grid lines)
         rpass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-        rpass.set_pipeline(&self.scene_tri_pipeline);
-        rpass.set_vertex_buffer(0, scene.tri_buffer.slice(..));
-        rpass.draw(0..scene.tri_vertex_count, 0..1);
+        let draw_scene = |rpass: &mut wgpu::RenderPass| {
+            rpass.set_pipeline(&self.scene_tri_pipeline);
+            rpass.set_vertex_buffer(0, scene.tri_buffer.slice(..));
+            rpass.draw(0..scene.tri_vertex_count, 0..1);
 
-        rpass.set_pipeline(&self.scene_line_pipeline);
-        rpass.set_vertex_buffer(0, scene.line_buffer.slice(..));
-        rpass.draw(0..6, 0..scene.line_instance_count);
+            rpass.set_pipeline(&self.scene_line_pipeline);
+            rpass.set_vertex_buffer(0, scene.line_buffer.slice(..));
+            rpass.draw(0..6, 0..scene.line_instance_count);
+        };
 
-        if let Some(tp) = toolpaths {
-            // When toolpaths are visible: draw toolpaths first, then draw the
-            // mesh semi-transparently so internal toolpaths remain clearly visible.
-            rpass.set_pipeline(&self.toolpath_line_pipeline);
-            rpass.set_vertex_buffer(0, tp.line_buffer.slice(..));
-            rpass.draw(0..6, 0..tp.line_instance_count);
+        let draw_geometry = |rpass: &mut wgpu::RenderPass| {
+            if let Some(tp) = toolpaths {
+                // When toolpaths are visible: draw toolpaths first, then draw the
+                // mesh semi-transparently so internal toolpaths remain clearly visible.
+                rpass.set_pipeline(&self.toolpath_line_pipeline);
+                rpass.set_vertex_buffer(0, tp.line_buffer.slice(..));
+                rpass.draw(0..6, 0..tp.line_instance_count);
 
-            rpass.set_pipeline(&self.mesh_transparent_pipeline);
-            for mesh in meshes {
-                rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                rpass.draw(0..mesh.vertex_count, 0..1);
+                rpass.set_pipeline(&self.mesh_transparent_pipeline);
+                for mesh in meshes {
+                    rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    rpass.draw(0..mesh.vertex_count, 0..1);
+                }
+            } else {
+                // Normal mode: draw opaque meshes with depth testing & depth writing
+                rpass.set_pipeline(&self.pipeline);
+                for mesh in meshes {
+                    rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    rpass.draw(0..mesh.vertex_count, 0..1);
+                }
             }
+        };
+
+        // If the camera is underneath the bed plane, draw the geometry first so the
+        // mostly-transparent bed surface and grid lines blend seamlessly on top of it.
+        // If the camera is above, draw the bed first so the model sits on top of it.
+        if camera_pos.z < bed_z {
+            draw_geometry(&mut rpass);
+            draw_scene(&mut rpass);
         } else {
-            // Normal mode: draw opaque meshes with depth testing & depth writing
-            rpass.set_pipeline(&self.pipeline);
-            for mesh in meshes {
-                rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                rpass.draw(0..mesh.vertex_count, 0..1);
-            }
+            draw_scene(&mut rpass);
+            draw_geometry(&mut rpass);
         }
 
         // Draw semi-transparent overlay (if any)
@@ -972,6 +998,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 pub struct Viewport3dCallback {
     pub rect: egui::Rect,
     pub view_proj: Mat4,
+    pub camera_pos: Vec3,
+    pub bed_z: f32,
     pub scene: std::sync::Arc<UploadedScene>,
     pub meshes: std::sync::Arc<Vec<UploadedMesh>>,
     pub overlay: Option<std::sync::Arc<UploadedMesh>>,
@@ -995,6 +1023,8 @@ impl egui_wgpu::CallbackTrait for Viewport3dCallback {
             egui_encoder,
             self.rect,
             self.view_proj,
+            self.camera_pos,
+            self.bed_z,
             &self.scene,
             &self.meshes,
             self.overlay.as_deref(),

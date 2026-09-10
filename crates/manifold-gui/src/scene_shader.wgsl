@@ -8,6 +8,8 @@ struct Camera {
     viewport_size: vec2<f32>,
     line_width: f32,
     render_mode: f32,
+    camera_pos: vec3<f32>,
+    bed_z: f32,
 }
 
 @group(0) @binding(0)
@@ -86,6 +88,23 @@ fn vs_line(
 }
 
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return in.color;
+fn fs_main(
+    in: VertexOutput,
+    @builtin(front_facing) is_front: bool,
+) -> @location(0) vec4<f32> {
+    var col = in.color;
+    // When viewed from underneath (!is_front for the bed quad) or when the
+    // camera is below the bed plane, make the bed mostly transparent so the
+    // printed part can be clearly seen from low angles.
+    let is_underneath = !is_front || (camera.camera_pos.z < camera.bed_z + 0.5);
+    if (is_underneath) {
+        if (col.a < 0.5) {
+            // Bed quad: scale alpha down to ~0.05 (mostly transparent)
+            col.a = col.a * 0.15;
+        } else {
+            // Grid lines: scale alpha down to 0.20 (faint reference lines)
+            col.a = col.a * 0.20;
+        }
+    }
+    return col;
 }

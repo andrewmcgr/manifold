@@ -9,6 +9,8 @@ struct Camera {
     viewport_size: vec2<f32>,
     line_width: f32,
     render_mode: f32,
+    camera_pos: vec3<f32>,
+    bed_z: f32,
 }
 
 @group(0) @binding(0)

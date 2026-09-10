@@ -91,19 +91,21 @@ The left sidebar in `manifold-gui` organizes slicing and machine parameters into
 ---
 
 ## 8. Order Field
-- **Kind**: Slicing isosurface generator (`Height`, `Conical`, `Eikonal`).
+- **Kind**: Slicing isosurface generator (`Height`, `Conical`, `Eikonal`, `DualIso`, `Anisotropic FSM`).
 - *Conical Options*:
   - **Apex**: 3D coordinate $(X, Y, Z)$ of the cone apex.
   - **Cone Slope**: Slope angle multiplier.
-- *Eikonal Options*:
+- *Anisotropic FSM Options*:
+  - **Enable Boundary Metrics**: When checked, blends directional metric tensors near top cosmetic and wall boundaries. When unchecked (default), solves isotropic front propagation with slope limit relaxation.
+  - **Top Tangency Aspect Ratio**: Metric tensor aspect ratio along top surface normals ($> 1.0$ curves into tangency, $< 1.0$ into orthogonality).
+  - **Wall Orthogonality Aspect Ratio**: Metric tensor aspect ratio along vertical wall surfaces ($> 1.0$ curves into orthogonality, $< 1.0$ into tangency).
+  - **Tensor Skin Depth (mm)**: Subsurface depth within which surface anisotropic metric tensors are blended with the isotropic background.
+  - **FSM Sweep Iterations**: Number of multi-directional Gauss-Seidel coordinate sweep iterations (typically 8 to 16).
+- *Eikonal / DualIso Options*:
   - **Surface Order Weight**: Multiplier (default $1.0$) for the geodesic Surface Eikonal lower bound on the model skin, eliminating surface local minima.
-  - **Conform to Top Surfaces**: Blends isosurfaces parallel to upward-facing exterior surfaces.
-  - **Top Conform Detach Angle (°)**: Angle threshold ($0.0\text{--}90.0^\circ$) beyond which steep top surfaces revert to bulk slicing.
-  - **Conform to Bottom Surfaces**: Warps isosurfaces parallel to downward-facing overhang surfaces.
-  - **Bottom Conform Detach Angle (°)**: Angle threshold ($0.0\text{--}90.0^\circ$) for bottom surface tracking.
-  - **Conformal Skin Depth (mm)**: Subsurface depth within which conformal warping applies.
   - **Enforce Vertical Monotonicity**: Enforces strictly increasing layer order along vertical columns ($\partial\Phi/\partial z \ge 0.15$) to prevent downward stalls or mid-air floating loops.
-  - **Toolhead Clearance Profile (XZ)**: Interactive table of $(X, Z)$ coordinate points defining the physical gantry clearance cone.
+- *Clearance Envelope (Eikonal, DualIso, Anisotropic FSM)*:
+  - **Toolhead Clearance Profile (XZ)**: Interactive table of $(X, Z)$ coordinate points defining the physical gantry clearance cone. Enforces Lipschitz slope relaxation across the order field grid to prevent toolhead collisions.
 
 ---
 
