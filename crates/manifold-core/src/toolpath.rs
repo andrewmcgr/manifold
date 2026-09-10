@@ -2942,12 +2942,18 @@ pub fn plan_with_progress(
                                 .eikonal_conformal_bottom_max_angle_deg
                                 .unwrap_or(10.0);
 
+                            let p_above = mid_point + DVec3::new(0.0, 0.0, config.layer_height);
+                            let is_air_above = sdf.sample(p_above).value > 0.02;
+                            let p_below = mid_point - DVec3::new(0.0, 0.0, config.layer_height);
+                            let is_air_below = sdf.sample(p_below).value > 0.02;
+
                             if n_cad.z > 0.0
+                                && is_air_above
                                 && angle_from_horiz_deg <= top_max_angle
                                 && d_surface <= skin_thickness
                             {
                                 segment.kind = MoveKind::TopSurface;
-                            } else if n_cad.z < 0.0 && d_surface <= skin_thickness {
+                            } else if n_cad.z < 0.0 && is_air_below && d_surface <= skin_thickness {
                                 if angle_from_horiz_deg <= bottom_max_angle {
                                     segment.kind = MoveKind::Bridge;
                                     segment.speed = config.bridge_speed();

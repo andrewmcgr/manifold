@@ -915,6 +915,13 @@ pub fn slice_mesh_with_progress(
                     });
                 }
 
+                let wall0_loops: Vec<Vec<DVec3>> = wall0_loops
+                    .into_iter()
+                    .filter(|pts| {
+                        pts.len() >= 3 && loop_perimeter(pts) >= 3.0 * config.nozzle_diameter
+                    })
+                    .collect();
+
                 let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
                 let canonical_2d = polygon2d::canonicalize(&loops_2d);
                 let outers: Vec<Vec<[f64; 2]>> = canonical_2d
@@ -923,12 +930,17 @@ pub fn slice_mesh_with_progress(
                     .collect();
 
                 for (island_idx, pts) in wall0_loops.into_iter().enumerate() {
+                    let mid_2d = [(pts[0] - origin).dot(basis1), (pts[0] - origin).dot(basis2)];
+                    let island = outers
+                        .iter()
+                        .position(|out| polygon2d::point_in_polygon(mid_2d, out))
+                        .unwrap_or(island_idx.min(outers.len().saturating_sub(1)));
                     let arc_fraction = compute_arc_fractions(&pts);
                     let n_pts = pts.len();
                     loops.push(WallLoop {
                         is_open: false,
                         wall_index: 0,
-                        island: island_idx,
+                        island,
                         unsupported: vec![false; n_pts],
                         top_surface: Vec::new(),
                         arc_fraction,
@@ -1066,8 +1078,15 @@ pub fn slice_mesh_with_progress(
                             order_value,
                             BUILD_DIRECTION,
                         );
-                        if !ib_loops.is_empty() {
-                            found_ib = ib_loops;
+                        let valid_ib: Vec<Vec<DVec3>> = ib_loops
+                            .into_iter()
+                            .filter(|pts| {
+                                pts.len() >= 3
+                                    && loop_perimeter(pts) >= 3.0 * config.nozzle_diameter
+                            })
+                            .collect();
+                        if !valid_ib.is_empty() {
+                            found_ib = valid_ib;
                             break;
                         }
                     }
