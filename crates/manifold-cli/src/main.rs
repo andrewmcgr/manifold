@@ -16,7 +16,7 @@ use std::path::Path;
 
 /// Non-planar slicer CLI.
 #[derive(Debug, Parser)]
-#[command(name = "manifold", version, about)]
+#[command(name = "manifold", version = manifold_core::version::MANIFOLD_VERSION, about)]
 struct Cli {
     /// Input mesh file(s) (STL or 3MF). Each entry may optionally suffix a
     /// tool id to assign that file's objects to, e.g. `part.stl:1`

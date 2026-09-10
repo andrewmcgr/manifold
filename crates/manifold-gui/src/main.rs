@@ -32,8 +32,9 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    let title = format!("Manifold {}", manifold_core::version::MANIFOLD_VERSION);
     eframe::run_native(
-        "Manifold",
+        &title,
         native_options,
         Box::new(|cc| Ok(Box::new(ManifoldApp::new(cc)))),
     )

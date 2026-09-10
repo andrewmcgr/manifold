@@ -33,6 +33,7 @@ pub mod toolpath;
 pub mod transform;
 pub mod transient_pressure;
 pub mod verification;
+pub mod version;
 pub mod wave_overhang;
 pub mod workspace;
 
@@ -40,6 +41,7 @@ pub use error::{Error, Result};
 pub use statistics::{
     compute_print_statistics, compute_print_statistics_with_machine, PrintStatistics,
 };
+pub use version::MANIFOLD_VERSION;
 pub use workspace::Workspace;
 
 /// Strategy for non-planar nozzle slope clearance and flow compensation.
