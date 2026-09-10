@@ -708,6 +708,75 @@ fn subdivide_long_traverses(
         .collect()
 }
 
+/// Displaces the toolpath centerline points of an outer wall loop inward (or outward)
+/// along the local in-surface CAD normal so that the exterior boundary of the extruded bead
+/// remains strictly pinned to the CAD model surface across variable line widths.
+///
+/// $$\mathbf{p}_{\text{pinned}} = \mathbf{p} - \hat{\mathbf{u}} \cdot \frac{w_{\text{eff}} - w_{\text{nominal}}}{2}$$
+///
+/// where $\hat{\mathbf{u}}$ is the unit CAD surface normal projected onto the layer order surface.
+fn pin_outer_wall_centerline(path: &mut Path, layer: &Layer, config: &SlicerConfig) {
+    let point_count = path.points.len();
+    if point_count < 2 || path.segments.is_empty() {
+        return;
+    }
+
+    // Only apply to outer wall paths
+    let is_outer_wall = path
+        .segments
+        .first()
+        .is_some_and(|s| s.kind == MoveKind::WallOuter);
+    if !is_outer_wall {
+        return;
+    }
+
+    let sdf = match layer.mesh_sdf.as_deref() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let nominal_w = config.wall_line_width;
+    let max_shift = 0.5 * nominal_w;
+
+    for i in 0..point_count {
+        let seg_idx = if i < path.segments.len() {
+            i
+        } else {
+            path.segments.len() - 1
+        };
+        let seg = &path.segments[seg_idx];
+        let w_eff = if seg.line_width > 1e-4 {
+            seg.line_width
+        } else {
+            nominal_w
+        };
+
+        let delta_w = w_eff - nominal_w;
+        if delta_w.abs() <= 1e-4 {
+            continue;
+        }
+
+        let p = path.points[i];
+        let cad_grad = sdf.sample(p).gradient;
+        let cad_len = cad_grad.length();
+        if cad_len <= 1e-6 || !cad_len.is_finite() {
+            continue;
+        }
+        let n_cad = cad_grad / cad_len;
+
+        let n_order = crate::order_field::numeric_gradient(layer.order_field.as_ref(), p)
+            .and_then(|g| g.try_normalize())
+            .unwrap_or(DVec3::Z);
+
+        // Project n_cad onto layer tangent plane: u_vec = n_cad - (n_cad . n_order) * n_order
+        let u_vec = n_cad - n_order * n_cad.dot(n_order);
+        if let Some(u_hat) = u_vec.try_normalize() {
+            let shift = (0.5 * delta_w).clamp(-max_shift, max_shift);
+            path.points[i] -= u_hat * shift;
+        }
+    }
+}
+
 /// Greedily reorders `paths` to reduce travel-move distance between them,
 /// controlled by `config.travel_order_optimization_enabled` (no-op,
 /// `paths` unchanged, when `false`).
@@ -2794,6 +2863,7 @@ pub fn plan_with_progress(
                 .find(|tool| tool.id == object.tool)
                 .map(crate::tool::Tool::nozzle_temperature);
             for path in &mut paths {
+                pin_outer_wall_centerline(path, layer, config);
                 let point_count = path.points.len();
                 if point_count == 0 {
                     continue;
@@ -5821,6 +5891,144 @@ mod tests {
             sub_path.segments.len()
         );
         assert_eq!(sub_path.points.len(), sub_path.segments.len() + 1);
+    }
+
+    fn test_cube_mesh() -> Mesh {
+        let vertices = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 0.0),
+            DVec3::new(10.0, 10.0, 0.0),
+            DVec3::new(0.0, 10.0, 0.0),
+            DVec3::new(0.0, 0.0, 10.0),
+            DVec3::new(10.0, 0.0, 10.0),
+            DVec3::new(10.0, 10.0, 10.0),
+            DVec3::new(0.0, 10.0, 10.0),
+        ];
+        let indices = vec![
+            0, 2, 1, 0, 3, 2, // -Z
+            4, 5, 6, 4, 6, 7, // +Z
+            0, 1, 5, 0, 5, 4, // -Y
+            3, 7, 6, 3, 6, 2, // +Y
+            0, 4, 7, 0, 7, 3, // -X
+            1, 2, 6, 1, 6, 5, // +X
+        ];
+        Mesh::new(vertices, indices)
+    }
+
+    #[test]
+    fn pin_outer_wall_centerline_shifts_widened_wall_inward_to_preserve_exterior_boundary() {
+        let field: Arc<dyn manifold_fidget::order::OrderField> =
+            Arc::new(manifold_fidget::order::HeightOrderField::new(DVec3::Z));
+        let mesh = test_cube_mesh(); // Cube from (0,0,0) to (10,10,10)
+        let faces: Vec<[usize; 3]> = mesh
+            .indices
+            .chunks_exact(3)
+            .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
+            .collect();
+        let sdf = Arc::new(manifold_fidget::mesh_sdf::MeshSdf::new(
+            mesh.vertices.clone(),
+            faces,
+        ));
+
+        let layer = Layer {
+            object: ObjectId(1),
+            index: 1,
+            order: 5.0,
+            loops: vec![],
+            infill_boundary: vec![],
+            solid_fill_boundary: vec![],
+            order_field: Arc::clone(&field),
+            mesh_sdf: Some(Arc::clone(&sdf)),
+        };
+
+        let config = SlicerConfig {
+            wall_line_width: 0.40,
+            ..SlicerConfig::default()
+        };
+
+        // Right wall at X = 9.80 (0.20 mm inside CAD surface X = 10.0)
+        // Normal to right wall is +X (outward)
+        let mut path = Path {
+            points: vec![
+                DVec3::new(9.80, 2.0, 5.0),
+                DVec3::new(9.80, 8.0, 5.0),
+                DVec3::new(2.0, 8.0, 5.0),
+                DVec3::new(2.0, 2.0, 5.0),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 3000.0,
+                    extrusion_rate: 1.0,
+                    support_fraction: 1.0,
+                    extrusion_length: 0.1,
+                    channel_width: f64::INFINITY,
+                    order: 5.0,
+                    line_width: 0.60, // Widened by +0.20 mm!
+                    is_scarf: false,
+                    id: 0,
+                    island: 0,
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 3000.0,
+                    extrusion_rate: 1.0,
+                    support_fraction: 1.0,
+                    extrusion_length: 0.1,
+                    channel_width: f64::INFINITY,
+                    order: 5.0,
+                    line_width: 0.60,
+                    is_scarf: false,
+                    id: 0,
+                    island: 0,
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 3000.0,
+                    extrusion_rate: 1.0,
+                    support_fraction: 1.0,
+                    extrusion_length: 0.1,
+                    channel_width: f64::INFINITY,
+                    order: 5.0,
+                    line_width: 0.40,
+                    is_scarf: false,
+                    id: 0,
+                    island: 0,
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 3000.0,
+                    extrusion_rate: 1.0,
+                    support_fraction: 1.0,
+                    extrusion_length: 0.1,
+                    channel_width: f64::INFINITY,
+                    order: 5.0,
+                    line_width: 0.40,
+                    is_scarf: false,
+                    id: 0,
+                    island: 0,
+                },
+            ],
+            tool: ToolId(0),
+        };
+
+        pin_outer_wall_centerline(&mut path, &layer, &config);
+
+        // When line width widens from 0.40 to 0.60 mm (+0.20 mm),
+        // the centerline must shift inward by 0.10 mm:
+        // X = 9.80 -> X = 9.70!
+        assert!(
+            (path.points[0].x - 9.70).abs() < 1e-3,
+            "Centerline must shift inward by 0.10 mm to X=9.70, got {}",
+            path.points[0].x
+        );
+        // And the outer boundary of the bead (X + line_width/2) must equal 10.00:
+        let outer_edge_x = path.points[0].x + 0.60 / 2.0;
+        assert!(
+            (outer_edge_x - 10.00).abs() < 1e-3,
+            "Outer edge of widened bead must remain pinned to CAD boundary 10.00, got {}",
+            outer_edge_x
+        );
     }
 
     #[test]
