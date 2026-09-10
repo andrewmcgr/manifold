@@ -2886,7 +2886,7 @@ pub fn plan_with_progress(
                     let climb_slope = unit_dir.dot(crate::slicing::BUILD_DIRECTION);
 
                     let mid_point = (start + end) * 0.5;
-                    let (support_fraction, bed_fraction) = support_fractions_at(
+                    let (grad_support_fraction, bed_fraction) = support_fractions_at(
                         mid_point,
                         segment.order,
                         layer.order_field.as_ref(),
@@ -2894,40 +2894,46 @@ pub fn plan_with_progress(
                         bed_z,
                         config,
                     );
+
+                    // Physical substrate support check along gravity (-Z):
+                    // In non-planar or conformal fields, the order gradient can point horizontally
+                    // along an arch, falsely reporting high support from the pillar behind the bead.
+                    // True physical support requires solid material directly beneath the bead in gravity.
+                    let vertical_support = if let Some(sdf) = layer.mesh_sdf.as_deref() {
+                        let probe_mid = mid_point - DVec3::new(0.0, 0.0, config.layer_height);
+                        let dist_below = sdf.sample(probe_mid).value;
+                        let nozzle_r = config.nozzle_diameter * 0.5;
+                        (1.0 - dist_below / nozzle_r).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+
+                    let support_fraction = grad_support_fraction.min(vertical_support);
                     segment.support_fraction = support_fraction.max(bed_fraction);
                     let is_first_layer =
                         bed_fraction > 0.0 || (layer.order - order_min).abs() < 1e-6;
 
-                    // Reclassify severely unsupported perimeter moves (e.g. horizontal underside of arches)
-                    // as Overhang or Bridge based on physical substrate support from below.
+                    // Reclassify perimeter moves on downward-facing CAD surfaces (underside of arches / overhangs)
+                    // using the true surface normal n_cad. If n_cad.z < 0, the surface faces downwards into open air.
                     if !is_first_layer
                         && layer.mesh_sdf.is_some()
                         && (segment.kind == MoveKind::WallOuter
                             || segment.kind == MoveKind::WallInner)
-                        && segment.support_fraction < 0.25
                     {
-                        let (sup_start, _) = support_fractions_at(
-                            start,
-                            segment.order,
-                            layer.order_field.as_ref(),
-                            layer.mesh_sdf.as_deref(),
-                            bed_z,
-                            config,
-                        );
-                        let (sup_end, _) = support_fractions_at(
-                            end,
-                            segment.order,
-                            layer.order_field.as_ref(),
-                            layer.mesh_sdf.as_deref(),
-                            bed_z,
-                            config,
-                        );
-                        if sup_start >= 0.50 && sup_end >= 0.50 {
-                            segment.kind = MoveKind::Bridge;
-                            segment.speed = config.bridge_speed();
-                        } else {
-                            segment.kind = MoveKind::Overhang;
-                            segment.speed = speed_for_kind(MoveKind::Overhang, config);
+                        let sdf = layer.mesh_sdf.as_deref().unwrap();
+                        let grad = sdf.sample(mid_point).gradient;
+                        let grad_len = grad.length();
+                        if grad_len > 1e-6 && grad_len.is_finite() {
+                            let n_cad = grad / grad_len;
+                            if n_cad.z < -0.25 {
+                                if n_cad.z < -0.75 {
+                                    segment.kind = MoveKind::Bridge;
+                                    segment.speed = config.bridge_speed();
+                                } else {
+                                    segment.kind = MoveKind::Overhang;
+                                    segment.speed = speed_for_kind(MoveKind::Overhang, config);
+                                }
+                            }
                         }
                     }
 
