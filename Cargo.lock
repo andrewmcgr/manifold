@@ -2521,6 +2521,7 @@ dependencies = [
 name = "manifold-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "glam 0.29.3",
  "i_overlay",
  "lib3mf",

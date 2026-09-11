@@ -31,6 +31,7 @@ i_overlay = { version = "8.0.0", features = ["glam"] }
 wgpu = "22"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [profile.release]
 lto = true

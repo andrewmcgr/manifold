@@ -21,5 +21,6 @@ tracing.workspace = true
 manifold-fidget.workspace = true
 rayon.workspace = true
 i_overlay.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
