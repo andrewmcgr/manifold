@@ -66,6 +66,8 @@ The left sidebar in `manifold-gui` organizes slicing and machine parameters into
   - **Pre-Retract Taper Distance (mm)**: Bleeds melt-zone pressure before travel stops.
   - **Use Firmware Retraction (G10/G11)**: Emits firmware retraction macros.
 - **Slicer-Side Adaptive Pressure Advance**: Directly modulates extruder position $E$ along acceleration and deceleration ramps via error-bounded recursive chord bisection ($E^*(s)$) while emitting `SET_PRESSURE_ADVANCE ADVANCE=0`.
+- **Corner Overlap & SCV Flow Compensation**: Deducts redundant volume deposited on the inside of corners and along shortcutting Klipper SCV arcs to prevent inside corner bulging and ridges.
+  - **Corner Compensation Ratio**: Sensitivity multiplier (default $1.00 = 100\%$ deduction).
 - **Transient Nozzle Pressure Compensation**: Tracks accumulated melt zone pressure across consecutive moves using the hotend elasticity constant ($K = C_{\text{PA}}$) and dynamically scales down commanded volume ($M = (Q_{\text{target}} / P_{\text{average}})^\beta$) on rapid short-stroke infill and gaps.
   - **Min Flow Multiplier ($M_{\text{min}}$)**: Safety floor to prevent starvation (default $0.75$).
   - **Sensitivity Exponent ($\beta$)**: Power-law exponent scaling the flow reduction ratio (default $1.00$). Values $< 1.0$ attenuate the reduction; values $> 1.0$ make it more aggressive.

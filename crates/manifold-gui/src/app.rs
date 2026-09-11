@@ -1355,6 +1355,31 @@ impl ManifoldApp {
             }
 
             ui.checkbox(
+                &mut self.config.enable_corner_flow_compensation,
+                "Corner overlap & SCV flow compensation",
+            )
+            .on_hover_text(
+                "Deducts redundant volume deposited on the inside of corners and along shortcutting Klipper SCV arcs to prevent inside corner bulging and ridges.",
+            );
+            if self.config.enable_corner_flow_compensation {
+                let mut ratio = self.config.corner_flow_compensation_ratio();
+                if drag_num(
+                    ui,
+                    &mut ratio,
+                    0.05,
+                    0.0..=2.0,
+                    "Corner compensation ratio",
+                )
+                .on_hover_text(
+                    "Sensitivity ratio for corner flow compensation (default 1.00 = 100% deduction). Set lower for subtle compensation or higher to more aggressively flatten corner buildup.",
+                )
+                .changed()
+                {
+                    self.config.corner_flow_compensation_ratio = Some(ratio);
+                }
+            }
+
+            ui.checkbox(
                 &mut self.config.enable_transient_pressure_compensation,
                 "Transient nozzle pressure compensation",
             )

@@ -147,6 +147,14 @@ struct Cli {
     #[arg(long)]
     transient_pressure_compensation: bool,
 
+    /// Disable kinematic and geometric corner overlap flow compensation (enabled by default).
+    #[arg(long)]
+    no_corner_flow_compensation: bool,
+
+    /// Compensation multiplier ratio for corner flow compensation (default 1.0).
+    #[arg(long)]
+    corner_flow_compensation_ratio: Option<f64>,
+
     /// Minimum compensation multiplier M_min for transient nozzle pressure flow compensation.
     #[arg(long)]
     transient_pressure_min_multiplier: Option<f64>,
@@ -305,6 +313,8 @@ fn main() -> Result<()> {
         fsm_wall_ortho_aspect: cli.fsm_wall_ortho,
         fsm_skin_depth_mm: cli.fsm_skin_depth,
         fsm_max_sweeps: cli.fsm_sweeps,
+        enable_corner_flow_compensation: !cli.no_corner_flow_compensation,
+        corner_flow_compensation_ratio: cli.corner_flow_compensation_ratio,
         enable_transient_pressure_compensation: cli.transient_pressure_compensation,
         transient_pressure_min_multiplier: cli.transient_pressure_min_multiplier,
         transient_pressure_beta: cli.transient_pressure_beta,

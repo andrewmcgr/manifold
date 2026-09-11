@@ -7,6 +7,7 @@
 pub mod bounds;
 pub mod bridge;
 pub mod convex_hull;
+pub mod corner_flow;
 pub mod error;
 pub mod extrusion;
 pub mod fluid_dynamics;
@@ -487,6 +488,13 @@ pub struct SlicerConfig {
     /// Defaults to 0.5 when None (matching modern Klipper defaults).
     #[serde(default)]
     pub minimum_cruise_ratio: Option<f64>,
+    /// Whether to enable kinematic and geometric corner overlap flow compensation.
+    /// Deducts redundant volume deposited on the inside of corners and along shortcutting Klipper SCV arcs.
+    #[serde(default = "default_enable_corner_flow_compensation")]
+    pub enable_corner_flow_compensation: bool,
+    /// Compensation multiplier ratio for corner flow compensation, defaulting to 1.0 (100%).
+    #[serde(default)]
+    pub corner_flow_compensation_ratio: Option<f64>,
     /// Whether to enable time-based dynamic residual pressure flow compensation.
     /// Models the hotend melt zone as a first-order differential system and scales down
     /// commanded volume when average pressure exceeds target flow on short rapid moves.
@@ -544,6 +552,11 @@ pub struct SlicerConfig {
 /// Static serde-deserialize fallback for [`SlicerConfig::wall_offset`]: `0.20` mm.
 fn default_wall_offset() -> f64 {
     0.20
+}
+
+/// Static serde-deserialize fallback for [`SlicerConfig::enable_corner_flow_compensation`]: `true`.
+fn default_enable_corner_flow_compensation() -> bool {
+    true
 }
 
 /// Static serde-deserialize fallback for [`SlicerConfig::eikonal_enforce_monotonic_growth`]: `true`.
@@ -720,6 +733,8 @@ impl Default for SlicerConfig {
             fsm_skin_depth_mm: None,
             fsm_max_sweeps: None,
             wall_order: None,
+            enable_corner_flow_compensation: true,
+            corner_flow_compensation_ratio: None,
             enable_transient_pressure_compensation: false,
             transient_pressure_min_multiplier: None,
             transient_pressure_beta: None,
@@ -1155,6 +1170,14 @@ impl SlicerConfig {
     #[must_use]
     pub fn minimum_cruise_ratio(&self) -> f64 {
         self.minimum_cruise_ratio.unwrap_or(0.5).clamp(0.0, 1.0)
+    }
+
+    /// Compensation multiplier ratio for corner flow compensation, defaulting to 1.0.
+    #[must_use]
+    pub fn corner_flow_compensation_ratio(&self) -> f64 {
+        self.corner_flow_compensation_ratio
+            .unwrap_or(1.0)
+            .clamp(0.0, 2.0)
     }
 
     /// Minimum compensation multiplier M_min for transient pressure flow compensation, defaulting to 0.75.

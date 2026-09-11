@@ -124,3 +124,32 @@ During travel moves, residual pressure decays exponentially toward zero ($P_{\te
   "transient_pressure_beta": 1.0
 }
 ```
+
+---
+
+## Kinematic & Geometric Corner Overlap Flow Compensation
+
+When two extruded tracks of line width $w$ and layer height $h$ meet at a corner with in-surface turning angle $\alpha \in (0, \pi)$ (interior angle $\theta = \pi - \alpha$):
+
+1. **Geometric Inner-Corner Overlap**:
+   The inner boundaries of the two tracks intersect, creating a triangular/rhombus overlap footprint of area:
+   $$\Delta A_{\text{overlap}} = \frac{w^2}{4} \cot\left(\frac{\theta}{2}\right) = \frac{w^2}{4} \tan\left(\frac{\alpha}{2}\right)$$
+   This deposits redundant volume on the inside of the turn:
+   $$\Delta V_{\text{geom}} = \frac{w^2 h}{4} \tan\left(\frac{\alpha}{2}\right)$$
+
+2. **Klipper SCV Shortcut Arc & Path Shortening**:
+   Under Klipper's Square Corner Velocity (SCV) model, the toolhead corners at velocity $v_{\text{corner}} = \text{klipper\_corner\_velocity}(\hat{\mathbf{d}}_1, \hat{\mathbf{d}}_2, \text{scv}, a)$. Instead of tracking the programmed sharp corner, the toolhead rounds the vertex along a smooth trajectory of effective radius $R_{\text{eff}} = \frac{v_{\text{corner}}^2}{a \sin(\alpha/2)}$, shortcutting distance $s_{\text{tangent}} = R_{\text{eff}} \tan(\alpha/2)$ on each leg. The actual nozzle path length along the rounding arc is $L_{\text{arc}} = R_{\text{eff}} \cdot \alpha$, yielding kinematic path shortening:
+   $$\Delta L_{\text{kinematic}} = 2 s_{\text{tangent}} - R_{\text{eff}} \alpha = R_{\text{eff}} \left(2 \tan\left(\frac{\alpha}{2}\right) - \alpha\right)$$
+   Commanding full nominal extrusion over the straight distance deposits redundant volume:
+   $$\Delta V_{\text{kinematic}} = \Delta L_{\text{kinematic}} \cdot A_{\text{bead}}$$
+
+In non-planar slicing, directions $\hat{\mathbf{d}}_1$ and $\hat{\mathbf{d}}_2$ are projected onto the local layer tangent plane orthogonal to the layer surface normal $\hat{\mathbf{n}}$ before evaluating the in-surface turning angle $\alpha$, preventing straight lines draping over curved hills or arches from being falsely detected as corners.
+
+The total redundant volume $\Delta V_{\text{corner}} = (\Delta V_{\text{geom}} + \Delta V_{\text{kinematic}}) \cdot \text{ratio}$ is symmetrically deducted from the adjacent segments, clamped to a safety floor ($35\%$ of nominal segment volume) to prevent starvation.
+
+```json
+{
+  "enable_corner_flow_compensation": true,
+  "corner_flow_compensation_ratio": 1.0
+}
+```

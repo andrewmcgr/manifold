@@ -3141,6 +3141,15 @@ pub fn plan_with_progress(
                 }
             }
 
+            if config.enable_corner_flow_compensation {
+                crate::corner_flow::apply_corner_flow_compensation(
+                    &mut paths,
+                    Some(layer.order_field.as_ref()),
+                    config,
+                    machine,
+                );
+            }
+
             if config.scarf_joint_enabled {
                 let scarf_len = config.scarf_joint_length();
                 let scarf_steps = config.scarf_joint_steps();
@@ -5844,6 +5853,7 @@ mod tests {
             travel_order_optimization_enabled: false,
             travel_collision_avoidance_enabled: false,
             bead_clearance_compensation_enabled: Some(false),
+            enable_corner_flow_compensation: false,
             ..SlicerConfig::default()
         };
         let tools = vec![Tool::new(ToolId(0), 0.4)];
