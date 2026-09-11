@@ -170,26 +170,22 @@ fn insert_z_hops(paths: Vec<Path>, config: &SlicerConfig) -> Vec<Path> {
     if hop_height <= 0.0 {
         return paths;
     }
+    let min_travel_for_hop = config.effective_min_travel_for_retract();
     paths
         .into_par_iter()
-        .map(|path| insert_z_hops_into_path(path, hop_height))
+        .map(|path| insert_z_hops_into_path(path, hop_height, min_travel_for_hop))
         .collect()
 }
 
 /// Rebuilds a single `path`'s `points`/`segments` with Z-hop lift/drop
 /// geometry inserted around every maximal run of consecutive
-/// [`MoveKind::Travel`] segments -- except a run that both departs from
-/// and arrives at an [`MoveKind::Infill`] segment, which is left as a
-/// plain, un-hopped travel move. A single infill fill (e.g. one
-/// `MonotonicInfill::generate` call's boustrophedon zigzag, or multiple
-/// islands scanned together within one region) already emits its own
-/// internal travel jumps between scan-line segments as one continuous
-/// `Path`; those jumps stay at the same printed Z and don't need to clear
-/// already-extruded geometry the way a travel between *different* move
-/// kinds (e.g. wall-to-infill, or path-to-path) might, so hopping between
-/// them is pure wasted motion. See [`insert_z_hops`]'s doc comment for the
-/// exact point sequence when a hop *is* inserted.
-fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
+/// [`MoveKind::Travel`] segments -- except:
+/// 1. A run that both departs from and arrives at an [`MoveKind::Infill`] segment.
+/// 2. A run whose total travel distance is `<=` `min_travel_for_hop` (since it will not
+///    trigger a retraction during G-code emission, it should not Z-hop).
+///
+/// See [`insert_z_hops`]'s doc comment for the exact point sequence when a hop *is* inserted.
+fn insert_z_hops_into_path(path: Path, hop_height: f64, min_travel_for_hop: f64) -> Path {
     let Path {
         points,
         segments,
@@ -248,7 +244,13 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64) -> Path {
             let departs_infill = run_start > 0 && segments[run_start - 1].kind == MoveKind::Infill;
             let arrives_infill =
                 run_end + 1 < point_count - 1 && segments[run_end + 1].kind == MoveKind::Infill;
-            if departs_infill && arrives_infill {
+
+            let mut run_distance = 0.0;
+            for k in run_start..=run_end {
+                run_distance += points[k].distance(points[k + 1]);
+            }
+
+            if (departs_infill && arrives_infill) || run_distance <= min_travel_for_hop {
                 for k in run_start..run_end {
                     new_points.push(points[k + 1]);
                 }
@@ -908,10 +910,14 @@ const MAX_TRAVEL_GRID_NODES: usize = 8_000;
 /// Returns whether the straight travel chord `a -> b` crosses solid material or violates
 /// `clearance` from existing printed material at any sampled point.
 ///
-/// Uses sphere tracing (SDF ray marching) leveraging the Lipschitz-1 bound of signed distance
-/// fields to safely advance across open air in large steps rather than fixed dense sampling,
-/// speeding up clearance verification by 50x-100x. Near the endpoints `a` and `b`, the required
-/// clearance ramps from 0 at the contact boundary up to `clearance`.
+/// Evaluates true 3D non-planar geometry:
+/// - If the chord penetrates into already-printed solid material (`SDF < -1e-4` and
+///   `order(p) < expected_order - tolerance`), such as when bridging across an upward-convex surface crown,
+///   it is flagged as blocked.
+/// - If the surface between `a` and `b` is flat or concave, the chord remains on or above the surface
+///   in open air and is not considered blocked.
+/// - If the chord departs into open air across a void and re-enters solid material, it is flagged as blocked.
+/// - Enforces lateral toolhead clearance against previously printed vertical walls and obstacles.
 fn travel_chord_is_blocked(
     mesh_sdf: &MeshSdf,
     order_field: Option<&dyn OrderField>,
@@ -934,27 +940,89 @@ fn travel_chord_is_blocked(
     let step = (clearance * 0.5).max(0.1);
     let samples = ((distance / step).ceil() as usize).clamp(4, 64);
     let order_epsilon = 1e-4;
+
+    let order_a = order_field.map(|f| f.order(a)).unwrap_or(a.z);
+    let order_b = order_field.map(|f| f.order(b)).unwrap_or(b.z);
+    let valid_order_endpoints = order_field.is_some() && order_a.is_finite() && order_b.is_finite();
+
+    let mut had_open_air = false;
+
     (0..=samples).any(|s| {
         let t = s as f64 / samples as f64;
         let p = a.lerp(b, t);
         if p.z > z_ceiling + order_epsilon {
             return false;
         }
-        let dist_from_start = t * distance;
-        let dist_from_end = (1.0 - t) * distance;
-        let required_clearance = clearance.min(dist_from_start).min(dist_from_end);
+
         let sample = mesh_sdf.sample(p);
-        if sample.value < required_clearance - 1e-4 {
-            if let Some(field) = order_field {
-                let p_order = field.order(p);
-                if !p_order.is_finite() || p_order > current_order + order_epsilon {
-                    return false;
+        if sample.value > clearance * 0.5 {
+            had_open_air = true;
+        }
+
+        // Without an order field, there is no notion of "already printed" beyond the
+        // physical Z ceiling already checked above -- treat every sampled point as
+        // potentially printed so solid-penetration checks below still apply.
+        let p_order = order_field.map(|field| field.order(p));
+        let is_printed = match p_order {
+            Some(po) => po.is_finite() && po <= current_order + order_epsilon,
+            None => true,
+        };
+
+        if !is_printed {
+            return false;
+        }
+
+        // 1. 3D Non-Planar Convexity Check:
+        // If the 3D surface crowns upward between a and b, the chord cuts under the crown
+        // into earlier layers' printed material (p_order < expected_order - tolerance).
+        if sample.value < -1e-4 && valid_order_endpoints {
+            if let Some(po) = p_order {
+                let expected_order = (1.0 - t) * order_a + t * order_b;
+                let convex_depth_tolerance = 0.05; // 50 microns
+                if po < expected_order - convex_depth_tolerance {
+                    return true;
                 }
             }
-            true
-        } else {
-            false
         }
+
+        // 2. Air-gap re-entry check:
+        // If a travel move leaves the printed island into open air and then penetrates solid again,
+        // it is crossing a void into a separate feature/island.
+        if had_open_air && sample.value < -1e-4 {
+            return true;
+        }
+
+        // 3. Clearance against higher or separate printed obstacles:
+        // Near the endpoints of a short move (within clearance), the nozzle is moving on the current layer
+        // surface (e.g. wall transitions). On long moves away from endpoints, safety clearance is enforced.
+        //
+        // Skipped when the order field already vouches for `p` as legitimately open
+        // space at or above the chord's interpolated order (i.e. checks #1/#2 above
+        // already concluded this isn't a solid-material penetration) -- otherwise this
+        // raw-SDF-only check can flag a chord as blocked purely because it happens to
+        // pass near an unrelated side feature of the mesh, overriding an order-aware
+        // verdict that the point is free space.
+        let order_field_vouches_for_free_space = valid_order_endpoints
+            && p_order.is_some_and(|po| po >= (1.0 - t) * order_a + t * order_b - 1e-4);
+
+        if !order_field_vouches_for_free_space {
+            let dist_from_start = t * distance;
+            let dist_from_end = (1.0 - t) * distance;
+            let required_clearance = clearance.min(dist_from_start).min(dist_from_end);
+
+            if sample.value < required_clearance - 1e-4 {
+                // Check if there is printed material rising above the chord at this position.
+                // If the local surface normal points mostly upward and p.z is at the layer ceiling,
+                // the nozzle is traveling along the top surface, not colliding into a side wall.
+                let is_top_surface =
+                    sample.gradient.z > 0.70 && (p.z >= z_ceiling - 1e-4 || sample.value >= -1e-4);
+                if !is_top_surface {
+                    return true;
+                }
+            }
+        }
+
+        false
     })
 }
 
@@ -4315,6 +4383,9 @@ mod tests {
         let config = SlicerConfig {
             z_hop_enabled: true,
             z_hop_height: 0.4,
+            // Isolate the min-travel-for-hop threshold from scarf-joint blending
+            // (see comment in insert_z_hops_skips_runs_below_effective_min_travel_for_retract).
+            scarf_joint_enabled: false,
             ..SlicerConfig::default()
         };
 
@@ -4466,6 +4537,9 @@ mod tests {
         let config = SlicerConfig {
             z_hop_enabled: true,
             z_hop_height: 0.4,
+            // Isolate the min-travel-for-hop threshold from scarf-joint blending
+            // (see comment in insert_z_hops_skips_runs_below_effective_min_travel_for_retract).
+            scarf_joint_enabled: false,
             ..SlicerConfig::default()
         };
 
@@ -4482,7 +4556,7 @@ mod tests {
         // comment. Regression test for a panic where the tail-append step
         // assumed a closing segment always existed.
         let p0 = DVec3::new(0.0, 0.0, 0.0);
-        let p1 = DVec3::new(1.0, 0.0, 0.0);
+        let p1 = DVec3::new(2.0, 0.0, 0.0); // 2.0mm travel: above the default 1.5mm threshold
         let p2 = DVec3::new(5.0, 0.0, 0.0);
         let infill_segment = Segment {
             island: 0,
@@ -4520,6 +4594,9 @@ mod tests {
         let config = SlicerConfig {
             z_hop_enabled: true,
             z_hop_height: 0.4,
+            // Isolate the min-travel-for-hop threshold from scarf-joint blending
+            // (see comment in insert_z_hops_skips_runs_below_effective_min_travel_for_retract).
+            scarf_joint_enabled: false,
             ..SlicerConfig::default()
         };
 
@@ -4532,7 +4609,7 @@ mod tests {
             vec![
                 p0,
                 DVec3::new(0.0, 0.0, 0.4),
-                DVec3::new(1.0, 0.0, 0.4),
+                DVec3::new(2.0, 0.0, 0.4),
                 p1,
                 p2
             ]
@@ -5244,6 +5321,147 @@ mod tests {
             DVec3::new(2.0, 0.5, 0.8),
             clearance,
         ));
+    }
+
+    #[test]
+    fn insert_z_hops_skips_runs_below_effective_min_travel_for_retract() {
+        let p0 = DVec3::new(0.0, 0.0, 0.0);
+        let p1 = DVec3::new(0.5, 0.0, 0.0); // 0.5mm travel: below default 1.5mm threshold
+        let p2 = DVec3::new(10.0, 0.0, 0.0); // 9.5mm extrusion move, not a travel
+        let p3 = DVec3::new(12.5, 0.0, 0.0); // 2.5mm travel: above the 1.5mm threshold
+
+        let wall_seg = Segment {
+            island: 0,
+            kind: MoveKind::WallOuter,
+            speed: 60.0,
+            extrusion_rate: 1.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 1.0,
+            line_width: 0.4,
+            is_scarf: false,
+            id: 0,
+            channel_width: f64::INFINITY,
+        };
+        let short_travel = Segment {
+            island: 0,
+            kind: MoveKind::Travel,
+            speed: 150.0,
+            extrusion_rate: 0.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 0.0,
+            line_width: 0.0,
+            is_scarf: false,
+            id: 0,
+            channel_width: f64::INFINITY,
+        };
+        let long_travel = Segment {
+            island: 0,
+            kind: MoveKind::Travel,
+            speed: 150.0,
+            extrusion_rate: 0.0,
+            support_fraction: 0.0,
+            order: 0.0,
+            extrusion_length: 0.0,
+            line_width: 0.0,
+            is_scarf: false,
+            id: 0,
+            channel_width: f64::INFINITY,
+        };
+
+        let path = Path {
+            points: vec![p0, p1, p2, p3],
+            segments: vec![short_travel, wall_seg, long_travel],
+            tool: ToolId(0),
+        };
+
+        let config = SlicerConfig {
+            z_hop_enabled: true,
+            z_hop_height: 0.4,
+            min_travel_for_retract: Some(1.5),
+            // Isolate the min-travel-for-hop threshold from scarf-joint blending
+            // (effective_min_travel_for_retract() adds scarf_joint_length() on top
+            // of min_travel_for_retract() when scarf joints are enabled).
+            scarf_joint_enabled: false,
+            ..SlicerConfig::default()
+        };
+
+        let hopped = insert_z_hops(vec![path], &config);
+        assert_eq!(hopped.len(), 1);
+        let res = &hopped[0];
+
+        // The short travel (0.5mm <= 1.5mm) must NOT have lift/drop points inserted.
+        assert_eq!(res.points[0], p0);
+        assert_eq!(res.points[1], p1);
+
+        // The long travel (9.5mm > 1.5mm) MUST have Z-hop lift/drop points inserted.
+        let has_hop = res.points.iter().any(|p| (p.z - 0.4).abs() < 1e-4);
+        assert!(has_hop, "expected long travel move to have z-hop inserted");
+    }
+
+    #[test]
+    fn travel_chord_is_blocked_convex_crown_vs_concave_depression() {
+        // A test order field with a parabolic profile order(p) = p.z - (p.x - 5.0)^2 * 0.1
+        // An isosurface order(p) = c is z = c + 0.1*(x-5)^2 (concave upward / sagging bowl in Z).
+        // Conversely, with order(p) = p.z + (p.x - 5.0)^2 * 0.1, the isosurface is z = c - 0.1*(x-5)^2 (convex crown in Z).
+        struct ParabolicOrderField {
+            convex: bool,
+        }
+        impl OrderField for ParabolicOrderField {
+            fn order(&self, p: DVec3) -> f64 {
+                let dx = p.x - 5.0;
+                if self.convex {
+                    p.z + dx * dx * 0.1
+                } else {
+                    p.z - dx * dx * 0.1
+                }
+            }
+        }
+
+        let sdf = test_cube_mesh();
+        let faces: Vec<[usize; 3]> = sdf
+            .indices
+            .chunks_exact(3)
+            .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
+            .collect();
+        let mesh_sdf = MeshSdf::new(sdf.vertices.clone(), faces);
+
+        let convex_field = ParabolicOrderField { convex: true };
+        let concave_field = ParabolicOrderField { convex: false };
+
+        // Two points on the layer surface order = 6.0:
+        // For convex field: at x=2, z = 6.0 - 0.1*(2-5)^2 = 6.0 - 0.9 = 5.1
+        //                   at x=8, z = 6.0 - 0.1*(8-5)^2 = 6.0 - 0.9 = 5.1
+        // At midpoint x=5: a straight line stays at z = 5.1, but the convex crown of this layer is at z = 6.0!
+        // So the straight line cuts UNDER the layer at order(p) = 5.1 + 0 = 5.1 < 6.0 into previously printed solid!
+        let a = DVec3::new(2.0, 5.0, 5.1);
+        let b = DVec3::new(8.0, 5.0, 5.1);
+
+        assert!(
+            travel_chord_is_blocked(&mesh_sdf, Some(&convex_field), 6.0, 6.0, a, b, 0.4,),
+            "travel chord cutting through an upward convex crown must be detected as blocked"
+        );
+
+        // For concave field: at x=2, z = 6.0 + 0.1*(2-5)^2 = 6.9
+        //                    at x=8, z = 6.0 + 0.1*(8-5)^2 = 6.9
+        // At midpoint x=5: a straight line stays at z = 6.9, while the layer sag is at z = 6.0.
+        // So the straight line is ABOVE the layer surface (order = 6.9 > 6.0), not cutting through solid!
+        let a_concave = DVec3::new(2.0, 5.0, 6.9);
+        let b_concave = DVec3::new(8.0, 5.0, 6.9);
+
+        assert!(
+            !travel_chord_is_blocked(
+                &mesh_sdf,
+                Some(&concave_field),
+                6.0,
+                6.9,
+                a_concave,
+                b_concave,
+                0.4,
+            ),
+            "travel chord over a concave surface depression must stay in free space and not be blocked"
+        );
     }
 
     #[test]
