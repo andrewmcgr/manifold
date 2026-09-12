@@ -30,10 +30,25 @@ manifold base.stl:0 accent.stl:1 insert.stl:0 -o multi_material.gcode
 
 ## Command Line Options Reference
 
+### Moonraker printer options
+
+| Flag | Behavior |
+| --- | --- |
+| `--printer-url URL` | Configure HTTP(S) endpoint; by itself never uploads. |
+| `--printer-api-key KEY` | Optional authentication credential (may appear in shell history). |
+| `--upload` | Upload generated G-code without intentionally starting it. |
+| `--print` | One combined upload-and-start; queued/unconfirmed starts return nonzero. |
+| `--monitor` | With `--print`, follow the canonical uploaded job; alone with a URL, attach without mesh input or writes. |
+
+`--upload --monitor` without `--print` is rejected. Monitoring errors/cancellation
+return nonzero; Ctrl-C exits monitoring without cancelling the print. See
+[Moonraker connectivity](moonraker.md) for setup, GUI controls, safety limits and
+optional operator-authorized validation.
+
 ### General Options
 
 | Flag | Description | Default |
-|---|---|---|
+| --- | --- | --- |
 | `-o, --output <PATH>` | Output G-code file path. | `out.gcode` |
 | `-h, --help` | Print help message and option descriptions. | — |
 | `-V, --version` | Print version information. | — |
@@ -43,7 +58,7 @@ manifold base.stl:0 accent.stl:1 insert.stl:0 -o multi_material.gcode
 ### Layering & Extrusion Options
 
 | Option | Type | Default | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--layer-height <MM>` | Float | `0.20` | Nominal non-planar layer thickness in millimeters. |
 | `--nozzle-diameter <MM>` | Float | `0.40` | Default nozzle orifice diameter in millimeters. |
 
@@ -52,7 +67,7 @@ manifold base.stl:0 accent.stl:1 insert.stl:0 -o multi_material.gcode
 ### Order Fields & Non-Planar Geometry
 
 | Option | Values | Default | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--order-field <KIND>` | `height`, `conical`, `eikonal` | `height` | Slicing order field geometry. |
 | `--eikonal-slope-profile <POINTS>` | `height_mm:max_deg,...` | *(unconstrained)* | Series of toolhead clearance envelope points (`x:z` or `height:angle`). E.g. `"0:45,4:2"` or `"0:0,15:5,35:20"`. |
 | `--eikonal-conform-top-surfaces` | Flag | `false` | Monotonically warp Eikonal field parallel to upward-facing exterior surfaces. |
@@ -65,7 +80,7 @@ manifold base.stl:0 accent.stl:1 insert.stl:0 -o multi_material.gcode
 ### Infill & Overhangs
 
 | Option | Values / Type | Default | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--sparse-infill-pattern <KIND>` | `monotonic`, `concentric`, `all-walls`, `cubic`, `gyroid`, `schwarz-d`, `schwarz-p`, `none` | `cubic` | Infill pattern for interior sparse regions. |
 | `--solid-infill-pattern <KIND>` | `monotonic`, `concentric`, `all-walls`, `cubic`, `gyroid`, `schwarz-d`, `schwarz-p`, `none` | `all-walls` | Infill pattern for solid top/bottom exposure layers. |
 | `--infill-pattern <KIND>` | *(same as above)* | `cubic` | Legacy unified infill pattern setting. |
@@ -79,7 +94,7 @@ manifold base.stl:0 accent.stl:1 insert.stl:0 -o multi_material.gcode
 ### Speeds & Kinematics
 
 | Option | Type | Default | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--square-corner-velocity <MM_S>` | Float | `5.0` | Klipper Square Corner Velocity (SCV) limit (mm/s). |
 | `--speed-deadband <PCT>` | Float | `10.0` | Speed deadband percentage to compact G-code feedrate outputs. |
 | `--acceleration-deadband <PCT>` | Float | `20.0` | Acceleration deadband percentage to compact `SET_VELOCITY_LIMIT` outputs. |
@@ -89,7 +104,7 @@ manifold base.stl:0 accent.stl:1 insert.stl:0 -o multi_material.gcode
 ### Temperatures & Cooling
 
 | Option | Type | Default | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--nozzle-temp <C>` | Float | `240.0` | Target nozzle/hotend temperature (°C). |
 | `--bed-temp <C>` | Float | `60.0` | Target heated bed temperature (°C). |
 | `--chamber-temp <C>` | Float | `0.0` | Target heated chamber temperature (°C, 0 = unheated). |
@@ -102,7 +117,7 @@ manifold base.stl:0 accent.stl:1 insert.stl:0 -o multi_material.gcode
 ### Retraction & Fluid Dynamics
 
 | Option | Type | Default | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--fluid-dynamics` | Flag | `false` | Enable non-Newtonian 2-point PA, extrudate swell compensation, and adaptive fluid retraction. |
 | `--static-retraction <MM>` | Float | `0.15` | Static mechanical break-away distance (mm) under fluid dynamics. |
 

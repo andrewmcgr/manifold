@@ -35,7 +35,7 @@ crates/
 ### Dependencies
 
 - **`crates/manifold-printer`**:
-  - `reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }`
+  - `reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }`
   - `tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }`
   - `tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }`
   - `serde = { version = "1", features = ["derive"] }`
@@ -58,84 +58,29 @@ crates/
 
 #### Data Types & Telemetry Models
 
-```rust
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ConnectionState {
-    Disconnected,
-    Connecting,
-    Connected,
-    Reconnecting { attempt: u32 },
-    Error(String),
-}
+The public model includes connection state, explicit freshness/readiness and
+subscription/job generations, unknown/cancelled print states, filename, separate
+display/SD progress availability, durations, approximate remaining time, optional
+reported layers/Z/thermals, and Klipper messages. Unknown state never means ready.
+`MoonrakerConfig` preserves optional plaintext API-key persistence (redacted Debug)
+and the backward-compatible auto-connect field.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum PrintState {
-    #[default]
-    Standby,
-    Printing,
-    Paused,
-    Complete,
-    Error,
-}
+#### Shared protocol and session contract (corrected after whole-branch review)
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct TemperatureState {
-    pub current: f32,
-    pub target: f32,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
-pub struct PrinterTelemetry {
-    pub connection_state: ConnectionState,
-    pub print_state: PrintState,
-    pub filename: Option<String>,
-    pub progress_fraction: f32,            // 0.0 ..= 1.0
-    pub print_duration_secs: u64,
-    pub total_duration_secs: u64,
-    pub estimated_remaining_secs: Option<u64>,
-    pub toolhead_z: Option<f64>,
-    pub current_layer: Option<u32>,
-    pub total_layers: Option<u32>,
-    pub hotend: Option<TemperatureState>,
-    pub bed: Option<TemperatureState>,
-    pub klipper_message: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct MoonrakerConfig {
-    pub url: String,
-    pub api_key: Option<String>,
-    #[serde(default = "default_true")]
-    pub auto_connect: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-```
-
-#### Low-Level Async Client (`MoonrakerClient`)
-
-Implements REST and raw WebSocket connections:
-
-- `check_connection(&self) -> Result<ServerInfo, MoonrakerError>`
-- `upload_gcode(&self, filename: &str, gcode_bytes: Vec<u8>, start_print: bool, progress: Option<mpsc::Sender<f32>>) -> Result<(), MoonrakerError>`
-- `start_print(&self, filename: &str) -> Result<(), MoonrakerError>`
-- `pause_print(&self) -> Result<(), MoonrakerError>`
-- `resume_print(&self) -> Result<(), MoonrakerError>`
-- `cancel_print(&self) -> Result<(), MoonrakerError>`
-- `emergency_stop(&self) -> Result<(), MoonrakerError>`
-- `subscribe_objects(&self) -> Result<impl Stream<Item = Result<StatusNotification, MoonrakerError>>, MoonrakerError>`
-
-#### High-Level Worker Session (`PrinterSessionHandle`)
-
-Designed for non-blocking UI integration:
-
-- Spawns a Tokio background thread managing the WebSocket loop, keepalive pings, reconnects with exponential backoff (1s to 10s), and REST action dispatches.
-- Exposes:
-  - `command_tx: Sender<PrinterCommand>`
-  - `telemetry_rx: Receiver<PrinterTelemetry>`
-  - `upload_progress_rx: Receiver<f32>`
+- `MoonrakerClient` validates one normalized HTTP(S) directory endpoint for both
+  transports. REST uses X-Api-Key; WS authenticates with correlated
+  server.connection.identify (desktop), then readiness and subscription requests.
+- Upload returns a typed canonical path/root and Uploaded/Started/Queued/
+  StartNotConfirmed outcome decoded from Moonraker's direct response. Upload chunks
+  expose client bytes read, not server completion. Controls validate acknowledgments.
+- `PrinterSessionHandle` owns cancellable work, offers immutable active endpoint,
+  bounded action admission/operation history, fresh telemetry snapshots, atomic
+  upload/start reservation, serialized normal actions and independent emergency HTTP.
+  A snapshot interface is approved; no unused subscribe stream wrapper is required.
+- Disconnect/last-handle drop terminates owned work and prevents reconnection;
+  explicit Reconnect may reopen. Already transmitted effects cannot be undone.
+- Errors identify the operation, server code/message and uncertainty after possible
+  transmission. Never automatically retry a mutating request.
 
 ---
 
@@ -156,10 +101,17 @@ PRINTER OPTIONS:
 
 **Flow:**
 
-1. Slice objects to G-code.
-2. If `--upload` or `--print` is set, instantiate `MoonrakerClient` and upload with multipart stream.
-3. If `--print` is set, trigger `start_print`.
-4. If `--monitor` is requested, establish the WebSocket subscription and render an `indicatif` progress bar showing progress, ETA, and temperatures until the job completes or fails.
+1. Validate intent before slicing. A URL alone does not upload. Monitor-only with
+   a URL attaches without mesh input, slicing or file writes.
+2. Upload only for `--upload`/`--print`; `--print` uses the single combined multipart
+   `print=true` request, **never an extra start after upload**.
+3. Parse the direct upload outcome. Queued/unconfirmed immediate printing is not
+   successful `--print`; report canonical filename and return nonzero.
+4. `--print --monitor` binds to that filename and an active-job observation before
+   accepting completion. Monitor-only identifies the existing active file. Reject
+   `--upload --monitor` without `--print`. Failure/cancellation/auth error exits nonzero;
+   Ctrl-C exits monitoring without cancelling the print. Readiness/start/disconnection
+   waits are bounded. Progress-based ETA is explicitly approximate or unknown.
 
 ### 4.2. GUI (`manifold-gui`)
 
@@ -183,12 +135,17 @@ Existing `profile.json` files continue loading safely due to `#[serde(default)]`
 
 1. **Toolbar Actions (Top Pane)**:
    - Next to "Slice" and "Export…", add "Upload" and "Upload & Print" buttons.
-   - Disabled unless `gcode.is_some()` AND `printer.is_connected()`.
-   - Disabled while upload is actively inflight to prevent double-submissions.
+   - Disabled unless G-code exists and telemetry is fresh and subscribed.
+   - Disabled during upload/pending start. Start additionally requires ready Klipper
+     and an inactive known job state; fresh server queries enforce guards as well.
 2. **Modular Printer Panel (`crates/manifold-gui/src/printer_panel.rs`)**:
    - Collapsible panel (side pane or bottom dock) designed for iterative UI refinement.
-   - **Connection header:** URL text input, API key input, Connect/Disconnect button, status badge (green/yellow/red).
-   - **Upload bar:** Active upload progress bar when transferring G-code.
+   - **Connection header:** Separate draft and active target labels; masked API key,
+     explicit auto-connect checkbox, validated settings saved independently of Connect.
+     Every profile replacement retires the old session even when auto-connect is off.
+   - **Upload bar:** Client-byte-read upload progress separate from print progress;
+     operation IDs/results/errors retained for acknowledgment. Bounded repaint while
+     session/action exists, including collapsed panel.
    - **Live Job Card (active during print):**
      - Filename and print status pill (`Printing`, `Paused`, etc.).
      - Progress bar with percentage and ETA.
@@ -197,7 +154,9 @@ Existing `profile.json` files continue loading safely due to `#[serde(default)]`
    - **Action Bar:**
      - Toggle `Pause` / `Resume`.
      - `Cancel Print` with confirmation modal/dialog.
-     - Distinct red `Emergency Stop` button.
+     - Distinct red `Emergency Stop` for the immutable configured active target,
+       independent of WS readiness or normal upload queue; best effort, not hardware safety.
+     - Clear cancel confirmation on session/job changes; disconnect is not cancellation.
 
 ---
 
@@ -206,7 +165,15 @@ Existing `profile.json` files continue loading safely due to `#[serde(default)]`
 - **Upload Failures:** Categorize network connection drops, HTTP 4xx/5xx, and Moonraker disk full errors with clear user feedback.
 - **WebSocket Reconnection:** Automatic retry on disconnect with exponential backoff (1s, 2s, 4s, up to 10s) and state indication (`Reconnecting { attempt }`).
 - **Klipper Error Handling:** Extract error messages from Klipper `print_stats.message` and display prominently.
-- **Safe State Transitions:** Guard against starting a print while another job is active or while heaters are in an unhandled state.
+- **Safe State Transitions:** Query fresh Klipper readiness/job state, reject starts
+  during active/paused/error/unknown states and protect the active filename from overwrite.
+  Do not invent a cold-heater threshold: start G-code normally performs heating.
+- **Telemetry semantics:** Replace snapshots on reconnect; handle Klipper lifecycle,
+  clear reset fields, advance SD fallback across deltas, and read layers only from
+  print_stats.info. toolhead.estimated_print_time is a motion clock, not job ETA.
+- **Ownership/deadlines:** Bounded connect/RPC/HTTP/pong deadlines; EOF is explicit;
+  all unexpected disconnects use cancellable 1,2,4,8,10-second backoff. Authentication
+  errors require correction/reconnect. Never replay mutations automatically.
 
 ---
 
@@ -221,4 +188,9 @@ Existing `profile.json` files continue loading safely due to `#[serde(default)]`
 3. **GUI Profile Tests:**
    - Verify serialization/deserialization backward compatibility of `Profile` with and without `MoonrakerConfig`.
 4. **Manual & Local Printer Testing:**
-   - Validation against a real local Moonraker instance or Dockerized Klipper/Moonraker emulator.
+   - Optional operator-authorized validation, read-only first; see `docs/moonraker.md`.
+     No real-printer or visual validation is claimed by loopback/headless tests.
+
+The corrected implementation plan replaces defective executable samples with these
+contracts and named behavioral regressions. Tests run in release mode; normal GUI
+binary unit tests do not inherently launch application main.
