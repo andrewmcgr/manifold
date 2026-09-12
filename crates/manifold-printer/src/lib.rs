@@ -12,4 +12,4 @@ pub use model::{ConnectionState, MoonrakerConfig, PrintState, PrinterTelemetry, 
 pub use session::{PrinterAction, PrinterSessionHandle};
 
 pub use model::{ServerInfo, UploadDisposition, UploadOutcome};
-pub use operation::{ActionOutcome, Operation, OperationState};
+pub use operation::{ActionOutcome, Operation, OperationState, ResultSummary};

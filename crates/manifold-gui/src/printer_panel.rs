@@ -139,6 +139,11 @@ impl PrinterPanel {
                 if session.is_start_pending() {
                     ui.colored_label(Color32::YELLOW,"Start pending observation / reconciliation. If uncertain, inspect the printer before explicitly reconnecting.");
                 }
+                let summary = session.emergency_summary();
+                if !summary.is_empty() {
+                    ui.colored_label(Color32::YELLOW, format!("Earlier emergency stops: {} acknowledged by server, {} failed ({} outcome unknown). Inspect printer; network stop is not a safety guarantee.", summary.succeeded, summary.failed, summary.outcome_unknown));
+                    if ui.small_button("Acknowledge earlier stop results").clicked() {session.acknowledge_emergency_summary();}
+                }
                 for op in session.operations() {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!("#{} {}:",op.id,op.name));

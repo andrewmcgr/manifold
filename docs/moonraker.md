@@ -67,7 +67,7 @@ not a directory path. The server is still authoritative for races with other cli
 
 Operation IDs show pending work, upload bytes read, server outcomes and actionable
 errors. **Upload progress is client bytes read, not server completion or print
-progress.** Errors remain until acknowledged. A pending start can reserve upload
+progress.** Ordinary errors remain until acknowledged; emergency history uses the bounded summary described below. A pending start can reserve upload
 admission until the corresponding active job is observed; if it stays uncertain,
 inspect Moonraker before explicitly reconnecting to reconcile.
 
@@ -84,7 +84,12 @@ request already transmitted. Dropping/retiring a session cancels local owned wor
 rejects unsent commands and stops reconnecting without blocking the UI on a join.
 
 **Emergency Stop** uses a separate bounded HTTP path and does not wait for a WS
-handshake, held upload or full normal queue. Its result is visible; an interrupted
+handshake, held upload, full normal queue or retained ordinary failures. One stop
+may be in flight at a time. Once it completes, another deliberate stop can dispatch
+without acknowledging unrelated results, even if the previous stop failed. The
+latest stop retains its detailed result; older stop results become bounded visible
+success/failure/unknown counters until deliberately acknowledged. No stop is replayed
+automatically. Its result is visible; an interrupted
 request can have an unknown remote outcome. It is best-effort network control,
 **not a hardware safety guarantee**. Use the printer's physical safety mechanisms
 when needed. Do not treat UI disconnection or a failed request as evidence that

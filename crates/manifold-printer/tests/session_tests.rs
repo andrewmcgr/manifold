@@ -528,3 +528,99 @@ async fn emergency_http_timeout_reports_unknown_without_mutation_replay() {
     assert!(server.requests.is_empty());
     drop(held);
 }
+
+#[tokio::test]
+async fn repeated_emergency_http_dispatch_survives_saturated_failed_history() {
+    let mut server = Server::start().await;
+    let session = PrinterSessionHandle::spawn(MoonrakerConfig {
+        url: server.url.clone(),
+        ..Default::default()
+    });
+    let mut ws = server.socket().await;
+    subscribe(
+        &mut ws,
+        json!({"print_stats":{"state":"standby","filename":""}}),
+    )
+    .await;
+    until(|| session.latest_telemetry().fresh).await;
+    // Construct the review's exact imbalance through real admission and HTTP completion.
+    for index in 0..63 {
+        let id = session.send_action(PrinterAction::Pause).unwrap();
+        let request = server.request().await;
+        assert_eq!(request.path, "/printer/print/pause");
+        request
+            .respond
+            .send(if index == 0 {
+                json!({})
+            } else {
+                json!({"error":{"code":409,"message":"normal failure retained"}})
+            })
+            .unwrap();
+        until(|| {
+            session
+                .operations()
+                .iter()
+                .any(|op| op.id == id && !op.state.is_pending())
+        })
+        .await;
+    }
+    assert_eq!(session.operations().len(), 63);
+    assert!(session
+        .operations()
+        .iter()
+        .all(|op| matches!(op.state, OperationState::Failed { .. })));
+    assert!(session.send_action(PrinterAction::Pause).is_err());
+    session.send_action(PrinterAction::Disconnect).unwrap();
+    // No WS, no acknowledgment, and no automatic replay. Each attempt must reach HTTP.
+    for attempt in 0..100 {
+        let id = session
+            .send_action(PrinterAction::EmergencyStop)
+            .unwrap_or_else(|e| panic!("explicit stop attempt {attempt} blocked: {e}"));
+        let held = server.request().await;
+        assert_eq!(held.path, "/printer/emergency_stop");
+        assert!(
+            session.send_action(PrinterAction::EmergencyStop).is_err(),
+            "coalesce/reject only while in flight"
+        );
+        assert!(server.requests.is_empty());
+        held.respond
+            .send(if attempt % 2 == 0 {
+                json!({"error":{"code":409,"message":"stop failed"}})
+            } else {
+                json!({})
+            })
+            .unwrap();
+        until(|| {
+            session
+                .operations()
+                .iter()
+                .any(|op| op.id == id && !op.state.is_pending())
+        })
+        .await;
+        assert!(session.operations().iter().any(|op| op.id == id && matches!(op.state, OperationState::Failed { outcome_unknown, .. } if outcome_unknown == (attempt % 2 == 1))));
+        assert!(
+            session.operations().len() <= 64,
+            "retention must stay bounded"
+        );
+    }
+    assert_eq!(
+        session
+            .operations()
+            .iter()
+            .filter(|op| op.name == "pause")
+            .count(),
+        63
+    );
+    let summary = session.emergency_summary();
+    assert_eq!(summary.failed, 99);
+    assert_eq!(summary.outcome_unknown, 49);
+    assert_eq!(summary.succeeded, 0);
+    session.acknowledge_emergency_summary();
+    assert!(session.emergency_summary().is_empty());
+    assert_eq!(
+        session.operations().len(),
+        64,
+        "summary acknowledgment must not erase current or normal evidence"
+    );
+    assert!(server.requests.is_empty());
+}

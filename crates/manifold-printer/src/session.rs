@@ -7,15 +7,17 @@ use crate::client::MoonrakerClient;
 use crate::error::MoonrakerError;
 use crate::model::{ConnectionState, MoonrakerConfig, PrinterTelemetry, UploadDisposition};
 pub use crate::operation::PrinterAction;
-use crate::operation::{ActionOutcome, Operation, OperationState};
+use crate::operation::{ActionOutcome, Operation, OperationState, ResultSummary};
 
-const HISTORY_LIMIT: usize = 64;
+const NORMAL_HISTORY_LIMIT: usize = 63;
 
 pub(crate) struct Shared {
     pub telemetry: PrinterTelemetry,
     pub epoch: u64,
     online: bool,
     operations: VecDeque<Operation>,
+    emergency: Option<Operation>,
+    emergency_summary: ResultSummary,
     next_id: u64,
     pending_start: Option<String>,
 }
@@ -39,7 +41,7 @@ impl Shared {
         self.telemetry.fresh = false;
         self.telemetry.klippy_ready = false;
         self.telemetry.estimated_remaining_secs = None;
-        for op in &mut self.operations {
+        for op in self.operations.iter_mut().chain(self.emergency.iter_mut()) {
             if op.state.is_pending() {
                 let outcome_unknown = matches!(op.state, OperationState::Running { .. });
                 op.state = OperationState::Failed {
@@ -57,6 +59,7 @@ impl Shared {
         if let Some(op) = self
             .operations
             .iter_mut()
+            .chain(self.emergency.iter_mut())
             .find(|o| o.id == id && o.state.is_pending())
         {
             op.state = state;
@@ -100,6 +103,8 @@ impl PrinterSessionHandle {
             epoch: 0,
             online: config.auto_connect,
             operations: VecDeque::new(),
+            emergency: None,
+            emergency_summary: ResultSummary::default(),
             next_id: 1,
             pending_start: None,
         }));
@@ -158,22 +163,32 @@ impl PrinterSessionHandle {
         self.owner.shared.lock().unwrap().telemetry.clone()
     }
     pub fn operations(&self) -> Vec<Operation> {
-        self.owner
-            .shared
-            .lock()
-            .unwrap()
+        let shared = self.owner.shared.lock().unwrap();
+        shared
             .operations
             .iter()
+            .chain(shared.emergency.iter())
             .cloned()
             .collect()
     }
+    pub fn emergency_summary(&self) -> ResultSummary {
+        self.owner.shared.lock().unwrap().emergency_summary.clone()
+    }
+    pub fn acknowledge_emergency_summary(&self) {
+        self.owner.shared.lock().unwrap().emergency_summary = ResultSummary::default();
+    }
     pub fn acknowledge(&self, id: u64) {
-        self.owner
-            .shared
-            .lock()
-            .unwrap()
+        let mut shared = self.owner.shared.lock().unwrap();
+        shared
             .operations
             .retain(|op| op.id != id || op.state.is_pending());
+        if shared
+            .emergency
+            .as_ref()
+            .is_some_and(|op| op.id == id && !op.state.is_pending())
+        {
+            shared.emergency = None;
+        }
     }
     pub fn is_uploading(&self) -> bool {
         let shared = self.owner.shared.lock().unwrap();
@@ -224,22 +239,18 @@ impl PrinterSessionHandle {
         }
         if stop
             && shared
-                .operations
-                .iter()
-                .any(|o| o.name == "emergency stop" && o.state.is_pending())
+                .emergency
+                .as_ref()
+                .is_some_and(|o| o.state.is_pending())
         {
             return Err(MoonrakerError::rejected(
                 action.name(),
                 "emergency stop already pending",
             ));
         }
-        // Reserve one history slot for emergency stop, even when normal results need acknowledgment.
-        let limit = if stop {
-            HISTORY_LIMIT
-        } else {
-            HISTORY_LIMIT - 1
-        };
-        while shared.operations.len() >= limit {
+        // Normal history never owns emergency capacity. A completed stop is summarized
+        // only when the operator deliberately submits another; publication cannot block dispatch.
+        while !stop && shared.operations.len() >= NORMAL_HISTORY_LIMIT {
             if let Some(index) = shared
                 .operations
                 .iter()
@@ -270,12 +281,19 @@ impl PrinterSessionHandle {
         }
         let id = shared.next_id;
         shared.next_id += 1;
-        shared.operations.push_back(Operation {
+        let operation = Operation {
             id,
             name: action.name().into(),
             upload: action.is_upload(),
             state: OperationState::Pending,
-        });
+        };
+        if stop {
+            if let Some(previous) = shared.emergency.replace(operation) {
+                shared.emergency_summary.include(&previous.state);
+            }
+        } else {
+            shared.operations.push_back(operation);
+        }
         permit.send(Command {
             id,
             epoch: shared.epoch,

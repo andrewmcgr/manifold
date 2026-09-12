@@ -58,3 +58,31 @@ pub struct Operation {
     pub state: OperationState,
     pub(crate) upload: bool,
 }
+
+/// Bounded, deliberately acknowledged evidence when detailed results are compacted.
+/// Counts saturate instead of wrapping; unknown outcomes are a subset of failures.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResultSummary {
+    pub succeeded: u64,
+    pub failed: u64,
+    pub outcome_unknown: u64,
+}
+impl ResultSummary {
+    pub fn include(&mut self, state: &OperationState) {
+        match state {
+            OperationState::Succeeded(_) => self.succeeded = self.succeeded.saturating_add(1),
+            OperationState::Failed {
+                outcome_unknown, ..
+            } => {
+                self.failed = self.failed.saturating_add(1);
+                if *outcome_unknown {
+                    self.outcome_unknown = self.outcome_unknown.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.succeeded == 0 && self.failed == 0
+    }
+}
