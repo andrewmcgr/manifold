@@ -3,8 +3,6 @@ use manifold_printer::{
     ConnectionState, MoonrakerConfig, PrintState, PrinterAction, PrinterSessionHandle,
 };
 
-// Allow dead_code temporarily while Task 8 wires PrinterPanel into app.rs
-#[allow(dead_code)]
 pub struct PrinterPanel {
     pub collapsed: bool,
     pub confirming_cancel: bool,
@@ -23,7 +21,6 @@ impl Default for PrinterPanel {
     }
 }
 
-#[allow(dead_code)]
 impl PrinterPanel {
     pub fn new(config: Option<&MoonrakerConfig>) -> Self {
         Self {

@@ -2,6 +2,7 @@
 //! an in-panel import toolbar (Phase 4, see ROADMAP.md).
 
 use crate::camera::OrbitCamera;
+use crate::printer_panel::PrinterPanel;
 use crate::profile::Profile;
 use crate::render::{
     MeshOverlayMode, MeshRenderResources, UploadedMesh, UploadedScene, UploadedToolpaths,
@@ -18,6 +19,7 @@ use manifold_core::order_field::OrderFieldKind;
 use manifold_core::tool::Tool;
 use manifold_core::transform::Transform;
 use manifold_core::{ids::ObjectId, ids::ToolId, mesh::Mesh, object, object::Object, stl, threemf};
+use manifold_printer::{MoonrakerConfig, PrinterAction, PrinterSessionHandle};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -188,6 +190,12 @@ pub struct ManifoldApp {
     /// the server thread failed to start.
     #[cfg(feature = "mcp-server")]
     mcp_rx: Option<std::sync::mpsc::Receiver<crate::mcp::Command>>,
+    /// Active Moonraker printer session handle for printer control and telemetry.
+    printer_session: Option<PrinterSessionHandle>,
+    /// Modular printer control and telemetry panel in the settings pane.
+    printer_panel: PrinterPanel,
+    /// Currently saved/configured Moonraker configuration.
+    moonraker_config: Option<MoonrakerConfig>,
 }
 
 impl ManifoldApp {
@@ -267,6 +275,9 @@ impl ManifoldApp {
             sdf_slice_texture: None,
             #[cfg(feature = "mcp-server")]
             mcp_rx,
+            printer_session: None,
+            printer_panel: PrinterPanel::new(None),
+            moonraker_config: None,
         }
     }
 
@@ -891,7 +902,7 @@ impl ManifoldApp {
                             let profile = Profile {
                                 machine: self.machine.clone(),
                                 config: self.config.clone(),
-                                moonraker: None,
+                                moonraker: self.moonraker_config.clone(),
                             };
                             match profile.save(&path) {
                                 Ok(()) => {
@@ -924,6 +935,18 @@ impl ManifoldApp {
                                         .map_or(0, |max_id| max_id + 1);
                                     self.profile_path = Some(path);
                                     self.profile_error = None;
+
+                                    if let Some(ref config) = profile.moonraker {
+                                        self.moonraker_config = Some(config.clone());
+                                        self.printer_panel = PrinterPanel::new(Some(config));
+                                        if config.auto_connect {
+                                            self.printer_session =
+                                                Some(PrinterSessionHandle::spawn(config.clone()));
+                                        }
+                                    } else {
+                                        self.moonraker_config = None;
+                                        self.printer_panel = PrinterPanel::new(None);
+                                    }
 
                                     let device = frame
                                         .wgpu_render_state()
@@ -2655,6 +2678,13 @@ impl ManifoldApp {
         }
 
         ui.separator();
+        let moonraker_cfg_ref = &mut self.moonraker_config;
+        self.printer_panel
+            .show(ui, &mut self.printer_session, |cfg| {
+                *moonraker_cfg_ref = Some(cfg);
+            });
+
+        ui.separator();
         ui.checkbox(&mut self.show_sdf_panel, "Show SDF debug panel");
 
         if let Some(gcode) = &self.gcode {
@@ -3061,6 +3091,50 @@ impl ManifoldApp {
                     }
                 }
             }
+
+            let printer_ready = self.printer_session.as_ref().is_some_and(|s| {
+                s.latest_telemetry().connection_state
+                    == manifold_printer::ConnectionState::Connected
+            });
+            let printer_uploading = self
+                .printer_session
+                .as_ref()
+                .is_some_and(|s| s.is_uploading());
+            let can_upload = self.gcode.is_some() && printer_ready && !printer_uploading;
+
+            let default_gcode_name = self
+                .objects
+                .first()
+                .and_then(|obj| obj.name.as_ref())
+                .map(|name| format!("{name}.gcode"))
+                .unwrap_or_else(|| "out.gcode".to_string());
+
+            ensure_row_space(ui, 120.0);
+            if ui
+                .add_enabled(can_upload, egui::Button::new("Upload to Printer"))
+                .clicked()
+            {
+                if let (Some(session), Some(gcode)) = (&self.printer_session, &self.gcode) {
+                    let _ = session.send_action(PrinterAction::UploadOnly {
+                        filename: default_gcode_name.clone(),
+                        gcode: gcode.as_bytes().to_vec(),
+                    });
+                }
+            }
+
+            ensure_row_space(ui, 110.0);
+            if ui
+                .add_enabled(can_upload, egui::Button::new("Upload & Print"))
+                .clicked()
+            {
+                if let (Some(session), Some(gcode)) = (&self.printer_session, &self.gcode) {
+                    let _ = session.send_action(PrinterAction::UploadAndPrint {
+                        filename: default_gcode_name,
+                        gcode: gcode.as_bytes().to_vec(),
+                    });
+                }
+            }
+
             ensure_row_space(ui, 130.0);
             ui.checkbox(&mut self.show_toolpaths, "Show toolpaths");
             ensure_row_space(ui, 190.0);
