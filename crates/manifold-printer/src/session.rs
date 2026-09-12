@@ -1,299 +1,367 @@
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::{mpsc, watch};
+
 use crate::client::MoonrakerClient;
+use crate::error::MoonrakerError;
 use crate::model::{ConnectionState, MoonrakerConfig, PrinterTelemetry};
-use crate::subscription::{apply_status_delta, build_subscribe_request};
-use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info, warn};
-use url::Url;
+pub use crate::operation::PrinterAction;
+use crate::operation::{ActionOutcome, Operation, OperationState};
 
-#[derive(Debug)]
-pub enum PrinterAction {
-    UploadAndPrint { filename: String, gcode: Vec<u8> },
-    UploadOnly { filename: String, gcode: Vec<u8> },
-    Pause,
-    Resume,
-    Cancel,
-    EmergencyStop,
-    Disconnect,
-    Reconnect,
+const HISTORY_LIMIT: usize = 64;
+
+pub(crate) struct Shared {
+    pub telemetry: PrinterTelemetry,
+    pub epoch: u64,
+    online: bool,
+    operations: VecDeque<Operation>,
+    next_id: u64,
 }
-
+impl Shared {
+    fn invalidate(&mut self) {
+        self.epoch += 1;
+        self.telemetry.fresh = false;
+        self.telemetry.klippy_ready = false;
+        self.telemetry.estimated_remaining_secs = None;
+        for op in &mut self.operations {
+            if op.state.is_pending() {
+                let outcome_unknown = matches!(op.state, OperationState::Running { .. });
+                op.state = OperationState::Failed {
+                    outcome_unknown,
+                    message: if outcome_unknown {
+                        "Session work interrupted; remote outcome unknown. Disconnect does not cancel a print. Check the printer before retrying.".into()
+                    } else {
+                        "Unsent action rejected: session changed".into()
+                    },
+                };
+            }
+        }
+    }
+    fn update(&mut self, id: u64, state: OperationState) {
+        if let Some(op) = self
+            .operations
+            .iter_mut()
+            .find(|o| o.id == id && o.state.is_pending())
+        {
+            op.state = state;
+        }
+    }
+}
+struct Command {
+    id: u64,
+    epoch: u64,
+    action: PrinterAction,
+}
+struct Owner {
+    endpoint: String,
+    normal: mpsc::Sender<Command>,
+    emergency: mpsc::Sender<Command>,
+    lifecycle: watch::Sender<u64>,
+    shared: Arc<Mutex<Shared>>,
+}
+impl Drop for Owner {
+    fn drop(&mut self) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.invalidate();
+        shared.online = false;
+        shared.telemetry.connection_state = ConnectionState::Disconnected;
+        self.lifecycle.send_replace(shared.epoch);
+        // No join on the UI thread. Closing lifecycle cancels every owned future.
+    }
+}
 #[derive(Clone)]
 pub struct PrinterSessionHandle {
-    action_tx: mpsc::UnboundedSender<PrinterAction>,
-    telemetry: Arc<RwLock<PrinterTelemetry>>,
-    uploading: Arc<AtomicBool>,
+    owner: Arc<Owner>,
 }
 
 impl PrinterSessionHandle {
     pub fn spawn(config: MoonrakerConfig) -> Self {
-        let (action_tx, action_rx) = mpsc::unbounded_channel();
-        let telemetry = Arc::new(RwLock::new(PrinterTelemetry::default()));
-        let uploading = Arc::new(AtomicBool::new(false));
-
-        let tele_clone = Arc::clone(&telemetry);
-        let up_clone = Arc::clone(&uploading);
-
-        std::thread::Builder::new()
-            .name("manifold-printer-worker".to_string())
+        let (normal, normal_rx) = mpsc::channel(8);
+        let (emergency, emergency_rx) = mpsc::channel(1);
+        let (lifecycle, lifecycle_rx) = watch::channel(0);
+        let shared = Arc::new(Mutex::new(Shared {
+            telemetry: PrinterTelemetry::default(),
+            epoch: 0,
+            online: config.auto_connect,
+            operations: VecDeque::new(),
+            next_id: 1,
+        }));
+        let client = MoonrakerClient::new(config.clone());
+        let endpoint = client
+            .as_ref()
+            .map(|c| c.config().url.clone())
+            .unwrap_or(config.url);
+        let worker_shared = shared.clone();
+        let spawn = std::thread::Builder::new()
+            .name("manifold-printer-worker".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
+                let result = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        error!("Failed to create printer Tokio runtime: {e}");
-                        return;
+                    .build();
+                match (result, client) {
+                    (Ok(rt), Ok(client)) => rt.block_on(run_worker(
+                        client,
+                        normal_rx,
+                        emergency_rx,
+                        lifecycle_rx,
+                        worker_shared,
+                    )),
+                    (rt, client) => {
+                        let message = match (rt, client) {
+                            (Err(e), _) => e.to_string(),
+                            (_, Err(e)) => e.to_string(),
+                            _ => unreachable!(),
+                        };
+                        worker_shared.lock().unwrap().telemetry.connection_state =
+                            ConnectionState::Error(message);
                     }
-                };
-
-                rt.block_on(run_worker(config, action_rx, tele_clone, up_clone));
-            })
-            .expect("Failed to spawn printer worker thread");
-
+                }
+            });
+        if let Err(e) = spawn {
+            shared.lock().unwrap().telemetry.connection_state =
+                ConnectionState::Error(e.to_string());
+        }
         Self {
-            action_tx,
-            telemetry,
-            uploading,
+            owner: Arc::new(Owner {
+                endpoint,
+                normal,
+                emergency,
+                lifecycle,
+                shared,
+            }),
         }
     }
-
-    pub fn send_action(
-        &self,
-        action: PrinterAction,
-    ) -> Result<(), mpsc::error::SendError<PrinterAction>> {
-        self.action_tx.send(action)
+    pub fn endpoint(&self) -> &str {
+        &self.owner.endpoint
     }
-
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.owner) as usize
+    }
     pub fn latest_telemetry(&self) -> PrinterTelemetry {
-        self.telemetry.read().unwrap().clone()
+        self.owner.shared.lock().unwrap().telemetry.clone()
     }
-
+    pub fn operations(&self) -> Vec<Operation> {
+        self.owner
+            .shared
+            .lock()
+            .unwrap()
+            .operations
+            .iter()
+            .cloned()
+            .collect()
+    }
+    pub fn acknowledge(&self, id: u64) {
+        self.owner
+            .shared
+            .lock()
+            .unwrap()
+            .operations
+            .retain(|op| op.id != id || op.state.is_pending());
+    }
     pub fn is_uploading(&self) -> bool {
-        self.uploading.load(Ordering::Relaxed)
+        self.owner
+            .shared
+            .lock()
+            .unwrap()
+            .operations
+            .iter()
+            .any(|op| op.upload && op.state.is_pending())
+    }
+    pub fn send_action(&self, action: PrinterAction) -> Result<u64, MoonrakerError> {
+        let mut shared = self.owner.shared.lock().unwrap();
+        if matches!(action, PrinterAction::Disconnect | PrinterAction::Reconnect) {
+            shared.invalidate();
+            shared.online = matches!(action, PrinterAction::Reconnect);
+            shared.telemetry.connection_state = if shared.online {
+                ConnectionState::Connecting
+            } else {
+                ConnectionState::Disconnected
+            };
+            self.owner.lifecycle.send_replace(shared.epoch);
+            return Ok(0);
+        }
+        let stop = matches!(action, PrinterAction::EmergencyStop);
+        if !stop
+            && (!shared.online
+                || !shared.telemetry.fresh
+                || shared.telemetry.connection_state != ConnectionState::Connected)
+        {
+            return Err(MoonrakerError::rejected(
+                action.name(),
+                "printer subscription unavailable; reconnect and try explicitly",
+            ));
+        }
+        if action.is_upload()
+            && shared
+                .operations
+                .iter()
+                .any(|o| o.upload && o.state.is_pending())
+        {
+            return Err(MoonrakerError::rejected(
+                action.name(),
+                "another upload/start is pending",
+            ));
+        }
+        if stop
+            && shared
+                .operations
+                .iter()
+                .any(|o| o.name == "emergency stop" && o.state.is_pending())
+        {
+            return Err(MoonrakerError::rejected(
+                action.name(),
+                "emergency stop already pending",
+            ));
+        }
+        // Reserve one history slot for emergency stop, even when normal results need acknowledgment.
+        let limit = if stop {
+            HISTORY_LIMIT
+        } else {
+            HISTORY_LIMIT - 1
+        };
+        while shared.operations.len() >= limit {
+            if let Some(index) = shared
+                .operations
+                .iter()
+                .position(|o| matches!(o.state, OperationState::Succeeded(_)))
+            {
+                shared.operations.remove(index);
+            } else {
+                return Err(MoonrakerError::rejected(
+                    action.name(),
+                    "acknowledge completed errors before submitting more actions",
+                ));
+            }
+        }
+        let tx = if stop {
+            &self.owner.emergency
+        } else {
+            &self.owner.normal
+        };
+        let permit = tx.try_reserve().map_err(|_| {
+            MoonrakerError::rejected(action.name(), "command queue full or worker stopped")
+        })?;
+        if stop {
+            shared.invalidate();
+            self.owner.lifecycle.send_replace(shared.epoch);
+        }
+        let id = shared.next_id;
+        shared.next_id += 1;
+        shared.operations.push_back(Operation {
+            id,
+            name: action.name().into(),
+            upload: action.is_upload(),
+            state: OperationState::Pending,
+        });
+        permit.send(Command {
+            id,
+            epoch: shared.epoch,
+            action,
+        });
+        Ok(id)
     }
 }
 
 async fn run_worker(
-    config: MoonrakerConfig,
-    mut action_rx: mpsc::UnboundedReceiver<PrinterAction>,
-    telemetry: Arc<RwLock<PrinterTelemetry>>,
-    uploading: Arc<AtomicBool>,
+    client: MoonrakerClient,
+    mut normal: mpsc::Receiver<Command>,
+    mut emergency: mpsc::Receiver<Command>,
+    mut lifecycle: watch::Receiver<u64>,
+    shared: Arc<Mutex<Shared>>,
 ) {
-    let client = match MoonrakerClient::new(config.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            if let Ok(mut t) = telemetry.write() {
-                t.connection_state = ConnectionState::Error(e.to_string());
-            }
-            return;
+    loop {
+        let epoch = *lifecycle.borrow_and_update();
+        let online = shared.lock().unwrap().online;
+        tokio::select! {
+            biased;
+            changed = lifecycle.changed() => { if changed.is_err() { break; } }
+            _ = actions(&client, &mut emergency, &shared, epoch, true) => break,
+            _ = actions(&client, &mut normal, &shared, epoch, false) => break,
+            _ = async {
+                if online { crate::transport::run(&client, &shared, epoch).await; }
+                std::future::pending::<()>().await;
+            } => {}
         }
-    };
+    }
+}
 
-    let mut auto_reconnect = config.auto_connect;
-    let mut reconnect_attempt = 0;
-
-    let ws_url = {
-        let mut u = match Url::parse(&config.url) {
-            Ok(u) => u,
-            Err(e) => {
-                if let Ok(mut t) = telemetry.write() {
-                    t.connection_state = ConnectionState::Error(e.to_string());
-                }
-                return;
+async fn actions(
+    client: &MoonrakerClient,
+    rx: &mut mpsc::Receiver<Command>,
+    shared: &Arc<Mutex<Shared>>,
+    epoch: u64,
+    emergency: bool,
+) {
+    while let Some(command) = rx.recv().await {
+        {
+            let mut state = shared.lock().unwrap();
+            if command.epoch != epoch || state.epoch != epoch {
+                continue;
             }
+            if !emergency && !state.telemetry.fresh {
+                state.update(
+                    command.id,
+                    OperationState::Failed {
+                        message: "Unsent action rejected: subscription lost".into(),
+                        outcome_unknown: false,
+                    },
+                );
+                continue;
+            }
+            state.update(
+                command.id,
+                OperationState::Running {
+                    bytes_read: 0,
+                    total_bytes: 0,
+                },
+            );
+        }
+        let progress_state = shared.clone();
+        let id = command.id;
+        let progress = Arc::new(move |bytes_read, total_bytes| {
+            progress_state.lock().unwrap().update(
+                id,
+                OperationState::Running {
+                    bytes_read,
+                    total_bytes,
+                },
+            );
+        });
+        let result = match command.action {
+            PrinterAction::UploadOnly { filename, gcode } => client
+                .upload_gcode_with_progress(&filename, gcode, false, Some(progress))
+                .await
+                .map(ActionOutcome::Upload),
+            PrinterAction::UploadAndPrint { filename, gcode } => client
+                .upload_gcode_with_progress(&filename, gcode, true, Some(progress))
+                .await
+                .map(ActionOutcome::Upload),
+            PrinterAction::Pause => client
+                .pause_print()
+                .await
+                .map(|_| ActionOutcome::Acknowledged),
+            PrinterAction::Resume => client
+                .resume_print()
+                .await
+                .map(|_| ActionOutcome::Acknowledged),
+            PrinterAction::Cancel => client
+                .cancel_print()
+                .await
+                .map(|_| ActionOutcome::Acknowledged),
+            PrinterAction::EmergencyStop => client
+                .emergency_stop()
+                .await
+                .map(|_| ActionOutcome::Acknowledged),
+            _ => unreachable!("lifecycle actions never queued"),
         };
-        let ws_scheme = if u.scheme() == "https" { "wss" } else { "ws" };
-        let _ = u.set_scheme(ws_scheme);
-        match u.join("websocket") {
-            Ok(ws_u) => ws_u,
-            Err(e) => {
-                if let Ok(mut t) = telemetry.write() {
-                    t.connection_state = ConnectionState::Error(e.to_string());
-                }
-                return;
-            }
-        }
-    };
-
-    'main_loop: loop {
-        if !auto_reconnect {
-            if let Ok(mut t) = telemetry.write() {
-                t.connection_state = ConnectionState::Disconnected;
-            }
-            while let Some(action) = action_rx.recv().await {
-                match action {
-                    PrinterAction::Reconnect => {
-                        auto_reconnect = true;
-                        reconnect_attempt = 0;
-                        break;
-                    }
-                    _ => warn!("Ignored action while disconnected: {action:?}"),
-                }
-            }
-        }
-
-        if let Ok(mut t) = telemetry.write() {
-            if reconnect_attempt == 0 {
-                t.connection_state = ConnectionState::Connecting;
-            } else {
-                t.connection_state = ConnectionState::Reconnecting {
-                    attempt: reconnect_attempt,
-                };
-            }
-        }
-
-        let ws_stream_res = connect_async(ws_url.as_str()).await;
-        let mut ws_stream = match ws_stream_res {
-            Ok((stream, _)) => {
-                reconnect_attempt = 0;
-                if let Ok(mut t) = telemetry.write() {
-                    t.connection_state = ConnectionState::Connected;
-                }
-                stream
-            }
-            Err(_err) => {
-                reconnect_attempt += 1;
-                let backoff_secs = (1u64 << reconnect_attempt.min(4)).min(10);
-                if let Ok(mut t) = telemetry.write() {
-                    t.connection_state = ConnectionState::Reconnecting {
-                        attempt: reconnect_attempt,
-                    };
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {
-                        continue 'main_loop;
-                    }
-                    Some(action) = action_rx.recv() => {
-                        if let PrinterAction::Disconnect = action {
-                            auto_reconnect = false;
-                            continue 'main_loop;
-                        }
-                    }
-                }
-                continue 'main_loop;
-            }
+        let state = match result {
+            Ok(result) => OperationState::Succeeded(result),
+            Err(e) => OperationState::Failed {
+                outcome_unknown: e.outcome_unknown(),
+                message: client.redact(&e.to_string()),
+            },
         };
-
-        // Subscribe to objects
-        let sub_req = build_subscribe_request(1);
-        let _ = ws_stream.send(Message::Text(sub_req.to_string())).await;
-
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
-
-        'ws_loop: loop {
-            tokio::select! {
-                _ = ping_interval.tick() => {
-                    if let Err(e) = ws_stream.send(Message::Ping(vec![])).await {
-                        warn!("WebSocket ping failed: {e}");
-                        break 'ws_loop;
-                    }
-                }
-                Some(msg_res) = ws_stream.next() => {
-                    match msg_res {
-                        Ok(Message::Text(text)) => {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                                if val.get("method").and_then(|v| v.as_str()) == Some("notify_status_update") {
-                                    if let Some(params) = val.get("params").and_then(|v| v.as_array()) {
-                                        if let Some(delta) = params.first() {
-                                            if let Ok(mut t) = telemetry.write() {
-                                                apply_status_delta(&mut t, delta);
-                                            }
-                                        }
-                                    }
-                                } else if let Some(res) = val.get("result").and_then(|v| v.get("status")) {
-                                    if let Ok(mut t) = telemetry.write() {
-                                        apply_status_delta(&mut t, res);
-                                    }
-                                }
-                            }
-                        }
-                        Ok(Message::Close(_)) => {
-                            info!("WebSocket closed by server");
-                            break 'ws_loop;
-                        }
-                        Err(e) => {
-                            warn!("WebSocket stream error: {e}");
-                            break 'ws_loop;
-                        }
-                        _ => {}
-                    }
-                }
-                Some(action) = action_rx.recv() => {
-                    match action {
-                        PrinterAction::UploadAndPrint { filename, gcode } => {
-                            let client = client.clone();
-                            let uploading = Arc::clone(&uploading);
-                            tokio::spawn(async move {
-                                uploading.store(true, Ordering::Relaxed);
-                                let res = client.upload_gcode(&filename, gcode, true).await;
-                                uploading.store(false, Ordering::Relaxed);
-                                if let Err(e) = res {
-                                    error!("Upload & Print failed: {e}");
-                                }
-                            });
-                        }
-                        PrinterAction::UploadOnly { filename, gcode } => {
-                            let client = client.clone();
-                            let uploading = Arc::clone(&uploading);
-                            tokio::spawn(async move {
-                                uploading.store(true, Ordering::Relaxed);
-                                let res = client.upload_gcode(&filename, gcode, false).await;
-                                uploading.store(false, Ordering::Relaxed);
-                                if let Err(e) = res {
-                                    error!("Upload Only failed: {e}");
-                                }
-                            });
-                        }
-                        PrinterAction::Pause => {
-                            let client = client.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = client.pause_print().await {
-                                    error!("Pause failed: {e}");
-                                }
-                            });
-                        }
-                        PrinterAction::Resume => {
-                            let client = client.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = client.resume_print().await {
-                                    error!("Resume failed: {e}");
-                                }
-                            });
-                        }
-                        PrinterAction::Cancel => {
-                            let client = client.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = client.cancel_print().await {
-                                    error!("Cancel failed: {e}");
-                                }
-                            });
-                        }
-                        PrinterAction::EmergencyStop => {
-                            let client = client.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = client.emergency_stop().await {
-                                    error!("Emergency stop failed: {e}");
-                                }
-                            });
-                        }
-                        PrinterAction::Disconnect => {
-                            auto_reconnect = false;
-                            break 'ws_loop;
-                        }
-                        PrinterAction::Reconnect => {
-                            auto_reconnect = true;
-                            break 'ws_loop;
-                        }
-                    }
-                }
-            }
-        }
+        shared.lock().unwrap().update(id, state);
     }
 }

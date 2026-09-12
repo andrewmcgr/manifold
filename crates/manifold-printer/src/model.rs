@@ -15,7 +15,9 @@ pub enum ConnectionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PrintState {
     #[default]
+    Unknown,
     Standby,
+    Cancelled,
     Printing,
     Paused,
     Complete,
@@ -31,6 +33,12 @@ pub struct TemperatureState {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PrinterTelemetry {
     pub connection_state: ConnectionState,
+    /// True only for a live, authenticated subscription snapshot.
+    pub fresh: bool,
+    pub generation: u64,
+    pub klippy_ready: bool,
+    pub display_progress: Option<f32>,
+    pub sd_progress: Option<f32>,
     pub print_state: PrintState,
     pub filename: Option<String>,
     pub progress_fraction: f32,
@@ -45,7 +53,7 @@ pub struct PrinterTelemetry {
     pub klipper_message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoonrakerConfig {
     pub url: String,
     #[serde(default)]
@@ -85,7 +93,54 @@ mod tests {
     fn test_printer_telemetry_defaults() {
         let telemetry = PrinterTelemetry::default();
         assert_eq!(telemetry.connection_state, ConnectionState::Disconnected);
-        assert_eq!(telemetry.print_state, PrintState::Standby);
+        assert_eq!(telemetry.print_state, PrintState::Unknown);
         assert_eq!(telemetry.progress_fraction, 0.0);
     }
+}
+
+impl std::fmt::Debug for MoonrakerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MoonrakerConfig")
+            .field("url", &self.url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("auto_connect", &self.auto_connect)
+            .finish()
+    }
+}
+
+impl PrintState {
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Printing | Self::Paused)
+    }
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "standby" => Self::Standby,
+            "printing" => Self::Printing,
+            "paused" => Self::Paused,
+            "complete" => Self::Complete,
+            "cancelled" => Self::Cancelled,
+            "error" => Self::Error,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerInfo {
+    pub klippy_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadDisposition {
+    Uploaded,
+    Started,
+    Queued,
+    StartNotConfirmed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadOutcome {
+    pub path: String,
+    pub root: String,
+    pub disposition: UploadDisposition,
 }

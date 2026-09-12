@@ -65,25 +65,29 @@ pub fn apply_status_delta(telemetry: &mut PrinterTelemetry, delta: &Value) {
         }
     }
 
-    if let Some(display) = delta.get("display_status") {
-        if let Some(progress) = display.get("progress").and_then(|v| v.as_f64()) {
-            telemetry.progress_fraction = progress.clamp(0.0, 1.0) as f32;
-        }
-    }
-
     if let Some(stats) = delta.get("print_stats") {
         if let Some(state_str) = stats.get("state").and_then(|v| v.as_str()) {
-            telemetry.print_state = match state_str.to_lowercase().as_str() {
-                "printing" => PrintState::Printing,
-                "paused" => PrintState::Paused,
-                "complete" => PrintState::Complete,
-                "error" => PrintState::Error,
-                _ => PrintState::Standby,
-            };
+            telemetry.print_state = PrintState::parse(state_str);
         }
-        if let Some(filename) = stats.get("filename").and_then(|v| v.as_str()) {
-            if !filename.is_empty() {
-                telemetry.filename = Some(filename.to_string());
+        if let Some(filename) = stats.get("filename").and_then(Value::as_str) {
+            let filename = (!filename.is_empty()).then(|| filename.to_string());
+            if telemetry.filename != filename {
+                telemetry.display_progress = None;
+                telemetry.sd_progress = None;
+                telemetry.current_layer = None;
+                telemetry.total_layers = None;
+                telemetry.klipper_message = None;
+                telemetry.print_duration_secs = 0;
+                telemetry.total_duration_secs = 0;
+            }
+            telemetry.filename = filename;
+        }
+        if let Some(info) = stats.get("info") {
+            if let Some(layer) = info.get("current_layer") {
+                telemetry.current_layer = layer.as_u64().and_then(|n| n.try_into().ok());
+            }
+            if let Some(layer) = info.get("total_layer") {
+                telemetry.total_layers = layer.as_u64().and_then(|n| n.try_into().ok());
             }
         }
         if let Some(dur) = stats.get("print_duration").and_then(|v| v.as_f64()) {
@@ -109,22 +113,31 @@ pub fn apply_status_delta(telemetry: &mut PrinterTelemetry, delta: &Value) {
                 }
             }
         }
-        if let Some(est) = toolhead
-            .get("estimated_print_time")
-            .and_then(|v| v.as_f64())
-        {
-            if est > 0.0 && telemetry.print_duration_secs > 0 {
-                let remaining = (est as u64).saturating_sub(telemetry.print_duration_secs);
-                telemetry.estimated_remaining_secs = Some(remaining);
-            }
+    }
+    for (object, target) in [
+        ("display_status", &mut telemetry.display_progress),
+        ("virtual_sdcard", &mut telemetry.sd_progress),
+    ] {
+        if let Some(value) = delta.get(object).and_then(|v| v.get("progress")) {
+            *target = value
+                .as_f64()
+                .filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
+                .map(|p| p as f32);
         }
     }
-
-    if let Some(sdcard) = delta.get("virtual_sdcard") {
-        if telemetry.progress_fraction == 0.0 {
-            if let Some(progress) = sdcard.get("progress").and_then(|v| v.as_f64()) {
-                telemetry.progress_fraction = progress.clamp(0.0, 1.0) as f32;
-            }
-        }
-    }
+    telemetry.progress_fraction = telemetry
+        .display_progress
+        .or(telemetry.sd_progress)
+        .unwrap_or(0.0);
+    let p = f64::from(telemetry.progress_fraction);
+    // Progress-based approximation, never Klipper's MCU motion clock.
+    telemetry.estimated_remaining_secs = if telemetry.print_state == PrintState::Printing
+        && p > 0.0
+        && p <= 1.0
+        && telemetry.print_duration_secs > 0
+    {
+        Some((telemetry.print_duration_secs as f64 * (1.0 - p) / p).round() as u64)
+    } else {
+        None
+    };
 }
