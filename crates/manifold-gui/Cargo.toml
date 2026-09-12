@@ -36,3 +36,9 @@ schemars = { version = "1", optional = true }
 
 [features]
 mcp-server = ["dep:rmcp", "dep:tokio", "dep:schemars"]
+
+[dev-dependencies]
+# Reuse the loopback HTTP/WS fixtures for session-retirement regressions.
+tokio = { version = "1", features = ["full"] }
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = "0.24"

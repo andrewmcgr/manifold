@@ -1,10 +1,21 @@
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use egui::{Color32, RichText, Ui};
 use manifold_printer::{
-    ActionOutcome, ConnectionState, MoonrakerClient, MoonrakerConfig, OperationState, PrintState,
-    PrinterAction, PrinterSessionHandle, PrinterTelemetry,
+    ActionOutcome, ConnectionState, MoonrakerClient, MoonrakerConfig, Operation, OperationState,
+    PrintState, PrinterAction, PrinterSessionHandle, PrinterTelemetry, ResultSummary,
 };
+
+// Each retired session holds at most 63 ordinary results, one stop and its summary.
+// Older targets are explicitly compacted, never silently acknowledged.
+const RETIRED_SESSION_LIMIT: usize = 8;
+struct RetiredSession {
+    endpoint: String,
+    identity: usize,
+    operations: Vec<Operation>,
+    emergency_summary: ResultSummary,
+}
 
 pub struct PrinterPanel {
     pub collapsed: bool,
@@ -14,6 +25,8 @@ pub struct PrinterPanel {
     pub auto_connect: bool,
     pub action_error: Option<String>,
     has_settings: bool,
+    retired: VecDeque<RetiredSession>,
+    retired_summary: ResultSummary,
     confirmation_target: Option<(usize, u64, u64, Option<String>)>,
 }
 impl Default for PrinterPanel {
@@ -37,6 +50,8 @@ impl PrinterPanel {
             has_settings: config.is_some(),
             action_error: None,
             confirmation_target: None,
+            retired: VecDeque::new(),
+            retired_summary: ResultSummary::default(),
         }
     }
     fn validated_draft(&self) -> Result<MoonrakerConfig, String> {
@@ -65,12 +80,91 @@ impl PrinterPanel {
         session: &mut Option<PrinterSessionHandle>,
         config: Option<&MoonrakerConfig>,
     ) {
-        if let Some(old) = session.take() {
-            let _ = old.send_action(PrinterAction::Disconnect);
-        }
+        self.retire(session);
+        let retired = std::mem::take(&mut self.retired);
+        let summary = std::mem::take(&mut self.retired_summary);
         *self = Self::new(config);
+        self.retired = retired;
+        self.retired_summary = summary;
         if let Some(config) = config.filter(|c| c.auto_connect) {
             *session = Some(PrinterSessionHandle::spawn(config.clone()));
+        }
+    }
+    fn retire(&mut self, session: &mut Option<PrinterSessionHandle>) {
+        if let Some(old) = session.take() {
+            // Disconnect synchronously publishes pending/uncertain results before dropping
+            // the last owner. The archive contains data only, never a networking handle.
+            let _ = old.send_action(PrinterAction::Disconnect);
+            let result = RetiredSession {
+                endpoint: old.endpoint().into(),
+                identity: old.identity(),
+                operations: old.operations(),
+                emergency_summary: old.emergency_summary(),
+            };
+            if !result.operations.is_empty() || !result.emergency_summary.is_empty() {
+                self.retired.push_back(result);
+            }
+            while self.retired.len() > RETIRED_SESSION_LIMIT {
+                if let Some(oldest) = self.retired.pop_front() {
+                    for op in oldest.operations {
+                        self.retired_summary.include(&op.state);
+                    }
+                    self.retired_summary.merge(&oldest.emergency_summary);
+                }
+            }
+        }
+        self.confirming_cancel = false;
+        self.confirmation_target = None;
+    }
+    fn connect_draft(
+        &mut self,
+        session: &mut Option<PrinterSessionHandle>,
+        mut config: MoonrakerConfig,
+    ) {
+        self.retire(session);
+        config.auto_connect = true; // Explicit Connect ignores saved auto-connect preference.
+        *session = Some(PrinterSessionHandle::spawn(config));
+    }
+    fn show_retired(&mut self, ui: &mut Ui) {
+        for retired in &mut self.retired {
+            ui.label(format!(
+                "Retired target: {} — session {}",
+                retired.endpoint, retired.identity
+            ));
+            retired.operations.retain(|op| {
+                let mut acknowledge = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("#{} {}: {:?}", op.id, op.name, op.state));
+                    acknowledge = ui.small_button("Acknowledge retired result").clicked();
+                });
+                !acknowledge
+            });
+            if !retired.emergency_summary.is_empty() {
+                ui.colored_label(
+                    Color32::YELLOW,
+                    format!(
+                        "Earlier retired emergency results: {:?}",
+                        retired.emergency_summary
+                    ),
+                );
+                if ui
+                    .small_button("Acknowledge retired stop summary")
+                    .clicked()
+                {
+                    retired.emergency_summary = ResultSummary::default();
+                }
+            }
+        }
+        self.retired
+            .retain(|r| !r.operations.is_empty() || !r.emergency_summary.is_empty());
+        if !self.retired_summary.is_empty() {
+            ui.colored_label(Color32::YELLOW, format!("Older retired targets (details compacted): {} successful, {} failed, {} outcome unknown. Disconnect cannot undo transmitted commands; inspect those printers.", self.retired_summary.succeeded, self.retired_summary.failed, self.retired_summary.outcome_unknown));
+            if ui
+                .small_button("Acknowledge older retired results")
+                .clicked()
+            {
+                self.retired_summary = ResultSummary::default();
+            }
         }
     }
     pub fn send(&mut self, session: &PrinterSessionHandle, action: PrinterAction) {
@@ -168,6 +262,7 @@ impl PrinterPanel {
                     });
                 }
             }
+            self.show_retired(ui);
             if let Some(error) = &self.action_error {ui.colored_label(Color32::RED,error);}
             if self.collapsed {return;}
             ui.separator();
@@ -194,11 +289,7 @@ impl PrinterPanel {
                         on_save_config(config.clone());
                         self.action_error = None;
                         if connect {
-                            if let Some(old) = session_opt.take() {let _ = old.send_action(PrinterAction::Disconnect);}
-                            let mut active = config;
-                            active.auto_connect = true; // Explicit Connect is independent of the saved auto-connect preference.
-                            *session_opt = Some(PrinterSessionHandle::spawn(active));
-                            self.confirming_cancel = false;
+                            self.connect_draft(session_opt, config);
                         }
                     }
                     Err(e) => self.action_error = Some(e),
@@ -401,3 +492,7 @@ mod tests {
         assert_eq!(panel2.api_key_input, "key123");
     }
 }
+
+#[cfg(test)]
+#[path = "printer_panel_tests.rs"]
+mod retirement_tests;

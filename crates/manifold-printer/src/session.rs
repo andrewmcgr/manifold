@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, watch};
@@ -10,6 +11,7 @@ pub use crate::operation::PrinterAction;
 use crate::operation::{ActionOutcome, Operation, OperationState, ResultSummary};
 
 const NORMAL_HISTORY_LIMIT: usize = 63;
+static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub(crate) struct Shared {
     pub telemetry: PrinterTelemetry,
@@ -72,6 +74,7 @@ struct Command {
     action: PrinterAction,
 }
 struct Owner {
+    identity: usize,
     endpoint: String,
     normal: mpsc::Sender<Command>,
     emergency: mpsc::Sender<Command>,
@@ -145,6 +148,7 @@ impl PrinterSessionHandle {
         }
         Self {
             owner: Arc::new(Owner {
+                identity: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
                 endpoint,
                 normal,
                 emergency,
@@ -157,7 +161,7 @@ impl PrinterSessionHandle {
         &self.owner.endpoint
     }
     pub fn identity(&self) -> usize {
-        Arc::as_ptr(&self.owner) as usize
+        self.owner.identity
     }
     pub fn latest_telemetry(&self) -> PrinterTelemetry {
         self.owner.shared.lock().unwrap().telemetry.clone()

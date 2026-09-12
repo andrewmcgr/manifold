@@ -82,6 +82,12 @@ Pause/Resume are ordinary ordered controls. Cancel asks for confirmation tied to
 the current session/job. **Disconnect is not cancellation** and cannot undo a
 request already transmitted. Dropping/retiring a session cancels local owned work,
 rejects unsent commands and stops reconnecting without blocking the UI on a join.
+Profile replacement and Connect draft retain completed/interrupted results separately
+from the retired worker, tagged with endpoint, session and operation ID, even when
+the new profile has no connection. The last eight retired sessions retain details;
+older results become explicit success/failure/unknown counters (old target details
+are compacted). Profile resets never acknowledge these warnings. Acknowledge results
+deliberately after inspecting the affected printer; no old worker is held for history.
 
 **Emergency Stop** uses a separate bounded HTTP path and does not wait for a WS
 handshake, held upload, full normal queue or retained ordinary failures. One stop

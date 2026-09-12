@@ -82,6 +82,11 @@ impl ResultSummary {
             _ => {}
         }
     }
+    pub fn merge(&mut self, other: &Self) {
+        self.succeeded = self.succeeded.saturating_add(other.succeeded);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.outcome_unknown = self.outcome_unknown.saturating_add(other.outcome_unknown);
+    }
     pub fn is_empty(&self) -> bool {
         self.succeeded == 0 && self.failed == 0
     }
