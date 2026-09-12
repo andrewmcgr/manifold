@@ -7,13 +7,20 @@ use crate::{
     transform::Transform,
 };
 use glam::DVec3;
+use std::sync::Arc;
 
 /// A single mesh instance placed within a [`crate::workspace::Workspace`],
 /// assigned to a tool.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Object {
     pub id: ObjectId,
-    pub mesh: Mesh,
+    /// Shared, immutable mesh data. `Arc`-wrapped so that instances created
+    /// by [`Object::duplicate`] reuse the same underlying vertex/index
+    /// buffers (and any per-object mesh caches derived from them) instead of
+    /// deep-copying the mesh — cheap duplication is the whole point of
+    /// instancing. Nothing mutates a `Mesh` in place after construction;
+    /// only `transform` changes per-instance.
+    pub mesh: Arc<Mesh>,
     /// Full position/rotation/scale placement of this object in world
     /// space.
     pub transform: Transform,
@@ -28,10 +35,25 @@ impl Object {
     pub fn new(id: ObjectId, mesh: Mesh, tool: ToolId) -> Self {
         Self {
             id,
-            mesh,
+            mesh: Arc::new(mesh),
             transform: Transform::identity(),
             tool,
             name: None,
+        }
+    }
+
+    /// Create a new instance of this object under a fresh `id`, sharing the
+    /// same underlying mesh data (an `Arc` clone, not a deep copy) and
+    /// copying `transform`/`tool`/`name` as a starting point — callers
+    /// typically reposition the returned object (e.g. via
+    /// [`arrange_on_bed`]) so it doesn't sit exactly on top of the original.
+    pub fn duplicate(&self, id: ObjectId) -> Self {
+        Self {
+            id,
+            mesh: Arc::clone(&self.mesh),
+            transform: self.transform,
+            tool: self.tool,
+            name: self.name.clone(),
         }
     }
 
@@ -184,6 +206,21 @@ mod tests {
         let object = Object::new(ObjectId(1), Mesh::default(), ToolId(1)).with_name("benchy");
         assert_eq!(object.name.as_deref(), Some("benchy"));
         assert_eq!(object.display_name(), "benchy");
+    }
+
+    #[test]
+    fn duplicate_shares_mesh_arc_and_copies_transform_tool_and_name() {
+        let original = Object::new(ObjectId(1), Mesh::default(), ToolId(2)).with_name("benchy");
+        let mut original = original;
+        original.transform = Transform::from_translation(DVec3::new(3.0, 4.0, 0.0));
+
+        let instance = original.duplicate(ObjectId(7));
+
+        assert_eq!(instance.id, ObjectId(7));
+        assert!(Arc::ptr_eq(&instance.mesh, &original.mesh));
+        assert_eq!(instance.transform, original.transform);
+        assert_eq!(instance.tool, original.tool);
+        assert_eq!(instance.name, original.name);
     }
 
     #[test]

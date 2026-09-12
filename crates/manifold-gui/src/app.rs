@@ -352,7 +352,7 @@ impl ManifoldApp {
         }
     }
 
-        fn build_scene(
+    fn build_scene(
         device: &eframe::egui_wgpu::wgpu::Device,
         machine: &Machine,
         objects: &[Object],
@@ -365,14 +365,18 @@ impl ManifoldApp {
 
         let names: Vec<String> = objects
             .iter()
-            .map(|object| object.name.clone().unwrap_or_else(|| format!("Object {}", object.id.0)))
+            .map(|object| {
+                object
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("Object {}", object.id.0))
+            })
             .collect();
         let atlas = crate::text_raster::build_atlas(&names);
         let text_vertices = scene::build_object_labels(machine, objects, &atlas);
 
         UploadedScene::upload(device, &lines, &triangles, &text_vertices, &atlas)
     }
-
 
     /// Combined axis-aligned bounding box enclosing the machine build volume
     /// and every loaded object (transformed to world space).
@@ -511,6 +515,26 @@ impl ManifoldApp {
                 self.import_error = None;
             }
             Err(err) => self.import_error = Some(err.to_string()),
+        }
+    }
+
+    /// Duplicates the object at `index`, placing the copy alongside the
+    /// original and selecting it. Shares the underlying mesh data (see
+    /// `Object::duplicate`) rather than deep-copying it.
+    fn duplicate_object(&mut self, index: usize, device: &eframe::egui_wgpu::wgpu::Device) {
+        if let Some(object) = self.objects.get(index) {
+            let id = ObjectId(self.next_object_id);
+            self.next_object_id += 1;
+            let (bed_min, bed_max) = self.machine.build_volume.bounding_box();
+            let offset_x = ((bed_max.x - bed_min.x) * 0.02 + 10.0).max(10.0);
+            let mut copy = object.duplicate(id);
+            copy.transform = copy
+                .transform
+                .then_translate(DVec3::new(offset_x, 0.0, 0.0));
+            self.objects.push(copy);
+            self.selected = Some(self.objects.len() - 1);
+            self.update_camera_bounds();
+            self.reupload(device);
         }
     }
 
@@ -2908,6 +2932,20 @@ impl ManifoldApp {
                         .device
                         .clone();
                     self.import(&path, &device);
+                }
+            }
+            if ui
+                .add_enabled(self.selected.is_some(), egui::Button::new("Duplicate"))
+                .on_hover_text("Duplicate selected object")
+                .clicked()
+            {
+                if let Some(index) = self.selected {
+                    let device = frame
+                        .wgpu_render_state()
+                        .expect("wgpu renderer is required")
+                        .device
+                        .clone();
+                    self.duplicate_object(index, &device);
                 }
             }
             if ui

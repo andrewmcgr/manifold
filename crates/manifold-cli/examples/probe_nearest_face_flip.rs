@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     };
     object::center_on_bed(&mut objects, &build_volume);
     let obj = &objects[0];
-    let mut mesh = obj.mesh.clone();
+    let mut mesh = (*obj.mesh).clone();
     for v in &mut mesh.vertices {
         *v = obj.transform.transform_point(*v);
     }
