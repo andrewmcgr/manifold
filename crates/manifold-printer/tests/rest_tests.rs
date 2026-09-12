@@ -312,3 +312,125 @@ async fn malformed_control_success_is_not_an_acknowledgement() {
     .unwrap();
     assert!(client.cancel_print().await.unwrap_err().outcome_unknown());
 }
+
+#[tokio::test]
+async fn gateway_and_server_mutation_errors_are_unknown_not_definitive_rejections() {
+    for (status, body) in [
+        (502, "<html>Bad Gateway secret</html>"),
+        (504, "upstream timed out after forwarding secret"),
+        (
+            500,
+            r#"{"error":{"code":500,"message":"internal error secret"}}"#,
+        ),
+        (
+            200,
+            r#"{"error":{"code":500,"message":"internal error secret"}}"#,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        ready(&server, "standby", "").await;
+        Mock::given(method("POST"))
+            .and(path("/server/files/upload"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = MoonrakerClient::new(MoonrakerConfig {
+            url: server.uri(),
+            api_key: Some("secret".into()),
+            auto_connect: false,
+        })
+        .unwrap();
+        let error = client
+            .upload_gcode("part.gcode", vec![1], true)
+            .await
+            .unwrap_err();
+        assert!(
+            error.outcome_unknown(),
+            "gateway/server response cannot prove nonexecution: {error:?}"
+        );
+        let display = error.to_string();
+        assert!(display.contains("upload") && display.contains(&status.to_string()));
+        assert!(!display.contains("secret") && !format!("{error:?}").contains("secret"));
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .count(),
+            1
+        );
+    }
+}
+#[tokio::test]
+async fn malformed_decode_errors_redact_credentials_in_display_and_debug() {
+    for (upload, key) in [
+        (false, "secret-key"),
+        (true, "secret-key"),
+        (true, "secret\"key\\suffix"),
+    ] {
+        let server = MockServer::start().await;
+        if upload {
+            ready(&server, "standby", "").await;
+        }
+        Mock::given(path(if upload { "/server/files/upload" } else { "/server/info" }))
+            .respond_with(ResponseTemplate::new(200).set_body_json(if upload {
+                serde_json::json!({"item":{"path":"part.gcode","root":"gcodes"},"print_started":key,"print_queued":false})
+            } else {
+                serde_json::json!({"result":key})
+            })).mount(&server).await;
+        let client = MoonrakerClient::new(MoonrakerConfig {
+            url: server.uri(),
+            api_key: Some(key.into()),
+            auto_connect: false,
+        })
+        .unwrap();
+        let error = if upload {
+            client
+                .upload_gcode("part.gcode", vec![1], true)
+                .await
+                .unwrap_err()
+        } else {
+            client.check_connection().await.unwrap_err()
+        };
+        assert!(!error.to_string().contains(key), "{error}");
+        assert!(!format!("{error:?}").contains(key));
+        let quoted = format!("{key:?}");
+        let escaped = &quoted[1..quoted.len() - 1];
+        assert!(
+            !error.to_string().contains(escaped),
+            "escaped key leaked: {error}"
+        );
+        let debug_quoted = format!("{escaped:?}");
+        assert!(!format!("{error:?}").contains(&debug_quoted[1..debug_quoted.len() - 1]));
+        assert!(error.to_string().contains("invalid"));
+        assert!(error.to_string().contains("[REDACTED]"));
+    }
+}
+
+#[tokio::test]
+async fn fresh_query_failure_is_known_unsent_even_for_gateway_response() {
+    let server = MockServer::start().await;
+    Mock::given(path("/server/info"))
+        .respond_with(ResponseTemplate::new(504).set_body_string("gateway unavailable"))
+        .mount(&server)
+        .await;
+    let client = MoonrakerClient::new(MoonrakerConfig {
+        url: server.uri(),
+        ..Default::default()
+    })
+    .unwrap();
+    let error = client
+        .upload_gcode("part.gcode", vec![1], true)
+        .await
+        .unwrap_err();
+    assert!(!error.outcome_unknown());
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|request| request.method == "GET"));
+}

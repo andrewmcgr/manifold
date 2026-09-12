@@ -80,7 +80,14 @@ impl MoonrakerClient {
     }
     pub(crate) fn redact(&self, message: &str) -> String {
         match self.config.api_key.as_deref().filter(|k| !k.is_empty()) {
-            Some(key) => message.replace(key, "[REDACTED]"),
+            Some(key) => {
+                // Serde's unexpected-string diagnostics use Debug escaping. Redact that
+                // representation as well as literal credentials before errors escape.
+                let quoted = format!("{key:?}");
+                message
+                    .replace(&quoted[1..quoted.len() - 1], "[REDACTED]")
+                    .replace(key, "[REDACTED]")
+            }
             None => message.into(),
         }
     }
@@ -108,28 +115,50 @@ impl MoonrakerClient {
             }
         })?;
         let status = resp.status();
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| MoonrakerError::OutcomeUnknown {
-                operation: operation.into(),
-                message: self.redact(&e.to_string()),
-            })?;
+        let body = resp.bytes().await.map_err(|e| {
+            if mutating {
+                MoonrakerError::HttpOutcomeUnknown {
+                    operation: operation.into(),
+                    status: status.as_u16(),
+                    message: self.redact(&e.to_string()),
+                }
+            } else {
+                MoonrakerError::rejected(operation, &self.redact(&e.to_string()))
+            }
+        })?;
         let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         if !status.is_success() || value.get("error").is_some() {
-            let error = value.get("error").unwrap_or(&value);
+            let error = value.get("error");
+            let code = error.and_then(|e| e["code"].as_i64());
+            let detail = error.and_then(|e| e["message"].as_str());
+            let message = self.redact(
+                detail.unwrap_or(
+                    status
+                        .canonical_reason()
+                        .unwrap_or("invalid application response"),
+                ),
+            );
+            // Only a valid application-level client rejection proves nonexecution.
+            // Gateways and even structured server failures may follow side effects.
+            let definitive_rejection = !status.is_server_error()
+                && (status.is_client_error() || status.is_success())
+                && code.is_some_and(|code| (400..500).contains(&code))
+                && detail.is_some();
+            if mutating && !definitive_rejection {
+                return Err(MoonrakerError::HttpOutcomeUnknown {
+                    operation: operation.into(),
+                    status: status.as_u16(),
+                    message: format!(
+                        "application code {}: {message}",
+                        code.map(|n| n.to_string())
+                            .unwrap_or_else(|| "unavailable".into())
+                    ),
+                });
+            }
             return Err(MoonrakerError::Api {
                 operation: operation.into(),
-                code: error
-                    .get("code")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(i64::from(status.as_u16())),
-                message: self.redact(
-                    error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or(status.canonical_reason().unwrap_or("invalid response")),
-                ),
+                code: code.unwrap_or(i64::from(status.as_u16())),
+                message,
             });
         }
         Ok(value)
@@ -144,14 +173,19 @@ impl MoonrakerClient {
                 false,
             )
             .await?;
-        Ok(serde_json::from_value(value["result"].clone())?)
+        serde_json::from_value(value["result"].clone()).map_err(|e| {
+            MoonrakerError::rejected(
+                "server info",
+                &self.redact(&format!("invalid server info response: {e}")),
+            )
+        })
     }
     pub async fn query_job(&self) -> Result<PrinterTelemetry, MoonrakerError> {
         let info = self.check_connection().await?;
         if info.klippy_state != "ready" {
             return Err(MoonrakerError::rejected(
                 "job query",
-                &format!("Klipper is {}", info.klippy_state),
+                &self.redact(&format!("Klipper is {}", info.klippy_state)),
             ));
         }
         let value = self
@@ -274,7 +308,7 @@ impl MoonrakerClient {
         let response: Response =
             serde_json::from_value(value).map_err(|e| MoonrakerError::OutcomeUnknown {
                 operation: "upload".into(),
-                message: format!("invalid upload response: {e}"),
+                message: self.redact(&format!("invalid upload response: {e}")),
             })?;
         if response.item.path.is_empty() || response.item.root != "gcodes" {
             return Err(MoonrakerError::OutcomeUnknown {

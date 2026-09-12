@@ -38,7 +38,8 @@ verification. Public API spelling is subordinate to these contracts.
 - [x] Keep optional plaintext profile API-key compatibility, mask GUI input and
   redact credential Debug/error output. No keys in URL queries or redirects.
 - [x] Use typed upload and operation outcomes; distinguish rejection, server error
-  and outcome-unknown after possible transmission.
+  and outcome-unknown after possible transmission, including gateway/structured 5xx
+  errors. Redact untrusted decode diagnostics before direct client/CLI propagation.
 
 References: `src/model.rs`, `src/error.rs`, `src/operation.rs` under
 `crates/manifold-printer`; `config_debug_redacts_key_and_rejects_credentials_in_url`.
@@ -98,12 +99,16 @@ source-fallback, layers/reset, same-filename restart and ETA tests.
   Reconnect can reopen a retained handle. Disconnect is **not print cancellation**;
   already transmitted side effects cannot be recalled and may be outcome-unknown.
 - [x] Use bounded normal admission, serialized execution and atomic upload/start
-  single-flight. Retain pending-start reservation until observed or reconciled.
+  single-flight. Retain operation-owned pending-start reservation until observed or
+  reconciled; reject unsent stale starts by releasing only their own reservation.
 - [x] Give Emergency Stop its own bounded immediate HTTP path, independent of WS
-  handshake/backoff and a held upload/full normal queue. Invalidate unsent normal
-  work. Report success/failure; network stop is not a hardware safety guarantee.
-- [x] Store bounded operation IDs/states/progress/results; retain failures until
-  acknowledgment and explicitly reject unavailable/full admissions.
+  handshake/backoff, a held upload/full normal queue and retained ordinary failures.
+  Use a separate latest-stop slot with bounded acknowledged summary of earlier stop
+  results; a failed completed stop cannot block another deliberate idle-lane attempt.
+  Invalidate unsent normal work. Network stop is not a hardware safety guarantee.
+- [x] Store bounded operation IDs/states/progress/results; retain ordinary failures
+  until acknowledgment and explicitly reject unavailable/full ordinary admissions.
+  Never gate emergency dispatch on ordinary history or stop-result acknowledgment.
 
 References: `session.rs`, `transport.rs`, `operation.rs`; `tests/session_tests.rs`.
 Loopback tests exercise successful authenticated WS, rejected subscription, EOF/drop,
@@ -118,10 +123,13 @@ pending-start reservation, pong/RPC/action timeout and capped/backed-off retries
   active filename. Reject upload+monitor without print. Upload+print is one combined
   upload/start, not two uploads or a separate start.
 - [x] Print+monitor requires a Started upload outcome, canonical filename and an
-  active-job observation before accepting completion; old terminal telemetry cannot
-  satisfy it. Fail/queued/unconfirmed/cancelled/auth failure exits nonzero.
-- [x] Bound initial readiness/job-start/disconnection waits. Ctrl-C exits monitoring
-  without sending print cancellation. Display filename, stale state, thermals,
+  new active-job observation before any terminal decision; validate job/subscription
+  identity on every state and fail conservatively when reconnect breaks continuity.
+  Old complete/error/cancelled telemetry cannot satisfy the requested new run.
+- [x] Bound initial readiness/job-start/disconnection waits. Service Ctrl-C with one
+  continuous listener through readiness, guards, transmission and monitoring; drop
+  unsent work and warn of uncertainty after possible transmission, without cancel/start
+  compensation. Display filename, stale state, thermals,
   elapsed time and explicitly approximate/unknown remaining time.
 
 References: `crates/manifold-cli/src/printer.rs`, `src/main.rs`, and
@@ -131,7 +139,10 @@ References: `crates/manifold-cli/src/printer.rs`, `src/main.rs`, and
 
 - [x] Preserve profiles without Moonraker. **Every** profile load retires the previous
   target, including missing Moonraker and auto_connect=false. Active endpoint/session
-  identity is immutable and visually separate from editable draft settings.
+  identity is immutable and visually separate from editable draft settings. Retain
+  endpoint/session/operation-tagged retirement results as data, never networking
+  handles. Keep eight detailed retired sessions and explicitly summarize older results
+  until acknowledged; profile resets and Connect draft never erase uncertainty.
 - [x] Mask API-key input, expose explicit auto-connect preference, validate/save draft
   settings without requiring Connect, and use visible draft in Save Profile.
 - [x] Keep the modular collapsible panel. Display action admission errors, retained
@@ -146,6 +157,21 @@ References: `crates/manifold-cli/src/printer.rs`, `src/main.rs`, and
 References: `crates/manifold-gui/src/{printer_panel,app,profile}.rs`; headless egui
 shape/state/repaint tests plus profile compatibility tests. These tests do not launch
 the desktop application's main loop or assert visual usability on actual hardware.
+
+### Authorized follow-up regressions (R1–R5, N1–N2)
+
+- R2: `repeated_emergency_http_dispatch_survives_saturated_failed_history` constructs
+  63 failed ordinary HTTP results, then 100 explicit failed/unknown stops with no WS
+  or acknowledgment. Existing held-upload/full-queue emergency regressions remain.
+- R1: `profile_retirement_preserves_transmitted_upload_uncertainty_without_worker`,
+  `connect_draft_preserves_old_target_uncertainty_without_worker`, and bounded
+  repeated-retirement/headless feedback tests assert socket/HTTP retirement and data retention.
+- R3: CLI unit identity matrices plus same-filename old-cancellation subprocess tests.
+- R4: SIGINT subprocess barriers on both guard queries and received upload; no extra mutations.
+- R5/N1: gateway/server outcome, uncertain reservation across reconnect, owned stale
+  rejection/admission recovery and explicit application-rejection release tests.
+- N2: direct Display/Debug and CLI malformed-response credential-echo tests, including
+  Debug-escaped credentials. All fixtures are loopback-only.
 
 ### Task 9: Verification and review
 

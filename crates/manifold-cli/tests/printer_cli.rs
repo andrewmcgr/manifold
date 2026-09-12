@@ -280,6 +280,10 @@ async fn interrupt_held_pipeline(after_transmission: bool, hold_job_query: bool)
         },
     )
     .await;
+    tokio::time::timeout(Duration::from_secs(2), &mut held.client_closed)
+        .await
+        .expect("interruption must drop held HTTP work")
+        .unwrap();
     // Releasing a held guard after interruption cannot resume the dropped pipeline.
     let _ = held
         .respond
@@ -310,4 +314,49 @@ async fn print_monitor_uses_canonical_upload_name_and_waits_for_active_job() {
 #[tokio::test]
 async fn print_monitor_ignores_old_same_filename_cancellation_before_new_run() {
     print_monitor_after_old_terminal("canonical.gcode", "cancelled").await;
+}
+
+#[tokio::test]
+async fn malformed_upload_response_never_echoes_api_key_in_cli_errors() {
+    for key in ["secret-key", "secret\"key\\suffix"] {
+        let mut server = Server::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        mesh(dir.path());
+        let child = command(dir.path())
+            .args([
+                "model.stl",
+                "--print",
+                "--printer-url",
+                &server.url,
+                "--printer-api-key",
+                key,
+            ])
+            .spawn()
+            .unwrap();
+        server
+            .request()
+            .await
+            .respond
+            .send(json!({"result":{"klippy_state":"ready"}}))
+            .unwrap();
+        server
+            .request()
+            .await
+            .respond
+            .send(json!({"result":{"status":{"print_stats":{"state":"standby","filename":""}}}}))
+            .unwrap();
+        let upload = server.request().await;
+        assert_eq!(upload.path, "/server/files/upload");
+        upload.respond.send(json!({"item":{"path":"part.gcode","root":"gcodes"},"print_started":key,"print_queued":false})).unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(3), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        let escaped = format!("{key:?}");
+        assert!(!error.contains(key) && !error.contains(&escaped[1..escaped.len() - 1]));
+        assert!(error.contains("invalid upload response") && error.contains("[REDACTED]"));
+        assert!(server.requests.is_empty());
+    }
 }

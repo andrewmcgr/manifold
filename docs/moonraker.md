@@ -74,8 +74,8 @@ not a directory path. The server is still authoritative for races with other cli
 
 Operation IDs show pending work, upload bytes read, server outcomes and actionable
 errors. **Upload progress is client bytes read, not server completion or print
-progress.** Ordinary errors remain until acknowledged; emergency history uses the bounded summary described below. A pending start can reserve upload
-admission until the corresponding active job is observed; if it stays uncertain,
+progress.** Ordinary errors remain until acknowledged; emergency history uses the
+bounded summary described below. A pending start can reserve upload admission until the corresponding active job is observed; if it stays uncertain,
 inspect Moonraker before explicitly reconnecting to reconcile.
 
 Telemetry updates repaint the UI at bounded intervals, including when the panel is
@@ -102,11 +102,27 @@ may be in flight at a time. Once it completes, another deliberate stop can dispa
 without acknowledging unrelated results, even if the previous stop failed. The
 latest stop retains its detailed result; older stop results become bounded visible
 success/failure/unknown counters until deliberately acknowledged. No stop is replayed
-automatically. Its result is visible; an interrupted
-request can have an unknown remote outcome. It is best-effort network control,
+automatically. Its result is visible; an interrupted request can have an unknown
+remote outcome. It is best-effort network control,
 **not a hardware safety guarantee**. Use the printer's physical safety mechanisms
 when needed. Do not treat UI disconnection or a failed request as evidence that
 motion/heaters have stopped.
+
+## Uncertain outcomes and credentials
+
+A valid Moonraker application rejection (for example, a structured 409) can be a
+known failure. A gateway 502/504, malformed mutation response, or server failure
+can follow execution: it is **outcome unknown**, not evidence that nothing happened.
+Errors retain the operation and HTTP status with redacted structured detail, without
+dumping response bodies. Never automatically retry an ambiguous mutation. An
+uncertain start retains its admission reservation across automatic reconnect to
+standby; inspect the printer before explicitly reconciling. A queued start rejected
+before execution after subscription loss releases only its own reservation.
+Read-only guard failures before mutation transmission are known unsent failures.
+
+Malformed-response decode diagnostics are credential-redacted in direct client/CLI
+paths as well as session feedback, including escaped strings in type errors. This
+does not hide credentials from shell history, process arguments or plaintext profiles.
 
 ## Validation and optional live verification
 

@@ -10,6 +10,7 @@ pub type Socket = WebSocketStream<TcpStream>;
 pub struct Request {
     pub path: String,
     pub respond: oneshot::Sender<Value>,
+    pub client_closed: oneshot::Receiver<()>,
 }
 pub struct Server {
     pub url: String,
@@ -24,6 +25,10 @@ impl Drop for Server {
 }
 impl Server {
     pub async fn start() -> Self {
+        Self::start_with_upload_response(None).await
+    }
+    pub async fn start_with_upload_response(response: Option<(u16, &str)>) -> Self {
+        let response = response.map(|(status, body)| (status, body.to_owned()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (ws_tx, sockets) = mpsc::unbounded_channel();
@@ -34,6 +39,7 @@ impl Server {
                 let (mut tcp, _) = listener.accept().await.unwrap();
                 let ws_tx = ws_tx.clone();
                 let http_tx = http_tx.clone();
+                let response_override = response.clone();
                 handlers.spawn(async move {
                     let mut peek=[0u8;2048];
                     loop {
@@ -58,10 +64,21 @@ impl Server {
                         let n=tcp.read(&mut buf).await.unwrap();if n==0 {return;}bytes.extend_from_slice(&buf[..n]);
                     }
                     let (respond,reply)=oneshot::channel();
-                    if http_tx.send(Request{path,respond}).is_err(){return;}
-                    if let Ok(value)=reply.await {
-                        let body=value.to_string();
-                        let response=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+                    let (closed, client_closed) = oneshot::channel();
+                    let upload = path == "/server/files/upload";
+                    if http_tx.send(Request{path,respond,client_closed}).is_err(){return;}
+                    let mut eof = [0u8; 1];
+                    let value = tokio::select! {
+                        result = reply => result,
+                        result = tcp.read(&mut eof) => {
+                            assert!(matches!(result, Ok(0) | Err(_)), "unexpected data after complete request");
+                            let _ = closed.send(());
+                            return;
+                        }
+                    };
+                    if let Ok(value)=value {
+                        let (status, body) = response_override.filter(|_| upload).unwrap_or_else(|| (200, value.to_string()));
+                        let response=format!("HTTP/1.1 {status} Test Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
                         let _=tcp.write_all(response.as_bytes()).await;
                     }
                 });

@@ -13,6 +13,11 @@ use crate::operation::{ActionOutcome, Operation, OperationState, ResultSummary};
 const NORMAL_HISTORY_LIMIT: usize = 63;
 static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
 
+struct StartReservation {
+    operation_id: u64,
+    filename: String,
+}
+
 pub(crate) struct Shared {
     pub telemetry: PrinterTelemetry,
     pub epoch: u64,
@@ -21,13 +26,25 @@ pub(crate) struct Shared {
     emergency: Option<Operation>,
     emergency_summary: ResultSummary,
     next_id: u64,
-    pending_start: Option<String>,
+    pending_start: Option<StartReservation>,
 }
 impl Shared {
     pub(crate) fn reconcile_start(&mut self) {
         if self.telemetry.fresh
             && self.telemetry.print_state.is_active()
-            && self.pending_start == self.telemetry.filename
+            && self
+                .pending_start
+                .as_ref()
+                .is_some_and(|start| Some(&start.filename) == self.telemetry.filename.as_ref())
+        {
+            self.pending_start = None;
+        }
+    }
+    fn release_start(&mut self, operation_id: u64) {
+        if self
+            .pending_start
+            .as_ref()
+            .is_some_and(|start| start.operation_id == operation_id)
         {
             self.pending_start = None;
         }
@@ -280,11 +297,14 @@ impl PrinterSessionHandle {
             shared.invalidate();
             self.owner.lifecycle.send_replace(shared.epoch);
         }
-        if let PrinterAction::UploadAndPrint { filename, .. } = &action {
-            shared.pending_start = Some(filename.clone());
-        }
         let id = shared.next_id;
         shared.next_id += 1;
+        if let PrinterAction::UploadAndPrint { filename, .. } = &action {
+            shared.pending_start = Some(StartReservation {
+                operation_id: id,
+                filename: filename.clone(),
+            });
+        }
         let operation = Operation {
             id,
             name: action.name().into(),
@@ -344,6 +364,7 @@ async fn actions(
                 continue;
             }
             if !emergency && !state.telemetry.fresh {
+                state.release_start(command.id);
                 state.update(
                     command.id,
                     OperationState::Failed {
@@ -410,11 +431,17 @@ async fn actions(
                             UploadDisposition::Started | UploadDisposition::Queued
                         ) =>
                     {
-                        shared.pending_start = Some(outcome.path.clone());
+                        if let Some(start) = shared
+                            .pending_start
+                            .as_mut()
+                            .filter(|start| start.operation_id == id)
+                        {
+                            start.filename = outcome.path.clone();
+                        }
                         shared.reconcile_start();
                     }
                     Err(error) if error.outcome_unknown() => {}
-                    _ => shared.pending_start = None,
+                    _ => shared.release_start(id),
                 }
             }
         }

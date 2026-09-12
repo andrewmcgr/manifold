@@ -20,6 +20,12 @@ pub enum MoonrakerError {
     },
     #[error("{operation}: outcome unknown; do not automatically retry: {message}")]
     OutcomeUnknown { operation: String, message: String },
+    #[error("{operation}: HTTP {status}, outcome unknown; do not automatically retry: {message}")]
+    HttpOutcomeUnknown {
+        operation: String,
+        status: u16,
+        message: String,
+    },
     #[error("{0} deadline exceeded")]
     Timeout(&'static str),
     #[error("IO error: {0}")]
@@ -43,7 +49,10 @@ impl MoonrakerError {
         )
     }
     pub fn outcome_unknown(&self) -> bool {
-        matches!(self, Self::OutcomeUnknown { .. })
+        matches!(
+            self,
+            Self::OutcomeUnknown { .. } | Self::HttpOutcomeUnknown { .. }
+        )
     }
 }
 impl From<tokio_tungstenite::tungstenite::Error> for MoonrakerError {

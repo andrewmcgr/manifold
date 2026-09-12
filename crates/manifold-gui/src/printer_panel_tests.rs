@@ -58,7 +58,7 @@ async fn held_upload_retirement(connect_draft: bool, configured: bool) {
         .respond
         .send(json!({"result":{"status":{"print_stats":{"state":"standby","filename":""}}}}))
         .unwrap();
-    let held = server.request().await;
+    let mut held = server.request().await;
     assert_eq!(held.path, "/server/files/upload");
     session.send_action(PrinterAction::Pause).unwrap();
     let mut next = Server::start().await;
@@ -80,6 +80,10 @@ async fn held_upload_retirement(connect_draft: bool, configured: bool) {
     })
     .await
     .expect("retired worker must close WS, not be retained for history");
+    tokio::time::timeout(Duration::from_secs(3), &mut held.client_closed)
+        .await
+        .expect("retired worker must drop held HTTP request")
+        .unwrap();
     let text = rendered(&mut panel, &mut active);
     assert!(text.contains(&endpoint), "retired target disappeared");
     assert!(text.contains(&format!("#{id}")));

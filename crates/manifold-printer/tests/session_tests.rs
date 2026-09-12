@@ -226,7 +226,7 @@ async fn atomic_upload_admission_stop_bypasses_upload_and_invalidates_queued_con
         .respond
         .send(json!({"result":{"status":{"print_stats":{"state":"standby","filename":""}}}}))
         .unwrap();
-    let held_upload = server.request().await;
+    let mut held_upload = server.request().await;
     assert_eq!(held_upload.path, "/server/files/upload");
     until(|| {
         session.operations().iter().any(|o| {
@@ -279,6 +279,10 @@ async fn atomic_upload_admission_stop_bypasses_upload_and_invalidates_queued_con
             .await
             .is_err()
     );
+    tokio::time::timeout(Duration::from_secs(3), &mut held_upload.client_closed)
+        .await
+        .expect("stop must retire held upload HTTP future")
+        .unwrap();
     drop(held_upload);
     session.acknowledge(upload);
     assert!(!session.operations().iter().any(|o| o.id == upload));
@@ -623,4 +627,224 @@ async fn repeated_emergency_http_dispatch_survives_saturated_failed_history() {
         "summary acknowledgment must not erase current or normal evidence"
     );
     assert!(server.requests.is_empty());
+}
+
+#[tokio::test]
+async fn queued_unsent_start_releases_only_its_reservation_after_subscription_loss() {
+    let mut server = Server::start().await;
+    let session = PrinterSessionHandle::spawn(MoonrakerConfig {
+        url: server.url.clone(),
+        ..Default::default()
+    });
+    let mut ws = server.socket().await;
+    subscribe(
+        &mut ws,
+        json!({"print_stats":{"state":"standby","filename":""}}),
+    )
+    .await;
+    until(|| session.latest_telemetry().fresh).await;
+    session.send_action(PrinterAction::Pause).unwrap();
+    let held_pause = server.request().await;
+    let id = session
+        .send_action(PrinterAction::UploadAndPrint {
+            filename: "queued.gcode".into(),
+            gcode: vec![1],
+        })
+        .unwrap();
+    assert!(session.is_start_pending());
+    drop(ws);
+    until(|| !session.latest_telemetry().fresh).await;
+    held_pause.respond.send(json!({"result":"ok"})).unwrap();
+    until(|| {
+        session.operations().iter().any(|op| {
+            op.id == id
+                && matches!(
+                    op.state,
+                    OperationState::Failed {
+                        outcome_unknown: false,
+                        ..
+                    }
+                )
+        })
+    })
+    .await;
+    assert!(
+        !session.is_start_pending(),
+        "known unsent start must release its reservation"
+    );
+    let mut ws = server.socket().await;
+    subscribe(
+        &mut ws,
+        json!({"print_stats":{"state":"standby","filename":""}}),
+    )
+    .await;
+    until(|| session.latest_telemetry().fresh).await;
+    assert!(
+        server.requests.is_empty(),
+        "rejected queued upload cannot be transmitted"
+    );
+    session
+        .send_action(PrinterAction::UploadAndPrint {
+            filename: "next.gcode".into(),
+            gcode: vec![1],
+        })
+        .unwrap();
+    assert_eq!(
+        server.request().await.path,
+        "/server/info",
+        "admission recovered"
+    );
+}
+
+#[tokio::test]
+async fn gateway_unknown_start_reservation_survives_stale_unrelated_rejection_and_reconnect() {
+    for status in [502, 504] {
+        let mut server = Server::start_with_upload_response(Some((
+            status,
+            "<html>gateway failed after forwarding secret</html>",
+        )))
+        .await;
+        let session = PrinterSessionHandle::spawn(MoonrakerConfig {
+            url: server.url.clone(),
+            api_key: Some("secret".into()),
+            ..Default::default()
+        });
+        let mut ws = server.socket().await;
+        subscribe(
+            &mut ws,
+            json!({"print_stats":{"state":"standby","filename":""}}),
+        )
+        .await;
+        until(|| session.latest_telemetry().fresh).await;
+        let id = session
+            .send_action(PrinterAction::UploadAndPrint {
+                filename: "part.gcode".into(),
+                gcode: vec![1],
+            })
+            .unwrap();
+        server
+            .request()
+            .await
+            .respond
+            .send(json!({"result":{"klippy_state":"ready"}}))
+            .unwrap();
+        server
+            .request()
+            .await
+            .respond
+            .send(json!({"result":{"status":{"print_stats":{"state":"standby","filename":""}}}}))
+            .unwrap();
+        let held = server.request().await;
+        assert_eq!(held.path, "/server/files/upload");
+        let queued = session.send_action(PrinterAction::Pause).unwrap();
+        drop(ws);
+        until(|| !session.latest_telemetry().fresh).await;
+        held.respond.send(Value::Null).unwrap();
+        until(|| {
+            session.operations().iter().any(|op| {
+                op.id == queued
+                    && matches!(
+                        op.state,
+                        OperationState::Failed {
+                            outcome_unknown: false,
+                            ..
+                        }
+                    )
+            })
+        })
+        .await;
+        let operations = session.operations();
+        let op = operations.iter().find(|op| op.id == id).unwrap();
+        assert!(
+            matches!(
+                op.state,
+                OperationState::Failed {
+                    outcome_unknown: true,
+                    ..
+                }
+            ),
+            "{op:?}"
+        );
+        assert!(!format!("{op:?}").contains("secret"));
+        assert!(format!("{op:?}").contains(&status.to_string()));
+        assert!(
+            session.is_start_pending(),
+            "gateway or unrelated rejection must not clear uncertain start"
+        );
+        let mut ws = server.socket().await;
+        subscribe(
+            &mut ws,
+            json!({"print_stats":{"state":"standby","filename":""}}),
+        )
+        .await;
+        until(|| session.latest_telemetry().fresh).await;
+        assert!(session
+            .send_action(PrinterAction::UploadAndPrint {
+                filename: "duplicate.gcode".into(),
+                gcode: vec![1]
+            })
+            .is_err());
+        assert!(
+            server.requests.is_empty(),
+            "no extra start, upload, replay, or stale pause"
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_application_rejection_releases_start_reservation() {
+    let mut server = Server::start_with_upload_response(Some((
+        409,
+        r#"{"error":{"code":409,"message":"not permitted"}}"#,
+    )))
+    .await;
+    let session = PrinterSessionHandle::spawn(MoonrakerConfig {
+        url: server.url.clone(),
+        ..Default::default()
+    });
+    let mut ws = server.socket().await;
+    subscribe(
+        &mut ws,
+        json!({"print_stats":{"state":"standby","filename":""}}),
+    )
+    .await;
+    until(|| session.latest_telemetry().fresh).await;
+    let id = session
+        .send_action(PrinterAction::UploadAndPrint {
+            filename: "part.gcode".into(),
+            gcode: vec![1],
+        })
+        .unwrap();
+    server
+        .request()
+        .await
+        .respond
+        .send(json!({"result":{"klippy_state":"ready"}}))
+        .unwrap();
+    server
+        .request()
+        .await
+        .respond
+        .send(json!({"result":{"status":{"print_stats":{"state":"standby","filename":""}}}}))
+        .unwrap();
+    server.request().await.respond.send(Value::Null).unwrap();
+    until(|| {
+        session.operations().iter().any(|op| {
+            op.id == id
+                && matches!(
+                    op.state,
+                    OperationState::Failed {
+                        outcome_unknown: false,
+                        ..
+                    }
+                )
+        })
+    })
+    .await;
+    assert!(!session.is_start_pending());
+    assert!(!session.is_uploading());
+    assert!(
+        server.requests.is_empty(),
+        "rejection never auto-replays a mutation"
+    );
 }
