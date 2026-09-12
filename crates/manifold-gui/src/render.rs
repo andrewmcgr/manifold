@@ -315,8 +315,11 @@ impl UploadedScene {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        let atlas_pixels: Vec<f32> =
-            atlas.pixels.iter().map(|&byte| byte as f32 / 255.0).collect();
+        let atlas_pixels: Vec<f32> = atlas
+            .pixels
+            .iter()
+            .map(|&byte| byte as f32 / 255.0)
+            .collect();
         let fallback_pixels = [0.0f32];
         let atlas_pixel_contents = if atlas_pixels.is_empty() {
             bytemuck::cast_slice(&fallback_pixels)
@@ -703,11 +706,12 @@ impl MeshRenderResources {
         });
 
         let label_bind_group_layout = label_bind_group_layout_descriptor(device);
-        let label_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("manifold label pipeline layout"),
-            bind_group_layouts: &[&camera_bind_group_layout, &label_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let label_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("manifold label pipeline layout"),
+                bind_group_layouts: &[&camera_bind_group_layout, &label_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let label_vertex_buffers = [wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<SceneTextVertex>() as wgpu::BufferAddress,

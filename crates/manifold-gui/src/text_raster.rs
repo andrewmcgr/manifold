@@ -51,7 +51,9 @@ pub fn build_atlas(names: &[String]) -> TextAtlas {
         .to_vec();
     let font = FontRef::try_from_slice(&font_bytes).expect("egui's bundled Hack font is valid");
     let scaled_font = font.as_scaled(PxScale::from(ATLAS_PIXEL_HEIGHT));
-    let height_px = (scaled_font.ascent() - scaled_font.descent()).ceil().max(1.0) as u32;
+    let height_px = (scaled_font.ascent() - scaled_font.descent())
+        .ceil()
+        .max(1.0) as u32;
 
     let rasters: Vec<(u32, Vec<u8>)> = names
         .iter()
@@ -75,11 +77,19 @@ pub fn build_atlas(names: &[String]) -> TextAtlas {
             let dst_start = (y * width_px + x_offset_px) as usize;
             pixels[dst_start..dst_start + w as usize].copy_from_slice(src);
         }
-        labels.push(LabelMetrics { x_offset_px, width_px: w });
+        labels.push(LabelMetrics {
+            x_offset_px,
+            width_px: w,
+        });
         x_offset_px += w + ATLAS_PADDING_PX;
     }
 
-    TextAtlas { width_px, height_px, pixels, labels }
+    TextAtlas {
+        width_px,
+        height_px,
+        pixels,
+        labels,
+    }
 }
 
 /// Rasterizes a single line of `text` at `height_px` tall, returning its
@@ -99,7 +109,10 @@ fn rasterize_one<'a>(
         if let Some(prev_id) = prev {
             caret_x += scaled_font.kern(prev_id, glyph_id);
         }
-        let position = Point { x: caret_x, y: scaled_font.ascent() };
+        let position = Point {
+            x: caret_x,
+            y: scaled_font.ascent(),
+        };
         glyphs.push(glyph_id.with_scale_and_position(scaled_font.scale(), position));
         caret_x += scaled_font.h_advance(glyph_id);
         prev = Some(glyph_id);
@@ -144,7 +157,10 @@ mod tests {
         assert_eq!(atlas.labels.len(), 2);
         assert_eq!(atlas.labels[0].x_offset_px, 0);
         assert!(atlas.labels[1].x_offset_px >= atlas.labels[0].width_px);
-        assert_eq!(atlas.pixels.len(), (atlas.width_px * atlas.height_px) as usize);
+        assert_eq!(
+            atlas.pixels.len(),
+            (atlas.width_px * atlas.height_px) as usize
+        );
         // Some rasterized coverage should be non-zero for non-empty text.
         assert!(atlas.pixels.iter().any(|&p| p > 0));
     }

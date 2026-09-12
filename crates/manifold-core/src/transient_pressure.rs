@@ -243,6 +243,13 @@ pub fn apply_transient_flow_compensation(
     let mut current_tool = None;
     let mut last_pos: Option<DVec3> = None;
     let mut fluid_engine: Option<FluidDynamicsEngine> = None;
+    // Mirrors `gcode::emit`'s per-tool `retracted` flag: starts `true` (a
+    // fresh tool has no primed filament), so the very first extruding move
+    // gets an unretract charged against it, matching emitted Gcode.
+    let mut retracted = true;
+    let retract_time = config.retraction_duration_seconds();
+    let unretract_time = config.unretraction_duration_seconds();
+    let min_retract_travel = config.effective_min_travel_for_retract();
 
     for path in paths.iter_mut() {
         if path.segments.is_empty() || path.points.is_empty() {
@@ -253,6 +260,7 @@ pub fn apply_transient_flow_compensation(
         if current_tool != Some(path.tool) {
             current_tool = Some(path.tool);
             tracker.reset();
+            retracted = true;
             let tool_temp = machine
                 .and_then(|m| m.tools.iter().find(|t| t.id == path.tool))
                 .map(crate::tool::Tool::nozzle_temperature);
@@ -289,6 +297,18 @@ pub fn apply_transient_flow_compensation(
                 } else {
                     static_pa
                 };
+                // Mirrors `gcode::emit`'s retract-before-travel trigger: only
+                // fires when the upcoming travel run exceeds the configured
+                // threshold, and only ever once per unretracted run (tracked
+                // via `retracted`). Uses this single travel move's own
+                // distance rather than summing the full contiguous travel
+                // run gcode.rs considers -- an approximation that only
+                // differs for multi-segment travel runs, which are rare.
+                if !retracted && travel_dist > min_retract_travel {
+                    let r_vol = -config.retraction_length() * filament_area;
+                    tracker.process_retraction(r_vol, retract_time, k_pa);
+                    retracted = true;
+                }
                 tracker.process_travel(travel_time, k_pa);
             }
         }
@@ -300,7 +320,24 @@ pub fn apply_transient_flow_compensation(
                 && segment.kind != MoveKind::Travel
                 && segment.kind != MoveKind::DebugExcluded;
 
+            let k_pa = if let Some(ref engine) = fluid_engine {
+                engine.dynamic_pressure_advance(1.0, 0.0)
+            } else {
+                static_pa
+            };
+
             if is_extruding && t_move > 1e-9 {
+                // Mirrors `gcode::emit`'s unretract-before-resuming-extrusion:
+                // charge the unretract move's own physical duration against
+                // the pressure tracker before processing this extruding move.
+                if retracted {
+                    let u_vol = (config.retraction_length() + config.unretract_extra_length())
+                        .max(0.0)
+                        * filament_area;
+                    tracker.process_retraction(u_vol, unretract_time, k_pa);
+                    retracted = false;
+                }
+
                 let v_nominal = segment.extrusion_length * filament_area; // mm³
                 let q_nominal = v_nominal / t_move; // mm³/s
 
@@ -328,11 +365,18 @@ pub fn apply_transient_flow_compensation(
                     }
                 }
             } else if segment.kind == MoveKind::Travel || segment.extrusion_length <= 0.0 {
-                let k_pa = if let Some(ref engine) = fluid_engine {
-                    engine.dynamic_pressure_advance(1.0, 0.0)
-                } else {
-                    static_pa
-                };
+                // Mirrors `gcode::emit`'s retract-before-travel trigger for
+                // in-path travel segments (same threshold/approximation as
+                // the inter-path case above).
+                if !retracted {
+                    let (p0, p1) = (path.points[i], path.points.get(i + 1).copied());
+                    let seg_dist = p1.map_or(0.0, |p1| p0.distance(p1));
+                    if seg_dist > min_retract_travel {
+                        let r_vol = -config.retraction_length() * filament_area;
+                        tracker.process_retraction(r_vol, retract_time, k_pa);
+                        retracted = true;
+                    }
+                }
                 tracker.process_travel(t_move, k_pa);
             }
         }
@@ -572,11 +616,17 @@ mod tests {
         let mut paths = vec![path1, path2];
         apply_transient_flow_compensation(&mut paths, &config, None);
 
-        // Path 2's initial long segment must receive a clean M = 1.0 (extrusion_rate == 1.0)
+        // Path 2's initial long segment follows a real (non-instantaneous) unretract
+        // move, which primes measurable positive pressure right before the extrusion
+        // starts -- a real hotend does not return to a clean zero-pressure slate after
+        // unretracting. So M lands below 1.0 but must stay well clear of the residual
+        // floor left over from path 1's tapered tail, proving the long travel's decay
+        // and the unretract priming are both accounted for rather than one masking
+        // a bug in the other.
+        let m = paths[1].segments[0].extrusion_rate;
         assert!(
-            (paths[1].segments[0].extrusion_rate - 1.0).abs() < 1e-4,
-            "expected path 2 start segment to have extrusion_rate 1.0, got {}",
-            paths[1].segments[0].extrusion_rate
+            (0.65..1.0).contains(&m),
+            "expected path 2 start segment M in [0.65, 1.0) reflecting post-unretract pressure priming, got {m}"
         );
     }
 }

@@ -1,7 +1,7 @@
 //! Slicing and toolpath print statistics (print time, filament volume, and mass).
 
 use crate::{
-    kinematics::plan_path_velocities,
+    kinematics::plan_chained_path_velocities,
     toolpath::{MoveKind, Path},
     SlicerConfig,
 };
@@ -94,28 +94,72 @@ pub fn compute_print_statistics_with_machine(
 
     let density = material_density_g_cm3.unwrap_or_else(|| config.filament_density());
 
-    for path in paths {
+    // Mirrors `gcode::emit`'s per-tool `retracted` flag and
+    // `transient_pressure::apply_transient_flow_compensation`'s equivalent
+    // tracking: retraction/unretraction are E-only moves with no XY
+    // displacement, so they're otherwise invisible to any duration computed
+    // from travel distance alone. Charging their configured duration here
+    // keeps `estimated_time_seconds` consistent with the actual Gcode
+    // `gcode::emit` writes. Uses each travel move's own distance against
+    // `effective_min_travel_for_retract()` rather than summing the full
+    // contiguous travel run gcode.rs considers -- an approximation that
+    // only differs for multi-segment travel runs, which are rare.
+    let mut current_tool: Option<crate::ids::ToolId> = None;
+    let mut retracted = true;
+    let retract_time = config.retraction_duration_seconds();
+    let unretract_time = config.unretraction_duration_seconds();
+    let min_retract_travel = config.effective_min_travel_for_retract();
+
+    // Plans velocities across contiguous same-tool open-path runs as one
+    // continuous polyline (see `plan_chained_path_velocities`), rather than
+    // per-`Path` in isolation, so `estimated_time_seconds` doesn't inflate
+    // print time with a phantom stop-to-zero at every one of the (often
+    // thousands of) `Path` object boundaries a non-planar slice produces.
+    let first_layer_flags: Vec<bool> = paths
+        .iter()
+        .map(|path| {
+            let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
+            (path_order - min_order).abs() < 1e-4
+        })
+        .collect();
+    let all_profiles = plan_chained_path_velocities(
+        paths,
+        &*model,
+        &first_layer_flags,
+        config.square_corner_velocity(),
+        config.minimum_cruise_ratio(),
+    );
+
+    for (path, profiles) in paths.iter().zip(all_profiles.iter()) {
+        if current_tool != Some(path.tool) {
+            current_tool = Some(path.tool);
+            retracted = true;
+        }
+
         let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
         if !seen_orders.iter().any(|&o| (o - path_order).abs() < 1e-4) {
             seen_orders.push(path_order);
         }
-        let is_first_layer = (path_order - min_order).abs() < 1e-4;
-
-        let profiles = plan_path_velocities(
-            &path.points,
-            &path.segments,
-            &*model,
-            is_first_layer,
-            config.square_corner_velocity(),
-            config.minimum_cruise_ratio(),
-        );
 
         for (i, seg) in path.segments.iter().enumerate() {
-            if seg.kind == MoveKind::Travel {
+            let is_travel = seg.kind == MoveKind::Travel;
+            if is_travel {
                 total_travel_moves += 1;
             } else {
                 total_extruding_moves += 1;
                 total_extrusion_mm += seg.extrusion_length;
+            }
+
+            if is_travel && !retracted {
+                let p0 = path.points.get(i).copied().unwrap_or(glam::DVec3::ZERO);
+                let p1 = path.points.get(i + 1).copied().unwrap_or(p0);
+                if p0.distance(p1) > min_retract_travel {
+                    total_time += retract_time;
+                    retracted = true;
+                }
+            } else if !is_travel && retracted {
+                total_time += unretract_time;
+                retracted = false;
             }
 
             if let Some(profile) = profiles.get(i) {

@@ -374,7 +374,30 @@ pub fn emit_with_machine(
         .map(|segment| segment.order)
         .fold(f64::INFINITY, f64::min);
 
-    for path in paths {
+    // Plan velocities across the whole program up front (rather than in
+    // isolation per-path inside the loop below) so spatially-contiguous open
+    // paths (chained infill/scan-line runs, tangent fill, etc.) carry
+    // continuous entry/exit speeds across their shared boundary instead of a
+    // phantom deceleration-to-zero-then-reacceleration at every `Path` split
+    // -- see `kinematics::plan_chained_path_velocities`. This also keeps
+    // retraction/pressure-advance bookkeeping below consistent with the
+    // actual planned motion rather than a per-path re-derivation.
+    let first_layer_flags: Vec<bool> = paths
+        .iter()
+        .map(|path| {
+            let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
+            (path_order - min_order).abs() < 1e-4
+        })
+        .collect();
+    let all_initial_profiles = crate::kinematics::plan_chained_path_velocities(
+        paths,
+        motion_model.as_ref(),
+        &first_layer_flags,
+        scv,
+        config.minimum_cruise_ratio(),
+    );
+
+    for (path_idx, path) in paths.iter().enumerate() {
         if !path.segments.is_empty()
             && path
                 .segments
@@ -423,19 +446,12 @@ pub fn emit_with_machine(
             fluid_engine = config.fluid_dynamics_engine(tool_temp);
         }
 
-        let initial_profiles = crate::kinematics::plan_path_velocities(
-            &path.points,
-            &path.segments,
-            motion_model.as_ref(),
-            is_first_layer,
-            config.square_corner_velocity(),
-            config.minimum_cruise_ratio(),
-        );
+        let initial_profiles = &all_initial_profiles[path_idx];
 
         let (path, profiles) = if config.enable_slicer_pressure_advance {
             let subdivided = crate::subdivide_pa::subdivide_path_for_pressure_advance(
                 path.clone(),
-                &initial_profiles,
+                initial_profiles,
                 config,
                 fluid_engine.as_ref(),
             );
@@ -449,7 +465,7 @@ pub fn emit_with_machine(
             );
             (subdivided, sub_profiles)
         } else {
-            (path.clone(), initial_profiles)
+            (path.clone(), initial_profiles.clone())
         };
 
         for (i, p) in path.points.iter().enumerate() {

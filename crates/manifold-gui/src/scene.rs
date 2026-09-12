@@ -190,7 +190,6 @@ pub fn build_toolhead_markers(machine: &Machine, size: f64) -> Vec<SceneVertex> 
     vertices
 }
 
-
 /// One vertex for the textured object-label shader: position + atlas UV.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
@@ -201,7 +200,10 @@ pub struct SceneTextVertex {
 
 impl SceneTextVertex {
     pub fn new(position: DVec3, uv: [f32; 2]) -> Self {
-        Self { position: position.as_vec3().to_array(), uv }
+        Self {
+            position: position.as_vec3().to_array(),
+            uv,
+        }
     }
 }
 

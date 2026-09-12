@@ -939,6 +939,30 @@ impl SlicerConfig {
         self.unretract_extra_length.unwrap_or(0.0)
     }
 
+    /// Wall-clock duration (seconds) of a single retraction move: the E-only
+    /// `G1 E-{retraction_length} F{retraction_speed}` move `gcode::emit` writes
+    /// before a qualifying travel run. Used to keep elapsed-time accounting
+    /// (both [`statistics::compute_print_statistics_with_machine`] and
+    /// [`transient_pressure::apply_transient_flow_compensation`]) consistent
+    /// with the physical time this move actually consumes, since it carries
+    /// no XY displacement and would otherwise be invisible to any duration
+    /// computed purely from segment travel distance.
+    #[must_use]
+    pub fn retraction_duration_seconds(&self) -> f64 {
+        self.retraction_length() / (self.retraction_speed() / 60.0).max(1e-6)
+    }
+
+    /// Wall-clock duration (seconds) of a single unretraction/prime move: the
+    /// E-only `G1 E{unretract_length} F{unretract_speed}` move `gcode::emit`
+    /// writes before resuming extrusion after a retracted travel run. See
+    /// [`SlicerConfig::retraction_duration_seconds`] for why this is tracked
+    /// separately from travel duration.
+    #[must_use]
+    pub fn unretraction_duration_seconds(&self) -> f64 {
+        let len = (self.retraction_length() + self.unretract_extra_length()).max(0.0);
+        len / (self.unretract_speed() / 60.0).max(1e-6)
+    }
+
     /// Wipe distance (mm), defaulting to `1.0` mm when `None`.
     #[must_use]
     pub fn wipe_distance(&self) -> f64 {

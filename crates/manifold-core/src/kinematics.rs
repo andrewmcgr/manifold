@@ -804,6 +804,103 @@ pub fn plan_path_velocities(
     profiles
 }
 
+/// Groups `paths` into runs of spatially-contiguous, same-tool, open paths
+/// (`paths[k]` ends exactly where `paths[k + 1]` begins, with no real travel
+/// move between them) and plans velocities across each run as one continuous
+/// polyline, rather than calling [`plan_path_velocities`] separately per
+/// `Path` object and forcing a phantom stop-to-zero at every one of those
+/// object boundaries. A non-planar slice can produce thousands of `Path`
+/// objects (one per wall loop, one per infill/TPMS/tangent-fill run, one per
+/// island) that are nonetheless directly connected in space -- treating each
+/// as an isolated deceleration-to-zero-then-reacceleration event (as Klipper's
+/// real lookahead planner never does) was inflating `estimated_time_seconds`
+/// far above actual measured print time.
+///
+/// Closed loops (`segments.len() == points.len()`, wrapping back to their own
+/// first point) are always planned in isolation: chaining one into a run
+/// would corrupt its wraparound segment, since the wraparound index would no
+/// longer refer to its own start once other paths' points are prepended.
+/// Only paths where `segments.len() + 1 == points.len()` (open polylines --
+/// the common shape for infill scanlines, TPMS fills, tangent-surface fills,
+/// and bridges) are eligible to chain.
+///
+/// Returns one `Vec<PlannedMotionProfile>` per input path, in the same
+/// order, so callers can index into the result exactly as if they had called
+/// `plan_path_velocities` once per path.
+#[must_use]
+pub fn plan_chained_path_velocities(
+    paths: &[crate::toolpath::Path],
+    model: &dyn MotionModel,
+    first_layer_flags: &[bool],
+    square_corner_velocity_mm_s: f64,
+    minimum_cruise_ratio: f64,
+) -> Vec<Vec<PlannedMotionProfile>> {
+    const CHAIN_EPS: f64 = 1e-4;
+    let n = paths.len();
+    debug_assert_eq!(first_layer_flags.len(), n);
+    let is_open = |p: &crate::toolpath::Path| p.segments.len() + 1 == p.points.len();
+
+    let mut result: Vec<Vec<PlannedMotionProfile>> = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j + 1 < n
+            && is_open(&paths[j])
+            && paths[j].tool == paths[j + 1].tool
+            && first_layer_flags[j] == first_layer_flags[j + 1]
+            && paths[j]
+                .points
+                .last()
+                .zip(paths[j + 1].points.first())
+                .is_some_and(|(a, b)| a.distance(*b) < CHAIN_EPS)
+        {
+            j += 1;
+        }
+
+        if j == i {
+            let profiles = plan_path_velocities(
+                &paths[i].points,
+                &paths[i].segments,
+                model,
+                first_layer_flags[i],
+                square_corner_velocity_mm_s,
+                minimum_cruise_ratio,
+            );
+            result.push(profiles);
+            i += 1;
+            continue;
+        }
+
+        let mut points: Vec<DVec3> = paths[i].points.clone();
+        let mut segments: Vec<crate::toolpath::Segment> = paths[i].segments.clone();
+        let mut lengths = vec![paths[i].segments.len()];
+        for path in &paths[(i + 1)..=j] {
+            points.extend(path.points.iter().skip(1).copied());
+            segments.extend(path.segments.iter().copied());
+            lengths.push(path.segments.len());
+        }
+
+        let combined_profiles = plan_path_velocities(
+            &points,
+            &segments,
+            model,
+            first_layer_flags[i],
+            square_corner_velocity_mm_s,
+            minimum_cruise_ratio,
+        );
+
+        let mut offset = 0;
+        for len in lengths {
+            result.push(combined_profiles[offset..offset + len].to_vec());
+            offset += len;
+        }
+
+        i = j + 1;
+    }
+
+    result
+}
+
 /// Computes maximum allowable linear feedrate (in mm/min) constrained by a volumetric flow limit.
 ///
 /// If `max_volumetric_speed_mm3_s` is provided and $> 0$, clamps velocity such that:
@@ -1567,6 +1664,142 @@ mod tests {
         assert!(
             p_zero.accel_distance + p_zero.decel_distance > p.accel_distance + p.decel_distance
         );
+    }
+
+    #[test]
+    fn plan_chained_path_velocities_treats_connected_open_paths_as_one_continuous_run() {
+        use crate::toolpath::Segment;
+
+        // Two open paths, same tool, same first-layer flag, where path 2 begins
+        // exactly where path 1 ends: a chained infill run.
+        let path1 = crate::toolpath::Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(50.0, 0.0, 0.0)],
+            segments: vec![Segment {
+                kind: MoveKind::Infill,
+                speed: 12000.0,
+                ..Segment::default()
+            }],
+            tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        };
+        let path2 = crate::toolpath::Path {
+            points: vec![DVec3::new(50.0, 0.0, 0.0), DVec3::new(100.0, 0.0, 0.0)],
+            segments: vec![Segment {
+                kind: MoveKind::Infill,
+                speed: 12000.0,
+                ..Segment::default()
+            }],
+            tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        };
+        let paths = vec![path1, path2];
+        let model = StandardMotionModel::default();
+
+        let chained = plan_chained_path_velocities(&paths, &model, &[false, false], 5.0, 0.5);
+        assert_eq!(chained.len(), 2);
+        assert_eq!(chained[0].len(), 1);
+        assert_eq!(chained[1].len(), 1);
+
+        // Chained: path1's exit speed matches path2's entry speed (no forced
+        // deceleration to zero at the shared boundary point).
+        assert!(
+            chained[0][0].exit_speed > 1.0,
+            "expected non-zero exit speed when chained, got {}",
+            chained[0][0].exit_speed
+        );
+        assert!((chained[0][0].exit_speed - chained[1][0].entry_speed).abs() < 1e-6);
+
+        // Isolated (unchained) planning of the same two paths independently
+        // forces both to decelerate to zero at their own boundaries.
+        let isolated1 = plan_path_velocities(
+            &paths[0].points,
+            &paths[0].segments,
+            &model,
+            false,
+            5.0,
+            0.5,
+        );
+        assert_eq!(isolated1[0].exit_speed, 0.0);
+    }
+
+    #[test]
+    fn plan_chained_path_velocities_does_not_chain_across_tool_or_layer_or_closed_loop_boundaries()
+    {
+        use crate::toolpath::Segment;
+
+        // Different tool: must not chain even though spatially contiguous.
+        let path1 = crate::toolpath::Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(50.0, 0.0, 0.0)],
+            segments: vec![Segment {
+                kind: MoveKind::Infill,
+                speed: 12000.0,
+                ..Segment::default()
+            }],
+            tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        };
+        let path2 = crate::toolpath::Path {
+            points: vec![DVec3::new(50.0, 0.0, 0.0), DVec3::new(100.0, 0.0, 0.0)],
+            segments: vec![Segment {
+                kind: MoveKind::Infill,
+                speed: 12000.0,
+                ..Segment::default()
+            }],
+            tool: crate::ids::ToolId(1),
+            object: crate::ids::ObjectId::default(),
+        };
+        let model = StandardMotionModel::default();
+        let chained =
+            plan_chained_path_velocities(&[path1, path2], &model, &[false, false], 5.0, 0.5);
+        assert_eq!(chained[0][0].exit_speed, 0.0);
+
+        // Closed loop (points.len() == segments.len()) must never be chained,
+        // even when immediately followed by a spatially-contiguous open path.
+        let closed = crate::toolpath::Path {
+            points: vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(10.0, 0.0, 0.0),
+                DVec3::new(10.0, 10.0, 0.0),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 6000.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 6000.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 6000.0,
+                    ..Segment::default()
+                },
+            ],
+            tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        };
+        let open_follow_up = crate::toolpath::Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(5.0, 0.0, 0.0)],
+            segments: vec![Segment {
+                kind: MoveKind::Infill,
+                speed: 12000.0,
+                ..Segment::default()
+            }],
+            tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        };
+        let chained_closed = plan_chained_path_velocities(
+            &[closed, open_follow_up],
+            &model,
+            &[false, false],
+            5.0,
+            0.5,
+        );
+        assert_eq!(chained_closed[0].last().unwrap().exit_speed, 0.0);
+        assert_eq!(chained_closed[1][0].entry_speed, 0.0);
     }
 
     #[test]

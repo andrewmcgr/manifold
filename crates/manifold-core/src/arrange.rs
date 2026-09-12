@@ -62,7 +62,12 @@ struct Prepared {
 /// hold), it degrades gracefully to a best-effort center placement rather
 /// than failing the whole arrangement.
 #[must_use]
-pub fn arrange(items: &[ArrangeItem], clearance: f64, bed_min: DVec2, bed_max: DVec2) -> Vec<Placement> {
+pub fn arrange(
+    items: &[ArrangeItem],
+    clearance: f64,
+    bed_min: DVec2,
+    bed_max: DVec2,
+) -> Vec<Placement> {
     let n = items.len();
     if n == 0 {
         return Vec::new();
@@ -78,7 +83,11 @@ pub fn arrange(items: &[ArrangeItem], clearance: f64, bed_min: DVec2, bed_max: D
         .collect();
 
     // Tallest first; stable sort so equal-height objects keep input order.
-    prepared.sort_by(|a, b| b.height.partial_cmp(&a.height).unwrap_or(std::cmp::Ordering::Equal));
+    prepared.sort_by(|a, b| {
+        b.height
+            .partial_cmp(&a.height)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let radius_step = prepared
         .iter()
@@ -92,15 +101,30 @@ pub fn arrange(items: &[ArrangeItem], clearance: f64, bed_min: DVec2, bed_max: D
     let mut translations = vec![DVec2::ZERO; n];
 
     for item in &prepared {
-        let candidate = find_placement(item, &placed, bed_center, bed_min, bed_max, radius_step, max_spiral_radius)
-            .unwrap_or(bed_center);
+        let candidate = find_placement(
+            item,
+            &placed,
+            bed_center,
+            bed_min,
+            bed_max,
+            radius_step,
+            max_spiral_radius,
+        )
+        .unwrap_or(bed_center);
 
-        let placed_shape: Vec<DVec2> = item.centered_inflated.iter().map(|p| *p + candidate).collect();
+        let placed_shape: Vec<DVec2> = item
+            .centered_inflated
+            .iter()
+            .map(|p| *p + candidate)
+            .collect();
         placed.push(placed_shape);
         translations[item.original_index] = candidate;
     }
 
-    translations.into_iter().map(|translation| Placement { translation }).collect()
+    translations
+        .into_iter()
+        .map(|translation| Placement { translation })
+        .collect()
 }
 
 /// Recenters `item.footprint` on its own centroid and inflates it outward
@@ -108,7 +132,11 @@ pub fn arrange(items: &[ArrangeItem], clearance: f64, bed_min: DVec2, bed_max: D
 /// offset degenerates (e.g. a near-zero-area input footprint).
 fn prepare_item(original_index: usize, item: &ArrangeItem, half_gap: f64) -> Prepared {
     let centroid = centroid_of(&item.footprint);
-    let centered: Vec<[f64; 2]> = item.footprint.iter().map(|p| [p.x - centroid.x, p.y - centroid.y]).collect();
+    let centered: Vec<[f64; 2]> = item
+        .footprint
+        .iter()
+        .map(|p| [p.x - centroid.x, p.y - centroid.y])
+        .collect();
 
     let loop_2d = if half_gap > 0.0 {
         polygon2d::outward_offset(std::slice::from_ref(&centered), half_gap)
@@ -148,7 +176,10 @@ fn find_placement(
 ) -> Option<DVec2> {
     let try_center = |center: DVec2| -> bool {
         let shape: Vec<DVec2> = item.centered_inflated.iter().map(|p| *p + center).collect();
-        fits_in_bed(&shape, bed_min, bed_max) && placed.iter().all(|other| !convex_polygons_overlap(&shape, other))
+        fits_in_bed(&shape, bed_min, bed_max)
+            && placed
+                .iter()
+                .all(|other| !convex_polygons_overlap(&shape, other))
     };
 
     if try_center(bed_center) {
@@ -157,7 +188,8 @@ fn find_placement(
 
     let mut radius = radius_step;
     while radius <= max_spiral_radius {
-        let steps = ((2.0 * std::f64::consts::PI * radius / (radius_step.max(1e-6))).max(1.0) as usize)
+        let steps = ((2.0 * std::f64::consts::PI * radius / (radius_step.max(1e-6))).max(1.0)
+            as usize)
             .max((2.0 * std::f64::consts::PI / SPIRAL_ANGLE_STEP) as usize);
         for i in 0..steps {
             let angle = i as f64 * (2.0 * std::f64::consts::PI / steps as f64);
@@ -227,7 +259,9 @@ fn has_separating_axis(poly: &[DVec2], other: &[DVec2]) -> bool {
 fn project(poly: &[DVec2], axis: DVec2) -> (f64, f64) {
     poly.iter()
         .map(|p| p.dot(axis))
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), d| (lo.min(d), hi.max(d)))
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), d| {
+            (lo.min(d), hi.max(d))
+        })
 }
 
 #[cfg(test)]
@@ -249,7 +283,12 @@ mod tests {
             footprint: square(5.0),
             height: 10.0,
         }];
-        let placements = arrange(&items, 10.0, DVec2::new(-100.0, -100.0), DVec2::new(100.0, 100.0));
+        let placements = arrange(
+            &items,
+            10.0,
+            DVec2::new(-100.0, -100.0),
+            DVec2::new(100.0, 100.0),
+        );
         assert_eq!(placements.len(), 1);
         assert!(placements[0].translation.length() < 1e-6);
     }
@@ -266,12 +305,23 @@ mod tests {
                 height: 20.0,
             },
         ];
-        let placements = arrange(&items, 4.0, DVec2::new(-100.0, -100.0), DVec2::new(100.0, 100.0));
+        let placements = arrange(
+            &items,
+            4.0,
+            DVec2::new(-100.0, -100.0),
+            DVec2::new(100.0, 100.0),
+        );
         assert_eq!(placements.len(), 2);
 
         let half = 10.0 + 2.0; // inflated by clearance/2 = 2.0
-        let shape_a: Vec<DVec2> = square(half).iter().map(|p| *p + placements[0].translation).collect();
-        let shape_b: Vec<DVec2> = square(half).iter().map(|p| *p + placements[1].translation).collect();
+        let shape_a: Vec<DVec2> = square(half)
+            .iter()
+            .map(|p| *p + placements[0].translation)
+            .collect();
+        let shape_b: Vec<DVec2> = square(half)
+            .iter()
+            .map(|p| *p + placements[1].translation)
+            .collect();
         assert!(!convex_polygons_overlap(&shape_a, &shape_b));
     }
 
@@ -291,7 +341,12 @@ mod tests {
                 height: 15.0,
             },
         ];
-        let placements = arrange(&items, 5.0, DVec2::new(-100.0, -100.0), DVec2::new(100.0, 100.0));
+        let placements = arrange(
+            &items,
+            5.0,
+            DVec2::new(-100.0, -100.0),
+            DVec2::new(100.0, 100.0),
+        );
         // Item 1 (height 50, tallest) should land exactly at the bed center
         // since it's placed first with nothing else on the bed yet.
         assert!(placements[1].translation.length() < 1e-6);
@@ -322,22 +377,34 @@ mod tests {
         let placements = arrange(&items, 5.0, bed_min, bed_max);
         for (i, placement) in placements.iter().enumerate() {
             let half = 5.0 + 2.5;
-            let shape: Vec<DVec2> = square(half).iter().map(|p| *p + placement.translation).collect();
-            assert!(fits_in_bed(&shape, bed_min, bed_max), "item {i} escaped the bed");
+            let shape: Vec<DVec2> = square(half)
+                .iter()
+                .map(|p| *p + placement.translation)
+                .collect();
+            assert!(
+                fits_in_bed(&shape, bed_min, bed_max),
+                "item {i} escaped the bed"
+            );
         }
     }
 
     #[test]
     fn convex_polygons_overlap_detects_separated_squares() {
         let a = square(5.0);
-        let b: Vec<DVec2> = square(5.0).iter().map(|p| *p + DVec2::new(20.0, 0.0)).collect();
+        let b: Vec<DVec2> = square(5.0)
+            .iter()
+            .map(|p| *p + DVec2::new(20.0, 0.0))
+            .collect();
         assert!(!convex_polygons_overlap(&a, &b));
     }
 
     #[test]
     fn convex_polygons_overlap_detects_overlapping_squares() {
         let a = square(5.0);
-        let b: Vec<DVec2> = square(5.0).iter().map(|p| *p + DVec2::new(3.0, 0.0)).collect();
+        let b: Vec<DVec2> = square(5.0)
+            .iter()
+            .map(|p| *p + DVec2::new(3.0, 0.0))
+            .collect();
         assert!(convex_polygons_overlap(&a, &b));
     }
 }
