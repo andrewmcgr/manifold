@@ -3,6 +3,7 @@
 //! layer height, etc. each session (Phase 10, see ROADMAP.md).
 
 use manifold_core::{machine::Machine, SlicerConfig};
+use manifold_printer::MoonrakerConfig;
 use std::path::Path;
 
 /// A saved preset bundling the machine definition and slicing settings.
@@ -13,6 +14,8 @@ use std::path::Path;
 pub struct Profile {
     pub machine: Machine,
     pub config: SlicerConfig,
+    #[serde(default)]
+    pub moonraker: Option<MoonrakerConfig>,
 }
 
 impl Profile {
@@ -89,6 +92,7 @@ mod tests {
                 z_travel_penalty: 8.0,
                 ..SlicerConfig::default()
             },
+            moonraker: None,
         }
     }
 
@@ -106,5 +110,30 @@ mod tests {
         assert_eq!(loaded, profile);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_profile_deserialization_without_moonraker() {
+        let sample = sample_profile();
+        let mut value = serde_json::to_value(&sample).unwrap();
+        value.as_object_mut().unwrap().remove("moonraker");
+        let json = serde_json::to_string_pretty(&value).unwrap();
+        let profile: Profile = serde_json::from_str(&json).unwrap();
+        assert!(profile.moonraker.is_none());
+        assert_eq!(profile.machine, sample.machine);
+        assert_eq!(profile.config, sample.config);
+    }
+
+    #[test]
+    fn test_profile_roundtrip_with_moonraker() {
+        let mut profile = sample_profile();
+        profile.moonraker = Some(manifold_printer::MoonrakerConfig {
+            url: "http://voron.local:7125".to_string(),
+            api_key: Some("secret123".to_string()),
+            auto_connect: true,
+        });
+        let json = serde_json::to_string_pretty(&profile).unwrap();
+        let loaded: Profile = serde_json::from_str(&json).unwrap();
+        assert_eq!(profile, loaded);
     }
 }

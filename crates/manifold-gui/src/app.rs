@@ -891,6 +891,7 @@ impl ManifoldApp {
                             let profile = Profile {
                                 machine: self.machine.clone(),
                                 config: self.config.clone(),
+                                moonraker: None,
                             };
                             match profile.save(&path) {
                                 Ok(()) => {

@@ -2825,6 +2825,7 @@ dependencies = [
  "glam 0.29.3",
  "manifold-core",
  "manifold-fidget",
+ "manifold-printer",
  "rfd",
  "rmcp",
  "schemars",
