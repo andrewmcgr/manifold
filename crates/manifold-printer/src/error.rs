@@ -6,7 +6,7 @@ pub enum MoonrakerError {
     Http(#[from] reqwest::Error),
 
     #[error("WebSocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
 
     #[error("URL parse error: {0}")]
     Url(#[from] url::ParseError),
@@ -25,4 +25,10 @@ pub enum MoonrakerError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for MoonrakerError {
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::WebSocket(Box::new(err))
+    }
 }
