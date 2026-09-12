@@ -68,6 +68,64 @@ impl Object {
     }
 }
 
+/// Auto-arranges `objects` on a machine's bed using
+/// [`crate::arrange::arrange`]: each object's convex XY footprint
+/// (`Object::footprint_polygon`) and its world-space build height are fed
+/// in as an [`crate::arrange::ArrangeItem`], and the resulting per-object
+/// XY translation is applied on top of its existing transform (so
+/// rotation/scale and Z placement are preserved — only XY position
+/// moves). Objects with no valid footprint (fewer than 4 mesh vertices)
+/// are left untouched and excluded from collision consideration, since
+/// there's no polygon to place.
+pub fn arrange_on_bed(objects: &mut [Object], build_volume: &BoundingVolume, clearance: f64) {
+    let (bed_min, bed_max) = build_volume.bounding_box();
+    let bed_min_xy = glam::DVec2::new(bed_min.x, bed_min.y);
+    let bed_max_xy = glam::DVec2::new(bed_max.x, bed_max.y);
+
+    // Indices into `objects` for which we have a valid footprint (and thus
+    // an entry in `items`/`placements`, in the same relative order).
+    let mut arrangeable_indices = Vec::with_capacity(objects.len());
+    let mut items = Vec::with_capacity(objects.len());
+
+    for (index, object) in objects.iter().enumerate() {
+        let Some(footprint) = object.footprint_polygon() else {
+            continue;
+        };
+        let height = object
+            .mesh
+            .bounding_box()
+            .map(|(local_min, local_max)| {
+                let mut z_min = f64::INFINITY;
+                let mut z_max = f64::NEG_INFINITY;
+                for corner in crate::mesh::bounding_box_corners(local_min, local_max) {
+                    let z = object.transform.transform_point(corner).z;
+                    z_min = z_min.min(z);
+                    z_max = z_max.max(z);
+                }
+                z_max - z_min
+            })
+            .unwrap_or(0.0);
+        arrangeable_indices.push(index);
+        items.push(crate::arrange::ArrangeItem { footprint, height });
+    }
+
+    let placements = crate::arrange::arrange(&items, clearance, bed_min_xy, bed_max_xy);
+
+    for ((object_index, item), placement) in arrangeable_indices
+        .into_iter()
+        .zip(items.iter())
+        .zip(placements)
+    {
+        let current_centroid = crate::arrange::centroid_of(&item.footprint);
+        let offset = DVec3::new(
+            placement.translation.x - current_centroid.x,
+            placement.translation.y - current_centroid.y,
+            0.0,
+        );
+        objects[object_index].transform = objects[object_index].transform.then_translate(offset);
+    }
+}
+
 /// Re-center a freshly-loaded group of objects on a machine's bed: the
 /// combined world-space bounding box of every object's mesh (after its
 /// existing `transform`) is translated so it sits XY-centered on
@@ -174,6 +232,42 @@ mod tests {
         // (95,95)-(105,105) world.
         assert_eq!(world_min, DVec3::new(95.0, 95.0, 0.0));
         assert_eq!(world_max, DVec3::new(105.0, 105.0, 20.0));
+    }
+
+    #[test]
+    fn arrange_on_bed_moves_objects_toward_bed_center_not_a_corner() {
+        // A cube-ish object placed far from the bed center; after arranging
+        // on an otherwise-empty large bed it should land near the center,
+        // not get pushed further toward a corner by double-applying its
+        // existing offset.
+        let mesh = Mesh::new(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(10.0, 0.0, 0.0),
+                DVec3::new(0.0, 10.0, 0.0),
+                DVec3::new(0.0, 0.0, 10.0),
+            ],
+            vec![0, 1, 2, 0, 1, 3, 0, 2, 3, 1, 2, 3],
+        );
+        let mut object = Object::new(ObjectId(0), mesh, ToolId(0));
+        object.transform = Transform::from_translation(DVec3::new(150.0, 150.0, 0.0));
+        let mut objects = vec![object];
+        let build_volume = BoundingVolume::Aabb {
+            min: DVec3::ZERO,
+            max: DVec3::new(200.0, 200.0, 200.0),
+        };
+
+        arrange_on_bed(&mut objects, &build_volume, 1.0);
+
+        let centroid = objects[0]
+            .footprint_polygon()
+            .map(|poly| crate::arrange::centroid_of(&poly))
+            .unwrap();
+        // Bed center is (100, 100); a single item should land there.
+        assert!(
+            (centroid.x - 100.0).abs() < 1.0 && (centroid.y - 100.0).abs() < 1.0,
+            "expected centroid near bed center (100,100), got {centroid:?}"
+        );
     }
 
     #[test]

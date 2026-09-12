@@ -352,11 +352,7 @@ impl ManifoldApp {
         }
     }
 
-    /// Build the scene dressing (origin axes, bed grid/quad, object
-    /// footprint outlines, toolhead markers) for the given `machine`/
-    /// `objects` and upload it to the GPU. Called at startup and whenever
-    /// `machine`'s bed/tool geometry or `objects` changes.
-    fn build_scene(
+        fn build_scene(
         device: &eframe::egui_wgpu::wgpu::Device,
         machine: &Machine,
         objects: &[Object],
@@ -366,8 +362,17 @@ impl ManifoldApp {
         let mut triangles = scene::build_bed_quad(machine);
         triangles.extend(scene::build_footprint_outlines(machine, objects));
         triangles.extend(scene::build_toolhead_markers(machine, 8.0));
-        UploadedScene::upload(device, &lines, &triangles)
+
+        let names: Vec<String> = objects
+            .iter()
+            .map(|object| object.name.clone().unwrap_or_else(|| format!("Object {}", object.id.0)))
+            .collect();
+        let atlas = crate::text_raster::build_atlas(&names);
+        let text_vertices = scene::build_object_labels(machine, objects, &atlas);
+
+        UploadedScene::upload(device, &lines, &triangles, &text_vertices, &atlas)
     }
+
 
     /// Combined axis-aligned bounding box enclosing the machine build volume
     /// and every loaded object (transformed to world space).
@@ -2538,6 +2543,18 @@ impl ManifoldApp {
 
         ui.separator();
         ui.heading("Objects");
+        let mut arrangement_clearance = self.machine.arrangement_clearance();
+        if drag_num(
+            ui,
+            &mut arrangement_clearance,
+            0.5,
+            0.0..=f64::INFINITY,
+            "Arrangement clearance (mm)",
+        )
+        .changed()
+        {
+            self.machine.arrangement_clearance = Some(arrangement_clearance);
+        }
         if self.objects.is_empty() {
             ui.label("No objects loaded. Use Import to load an STL or 3MF file.");
         } else {
@@ -2577,6 +2594,20 @@ impl ManifoldApp {
                     .device
                     .clone();
                 self.remove_object(index, &device);
+            }
+            if self.objects.len() > 1 && ui.button("Arrange objects").clicked() {
+                object::arrange_on_bed(
+                    &mut self.objects,
+                    &self.machine.build_volume,
+                    self.machine.arrangement_clearance(),
+                );
+                self.update_camera_bounds();
+                let device = frame
+                    .wgpu_render_state()
+                    .expect("wgpu renderer is required")
+                    .device
+                    .clone();
+                self.reupload(&device);
             }
             if self.objects.len() > 1 && ui.button("Clear all objects").clicked() {
                 let device = frame

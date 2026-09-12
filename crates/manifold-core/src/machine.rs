@@ -75,6 +75,10 @@ pub struct Machine {
     /// Per-axis kinematic overrides and dedicated stepper dynamics models.
     #[serde(default)]
     pub axis_limits: HashMap<Axis, AxisLimits>,
+    /// Minimum XY gap (mm) auto-arrangement (`crate::arrange`) maintains
+    /// between object footprints. Defaults to 10mm when `None`.
+    #[serde(default)]
+    pub arrangement_clearance: Option<f64>,
 }
 
 impl Machine {
@@ -113,6 +117,7 @@ impl Machine {
             speed_limit: None,
             minimum_cruise_ratio: None,
             axis_limits: HashMap::new(),
+            arrangement_clearance: None,
         }
     }
 
@@ -152,6 +157,13 @@ impl Machine {
     /// Removes any custom limit overrides for a specific axis, reverting to machine globals.
     pub fn clear_axis_limits(&mut self, axis: Axis) {
         self.axis_limits.remove(&axis);
+    }
+
+    /// Minimum XY gap (mm) auto-arrangement maintains between object
+    /// footprints. Default: 10mm.
+    #[must_use]
+    pub fn arrangement_clearance(&self) -> f64 {
+        self.arrangement_clearance.unwrap_or(10.0)
     }
 
     /// Converts the serde-friendly `eikonal_slope_profile` breakpoints into

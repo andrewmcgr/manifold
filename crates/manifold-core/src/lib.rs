@@ -4,6 +4,7 @@
 //! It has no UI or CLI dependencies so it can run headless (e.g. embedded
 //! in a service) or be driven by the `manifold-cli` front-end.
 
+pub mod arrange;
 pub mod bounds;
 pub mod bridge;
 pub mod convex_hull;

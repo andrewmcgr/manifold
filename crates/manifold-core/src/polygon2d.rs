@@ -659,6 +659,16 @@ pub fn inward_offset(loops2d: &[Vec<[f64; 2]>], distance: f64) -> Vec<Vec<[f64; 
     simplified.outline(&style).into_iter().flatten().collect()
 }
 
+/// Expands `loops2d` outward by `distance` (a positive value moves
+/// boundaries away from the interior, growing the shape) — used for
+/// clearance-inflated footprints when auto-arranging objects on the bed.
+/// `loops2d` is simplified first.
+pub fn outward_offset(loops2d: &[Vec<[f64; 2]>], distance: f64) -> Vec<Vec<[f64; 2]>> {
+    let simplified = simplify(loops2d);
+    let style = OutlineStyle::new(distance.abs());
+    simplified.outline(&style).into_iter().flatten().collect()
+}
+
 /// Same as [`inward_offset`], but skips the input pre-simplify pass.
 ///
 /// `i_overlay`'s offsetting (`OutlineOffset::outline`) already cleans its
