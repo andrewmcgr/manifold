@@ -1,4 +1,6 @@
 //! Printer intent and job monitoring, separate from mesh loading and slicing.
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -66,6 +68,26 @@ pub fn require_started(outcome: &UploadOutcome) -> Result<()> {
 }
 const WAIT_LIMIT: Duration = Duration::from_secs(30);
 
+/// One signal listener spans readiness, guards, transmission and monitoring. Dropping
+/// a Tokio signal future does not restore default SIGINT handling, so inner stages
+/// must not install and then abandon their own listeners.
+pub async fn interruptible(
+    work: impl Future<Output = Result<()>>,
+    mutation_in_flight: &AtomicBool,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            if mutation_in_flight.load(Ordering::SeqCst) {
+                bail!("Interrupted upload: remote outcome unknown after possible transmission. Inspect the printer before retrying; no compensating cancel/start was sent");
+            }
+            bail!("Interrupted; work pending before mutation transmission was discarded. Any active print was NOT cancelled");
+        }
+        result = work => result,
+    }
+}
+
 pub async fn wait_ready(session: &PrinterSessionHandle) -> Result<()> {
     let began = Instant::now();
     loop {
@@ -79,10 +101,7 @@ pub async fn wait_ready(session: &PrinterSessionHandle) -> Result<()> {
         if began.elapsed() > WAIT_LIMIT {
             bail!("Timed out waiting for authenticated, ready printer telemetry; check endpoint, API key and Klipper state");
         }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
-            result = tokio::signal::ctrl_c() => {result?;bail!("Interrupted; no print cancellation was sent");}
-        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -92,6 +111,8 @@ struct Monitor {
     began: Instant,
     last_fresh: Instant,
     observed_job: Option<(u64, u64)>,
+    subscription_generation: Option<u64>,
+    prior_job: Option<u64>,
 }
 impl Monitor {
     fn new(target: Option<String>, now: Instant) -> Self {
@@ -101,6 +122,8 @@ impl Monitor {
             began: now,
             last_fresh: now,
             observed_job: None,
+            subscription_generation: None,
+            prior_job: None,
         }
     }
     /// Completion requires a matching active job observation, not old terminal telemetry.
@@ -115,23 +138,32 @@ impl Monitor {
             return Ok(false);
         }
         self.last_fresh = now;
+        if self
+            .subscription_generation
+            .is_some_and(|generation| generation != t.generation)
+        {
+            bail!("Printer subscription changed; monitored run continuity is uncertain. Inspect the printer; no completion was assumed");
+        }
+        self.subscription_generation = Some(t.generation);
+        // Validate identity before every decision, including terminal snapshots which the
+        // polling loop may see without observing the intervening run's active transition.
+        if let Some((_, job)) = self.observed_job {
+            if job != t.job_generation {
+                bail!("The monitored job was replaced by another run; completion not confirmed");
+            }
+        }
         if self.target.is_none() && t.print_state.is_active() {
             self.target = t.filename.clone();
         }
         let matches = self.target.is_some() && self.target == t.filename;
-        if matches && t.print_state.is_active() {
-            if let Some((generation, job)) = self.observed_job {
-                if generation == t.generation && job != t.job_generation {
-                    bail!("The monitored job was replaced by another run");
-                }
-            }
+        if matches && t.print_state.is_active() && self.prior_job != Some(t.job_generation) {
             self.observed_job = Some((t.generation, t.job_generation));
             self.observed_active = true;
         }
         if self.observed_active && !matches {
             bail!("Monitored file changed or was cleared; refusing to monitor another job");
         }
-        if matches {
+        if matches && self.observed_active {
             match t.print_state {
                 PrintState::Complete if self.observed_active => return Ok(true),
                 PrintState::Cancelled => bail!(
@@ -158,8 +190,18 @@ impl Monitor {
     }
 }
 
-pub async fn monitor(session: &PrinterSessionHandle, target: Option<String>) -> Result<()> {
-    let mut tracker = Monitor::new(target, Instant::now());
+pub async fn monitor(
+    session: &PrinterSessionHandle,
+    target: Option<(String, PrinterTelemetry)>,
+) -> Result<()> {
+    let mut tracker = Monitor::new(
+        target.as_ref().map(|(name, _)| name.clone()),
+        Instant::now(),
+    );
+    if let Some((_, before_start)) = target {
+        tracker.subscription_generation = Some(before_start.generation);
+        tracker.prior_job = Some(before_start.job_generation);
+    }
     let pb = indicatif::ProgressBar::new(100);
     pb.set_style(
         indicatif::ProgressStyle::default_bar()
@@ -204,14 +246,7 @@ pub async fn monitor(session: &PrinterSessionHandle, target: Option<String>) -> 
             pb.finish_with_message("Matching print completed");
             return Ok(());
         }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {},
-            result = tokio::signal::ctrl_c() => {
-                result?;
-                pb.abandon_with_message("Monitoring interrupted; print was NOT cancelled");
-                bail!("Monitoring interrupted; print was NOT cancelled");
-            }
-        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -325,6 +360,89 @@ mod tests {
                 now + WAIT_LIMIT
             )
             .is_err());
+    }
+    #[test]
+    fn monitor_ignores_old_same_filename_terminals_until_new_active_run() {
+        let now = Instant::now();
+        for terminal in [
+            PrintState::Cancelled,
+            PrintState::Error,
+            PrintState::Complete,
+        ] {
+            let mut monitor = Monitor::new(Some("same.gcode".into()), now);
+            let old = telemetry("same.gcode", terminal);
+            assert!(!monitor.observe(&old, now).unwrap());
+            let mut active = telemetry("same.gcode", PrintState::Printing);
+            active.job_generation = 1;
+            assert!(!monitor.observe(&active, now).unwrap());
+            active.print_state = PrintState::Complete;
+            assert!(monitor.observe(&active, now).unwrap());
+        }
+    }
+    #[test]
+    fn monitor_validates_identity_before_every_terminal_decision() {
+        let now = Instant::now();
+        for terminal in [
+            PrintState::Complete,
+            PrintState::Cancelled,
+            PrintState::Error,
+        ] {
+            for reconnect in [false, true] {
+                let mut monitor = Monitor::new(Some("same.gcode".into()), now);
+                let mut t = telemetry("same.gcode", PrintState::Printing);
+                monitor.observe(&t, now).unwrap();
+                if reconnect {
+                    t.generation += 1;
+                } else {
+                    t.job_generation += 1;
+                }
+                t.print_state = terminal;
+                let error = monitor.observe(&t, now).unwrap_err().to_string();
+                assert!(
+                    error.contains(if reconnect { "continuity" } else { "replaced" }),
+                    "{error}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn monitor_does_not_attach_after_unobserved_reconnect() {
+        let now = Instant::now();
+        let mut monitor = Monitor::new(Some("same.gcode".into()), now);
+        let mut t = telemetry("same.gcode", PrintState::Cancelled);
+        assert!(!monitor.observe(&t, now).unwrap());
+        t.generation += 1;
+        t.print_state = PrintState::Printing;
+        assert!(monitor
+            .observe(&t, now)
+            .unwrap_err()
+            .to_string()
+            .contains("continuity"));
+    }
+    #[test]
+    fn started_monitor_requires_new_job_in_pre_upload_subscription() {
+        let now = Instant::now();
+        let mut monitor = Monitor::new(Some("same.gcode".into()), now);
+        monitor.prior_job = Some(4);
+        monitor.subscription_generation = Some(2);
+        let mut t = telemetry("same.gcode", PrintState::Printing);
+        t.generation = 2;
+        t.job_generation = 4;
+        assert!(!monitor.observe(&t, now).unwrap());
+        assert!(
+            !monitor.observed_active,
+            "old active telemetry cannot bind the requested start"
+        );
+        t.job_generation = 5;
+        assert!(!monitor.observe(&t, now).unwrap());
+        assert!(monitor.observed_active);
+        let mut ambiguous = Monitor::new(Some("same.gcode".into()), now);
+        ambiguous.subscription_generation = Some(1);
+        assert!(ambiguous
+            .observe(&t, now)
+            .unwrap_err()
+            .to_string()
+            .contains("continuity"));
     }
     #[test]
     fn queued_or_unconfirmed_upload_does_not_claim_print_started() {

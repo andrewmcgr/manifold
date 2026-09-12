@@ -15,6 +15,8 @@ use crate::model::{
 };
 use crate::subscription::apply_status_delta;
 
+/// Called with `(0, total)` after guards, before possible transmission (including
+/// empty files), then with chunk byte counts. This is not server acknowledgment.
 pub type UploadProgress = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 #[derive(Clone, Debug)]
@@ -223,6 +225,11 @@ impl MoonrakerClient {
         }
         self.guard(filename, start).await?;
         let total = bytes.len() as u64;
+        // Guards have completed. Signal possible transmission even for an empty file;
+        // byte-read progress alone cannot distinguish it from an unsent guard query.
+        if let Some(callback) = &progress {
+            callback(0, total);
+        }
         let chunks = stream::unfold(
             (bytes, 0usize, progress),
             |(bytes, offset, progress)| async move {

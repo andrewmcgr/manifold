@@ -36,13 +36,20 @@ the endpoint; redirects are rejected rather than forwarding the API key.
   immediate print; `--print` returns nonzero unless Started is confirmed. No extra
   start request is sent to compensate for an ambiguous response.
 - Monitoring names the exact file. Print+monitor waits to observe it active before
-  accepting completion, rather than accepting an old completed job. A very short
-  job whose active transition was missed may time out instead of claiming success.
+  accepting any terminal result, rather than accepting old complete/cancelled/error
+  telemetry. Every decision validates both subscription and run generation, not just
+  filename. Print+monitor anchors identity before upload and requires a new run.
+  Reconnection that breaks provable continuity fails explicitly instead of claiming
+  a same-named run is the original. A very short job whose active transition was
+  missed may time out instead of claiming success.
 - Print errors, cancellation, terminal authentication errors and timeouts return
   nonzero. Initial readiness, job observation, and continuous disconnection waits
   are bounded at 30 seconds. There is no total time limit on a healthy active print.
-- Ctrl-C exits monitoring with nonzero status and **does not cancel the print**.
-  Inspect the printer if an upload/control request was interrupted after transmission.
+- Ctrl-C is serviced continuously through readiness, guard queries, upload/start
+  and monitoring, exits nonzero and **does not cancel the print**. Before mutation
+  transmission it discards unsent work; after possible transmission it warns that
+  the remote outcome is unknown. Inspect the printer before retrying. It sends no
+  compensating cancel/start. Byte-read progress does not establish remote execution.
 
 ## GUI
 

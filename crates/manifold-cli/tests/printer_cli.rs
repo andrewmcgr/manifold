@@ -142,8 +142,7 @@ async fn terminal_auth_failure_exits_nonzero_without_upload() {
     assert!(!status(&mut child).await.success());
     assert!(server.requests.is_empty());
 }
-#[tokio::test]
-async fn print_monitor_uses_canonical_upload_name_and_waits_for_active_job() {
+async fn print_monitor_after_old_terminal(old_filename: &str, old_state: &str) {
     let mut server = Server::start().await;
     let dir = tempfile::tempdir().unwrap();
     mesh(dir.path());
@@ -161,7 +160,7 @@ async fn print_monitor_uses_canonical_upload_name_and_waits_for_active_job() {
     let mut ws = server.socket().await;
     subscribe(
         &mut ws,
-        json!({"print_stats":{"state":"complete","filename":"old.gcode"}}),
+        json!({"print_stats":{"state":old_state,"filename":old_filename}}),
     )
     .await;
     let info = server.request().await;
@@ -171,11 +170,19 @@ async fn print_monitor_uses_canonical_upload_name_and_waits_for_active_job() {
         .unwrap();
     let query = server.request().await;
     assert!(query.path.starts_with("/printer/objects/query?"));
-    query.respond.send(json!({"result":{"status":{"print_stats":{"state":"complete","filename":"old.gcode"}}}})).unwrap();
+    query.respond.send(json!({"result":{"status":{"print_stats":{"state":old_state,"filename":old_filename}}}})).unwrap();
     let upload = server.request().await;
     assert_eq!(upload.path, "/server/files/upload");
     upload.respond.send(json!({"item":{"path":"canonical.gcode","root":"gcodes"},"print_started":true,"print_queued":false})).unwrap();
-    line_containing(&mut lines, "canonical.gcode — Complete").await;
+    line_containing(
+        &mut lines,
+        if old_state == "cancelled" {
+            "canonical.gcode — Cancelled"
+        } else {
+            "canonical.gcode — Complete"
+        },
+    )
+    .await;
     assert!(child.try_wait().unwrap().is_none());
     ws.send(Message::Text(json!({"method":"notify_status_update","params":[{"print_stats":{"state":"printing","filename":"canonical.gcode"}}]}).to_string())).await.unwrap();
     line_containing(&mut lines, "canonical.gcode — Printing").await;
@@ -213,4 +220,94 @@ async fn ctrl_c_exits_monitor_without_print_cancellation() {
     assert!(signal.success());
     assert!(!status(&mut child).await.success());
     assert!(server.requests.is_empty());
+}
+
+#[cfg(unix)]
+async fn interrupt_held_pipeline(after_transmission: bool, hold_job_query: bool) {
+    let mut server = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    mesh(dir.path());
+    let mut child = command(dir.path())
+        .args([
+            "model.stl",
+            "--print",
+            "--monitor",
+            "--printer-url",
+            &server.url,
+        ])
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let mut ws = server.socket().await;
+    subscribe(
+        &mut ws,
+        json!({"print_stats":{"state":"standby","filename":""}}),
+    )
+    .await;
+    let mut held = server.request().await;
+    assert_eq!(held.path, "/server/info");
+    if after_transmission || hold_job_query {
+        held.respond
+            .send(json!({"result":{"klippy_state":"ready"}}))
+            .unwrap();
+        held = server.request().await;
+        assert!(held.path.starts_with("/printer/objects/query?"));
+    }
+    if after_transmission {
+        held.respond
+            .send(json!({"result":{"status":{"print_stats":{"state":"standby","filename":""}}}}))
+            .unwrap();
+        held = server.request().await;
+        assert_eq!(held.path, "/server/files/upload");
+    }
+    assert!(Command::new("kill")
+        .args(["-INT", &child.id().unwrap().to_string()])
+        .status()
+        .await
+        .unwrap()
+        .success());
+    let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .expect("SIGINT must remain serviced through guard/upload")
+        .unwrap();
+    assert!(!status.success());
+    line_containing(
+        &mut lines,
+        if after_transmission {
+            "outcome unknown"
+        } else {
+            "before mutation transmission"
+        },
+    )
+    .await;
+    // Releasing a held guard after interruption cannot resume the dropped pipeline.
+    let _ = held
+        .respond
+        .send(json!({"result":{"klippy_state":"ready"}}));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), server.requests.recv())
+            .await
+            .is_err(),
+        "no mutation, compensating cancel/start, or replay after SIGINT"
+    );
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn ctrl_c_during_guards_prevents_upload_post() {
+    interrupt_held_pipeline(false, false).await;
+    interrupt_held_pipeline(false, true).await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn ctrl_c_after_upload_transmission_reports_uncertainty_without_compensation() {
+    interrupt_held_pipeline(true, false).await;
+}
+
+#[tokio::test]
+async fn print_monitor_uses_canonical_upload_name_and_waits_for_active_job() {
+    print_monitor_after_old_terminal("old.gcode", "complete").await;
+}
+#[tokio::test]
+async fn print_monitor_ignores_old_same_filename_cancellation_before_new_run() {
+    print_monitor_after_old_terminal("canonical.gcode", "cancelled").await;
 }

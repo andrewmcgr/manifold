@@ -163,7 +163,12 @@ async fn upload_direct_outcomes_multipart_auth_and_chunk_progress() {
         assert_eq!(result.disposition, want);
         assert_eq!(
             *events.lock().unwrap(),
-            vec![(65536, 140000), (131072, 140000), (140000, 140000)]
+            vec![
+                (0, 140000),
+                (65536, 140000),
+                (131072, 140000),
+                (140000, 140000)
+            ]
         );
         let requests = server.received_requests().await.unwrap();
         assert!(requests.iter().all(|r| r.headers["x-api-key"] == "secret"));

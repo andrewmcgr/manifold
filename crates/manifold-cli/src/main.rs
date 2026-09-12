@@ -292,7 +292,10 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        return rt.block_on(printer::monitor(&session, None));
+        return rt.block_on(printer::interruptible(
+            printer::monitor(&session, None),
+            &std::sync::atomic::AtomicBool::new(false),
+        ));
     }
 
     let mut objects = Vec::new();
@@ -378,29 +381,43 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        rt.block_on(async {
-            if let Some(session) = &session {
-                printer::wait_ready(session).await?;
-            }
-            eprintln!(
-                "Uploading to {}. A transmitted request cannot be recalled by exiting.",
-                client.base_url()
-            );
-            let outcome = client
-                .upload_gcode(filename, gcode.into_bytes(), start)
-                .await?;
-            eprintln!(
-                "{:?}: {}/{}",
-                outcome.disposition, outcome.root, outcome.path
-            );
-            if start {
-                printer::require_started(&outcome)?;
-            }
-            if let Some(session) = &session {
-                printer::monitor(session, Some(outcome.path)).await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })?;
+        let mutation_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progress_state = mutation_in_flight.clone();
+        rt.block_on(printer::interruptible(
+            async {
+                if let Some(session) = &session {
+                    printer::wait_ready(session).await?;
+                }
+                let before_start = session.as_ref().map(|s| s.latest_telemetry());
+                eprintln!(
+                    "Uploading to {}. A transmitted request cannot be recalled by exiting.",
+                    client.base_url()
+                );
+                let outcome = client
+                    .upload_gcode_with_progress(
+                        filename,
+                        gcode.into_bytes(),
+                        start,
+                        Some(std::sync::Arc::new(move |_, _| {
+                            progress_state.store(true, std::sync::atomic::Ordering::SeqCst);
+                        })),
+                    )
+                    .await?;
+                mutation_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+                eprintln!(
+                    "{:?}: {}/{}",
+                    outcome.disposition, outcome.root, outcome.path
+                );
+                if start {
+                    printer::require_started(&outcome)?;
+                }
+                if let (Some(session), Some(before_start)) = (&session, before_start) {
+                    printer::monitor(session, Some((outcome.path, before_start))).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            },
+            &mutation_in_flight,
+        ))?;
     }
 
     Ok(())
