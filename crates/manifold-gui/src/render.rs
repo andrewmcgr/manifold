@@ -12,7 +12,7 @@
 //! smooth antialiasing on all lines and edges, before resolving and blitting
 //! into egui's frame pass in `paint`.
 
-use crate::scene::{SceneLineInstance, SceneVertex};
+use crate::scene::{SceneLineInstance, SceneTextVertex, SceneVertex};
 use crate::toolpath_view::ToolpathLineInstance;
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
@@ -254,16 +254,31 @@ pub struct UploadedScene {
     line_instance_count: u32,
     tri_buffer: wgpu::Buffer,
     tri_vertex_count: u32,
+    text_buffer: wgpu::Buffer,
+    text_vertex_count: u32,
+    label_bind_group: wgpu::BindGroup,
 }
 
 impl UploadedScene {
-    /// Upload line-instance geometry (origin axes + grid) and triangle-list
-    /// geometry (bed quad + toolhead markers), already built by
-    /// `crate::scene`'s builders.
+    /// Upload line-instance geometry (origin axes + grid), triangle-list
+    /// geometry (bed quad + toolhead markers), and object name label quads +
+    /// their shared glyph atlas — all already built by `crate::scene`'s
+    /// builders and `crate::text_raster::build_atlas`.
+    ///
+    /// The atlas is bound to the label pipeline as a read-only storage
+    /// buffer of per-pixel coverage floats (not a `wgpu::Texture`), so this
+    /// only needs `device` — no `wgpu::Queue` — matching every other
+    /// scene-dressing upload in this module. The label bind group layout is
+    /// created fresh here from the same descriptor `MeshRenderResources::new`
+    /// uses for `label_pipeline`; wgpu deduplicates identical bind group
+    /// layout descriptors on a given device, so the two remain compatible
+    /// without threading the layout object through `crate::app`.
     pub fn upload(
         device: &wgpu::Device,
         lines: &[SceneLineInstance],
         triangles: &[SceneVertex],
+        text_vertices: &[SceneTextVertex],
+        atlas: &crate::text_raster::TextAtlas,
     ) -> Self {
         let fallback_line = [SceneLineInstance::default()];
         let line_contents = if lines.is_empty() {
@@ -277,6 +292,12 @@ impl UploadedScene {
         } else {
             bytemuck::cast_slice(triangles)
         };
+        let fallback_text = [SceneTextVertex::default()];
+        let text_contents = if text_vertices.is_empty() {
+            bytemuck::cast_slice(&fallback_text)
+        } else {
+            bytemuck::cast_slice(text_vertices)
+        };
 
         let line_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("manifold scene line buffer"),
@@ -288,14 +309,91 @@ impl UploadedScene {
             contents: tri_contents,
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let text_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("manifold scene label vertex buffer"),
+            contents: text_contents,
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let atlas_pixels: Vec<f32> =
+            atlas.pixels.iter().map(|&byte| byte as f32 / 255.0).collect();
+        let fallback_pixels = [0.0f32];
+        let atlas_pixel_contents = if atlas_pixels.is_empty() {
+            bytemuck::cast_slice(&fallback_pixels)
+        } else {
+            bytemuck::cast_slice(&atlas_pixels)
+        };
+        let atlas_pixel_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("manifold label atlas pixel buffer"),
+            contents: atlas_pixel_contents,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let atlas_info_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("manifold label atlas info buffer"),
+            contents: bytemuck::cast_slice(&[atlas.width_px.max(1), atlas.height_px.max(1)]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let label_bind_group_layout = label_bind_group_layout_descriptor(device);
+        let label_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("manifold label bind group"),
+            layout: &label_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: atlas_pixel_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: atlas_info_buffer.as_entire_binding(),
+                },
+            ],
+        });
 
         Self {
             line_buffer,
             line_instance_count: lines.len() as u32,
             tri_buffer,
             tri_vertex_count: triangles.len() as u32,
+            text_buffer,
+            text_vertex_count: text_vertices.len() as u32,
+            label_bind_group,
         }
     }
+}
+
+/// Bind group layout for the label pipeline's atlas storage buffer + info
+/// uniform (group 1) — shared by [`MeshRenderResources::new`] (to build
+/// `label_pipeline`'s layout) and [`UploadedScene::upload`] (to build each
+/// scene's `label_bind_group`). wgpu deduplicates bind group layouts created
+/// from identical descriptors on the same device, so independently created
+/// layouts from this same descriptor remain pipeline-compatible.
+fn label_bind_group_layout_descriptor(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("manifold label bind group layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
 }
 
 /// Toolpath preview line geometry (Phase 13, see ROADMAP.md) already
@@ -350,6 +448,7 @@ pub struct MeshRenderResources {
     overlay_pipeline: wgpu::RenderPipeline,
     scene_line_pipeline: wgpu::RenderPipeline,
     scene_tri_pipeline: wgpu::RenderPipeline,
+    label_pipeline: wgpu::RenderPipeline,
     toolpath_line_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
     blit_bind_group_layout: wgpu::BindGroupLayout,
@@ -598,6 +697,53 @@ impl MeshRenderResources {
             cache: None,
         });
 
+        let label_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("manifold label shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("label_shader.wgsl").into()),
+        });
+
+        let label_bind_group_layout = label_bind_group_layout_descriptor(device);
+        let label_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("manifold label pipeline layout"),
+            bind_group_layouts: &[&camera_bind_group_layout, &label_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let label_vertex_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<SceneTextVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2],
+        }];
+
+        let label_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("manifold label pipeline"),
+            layout: Some(&label_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &label_shader,
+                entry_point: "vs_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &label_vertex_buffers,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &label_shader,
+                entry_point: "fs_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(depth_stencil_state(false)),
+            multisample: multisample_state,
+            multiview: None,
+            cache: None,
+        });
+
         let toolpath_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("manifold toolpath shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("toolpath_shader.wgsl").into()),
@@ -755,6 +901,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             overlay_pipeline,
             scene_line_pipeline,
             scene_tri_pipeline,
+            label_pipeline,
             toolpath_line_pipeline,
             blit_pipeline,
             blit_bind_group_layout,
@@ -937,6 +1084,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             rpass.set_pipeline(&self.scene_line_pipeline);
             rpass.set_vertex_buffer(0, scene.line_buffer.slice(..));
             rpass.draw(0..6, 0..scene.line_instance_count);
+
+            rpass.set_pipeline(&self.label_pipeline);
+            rpass.set_bind_group(1, &scene.label_bind_group, &[]);
+            rpass.set_vertex_buffer(0, scene.text_buffer.slice(..));
+            rpass.draw(0..scene.text_vertex_count, 0..1);
         };
 
         let draw_geometry = |rpass: &mut wgpu::RenderPass| {

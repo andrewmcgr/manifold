@@ -14,6 +14,7 @@ mod mcp;
 mod profile;
 mod render;
 mod scene;
+mod text_raster;
 mod toolpath_view;
 
 use app::ManifoldApp;

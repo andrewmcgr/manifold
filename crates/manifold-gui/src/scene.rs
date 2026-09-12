@@ -7,6 +7,8 @@ use glam::DVec3;
 use manifold_core::machine::Machine;
 use manifold_core::object::Object;
 
+use crate::text_raster::TextAtlas;
+
 /// One vertex for the unlit scene-dressing shader: position + RGBA color.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
@@ -184,6 +186,93 @@ pub fn build_toolhead_markers(machine: &Machine, size: f64) -> Vec<SceneVertex> 
             vertices.push(SceneVertex::new(b, TOOLHEAD_COLOR));
             vertices.push(SceneVertex::new(apex, TOOLHEAD_COLOR));
         }
+    }
+    vertices
+}
+
+
+/// One vertex for the textured object-label shader: position + atlas UV.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+pub struct SceneTextVertex {
+    position: [f32; 3],
+    uv: [f32; 2],
+}
+
+impl SceneTextVertex {
+    pub fn new(position: DVec3, uv: [f32; 2]) -> Self {
+        Self { position: position.as_vec3().to_array(), uv }
+    }
+}
+
+/// World-space cap height of a rendered object name label, in millimeters.
+const LABEL_HEIGHT_MM: f64 = 5.0;
+/// Gap between an object's footprint (at its minimum-Y edge) and the label
+/// text placed just outside it, in millimeters.
+const LABEL_CLEARANCE_MM: f64 = 1.5;
+/// Small Z lift above the footprint outline's plane to prevent z-fighting
+/// between the label quad and the footprint/bed quads.
+const LABEL_Z_EPSILON: f64 = 0.02;
+
+/// A textured quad per object, baseline-aligned to world X (not rotated with
+/// the object), centered on the object footprint's X extent, and placed just
+/// outside the footprint's minimum-Y edge — i.e. a name tag sitting in front
+/// of each object on the bed. Objects with no footprint (or not present in
+/// `atlas`, e.g. an empty mesh) are silently skipped.
+pub fn build_object_labels(
+    machine: &Machine,
+    objects: &[Object],
+    atlas: &TextAtlas,
+) -> Vec<SceneTextVertex> {
+    let (bed_min, _) = machine.build_volume.bounding_box();
+    let z = bed_min.z + LABEL_Z_EPSILON;
+    let atlas_width_px = atlas.width_px.max(1) as f64;
+    let atlas_height_px = atlas.height_px.max(1) as f64;
+    let mm_per_px = LABEL_HEIGHT_MM / atlas_height_px;
+
+    let mut vertices = Vec::new();
+    for (object, metrics) in objects.iter().zip(&atlas.labels) {
+        let Some(polygon) = object.footprint_polygon() else {
+            continue;
+        };
+        if polygon.len() < 3 {
+            continue;
+        }
+
+        let mut min_x = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut min_y = f64::INFINITY;
+        for p in &polygon {
+            min_x = min_x.min(p.x);
+            max_x = max_x.max(p.x);
+            min_y = min_y.min(p.y);
+        }
+
+        let width_mm = metrics.width_px as f64 * mm_per_px;
+        let center_x = (min_x + max_x) * 0.5;
+        let x0 = center_x - width_mm * 0.5;
+        let x1 = x0 + width_mm;
+        let y_top = min_y - LABEL_CLEARANCE_MM;
+        let y_bottom = y_top - LABEL_HEIGHT_MM;
+
+        let u0 = metrics.x_offset_px as f32 / atlas_width_px as f32;
+        let u1 = (metrics.x_offset_px + metrics.width_px) as f32 / atlas_width_px as f32;
+
+        let p00 = DVec3::new(x0, y_bottom, z);
+        let p10 = DVec3::new(x1, y_bottom, z);
+        let p11 = DVec3::new(x1, y_top, z);
+        let p01 = DVec3::new(x0, y_top, z);
+
+        // v=0 at the raster's top row (glyph ascent), v=1 at the bottom
+        // (glyph descent), matching the atlas's row-major top-down layout so
+        // the label reads upright when viewed from above the bed (+Y up).
+        vertices.push(SceneTextVertex::new(p01, [u0, 0.0]));
+        vertices.push(SceneTextVertex::new(p11, [u1, 0.0]));
+        vertices.push(SceneTextVertex::new(p10, [u1, 1.0]));
+
+        vertices.push(SceneTextVertex::new(p01, [u0, 0.0]));
+        vertices.push(SceneTextVertex::new(p10, [u1, 1.0]));
+        vertices.push(SceneTextVertex::new(p00, [u0, 1.0]));
     }
     vertices
 }
