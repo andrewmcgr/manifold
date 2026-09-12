@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::client::MoonrakerClient;
 use crate::error::MoonrakerError;
-use crate::model::{ConnectionState, MoonrakerConfig, PrinterTelemetry};
+use crate::model::{ConnectionState, MoonrakerConfig, PrinterTelemetry, UploadDisposition};
 pub use crate::operation::PrinterAction;
 use crate::operation::{ActionOutcome, Operation, OperationState};
 
@@ -17,10 +17,25 @@ pub(crate) struct Shared {
     online: bool,
     operations: VecDeque<Operation>,
     next_id: u64,
+    pending_start: Option<String>,
 }
 impl Shared {
+    pub(crate) fn reconcile_start(&mut self) {
+        if self.telemetry.fresh
+            && self.telemetry.print_state.is_active()
+            && self.pending_start == self.telemetry.filename
+        {
+            self.pending_start = None;
+        }
+    }
     fn invalidate(&mut self) {
         self.epoch += 1;
+        self.pending_start = None;
+        self.telemetry.connection_state = if self.online {
+            ConnectionState::Connecting
+        } else {
+            ConnectionState::Disconnected
+        };
         self.telemetry.fresh = false;
         self.telemetry.klippy_ready = false;
         self.telemetry.estimated_remaining_secs = None;
@@ -86,6 +101,7 @@ impl PrinterSessionHandle {
             online: config.auto_connect,
             operations: VecDeque::new(),
             next_id: 1,
+            pending_start: None,
         }));
         let client = MoonrakerClient::new(config.clone());
         let endpoint = client
@@ -160,13 +176,15 @@ impl PrinterSessionHandle {
             .retain(|op| op.id != id || op.state.is_pending());
     }
     pub fn is_uploading(&self) -> bool {
-        self.owner
-            .shared
-            .lock()
-            .unwrap()
-            .operations
-            .iter()
-            .any(|op| op.upload && op.state.is_pending())
+        let shared = self.owner.shared.lock().unwrap();
+        shared.pending_start.is_some()
+            || shared
+                .operations
+                .iter()
+                .any(|op| op.upload && op.state.is_pending())
+    }
+    pub fn is_start_pending(&self) -> bool {
+        self.owner.shared.lock().unwrap().pending_start.is_some()
     }
     pub fn send_action(&self, action: PrinterAction) -> Result<u64, MoonrakerError> {
         let mut shared = self.owner.shared.lock().unwrap();
@@ -193,10 +211,11 @@ impl PrinterSessionHandle {
             ));
         }
         if action.is_upload()
-            && shared
-                .operations
-                .iter()
-                .any(|o| o.upload && o.state.is_pending())
+            && (shared.pending_start.is_some()
+                || shared
+                    .operations
+                    .iter()
+                    .any(|o| o.upload && o.state.is_pending()))
         {
             return Err(MoonrakerError::rejected(
                 action.name(),
@@ -245,6 +264,9 @@ impl PrinterSessionHandle {
         if stop {
             shared.invalidate();
             self.owner.lifecycle.send_replace(shared.epoch);
+        }
+        if let PrinterAction::UploadAndPrint { filename, .. } = &action {
+            shared.pending_start = Some(filename.clone());
         }
         let id = shared.next_id;
         shared.next_id += 1;
@@ -328,6 +350,7 @@ async fn actions(
                 },
             );
         });
+        let starts = matches!(command.action, PrinterAction::UploadAndPrint { .. });
         let result = match command.action {
             PrinterAction::UploadOnly { filename, gcode } => client
                 .upload_gcode_with_progress(&filename, gcode, false, Some(progress))
@@ -355,6 +378,24 @@ async fn actions(
                 .map(|_| ActionOutcome::Acknowledged),
             _ => unreachable!("lifecycle actions never queued"),
         };
+        if starts {
+            let mut shared = shared.lock().unwrap();
+            if shared.epoch == epoch {
+                match &result {
+                    Ok(ActionOutcome::Upload(outcome))
+                        if matches!(
+                            outcome.disposition,
+                            UploadDisposition::Started | UploadDisposition::Queued
+                        ) =>
+                    {
+                        shared.pending_start = Some(outcome.path.clone());
+                        shared.reconcile_start();
+                    }
+                    Err(error) if error.outcome_unknown() => {}
+                    _ => shared.pending_start = None,
+                }
+            }
+        }
         let state = match result {
             Ok(result) => OperationState::Succeeded(result),
             Err(e) => OperationState::Failed {

@@ -23,6 +23,7 @@ fn update(shared: &Mutex<Shared>, epoch: u64, f: impl FnOnce(&mut PrinterTelemet
     let mut state = shared.lock().unwrap();
     if state.epoch == epoch {
         f(&mut state.telemetry);
+        state.reconcile_start();
     }
 }
 fn backoff(attempt: u32) -> Duration {
@@ -42,8 +43,8 @@ pub(crate) async fn run(client: &MoonrakerClient, shared: &Arc<Mutex<Shared>>, e
                 ConnectionState::Reconnecting { attempt }
             };
         });
-        let began = Instant::now();
-        let result = connected(client, shared, epoch).await;
+        let mut usable_since = None;
+        let result = connected(client, shared, epoch, &mut usable_since).await;
         let error = result.expect_err("socket loop ends only on failure");
         update(shared, epoch, |t| {
             t.fresh = false;
@@ -60,7 +61,9 @@ pub(crate) async fn run(client: &MoonrakerClient, shared: &Arc<Mutex<Shared>>, e
             return; // Explicit reconnect after correcting credentials/settings.
         }
         // A handshake or instant accept/close must not reset the retry budget.
-        if began.elapsed() >= PING_INTERVAL + PONG_DEADLINE {
+        if usable_since
+            .is_some_and(|since: Instant| since.elapsed() >= PING_INTERVAL + PONG_DEADLINE)
+        {
             attempt = 0;
         }
         attempt = attempt.saturating_add(1);
@@ -83,6 +86,19 @@ async fn rpc(
             match socket.next().await {
                 Some(Ok(Message::Text(text))) => {
                     let value: Value = serde_json::from_str(&text)?;
+                    if matches!(
+                        value["method"].as_str(),
+                        Some(
+                            "notify_klippy_shutdown"
+                                | "notify_klippy_disconnected"
+                                | "notify_klippy_ready"
+                        )
+                    ) {
+                        return Err(MoonrakerError::rejected(
+                            "Klipper lifecycle",
+                            "readiness changed during RPC",
+                        ));
+                    }
                     if value["id"] != id {
                         continue;
                     }
@@ -117,6 +133,7 @@ async fn connected(
     client: &MoonrakerClient,
     shared: &Mutex<Shared>,
     epoch: u64,
+    usable_since: &mut Option<Instant>,
 ) -> Result<(), MoonrakerError> {
     let connected = timeout(
         Duration::from_secs(5),
@@ -185,6 +202,7 @@ async fn connected(
         };
         apply_status_delta(t, status);
     });
+    *usable_since = Some(Instant::now());
     let mut ping_at = Instant::now() + PING_INTERVAL;
     let mut awaiting_pong = false;
     loop {

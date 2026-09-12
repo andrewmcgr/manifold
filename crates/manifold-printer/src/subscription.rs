@@ -66,22 +66,34 @@ pub fn apply_status_delta(telemetry: &mut PrinterTelemetry, delta: &Value) {
     }
 
     if let Some(stats) = delta.get("print_stats") {
-        if let Some(state_str) = stats.get("state").and_then(|v| v.as_str()) {
-            telemetry.print_state = PrintState::parse(state_str);
+        let state = stats
+            .get("state")
+            .and_then(Value::as_str)
+            .map(PrintState::parse)
+            .unwrap_or(telemetry.print_state);
+        let filename = stats
+            .get("filename")
+            .and_then(Value::as_str)
+            .map(|s| (!s.is_empty()).then(|| s.to_string()))
+            .unwrap_or_else(|| telemetry.filename.clone());
+        let restarted = state.is_active()
+            && (!telemetry.print_state.is_active()
+                || stats
+                    .get("print_duration")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|d| d < telemetry.print_duration_secs as f64));
+        if telemetry.filename != filename || restarted {
+            telemetry.job_generation += 1;
+            telemetry.display_progress = None;
+            telemetry.sd_progress = None;
+            telemetry.current_layer = None;
+            telemetry.total_layers = None;
+            telemetry.klipper_message = None;
+            telemetry.print_duration_secs = 0;
+            telemetry.total_duration_secs = 0;
         }
-        if let Some(filename) = stats.get("filename").and_then(Value::as_str) {
-            let filename = (!filename.is_empty()).then(|| filename.to_string());
-            if telemetry.filename != filename {
-                telemetry.display_progress = None;
-                telemetry.sd_progress = None;
-                telemetry.current_layer = None;
-                telemetry.total_layers = None;
-                telemetry.klipper_message = None;
-                telemetry.print_duration_secs = 0;
-                telemetry.total_duration_secs = 0;
-            }
-            telemetry.filename = filename;
-        }
+        telemetry.print_state = state;
+        telemetry.filename = filename;
         if let Some(info) = stats.get("info") {
             if let Some(layer) = info.get("current_layer") {
                 telemetry.current_layer = layer.as_u64().and_then(|n| n.try_into().ok());

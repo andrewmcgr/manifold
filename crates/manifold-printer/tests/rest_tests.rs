@@ -291,3 +291,19 @@ async fn normalized_proxy_paths_and_redirect_do_not_leak_key() {
     }
     assert!(destination.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn malformed_control_success_is_not_an_acknowledgement() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/printer/print/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("truncated proxy response"))
+        .mount(&server)
+        .await;
+    let client = MoonrakerClient::new(MoonrakerConfig {
+        url: server.uri(),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(client.cancel_print().await.unwrap_err().outcome_unknown());
+}

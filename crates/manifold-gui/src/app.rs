@@ -886,6 +886,14 @@ impl ManifoldApp {
 
                 ui.horizontal(|ui| {
                     if ui.button("Save Profile…").clicked() {
+                        match self.printer_panel.profile_config() {
+                            Ok(config) => self.moonraker_config = config,
+                            Err(error) => {
+                                self.profile_error =
+                                    Some(format!("Invalid printer settings: {error}"));
+                                return;
+                            }
+                        }
                         let mut dialog = rfd::FileDialog::new()
                             .add_filter("Profile", &["json"])
                             .set_file_name(
@@ -936,17 +944,11 @@ impl ManifoldApp {
                                     self.profile_path = Some(path);
                                     self.profile_error = None;
 
-                                    if let Some(ref config) = profile.moonraker {
-                                        self.moonraker_config = Some(config.clone());
-                                        self.printer_panel = PrinterPanel::new(Some(config));
-                                        if config.auto_connect {
-                                            self.printer_session =
-                                                Some(PrinterSessionHandle::spawn(config.clone()));
-                                        }
-                                    } else {
-                                        self.moonraker_config = None;
-                                        self.printer_panel = PrinterPanel::new(None);
-                                    }
+                                    self.printer_panel.replace_profile(
+                                        &mut self.printer_session,
+                                        profile.moonraker.as_ref(),
+                                    );
+                                    self.moonraker_config = profile.moonraker;
 
                                     let device = frame
                                         .wgpu_render_state()
@@ -3093,8 +3095,8 @@ impl ManifoldApp {
             }
 
             let printer_ready = self.printer_session.as_ref().is_some_and(|s| {
-                s.latest_telemetry().connection_state
-                    == manifold_printer::ConnectionState::Connected
+                let t = s.latest_telemetry();
+                t.fresh && t.connection_state == manifold_printer::ConnectionState::Connected
             });
             let printer_uploading = self
                 .printer_session
@@ -3115,7 +3117,7 @@ impl ManifoldApp {
                 .clicked()
             {
                 if let (Some(session), Some(gcode)) = (&self.printer_session, &self.gcode) {
-                    let _ = session.send_action(PrinterAction::UploadOnly {
+                    self.printer_panel.send(session, PrinterAction::UploadOnly {
                         filename: default_gcode_name.clone(),
                         gcode: gcode.as_bytes().to_vec(),
                     });
@@ -3124,11 +3126,11 @@ impl ManifoldApp {
 
             ensure_row_space(ui, 110.0);
             if ui
-                .add_enabled(can_upload, egui::Button::new("Upload & Print"))
+                .add_enabled(can_upload && self.printer_session.as_ref().is_some_and(PrinterPanel::can_start), egui::Button::new("Upload & Print"))
                 .clicked()
             {
                 if let (Some(session), Some(gcode)) = (&self.printer_session, &self.gcode) {
-                    let _ = session.send_action(PrinterAction::UploadAndPrint {
+                    self.printer_panel.send(session, PrinterAction::UploadAndPrint {
                         filename: default_gcode_name,
                         gcode: gcode.as_bytes().to_vec(),
                     });
@@ -4118,6 +4120,7 @@ fn infill_pattern_label(kind: InfillPatternKind) -> &'static str {
 
 impl eframe::App for ManifoldApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        PrinterPanel::request_repaint(ctx, self.printer_session.as_ref());
         #[cfg(feature = "mcp-server")]
         self.drain_mcp_commands(frame);
 

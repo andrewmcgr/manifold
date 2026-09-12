@@ -88,7 +88,7 @@ async fn unavailable_commands_are_rejected_not_silently_consumed() {
 
 mod support;
 use manifold_printer::OperationState;
-use support::{reply, rpc, subscribe, until, Server};
+use support::{reply, rpc, subscribe, Server};
 
 #[tokio::test]
 async fn subscription_rejection_is_terminal_and_redacted() {
@@ -343,4 +343,188 @@ async fn missing_pong_expires_live_snapshot() {
         .klipper_message
         .unwrap()
         .contains("pong"));
+}
+
+#[tokio::test]
+async fn started_upload_keeps_admission_reserved_until_job_is_observed() {
+    let mut server = Server::start().await;
+    let session = PrinterSessionHandle::spawn(MoonrakerConfig {
+        url: server.url.clone(),
+        ..Default::default()
+    });
+    let mut ws = server.socket().await;
+    subscribe(
+        &mut ws,
+        json!({"print_stats":{"state":"standby","filename":""}}),
+    )
+    .await;
+    until(|| session.latest_telemetry().fresh).await;
+    let id = session
+        .send_action(PrinterAction::UploadAndPrint {
+            filename: "part.gcode".into(),
+            gcode: vec![1],
+        })
+        .unwrap();
+    server
+        .request()
+        .await
+        .respond
+        .send(json!({"result":{"klippy_state":"ready"}}))
+        .unwrap();
+    server
+        .request()
+        .await
+        .respond
+        .send(json!({"result":{"status":{"print_stats":{"state":"standby","filename":""}}}}))
+        .unwrap();
+    server.request().await.respond.send(json!({"item":{"path":"canonical.gcode","root":"gcodes"},"print_started":true,"print_queued":false})).unwrap();
+    until(|| {
+        session
+            .operations()
+            .iter()
+            .any(|o| o.id == id && matches!(o.state, OperationState::Succeeded(_)))
+    })
+    .await;
+    assert!(
+        session.is_uploading(),
+        "start must remain reserved while telemetry still shows old standby"
+    );
+    assert!(session
+        .send_action(PrinterAction::UploadAndPrint {
+            filename: "other.gcode".into(),
+            gcode: vec![1]
+        })
+        .is_err());
+    ws.send(Message::Text(json!({"method":"notify_status_update","params":[{"print_stats":{"state":"printing","filename":"canonical.gcode"}}]}).to_string())).await.unwrap();
+    until(|| !session.is_uploading()).await;
+}
+
+pub async fn until(mut predicate: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !predicate() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn accept_close_is_backed_off_and_drop_cancels_retry() {
+    let mut server = Server::start().await;
+    let session = PrinterSessionHandle::spawn(MoonrakerConfig {
+        url: server.url.clone(),
+        ..Default::default()
+    });
+    let ws = server.socket().await;
+    drop(ws);
+    until(|| {
+        matches!(
+            session.latest_telemetry().connection_state,
+            ConnectionState::Reconnecting { attempt: 1 }
+        )
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(700), server.sockets.recv())
+            .await
+            .is_err()
+    );
+    let ws = server.socket().await;
+    drop(ws);
+    until(|| {
+        matches!(
+            session.latest_telemetry().connection_state,
+            ConnectionState::Reconnecting { attempt: 2 }
+        )
+    })
+    .await;
+    drop(session);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(2200), server.sockets.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn unanswered_subscription_has_deadline_and_lifecycle_invalidates_snapshot() {
+    let mut server = Server::start().await;
+    let session = PrinterSessionHandle::spawn(MoonrakerConfig {
+        url: server.url.clone(),
+        ..Default::default()
+    });
+    let mut ws = server.socket().await;
+    let identify = rpc(&mut ws).await;
+    reply(&mut ws, &identify["id"], json!({"connection_id":1})).await;
+    let info = rpc(&mut ws).await;
+    reply(&mut ws, &info["id"], json!({"klippy_state":"ready"})).await;
+    let sub = rpc(&mut ws).await;
+    assert_eq!(sub["method"], "printer.objects.subscribe");
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if matches!(
+                session.latest_telemetry().connection_state,
+                ConnectionState::Reconnecting { .. }
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!session.latest_telemetry().fresh);
+    let mut ws = server.socket().await;
+    subscribe(
+        &mut ws,
+        json!({"print_stats":{"state":"printing","filename":"a.gcode"}}),
+    )
+    .await;
+    until(|| session.latest_telemetry().fresh).await;
+    ws.send(Message::Text(
+        json!({"method":"notify_klippy_shutdown","params":[]}).to_string(),
+    ))
+    .await
+    .unwrap();
+    until(|| !session.latest_telemetry().fresh).await;
+    assert!(!session.latest_telemetry().klippy_ready);
+    assert!(session.send_action(PrinterAction::Resume).is_err());
+}
+
+#[tokio::test]
+async fn emergency_http_timeout_reports_unknown_without_mutation_replay() {
+    let mut server = Server::start().await;
+    let session = PrinterSessionHandle::spawn(MoonrakerConfig {
+        url: server.url.clone(),
+        auto_connect: false,
+        api_key: None,
+    });
+    let id = session.send_action(PrinterAction::EmergencyStop).unwrap();
+    let held = server.request().await;
+    assert_eq!(held.path, "/printer/emergency_stop");
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if session
+                .operations()
+                .iter()
+                .any(|o| o.id == id && !o.state.is_pending())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(session.operations().iter().any(|o| o.id == id
+        && matches!(
+            o.state,
+            OperationState::Failed {
+                outcome_unknown: true,
+                ..
+            }
+        )));
+    assert!(server.requests.is_empty());
+    drop(held);
 }

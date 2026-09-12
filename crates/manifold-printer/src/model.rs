@@ -36,6 +36,7 @@ pub struct PrinterTelemetry {
     /// True only for a live, authenticated subscription snapshot.
     pub fresh: bool,
     pub generation: u64,
+    pub job_generation: u64,
     pub klippy_ready: bool,
     pub display_progress: Option<f32>,
     pub sd_progress: Option<f32>,

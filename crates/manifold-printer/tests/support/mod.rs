@@ -112,12 +112,3 @@ pub async fn subscribe(socket: &mut Socket, status: Value) {
     assert_eq!(sub["method"], "printer.objects.subscribe");
     reply(socket, &sub["id"], json!({"status":status})).await;
 }
-pub async fn until(mut predicate: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !predicate() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-}

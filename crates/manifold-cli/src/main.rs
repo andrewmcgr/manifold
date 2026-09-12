@@ -2,6 +2,8 @@
 //! Gcode. Accepts multiple input files, each optionally suffixed with a
 //! tool id (`path[:tool]`) for per-file tool assignment.
 
+mod printer;
+
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use glam::DVec3;
@@ -15,13 +17,13 @@ use std::io::BufReader;
 use std::path::Path;
 
 /// Non-planar slicer CLI.
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "manifold", version = manifold_core::version::MANIFOLD_VERSION, about)]
 struct Cli {
     /// Input mesh file(s) (STL or 3MF). Each entry may optionally suffix a
     /// tool id to assign that file's objects to, e.g. `part.stl:1`
     /// (defaults to tool `0` if omitted).
-    #[arg(required = true, num_args = 1..)]
+    #[arg(num_args = 0..)]
     inputs: Vec<String>,
 
     /// Output Gcode file.
@@ -284,6 +286,14 @@ impl From<WallOrderArg> for manifold_core::WallOrder {
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+    let intent = printer::intent(&cli)?;
+    if intent == printer::Intent::Monitor {
+        let session = manifold_printer::PrinterSessionHandle::spawn(printer::config(&cli));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        return rt.block_on(printer::monitor(&session, None));
+    }
 
     let mut objects = Vec::new();
     let mut next_object_id = 0u32;
@@ -356,68 +366,41 @@ fn main() -> Result<()> {
     std::fs::write(&cli.output, &gcode)?;
     tracing::info!(output = %cli.output.display(), "wrote gcode");
 
-    if cli.upload || cli.print || cli.printer_url.is_some() {
-        if let Some(ref url) = cli.printer_url {
-            let config = manifold_printer::MoonrakerConfig {
-                url: url.clone(),
-                api_key: cli.printer_api_key.clone(),
-                auto_connect: true,
-            };
-            let client = manifold_printer::MoonrakerClient::new(config)?;
-            let filename = cli
-                .output
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("out.gcode");
-
-            tracing::info!("Uploading Gcode to Moonraker ({url})...");
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(client.upload_gcode(filename, gcode.as_bytes().to_vec(), cli.print))?;
-            tracing::info!("Upload successful!");
-
-            if cli.monitor {
-                tracing::info!("Monitoring print job...");
-                let session =
-                    manifold_printer::PrinterSessionHandle::spawn(client.config().clone());
-                let pb = indicatif::ProgressBar::new(100);
-                pb.set_style(
-                    indicatif::ProgressStyle::default_bar()
-                        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}% ({eta}) {msg}")?
-                        .progress_chars("#>-"),
-                );
-
-                rt.block_on(async {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        let t = session.latest_telemetry();
-                        let pct = (t.progress_fraction * 100.0) as u64;
-                        pb.set_position(pct);
-
-                        let temp_str = match (&t.hotend, &t.bed) {
-                            (Some(h), Some(b)) => format!(
-                                "E:{:.0}/{:.0}°C B:{:.0}/{:.0}°C",
-                                h.current, h.target, b.current, b.target
-                            ),
-                            _ => String::new(),
-                        };
-                        pb.set_message(format!("{:?} {}", t.print_state, temp_str));
-
-                        if matches!(
-                            t.print_state,
-                            manifold_printer::PrintState::Complete
-                                | manifold_printer::PrintState::Error
-                        ) {
-                            pb.finish_with_message(format!("Finished: {:?}", t.print_state));
-                            break;
-                        }
-                    }
-                });
+    if let printer::Intent::Upload { start, monitor } = intent {
+        let config = printer::config(&cli);
+        let client = manifold_printer::MoonrakerClient::new(config.clone())?;
+        let session = monitor.then(|| manifold_printer::PrinterSessionHandle::spawn(config));
+        let filename = cli
+            .output
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("out.gcode");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            if let Some(session) = &session {
+                printer::wait_ready(session).await?;
             }
-        } else {
-            bail!("--upload or --print was passed, but no --printer-url was provided");
-        }
+            eprintln!(
+                "Uploading to {}. A transmitted request cannot be recalled by exiting.",
+                client.base_url()
+            );
+            let outcome = client
+                .upload_gcode(filename, gcode.into_bytes(), start)
+                .await?;
+            eprintln!(
+                "{:?}: {}/{}",
+                outcome.disposition, outcome.root, outcome.path
+            );
+            if start {
+                printer::require_started(&outcome)?;
+            }
+            if let Some(session) = &session {
+                printer::monitor(session, Some(outcome.path)).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
     }
 
     Ok(())
@@ -510,6 +493,17 @@ fn load_objects(path: &Path, tool: ToolId, next_object_id: &mut u32) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_only_accepts_no_mesh_input() {
+        let cli = Cli::try_parse_from([
+            "manifold",
+            "--monitor",
+            "--printer-url",
+            "http://127.0.0.1:7125",
+        ]);
+        assert!(cli.is_ok(), "monitor-only must not require a mesh");
+    }
 
     #[test]
     fn parse_input_entry_defaults_to_tool_zero() {

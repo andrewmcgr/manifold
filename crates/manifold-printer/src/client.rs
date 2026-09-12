@@ -296,27 +296,38 @@ impl MoonrakerClient {
             .try_lock()
             .map_err(|_| MoonrakerError::rejected("start", "another upload/start is pending"))?;
         self.guard(filename, true).await?;
-        self.request(
-            "start",
-            self.http
-                .post(self.base_url.join("printer/print/start")?)
-                .query(&[("filename", filename)])
-                .timeout(Duration::from_secs(15)),
-            true,
-        )
-        .await?;
+        let value = self
+            .request(
+                "start",
+                self.http
+                    .post(self.base_url.join("printer/print/start")?)
+                    .query(&[("filename", filename)])
+                    .timeout(Duration::from_secs(15)),
+                true,
+            )
+            .await?;
+        Self::acknowledged("start", &value)
+    }
+    fn acknowledged(operation: &str, value: &Value) -> Result<(), MoonrakerError> {
+        if value["result"] != "ok" {
+            return Err(MoonrakerError::OutcomeUnknown {
+                operation: operation.into(),
+                message: "missing server acknowledgement".into(),
+            });
+        }
         Ok(())
     }
     async fn control(&self, operation: &str, path: &str) -> Result<(), MoonrakerError> {
-        self.request(
-            operation,
-            self.http
-                .post(self.base_url.join(path)?)
-                .timeout(Duration::from_secs(10)),
-            true,
-        )
-        .await?;
-        Ok(())
+        let value = self
+            .request(
+                operation,
+                self.http
+                    .post(self.base_url.join(path)?)
+                    .timeout(Duration::from_secs(10)),
+                true,
+            )
+            .await?;
+        Self::acknowledged(operation, &value)
     }
     pub async fn pause_print(&self) -> Result<(), MoonrakerError> {
         self.control("pause", "printer/print/pause").await

@@ -106,3 +106,19 @@ fn progress_sources_null_fallback_pause_eta_and_cancelled_unknown() {
     assert_eq!(t.progress_fraction, 0.0);
     assert_eq!(t.estimated_remaining_secs, None);
 }
+
+#[test]
+fn same_filename_restart_resets_job_estimates() {
+    let mut t = PrinterTelemetry::default();
+    apply_status_delta(
+        &mut t,
+        &serde_json::json!({"print_stats":{"filename":"same.gcode","state":"complete","print_duration":1000,"info":{"current_layer":100}},"display_status":{"progress":1.0}}),
+    );
+    apply_status_delta(
+        &mut t,
+        &serde_json::json!({"print_stats":{"state":"printing"}}),
+    );
+    assert_eq!(t.progress_fraction, 0.0);
+    assert_eq!(t.current_layer, None);
+    assert_eq!(t.estimated_remaining_secs, None);
+}

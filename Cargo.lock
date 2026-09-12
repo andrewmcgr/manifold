@@ -2769,6 +2769,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "glam 0.29.3",
  "indicatif",
  "manifold-core",
@@ -2776,7 +2777,9 @@ dependencies = [
  "manifold-printer",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
 ]
