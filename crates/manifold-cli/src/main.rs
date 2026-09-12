@@ -166,6 +166,26 @@ struct Cli {
     /// Static mechanical retraction distance (mm) when fluid dynamics model is enabled.
     #[arg(long)]
     static_retraction: Option<f64>,
+
+    /// Moonraker printer URL (e.g. http://192.168.1.50:7125)
+    #[arg(long)]
+    printer_url: Option<String>,
+
+    /// Moonraker API key (if authentication is enabled)
+    #[arg(long)]
+    printer_api_key: Option<String>,
+
+    /// Upload the sliced Gcode to the printer via Moonraker
+    #[arg(long)]
+    upload: bool,
+
+    /// Start printing immediately after upload
+    #[arg(long)]
+    print: bool,
+
+    /// Tail print progress and temperatures in the terminal until completion
+    #[arg(long)]
+    monitor: bool,
 }
 
 /// Parses a `--eikonal-slope-profile` argument of comma-separated
@@ -333,8 +353,72 @@ fn main() -> Result<()> {
     let workspace = Workspace::new(objects, machine, config);
 
     let gcode = slice_to_gcode(&workspace)?;
-    std::fs::write(&cli.output, gcode)?;
+    std::fs::write(&cli.output, &gcode)?;
     tracing::info!(output = %cli.output.display(), "wrote gcode");
+
+    if cli.upload || cli.print || cli.printer_url.is_some() {
+        if let Some(ref url) = cli.printer_url {
+            let config = manifold_printer::MoonrakerConfig {
+                url: url.clone(),
+                api_key: cli.printer_api_key.clone(),
+                auto_connect: true,
+            };
+            let client = manifold_printer::MoonrakerClient::new(config)?;
+            let filename = cli
+                .output
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("out.gcode");
+
+            tracing::info!("Uploading Gcode to Moonraker ({url})...");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(client.upload_gcode(filename, gcode.as_bytes().to_vec(), cli.print))?;
+            tracing::info!("Upload successful!");
+
+            if cli.monitor {
+                tracing::info!("Monitoring print job...");
+                let session =
+                    manifold_printer::PrinterSessionHandle::spawn(client.config().clone());
+                let pb = indicatif::ProgressBar::new(100);
+                pb.set_style(
+                    indicatif::ProgressStyle::default_bar()
+                        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}% ({eta}) {msg}")?
+                        .progress_chars("#>-"),
+                );
+
+                rt.block_on(async {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let t = session.latest_telemetry();
+                        let pct = (t.progress_fraction * 100.0) as u64;
+                        pb.set_position(pct);
+
+                        let temp_str = match (&t.hotend, &t.bed) {
+                            (Some(h), Some(b)) => format!(
+                                "E:{:.0}/{:.0}°C B:{:.0}/{:.0}°C",
+                                h.current, h.target, b.current, b.target
+                            ),
+                            _ => String::new(),
+                        };
+                        pb.set_message(format!("{:?} {}", t.print_state, temp_str));
+
+                        if matches!(
+                            t.print_state,
+                            manifold_printer::PrintState::Complete
+                                | manifold_printer::PrintState::Error
+                        ) {
+                            pb.finish_with_message(format!("Finished: {:?}", t.print_state));
+                            break;
+                        }
+                    }
+                });
+            }
+        } else {
+            bail!("--upload or --print was passed, but no --printer-url was provided");
+        }
+    }
 
     Ok(())
 }
@@ -488,5 +572,24 @@ mod tests {
         assert_eq!(next_object_id, 6);
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_cli_printer_args() {
+        use clap::Parser;
+        let args = vec![
+            "manifold",
+            "model.stl",
+            "--printer-url",
+            "http://192.168.1.50:7125",
+            "--upload",
+            "--print",
+            "--monitor",
+        ];
+        let cli = Cli::parse_from(args);
+        assert_eq!(cli.printer_url.as_deref(), Some("http://192.168.1.50:7125"));
+        assert!(cli.upload);
+        assert!(cli.print);
+        assert!(cli.monitor);
     }
 }

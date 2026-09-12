@@ -12,9 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 manifold-core.workspace = true
+manifold-printer = { path = "../manifold-printer" }
 anyhow.workspace = true
 clap.workspace = true
 glam.workspace = true
+indicatif = "0.17"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
