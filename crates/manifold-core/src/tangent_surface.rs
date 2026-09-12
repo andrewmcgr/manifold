@@ -297,6 +297,7 @@ pub fn plan_tangent_surfaces(
                             points: pts,
                             segments,
                             tool,
+                            object: layers[k].object,
                         });
                     }
 

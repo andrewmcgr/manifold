@@ -2,7 +2,12 @@
 
 use crate::infill::{self, InfillRegion};
 use crate::{
-    bounds::BoundingVolume, extrusion, ids::ToolId, object::Object, slicing::Layer, tool::Tool,
+    bounds::BoundingVolume,
+    extrusion,
+    ids::{ObjectId, ToolId},
+    object::Object,
+    slicing::Layer,
+    tool::Tool,
     Error, Result, SlicerConfig,
 };
 use glam::DVec3;
@@ -190,6 +195,7 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64, min_travel_for_hop: f64)
         points,
         segments,
         tool,
+        object,
     } = path;
     let point_count = points.len();
     // Fewer than 2 points means no edges at all -- nothing to hop around.
@@ -199,6 +205,7 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64, min_travel_for_hop: f64)
             points,
             segments,
             tool,
+            object,
         };
     }
 
@@ -211,6 +218,7 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64, min_travel_for_hop: f64)
             points,
             segments,
             tool,
+            object,
         };
     }
 
@@ -325,6 +333,7 @@ fn insert_z_hops_into_path(path: Path, hop_height: f64, min_travel_for_hop: f64)
         points: new_points,
         segments: new_segments,
         tool,
+        object,
     }
 }
 
@@ -705,6 +714,7 @@ fn subdivide_long_traverses(
                 points: new_points,
                 segments: new_segments,
                 tool: path.tool,
+                object: path.object,
             }
         })
         .collect()
@@ -1721,6 +1731,7 @@ fn route_travel_moves(
         a: DVec3,
         b: DVec3,
         tool: crate::ids::ToolId,
+        object: ObjectId,
         order: f64,
         a_dir: Option<DVec3>,
         b_dir: Option<DVec3>,
@@ -1746,12 +1757,14 @@ fn route_travel_moves(
                 None
             };
             let tool = paths[i].tool;
+            let object = paths[i].object;
             let order = paths[i].segments.first().map(|s| s.order).unwrap_or(0.0);
             Some(TravelPair {
                 idx: i,
                 a,
                 b,
                 tool,
+                object,
                 order,
                 a_dir,
                 b_dir,
@@ -1772,6 +1785,7 @@ fn route_travel_moves(
                  a,
                  b,
                  tool,
+                 object,
                  order,
                  a_dir,
                  b_dir,
@@ -1831,6 +1845,7 @@ fn route_travel_moves(
                         points: waypoints,
                         segments,
                         tool,
+                        object,
                     },
                 ))
             },
@@ -2016,6 +2031,7 @@ fn simplify_path(path: Path, tolerance: f64) -> Path {
         points,
         segments,
         tool,
+        object,
     } = path;
     let point_count = points.len();
     if point_count < 3 || tolerance <= 0.0 {
@@ -2023,12 +2039,13 @@ fn simplify_path(path: Path, tolerance: f64) -> Path {
             points,
             segments,
             tool,
+            object,
         };
     }
     if segments.len() == point_count {
-        simplify_closed_path(points, segments, tolerance, tool)
+        simplify_closed_path(points, segments, tolerance, tool, object)
     } else {
-        simplify_open_path(points, segments, tolerance, tool)
+        simplify_open_path(points, segments, tolerance, tool, object)
     }
 }
 
@@ -2040,6 +2057,7 @@ fn simplify_open_path(
     segments: Vec<Segment>,
     tolerance: f64,
     tool: ToolId,
+    object: ObjectId,
 ) -> Path {
     let point_count = points.len();
     let chain: Vec<usize> = (0..point_count).collect();
@@ -2061,6 +2079,7 @@ fn simplify_open_path(
         points: new_points,
         segments: new_segments,
         tool,
+        object,
     }
 }
 
@@ -2075,6 +2094,7 @@ fn simplify_closed_path(
     segments: Vec<Segment>,
     tolerance: f64,
     tool: ToolId,
+    object: ObjectId,
 ) -> Path {
     let point_count = points.len();
     let (a, b) = farthest_pair(&points);
@@ -2085,6 +2105,7 @@ fn simplify_closed_path(
             points,
             segments,
             tool,
+            object,
         };
     }
 
@@ -2120,6 +2141,7 @@ fn simplify_closed_path(
         points: new_points,
         segments: new_segments,
         tool,
+        object,
     }
 }
 
@@ -2357,6 +2379,10 @@ pub struct Path {
     /// insert tool-change Gcode between paths assigned to different
     /// tools.
     pub tool: ToolId,
+    /// The source object this path was planned from — looked up from the
+    /// layer's `object` field. Lets [`crate::gcode::emit`] emit
+    /// `EXCLUDE_OBJECT_START`/`_END` markers around each object's paths.
+    pub object: ObjectId,
 }
 
 /// Plan toolpaths for a set of layers, tagging each planned path with the
@@ -2584,6 +2610,7 @@ pub fn plan_with_progress(
                             points: wall_loop.points.clone(),
                             segments,
                             tool: object.tool,
+                            object: object.id,
                         });
                     }
                     continue;
@@ -2610,6 +2637,7 @@ pub fn plan_with_progress(
                     basis2,
                     origin,
                     tool: object.tool,
+                    object: object.id,
                 };
                 let (gap_line_widths, gap_paths) =
                     crate::gap_fill::plan_gap_fill_for_wall(wall_loop, layer, &gap_ctx);
@@ -2693,6 +2721,7 @@ pub fn plan_with_progress(
                     points: wall_loop.points.clone(),
                     segments,
                     tool: object.tool,
+                    object: object.id,
                 });
                 paths.extend(gap_paths);
             }
@@ -3536,6 +3565,7 @@ mod tests {
             points,
             segments,
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         }
     }
 
@@ -4378,6 +4408,7 @@ mod tests {
             points: vec![p0, p1, p2, p3],
             segments: vec![wall_segment, travel_segment, wall_segment, wall_segment],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {
@@ -4472,6 +4503,7 @@ mod tests {
             points: vec![p0, p1, p2, p3],
             segments: vec![infill_segment, travel_segment, infill_segment],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {
@@ -4532,6 +4564,7 @@ mod tests {
             points: vec![p0, p1, p2],
             segments: vec![travel_segment, infill_segment],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {
@@ -4589,6 +4622,7 @@ mod tests {
             points: vec![p0, p1, p2],
             segments: vec![travel_segment, infill_segment],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {
@@ -4663,6 +4697,7 @@ mod tests {
             points: vec![p0, p1, p2],
             segments: vec![wall_segment, travel_segment, wall_segment],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {
@@ -4719,6 +4754,7 @@ mod tests {
             points: vec![p0, p1, p2],
             segments: vec![wall_segment, travel_segment, wall_segment],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         // When z_hop_enabled is true, but height is 0.0, it must be a no-op identical to disabled.
@@ -4783,6 +4819,7 @@ mod tests {
             points,
             segments,
             tool: ToolId::default(),
+            object: crate::ids::ObjectId::default(),
         }
     }
 
@@ -4807,6 +4844,7 @@ mod tests {
             points,
             segments,
             tool: ToolId::default(),
+            object: crate::ids::ObjectId::default(),
         }
     }
 
@@ -5374,6 +5412,7 @@ mod tests {
             points: vec![p0, p1, p2, p3],
             segments: vec![short_travel, wall_seg, long_travel],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {
@@ -5951,6 +5990,7 @@ mod tests {
         ];
         let paths = vec![Path {
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
             points: orig_points.clone(),
             segments: vec![
                 Segment {
@@ -6219,6 +6259,7 @@ mod tests {
                 island: 0,
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let subdivided = subdivide_long_traverses(vec![path], &field, 0.2);
@@ -6351,6 +6392,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         pin_outer_wall_centerline(&mut path, &layer, &config);

@@ -47,6 +47,25 @@ impl Object {
             .clone()
             .unwrap_or_else(|| format!("Object {}", self.id.0))
     }
+
+    /// Convex XY footprint polygon of this object in world (bed) space,
+    /// derived by projecting a simplified 3D convex hull of its
+    /// world-transformed mesh vertices onto the bed plane. Returns `None`
+    /// for meshes with fewer than 4 vertices (no valid hull).
+    pub fn footprint_polygon(&self) -> Option<Vec<glam::DVec2>> {
+        let world_points: Vec<DVec3> = self
+            .mesh
+            .vertices
+            .iter()
+            .map(|&p| self.transform.transform_point(p))
+            .collect();
+        let hull = crate::convex_hull::compute_simplified_convex_hull(
+            &world_points,
+            crate::convex_hull::DEFAULT_MAX_FACETS,
+            crate::convex_hull::DEFAULT_VOLUME_THRESHOLD_RATIO,
+        )?;
+        Some(crate::convex_hull::project_hull_to_xy(&hull))
+    }
 }
 
 /// Re-center a freshly-loaded group of objects on a machine's bed: the

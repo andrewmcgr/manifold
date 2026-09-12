@@ -4,7 +4,7 @@
 //! Designed for model reorientation ("Lay on Face") and build-plate grounding
 //! ("Drop to Bed").
 
-use glam::DVec3;
+use glam::{DVec2, DVec3};
 
 /// A single flat facet of a simplified convex hull.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +76,69 @@ pub fn compute_simplified_convex_hull(
 
     let polytope = build_polytope_from_planes(&selected_planes);
     Some(polytope_to_simplified_hull(&polytope, &selected_planes))
+}
+
+/// Projects a simplified 3D convex hull onto the XY plane (dropping Z) and
+/// returns its convex footprint polygon (CCW, no duplicated closing point).
+///
+/// Useful for bed-footprint previews and G-code `EXCLUDE_OBJECT` boundaries,
+/// where an exact convex outline is sufficient and cheaper than a full mesh
+/// silhouette.
+pub fn project_hull_to_xy(hull: &SimplifiedHull) -> Vec<DVec2> {
+    let mut points: Vec<DVec2> = Vec::new();
+    for facet in &hull.facets {
+        for &v in &facet.boundary {
+            let p = DVec2::new(v.x, v.y);
+            if !points.iter().any(|&q| (q - p).length_squared() < 1e-8) {
+                points.push(p);
+            }
+        }
+    }
+    convex_hull_2d(&points)
+}
+
+/// Computes the 2D convex hull of `points` via Andrew's monotone chain.
+/// Returns a CCW polygon with no duplicated closing point.
+fn convex_hull_2d(points: &[DVec2]) -> Vec<DVec2> {
+    let mut pts = points.to_vec();
+    pts.sort_by(|a, b| {
+        a.x.partial_cmp(&b.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    pts.dedup_by(|a, b| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9);
+
+    if pts.len() < 3 {
+        return pts;
+    }
+
+    fn cross(o: DVec2, a: DVec2, b: DVec2) -> f64 {
+        (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+    }
+
+    let n = pts.len();
+    let mut hull: Vec<DVec2> = Vec::with_capacity(2 * n);
+
+    // Lower hull
+    for &p in &pts {
+        while hull.len() >= 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+
+    // Upper hull
+    let lower_len = hull.len() + 1;
+    for &p in pts.iter().rev() {
+        while hull.len() >= lower_len && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0
+        {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+
+    hull.pop(); // last point == first point
+    hull
 }
 
 /// A candidate supporting plane touching the model at >= 3 points.

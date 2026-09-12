@@ -6,6 +6,17 @@ use crate::{
 };
 use glam::DVec3;
 
+/// Sanitizes an object's display name into a Klipper `EXCLUDE_OBJECT` NAME
+/// token: replaces whitespace with underscores since `NAME=` values are
+/// parsed as a single unquoted parameter word.
+fn object_gcode_name(object: &crate::object::Object) -> String {
+    object
+        .display_name()
+        .chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect()
+}
+
 fn format_temp(temp: f64) -> String {
     if (temp - temp.round()).abs() < 1e-4 {
         format!("{:.0}", temp.round())
@@ -217,13 +228,14 @@ fn first_layer_xy_bounds(paths: &[Path]) -> Option<(f64, f64, f64, f64)> {
 /// for now; no explicit distance/speed parameters are emitted -- follow-up
 /// work if per-tool/per-config retract tuning is needed.
 pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
-    emit_with_machine(paths, config, None)
+    emit_with_machine(paths, config, None, None)
 }
 
 pub fn emit_with_machine(
     paths: &[Path],
     config: &SlicerConfig,
     machine: Option<&crate::machine::Machine>,
+    objects: Option<&[crate::object::Object]>,
 ) -> String {
     let mut out = String::new();
     let bounds = first_layer_xy_bounds(paths).unwrap_or((0.0, 0.0, 0.0, 0.0));
@@ -277,6 +289,34 @@ pub fn emit_with_machine(
     // so M83 must be the last word on extrusion mode before the first extruding move.
     out.push_str("M83\n");
 
+    // Klipper `exclude_object` integration: declare every object's name,
+    // center, and convex XY footprint polygon up front (`EXCLUDE_OBJECT_DEFINE`)
+    // so the printer/UI can offer per-object cancellation before printing
+    // starts. Silently skipped for any object whose mesh can't produce a
+    // valid convex hull (fewer than 4 vertices) -- it just won't be
+    // individually excludable.
+    if let Some(objects) = objects {
+        for object in objects {
+            if let Some(footprint) = object.footprint_polygon() {
+                if footprint.len() < 3 {
+                    continue;
+                }
+                let name = object_gcode_name(object);
+                let centroid = footprint.iter().fold(glam::DVec2::ZERO, |acc, p| acc + *p)
+                    / footprint.len() as f64;
+                let polygon = footprint
+                    .iter()
+                    .map(|p| format!("[{:.3},{:.3}]", p.x, p.y))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                out.push_str(&format!(
+                    "EXCLUDE_OBJECT_DEFINE NAME={name} CENTER={:.3},{:.3} POLYGON=[{polygon}]\n",
+                    centroid.x, centroid.y
+                ));
+            }
+        }
+    }
+
     if config.enable_slicer_pressure_advance {
         out.push_str("SET_PRESSURE_ADVANCE ADVANCE=0\n");
     } else if let Some(pa) = config.pressure_advance {
@@ -307,6 +347,7 @@ pub fn emit_with_machine(
     }
 
     let mut current_tool = None;
+    let mut current_object: Option<crate::ids::ObjectId> = None;
     let mut current_f: Option<f64> = None;
     let mut current_accel: Option<f64> = None;
     let mut current_pa: Option<f64> = None;
@@ -349,6 +390,25 @@ pub fn emit_with_machine(
             let layer_idx = (seen_orders.len() - 1) as u32;
             if !fan_is_on && layer_idx >= fan_delay {
                 fan_is_on = true;
+            }
+        }
+        if let Some(objects) = objects {
+            if current_object != Some(path.object) {
+                if let Some(prev_id) = current_object {
+                    if let Some(prev_obj) = objects.iter().find(|o| o.id == prev_id) {
+                        out.push_str(&format!(
+                            "EXCLUDE_OBJECT_END NAME={}\n",
+                            object_gcode_name(prev_obj)
+                        ));
+                    }
+                }
+                if let Some(next_obj) = objects.iter().find(|o| o.id == path.object) {
+                    out.push_str(&format!(
+                        "EXCLUDE_OBJECT_START NAME={}\n",
+                        object_gcode_name(next_obj)
+                    ));
+                }
+                current_object = Some(path.object);
             }
         }
         if current_tool != Some(path.tool) {
@@ -646,6 +706,17 @@ pub fn emit_with_machine(
         }
     }
 
+    if let Some(objects) = objects {
+        if let Some(prev_id) = current_object {
+            if let Some(prev_obj) = objects.iter().find(|o| o.id == prev_id) {
+                out.push_str(&format!(
+                    "EXCLUDE_OBJECT_END NAME={}\n",
+                    object_gcode_name(prev_obj)
+                ));
+            }
+        }
+    }
+
     if !retracted {
         if config.use_firmware_retraction {
             out.push_str("G10\n");
@@ -791,16 +862,19 @@ mod tests {
                 points: Vec::new(),
                 segments: Vec::new(),
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
             Path {
                 points: Vec::new(),
                 segments: Vec::new(),
                 tool: ToolId(1),
+                object: crate::ids::ObjectId::default(),
             },
             Path {
                 points: Vec::new(),
                 segments: Vec::new(),
                 tool: ToolId(1),
+                object: crate::ids::ObjectId::default(),
             },
         ];
 
@@ -849,6 +923,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         }];
 
         let out = emit(&paths, &config_without_print_gcode());
@@ -888,6 +963,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         }];
 
         let config = SlicerConfig {
@@ -943,6 +1019,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         }];
 
         // Started retracted (fresh tool), so the *first* extruding move
@@ -1020,6 +1097,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         }];
 
         let out = emit(&paths, &config_without_print_gcode());
@@ -1051,6 +1129,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
             Path {
                 points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
@@ -1059,6 +1138,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(1),
+                object: crate::ids::ObjectId::default(),
             },
         ];
 
@@ -1105,6 +1185,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         }];
 
         let out = emit(&paths, &config_without_print_gcode());
@@ -1138,6 +1219,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
             Path {
                 points: vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0)],
@@ -1147,6 +1229,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(1),
+                object: crate::ids::ObjectId::default(),
             },
         ];
 
@@ -1173,6 +1256,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         }];
 
         let out = emit(&paths, &config_without_print_gcode());
@@ -1196,6 +1280,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
             Path {
                 points: vec![DVec3::new(1.0, 0.0, 0.0), DVec3::new(2.0, 0.0, 0.0)],
@@ -1205,6 +1290,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
         ];
 
@@ -1359,6 +1445,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
             Path {
                 points: vec![DVec3::new(-5.0, -5.0, 0.25), DVec3::new(20.0, 20.0, 0.25)],
@@ -1368,6 +1455,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
         ];
         let config = SlicerConfig {
@@ -1423,6 +1511,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         }];
 
         let out = emit(&paths, &config_without_print_gcode());
@@ -1472,6 +1561,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
             Path {
                 points: vec![DVec3::new(11.0, 0.0, 0.0), DVec3::new(20.0, 0.0, 0.0)],
@@ -1481,6 +1571,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
         ];
 
@@ -1512,6 +1603,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
             Path {
                 points: vec![DVec3::new(18.5, 0.0, 0.0), DVec3::new(30.0, 0.0, 0.0)],
@@ -1521,6 +1613,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
         ];
 
@@ -1546,6 +1639,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
             Path {
                 points: vec![DVec3::new(20.0, 0.0, 0.0), DVec3::new(30.0, 0.0, 0.0)],
@@ -1555,6 +1649,7 @@ mod tests {
                     ..Segment::default()
                 }],
                 tool: ToolId(0),
+                object: crate::ids::ObjectId::default(),
             },
         ];
 
@@ -1584,6 +1679,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
         let path1 = Path {
             points: vec![DVec3::new(0.0, 0.0, 0.4), DVec3::new(10.0, 0.0, 0.4)],
@@ -1593,6 +1689,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {
@@ -1636,6 +1733,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {
@@ -1668,6 +1766,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
         let path2 = Path {
             points: vec![DVec3::new(50.0, 50.0, 0.0), DVec3::new(60.0, 50.0, 0.0)],
@@ -1678,6 +1777,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {
@@ -1725,6 +1825,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = config_without_print_gcode();
@@ -1766,6 +1867,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {
@@ -1823,6 +1925,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {
@@ -1855,6 +1958,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let path2 = Path {
@@ -1867,6 +1971,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig {

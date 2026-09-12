@@ -182,6 +182,7 @@ pub fn subdivide_path_for_pressure_advance(
         points: new_points,
         segments: new_segments,
         tool: path.tool,
+        object: path.object,
     }
 }
 
@@ -279,6 +280,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         // A move that is purely cruising (accel_distance = 0, decel_distance = 0)
@@ -314,6 +316,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         // Starts from 0 speed and accelerates across the first 25mm to 100mm/s (6000 mm/min)
@@ -361,6 +364,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         // Decelerates from 100mm/s to 0 across the last 20mm
@@ -405,6 +409,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let profiles = vec![PlannedMotionProfile {
@@ -438,6 +443,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         // A move that starts at 0, accelerates to cruise, then decelerates back to 0

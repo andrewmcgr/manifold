@@ -11,7 +11,7 @@
 //! the innermost wall and the infill boundary), halving the required bead width to
 //! $\Delta s / 2 \in [w_{\min}, w_{\max}]$ and achieving 100% solid shell fill.
 
-use crate::ids::ToolId;
+use crate::ids::{ObjectId, ToolId};
 use crate::slicing::{Layer, WallLoop};
 use crate::toolpath::{speed_for_kind, MoveKind, Path, Segment};
 use crate::SlicerConfig;
@@ -34,6 +34,7 @@ pub struct GapFillContext<'a> {
     pub basis2: DVec3,
     pub origin: DVec3,
     pub tool: ToolId,
+    pub object: ObjectId,
 }
 
 /// Evaluates the 3D centerline gap-fill point between a wall loop vertex `p` and its neighbor.
@@ -339,6 +340,7 @@ pub fn plan_gap_fill_for_wall(
                 points: pts,
                 segments,
                 tool: ctx.tool,
+                object: ctx.object,
             });
         }
     }

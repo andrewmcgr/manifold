@@ -494,6 +494,7 @@ fn assemble_scanlines_into_paths(
                             points,
                             segments,
                             tool: crate::ids::ToolId::default(),
+                            object: crate::ids::ObjectId::default(),
                         });
                         points = Vec::new();
                         segments = Vec::new();
@@ -516,6 +517,7 @@ fn assemble_scanlines_into_paths(
                 points,
                 segments,
                 tool: crate::ids::ToolId::default(),
+                object: crate::ids::ObjectId::default(),
             });
         }
     }
@@ -839,6 +841,7 @@ fn generate_tpms_infill(
             points,
             segments,
             tool: crate::ids::ToolId::default(),
+            object: crate::ids::ObjectId::default(),
         });
     }
 
@@ -1070,6 +1073,7 @@ impl InfillGenerator for ConcentricInfill {
                     points,
                     segments,
                     tool: crate::ids::ToolId::default(),
+                    object: crate::ids::ObjectId::default(),
                 }
             })
             .collect()
@@ -1175,6 +1179,7 @@ impl InfillGenerator for AllWallsInfill {
                     points,
                     segments,
                     tool: crate::ids::ToolId::default(),
+                    object: crate::ids::ObjectId::default(),
                 }
             })
             .collect()

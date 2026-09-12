@@ -1275,6 +1275,7 @@ pub fn slice_to_gcode(workspace: &Workspace) -> Result<String> {
         &paths,
         &workspace.config,
         Some(&workspace.machine),
+        Some(&workspace.objects),
     ))
 }
 
@@ -1289,6 +1290,7 @@ pub fn slice_to_gcode_with_progress(
         &paths,
         &workspace.config,
         Some(&workspace.machine),
+        Some(&workspace.objects),
     ))
 }
 

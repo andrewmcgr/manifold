@@ -385,6 +385,7 @@ mod tests {
                 4
             ],
             tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let config = SlicerConfig::default();

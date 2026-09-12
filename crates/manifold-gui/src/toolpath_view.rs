@@ -764,6 +764,7 @@ mod tests {
             points,
             segments,
             tool: ToolId(0),
+            object: manifold_core::ids::ObjectId::default(),
         }
     }
 
@@ -847,6 +848,7 @@ mod tests {
             points,
             segments,
             tool: manifold_core::ids::ToolId::default(),
+            object: manifold_core::ids::ObjectId::default(),
         };
         let instances = build_lines_default(&[path], f64::INFINITY);
         assert_eq!(instances.len(), 2);
@@ -923,6 +925,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: manifold_core::ids::ObjectId::default(),
         };
         let path_b = Path {
             points: vec![DVec3::new(20.0, 20.0, 0.2), DVec3::new(30.0, 20.0, 0.2)],
@@ -955,6 +958,7 @@ mod tests {
                 },
             ],
             tool: ToolId(0),
+            object: manifold_core::ids::ObjectId::default(),
         };
         let instances = build_lines_default(&[path_a, path_b], f64::INFINITY);
         // path_a: 2 segments (ends at [0,0,0])
@@ -1105,6 +1109,7 @@ mod tests {
             points,
             segments,
             tool: ToolId(0),
+            object: manifold_core::ids::ObjectId::default(),
         };
 
         // Speed view: low speed gets blue (c[2] > c[0]), high speed gets red (c[0] > c[2]), travel gets COLOR_TRAVEL

@@ -550,6 +550,7 @@ mod tests {
                 },
             ],
             tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         // Path 2 begins at (50, 50, 0.2) after a travel move, with a long extrusion
@@ -565,6 +566,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
         };
 
         let mut paths = vec![path1, path2];

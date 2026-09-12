@@ -705,6 +705,7 @@ pub fn plan_wave_overhangs(
                             points: pts,
                             segments,
                             tool,
+                            object: layers[best_layer_idx].object,
                         });
                     }
                 }
@@ -980,6 +981,7 @@ pub fn plan_wave_overhangs(
                         points: pts_3d,
                         segments,
                         tool,
+                        object: layers[k].object,
                     });
                 }
             }

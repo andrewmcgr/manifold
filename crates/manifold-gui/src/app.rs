@@ -68,9 +68,11 @@ pub struct ManifoldApp {
     objects: Vec<Object>,
     /// GPU-uploaded copies of `objects`, rebuilt whenever `objects` changes.
     uploaded_meshes: Arc<Vec<UploadedMesh>>,
-    /// Scene dressing (origin axes, bed grid/quad, toolhead markers),
-    /// rebuilt via `Self::build_scene` whenever `machine`'s bed/tool
-    /// geometry changes in the settings panel (Phase 3/6, see ROADMAP.md).
+    /// Scene dressing (origin axes, bed grid/quad, object footprint
+    /// outlines, toolhead markers), rebuilt via `Self::build_scene` whenever
+    /// `machine`'s bed/tool geometry changes in the settings panel, or
+    /// whenever `objects` changes (via `reupload`, which every object
+    /// add/remove/transform path already calls).
     uploaded_scene: Arc<UploadedScene>,
     camera: OrbitCamera,
     next_object_id: u32,
@@ -205,7 +207,7 @@ impl ManifoldApp {
             ));
 
         let machine = default_machine();
-        let uploaded_scene = Arc::new(Self::build_scene(&wgpu_render_state.device, &machine));
+        let uploaded_scene = Arc::new(Self::build_scene(&wgpu_render_state.device, &machine, &[]));
 
         let mut camera = OrbitCamera::default();
         let (min, max) = machine.build_volume.bounding_box();
@@ -350,14 +352,19 @@ impl ManifoldApp {
         }
     }
 
-    /// Build the scene dressing (origin axes, bed grid/quad, toolhead
-    /// markers) for the given `machine` and upload it to the GPU. Called at
-    /// startup and whenever `machine`'s bed/tool geometry changes in the
-    /// settings panel.
-    fn build_scene(device: &eframe::egui_wgpu::wgpu::Device, machine: &Machine) -> UploadedScene {
+    /// Build the scene dressing (origin axes, bed grid/quad, object
+    /// footprint outlines, toolhead markers) for the given `machine`/
+    /// `objects` and upload it to the GPU. Called at startup and whenever
+    /// `machine`'s bed/tool geometry or `objects` changes.
+    fn build_scene(
+        device: &eframe::egui_wgpu::wgpu::Device,
+        machine: &Machine,
+        objects: &[Object],
+    ) -> UploadedScene {
         let mut lines = scene::build_origin_axes(50.0);
         lines.extend(scene::build_grid(machine, 10.0));
         let mut triangles = scene::build_bed_quad(machine);
+        triangles.extend(scene::build_footprint_outlines(machine, objects));
         triangles.extend(scene::build_toolhead_markers(machine, 8.0));
         UploadedScene::upload(device, &lines, &triangles)
     }
@@ -572,6 +579,7 @@ impl ManifoldApp {
             })
             .collect();
         self.uploaded_meshes = Arc::new(uploaded);
+        self.uploaded_scene = Arc::new(Self::build_scene(device, &self.machine, &self.objects));
     }
 
     /// Rebuilds and re-uploads `uploaded_toolpaths` from `toolpaths`,
@@ -768,6 +776,7 @@ impl ManifoldApp {
                     &paths,
                     &self.config,
                     Some(&self.machine),
+                    Some(&self.objects),
                 );
                 self.toolpath_order_range = toolpath_view::order_range(&paths);
                 // Default the scrub slider to the max order so a fresh
@@ -892,8 +901,11 @@ impl ManifoldApp {
                                         .device
                                         .clone();
                                     self.update_camera_bounds();
-                                    self.uploaded_scene =
-                                        Arc::new(Self::build_scene(&device, &self.machine));
+                                    self.uploaded_scene = Arc::new(Self::build_scene(
+                                        &device,
+                                        &self.machine,
+                                        &self.objects,
+                                    ));
                                 }
                                 Err(error) => {
                                     self.profile_error = Some(error.to_string());
@@ -2263,7 +2275,8 @@ impl ManifoldApp {
                 .expect("wgpu renderer is required")
                 .device
                 .clone();
-            self.uploaded_scene = Arc::new(Self::build_scene(&device, &self.machine));
+            self.uploaded_scene =
+                Arc::new(Self::build_scene(&device, &self.machine, &self.objects));
         }
         ui.collapsing("Tools & Nozzles", |ui| {
             let mut remove_idx = None;

@@ -238,6 +238,7 @@ pub fn plan_bridges(layers: &[Layer], config: &SlicerConfig, tool: ToolId) -> Br
                     points: pts,
                     segments,
                     tool,
+                    object: layers[k].object,
                 });
             }
 

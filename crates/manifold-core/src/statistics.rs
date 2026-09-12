@@ -171,6 +171,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
         }];
 
         let config = SlicerConfig {
@@ -218,6 +219,7 @@ mod tests {
                 ..Segment::default()
             }],
             tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
         }];
         let config = SlicerConfig::default();
 

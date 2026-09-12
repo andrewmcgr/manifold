@@ -5,6 +5,7 @@
 
 use glam::DVec3;
 use manifold_core::machine::Machine;
+use manifold_core::object::Object;
 
 /// One vertex for the unlit scene-dressing shader: position + RGBA color.
 #[repr(C)]
@@ -48,6 +49,10 @@ const AXIS_BLUE: [f32; 4] = [0.15, 0.35, 0.9, 1.0];
 const GRID_COLOR: [f32; 4] = [0.55, 0.55, 0.55, 1.0];
 const BED_COLOR: [f32; 4] = [0.3, 0.3, 0.32, 0.35];
 const TOOLHEAD_COLOR: [f32; 4] = [0.95, 0.55, 0.1, 1.0];
+/// Translucent grey used for object footprint outlines on the bed — kept
+/// low-alpha so the line doesn't visually compete with the toolpath/mesh
+/// preview when viewed from below the bed.
+const FOOTPRINT_COLOR: [f32; 4] = [0.6, 0.6, 0.6, 0.4];
 
 /// A fixed-size RGB axis triad at the world origin (X=red, Y=green,
 /// Z=blue), as a line-instance buffer.
@@ -107,6 +112,53 @@ pub fn build_bed_quad(machine: &Machine) -> Vec<SceneVertex> {
     .into_iter()
     .map(|p| SceneVertex::new(p, BED_COLOR))
     .collect()
+}
+
+/// A 1mm-thick closed outline (drawn as a quad ring, since line-instance
+/// segments have no configurable width) tracing each object's convex XY
+/// footprint at the bed's Z, as a triangle-list vertex buffer. Objects whose
+/// mesh has fewer than 4 vertices (no valid hull) are silently skipped.
+pub fn build_footprint_outlines(machine: &Machine, objects: &[Object]) -> Vec<SceneVertex> {
+    const LINE_WIDTH: f64 = 1.0;
+    let (bed_min, _) = machine.build_volume.bounding_box();
+    let z = bed_min.z;
+
+    let mut vertices = Vec::new();
+    for object in objects {
+        let Some(polygon) = object.footprint_polygon() else {
+            continue;
+        };
+        let n = polygon.len();
+        if n < 3 {
+            continue;
+        }
+        for i in 0..n {
+            let a = polygon[i];
+            let b = polygon[(i + 1) % n];
+            let edge = b - a;
+            let len = edge.length();
+            if len < 1e-9 {
+                continue;
+            }
+            // Outward normal (polygon is CCW from the XY hull projection, so
+            // rotating the edge direction -90 degrees points outward).
+            let normal = glam::DVec2::new(edge.y, -edge.x) / len * (LINE_WIDTH * 0.5);
+
+            let a_out = DVec3::new(a.x + normal.x, a.y + normal.y, z);
+            let a_in = DVec3::new(a.x - normal.x, a.y - normal.y, z);
+            let b_out = DVec3::new(b.x + normal.x, b.y + normal.y, z);
+            let b_in = DVec3::new(b.x - normal.x, b.y - normal.y, z);
+
+            vertices.push(SceneVertex::new(a_out, FOOTPRINT_COLOR));
+            vertices.push(SceneVertex::new(b_out, FOOTPRINT_COLOR));
+            vertices.push(SceneVertex::new(b_in, FOOTPRINT_COLOR));
+
+            vertices.push(SceneVertex::new(a_out, FOOTPRINT_COLOR));
+            vertices.push(SceneVertex::new(b_in, FOOTPRINT_COLOR));
+            vertices.push(SceneVertex::new(a_in, FOOTPRINT_COLOR));
+        }
+    }
+    vertices
 }
 
 /// A small pyramid marker at each of the machine's tools' mount
