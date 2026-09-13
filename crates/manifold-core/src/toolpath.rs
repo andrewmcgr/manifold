@@ -5,6 +5,7 @@ use crate::{
     bounds::BoundingVolume,
     extrusion,
     ids::{ObjectId, ToolId},
+    machine::Machine,
     object::Object,
     slicing::Layer,
     tool::Tool,
@@ -2292,6 +2293,72 @@ pub fn calculate_end_of_print_wipe_distance(
     l_calc.clamp(l_min, l_max)
 }
 
+pub fn calculate_end_of_print_clearance(
+    final_pt: DVec3,
+    reverse_dir: DVec3,
+    mesh_sdf: Option<&MeshSdf>,
+    order_field: Option<&dyn OrderField>,
+    machine: &Machine,
+    config: &SlicerConfig,
+) -> (DVec3, DVec3) {
+    let nozzle_dia = config.nozzle_diameter;
+    let (b_min, b_max) = match &machine.build_volume {
+        BoundingVolume::Aabb { min, max } => (*min, *max),
+        BoundingVolume::Sphere { .. } => machine.build_volume.bounding_box(),
+    };
+    let margin = 0.5;
+    let safe_min = b_min + DVec3::splat(margin);
+    let safe_max = b_max - DVec3::splat(margin);
+
+    // Compute outward shear direction from CAD normal + isosurface normal
+    let (cad_normal, iso_normal) = if let Some(sdf) = mesh_sdf {
+        let sample = sdf.sample(final_pt);
+        let cad_n = sample.gradient.try_normalize();
+        let iso_n = order_field
+            .and_then(|f| crate::order_field::numeric_gradient(f, final_pt))
+            .and_then(|g| g.try_normalize())
+            .map(|n| if n.z < 0.0 { -n } else { n })
+            .unwrap_or(DVec3::Z);
+        (cad_n, iso_n)
+    } else {
+        (None, DVec3::Z)
+    };
+
+    let exit_dir = if let Some(cad_n) = cad_normal {
+        let blended = cad_n * 1.5 + iso_normal * 0.5;
+        blended.try_normalize().unwrap_or(cad_n)
+    } else {
+        let rev_xy = DVec3::new(reverse_dir.x, reverse_dir.y, 0.0);
+        rev_xy.try_normalize().unwrap_or(DVec3::X)
+    };
+
+    // 1. Shear step (1.5 * nozzle_diameter)
+    let shear_dist = 1.5 * nozzle_dia;
+    let mut shear_pt = final_pt + exit_dir * shear_dist;
+    shear_pt = shear_pt.clamp(safe_min, safe_max);
+
+    // 2. Clearance move: half of arrangement clearance
+    let clear_dist = (0.5f64 * machine.arrangement_clearance()).max(1.0);
+    let mut clear_xy = glam::DVec2::new(exit_dir.x, exit_dir.y);
+    if clear_xy.length_squared() < 1e-4 {
+        clear_xy = glam::DVec2::X;
+    } else {
+        clear_xy = clear_xy.normalize();
+    }
+
+    let z_lift = config.end_of_print_clearance_z_lift();
+    let target_z = (shear_pt.z + z_lift).min(safe_max.z);
+
+    let mut clear_pt = DVec3::new(
+        shear_pt.x + clear_xy.x * clear_dist,
+        shear_pt.y + clear_xy.y * clear_dist,
+        target_z,
+    );
+    clear_pt = clear_pt.clamp(safe_min, safe_max);
+
+    (shear_pt, clear_pt)
+}
+
 /// Chooses the Gcode feedrate (`Segment::speed`, mm/min) for a segment of
 /// the given `kind`, from `config` via its [`crate::kinematics::MotionModel`].
 #[must_use]
@@ -3571,7 +3638,10 @@ fn defer_unsupported_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ids::ObjectId, mesh::Mesh, slicing::WallLoop};
+    use crate::{
+        bounds::BoundingVolume, ids::ObjectId, machine::Machine, mesh::Mesh, slicing::WallLoop,
+        tool::Tool,
+    };
     use manifold_fidget::order::HeightOrderField;
     use std::sync::Arc;
 
@@ -6610,5 +6680,76 @@ mod tests {
 
         let wipe_dist = calculate_end_of_print_wipe_distance(&config, None, 20.0, 0.4, 0.2, 10.0);
         assert_eq!(wipe_dist, 3.5);
+    }
+
+    #[test]
+    fn calculate_end_of_print_clearance_clamps_to_max_z() {
+        let machine = Machine::new(
+            BoundingVolume::Aabb {
+                min: DVec3::ZERO,
+                max: DVec3::new(200.0, 200.0, 100.0), // Z max is 100.0
+            },
+            vec![Tool::new(crate::ids::ToolId(0), 0.4)],
+        );
+        let config = SlicerConfig::default();
+
+        // Final point is already near Z max: Z = 99.5
+        let final_pt = DVec3::new(100.0, 100.0, 99.5);
+        let reverse_dir = -DVec3::X;
+
+        let (_shear, clear) =
+            calculate_end_of_print_clearance(final_pt, reverse_dir, None, None, &machine, &config);
+
+        // Clearance point must not exceed Z max (100.0 - 0.5 safety margin = 99.5)
+        assert!(clear.z <= 99.5);
+        assert!(clear.x >= 0.5 && clear.x <= 199.5);
+        assert!(clear.y >= 0.5 && clear.y <= 199.5);
+    }
+
+    #[test]
+    fn calculate_end_of_print_clearance_uses_arrangement_clearance() {
+        let mut machine = Machine::new(
+            BoundingVolume::Aabb {
+                min: DVec3::ZERO,
+                max: DVec3::new(200.0, 200.0, 200.0),
+            },
+            vec![Tool::new(crate::ids::ToolId(0), 0.4)],
+        );
+        machine.arrangement_clearance = Some(14.0); // Half is 7.0mm
+        let config = SlicerConfig::default();
+
+        let final_pt = DVec3::new(100.0, 100.0, 50.0);
+        let reverse_dir = DVec3::X; // moving in -X, so reverse is +X
+
+        let (shear, clear) =
+            calculate_end_of_print_clearance(final_pt, reverse_dir, None, None, &machine, &config);
+
+        // Clearance distance from shear point in XY should be 7.0mm
+        let xy_dist = glam::DVec2::new(clear.x - shear.x, clear.y - shear.y).length();
+        assert!((xy_dist - 7.0).abs() < 1e-3);
+        // Z lift of 2.0mm applied
+        assert!((clear.z - (shear.z + 2.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn calculate_end_of_print_clearance_clamps_to_max_xy_boundaries() {
+        let machine = Machine::new(
+            BoundingVolume::Aabb {
+                min: DVec3::ZERO,
+                max: DVec3::new(100.0, 100.0, 100.0),
+            },
+            vec![Tool::new(crate::ids::ToolId(0), 0.4)],
+        );
+        let config = SlicerConfig::default();
+
+        // Final point right at edge of bed: X = 98.0
+        let final_pt = DVec3::new(98.0, 50.0, 10.0);
+        let reverse_dir = DVec3::X; // pointing towards +X (beyond 100.0)
+
+        let (_shear, clear) =
+            calculate_end_of_print_clearance(final_pt, reverse_dir, None, None, &machine, &config);
+
+        assert!(clear.x <= 99.5);
+        assert!(clear.x >= 0.5);
     }
 }
