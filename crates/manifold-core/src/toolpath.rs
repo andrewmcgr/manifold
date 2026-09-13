@@ -2401,6 +2401,16 @@ pub fn append_end_of_print_wipe_and_clearance(
         return Ok(());
     }
 
+    // Truncate any trailing non-extruding segments and points after the last
+    // extruding segment so the path ends cleanly at `p_end`.
+    path.segments.truncate(last_extruding_idx + 1);
+    path.points.truncate(last_extruding_idx + 2);
+    // In the rare edge case where a closed path had points.len() == segments.len()
+    // and last_extruding_idx + 1 wrapped around to index 0, ensure the tail point is explicitly `p_end`.
+    if path.points.last().copied() != Some(p_end) {
+        path.points.push(p_end);
+    }
+
     let reverse_dir = -seg_vec / seg_len;
     let terminal_v = (last_extruding_seg.speed / 60.0).max(1.0);
     let bead_w = if last_extruding_seg.line_width > 0.0 {
@@ -6935,5 +6945,86 @@ mod tests {
         // Final point elevated and cleared
         let final_pt = *last_path.points.last().unwrap();
         assert!(final_pt.z >= 3.0); // 1.0 + 2.0 Z lift
+    }
+
+    #[test]
+    fn append_end_of_print_wipe_truncates_trailing_travel_segments_before_wiping() {
+        let config = SlicerConfig {
+            end_of_print_wipe_enabled: true,
+            nozzle_diameter: 0.4,
+            wall_line_width: 0.4,
+            layer_height: 0.2,
+            ..SlicerConfig::default()
+        };
+
+        let machine = Machine::new(
+            BoundingVolume::Aabb {
+                min: DVec3::ZERO,
+                max: DVec3::new(200.0, 200.0, 200.0),
+            },
+            vec![Tool::new(crate::ids::ToolId(0), 0.4)],
+        );
+
+        // Path with 2 extrusion segments followed by 1 trailing Travel segment (e.g. from seam gap / prior wipe)
+        let path = Path {
+            points: vec![
+                DVec3::new(10.0, 10.0, 1.0),
+                DVec3::new(20.0, 10.0, 1.0),
+                DVec3::new(20.0, 20.0, 1.0), // end of extrusion
+                DVec3::new(25.0, 25.0, 1.0), // trailing travel point
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    order: 1.0,
+                    line_width: 0.4,
+                    extrusion_length: 1.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    order: 1.0,
+                    line_width: 0.4,
+                    extrusion_length: 1.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::Travel,
+                    order: 1.0,
+                    line_width: 0.0,
+                    extrusion_length: 0.0,
+                    ..Segment::default()
+                },
+            ],
+            ..Path::default()
+        };
+
+        let mut paths = vec![path];
+        let objects = vec![];
+
+        append_end_of_print_wipe_and_clearance(&mut paths, &objects, &machine, &config).unwrap();
+
+        let last_path = paths.last().unwrap();
+        // The trailing Travel segment and point (25, 25, 1) must have been truncated so
+        // that the path immediately before wipe ended at (20, 20, 1).
+        // Resulting segments: 2 extruding + 1 wipe + 1 shear + 1 clearance = 5 segments.
+        assert_eq!(last_path.segments.len(), 5);
+        // Resulting points: 3 original extrusion points + 1 wipe + 1 shear + 1 clearance = 6 points.
+        assert_eq!(last_path.points.len(), 6);
+
+        // Point at index 2 must be p_end (20, 20, 1)
+        assert_eq!(last_path.points[2], DVec3::new(20.0, 20.0, 1.0));
+
+        // Wipe move starts from p_end (index 2) and moves to p_wipe (index 3)
+        let wipe_seg = &last_path.segments[2];
+        assert_eq!(wipe_seg.kind, MoveKind::Travel);
+        assert_eq!(wipe_seg.extrusion_length, 0.0);
+        let wipe_pt = last_path.points[3];
+        assert_eq!(wipe_pt.x, 20.0);
+        assert!(wipe_pt.y < 20.0 && wipe_pt.y >= 15.0);
+
+        // Clearance point at the end
+        let final_pt = *last_path.points.last().unwrap();
+        assert!(final_pt.z >= 3.0);
     }
 }
