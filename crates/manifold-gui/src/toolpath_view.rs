@@ -498,7 +498,7 @@ pub fn palette_color(kind: MoveKind, is_scarf: bool) -> [f32; 4] {
             MoveKind::Bridge => COLOR_BRIDGE,
             MoveKind::Overhang => COLOR_OVERHANG,
             MoveKind::TopSurface => COLOR_TOP_SURFACE,
-            MoveKind::Travel => COLOR_TRAVEL,
+            MoveKind::Travel | MoveKind::Wipe => COLOR_TRAVEL,
             MoveKind::DebugExcluded => COLOR_DEBUG_EXCLUDED,
         }
     }
@@ -625,7 +625,7 @@ pub fn build_toolpath_lines_filtered(
                     MoveKind::Bridge => LineTypeKey::Bridge,
                     MoveKind::Overhang => LineTypeKey::Overhang,
                     MoveKind::TopSurface => LineTypeKey::TopSurface,
-                    MoveKind::Travel => LineTypeKey::Travel,
+                    MoveKind::Travel | MoveKind::Wipe => LineTypeKey::Travel,
                     MoveKind::DebugExcluded => LineTypeKey::DebugExcluded,
                 }
             };

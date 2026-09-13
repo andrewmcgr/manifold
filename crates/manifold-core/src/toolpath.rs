@@ -2361,7 +2361,7 @@ pub fn calculate_end_of_print_clearance(
 
 pub fn append_end_of_print_wipe_and_clearance(
     paths: &mut [Path],
-    _objects: &[crate::object::Object],
+    objects: &[crate::object::Object],
     machine: &crate::machine::Machine,
     config: &SlicerConfig,
 ) -> Result<()> {
@@ -2419,20 +2419,91 @@ pub fn append_end_of_print_wipe_and_clearance(
         config.wall_line_width
     };
     let bead_h = config.layer_height;
-    let wipe_dist =
-        calculate_end_of_print_wipe_distance(config, None, terminal_v, bead_w, bead_h, seg_len);
+    let active_obj = objects.iter().find(|o| o.id == path.object);
+    let faces: Vec<[usize; 3]> = active_obj
+        .map(|o| {
+            o.mesh
+                .indices
+                .chunks_exact(3)
+                .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
+                .collect()
+        })
+        .unwrap_or_default();
+    let mesh_sdf = if !faces.is_empty() {
+        active_obj.map(|o| manifold_fidget::mesh_sdf::MeshSdf::new(o.mesh.vertices.clone(), faces))
+    } else {
+        None
+    };
+    let order_field_owned;
+    let order_field: Option<&dyn OrderField> = if let Some(obj) = active_obj {
+        order_field_owned = crate::order_field::order_field_for(
+            config.order_field,
+            config,
+            &obj.mesh,
+            &machine.slope_profile(),
+        );
+        Some(order_field_owned.as_ref())
+    } else {
+        None
+    };
+    let tool_temp = machine
+        .tools
+        .iter()
+        .find(|t| t.id == path.tool)
+        .map(crate::tool::Tool::nozzle_temperature);
+    let fluid_engine = config.fluid_dynamics_engine(tool_temp);
+
+    let wipe_dist = calculate_end_of_print_wipe_distance(
+        config,
+        fluid_engine.as_ref(),
+        terminal_v,
+        bead_w,
+        bead_h,
+        seg_len,
+    );
 
     let p_wipe = p_end + reverse_dir * wipe_dist;
-    let (p_shear, p_clear) =
-        calculate_end_of_print_clearance(p_wipe, reverse_dir, None, None, machine, config);
+    let (p_shear, mut p_clear) = calculate_end_of_print_clearance(
+        p_wipe,
+        reverse_dir,
+        mesh_sdf.as_ref(),
+        order_field,
+        machine,
+        config,
+    );
+
+    if let Some(ref sdf) = mesh_sdf {
+        let max_z = path
+            .points
+            .iter()
+            .map(|pt| pt.z)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let (_b_min, b_max) = match &machine.build_volume {
+            BoundingVolume::Aabb { min, max } => (*min, *max),
+            BoundingVolume::Sphere { .. } => machine.build_volume.bounding_box(),
+        };
+        let safe_max_z = b_max.z - 0.5;
+        if travel_chord_is_blocked(
+            sdf,
+            order_field,
+            last_extruding_seg.order,
+            max_z,
+            p_shear,
+            p_clear,
+            config.nozzle_diameter,
+        ) {
+            let elevated_z = (max_z + config.nozzle_diameter).min(safe_max_z);
+            p_clear.z = p_clear.z.max(elevated_z);
+        }
+    }
 
     let wipe_speed = config.retraction_speed();
     let travel_speed = config.travel_speed;
 
-    // 1. Wipe segment (Travel move back along bead with 0 extrusion)
+    // 1. Wipe segment (MoveKind::Wipe move back along bead with 0 extrusion)
     path.points.push(p_wipe);
     path.segments.push(Segment {
-        kind: MoveKind::Travel,
+        kind: MoveKind::Wipe,
         extrusion_rate: 0.0,
         extrusion_length: 0.0,
         speed: wipe_speed,
@@ -2511,6 +2582,8 @@ pub enum MoveKind {
     /// `plan`'s segment-classification loop.
     TopSurface,
     Travel,
+    /// Unextruded wipe move reversing along the bead at the end of the print.
+    Wipe,
     /// Debug moves preserved for visualization only (not emitted to G-code).
     /// E.g. loops/paths excluded by mesh containment checks or unclosed contour fragments.
     DebugExcluded,
@@ -6928,9 +7001,9 @@ mod tests {
         assert_eq!(last_path.points.len(), 6);
         assert_eq!(last_path.segments.len(), 5);
 
-        // Wipe segment (index 2): travel with 0 extrusion, reversing towards (20.0, 10.0, 1.0)
+        // Wipe segment (index 2): MoveKind::Wipe with 0 extrusion, reversing towards (20.0, 10.0, 1.0)
         let wipe_seg = &last_path.segments[2];
-        assert_eq!(wipe_seg.kind, MoveKind::Travel);
+        assert_eq!(wipe_seg.kind, MoveKind::Wipe);
         assert_eq!(wipe_seg.extrusion_length, 0.0);
         let wipe_pt = last_path.points[3];
         assert_eq!(wipe_pt.x, 20.0);
@@ -7017,7 +7090,7 @@ mod tests {
 
         // Wipe move starts from p_end (index 2) and moves to p_wipe (index 3)
         let wipe_seg = &last_path.segments[2];
-        assert_eq!(wipe_seg.kind, MoveKind::Travel);
+        assert_eq!(wipe_seg.kind, MoveKind::Wipe);
         assert_eq!(wipe_seg.extrusion_length, 0.0);
         let wipe_pt = last_path.points[3];
         assert_eq!(wipe_pt.x, 20.0);

@@ -234,9 +234,9 @@ impl MotionModel for StandardMotionModel {
             MoveKind::Infill => self.infill_speed,
             MoveKind::TopSurface => self.solid_infill_speed,
             MoveKind::Bridge | MoveKind::Overhang | MoveKind::DebugExcluded => self.bridge_speed,
-            MoveKind::Travel => self.travel_speed,
+            MoveKind::Travel | MoveKind::Wipe => self.travel_speed,
         };
-        if is_first_layer && kind != MoveKind::Travel {
+        if is_first_layer && kind != MoveKind::Travel && kind != MoveKind::Wipe {
             nominal.min(self.first_layer_speed)
         } else {
             nominal
@@ -244,7 +244,7 @@ impl MotionModel for StandardMotionModel {
     }
 
     fn available_acceleration(&self, kind: MoveKind, is_first_layer: bool, _v_mm_s: f64) -> f64 {
-        if is_first_layer && kind != MoveKind::Travel {
+        if is_first_layer && kind != MoveKind::Travel && kind != MoveKind::Wipe {
             return self.first_layer_acceleration;
         }
         match kind {
@@ -254,7 +254,7 @@ impl MotionModel for StandardMotionModel {
             MoveKind::Bridge | MoveKind::Overhang | MoveKind::DebugExcluded => {
                 self.outer_wall_acceleration
             }
-            MoveKind::Travel => self.travel_acceleration,
+            MoveKind::Travel | MoveKind::Wipe => self.travel_acceleration,
         }
     }
 

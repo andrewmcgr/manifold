@@ -159,7 +159,7 @@ pub fn line_width_for_kind(kind: MoveKind, config: &SlicerConfig) -> f64 {
         | MoveKind::DebugExcluded => config.wall_line_width,
         MoveKind::Infill | MoveKind::Bridge => config.infill_line_width,
         MoveKind::Overhang => config.wall_line_width.min(config.nozzle_diameter),
-        MoveKind::Travel => 0.0,
+        MoveKind::Travel | MoveKind::Wipe => 0.0,
     }
 }
 

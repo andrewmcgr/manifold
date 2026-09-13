@@ -482,7 +482,9 @@ pub fn emit_with_machine(
                 None
             };
             let extruding = incoming_segment.is_some_and(|segment| {
-                segment.kind != MoveKind::Travel && segment.kind != MoveKind::DebugExcluded
+                segment.kind != MoveKind::Travel
+                    && segment.kind != MoveKind::Wipe
+                    && segment.kind != MoveKind::DebugExcluded
             });
             let move_kind = incoming_segment.map_or(MoveKind::Travel, |s| s.kind);
             let move_speed = incoming_segment.map_or_else(
@@ -539,7 +541,7 @@ pub fn emit_with_machine(
             // 2. If entering an in-path Travel segment, retract before the move if travel distance exceeds threshold.
             // Unretract before resuming an extruding move.
             if !extruding {
-                if !retracted {
+                if !retracted && move_kind != MoveKind::Wipe {
                     // Calculate total upcoming travel distance for this travel run.
                     let mut upcoming_travel_dist = 0.0;
                     if i == 0 {
@@ -573,7 +575,8 @@ pub fn emit_with_machine(
                     }
 
                     let min_retract_travel = config.effective_min_travel_for_retract();
-                    if upcoming_travel_dist > min_retract_travel {
+                    let from_wipe = last_move_kind == Some(MoveKind::Wipe);
+                    if from_wipe || upcoming_travel_dist > min_retract_travel {
                         if config.use_firmware_retraction && !config.use_fluid_dynamics() {
                             out.push_str("G10\n");
                         } else {
@@ -600,32 +603,42 @@ pub fn emit_with_machine(
                 // Move SET_PRESSURE_ADVANCE earlier: emit immediately before the travel move
                 // that gets to the unretract so the firmware can process PA ahead of time
                 // during transit rather than pausing between unretract and extrusion.
-                if let Some(ref engine) = fluid_engine {
-                    let upcoming_start = if i == 0 { 0 } else { i };
-                    let upcoming_extruding = path.segments[upcoming_start..]
-                        .iter()
-                        .enumerate()
-                        .find(|(_, seg)| seg.kind != MoveKind::Travel)
-                        .map(|(offset, seg)| (seg, upcoming_start + offset));
+                // When slicer-side pressure advance is enabled, firmware PA must remain 0.
+                if !config.enable_slicer_pressure_advance {
+                    if let Some(ref engine) = fluid_engine {
+                        let upcoming_start = if i == 0 { 0 } else { i };
+                        let upcoming_extruding = path.segments[upcoming_start..]
+                            .iter()
+                            .enumerate()
+                            .find(|(_, seg)| {
+                                seg.kind != MoveKind::Travel && seg.kind != MoveKind::Wipe
+                            })
+                            .map(|(offset, seg)| (seg, upcoming_start + offset));
 
-                    if let Some((next_seg, next_idx)) = upcoming_extruding {
-                        let dur_s = profiles
-                            .get(next_idx)
-                            .map_or(0.05, |prof| prof.duration_seconds);
-                        let delta_e = next_seg.extrusion_length;
-                        let flow_rate_q = if dur_s > 1e-4 && delta_e > 0.0 {
-                            (delta_e * filament_area) / dur_s
-                        } else {
-                            (next_seg.speed / 60.0) * config.layer_height * config.wall_line_width
-                        };
-                        let target_pa = engine.dynamic_pressure_advance(flow_rate_q, fan_fraction);
-                        let pa_deadband = engine.config().pa_deadband;
-                        let should_emit_pa = current_pa.is_none_or(|active| {
-                            (target_pa - active).abs() / active.max(0.001) >= pa_deadband
-                        });
-                        if should_emit_pa {
-                            out.push_str(&format!("SET_PRESSURE_ADVANCE ADVANCE={target_pa:.4}\n"));
-                            current_pa = Some(target_pa);
+                        if let Some((next_seg, next_idx)) = upcoming_extruding {
+                            let dur_s = profiles
+                                .get(next_idx)
+                                .map_or(0.05, |prof| prof.duration_seconds);
+                            let delta_e = next_seg.extrusion_length;
+                            let flow_rate_q = if dur_s > 1e-4 && delta_e > 0.0 {
+                                (delta_e * filament_area) / dur_s
+                            } else {
+                                (next_seg.speed / 60.0)
+                                    * config.layer_height
+                                    * config.wall_line_width
+                            };
+                            let target_pa =
+                                engine.dynamic_pressure_advance(flow_rate_q, fan_fraction);
+                            let pa_deadband = engine.config().pa_deadband;
+                            let should_emit_pa = current_pa.is_none_or(|active| {
+                                (target_pa - active).abs() / active.max(0.001) >= pa_deadband
+                            });
+                            if should_emit_pa {
+                                out.push_str(&format!(
+                                    "SET_PRESSURE_ADVANCE ADVANCE={target_pa:.4}\n"
+                                ));
+                                current_pa = Some(target_pa);
+                            }
                         }
                     }
                 }
@@ -653,7 +666,8 @@ pub fn emit_with_machine(
             }
 
             // Dynamic pressure advance update for mid-path extruding moves without preceding travel
-            if extruding {
+            // When slicer-side pressure advance is enabled, firmware PA must remain 0.
+            if extruding && !config.enable_slicer_pressure_advance {
                 if let Some(ref engine) = fluid_engine {
                     let duration_s = if i > 0 {
                         profiles
@@ -701,7 +715,11 @@ pub fn emit_with_machine(
                 accumulated_travel_time_s += travel_dur;
             }
 
-            let cmd = if !extruding { "G0" } else { "G1" };
+            let cmd = if !extruding && move_kind != MoveKind::Wipe {
+                "G0"
+            } else {
+                "G1"
+            };
             out.push_str(&format!("{cmd} X{:.3} Y{:.3} Z{:.3}", p.x, p.y, p.z));
             if extruding {
                 let delta_e = incoming_segment.map_or(0.0, |segment| segment.extrusion_length);
@@ -2088,7 +2106,7 @@ mod tests {
                     ..Segment::default()
                 },
                 Segment {
-                    kind: MoveKind::Travel,
+                    kind: MoveKind::Wipe,
                     order: 1.0,
                     line_width: 0.0,
                     extrusion_length: 0.0,
@@ -2114,12 +2132,34 @@ mod tests {
 
         let gcode = emit_with_machine(&[path], &config, Some(&machine), None);
 
-        // Verify wipe move is G0 or G1 with no E parameter
-        assert!(gcode.contains("X18.000 Y10.000 Z1.000"));
-        // Retract G10 must appear before the clearance travel moves and before PRINT_END
+        // Verify wipe move is G1 with no E parameter
+        assert!(
+            gcode.contains("G1 X18.000 Y10.000 Z1.000"),
+            "wipe move must be emitted as G1: {gcode}"
+        );
+        let wipe_pos = gcode
+            .find("G1 X18.000 Y10.000 Z1.000")
+            .expect("G1 wipe move must be present");
+
+        // Retract G10 must appear AFTER wipe and BEFORE the clearance travel moves and before PRINT_END
         let g10_pos = gcode.rfind("G10").expect("G10 retract must be emitted");
+        let clearance_pos = gcode
+            .find("X18.000 Y18.000 Z3.000")
+            .expect("clearance travel move must be present");
         let print_end_pos = gcode.find("PRINT_END").expect("PRINT_END must be present");
-        assert!(g10_pos < print_end_pos);
+
+        assert!(
+            wipe_pos < g10_pos,
+            "wipe must appear before retract (wipe={wipe_pos}, g10={g10_pos})"
+        );
+        assert!(
+            g10_pos < clearance_pos,
+            "retract must appear before clearance travel (g10={g10_pos}, clear={clearance_pos})"
+        );
+        assert!(
+            clearance_pos < print_end_pos,
+            "clearance travel must appear before end_gcode (clear={clearance_pos}, end={print_end_pos})"
+        );
 
         // No duplicate second G10 between clearance and PRINT_END
         let after_clearance = &gcode[g10_pos + 3..print_end_pos];
