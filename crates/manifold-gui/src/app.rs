@@ -1592,6 +1592,25 @@ impl ManifoldApp {
                 }
             }
 
+            ui.checkbox(
+                &mut self.config.end_of_print_wipe_enabled,
+                "End-of-print pressure bleed wipe",
+            );
+            if self.config.end_of_print_wipe_enabled {
+                let mut z_lift = self.config.end_of_print_clearance_z_lift();
+                if drag_num(
+                    ui,
+                    &mut z_lift,
+                    0.1,
+                    0.0..=20.0,
+                    "Clearance Z-lift (mm)",
+                )
+                .changed()
+                {
+                    self.config.end_of_print_clearance_z_lift = Some(z_lift);
+                }
+            }
+
             ui.checkbox(&mut self.config.scarf_joint_enabled, "Scarf joint seams");
             if self.config.scarf_joint_enabled {
                 let mut scarf_len = self.config.scarf_joint_length();
@@ -4198,5 +4217,38 @@ fn load_objects(path: &Path, next_object_id: &mut u32) -> anyhow::Result<Vec<Obj
             other,
             path.display()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_panel_renders_end_of_print_wipe_controls() {
+        let ctx = egui::Context::default();
+        let mut config = manifold_core::SlicerConfig::default();
+        assert!(config.end_of_print_wipe_enabled());
+        assert_eq!(config.end_of_print_clearance_z_lift(), 2.0);
+
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.checkbox(
+                    &mut config.end_of_print_wipe_enabled,
+                    "End-of-print pressure bleed wipe",
+                );
+                if config.end_of_print_wipe_enabled {
+                    let mut z_lift = config.end_of_print_clearance_z_lift();
+                    if drag_num(ui, &mut z_lift, 0.1, 0.0..=20.0, "Clearance Z-lift (mm)").changed()
+                    {
+                        config.end_of_print_clearance_z_lift = Some(z_lift);
+                    }
+                }
+            });
+        });
+
+        let text = format!("{:?}", output.shapes);
+        assert!(text.contains("End-of-print pressure bleed wipe"));
+        assert!(text.contains("Clearance Z-lift (mm)"));
     }
 }
