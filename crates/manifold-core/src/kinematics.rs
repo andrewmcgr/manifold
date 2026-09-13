@@ -574,6 +574,7 @@ pub fn klipper_corner_velocity(
     square_corner_velocity: f64,
     accel: f64,
 ) -> f64 {
+    let _ = accel;
     let cos_theta = dir_in.dot(dir_out).clamp(-1.0, 1.0);
     if cos_theta >= 0.999999 {
         return 10000.0; // Collinear / straight move
@@ -582,29 +583,52 @@ pub fn klipper_corner_velocity(
         return 0.0; // 180° full reversal
     }
 
-    // Klipper square corner velocity formula:
-    // sin(theta/2) = sqrt((1 - cos_theta) / 2)
-    // cos(theta/2) = sqrt((1 + cos_theta) / 2)
-    let sin_half = ((1.0 - cos_theta) * 0.5).max(0.0).sqrt();
-    let cos_half = ((1.0 + cos_theta) * 0.5).max(0.0).sqrt();
+    // Klipper's real junction-deviation formula (`toolhead.py`'s
+    // `Move.calc_junction`) is built on `junction_cos_theta =
+    // -(dir_in . dir_out)` -- the NEGATED dot product, since Klipper
+    // measures theta as the *turn angle* (0 for a straight line, 180°
+    // for a full reversal), not the angle between the two direction
+    // vectors as position vectors (which is the other way around: 0 for
+    // a full reversal, 180° for a straight line). Substituting the
+    // negation through Klipper's own
+    // `sin_theta_d2 = sqrt(max(0, 0.5*(1 - junction_cos_theta)))` /
+    // `cos_theta_d2 = sqrt(max(0, 0.5*(1 + junction_cos_theta)))` gives
+    // the two lines below in terms of the plain (non-negated) dot
+    // product `cos_theta` used here. Getting this sign wrong (as a
+    // prior version of this function did, computing `sin_half`/`cos_half`
+    // directly from `cos_theta` with no negation) inverts the entire
+    // curve: velocity would *increase* with sharper turns and *decrease*
+    // toward a straight line, the opposite of correct physics, and was
+    // capping nearly-collinear (large-radius, finely-subdivided curved
+    // wall) moves to a couple mm/s instead of near-nominal speed.
+    let sin_theta_d2 = ((1.0 + cos_theta) * 0.5).max(0.0).sqrt();
+    let cos_theta_d2 = ((1.0 - cos_theta) * 0.5).max(0.0).sqrt();
+    if cos_theta_d2 <= 1e-9 || sin_theta_d2 >= 1.0 - 1e-9 {
+        return 0.0;
+    }
 
-    let scv_limit = if sin_half > 1e-6 {
-        square_corner_velocity * (cos_half / sin_half)
-    } else {
-        10000.0
-    };
-
-    // Centripetal acceleration limit over 0.04mm junction deviation
-    let junction_deviation = 0.04;
-    let centripetal_limit = if sin_half < 0.999 {
-        ((accel * junction_deviation * sin_half) / (1.0 - sin_half))
-            .max(0.0)
-            .sqrt()
-    } else {
-        0.0
-    };
-
-    scv_limit.min(centripetal_limit).max(0.0)
+    // Klipper computes `junction_deviation = scv^2 * (sqrt(2) - 1) /
+    // accel` once (`_calc_junction_deviation`), then
+    // `move_jd_v2 = R_jd * junction_deviation * accel` where
+    // `R_jd = sin_theta_d2 / (1 - sin_theta_d2)`. `accel` cancels
+    // algebraically (`junction_deviation * accel = scv^2 * (sqrt(2) -
+    // 1)`), leaving corner velocity a pure function of angle and `scv`
+    // -- consistent with "square corner velocity" being defined
+    // independent of acceleration (verified: at exactly 90°, this
+    // reduces to exactly `scv`, matching Klipper's own defining
+    // property and this function's existing unit test).
+    //
+    // Klipper also applies a second, move-length-and-accel-dependent
+    // "centripetal" clamp per adjacent move (`move_centripetal_v2`).
+    // That term is intentionally not replicated here, consistent with
+    // this function's existing single-`accel`, no-move-length
+    // simplification: distance-based reachable-speed limiting is
+    // separately handled by `max_directional_reachable_speed` in the
+    // caller's forward/backward passes.
+    let r_jd = sin_theta_d2 / (1.0 - sin_theta_d2);
+    let move_jd_v2 =
+        r_jd * square_corner_velocity * square_corner_velocity * (2.0_f64.sqrt() - 1.0);
+    move_jd_v2.max(0.0).sqrt()
 }
 
 /// Kinematic motion profile for a single move segment.
@@ -804,29 +828,47 @@ pub fn plan_path_velocities(
     profiles
 }
 
-/// Groups `paths` into runs of spatially-contiguous, same-tool, open paths
-/// (`paths[k]` ends exactly where `paths[k + 1]` begins, with no real travel
-/// move between them) and plans velocities across each run as one continuous
-/// polyline, rather than calling [`plan_path_velocities`] separately per
-/// `Path` object and forcing a phantom stop-to-zero at every one of those
-/// object boundaries. A non-planar slice can produce thousands of `Path`
-/// objects (one per wall loop, one per infill/TPMS/tangent-fill run, one per
-/// island) that are nonetheless directly connected in space -- treating each
-/// as an isolated deceleration-to-zero-then-reacceleration event (as Klipper's
-/// real lookahead planner never does) was inflating `estimated_time_seconds`
-/// far above actual measured print time.
+/// Groups `paths` into runs of same-tool, same-layer paths connected by
+/// either an exact touch or a short ("no retraction would fire") travel
+/// gap, and plans velocities across each run as one continuous polyline,
+/// rather than calling [`plan_path_velocities`] separately per `Path`
+/// object and forcing a phantom stop-to-zero at every one of those object
+/// boundaries. A non-planar slice can produce thousands of `Path` objects
+/// (one per wall loop, one per infill/TPMS/tangent-fill run, one per
+/// island); treating each as an isolated deceleration-to-zero-then-
+/// reacceleration event -- something Klipper's real lookahead planner
+/// never does for a short, non-retracting hop between them -- was
+/// inflating `estimated_time_seconds` far above actual measured print
+/// time, and (since the exact same profiles bake pressure-advance E
+/// values and feed transient/corner flow compensation) was feeding those
+/// compensation systems a fictitious accel/decel cycle that never
+/// actually happens on the real machine.
 ///
-/// Closed loops (`segments.len() == points.len()`, wrapping back to their own
-/// first point) are always planned in isolation: chaining one into a run
-/// would corrupt its wraparound segment, since the wraparound index would no
-/// longer refer to its own start once other paths' points are prepended.
-/// Only paths where `segments.len() + 1 == points.len()` (open polylines --
-/// the common shape for infill scanlines, TPMS fills, tangent-surface fills,
-/// and bridges) are eligible to chain.
+/// `max_bridge_gap_mm` is normally `config.effective_min_travel_for_retract()`:
+/// a gap up to (but not exceeding) that distance will not trigger a real
+/// retraction in `gcode::emit`, so the toolhead's XY motion genuinely can
+/// (and, on real hardware with cross-move lookahead, typically does)
+/// continue through it -- the gap is bridged with a synthetic zero-
+/// extrusion `MoveKind::Travel` connector segment (at the motion model's
+/// travel feedrate) purely for velocity-continuity planning, not added to
+/// any real `Path`. A gap beyond `max_bridge_gap_mm` triggers a genuine
+/// retraction in the emitted Gcode -- a real stop of XY motion -- so that
+/// boundary is correctly left isolated (entry/exit junction velocity 0).
+///
+/// Closed loops (`segments.len() == points.len()`) are represented, purely
+/// for this planning pass, in the same shape as open paths by
+/// materializing their wraparound closing point as an explicit extra point
+/// (`segments.len() + 1 == points.len()`, `points[n] == points[0]`) --
+/// this re-indexing is lossless: it's exactly the point the closed loop's
+/// own final (`n - 1`-th) segment already connects to via `% points.len()`
+/// wraparound, just spelled out explicitly so the loop can be spliced into
+/// a combined run like any open path. The original `Path` objects (with
+/// their real wraparound-indexed `points`/`segments`) are untouched --
+/// only this function's own working copies are re-shaped.
 ///
 /// Returns one `Vec<PlannedMotionProfile>` per input path, in the same
-/// order, so callers can index into the result exactly as if they had called
-/// `plan_path_velocities` once per path.
+/// order, so callers can index into the result exactly as if they had
+/// called `plan_path_velocities` once per path.
 #[must_use]
 pub fn plan_chained_path_velocities(
     paths: &[crate::toolpath::Path],
@@ -834,32 +876,62 @@ pub fn plan_chained_path_velocities(
     first_layer_flags: &[bool],
     square_corner_velocity_mm_s: f64,
     minimum_cruise_ratio: f64,
+    max_bridge_gap_mm: f64,
 ) -> Vec<Vec<PlannedMotionProfile>> {
     const CHAIN_EPS: f64 = 1e-4;
     let n = paths.len();
     debug_assert_eq!(first_layer_flags.len(), n);
-    let is_open = |p: &crate::toolpath::Path| p.segments.len() + 1 == p.points.len();
+
+    // Every path (open or closed) is given an "opened" point list for
+    // planning purposes; see doc comment above.
+    let opened_points: Vec<Vec<DVec3>> = paths
+        .iter()
+        .map(|p| {
+            if !p.points.is_empty() && p.segments.len() == p.points.len() {
+                let mut pts = p.points.clone();
+                pts.push(p.points[0]);
+                pts
+            } else {
+                p.points.clone()
+            }
+        })
+        .collect();
 
     let mut result: Vec<Vec<PlannedMotionProfile>> = Vec::with_capacity(n);
     let mut i = 0;
     while i < n {
+        if paths[i].segments.is_empty() || opened_points[i].len() < 2 {
+            result.push(Vec::new());
+            i += 1;
+            continue;
+        }
+
+        // Extend the run [i..=j], recording the bridging gap distance
+        // (0 for an exact touch) consumed between each adjacent pair.
         let mut j = i;
-        while j + 1 < n
-            && is_open(&paths[j])
-            && paths[j].tool == paths[j + 1].tool
-            && first_layer_flags[j] == first_layer_flags[j + 1]
-            && paths[j]
-                .points
-                .last()
-                .zip(paths[j + 1].points.first())
-                .is_some_and(|(a, b)| a.distance(*b) < CHAIN_EPS)
-        {
+        let mut gaps: Vec<f64> = Vec::new();
+        while j + 1 < n {
+            if paths[j + 1].segments.is_empty() || opened_points[j + 1].len() < 2 {
+                break;
+            }
+            if paths[j].tool != paths[j + 1].tool
+                || first_layer_flags[j] != first_layer_flags[j + 1]
+            {
+                break;
+            }
+            let a = *opened_points[j].last().unwrap();
+            let b = opened_points[j + 1][0];
+            let gap = a.distance(b);
+            if gap > max_bridge_gap_mm {
+                break;
+            }
+            gaps.push(gap);
             j += 1;
         }
 
         if j == i {
             let profiles = plan_path_velocities(
-                &paths[i].points,
+                &opened_points[i],
                 &paths[i].segments,
                 model,
                 first_layer_flags[i],
@@ -871,13 +943,38 @@ pub fn plan_chained_path_velocities(
             continue;
         }
 
-        let mut points: Vec<DVec3> = paths[i].points.clone();
+        let travel_speed_mm_min = model.max_feedrate(MoveKind::Travel, first_layer_flags[i]);
+        let mut points: Vec<DVec3> = opened_points[i].clone();
         let mut segments: Vec<crate::toolpath::Segment> = paths[i].segments.clone();
-        let mut lengths = vec![paths[i].segments.len()];
-        for path in &paths[(i + 1)..=j] {
-            points.extend(path.points.iter().skip(1).copied());
-            segments.extend(path.segments.iter().copied());
-            lengths.push(path.segments.len());
+        // Parallel to `lengths`: whether that chunk of the combined run
+        // corresponds to a real input path (must be pushed to `result`) or
+        // a synthetic bridging connector (must be discarded).
+        let mut lengths: Vec<usize> = vec![paths[i].segments.len()];
+        let mut is_real: Vec<bool> = vec![true];
+        for (k, path_idx) in ((i + 1)..=j).enumerate() {
+            let gap = gaps[k];
+            if gap > CHAIN_EPS {
+                // Bridge the gap with a synthetic zero-extrusion travel
+                // connector: push the next unit's first point (the
+                // connector's target) and a matching Travel segment.
+                points.push(opened_points[path_idx][0]);
+                segments.push(crate::toolpath::Segment {
+                    kind: MoveKind::Travel,
+                    speed: travel_speed_mm_min,
+                    order: paths[path_idx]
+                        .segments
+                        .first()
+                        .map(|s| s.order)
+                        .unwrap_or(0.0),
+                    ..crate::toolpath::Segment::default()
+                });
+                lengths.push(1);
+                is_real.push(false);
+            }
+            points.extend(opened_points[path_idx].iter().skip(1).copied());
+            segments.extend(paths[path_idx].segments.iter().copied());
+            lengths.push(paths[path_idx].segments.len());
+            is_real.push(true);
         }
 
         let combined_profiles = plan_path_velocities(
@@ -890,8 +987,11 @@ pub fn plan_chained_path_velocities(
         );
 
         let mut offset = 0;
-        for len in lengths {
-            result.push(combined_profiles[offset..offset + len].to_vec());
+        for (len, real) in lengths.iter().zip(is_real.iter()) {
+            let chunk = combined_profiles[offset..offset + len].to_vec();
+            if *real {
+                result.push(chunk);
+            }
             offset += len;
         }
 
@@ -1579,6 +1679,52 @@ mod tests {
         assert_eq!(v_reverse, 0.0);
     }
 
+    /// Regression test for a sign-convention bug: an earlier version of
+    /// `klipper_corner_velocity` computed its half-angle terms straight
+    /// from `dir_in.dot(dir_out)` with no negation, which is backwards
+    /// relative to Klipper's real `junction_cos_theta = -(dir_in .
+    /// dir_out)` convention. That inverted the entire curve -- corner
+    /// velocity *increased* with a sharper turn and *decreased* toward a
+    /// straight line, the opposite of correct physics -- capping nearly-
+    /// collinear moves (the common case along a finely-subdivided curved
+    /// wall) to a couple mm/s instead of near-nominal speed, which was a
+    /// dominant contributor to `estimated_time_seconds` being roughly
+    /// 2.5x real measured print time for detailed non-planar prints.
+    #[test]
+    fn klipper_corner_velocity_decreases_monotonically_as_turn_angle_increases() {
+        let scv = 6.0;
+        let accel = 5000.0;
+        let d_in = DVec3::new(1.0, 0.0, 0.0);
+
+        let mut prev_v = f64::INFINITY;
+        for deg in [1.0f64, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 150.0, 179.0] {
+            let rad: f64 = deg.to_radians();
+            let d_out = DVec3::new(rad.cos(), rad.sin(), 0.0);
+            let v = klipper_corner_velocity(d_in, d_out, scv, accel);
+            assert!(
+                v <= prev_v + 1e-6,
+                "corner velocity must not increase as the turn sharpens: \
+                 at {deg}deg got v={v}, but a smaller angle already gave {prev_v}"
+            );
+            prev_v = v;
+        }
+
+        // A gentle 1-degree deviation (typical of a finely-subdivided
+        // smooth curve) must permit substantially faster cornering than
+        // the configured square_corner_velocity (the speed for a 90-degree
+        // turn) -- not less than it, which is what the sign bug produced.
+        let d_out_1deg = {
+            let rad = 1.0_f64.to_radians();
+            DVec3::new(rad.cos(), rad.sin(), 0.0)
+        };
+        let v_1deg = klipper_corner_velocity(d_in, d_out_1deg, scv, accel);
+        assert!(
+            v_1deg > scv * 5.0,
+            "a 1-degree near-straight deviation should permit much faster \
+             cornering than the 90-degree square_corner_velocity ({scv}mm/s), got {v_1deg}"
+        );
+    }
+
     #[test]
     fn stepper_max_reachable_velocity_converges_and_scales_with_distance() {
         let v_0 = 0.0;
@@ -1695,7 +1841,7 @@ mod tests {
         let paths = vec![path1, path2];
         let model = StandardMotionModel::default();
 
-        let chained = plan_chained_path_velocities(&paths, &model, &[false, false], 5.0, 0.5);
+        let chained = plan_chained_path_velocities(&paths, &model, &[false, false], 5.0, 0.5, 1.5);
         assert_eq!(chained.len(), 2);
         assert_eq!(chained[0].len(), 1);
         assert_eq!(chained[1].len(), 1);
@@ -1723,8 +1869,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_chained_path_velocities_does_not_chain_across_tool_or_layer_or_closed_loop_boundaries()
-    {
+    fn plan_chained_path_velocities_does_not_chain_across_tool_boundaries() {
         use crate::toolpath::Segment;
 
         // Different tool: must not chain even though spatially contiguous.
@@ -1750,11 +1895,19 @@ mod tests {
         };
         let model = StandardMotionModel::default();
         let chained =
-            plan_chained_path_velocities(&[path1, path2], &model, &[false, false], 5.0, 0.5);
+            plan_chained_path_velocities(&[path1, path2], &model, &[false, false], 5.0, 0.5, 1.5);
         assert_eq!(chained[0][0].exit_speed, 0.0);
+    }
 
-        // Closed loop (points.len() == segments.len()) must never be chained,
-        // even when immediately followed by a spatially-contiguous open path.
+    /// A closed wall loop (`points.len() == segments.len()`) immediately
+    /// followed by a spatially-contiguous open path (touching exactly, zero
+    /// gap) must now chain through: the loop is given an "opened"
+    /// representation (see `plan_chained_path_velocities`'s doc comment)
+    /// so its own exit speed is no longer artificially forced to zero.
+    #[test]
+    fn plan_chained_path_velocities_chains_a_closed_loop_into_a_contiguous_open_follow_up() {
+        use crate::toolpath::Segment;
+
         let closed = crate::toolpath::Path {
             points: vec![
                 DVec3::new(0.0, 0.0, 0.0),
@@ -1791,15 +1944,118 @@ mod tests {
             tool: crate::ids::ToolId(0),
             object: crate::ids::ObjectId::default(),
         };
+        let model = StandardMotionModel::default();
         let chained_closed = plan_chained_path_velocities(
             &[closed, open_follow_up],
             &model,
             &[false, false],
             5.0,
             0.5,
+            1.5,
         );
-        assert_eq!(chained_closed[0].last().unwrap().exit_speed, 0.0);
-        assert_eq!(chained_closed[1][0].entry_speed, 0.0);
+        assert!(
+            chained_closed[0].last().unwrap().exit_speed > 1.0,
+            "expected the closed loop's exit speed to carry through into the \
+             contiguous follow-up path, got {}",
+            chained_closed[0].last().unwrap().exit_speed
+        );
+        assert!(
+            (chained_closed[0].last().unwrap().exit_speed - chained_closed[1][0].entry_speed).abs()
+                < 1e-6
+        );
+    }
+
+    /// A short (sub-retraction-threshold) travel gap between two closed
+    /// loops of the same tool/layer must be bridged with a synthetic
+    /// connector rather than forcing both to decelerate to zero.
+    #[test]
+    fn plan_chained_path_velocities_bridges_a_short_gap_between_two_closed_loops() {
+        use crate::toolpath::Segment;
+
+        let make_loop = |origin: DVec3| crate::toolpath::Path {
+            points: vec![
+                origin,
+                origin + DVec3::new(10.0, 0.0, 0.0),
+                origin + DVec3::new(10.0, 10.0, 0.0),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 6000.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 6000.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 6000.0,
+                    ..Segment::default()
+                },
+            ],
+            tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        };
+        // Loop B's start is 1.0mm from loop A's end (its own start, since it's
+        // closed) -- well under a 1.5mm max_bridge_gap_mm.
+        let loop_a = make_loop(DVec3::new(0.0, 0.0, 0.0));
+        let loop_b = make_loop(DVec3::new(1.0, 0.0, 0.0));
+        let model = StandardMotionModel::default();
+        let chained =
+            plan_chained_path_velocities(&[loop_a, loop_b], &model, &[false, false], 5.0, 0.5, 1.5);
+        assert_eq!(chained[0].len(), 3);
+        assert_eq!(chained[1].len(), 3);
+        assert!(
+            chained[0].last().unwrap().exit_speed > 1.0,
+            "expected a bridged short gap to carry nonzero speed through, got {}",
+            chained[0].last().unwrap().exit_speed
+        );
+    }
+
+    /// A gap larger than `max_bridge_gap_mm` (i.e. long enough that
+    /// `gcode::emit` will actually retract across it) must still isolate --
+    /// a real stop of XY motion is correctly modeled as such.
+    #[test]
+    fn plan_chained_path_velocities_does_not_bridge_a_gap_beyond_max_bridge_gap_mm() {
+        use crate::toolpath::Segment;
+
+        let make_loop = |origin: DVec3| crate::toolpath::Path {
+            points: vec![
+                origin,
+                origin + DVec3::new(10.0, 0.0, 0.0),
+                origin + DVec3::new(10.0, 10.0, 0.0),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 6000.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 6000.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    speed: 6000.0,
+                    ..Segment::default()
+                },
+            ],
+            tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        };
+        // Loop B's start is 20mm from loop A's end -- far beyond a 1.5mm
+        // max_bridge_gap_mm, so a real retraction would fire here.
+        let loop_a = make_loop(DVec3::new(0.0, 0.0, 0.0));
+        let loop_b = make_loop(DVec3::new(20.0, 0.0, 0.0));
+        let model = StandardMotionModel::default();
+        let chained =
+            plan_chained_path_velocities(&[loop_a, loop_b], &model, &[false, false], 5.0, 0.5, 1.5);
+        assert_eq!(chained[0].last().unwrap().exit_speed, 0.0);
+        assert_eq!(chained[1][0].entry_speed, 0.0);
     }
 
     #[test]

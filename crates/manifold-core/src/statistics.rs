@@ -110,11 +110,13 @@ pub fn compute_print_statistics_with_machine(
     let unretract_time = config.unretraction_duration_seconds();
     let min_retract_travel = config.effective_min_travel_for_retract();
 
-    // Plans velocities across contiguous same-tool open-path runs as one
-    // continuous polyline (see `plan_chained_path_velocities`), rather than
-    // per-`Path` in isolation, so `estimated_time_seconds` doesn't inflate
-    // print time with a phantom stop-to-zero at every one of the (often
-    // thousands of) `Path` object boundaries a non-planar slice produces.
+    // Plans velocities across same-tool, same-layer runs -- closed loops
+    // bridged with each other and with open-path runs across gaps too
+    // short to trigger a real retraction -- as one continuous polyline
+    // (see `plan_chained_path_velocities`), rather than per-`Path` in
+    // isolation, so `estimated_time_seconds` doesn't inflate print time
+    // with a phantom stop-to-zero at every one of the (often thousands of)
+    // `Path` object boundaries a non-planar slice produces.
     let first_layer_flags: Vec<bool> = paths
         .iter()
         .map(|path| {
@@ -128,6 +130,7 @@ pub fn compute_print_statistics_with_machine(
         &first_layer_flags,
         config.square_corner_velocity(),
         config.minimum_cruise_ratio(),
+        min_retract_travel,
     );
 
     for (path, profiles) in paths.iter().zip(all_profiles.iter()) {

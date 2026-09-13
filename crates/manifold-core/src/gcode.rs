@@ -395,6 +395,7 @@ pub fn emit_with_machine(
         &first_layer_flags,
         scv,
         config.minimum_cruise_ratio(),
+        config.effective_min_travel_for_retract(),
     );
 
     for (path_idx, path) in paths.iter().enumerate() {
