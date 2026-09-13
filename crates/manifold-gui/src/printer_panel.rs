@@ -200,6 +200,17 @@ impl PrinterPanel {
                 PrintState::Standby | PrintState::Complete | PrintState::Cancelled
             )
     }
+    fn badge_endpoint<'a>(&'a self, session: Option<&'a PrinterSessionHandle>) -> Option<&'a str> {
+        if let Some(session) = session {
+            // Even a disconnected retained session is still the target of active controls.
+            Some(session.endpoint())
+        } else if self.has_settings || self.url_input != MoonrakerConfig::default().url {
+            Some(self.url_input.trim()).filter(|url| !url.is_empty())
+        } else {
+            None
+        }
+    }
+
     pub fn show(
         &mut self,
         ui: &mut Ui,
@@ -207,8 +218,9 @@ impl PrinterPanel {
         on_save_config: impl FnOnce(MoonrakerConfig),
     ) {
         Self::request_repaint(ui.ctx(), session_opt.as_ref());
-        if let Some(session) = session_opt.as_ref() {
-            self.sync_confirmation(session, &session.latest_telemetry());
+        let telemetry = session_opt.as_ref().map(|s| s.latest_telemetry());
+        if let (Some(session), Some(t)) = (session_opt.as_ref(), telemetry.as_ref()) {
+            self.sync_confirmation(session, t);
         } else {
             self.confirming_cancel = false;
             self.confirmation_target = None;
@@ -217,12 +229,12 @@ impl PrinterPanel {
             ui.horizontal(|ui| {
                 let title = if self.collapsed {"▶ Printer"} else {"▼ Printer"};
                 if ui.button(RichText::new(title).strong()).clicked() {self.collapsed = !self.collapsed;}
-                let state = session_opt.as_ref().map(|s|s.latest_telemetry().connection_state).unwrap_or_default();
-                let color = match state {ConnectionState::Connected=>Color32::GREEN,ConnectionState::Error(_)=>Color32::RED,_=>Color32::YELLOW};
-                ui.colored_label(color,format!("{state:?}"));
+                show_connection_badge(ui, self.badge_endpoint(session_opt.as_ref()), telemetry.as_ref());
             });
+            if let Some(ConnectionState::Error(message)) = telemetry.as_ref().map(|t| &t.connection_state) {
+                ui.colored_label(Color32::RED, message);
+            }
             if let Some(session) = session_opt.as_ref() {
-                ui.label(format!("Active target: {}",session.endpoint()));
                 let t = session.latest_telemetry();
                 if !t.fresh {ui.colored_label(Color32::YELLOW,"Telemetry stale / unavailable");}
                 if let Some(message) = &t.klipper_message {ui.colored_label(Color32::RED,message);}
@@ -329,11 +341,65 @@ impl PrinterPanel {
         });
     }
 }
+/// Never echo credentials from an unsaved or invalid URL into the compact header or tooltip.
+fn display_endpoint(endpoint: Option<&str>) -> String {
+    let Some(endpoint) = endpoint else {
+        return "No printer configured".into();
+    };
+    let Ok(mut url) = url::Url::parse(endpoint) else {
+        return "Invalid printer URL".into();
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return "Invalid printer URL".into();
+    }
+    // These fields are not supported by MoonrakerConfig, but may appear in a draft.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+fn show_connection_badge(
+    ui: &mut Ui,
+    endpoint: Option<&str>,
+    telemetry: Option<&PrinterTelemetry>,
+) -> egui::Response {
+    let endpoint = display_endpoint(endpoint);
+    let connected =
+        telemetry.is_some_and(|t| t.fresh && t.connection_state == ConnectionState::Connected);
+    let (symbol, color) = if connected {
+        ("✓", Color32::GREEN)
+    } else {
+        ("✗", Color32::GRAY)
+    };
+    let details = match telemetry {
+        None => "Configured draft — not connected".into(),
+        Some(t) => match &t.connection_state {
+            ConnectionState::Connected if t.fresh => "Connected — live telemetry".into(),
+            ConnectionState::Connected => "Connected — telemetry stale / unavailable".into(),
+            ConnectionState::Disconnected => "Disconnected".into(),
+            ConnectionState::Connecting => "Connecting".into(),
+            ConnectionState::Reconnecting { attempt } => {
+                format!("Reconnecting — attempt {attempt}")
+            }
+            ConnectionState::Error(message) => format!("Connection error: {message}"),
+        },
+    };
+    let target = if telemetry.is_some() {
+        "Active target"
+    } else {
+        "Draft target"
+    };
+    ui.add(egui::Label::new(RichText::new(format!("{symbol} {endpoint}")).color(color)).truncate())
+        .on_hover_text(format!("{target}: {endpoint}\n{details}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn panel_frame(
+    pub(super) fn panel_frame(
         ctx: &egui::Context,
         panel: &mut PrinterPanel,
         session: &mut Option<PrinterSessionHandle>,
@@ -403,8 +469,10 @@ mod tests {
         assert!(!text.contains("Draft URL:"));
         assert!(!text.contains("API key (stored in profile as plaintext):"));
         assert!(!text.contains("Connect draft"));
+        let endpoint = session.as_ref().unwrap().endpoint();
+        assert!(text.contains(&format!("✗ {endpoint}")));
+        assert!(!text.contains("Active target:"));
         for expected in [
-            "Active target:",
             "Emergency Stop",
             "Visible action error",
             "Status:",
@@ -573,8 +641,327 @@ mod tests {
         let ctx = egui::Context::default();
         let output = toggle_connection_settings(&ctx, &mut panel, &mut session);
         let text = format!("{:?}", output.shapes);
-        assert!(text.contains("Active target:"));
+        let endpoint = session.as_ref().unwrap().endpoint();
+        assert!(text.contains(&format!("✗ {endpoint}")));
+        assert!(!text.contains("Active target:"));
         assert!(text.contains("Draft URL:"));
+        assert!(text.contains("http://draft.invalid"));
+    }
+
+    fn badge_frame(
+        ctx: &egui::Context,
+        endpoint: Option<&str>,
+        telemetry: Option<&PrinterTelemetry>,
+        width: f32,
+        pointer: Option<egui::Pos2>,
+    ) -> (egui::FullOutput, egui::Rect) {
+        ctx.style_mut(|style| {
+            style.animation_time = 0.0;
+            style.interaction.tooltip_delay = 0.0;
+        });
+        let mut badge = egui::Rect::NOTHING;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 400.0),
+                )),
+                events: pointer.into_iter().map(egui::Event::PointerMoved).collect(),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            let _ = ui.button("▼ Printer");
+                            badge = show_connection_badge(ui, endpoint, telemetry).rect;
+                        });
+                    });
+                });
+            },
+        );
+        (output, badge)
+    }
+
+    fn hover_badge(
+        ctx: &egui::Context,
+        endpoint: Option<&str>,
+        telemetry: Option<&PrinterTelemetry>,
+        width: f32,
+    ) -> egui::FullOutput {
+        let (_, rect) = badge_frame(ctx, endpoint, telemetry, width, None);
+        // Move, settle, then paint the tooltip; no wall-clock waiting.
+        for _ in 0..3 {
+            badge_frame(ctx, endpoint, telemetry, width, Some(rect.center()));
+        }
+        badge_frame(ctx, endpoint, telemetry, width, Some(rect.center())).0
+    }
+
+    fn painted_text(output: &egui::FullOutput) -> Vec<&egui::epaint::TextShape> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn badge_requires_fresh_connected_telemetry_and_explains_each_state_on_hover() {
+        let endpoint = "https://printer.invalid:7125/proxy/";
+        for (state, fresh, connected, detail) in [
+            (
+                ConnectionState::Connected,
+                true,
+                true,
+                "Connected — live telemetry",
+            ),
+            (
+                ConnectionState::Connected,
+                false,
+                false,
+                "telemetry stale / unavailable",
+            ),
+            (ConnectionState::Disconnected, false, false, "Disconnected"),
+            (ConnectionState::Connecting, false, false, "Connecting"),
+            (
+                ConnectionState::Reconnecting { attempt: 3 },
+                false,
+                false,
+                "Reconnecting — attempt 3",
+            ),
+            (
+                ConnectionState::Error("synthetic connection failure".into()),
+                false,
+                false,
+                "Connection error: synthetic connection failure",
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let telemetry = PrinterTelemetry {
+                connection_state: state,
+                fresh,
+                ..Default::default()
+            };
+            let (output, _) = badge_frame(&ctx, Some(endpoint), Some(&telemetry), 600.0, None);
+            let expected = format!("{} {endpoint}", if connected { "✓" } else { "✗" });
+            let text = painted_text(&output);
+            let badge = text
+                .iter()
+                .find(|text| text.galley.text() == expected)
+                .unwrap();
+            let color = badge.galley.job.sections[0].format.color;
+            assert_eq!(
+                color,
+                if connected {
+                    Color32::GREEN
+                } else {
+                    Color32::GRAY
+                }
+            );
+            assert!(!text
+                .iter()
+                .any(|text| text.galley.text().starts_with("Active target:")));
+            let hover = hover_badge(&ctx, Some(endpoint), Some(&telemetry), 600.0);
+            assert!(
+                painted_text(&hover).iter().any(|text| text
+                    .galley
+                    .text()
+                    .contains(&format!("Active target: {endpoint}"))
+                    && text.galley.text().contains(detail)),
+                "missing hover detail: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_badge_truncates_in_narrow_header_and_hover_keeps_full_endpoint() {
+        let endpoint = "https://printer.invalid:7125/reverse-proxy/a-very-long-printer-directory/";
+        let telemetry = PrinterTelemetry {
+            fresh: true,
+            connection_state: ConnectionState::Connected,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let (output, rect) = badge_frame(&ctx, Some(endpoint), Some(&telemetry), 220.0, None);
+        let text = painted_text(&output);
+        let badge = text
+            .iter()
+            .find(|text| text.galley.text().starts_with("✓ "))
+            .unwrap();
+        let title = text
+            .iter()
+            .find(|text| text.galley.text() == "▼ Printer")
+            .unwrap();
+        assert!(badge.galley.elided);
+        assert_eq!(badge.galley.rows.len(), 1);
+        assert!((title.pos.y - badge.pos.y).abs() < 2.0);
+        assert!(rect.right() <= 212.0, "badge widened the pane: {rect:?}");
+        let hover = hover_badge(&ctx, Some(endpoint), Some(&telemetry), 220.0);
+        let text = painted_text(&hover);
+        let tooltip = text
+            .iter()
+            .find(|text| text.galley.text().starts_with("Active target:"))
+            .unwrap();
+        assert!(tooltip.galley.text().contains(endpoint));
+        assert!(!tooltip.galley.elided);
+    }
+
+    #[test]
+    fn draft_badge_and_hover_mask_url_credentials_and_reject_malformed_urls() {
+        for (input, expected) in [
+            (
+                "https://secret-user:secret-password@printer.invalid:7125/proxy/",
+                "https://printer.invalid:7125/proxy/",
+            ),
+            (
+                "https://printer.invalid/proxy/?api_key=secret-query",
+                "https://printer.invalid/proxy/",
+            ),
+            (
+                "https://printer.invalid/proxy/#secret-fragment",
+                "https://printer.invalid/proxy/",
+            ),
+            ("malformed secret-malformed", "Invalid printer URL"),
+            (
+                "ftp://secret-user:secret-password@printer.invalid/",
+                "Invalid printer URL",
+            ),
+        ] {
+            let mut panel = PrinterPanel::new(None);
+            panel.url_input = input.into();
+            panel.api_key_input = "secret-api-key".into();
+            let endpoint = panel.badge_endpoint(None);
+            for telemetry in [None, Some(PrinterTelemetry::default())] {
+                let ctx = egui::Context::default();
+                let (output, _) = badge_frame(&ctx, endpoint, telemetry.as_ref(), 600.0, None);
+                assert!(painted_text(&output)
+                    .iter()
+                    .any(|text| text.galley.text() == format!("✗ {expected}")));
+                assert!(!format!("{:?}", output.shapes).contains("secret-"));
+                let hover = hover_badge(&ctx, endpoint, telemetry.as_ref(), 600.0);
+                let target = if telemetry.is_some() {
+                    "Active target"
+                } else {
+                    "Draft target"
+                };
+                assert!(painted_text(&hover).iter().any(|text| text
+                    .galley
+                    .text()
+                    .contains(&format!("{target}: {expected}"))));
+                assert!(!format!("{:?}", hover.shapes).contains("secret-"));
+                if telemetry.is_none() {
+                    assert!(painted_text(&hover)
+                        .iter()
+                        .any(|text| text.galley.text().contains("not connected")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_identity_survives_draft_edits_and_profile_replacement_uses_new_draft() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = MoonrakerConfig {
+            url: format!("http://{}/proxy/", listener.local_addr().unwrap()),
+            auto_connect: false,
+            api_key: None,
+        };
+        let mut session = Some(PrinterSessionHandle::spawn(config));
+        let endpoint = session.as_ref().unwrap().endpoint().to_owned();
+        let mut panel = PrinterPanel::new(None);
+        panel.url_input =
+            "https://secret-user:secret-password@draft.invalid/?key=secret-query#secret-fragment"
+                .into();
+        assert_eq!(
+            panel.badge_endpoint(session.as_ref()),
+            Some(endpoint.as_str())
+        );
+        let ctx = egui::Context::default();
+        let output = panel_frame(&ctx, &mut panel, &mut session, vec![]);
+        let text = painted_text(&output);
+        assert_eq!(
+            text.iter()
+                .filter(|text| text.galley.text().contains(&endpoint))
+                .count(),
+            1
+        );
+        assert!(!format!("{:?}", output.shapes).contains("secret-"));
+        let hover = hover_badge(
+            &ctx,
+            panel.badge_endpoint(session.as_ref()),
+            Some(&session.as_ref().unwrap().latest_telemetry()),
+            600.0,
+        );
+        assert!(!format!("{:?}", hover.shapes).contains("draft.invalid"));
+        assert!(painted_text(&hover).iter().any(|text| text
+            .galley
+            .text()
+            .contains(&format!("Active target: {endpoint}"))));
+        let new_config = MoonrakerConfig {
+            url: "https://new-profile.invalid/proxy/".into(),
+            auto_connect: false,
+            api_key: None,
+        };
+        panel.replace_profile(&mut session, Some(&new_config));
+        assert!(session.is_none());
+        let output = panel_frame(&ctx, &mut panel, &mut session, vec![]);
+        assert!(painted_text(&output)
+            .iter()
+            .any(|text| text.galley.text() == format!("✗ {}", new_config.url)));
+        assert!(!format!("{:?}", output.shapes).contains(&endpoint));
+        panel.replace_profile(&mut session, None);
+        let output = panel_frame(&ctx, &mut panel, &mut session, vec![]);
+        assert!(painted_text(&output)
+            .iter()
+            .any(|text| text.galley.text() == "✗ No printer configured"));
+    }
+
+    #[tokio::test]
+    async fn connection_error_and_emergency_stop_remain_visible_when_printer_is_collapsed() {
+        // Invalid scheme fails locally, without opening a connection.
+        let session = PrinterSessionHandle::spawn(MoonrakerConfig {
+            url: "ftp://127.0.0.1/".into(),
+            auto_connect: false,
+            api_key: None,
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !matches!(
+                session.latest_telemetry().connection_state,
+                ConnectionState::Error(_)
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let ConnectionState::Error(message) = session.latest_telemetry().connection_state else {
+            unreachable!()
+        };
+        let mut active = Some(session);
+        let mut panel = PrinterPanel {
+            action_error: Some("Visible action error".into()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let output = panel_frame(&ctx, &mut panel, &mut active, vec![]);
+        let text = painted_text(&output);
+        for expected in [
+            message.as_str(),
+            "⛔ Emergency Stop",
+            "Visible action error",
+        ] {
+            assert!(
+                text.iter().any(|text| text.galley.text() == expected),
+                "missing {expected}"
+            );
+        }
+        assert!(!text
+            .iter()
+            .any(|text| text.galley.text() == "Connection settings"));
+        assert!(!text.iter().any(|text| text.galley.text() == "Draft URL:"));
     }
 
     #[test]

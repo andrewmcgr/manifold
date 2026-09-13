@@ -2,6 +2,7 @@
 //! an in-panel import toolbar (Phase 4, see ROADMAP.md).
 
 use crate::camera::OrbitCamera;
+use crate::output_action::OutputAction;
 use crate::printer_panel::PrinterPanel;
 use crate::profile::Profile;
 use crate::render::{
@@ -194,6 +195,8 @@ pub struct ManifoldApp {
     printer_session: Option<PrinterSessionHandle>,
     /// Modular printer control and telemetry panel in the settings pane.
     printer_panel: PrinterPanel,
+    /// Output choice is remembered only for this application session.
+    output_action: OutputAction,
     /// Currently saved/configured Moonraker configuration.
     moonraker_config: Option<MoonrakerConfig>,
 }
@@ -277,6 +280,7 @@ impl ManifoldApp {
             mcp_rx,
             printer_session: None,
             printer_panel: PrinterPanel::new(None),
+            output_action: OutputAction::default(),
             moonraker_config: None,
         }
     }
@@ -3069,31 +3073,6 @@ impl ManifoldApp {
                     );
                 });
             }
-            ensure_row_space(ui, 80.0);
-            if ui
-                .add_enabled(self.gcode.is_some(), egui::Button::new("Export…"))
-                .clicked()
-            {
-                let default_gcode_name = self
-                    .objects
-                    .first()
-                    .and_then(|obj| obj.name.as_ref())
-                    .map(|name| format!("{name}.gcode"))
-                    .unwrap_or_else(|| "out.gcode".to_string());
-
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Gcode", &["gcode"])
-                    .set_file_name(&default_gcode_name)
-                    .save_file()
-                {
-                    if let Some(gcode) = &self.gcode {
-                        if let Err(error) = std::fs::write(&path, gcode) {
-                            self.slice_error = Some(error.to_string());
-                        }
-                    }
-                }
-            }
-
             let printer_ready = self.printer_session.as_ref().is_some_and(|s| {
                 let t = s.latest_telemetry();
                 t.fresh && t.connection_state == manifold_printer::ConnectionState::Connected
@@ -3111,30 +3090,40 @@ impl ManifoldApp {
                 .map(|name| format!("{name}.gcode"))
                 .unwrap_or_else(|| "out.gcode".to_string());
 
-            ensure_row_space(ui, 120.0);
-            if ui
-                .add_enabled(can_upload, egui::Button::new("Upload to Printer"))
-                .clicked()
-            {
-                if let (Some(session), Some(gcode)) = (&self.printer_session, &self.gcode) {
-                    self.printer_panel.send(session, PrinterAction::UploadOnly {
-                        filename: default_gcode_name.clone(),
-                        gcode: gcode.as_bytes().to_vec(),
-                    });
-                }
-            }
-
+            let can_print = can_upload
+                && self.printer_session.as_ref().is_some_and(PrinterPanel::can_start);
             ensure_row_space(ui, 110.0);
-            if ui
-                .add_enabled(can_upload && self.printer_session.as_ref().is_some_and(PrinterPanel::can_start), egui::Button::new("Upload & Print"))
-                .clicked()
-            {
-                if let (Some(session), Some(gcode)) = (&self.printer_session, &self.gcode) {
-                    self.printer_panel.send(session, PrinterAction::UploadAndPrint {
-                        filename: default_gcode_name,
-                        gcode: gcode.as_bytes().to_vec(),
-                    });
+            match self.output_action.show(ui, self.gcode.is_some(), can_upload, can_print) {
+                Some(OutputAction::Export) => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Gcode", &["gcode"])
+                        .set_file_name(&default_gcode_name)
+                        .save_file()
+                    {
+                        if let Some(gcode) = &self.gcode {
+                            if let Err(error) = std::fs::write(&path, gcode) {
+                                self.slice_error = Some(error.to_string());
+                            }
+                        }
+                    }
                 }
+                Some(OutputAction::Upload) => {
+                    if let (Some(session), Some(gcode)) = (&self.printer_session, &self.gcode) {
+                        self.printer_panel.send(session, PrinterAction::UploadOnly {
+                            filename: default_gcode_name,
+                            gcode: gcode.as_bytes().to_vec(),
+                        });
+                    }
+                }
+                Some(OutputAction::Print) => {
+                    if let (Some(session), Some(gcode)) = (&self.printer_session, &self.gcode) {
+                        self.printer_panel.send(session, PrinterAction::UploadAndPrint {
+                            filename: default_gcode_name,
+                            gcode: gcode.as_bytes().to_vec(),
+                        });
+                    }
+                }
+                None => {}
             }
 
             ensure_row_space(ui, 130.0);

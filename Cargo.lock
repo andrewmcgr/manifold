@@ -2840,6 +2840,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "transform-gizmo-egui",
+ "url",
  "wgpu 22.1.0",
 ]
 

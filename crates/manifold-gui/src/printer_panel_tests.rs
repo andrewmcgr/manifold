@@ -144,6 +144,66 @@ async fn repeated_retirements_compact_results_visibly_until_acknowledged() {
     assert!(text.contains("2 outcome unknown"));
 }
 #[tokio::test]
+async fn collapsed_offline_panel_emergency_stop_click_bypasses_normal_action_guards() {
+    let mut server = Server::start().await;
+    let mut active = Some(PrinterSessionHandle::spawn(MoonrakerConfig {
+        url: server.url.clone(),
+        auto_connect: false,
+        api_key: None,
+    }));
+    let mut panel = PrinterPanel::default();
+    assert!(!PrinterPanel::can_start(active.as_ref().unwrap()));
+    assert!(!active.as_ref().unwrap().latest_telemetry().fresh);
+    let ctx = egui::Context::default();
+    let output = super::tests::panel_frame(&ctx, &mut panel, &mut active, vec![]);
+    let pos = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.text() == "⛔ Emergency Stop" => {
+                Some(egui::Rect::from_min_size(text.pos, text.galley.size()).center())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(active.as_ref().unwrap().operations().is_empty());
+    for pressed in [true, false] {
+        super::tests::panel_frame(
+            &ctx,
+            &mut panel,
+            &mut active,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+    }
+    let request = server.request().await;
+    assert_eq!(request.path, "/printer/emergency_stop");
+    request.respond.send(json!({"result":"ok"})).unwrap();
+    until(|| {
+        active
+            .as_ref()
+            .unwrap()
+            .operations()
+            .iter()
+            .all(|op| !op.state.is_pending())
+    })
+    .await;
+    assert_eq!(active.as_ref().unwrap().operations().len(), 1);
+    assert!(server.requests.is_empty());
+    assert!(
+        server.sockets.is_empty(),
+        "stop must not require a subscription"
+    );
+}
+
+#[tokio::test]
 async fn normal_disconnect_keeps_operation_specific_uncertainty_visible() {
     let mut server = Server::start().await;
     let mut active = Some(PrinterSessionHandle::spawn(MoonrakerConfig {

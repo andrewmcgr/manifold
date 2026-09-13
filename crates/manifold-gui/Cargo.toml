@@ -28,6 +28,8 @@ transform-gizmo-egui = "0.4.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ab_glyph = "0.2"
+# Safe endpoint presentation for drafts as well as active printer targets.
+url = "2"
 
 # Phase 9 (ROADMAP.md): dev/test-only MCP automation server, off by default.
 rmcp = { version = "0.9", features = ["server", "transport-async-rw"], optional = true }

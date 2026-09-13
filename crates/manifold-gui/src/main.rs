@@ -11,6 +11,7 @@ mod camera;
 mod lay_on_face;
 #[cfg(feature = "mcp-server")]
 mod mcp;
+mod output_action;
 mod printer_panel;
 mod profile;
 mod render;
