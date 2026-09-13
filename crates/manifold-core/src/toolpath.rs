@@ -2359,6 +2359,117 @@ pub fn calculate_end_of_print_clearance(
     (shear_pt, clear_pt)
 }
 
+pub fn append_end_of_print_wipe_and_clearance(
+    paths: &mut [Path],
+    _objects: &[crate::object::Object],
+    machine: &crate::machine::Machine,
+    config: &SlicerConfig,
+) -> Result<()> {
+    if !config.end_of_print_wipe_enabled() || paths.is_empty() {
+        return Ok(());
+    }
+
+    // Find the last path with extruding segments
+    let last_path_idx = match paths
+        .iter()
+        .rposition(|p| p.segments.iter().any(|s| s.kind != MoveKind::Travel))
+    {
+        Some(idx) => idx,
+        None => return Ok(()),
+    };
+
+    let path = &mut paths[last_path_idx];
+    if path.points.len() < 2 || path.segments.is_empty() {
+        return Ok(());
+    }
+
+    let (last_extruding_idx, last_extruding_seg) = match path
+        .segments
+        .iter()
+        .enumerate()
+        .rfind(|(_, s)| s.kind != MoveKind::Travel)
+    {
+        Some((idx, s)) => (idx, *s),
+        None => return Ok(()),
+    };
+
+    let p_start = path.points[last_extruding_idx];
+    let p_end = path.points[(last_extruding_idx + 1) % path.points.len()];
+    let seg_vec = p_end - p_start;
+    let seg_len = seg_vec.length();
+    if seg_len < 1e-4 {
+        return Ok(());
+    }
+
+    let reverse_dir = -seg_vec / seg_len;
+    let terminal_v = (last_extruding_seg.speed / 60.0).max(1.0);
+    let bead_w = if last_extruding_seg.line_width > 0.0 {
+        last_extruding_seg.line_width
+    } else {
+        config.wall_line_width
+    };
+    let bead_h = config.layer_height;
+    let wipe_dist =
+        calculate_end_of_print_wipe_distance(config, None, terminal_v, bead_w, bead_h, seg_len);
+
+    let p_wipe = p_end + reverse_dir * wipe_dist;
+    let (p_shear, p_clear) =
+        calculate_end_of_print_clearance(p_wipe, reverse_dir, None, None, machine, config);
+
+    let wipe_speed = config.retraction_speed();
+    let travel_speed = config.travel_speed;
+
+    // 1. Wipe segment (Travel move back along bead with 0 extrusion)
+    path.points.push(p_wipe);
+    path.segments.push(Segment {
+        kind: MoveKind::Travel,
+        extrusion_rate: 0.0,
+        extrusion_length: 0.0,
+        speed: wipe_speed,
+        order: last_extruding_seg.order,
+        support_fraction: last_extruding_seg.support_fraction,
+        line_width: 0.0,
+        is_scarf: false,
+        id: 0,
+        island: last_extruding_seg.island,
+        channel_width: last_extruding_seg.channel_width,
+    });
+
+    // 2. Shear step
+    path.points.push(p_shear);
+    path.segments.push(Segment {
+        kind: MoveKind::Travel,
+        extrusion_rate: 0.0,
+        extrusion_length: 0.0,
+        speed: travel_speed,
+        order: last_extruding_seg.order,
+        support_fraction: last_extruding_seg.support_fraction,
+        line_width: 0.0,
+        is_scarf: false,
+        id: 0,
+        island: last_extruding_seg.island,
+        channel_width: last_extruding_seg.channel_width,
+    });
+
+    // 3. Clearance travel move
+    path.points.push(p_clear);
+    path.segments.push(Segment {
+        kind: MoveKind::Travel,
+        extrusion_rate: 0.0,
+        extrusion_length: 0.0,
+        speed: travel_speed,
+        order: last_extruding_seg.order,
+        support_fraction: last_extruding_seg.support_fraction,
+        line_width: 0.0,
+        is_scarf: false,
+        id: 0,
+        island: last_extruding_seg.island,
+        channel_width: last_extruding_seg.channel_width,
+    });
+
+    Ok(())
+}
+
 /// Chooses the Gcode feedrate (`Segment::speed`, mm/min) for a segment of
 /// the given `kind`, from `config` via its [`crate::kinematics::MotionModel`].
 #[must_use]
@@ -6751,5 +6862,78 @@ mod tests {
 
         assert!(clear.x <= 99.5);
         assert!(clear.x >= 0.5);
+    }
+
+    #[test]
+    fn append_end_of_print_wipe_appends_unextruded_wipe_and_clearance_segments() {
+        let config = SlicerConfig {
+            end_of_print_wipe_enabled: true,
+            nozzle_diameter: 0.4,
+            wall_line_width: 0.4,
+            layer_height: 0.2,
+            ..SlicerConfig::default()
+        };
+
+        let machine = Machine::new(
+            BoundingVolume::Aabb {
+                min: DVec3::ZERO,
+                max: DVec3::new(200.0, 200.0, 200.0),
+            },
+            vec![Tool::new(crate::ids::ToolId(0), 0.4)],
+        );
+
+        // Path with 2 extrusion segments
+        let path = Path {
+            points: vec![
+                DVec3::new(10.0, 10.0, 1.0),
+                DVec3::new(20.0, 10.0, 1.0),
+                DVec3::new(20.0, 20.0, 1.0),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    order: 1.0,
+                    line_width: 0.4,
+                    extrusion_length: 1.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    order: 1.0,
+                    line_width: 0.4,
+                    extrusion_length: 1.0,
+                    ..Segment::default()
+                },
+            ],
+            ..Path::default()
+        };
+
+        let mut paths = vec![path];
+        let objects = vec![];
+
+        append_end_of_print_wipe_and_clearance(&mut paths, &objects, &machine, &config).unwrap();
+
+        let last_path = paths.last().unwrap();
+        // Originally 3 points and 2 segments; wipe + shear + clearance adds 3 points and 3 segments
+        assert_eq!(last_path.points.len(), 6);
+        assert_eq!(last_path.segments.len(), 5);
+
+        // Wipe segment (index 2): travel with 0 extrusion, reversing towards (20.0, 10.0, 1.0)
+        let wipe_seg = &last_path.segments[2];
+        assert_eq!(wipe_seg.kind, MoveKind::Travel);
+        assert_eq!(wipe_seg.extrusion_length, 0.0);
+        let wipe_pt = last_path.points[3];
+        assert_eq!(wipe_pt.x, 20.0);
+        assert!(wipe_pt.y < 20.0 && wipe_pt.y >= 15.0);
+
+        // Shear step and clearance moves are Travel with 0 extrusion
+        assert_eq!(last_path.segments[3].kind, MoveKind::Travel);
+        assert_eq!(last_path.segments[3].extrusion_length, 0.0);
+        assert_eq!(last_path.segments[4].kind, MoveKind::Travel);
+        assert_eq!(last_path.segments[4].extrusion_length, 0.0);
+
+        // Final point elevated and cleared
+        let final_pt = *last_path.points.last().unwrap();
+        assert!(final_pt.z >= 3.0); // 1.0 + 2.0 Z lift
     }
 }

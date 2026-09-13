@@ -1454,6 +1454,14 @@ pub fn plan_toolpaths_with_progress(
             })
             .collect();
     }
+
+    toolpath::append_end_of_print_wipe_and_clearance(
+        &mut paths,
+        &workspace.objects,
+        &workspace.machine,
+        &workspace.config,
+    )?;
+
     toolpath::validate_within_bounds(&paths, &workspace.machine.build_volume)?;
 
     Ok(paths)
