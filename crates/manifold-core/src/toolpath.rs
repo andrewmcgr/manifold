@@ -2259,6 +2259,39 @@ pub fn validate_within_bounds(paths: &[Path], build_volume: &BoundingVolume) -> 
     Ok(())
 }
 
+pub fn calculate_end_of_print_wipe_distance(
+    config: &SlicerConfig,
+    fluid_engine: Option<&crate::fluid_dynamics::FluidDynamicsEngine>,
+    terminal_velocity_mm_s: f64,
+    bead_width: f64,
+    bead_height: f64,
+    final_segment_len: f64,
+) -> f64 {
+    if let Some(manual) = config.end_of_print_wipe_distance {
+        return manual.clamp(0.0, final_segment_len.max(0.0));
+    }
+
+    let nozzle_dia = config.nozzle_diameter;
+    let l_min = 0.5 * nozzle_dia;
+    let l_max = 5.0f64.min(final_segment_len.max(0.0));
+
+    if l_max <= l_min {
+        return l_max;
+    }
+
+    let q = (bead_width * bead_height * terminal_velocity_mm_s).max(0.0);
+    let c_pa = if let Some(engine) = fluid_engine {
+        engine.dynamic_pressure_advance(q, 0.0)
+    } else {
+        config.pressure_advance.unwrap_or(0.0)
+    };
+
+    let static_wipe = 1.0 * nozzle_dia;
+    let l_calc = (c_pa * terminal_velocity_mm_s) + static_wipe;
+
+    l_calc.clamp(l_min, l_max)
+}
+
 /// Chooses the Gcode feedrate (`Segment::speed`, mm/min) for a segment of
 /// the given `kind`, from `config` via its [`crate::kinematics::MotionModel`].
 #[must_use]
@@ -6531,5 +6564,51 @@ mod tests {
             }
         }
         assert!(sloped_count > 0, "Expected at least one sloped segment");
+    }
+
+    #[test]
+    fn calculate_end_of_print_wipe_distance_scales_with_velocity_and_pa() {
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            pressure_advance: Some(0.05),
+            ..SlicerConfig::default()
+        };
+
+        // At low velocity
+        let wipe_low_v = calculate_end_of_print_wipe_distance(&config, None, 10.0, 0.4, 0.2, 10.0);
+        // At high velocity (more stored pressure)
+        let wipe_high_v = calculate_end_of_print_wipe_distance(&config, None, 60.0, 0.4, 0.2, 10.0);
+
+        assert!(wipe_high_v > wipe_low_v);
+        assert!(wipe_low_v >= 0.5 * config.nozzle_diameter);
+        assert!(wipe_high_v <= 5.0);
+    }
+
+    #[test]
+    fn calculate_end_of_print_wipe_distance_clamps_to_segment_length() {
+        let config = SlicerConfig {
+            nozzle_diameter: 0.4,
+            pressure_advance: Some(0.10),
+            ..SlicerConfig::default()
+        };
+
+        // Segment is only 0.25mm long
+        let short_seg_len = 0.25;
+        let wipe_dist =
+            calculate_end_of_print_wipe_distance(&config, None, 100.0, 0.4, 0.2, short_seg_len);
+
+        assert!(wipe_dist <= short_seg_len);
+        assert!(wipe_dist > 0.0);
+    }
+
+    #[test]
+    fn calculate_end_of_print_wipe_distance_uses_manual_override() {
+        let config = SlicerConfig {
+            end_of_print_wipe_distance: Some(3.5),
+            ..SlicerConfig::default()
+        };
+
+        let wipe_dist = calculate_end_of_print_wipe_distance(&config, None, 20.0, 0.4, 0.2, 10.0);
+        assert_eq!(wipe_dist, 3.5);
     }
 }
