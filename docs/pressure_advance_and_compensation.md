@@ -91,8 +91,8 @@ To achieve predictable, consistent extrusion, calibrate each layer in isolation:
 
 If your printer runs across a wide flow range (e.g. 30 mm/s outer walls up to 250 mm/s infill):
 
-1. Measure PA at low flow ($Q_1 \approx 5\text{ mm}^3/\text{s}$, e.g. outer wall) $\to C_{\text{PA\_low}}$.
-2. Measure PA at high flow ($Q_2 \approx 20\text{--}30\text{ mm}^3/\text{s}$, e.g. rapid infill) $\to C_{\text{PA\_high}}$.
+1. Measure PA at low flow ($Q_1 \approx 5\text{ mm}^3/\text{s}$, e.g. outer wall) $\to C_{\text{PA,low}}$.
+2. Measure PA at high flow ($Q_2 \approx 20\text{--}30\text{ mm}^3/\text{s}$, e.g. rapid infill) $\to C_{\text{PA,high}}$.
 3. Configure `pa_calibration_low` and `pa_calibration_high` under `fluid_dynamics`.
 
 ### Step 4: Corner Flow Compensation (Fine-Tuning Only)
