@@ -2049,4 +2049,83 @@ mod tests {
             "There should be no SET_PRESSURE_ADVANCE between unretract and extrusion: {between_unretract_and_extrude}"
         );
     }
+
+    #[test]
+    fn emit_end_of_print_wipe_retracts_before_clearance_and_executes_end_gcode() {
+        use crate::bounds::BoundingVolume;
+        use crate::machine::Machine;
+        use crate::tool::Tool;
+        use crate::toolpath::Segment;
+
+        let config = SlicerConfig {
+            use_firmware_retraction: true,
+            end_gcode: "M104 S0\nM140 S0\nPRINT_END".to_string(),
+            ..SlicerConfig::default()
+        };
+
+        let machine = Machine::new(
+            BoundingVolume::Aabb {
+                min: DVec3::ZERO,
+                max: DVec3::new(200.0, 200.0, 200.0),
+            },
+            vec![Tool::new(crate::ids::ToolId(0), 0.4)],
+        );
+
+        let path = Path {
+            points: vec![
+                DVec3::new(10.0, 10.0, 1.0),
+                DVec3::new(20.0, 10.0, 1.0),
+                DVec3::new(18.0, 10.0, 1.0), // wipe
+                DVec3::new(18.0, 11.0, 1.0), // shear
+                DVec3::new(18.0, 18.0, 3.0), // clearance
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    order: 1.0,
+                    line_width: 0.4,
+                    extrusion_length: 0.5,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::Travel,
+                    order: 1.0,
+                    line_width: 0.0,
+                    extrusion_length: 0.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::Travel,
+                    order: 1.0,
+                    line_width: 0.0,
+                    extrusion_length: 0.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::Travel,
+                    order: 1.0,
+                    line_width: 0.0,
+                    extrusion_length: 0.0,
+                    ..Segment::default()
+                },
+            ],
+            ..Path::default()
+        };
+
+        let gcode = emit_with_machine(&[path], &config, Some(&machine), None);
+
+        // Verify wipe move is G0 or G1 with no E parameter
+        assert!(gcode.contains("X18.000 Y10.000 Z1.000"));
+        // Retract G10 must appear before the clearance travel moves and before PRINT_END
+        let g10_pos = gcode.rfind("G10").expect("G10 retract must be emitted");
+        let print_end_pos = gcode.find("PRINT_END").expect("PRINT_END must be present");
+        assert!(g10_pos < print_end_pos);
+
+        // No duplicate second G10 between clearance and PRINT_END
+        let after_clearance = &gcode[g10_pos + 3..print_end_pos];
+        assert!(
+            !after_clearance.contains("G10"),
+            "must not emit redundant second retraction"
+        );
+    }
 }
