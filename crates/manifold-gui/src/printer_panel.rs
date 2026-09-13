@@ -266,6 +266,9 @@ impl PrinterPanel {
             if let Some(error) = &self.action_error {ui.colored_label(Color32::RED,error);}
             if self.collapsed {return;}
             ui.separator();
+            egui::CollapsingHeader::new("Connection settings")
+                .default_open(false)
+                .show(ui, |ui| {
             ui.label("Draft URL:");
             self.has_settings |= ui.text_edit_singleline(&mut self.url_input).changed();
             ui.label("API key (stored in profile as plaintext):");
@@ -295,6 +298,7 @@ impl PrinterPanel {
                     Err(e) => self.action_error = Some(e),
                 }
             }
+                });
             if let Some(session) = session_opt.as_ref() {
                 let t = session.latest_telemetry();
                 ui.separator();
@@ -328,6 +332,113 @@ impl PrinterPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn panel_frame(
+        ctx: &egui::Context,
+        panel: &mut PrinterPanel,
+        session: &mut Option<PrinterSessionHandle>,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| panel.show(ui, session, |_| {}));
+            },
+        )
+    }
+
+    fn toggle_connection_settings(
+        ctx: &egui::Context,
+        panel: &mut PrinterPanel,
+        session: &mut Option<PrinterSessionHandle>,
+    ) -> egui::FullOutput {
+        let output = panel_frame(ctx, panel, session, vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "Connection settings" => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()).center())
+                }
+                _ => None,
+            })
+            .expect("Connection settings header must be visible");
+        for pressed in [true, false] {
+            panel_frame(
+                ctx,
+                panel,
+                session,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+            );
+        }
+        panel_frame(ctx, panel, session, vec![])
+    }
+
+    #[test]
+    fn connection_settings_start_collapsed_and_toggle_without_hiding_active_controls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut session = Some(PrinterSessionHandle::spawn(MoonrakerConfig {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            auto_connect: false,
+            api_key: None,
+        }));
+        let mut panel = PrinterPanel::new(None);
+        panel.action_error = Some("Visible action error".into());
+        let ctx = egui::Context::default();
+        let initial = panel_frame(&ctx, &mut panel, &mut session, vec![]);
+        let text = format!("{:?}", initial.shapes);
+        assert!(text.contains("Connection settings"));
+        assert!(!text.contains("Draft URL:"));
+        assert!(!text.contains("API key (stored in profile as plaintext):"));
+        assert!(!text.contains("Connect draft"));
+        for expected in [
+            "Active target:",
+            "Emergency Stop",
+            "Visible action error",
+            "Status:",
+            "Print:",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing {expected} with settings collapsed"
+            );
+        }
+        let expanded = toggle_connection_settings(&ctx, &mut panel, &mut session);
+        let text = format!("{:?}", expanded.shapes);
+        for expected in [
+            "Draft URL:",
+            "API key (stored in profile as plaintext):",
+            "Auto-connect when profile loads",
+            "Save connection settings",
+            "Connect draft",
+            "Disconnect",
+            "Reconnect active",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing {expected} with settings expanded"
+            );
+        }
+        let next_frame = panel_frame(&ctx, &mut panel, &mut session, vec![]);
+        assert!(format!("{:?}", next_frame.shapes).contains("Draft URL:"));
+        let collapsed = toggle_connection_settings(&ctx, &mut panel, &mut session);
+        let text = format!("{:?}", collapsed.shapes);
+        assert!(!text.contains("Draft URL:"));
+        assert!(text.contains("Emergency Stop"));
+        assert!(text.contains("Status:"));
+    }
 
     #[test]
     fn every_profile_replacement_retires_previous_target_even_with_retained_handle() {
@@ -380,9 +491,10 @@ mod tests {
         assert!(!saved.auto_connect);
         let ctx = egui::Context::default();
         let mut active = None;
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| panel.show(ui, &mut active, |_| {}));
-        });
+        let output = toggle_connection_settings(&ctx, &mut panel, &mut active);
+        assert!(
+            format!("{:?}", output.shapes).contains("API key (stored in profile as plaintext):")
+        );
         assert!(!format!("{:?}", output.shapes).contains("secret-draft-key"));
         assert!(active.is_none());
         panel.url_input = "ftp://example.invalid".into();
@@ -459,9 +571,7 @@ mod tests {
         let mut panel = PrinterPanel::new(None);
         panel.url_input = "http://draft.invalid".into();
         let ctx = egui::Context::default();
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| panel.show(ui, &mut session, |_| {}));
-        });
+        let output = toggle_connection_settings(&ctx, &mut panel, &mut session);
         let text = format!("{:?}", output.shapes);
         assert!(text.contains("Active target:"));
         assert!(text.contains("Draft URL:"));
