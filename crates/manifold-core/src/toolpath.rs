@@ -7115,76 +7115,100 @@ mod tests {
 
     #[test]
     fn append_end_of_print_wipe_transforms_mesh_to_world_space_for_clearance_check() {
-        let config = SlicerConfig {
-            end_of_print_wipe_enabled: true,
-            nozzle_diameter: 0.4,
-            wall_line_width: 0.4,
-            layer_height: 0.2,
-            ..SlicerConfig::default()
-        };
+        // `calculate_end_of_print_clearance` biases its exit direction off
+        // `mesh_sdf.sample(final_pt).gradient` (the CAD surface normal
+        // nearest `final_pt`), computed from `mesh_sdf`/`order_field`
+        // built in `append_end_of_print_wipe_and_clearance`. This proves
+        // those are built in WORLD space: run the same object mesh once
+        // sitting immediately beside the wipe point (identity transform)
+        // and once translated 1,000,000mm away, and assert the resulting
+        // shear point differs by more than a token amount between the two.
+        // A bug that samples the mesh in local (untransformed) coordinates
+        // would use the exact same nearby geometry in both cases and
+        // produce (near-)identical shear points regardless of transform.
+        fn run_with_transform(transform: crate::transform::Transform) -> DVec3 {
+            let config = SlicerConfig {
+                end_of_print_wipe_enabled: true,
+                nozzle_diameter: 0.4,
+                wall_line_width: 0.4,
+                layer_height: 0.2,
+                ..SlicerConfig::default()
+            };
 
-        let machine = Machine::new(
-            BoundingVolume::Aabb {
-                min: DVec3::ZERO,
-                max: DVec3::new(1000.0, 1000.0, 200.0),
-            },
-            vec![Tool::new(crate::ids::ToolId(0), 0.4)],
-        );
-
-        // The cube mesh spans local (0,0,0)-(10,10,10), which is directly
-        // beneath the print path below (10,10,1)-(20,20,1). Translate it
-        // far away in world space: a correctly world-space-transformed
-        // mesh must NOT obstruct the clearance travel, whereas feeding the
-        // untransformed local-space mesh into the SDF/order-field (the bug
-        // this test guards against) would place solid geometry directly
-        // under the clearance chord and spuriously elevate it.
-        let mesh = test_cube_mesh();
-        let mut object =
-            crate::object::Object::new(crate::ids::ObjectId(1), mesh, crate::ids::ToolId(0));
-        object.transform =
-            crate::transform::Transform::from_translation(DVec3::new(500.0, 500.0, 0.0));
-
-        let path = Path {
-            object: crate::ids::ObjectId(1),
-            points: vec![
-                DVec3::new(10.0, 10.0, 1.0),
-                DVec3::new(20.0, 10.0, 1.0),
-                DVec3::new(20.0, 20.0, 1.0),
-            ],
-            segments: vec![
-                Segment {
-                    kind: MoveKind::WallOuter,
-                    order: 1.0,
-                    line_width: 0.4,
-                    extrusion_length: 1.0,
-                    ..Segment::default()
+            let machine = Machine::new(
+                BoundingVolume::Aabb {
+                    min: DVec3::new(-2_000_000.0, -2_000_000.0, -2_000_000.0),
+                    max: DVec3::new(2_000_000.0, 2_000_000.0, 2_000_000.0),
                 },
-                Segment {
-                    kind: MoveKind::WallOuter,
-                    order: 1.0,
-                    line_width: 0.4,
-                    extrusion_length: 1.0,
-                    ..Segment::default()
-                },
-            ],
-            ..Path::default()
-        };
+                vec![Tool::new(crate::ids::ToolId(0), 0.4)],
+            );
 
-        let mut paths = vec![path];
-        let objects = vec![object];
+            // A cube immediately on the -Y side of the wipe point (20, 15, 1)
+            // computed below, so its nearest-surface gradient at that point
+            // points in +Y when sampled in world space at the identity
+            // transform.
+            let mesh = test_cube_mesh(); // local (0,0,0)-(10,10,10)
+            let mut object =
+                crate::object::Object::new(crate::ids::ObjectId(1), mesh, crate::ids::ToolId(0));
+            object.transform = transform.then_translate(DVec3::new(15.0, 5.0, -4.0));
 
-        append_end_of_print_wipe_and_clearance(&mut paths, &objects, &machine, &config).unwrap();
+            let path = Path {
+                object: crate::ids::ObjectId(1),
+                points: vec![
+                    DVec3::new(10.0, 10.0, 1.0),
+                    DVec3::new(20.0, 10.0, 1.0),
+                    DVec3::new(20.0, 20.0, 1.0),
+                ],
+                segments: vec![
+                    Segment {
+                        kind: MoveKind::WallOuter,
+                        order: 1.0,
+                        line_width: 0.4,
+                        extrusion_length: 1.0,
+                        ..Segment::default()
+                    },
+                    Segment {
+                        kind: MoveKind::WallOuter,
+                        order: 1.0,
+                        line_width: 0.4,
+                        extrusion_length: 1.0,
+                        ..Segment::default()
+                    },
+                ],
+                ..Path::default()
+            };
 
-        let last_path = paths.last().unwrap();
-        let final_pt = *last_path.points.last().unwrap();
-        // With the cube correctly translated out of the way, the clearance Z
-        // stays at the baseline lift (1.0 + 2.0 = 3.0) rather than being
-        // elevated to clear a false obstruction sampled from the
-        // untransformed local-space mesh sitting directly under the path.
+            let mut paths = vec![path];
+            let objects = vec![object];
+
+            append_end_of_print_wipe_and_clearance(&mut paths, &objects, &machine, &config)
+                .unwrap();
+            // The shear point (second-to-last point: wipe, shear, clearance).
+            let pts = &paths.last().unwrap().points;
+            pts[pts.len() - 2]
+        }
+
+        // Object translated by `then_translate` on top of identity: mesh
+        // sits right beside the wipe point in world space, biasing the
+        // shear point measurably off the plain reverse-wipe direction.
+        let shear_near = run_with_transform(crate::transform::Transform::identity());
+
+        // Object translated by `then_translate` on top of an additional
+        // 1,000,000mm offset: with the world-space transform correctly
+        // applied, the mesh sits nowhere near the print, so the nearest-
+        // surface gradient direction (and hence the shear point) must come
+        // out substantially different from the nearby-mesh case above.
+        let shear_far = run_with_transform(crate::transform::Transform::from_translation(
+            DVec3::new(1_000_000.0, 1_000_000.0, 1_000_000.0),
+        ));
+
+        let delta = shear_near.distance(shear_far);
         assert!(
-            final_pt.z < 3.5,
-            "clearance unexpectedly elevated by mis-transformed mesh: z={}",
-            final_pt.z
+            delta > 0.05,
+            "expected the world-space-transformed mesh position to measurably change the \
+             CAD-normal-biased shear point (bug: local-space sampling ignores the transform \
+             entirely, producing near-identical points); shear_near={shear_near:?} \
+             shear_far={shear_far:?} delta={delta}"
         );
     }
 }
