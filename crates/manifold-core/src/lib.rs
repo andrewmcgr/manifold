@@ -1419,41 +1419,15 @@ pub fn plan_toolpaths_with_progress(
         );
     }
 
-    if workspace.config.enable_slicer_pressure_advance {
-        let motion_model = workspace
-            .config
-            .resolved_motion_model(Some(&workspace.machine));
-        paths = paths
-            .into_iter()
-            .map(|path| {
-                let is_first_layer = path.segments.first().is_some_and(|s| {
-                    (s.order - workspace.config.first_layer_height()).abs() < 1e-4
-                        || s.order <= workspace.config.first_layer_height()
-                });
-                let profiles = kinematics::plan_path_velocities(
-                    &path.points,
-                    &path.segments,
-                    motion_model.as_ref(),
-                    is_first_layer,
-                    workspace.config.square_corner_velocity(),
-                    workspace.config.minimum_cruise_ratio(),
-                );
-                let tool_temp = workspace
-                    .machine
-                    .tools
-                    .iter()
-                    .find(|t| t.id == path.tool)
-                    .map(tool::Tool::nozzle_temperature);
-                let fluid_engine = workspace.config.fluid_dynamics_engine(tool_temp);
-                subdivide_pa::subdivide_path_for_pressure_advance(
-                    path,
-                    &profiles,
-                    &workspace.config,
-                    fluid_engine.as_ref(),
-                )
-            })
-            .collect();
-    }
+    // NOTE: slicer-side pressure-advance subdivision is intentionally NOT
+    // applied here. `gcode::emit_with_machine` (the sole consumer of
+    // these paths for actual Gcode text, via `slice_to_gcode(_with_progress)`
+    // and the GUI's `finish_slice`) already subdivides+bakes pressure
+    // advance into `extrusion_length` internally, using chained
+    // cross-path velocity profiles (`kinematics::plan_chained_path_velocities`)
+    // that are more accurate than the independent per-path profiles this
+    // function would otherwise compute. Baking it here too would double-
+    // apply the pressure-advance extrusion boost on top of itself.
 
     toolpath::append_end_of_print_wipe_and_clearance(
         &mut paths,
@@ -1718,6 +1692,98 @@ mod tests {
 
         let err = slice_to_gcode(&workspace).unwrap_err();
         assert!(matches!(err, Error::MoveOutOfBounds { .. }));
+    }
+
+    /// Regression test for a dual-application bug: `plan_toolpaths` used to
+    /// bake slicer-side pressure-advance compensation into
+    /// `Segment::extrusion_length` (subdividing moves and inflating E)
+    /// whenever `enable_slicer_pressure_advance` was set, and then
+    /// `gcode::emit_with_machine` -- the only real consumer of these same
+    /// paths, via `slice_to_gcode`/`slice_to_gcode_with_progress` and the
+    /// GUI's `finish_slice` -- baked it in AGAIN on top, roughly doubling
+    /// the pressure-advance extrusion boost actually printed. `plan_toolpaths`
+    /// must leave paths untouched by pressure-advance subdivision
+    /// regardless of the flag: baking happens exactly once, inside
+    /// `gcode::emit_with_machine`.
+    #[test]
+    fn plan_toolpaths_does_not_bake_slicer_pressure_advance_leaving_it_to_gcode_emit() {
+        let machine = crate::machine::Machine::new(
+            crate::bounds::BoundingVolume::Aabb {
+                min: glam::DVec3::new(-10.0, -10.0, -10.0),
+                max: glam::DVec3::new(10.0, 10.0, 10.0),
+            },
+            Vec::new(),
+        );
+        let object =
+            crate::object::Object::new(crate::ids::ObjectId(0), cube_mesh(), crate::ids::ToolId(0));
+
+        let fluid_dynamics = Some(crate::fluid_dynamics::FluidDynamicsConfig {
+            pa_calibration_low: (0.045, 2.0),
+            pa_calibration_high: (0.025, 15.0),
+            ..Default::default()
+        });
+
+        // `fluid_dynamics` is held constant across both configs (it also
+        // feeds adaptive retraction/corner-flow elsewhere in
+        // `toolpath::plan_with_progress`, independent of pressure
+        // advance) so only `enable_slicer_pressure_advance` differs.
+        let config_pa_off = SlicerConfig {
+            layer_height: 0.25,
+            enable_slicer_pressure_advance: false,
+            pressure_advance: Some(0.05),
+            fluid_dynamics,
+            // Low acceleration relative to the cube's ~10mm wall segments
+            // guarantees the whole segment is a continuous acceleration
+            // ramp (never reaching cruise), so `subdivide_pa` actually
+            // has non-trivial E*(s) curvature to subdivide against.
+            outer_wall_acceleration: Some(50.0),
+            first_layer_acceleration: Some(50.0),
+            outer_wall_speed: Some(18000.0),
+            slicer_pa_tolerance_mm: Some(0.0005),
+            slicer_pa_min_segment_length: Some(0.01),
+            ..SlicerConfig::default()
+        };
+        let workspace_pa_off = Workspace::new(vec![object.clone()], machine.clone(), config_pa_off);
+        let paths_pa_off = plan_toolpaths(&workspace_pa_off).unwrap();
+
+        let config_pa_on = SlicerConfig {
+            layer_height: 0.25,
+            enable_slicer_pressure_advance: true,
+            pressure_advance: Some(0.05),
+            fluid_dynamics,
+            outer_wall_acceleration: Some(50.0),
+            first_layer_acceleration: Some(50.0),
+            outer_wall_speed: Some(18000.0),
+            slicer_pa_tolerance_mm: Some(0.0005),
+            slicer_pa_min_segment_length: Some(0.01),
+            ..SlicerConfig::default()
+        };
+        let workspace_pa_on = Workspace::new(vec![object], machine, config_pa_on);
+        let paths_pa_on = plan_toolpaths(&workspace_pa_on).unwrap();
+
+        // If `plan_toolpaths` baked pressure advance itself, enabling it
+        // would subdivide extruding moves into many more, shorter
+        // segments. With the fix, segment/point counts (and per-segment
+        // extrusion lengths) must be identical either way -- pressure
+        // advance subdivision only happens later, inside `gcode::emit`.
+        assert_eq!(paths_pa_off.len(), paths_pa_on.len());
+        for (off, on) in paths_pa_off.iter().zip(paths_pa_on.iter()) {
+            assert_eq!(
+                off.segments.len(),
+                on.segments.len(),
+                "plan_toolpaths must not subdivide for pressure advance"
+            );
+            assert_eq!(off.points.len(), on.points.len());
+            for (seg_off, seg_on) in off.segments.iter().zip(on.segments.iter()) {
+                assert!(
+                    (seg_off.extrusion_length - seg_on.extrusion_length).abs() < 1e-9,
+                    "plan_toolpaths must not alter extrusion_length for pressure advance: \
+                     off={} on={}",
+                    seg_off.extrusion_length,
+                    seg_on.extrusion_length
+                );
+            }
+        }
     }
 
     #[test]
