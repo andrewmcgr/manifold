@@ -2420,26 +2420,38 @@ pub fn append_end_of_print_wipe_and_clearance(
     };
     let bead_h = config.layer_height;
     let active_obj = objects.iter().find(|o| o.id == path.object);
-    let faces: Vec<[usize; 3]> = active_obj
-        .map(|o| {
+    let world_mesh = active_obj.map(|o| {
+        crate::mesh::Mesh::new(
             o.mesh
-                .indices
+                .vertices
+                .iter()
+                .map(|&v| o.transform.transform_point(v))
+                .collect(),
+            o.mesh.indices.clone(),
+        )
+    });
+    let faces: Vec<[usize; 3]> = world_mesh
+        .as_ref()
+        .map(|m| {
+            m.indices
                 .chunks_exact(3)
                 .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
                 .collect()
         })
         .unwrap_or_default();
     let mesh_sdf = if !faces.is_empty() {
-        active_obj.map(|o| manifold_fidget::mesh_sdf::MeshSdf::new(o.mesh.vertices.clone(), faces))
+        world_mesh
+            .as_ref()
+            .map(|m| manifold_fidget::mesh_sdf::MeshSdf::new(m.vertices.clone(), faces))
     } else {
         None
     };
     let order_field_owned;
-    let order_field: Option<&dyn OrderField> = if let Some(obj) = active_obj {
+    let order_field: Option<&dyn OrderField> = if let Some(ref m) = world_mesh {
         order_field_owned = crate::order_field::order_field_for(
             config.order_field,
             config,
-            &obj.mesh,
+            m,
             &machine.slope_profile(),
         );
         Some(order_field_owned.as_ref())
@@ -7099,5 +7111,80 @@ mod tests {
         // Clearance point at the end
         let final_pt = *last_path.points.last().unwrap();
         assert!(final_pt.z >= 3.0);
+    }
+
+    #[test]
+    fn append_end_of_print_wipe_transforms_mesh_to_world_space_for_clearance_check() {
+        let config = SlicerConfig {
+            end_of_print_wipe_enabled: true,
+            nozzle_diameter: 0.4,
+            wall_line_width: 0.4,
+            layer_height: 0.2,
+            ..SlicerConfig::default()
+        };
+
+        let machine = Machine::new(
+            BoundingVolume::Aabb {
+                min: DVec3::ZERO,
+                max: DVec3::new(1000.0, 1000.0, 200.0),
+            },
+            vec![Tool::new(crate::ids::ToolId(0), 0.4)],
+        );
+
+        // The cube mesh spans local (0,0,0)-(10,10,10), which is directly
+        // beneath the print path below (10,10,1)-(20,20,1). Translate it
+        // far away in world space: a correctly world-space-transformed
+        // mesh must NOT obstruct the clearance travel, whereas feeding the
+        // untransformed local-space mesh into the SDF/order-field (the bug
+        // this test guards against) would place solid geometry directly
+        // under the clearance chord and spuriously elevate it.
+        let mesh = test_cube_mesh();
+        let mut object =
+            crate::object::Object::new(crate::ids::ObjectId(1), mesh, crate::ids::ToolId(0));
+        object.transform =
+            crate::transform::Transform::from_translation(DVec3::new(500.0, 500.0, 0.0));
+
+        let path = Path {
+            object: crate::ids::ObjectId(1),
+            points: vec![
+                DVec3::new(10.0, 10.0, 1.0),
+                DVec3::new(20.0, 10.0, 1.0),
+                DVec3::new(20.0, 20.0, 1.0),
+            ],
+            segments: vec![
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    order: 1.0,
+                    line_width: 0.4,
+                    extrusion_length: 1.0,
+                    ..Segment::default()
+                },
+                Segment {
+                    kind: MoveKind::WallOuter,
+                    order: 1.0,
+                    line_width: 0.4,
+                    extrusion_length: 1.0,
+                    ..Segment::default()
+                },
+            ],
+            ..Path::default()
+        };
+
+        let mut paths = vec![path];
+        let objects = vec![object];
+
+        append_end_of_print_wipe_and_clearance(&mut paths, &objects, &machine, &config).unwrap();
+
+        let last_path = paths.last().unwrap();
+        let final_pt = *last_path.points.last().unwrap();
+        // With the cube correctly translated out of the way, the clearance Z
+        // stays at the baseline lift (1.0 + 2.0 = 3.0) rather than being
+        // elevated to clear a false obstruction sampled from the
+        // untransformed local-space mesh sitting directly under the path.
+        assert!(
+            final_pt.z < 3.5,
+            "clearance unexpectedly elevated by mis-transformed mesh: z={}",
+            final_pt.z
+        );
     }
 }

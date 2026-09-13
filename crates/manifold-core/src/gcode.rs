@@ -2069,6 +2069,79 @@ mod tests {
     }
 
     #[test]
+    fn emit_slicer_pressure_advance_suppresses_dynamic_pa_when_fluid_dynamics_configured() {
+        use crate::fluid_dynamics::FluidDynamicsConfig;
+        use crate::toolpath::Segment;
+        use glam::DVec3;
+
+        // Both slicer-side pressure advance AND a fluid-dynamics engine are
+        // configured together — the exact combination that previously
+        // caused dual-PA (firmware PA re-enabled mid-print on top of
+        // slicer-baked E-advance). With slicer PA active, firmware PA must
+        // stay at 0 for the entire print: no dynamic SET_PRESSURE_ADVANCE
+        // may be emitted past the header's ADVANCE=0.
+        let path1 = Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.2), DVec3::new(20.0, 0.0, 0.2)],
+            segments: vec![Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 1.0,
+                speed: 6000.0,
+                order: 0.2,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        };
+
+        let path2 = Path {
+            points: vec![DVec3::new(50.0, 50.0, 0.4), DVec3::new(70.0, 50.0, 0.4)],
+            segments: vec![Segment {
+                kind: MoveKind::Infill,
+                extrusion_length: 1.0,
+                speed: 12000.0,
+                order: 0.4,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        };
+
+        let config = SlicerConfig {
+            enable_slicer_pressure_advance: true,
+            pressure_advance: Some(0.05),
+            slicer_pa_tolerance_mm: Some(0.002),
+            slicer_pa_min_segment_length: Some(0.5),
+            fluid_dynamics: Some(FluidDynamicsConfig {
+                pa_calibration_low: (0.045, 2.0),
+                pa_calibration_high: (0.025, 15.0),
+                static_retraction_mm: 0.15,
+                ..Default::default()
+            }),
+            retraction_speed: Some(3600.0),
+            unretract_speed: Some(2400.0),
+            outer_wall_speed: Some(6000.0),
+            infill_speed: Some(12000.0),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&[path1, path2], &config);
+
+        // Header disables firmware PA exactly once.
+        assert!(out.contains("SET_PRESSURE_ADVANCE ADVANCE=0\n"));
+        // No dynamic (non-zero) SET_PRESSURE_ADVANCE may appear anywhere,
+        // even though a fluid_dynamics engine is configured.
+        let pa_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("SET_PRESSURE_ADVANCE"))
+            .collect();
+        assert_eq!(
+            pa_lines,
+            vec!["SET_PRESSURE_ADVANCE ADVANCE=0"],
+            "expected only the single header ADVANCE=0 line, found: {pa_lines:?}"
+        );
+    }
+
+    #[test]
     fn emit_end_of_print_wipe_retracts_before_clearance_and_executes_end_gcode() {
         use crate::bounds::BoundingVolume;
         use crate::machine::Machine;
