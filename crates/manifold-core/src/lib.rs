@@ -548,6 +548,21 @@ pub struct SlicerConfig {
     /// Defaults to 8.
     #[serde(default)]
     pub fsm_max_sweeps: Option<usize>,
+    /// Whether to perform an automated pressure-bleed wipe and clearance move at the end of the print.
+    /// Defaults to true.
+    #[serde(default = "default_true")]
+    pub end_of_print_wipe_enabled: bool,
+    /// Optional manual override for the end wipe distance in mm.
+    /// When None, dynamically derived from the fluid pressure advance model.
+    #[serde(default)]
+    pub end_of_print_wipe_distance: Option<f64>,
+    /// Vertical Z lift in mm applied during the final clearance move. Defaults to 2.0 mm when None.
+    #[serde(default)]
+    pub end_of_print_clearance_z_lift: Option<f64>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Static serde-deserialize fallback for [`SlicerConfig::wall_offset`]: `0.20` mm.
@@ -739,11 +754,23 @@ impl Default for SlicerConfig {
             enable_transient_pressure_compensation: false,
             transient_pressure_min_multiplier: None,
             transient_pressure_beta: None,
+            end_of_print_wipe_enabled: true,
+            end_of_print_wipe_distance: None,
+            end_of_print_clearance_z_lift: None,
         }
     }
 }
 
 impl SlicerConfig {
+    #[must_use]
+    pub fn end_of_print_wipe_enabled(&self) -> bool {
+        self.end_of_print_wipe_enabled
+    }
+
+    #[must_use]
+    pub fn end_of_print_clearance_z_lift(&self) -> f64 {
+        self.end_of_print_clearance_z_lift.unwrap_or(2.0).max(0.0)
+    }
     /// Infill pattern for sparse interior regions, defaulting to
     /// [`infill::InfillPatternKind::Cubic`] when not set.
     #[must_use]
@@ -1683,5 +1710,27 @@ mod tests {
 
         let err = slice_to_gcode(&workspace).unwrap_err();
         assert!(matches!(err, Error::MoveOutOfBounds { .. }));
+    }
+
+    #[test]
+    fn default_end_of_print_wipe_config_is_sane() {
+        let config = SlicerConfig::default();
+        assert!(config.end_of_print_wipe_enabled());
+        assert_eq!(config.end_of_print_wipe_distance, None);
+        assert_eq!(config.end_of_print_clearance_z_lift(), 2.0);
+    }
+
+    #[test]
+    fn end_of_print_wipe_config_deserialization_defaults() {
+        let config_default = SlicerConfig::default();
+        let mut value = serde_json::to_value(&config_default).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("end_of_print_wipe_enabled");
+        obj.remove("end_of_print_wipe_distance");
+        obj.remove("end_of_print_clearance_z_lift");
+        let json = serde_json::to_string(&value).unwrap();
+        let config: SlicerConfig = serde_json::from_str(&json).unwrap();
+        assert!(config.end_of_print_wipe_enabled());
+        assert_eq!(config.end_of_print_clearance_z_lift(), 2.0);
     }
 }
