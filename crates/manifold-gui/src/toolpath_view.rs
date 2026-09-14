@@ -137,6 +137,23 @@ pub enum ToolpathDataView {
     /// at or below the low-flow plateau, 1.0 = pinned at or above the high-flow plateau,
     /// log-space interpolated in between.
     PressureAdvanceBlend,
+    /// Real dynamic pressure-advance value (seconds) from the configured
+    /// `fluid_dynamics::FluidDynamicsEngine::dynamic_pressure_advance`,
+    /// evaluated at each segment's own flow rate with a fixed 0.0 (no-
+    /// cooling) fan fraction -- per-segment fan speed isn't tracked, so
+    /// this zeroes only the fan's contribution rather than guessing a
+    /// cooling state. This is NOT full temperature neutrality: the
+    /// nozzle temperature is still `SlicerConfig::default_nozzle_
+    /// temperature()` (no per-tool live temperature is available here
+    /// -- `segment_scalar_value_with_profile` only receives the bare
+    /// `Segment`, not its parent `Path`/tool), which can genuinely
+    /// differ from the calibration's own `reference_temp_c` (e.g. a
+    /// material calibrated at one temperature but sliced at another),
+    /// producing a real, non-cosmetic temperature-correction term in
+    /// that case. Falls back to the static
+    /// `SlicerConfig::pressure_advance` when no fluid-dynamics model is
+    /// configured, matching `transient_pressure`'s own fallback.
+    PressureAdvanceValue,
 }
 
 impl ToolpathDataView {
@@ -156,6 +173,7 @@ impl ToolpathDataView {
             Self::TransientPressureMultiplier => "Transient Pressure Multiplier",
             Self::SlopeCosine => "Slope Cosine",
             Self::PressureAdvanceBlend => "PA Blend Zone",
+            Self::PressureAdvanceValue => "Pressure Advance",
         }
     }
 
@@ -174,6 +192,7 @@ impl ToolpathDataView {
             | Self::CornerFlowMultiplier
             | Self::TransientPressureMultiplier
             | Self::SlopeCosine => "x",
+            Self::PressureAdvanceValue => "s",
         }
     }
 }
@@ -326,6 +345,16 @@ pub fn segment_scalar_value_with_profile(
             let q_low = fd.pa_calibration_low.1.max(0.1);
             let q_high = fd.pa_calibration_high.1.max(q_low + 0.1);
             ((q.ln() - q_low.ln()) / (q_high.ln() - q_low.ln())).clamp(0.0, 1.0)
+        }
+        ToolpathDataView::PressureAdvanceValue => {
+            let q = segment_flow_rate_mm3_s(segment, diff, config);
+            if q <= 1e-6 {
+                return 0.0;
+            }
+            match config.fluid_dynamics_engine(None) {
+                Some(engine) => engine.dynamic_pressure_advance(q, 0.0),
+                None => config.pressure_advance.unwrap_or(0.0),
+            }
         }
     }
 }
@@ -646,6 +675,7 @@ pub fn build_toolpath_lines_filtered(
                     | ToolpathDataView::CornerFlowMultiplier
                     | ToolpathDataView::TransientPressureMultiplier
                     | ToolpathDataView::PressureAdvanceBlend
+                    | ToolpathDataView::PressureAdvanceValue
                     | ToolpathDataView::SlopeCosine => COLOR_TRAVEL,
                     _ => {
                         let val = segment_scalar_value(
@@ -750,6 +780,7 @@ pub fn build_toolpath_lines_filtered(
                 | ToolpathDataView::TransientPressureMultiplier
                 | ToolpathDataView::SlopeCosine
                 | ToolpathDataView::PressureAdvanceBlend
+                | ToolpathDataView::PressureAdvanceValue
                     if segment.kind == MoveKind::Travel =>
                 {
                     COLOR_TRAVEL
@@ -1455,5 +1486,104 @@ mod tests {
             None,
         );
         assert_eq!(val, 0.0);
+    }
+
+    #[test]
+    fn pressure_advance_value_view_matches_the_real_calibrated_model() {
+        let fluid_dynamics = manifold_core::fluid_dynamics::FluidDynamicsConfig {
+            pa_calibration_low: (0.045, 2.0),
+            pa_calibration_high: (0.030, 8.0),
+            ..manifold_core::fluid_dynamics::FluidDynamicsConfig::default()
+        };
+        let config = manifold_core::SlicerConfig {
+            filament_diameter: 2.0,
+            fluid_dynamics: Some(fluid_dynamics),
+            ..manifold_core::SlicerConfig::default()
+        };
+        let start = DVec3::new(0.0, 0.0, 0.0);
+        let end = DVec3::new(10.0, 0.0, 0.0);
+
+        // Same flow-rate construction as the PA-blend test above: q =
+        // extrusion_length * fil_area / duration.
+        let seg_for_flow = |q: f64| Segment {
+            kind: MoveKind::WallOuter,
+            extrusion_length: q * 10.0 / std::f64::consts::PI,
+            speed: 60.0,
+            ..Segment::default()
+        };
+        let pa_value_at = |q: f64| {
+            segment_scalar_value(
+                &seg_for_flow(q),
+                start,
+                end,
+                ToolpathDataView::PressureAdvanceValue,
+                &config,
+                None,
+            )
+        };
+
+        // The two-point calibration curve is constructed to pass through
+        // both calibration points exactly -- default_nozzle_temperature()
+        // (240.0C) matches FluidDynamicsConfig::default()'s reference_temp_c
+        // (240.0C), so the temperature-correction term is a no-op here and
+        // this is an exact, not approximate, check.
+        assert!(
+            (pa_value_at(2.0) - 0.045).abs() < 1e-9,
+            "PA at q_low must equal the calibrated low-flow value exactly, got {}",
+            pa_value_at(2.0)
+        );
+        assert!(
+            (pa_value_at(8.0) - 0.030).abs() < 1e-9,
+            "PA at q_high must equal the calibrated high-flow value exactly, got {}",
+            pa_value_at(8.0)
+        );
+
+        // Shear-thinning: PA strictly decreases as flow rate increases, so
+        // an intermediate flow rate must land strictly between the two
+        // calibration points, not just clamp to one end.
+        let pa_mid = pa_value_at(4.0);
+        assert!(
+            pa_mid > 0.030 && pa_mid < 0.045,
+            "PA at an intermediate flow rate must lie strictly between the calibration points, got {pa_mid}"
+        );
+
+        // Travel moves carry no flow-rate signal and must report 0.0, not
+        // extrapolate a spurious PA value from a zero flow rate.
+        let travel = Segment {
+            kind: MoveKind::Travel,
+            extrusion_length: 0.0,
+            speed: 60.0,
+            ..Segment::default()
+        };
+        assert_eq!(
+            segment_scalar_value(
+                &travel,
+                start,
+                end,
+                ToolpathDataView::PressureAdvanceValue,
+                &config,
+                None,
+            ),
+            0.0
+        );
+
+        // With no fluid-dynamics model configured, fall back to the static
+        // pressure_advance config value -- matching transient_pressure's
+        // own fallback for the identical case.
+        let static_config = manifold_core::SlicerConfig {
+            filament_diameter: 2.0,
+            fluid_dynamics: None,
+            pressure_advance: Some(0.035),
+            ..manifold_core::SlicerConfig::default()
+        };
+        let val = segment_scalar_value(
+            &seg_for_flow(4.0),
+            start,
+            end,
+            ToolpathDataView::PressureAdvanceValue,
+            &static_config,
+            None,
+        );
+        assert_eq!(val, 0.035);
     }
 }
