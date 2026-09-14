@@ -348,26 +348,6 @@ fn fsm_field_for(
 
     let seed_surfaces_enabled = config.fsm_seed_surfaces_enabled;
     let seed_max_angle_deg = config.fsm_seed_max_angle_deg();
-    let is_seed_region = move |p: DVec3| {
-        if let Some(v) = is_seed_region_bed(p) {
-            return Some(v);
-        }
-        if !seed_surfaces_enabled {
-            return None;
-        }
-        let sample = sdf.sample(p);
-        if sample.value.abs() > seed_tolerance {
-            return None;
-        }
-        if !is_upward_within_angle(sample.gradient, seed_max_angle_deg) {
-            return None;
-        }
-        // A patch seed partway up the model carries its own real height
-        // along the build direction, not the bed's 0.0 -- otherwise it
-        // becomes a spurious second build plate the sweep treats as
-        // equally "nearest" in every direction around it.
-        Some(p.dot(BUILD_DIRECTION))
-    };
 
     let (dims, h, actual_min) = AnisotropicFsmOrderField::compute_grid_dims(min, max, cell_size);
     let mut tensor_grid = TensorGrid::new_isotropic(actual_min, dims, h);
@@ -393,6 +373,60 @@ fn fsm_field_for(
 
     let height_along = ConstantAxisHeight::new(BUILD_DIRECTION, min);
     let max_sweeps = config.fsm_max_sweeps();
+
+    if !seed_surfaces_enabled {
+        return AnisotropicFsmOrderField::solve_with_tensor_grid(
+            actual_min,
+            dims,
+            h,
+            &tensor_grid,
+            &is_solid,
+            &is_seed_region_bed,
+            max_sweeps,
+            Some(slope_profile),
+            Some(&height_along),
+        );
+    }
+
+    // Solve once with only the bed seeded (identical to the `seed_surfaces_enabled ==
+    // false` path above) to learn each candidate patch's *self-consistent* order
+    // value before seeding patches back in -- see `patch_seed_values`'s doc for why
+    // seeding a patch at its own geometric height instead produces a spurious sink.
+    let baseline = AnisotropicFsmOrderField::solve_with_tensor_grid(
+        actual_min,
+        dims,
+        h,
+        &tensor_grid,
+        &is_solid,
+        &is_seed_region_bed,
+        max_sweeps,
+        Some(slope_profile),
+        Some(&height_along),
+    );
+    let (component_id, component_value) = patch_seed_values(
+        dims,
+        h,
+        actual_min,
+        &is_solid,
+        &is_seed_region_bed,
+        sdf,
+        seed_tolerance,
+        seed_max_angle_deg,
+        &baseline,
+    );
+    let [nx, ny, _nz] = dims;
+    let is_seed_region = |p: DVec3| {
+        if let Some(v) = is_seed_region_bed(p) {
+            return Some(v);
+        }
+        let x = ((p.x - actual_min.x) / h).round() as usize;
+        let y = ((p.y - actual_min.y) / h).round() as usize;
+        let z = ((p.z - actual_min.z) / h).round() as usize;
+        let idx = x + y * nx + z * nx * ny;
+        let comp = *component_id.get(idx)?;
+        (comp >= 0).then(|| component_value[comp as usize])
+    };
+
     AnisotropicFsmOrderField::solve_with_tensor_grid(
         actual_min,
         dims,
@@ -404,6 +438,116 @@ fn fsm_field_for(
         Some(slope_profile),
         Some(&height_along),
     )
+}
+
+/// Groups upward-facing surface-patch seed candidates (see `fsm_field_for`'s
+/// `is_seed_region`) into 6-connected components on the FSM grid and assigns each
+/// component a single consensus order value -- the *maximum* order value an unseeded
+/// ("bed-only") baseline solve of the same tensor grid already assigned any of that
+/// component's member nodes.
+///
+/// Seeding a patch at its own geometric height (`p.dot(BUILD_DIRECTION)`, the
+/// pre-existing approach) makes it a second Dirichlet source that
+/// `AnisotropicFsmOrderField::solve_with_tensor_grid`'s bidirectional min-cost sweep
+/// can reach *more cheaply* than the correct bed-only path -- especially once
+/// `fsm_top_tangency_aspect` stretches the metric near the top -- producing a
+/// local-minimum funnel directly under the patch (order dips non-monotonically along
+/// `BUILD_DIRECTION` right there, then rises again), which downstream layer/infill
+/// extraction reads as a hole. What the feature actually needs from a seed is an
+/// *equality constraint* -- every point on the patch ends up at the same order value,
+/// so isosurfaces run flat and tangent across it -- not a specific, externally
+/// dictated value. The *maximum* (not mean) of the baseline's own values across the
+/// patch is used deliberately: any lower reduction (mean, median, ...) would still
+/// pull some member nodes below their own already-correct baseline value, which is
+/// exactly the artificial shortcut this seeding is trying to eliminate -- the maximum
+/// is the smallest value that is provably never cheaper to reach via the seed than via
+/// the baseline path already was, for every node in the patch.
+///
+#[allow(clippy::too_many_arguments)]
+fn patch_seed_values(
+    dims: [usize; 3],
+    h: f64,
+    actual_min: DVec3,
+    is_solid: &dyn Fn(DVec3) -> bool,
+    is_seed_region_bed: &dyn Fn(DVec3) -> Option<f64>,
+    sdf: &MeshSdf,
+    seed_tolerance: f64,
+    seed_max_angle_deg: f64,
+    baseline: &AnisotropicFsmOrderField,
+) -> (Vec<i32>, Vec<f64>) {
+    let [nx, ny, nz] = dims;
+    let total = nx * ny * nz;
+    let idx_of = |x: usize, y: usize, z: usize| x + y * nx + z * nx * ny;
+    let node_pos =
+        |x: usize, y: usize, z: usize| actual_min + DVec3::new(x as f64, y as f64, z as f64) * h;
+
+    let mut is_patch = vec![false; total];
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let p = node_pos(x, y, z);
+                if !is_solid(p) || is_seed_region_bed(p).is_some() {
+                    continue;
+                }
+                let sample = sdf.sample(p);
+                if sample.value.abs() > seed_tolerance {
+                    continue;
+                }
+                if is_upward_within_angle(sample.gradient, seed_max_angle_deg) {
+                    is_patch[idx_of(x, y, z)] = true;
+                }
+            }
+        }
+    }
+
+    // 6-connected flood fill: each connected component of qualifying nodes gets its
+    // own consensus value, since a mesh can have several disjoint flat/near-flat
+    // regions (e.g. several flat mechanical faces at different heights).
+    let mut component_id = vec![-1i32; total];
+    let mut component_max: Vec<f64> = Vec::new();
+    let mut stack = Vec::new();
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let start = idx_of(x, y, z);
+                if !is_patch[start] || component_id[start] >= 0 {
+                    continue;
+                }
+                let comp = component_max.len() as i32;
+                component_max.push(f64::NEG_INFINITY);
+                component_id[start] = comp;
+                stack.push((x, y, z));
+                while let Some((cx, cy, cz)) = stack.pop() {
+                    let v = baseline.order(node_pos(cx, cy, cz));
+                    let slot = &mut component_max[comp as usize];
+                    if v.is_finite() && v > *slot {
+                        *slot = v;
+                    }
+                    let neighbors = [
+                        cx.checked_sub(1).map(|x| (x, cy, cz)),
+                        (cx + 1 < nx).then_some((cx + 1, cy, cz)),
+                        cy.checked_sub(1).map(|y| (cx, y, cz)),
+                        (cy + 1 < ny).then_some((cx, cy + 1, cz)),
+                        cz.checked_sub(1).map(|z| (cx, cy, z)),
+                        (cz + 1 < nz).then_some((cx, cy, cz + 1)),
+                    ];
+                    for (nx_, ny_, nz_) in neighbors.into_iter().flatten() {
+                        let nidx = idx_of(nx_, ny_, nz_);
+                        if is_patch[nidx] && component_id[nidx] < 0 {
+                            component_id[nidx] = comp;
+                            stack.push((nx_, ny_, nz_));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let component_value: Vec<f64> = component_max
+        .into_iter()
+        .map(|v| if v.is_finite() { v } else { 0.0 })
+        .collect();
+    (component_id, component_value)
 }
 
 /// Hard cap on the dense Eikonal grid's total node count (`dims[0] *

@@ -229,25 +229,38 @@ pub fn plan_gap_fill_for_wall(
             let n_order = g_order / o_len;
             let cross_len = n_cad.cross(n_order).length();
 
-            if cross_len > 1e-4 && cross_len.is_finite() {
-                let ds = config.wall_line_width / cross_len;
-                target_ds_list.push(ds);
-
-                if ds > max_w {
-                    // Gap fill outward (between Wall w and Wall w - 1)
-                    if wall_loop.wall_index > 0 {
-                        gap_points_outer[i] =
-                            compute_gap_point(p, ds, n_cad, n_order, false, config, layer);
-                    }
-
-                    // Gap fill inward (between innermost wall and infill boundary)
-                    if is_innermost && !layer.infill_boundary.is_empty() {
-                        gap_points_inner[i] =
-                            compute_gap_point(p, ds, n_cad, n_order, true, config, layer);
-                    }
-                }
+            // Per this module's own documented formula (`Δs = w / |n_cad × n_order|`),
+            // near-tangency between the CAD normal and the order-field gradient
+            // (cross_len -> 0) is exactly the singular case where Δs -> infinity --
+            // gap fill is needed *most* there, not "not needed" as a naive
+            // division guard would suggest. Clamp to `max_w` so the same
+            // gap-fill-if-`ds > max_w` branch below always engages instead of
+            // silently skipping -- this is exactly the regime
+            // `fsm_top_tangency_aspect` deliberately produces near top surfaces.
+            let ds = if cross_len.is_finite() && cross_len > 1e-4 {
+                config.wall_line_width / cross_len
+            } else if cross_len.is_finite() {
+                max_w + 1.0
+            } else {
+                target_ds_list.push(config.wall_line_width);
                 continue;
+            };
+            target_ds_list.push(ds);
+
+            if ds > max_w {
+                // Gap fill outward (between Wall w and Wall w - 1)
+                if wall_loop.wall_index > 0 {
+                    gap_points_outer[i] =
+                        compute_gap_point(p, ds, n_cad, n_order, false, config, layer);
+                }
+
+                // Gap fill inward (between innermost wall and infill boundary)
+                if is_innermost && !layer.infill_boundary.is_empty() {
+                    gap_points_inner[i] =
+                        compute_gap_point(p, ds, n_cad, n_order, true, config, layer);
+                }
             }
+            continue;
         }
         target_ds_list.push(config.wall_line_width);
     }
