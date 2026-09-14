@@ -123,6 +123,15 @@ optional operator-authorized validation.
 
 ---
 
+### Moonraker Time-Estimate Checkpoints
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--slicer-checkpoints` | Flag | `false` | Emit periodic Moonraker `// action:slicer_checkpoint {"num": N, "rem": R}` comments reporting Manifold's own remaining-time estimate, for comparison against the printer's actual progress. See [Moonraker connectivity](moonraker.md#slicer-time-estimate-checkpoints). |
+| `--slicer-checkpoint-interval <S>` | Float | `5.0` | Target spacing (seconds of Manifold's own estimated elapsed time) between checkpoints when `--slicer-checkpoints` is set. |
+
+---
+
 ## Batch Processing Examples
 
 ### Shell Script: Batch Slicing with Conformal Eikonal & TPMS Infill

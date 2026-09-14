@@ -169,6 +169,18 @@ struct Cli {
     #[arg(long)]
     static_retraction: Option<f64>,
 
+    /// Emit periodic Moonraker-visible checkpoints (`// action:slicer_checkpoint
+    /// {"num": N, "rem": R}`) reporting Manifold's own remaining-time estimate
+    /// through the print, so it can be compared against the printer's actual
+    /// progress via Moonraker's API.
+    #[arg(long)]
+    slicer_checkpoints: bool,
+
+    /// Target spacing (seconds of Manifold's own estimated elapsed print time)
+    /// between emitted checkpoints when --slicer-checkpoints is set (default 5.0).
+    #[arg(long)]
+    slicer_checkpoint_interval: Option<f64>,
+
     /// Moonraker printer URL (e.g. http://192.168.1.50:7125)
     #[arg(long)]
     printer_url: Option<String>,
@@ -351,6 +363,8 @@ fn main() -> Result<()> {
         enable_transient_pressure_compensation: cli.transient_pressure_compensation,
         transient_pressure_min_multiplier: cli.transient_pressure_min_multiplier,
         transient_pressure_beta: cli.transient_pressure_beta,
+        enable_slicer_checkpoints: cli.slicer_checkpoints,
+        slicer_checkpoint_interval_seconds: cli.slicer_checkpoint_interval,
         ..SlicerConfig::default()
     };
 

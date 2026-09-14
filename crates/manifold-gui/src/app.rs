@@ -1491,6 +1491,31 @@ impl ManifoldApp {
                 }
             }
 
+            ui.checkbox(
+                &mut self.config.enable_slicer_checkpoints,
+                "Emit Moonraker slicer_checkpoint actions",
+            )
+            .on_hover_text(
+                "Periodically emits a `// action:slicer_checkpoint {\"num\": N, \"rem\": R}` Klipper RESPOND command reporting Manifold's own remaining-time estimate R (seconds), so it can be compared against the printer's actual progress via Moonraker's API. Only emitted at safe (non-extruding) points, never mid-bead.",
+            );
+            if self.config.enable_slicer_checkpoints {
+                let mut interval = self.config.slicer_checkpoint_interval_seconds();
+                if drag_num(
+                    ui,
+                    &mut interval,
+                    0.5,
+                    0.5..=3600.0,
+                    "Checkpoint interval (s)",
+                )
+                .on_hover_text(
+                    "Target spacing, in seconds of Manifold's own estimated elapsed print time, between emitted checkpoints (default 5.0).",
+                )
+                .changed()
+                {
+                    self.config.slicer_checkpoint_interval_seconds = Some(interval);
+                }
+            }
+
             let mut r_spd_mms = (self.config.retraction_speed() / 60.0).round();
             if drag_num(
                 ui,

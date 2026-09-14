@@ -108,6 +108,36 @@ remote outcome. It is best-effort network control,
 when needed. Do not treat UI disconnection or a failed request as evidence that
 motion/heaters have stopped.
 
+## Slicer time-estimate checkpoints
+
+Manifold's own kinematic model of a print (used for the estimated print time
+shown in the CLI/GUI statistics) can diverge from what the printer actually
+does, since it does not see the firmware's own lookahead planner, live
+acceleration limits, or filament/thermal reality. Enable
+`enable_slicer_checkpoints` (a GUI checkbox, or `--slicer-checkpoints` on the
+CLI) to have the emitted G-code periodically report Manifold's own
+remaining-time estimate back through Moonraker's
+[custom action commands](https://moonraker.readthedocs.io/en/latest/external_api/jsonrpc_notifications/#gcode-responses)
+mechanism, so it can be directly compared against the printer's actual
+elapsed/remaining time.
+
+Checkpoints are emitted as a Klipper `RESPOND TYPE=command` line, which
+Klipper always relays to Moonraker with a literal `//` prefix (independent
+of the printer's `[respond]` `default_type` setting):
+
+```
+// action:slicer_checkpoint {"num": 5, "rem": 1800}
+```
+
+`num` is a monotonically increasing checkpoint counter; `rem` is Manifold's
+own modeled remaining print time in seconds at that point. Checkpoints are
+spaced roughly every `slicer_checkpoint_interval_seconds` (a GUI field, or
+`--slicer-checkpoint-interval` on the CLI; default 5.0 seconds) of Manifold's
+own estimated elapsed time, but are only actually emitted at the next travel
+or retraction boundary at or after that interval elapses -- never
+mid-extrusion, so the `RESPOND` command cannot interrupt a bead. Disabled by
+default.
+
 ## Uncertain outcomes and credentials
 
 A valid Moonraker application rejection (for example, a structured 409) can be a

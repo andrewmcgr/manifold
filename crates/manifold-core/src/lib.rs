@@ -559,6 +559,21 @@ pub struct SlicerConfig {
     /// Vertical Z lift in mm applied during the final clearance move. Defaults to 2.0 mm when None.
     #[serde(default)]
     pub end_of_print_clearance_z_lift: Option<f64>,
+    /// Whether to emit periodic Moonraker-visible `RESPOND TYPE=command`
+    /// checkpoints (`// action:slicer_checkpoint {"num": N, "rem": R}`)
+    /// through the print, reporting Manifold's own remaining-time estimate
+    /// `R` (seconds) at that point so it can be compared against the
+    /// printer's actual elapsed/remaining time via Moonraker's API.
+    /// Disabled by default.
+    #[serde(default)]
+    pub enable_slicer_checkpoints: bool,
+    /// Target spacing (in seconds of Manifold's own estimated elapsed print
+    /// time) between emitted checkpoints. Checkpoints are only actually
+    /// emitted at the next travel or retraction boundary at or after this
+    /// interval elapses, never mid-extrusion, to avoid interrupting a bead.
+    /// Defaults to 5.0 seconds when `None`.
+    #[serde(default)]
+    pub slicer_checkpoint_interval_seconds: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -757,6 +772,8 @@ impl Default for SlicerConfig {
             end_of_print_wipe_enabled: true,
             end_of_print_wipe_distance: None,
             end_of_print_clearance_z_lift: None,
+            enable_slicer_checkpoints: false,
+            slicer_checkpoint_interval_seconds: None,
         }
     }
 }
@@ -770,6 +787,15 @@ impl SlicerConfig {
     #[must_use]
     pub fn end_of_print_clearance_z_lift(&self) -> f64 {
         self.end_of_print_clearance_z_lift.unwrap_or(2.0).max(0.0)
+    }
+    /// Target spacing (seconds of Manifold's own estimated elapsed print
+    /// time) between emitted `slicer_checkpoint` Moonraker actions,
+    /// defaulting to 5.0 seconds when `None`.
+    #[must_use]
+    pub fn slicer_checkpoint_interval_seconds(&self) -> f64 {
+        self.slicer_checkpoint_interval_seconds
+            .unwrap_or(5.0)
+            .max(0.1)
     }
     /// Infill pattern for sparse interior regions, defaulting to
     /// [`infill::InfillPatternKind::Cubic`] when not set.

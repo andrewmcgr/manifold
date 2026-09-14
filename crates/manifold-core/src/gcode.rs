@@ -230,6 +230,117 @@ fn first_layer_xy_bounds(paths: &[Path]) -> Option<(f64, f64, f64, f64)> {
 pub fn emit(paths: &[Path], config: &SlicerConfig) -> String {
     emit_with_machine(paths, config, None, None)
 }
+/// Estimates total print time (seconds) using the exact same per-path
+/// profile-selection logic `emit_with_machine`'s main loop applies --
+/// including slicer-side pressure-advance subdivision
+/// (`subdivide_path_for_pressure_advance` + a fresh `plan_path_velocities`
+/// call) when `config.enable_slicer_pressure_advance` is set -- rather than
+/// `statistics::compute_print_statistics_with_machine`'s independent,
+/// non-subdivision-aware computation over the original (un-subdivided)
+/// `paths`. Used exclusively to derive the Moonraker `slicer_checkpoint`
+/// action's `rem` (remaining time) denominator, so it stays internally
+/// consistent with `checkpoint_elapsed_s`'s numerator -- which accumulates
+/// against these same possibly-subdivided profiles -- instead of silently
+/// diverging whenever PA subdivision changes the point/segment shapes
+///
+/// Mirrors `statistics::compute_print_statistics_with_machine`'s existing
+/// retraction-detection simplification: checks each travel move's own
+/// distance against `effective_min_travel_for_retract()` rather than
+/// summing the full contiguous travel run `emit_with_machine`'s main loop
+/// considers -- an approximation that only differs for multi-segment
+/// travel runs, which are rare.
+/// actually emitted.
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_total_time_seconds(
+    paths: &[Path],
+    config: &SlicerConfig,
+    machine: Option<&crate::machine::Machine>,
+    motion_model: &dyn crate::kinematics::MotionModel,
+    all_initial_profiles: &[Vec<crate::kinematics::PlannedMotionProfile>],
+    min_order: f64,
+    scv: f64,
+) -> f64 {
+    let mut total = 0.0;
+    let mut current_tool: Option<crate::ids::ToolId> = None;
+    let mut fluid_engine = config.fluid_dynamics_engine(
+        paths
+            .first()
+            .and_then(|p| machine.and_then(|m| m.tools.iter().find(|t| t.id == p.tool)))
+            .map(crate::tool::Tool::nozzle_temperature),
+    );
+    let mut retracted = true;
+    let min_retract_travel = config.effective_min_travel_for_retract();
+    let retract_time = config.retraction_duration_seconds();
+    let unretract_time = config.unretraction_duration_seconds();
+
+    for (path_idx, path) in paths.iter().enumerate() {
+        if path.points.len() < 2 || path.segments.is_empty() {
+            continue;
+        }
+        let path_order = path.segments.first().map(|s| s.order).unwrap_or(0.0);
+        let is_first_layer = (path_order - min_order).abs() < 1e-4;
+        if current_tool != Some(path.tool) {
+            current_tool = Some(path.tool);
+            retracted = true;
+            let tool_temp = machine
+                .and_then(|m| m.tools.iter().find(|t| t.id == path.tool))
+                .map(crate::tool::Tool::nozzle_temperature);
+            fluid_engine = config.fluid_dynamics_engine(tool_temp);
+        }
+
+        let initial_profiles = &all_initial_profiles[path_idx];
+        let (path, profiles) = if config.enable_slicer_pressure_advance {
+            let subdivided = crate::subdivide_pa::subdivide_path_for_pressure_advance(
+                path.clone(),
+                initial_profiles,
+                config,
+                fluid_engine.as_ref(),
+            );
+            let sub_profiles = crate::kinematics::plan_path_velocities(
+                &subdivided.points,
+                &subdivided.segments,
+                motion_model,
+                is_first_layer,
+                scv,
+                config.minimum_cruise_ratio(),
+            );
+            (subdivided, sub_profiles)
+        } else {
+            (path.clone(), initial_profiles.clone())
+        };
+
+        for (i, seg) in path.segments.iter().enumerate() {
+            let is_travel = seg.kind == MoveKind::Travel;
+            if is_travel && !retracted {
+                let p0 = path.points.get(i).copied().unwrap_or(DVec3::ZERO);
+                let p1 = path.points.get(i + 1).copied().unwrap_or(p0);
+                if p0.distance(p1) > min_retract_travel {
+                    total += retract_time;
+                    retracted = true;
+                }
+            } else if !is_travel && retracted {
+                total += unretract_time;
+                retracted = false;
+            }
+
+            if let Some(profile) = profiles.get(i) {
+                total += profile.duration_seconds;
+            } else {
+                let p0 = path.points.get(i).copied().unwrap_or(DVec3::ZERO);
+                let p1 = path
+                    .points
+                    .get((i + 1) % path.points.len())
+                    .copied()
+                    .unwrap_or(DVec3::ZERO);
+                let dist = (p1 - p0).length();
+                let v = (seg.speed / 60.0).max(1.0);
+                total += dist / v;
+            }
+        }
+    }
+
+    total
+}
 
 pub fn emit_with_machine(
     paths: &[Path],
@@ -355,6 +466,12 @@ pub fn emit_with_machine(
     let mut last_extruding_flow_q: f64 = 0.0;
     let mut last_retraction_len: f64 = config.retraction_length();
     let mut accumulated_travel_time_s: f64 = 0.0;
+    // Moonraker `slicer_checkpoint` action reporting (see
+    // `config.enable_slicer_checkpoints`): tracks Manifold's own modeled
+    // elapsed time so a checkpoint can be emitted -- at the next safe
+    // (non-extruding) point -- once it crosses each interval multiple.
+    let checkpoints_enabled = config.enable_slicer_checkpoints;
+    let checkpoint_interval_s = config.slicer_checkpoint_interval_seconds();
     let mut retracted = true;
     let mut last_pos: Option<DVec3> = None;
     let motion_model = config.resolved_motion_model(machine);
@@ -397,6 +514,23 @@ pub fn emit_with_machine(
         config.minimum_cruise_ratio(),
         config.effective_min_travel_for_retract(),
     );
+
+    let checkpoint_total_s = if checkpoints_enabled {
+        checkpoint_total_time_seconds(
+            paths,
+            config,
+            machine,
+            motion_model.as_ref(),
+            &all_initial_profiles,
+            min_order,
+            scv,
+        )
+    } else {
+        0.0
+    };
+    let mut checkpoint_elapsed_s: f64 = 0.0;
+    let mut checkpoint_next_threshold_s: f64 = checkpoint_interval_s;
+    let mut checkpoint_num: u64 = 1;
 
     for (path_idx, path) in paths.iter().enumerate() {
         if !path.segments.is_empty()
@@ -507,6 +641,16 @@ pub fn emit_with_machine(
                 }
             }
 
+            if checkpoints_enabled && i > 0 {
+                checkpoint_elapsed_s += profiles.get(i - 1).map_or_else(
+                    || {
+                        last_pos
+                            .map_or(0.0, |prev| prev.distance(*p) / (move_speed / 60.0).max(1.0))
+                    },
+                    |prof| prof.duration_seconds,
+                );
+            }
+
             // Update acceleration limit with deadband filtering
             let target_accel =
                 motion_model.available_acceleration(move_kind, is_first_layer, actual_speed_mm_s);
@@ -598,6 +742,9 @@ pub fn emit_with_machine(
                             accumulated_travel_time_s = 0.0;
                         }
                         retracted = true;
+                        if checkpoints_enabled {
+                            checkpoint_elapsed_s += config.retraction_duration_seconds();
+                        }
                     }
                 }
 
@@ -663,6 +810,9 @@ pub fn emit_with_machine(
                         current_f = Some(u_spd);
                     }
                     retracted = false;
+                    if checkpoints_enabled {
+                        checkpoint_elapsed_s += config.unretraction_duration_seconds();
+                    }
                 }
             }
 
@@ -736,6 +886,16 @@ pub fn emit_with_machine(
                 current_f = Some(move_speed);
             }
             out.push('\n');
+            if checkpoints_enabled && !extruding {
+                while checkpoint_elapsed_s >= checkpoint_next_threshold_s {
+                    let rem = (checkpoint_total_s - checkpoint_elapsed_s).max(0.0).round();
+                    out.push_str(&format!(
+                        "RESPOND TYPE=command MSG=\"action:slicer_checkpoint {{\\\"num\\\": {checkpoint_num}, \\\"rem\\\": {rem:.0}}}\"\n"
+                    ));
+                    checkpoint_num += 1;
+                    checkpoint_next_threshold_s += checkpoint_interval_s;
+                }
+            }
             last_pos = Some(*p);
             last_move_kind = Some(move_kind);
         }
@@ -2240,6 +2400,284 @@ mod tests {
         assert!(
             !after_clearance.contains("G10"),
             "must not emit redundant second retraction"
+        );
+    }
+
+    #[test]
+    fn emit_slicer_checkpoints_reports_action_at_safe_points_only() {
+        use crate::toolpath::Segment;
+
+        // Three separate paths connected by travel jumps well beyond the
+        // default retraction threshold, so each transition is a genuine
+        // safe (non-extruding) point. A tiny checkpoint interval forces a
+        // checkpoint to fire at essentially every one of them.
+        let make_path = |x0: f64| Path {
+            points: vec![DVec3::new(x0, 0.0, 0.2), DVec3::new(x0 + 5.0, 0.0, 0.2)],
+            segments: vec![Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 1.0,
+                speed: 3000.0,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        };
+        let paths = vec![make_path(0.0), make_path(50.0), make_path(100.0)];
+
+        let config = SlicerConfig {
+            enable_slicer_checkpoints: true,
+            slicer_checkpoint_interval_seconds: Some(0.001),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&paths, &config);
+
+        let checkpoint_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("RESPOND TYPE=command MSG="))
+            .collect();
+        assert!(
+            checkpoint_lines.len() >= 2,
+            "expected at least 2 checkpoints across 2 travel gaps, got: {checkpoint_lines:?}"
+        );
+
+        // Exact wire format: a Klipper RESPOND command whose MSG, once
+        // Klipper's shlex-based extended-param parser unescapes the
+        // backslash-quoted JSON, is exactly
+        // `action:slicer_checkpoint {"num": 1, "rem": <R>}` -- which
+        // Klipper's `respond.py` (TYPE=command) always prefixes with a
+        // literal `//`, matching Moonraker's action-comment convention.
+        let first = checkpoint_lines[0];
+        assert!(
+            first.starts_with(
+                r#"RESPOND TYPE=command MSG="action:slicer_checkpoint {\"num\": 1, \"rem\": "#
+            ),
+            "unexpected checkpoint format: {first}"
+        );
+        assert!(
+            first.ends_with("}\""),
+            "unexpected checkpoint format: {first}"
+        );
+
+        // Every checkpoint line must be immediately preceded by a
+        // non-extruding line (a travel G0, or a retraction G10/G1 E-<len>),
+        // never a G1 extrusion move -- checkpoints must not interrupt a
+        // bead mid-print.
+        let lines: Vec<&str> = out.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.starts_with("RESPOND TYPE=command MSG=") {
+                let prev = lines[..i]
+                    .iter()
+                    .rev()
+                    .find(|l| !l.is_empty())
+                    .copied()
+                    .unwrap_or("");
+                let is_safe = prev.starts_with("G0 ")
+                    || prev == "G10"
+                    || prev == "G11"
+                    || (prev.starts_with("G1 E-") && !prev.contains('X'))
+                    || prev.starts_with("RESPOND TYPE=command MSG=");
+                assert!(
+                    is_safe,
+                    "checkpoint must follow a non-extruding line, got preceding line: {prev:?}"
+                );
+            }
+        }
+
+        // Remaining time must strictly decrease as the checkpoint count
+        // increases -- Manifold's own model of elapsed time is monotonic.
+        let rems: Vec<f64> = checkpoint_lines
+            .iter()
+            .map(|l| {
+                let rem_str = l
+                    .rsplit("\\\"rem\\\": ")
+                    .next()
+                    .unwrap()
+                    .trim_end_matches("}\"");
+                rem_str.parse::<f64>().unwrap()
+            })
+            .collect();
+        for pair in rems.windows(2) {
+            assert!(
+                pair[1] <= pair[0],
+                "remaining time must not increase across checkpoints: {rems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn emit_omits_slicer_checkpoints_when_disabled() {
+        use crate::toolpath::Segment;
+
+        let paths = vec![Path {
+            points: vec![DVec3::new(0.0, 0.0, 0.2), DVec3::new(5.0, 0.0, 0.2)],
+            segments: vec![Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 1.0,
+                speed: 3000.0,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        }];
+
+        let config = SlicerConfig {
+            enable_slicer_checkpoints: false,
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&paths, &config);
+        assert!(
+            !out.contains("RESPOND TYPE=command MSG=\"action:slicer_checkpoint"),
+            "must not emit checkpoints when disabled"
+        );
+    }
+
+    #[test]
+    fn emit_slicer_checkpoints_total_matches_actual_subdivided_non_chained_duration() {
+        use crate::fluid_dynamics::FluidDynamicsConfig;
+        use crate::toolpath::Segment;
+
+        // Three CONTIGUOUS (touching end-to-start) single-segment paths.
+        // `statistics::compute_print_statistics_with_machine` plans
+        // velocities across all three as one continuous chained run. But
+        // `emit_with_machine`'s actual slicer-pressure-advance branch
+        // subdivides each path independently and then REPLANS velocities
+        // per-path via a fresh, non-chained `plan_path_velocities` call --
+        // a materially different computation from the chained one.
+        // `checkpoint_total_s` must be derived from that SAME per-path,
+        // subdivision-aware computation (`checkpoint_total_time_seconds`,
+        // called identically here), not from the independent chained-only
+        // `compute_print_statistics_with_machine` figure, which this test
+        // proves diverges from it for this fixture.
+        let seg_speed = 3000.0; // 50 mm/s
+        let make_path = |x0: f64| Path {
+            points: vec![DVec3::new(x0, 0.0, 0.2), DVec3::new(x0 + 20.0, 0.0, 0.2)],
+            segments: vec![Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 2.0,
+                speed: seg_speed,
+                order: 0.2,
+                ..Segment::default()
+            }],
+            tool: ToolId(0),
+            object: crate::ids::ObjectId::default(),
+        };
+        let paths = vec![make_path(0.0), make_path(20.0), make_path(40.0)];
+
+        let config = SlicerConfig {
+            enable_slicer_checkpoints: true,
+            slicer_checkpoint_interval_seconds: Some(0.001),
+            enable_slicer_pressure_advance: true,
+            pressure_advance: Some(0.05),
+            outer_wall_acceleration: Some(500.0),
+            first_layer_acceleration: Some(500.0),
+            fluid_dynamics: Some(FluidDynamicsConfig {
+                pa_calibration_low: (0.045, 2.0),
+                pa_calibration_high: (0.025, 15.0),
+                ..Default::default()
+            }),
+            ..config_without_print_gcode()
+        };
+
+        let out = emit(&paths, &config);
+
+        let rems: Vec<f64> = out
+            .lines()
+            .filter(|l| l.starts_with("RESPOND TYPE=command MSG="))
+            .map(|l| {
+                l.rsplit("\\\"rem\\\": ")
+                    .next()
+                    .unwrap()
+                    .trim_end_matches("}\"")
+                    .parse::<f64>()
+                    .unwrap()
+            })
+            .collect();
+        assert!(!rems.is_empty(), "expected at least one checkpoint");
+        // Checkpoints only fire at non-extruding points; with 3 fully
+        // extruding contiguous paths and no internal Travel segments, the
+        // first checkpoint-eligible point is the boundary right after
+        // path 0 finishes -- so `rems[0]` reflects `total - elapsed(path 0)`,
+        // not `total - ~0`. Compute that same `elapsed(path 0)` quantity
+        // via the identical helper restricted to just path 0, so this
+        // test's expectations account for it precisely rather than
+        // assuming it away.
+        let checkpoint_total_s = rems[0];
+
+        let machine_none: Option<&crate::machine::Machine> = None;
+        let motion_model = config.resolved_motion_model(machine_none);
+        let min_order = paths
+            .iter()
+            .filter_map(|p| p.segments.first())
+            .map(|s| s.order)
+            .fold(f64::INFINITY, f64::min);
+        let first_layer_flags: Vec<bool> = paths
+            .iter()
+            .map(|p| {
+                let order = p.segments.first().map(|s| s.order).unwrap_or(0.0);
+                (order - min_order).abs() < 1e-4
+            })
+            .collect();
+        let all_initial_profiles = crate::kinematics::plan_chained_path_velocities(
+            &paths,
+            motion_model.as_ref(),
+            &first_layer_flags,
+            config.square_corner_velocity(),
+            config.minimum_cruise_ratio(),
+            config.effective_min_travel_for_retract(),
+        );
+
+        // Ground truth #1: exactly the computation `emit_with_machine`
+        // itself calls to derive `checkpoint_total_s`.
+        let correct_total = checkpoint_total_time_seconds(
+            &paths,
+            &config,
+            machine_none,
+            motion_model.as_ref(),
+            &all_initial_profiles,
+            min_order,
+            config.square_corner_velocity(),
+        );
+        // Elapsed time consumed by path 0 alone, under the identical
+        // subdivision-aware computation -- what `checkpoint_elapsed_s` has
+        // accumulated to by the time the first checkpoint burst fires.
+        let elapsed_after_path0 = checkpoint_total_time_seconds(
+            &paths[0..1],
+            &config,
+            machine_none,
+            motion_model.as_ref(),
+            &all_initial_profiles[0..1],
+            min_order,
+            config.square_corner_velocity(),
+        );
+        let expected_correct_rem = correct_total - elapsed_after_path0;
+
+        // Ground truth #2: the independent, non-subdivision-aware chained
+        // total that a pre-fix version incorrectly used as the denominator.
+        let wrong_total =
+            crate::statistics::compute_print_statistics_with_machine(&paths, &config, None, None)
+                .estimated_time_seconds;
+        let expected_wrong_rem = wrong_total - elapsed_after_path0;
+
+        // The two ground truths must meaningfully differ for this fixture
+        // to be discriminating at all -- otherwise this test can't tell
+        // the fix apart from the bug it targets.
+        assert!(
+            (expected_correct_rem - expected_wrong_rem).abs() > 1.0,
+            "test fixture must exercise a measurable divergence between the \
+             chained-only and subdivision-aware totals: correct_rem={expected_correct_rem} wrong_rem={expected_wrong_rem}"
+        );
+
+        // The value actually emitted in the G-code must match the correct
+        // (subdivision-aware) expectation, not the independent chained-only one.
+        assert!(
+            (checkpoint_total_s - expected_correct_rem).abs() < 1.0,
+            "emitted checkpoint_total_s={checkpoint_total_s} must match the actual subdivided/non-chained expectation={expected_correct_rem}"
+        );
+        assert!(
+            (checkpoint_total_s - expected_wrong_rem).abs() > 0.5,
+            "emitted checkpoint_total_s={checkpoint_total_s} must NOT match the independent chained-only expectation={expected_wrong_rem}"
         );
     }
 }
