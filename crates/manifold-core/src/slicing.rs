@@ -913,16 +913,65 @@ pub fn slice_mesh_with_progress(
     // instead of growing this `Vec` without bound until the process is
     // killed for memory exhaustion.
     const MAX_ORDER_STEPS: usize = 1_000_000;
+
+    // `order_value += layer_height` accumulates real floating-point rounding
+    // error over many additions -- e.g. repeated += 0.2 starting from 0.2
+    // drifts to 5.000000000000002 after the 25th addition, not exactly 5.0.
+    // A fixed `f64::EPSILON` (~2.22e-16) tolerance is far too tight to
+    // absorb that (the drift above is ~1.8e-15, ~8x larger), so the loop's
+    // `<=` check would fail one iteration early and silently drop the very
+    // last layer -- e.g. a flat-top cube's topmost layer landing a full
+    // `layer_height` short of the model's true top surface.
+    //
+    // Bound the tolerance by the loop's own actual worst case rather than a
+    // guessed constant: each `+=` can introduce up to ~1 ULP of rounding
+    // error *relative to the accumulator's own magnitude* (not
+    // `layer_height`'s -- `order_value` itself grows toward
+    // `effective_order_max`, and ULP size scales with magnitude), so over
+    // at most `MAX_ORDER_STEPS` additions the total drift is bounded by
+    // `MAX_ORDER_STEPS * f64::EPSILON * effective_order_max.abs()`. Flooring
+    // the scale by `layer_height` keeps this from collapsing toward zero
+    // for an object whose order range happens to sit right at the origin.
+    // For a typical small print (order_max ~5, layer_height 0.2) this is
+    // ~1e-9 -- utterly negligible next door to any real geometric decision
+    // -- while still being a real upper bound at the full 1,000,000-step
+    // cap, unlike a constant multiple of `layer_height` alone.
+    let order_scale = effective_order_max.abs().max(layer_height);
+    let order_step_epsilon = MAX_ORDER_STEPS as f64 * f64::EPSILON * order_scale;
     let mut order_values = Vec::new();
     let mut order_value = order_min + first_layer_height;
-    while order_value <= effective_order_max + f64::EPSILON {
+    while order_value <= effective_order_max + order_step_epsilon {
         if order_values.len() >= MAX_ORDER_STEPS {
             return Err(Error::Slicing(format!(
                 "order range [{order_min}, {effective_order_max}] with layer_height {layer_height} would \
                  require more than {MAX_ORDER_STEPS} layers; refusing to continue"
             )));
         }
-        order_values.push(order_value);
+        // Only back off when `order_value` has actually overshot
+        // `effective_order_max` -- which the accumulated floating-point
+        // drift that `order_step_epsilon` above intentionally lets the loop
+        // reach can do (e.g. landing at 5.000000000000002 for a true top of
+        // 5.0). An overshoot samples the contour-extraction plane just
+        // outside the solid, finding nothing (`loops.len() == 0`, silently
+        // dropping that layer's geometry) -- so back off by up to 0.005mm,
+        // matching the margin the crown-layer logic below already uses for
+        // the same reason on non-Height fields. The backoff is capped at
+        // half of `layer_height` so it can never push the capped value
+        // below the previous pushed value (which sits roughly
+        // `effective_order_max - layer_height` away, plus negligible
+        // drift) -- a fixed 0.005mm margin would invert that ordering for
+        // `layer_height` below ~0.01mm. Values that land at or below
+        // `effective_order_max` (including landing exactly on it, e.g. an
+        // exact-layer_height object with no drift) are pushed unchanged:
+        // there's no evidence that case needs correcting, and clamping it
+        // anyway would needlessly perturb otherwise-exact layer placement.
+        let backoff = 0.005_f64.min(layer_height * 0.5);
+        let capped_order_value = if order_value > effective_order_max {
+            effective_order_max - backoff
+        } else {
+            order_value
+        };
+        order_values.push(capped_order_value);
         let step = calibration
             .as_ref()
             .map(|c| c.adaptive_step(&*field, order_value, layer_height))
@@ -3498,6 +3547,121 @@ mod tests {
             1, 2, 6, 1, 6, 5, // +X
         ];
         Mesh::new(vertices, indices)
+    }
+
+    /// Regression test for a compound bug in the order-value stepping loop
+    /// that dropped a flat-topped object's topmost layer, or (once that was
+    /// fixed) generated a topmost layer with zero contour geometry.
+    ///
+    /// Bug 1: `order_value += layer_height` accumulates real floating-point
+    /// rounding error over many additions -- repeated `+= 0.2` starting
+    /// from 0.2 drifts to `5.000000000000002` after the 25th addition, not
+    /// exactly `5.0`. The old loop condition (`<= effective_order_max +
+    /// f64::EPSILON`, `f64::EPSILON` being ~2.22e-16) was far too tight to
+    /// absorb that ~1.78e-15 drift, so the loop terminated one iteration
+    /// early and silently dropped the final layer -- a 10x10x5mm object at
+    /// 0.2mm layer height produced only 24 layers (topping out at Z=4.8)
+    /// instead of the 25 needed to reach the true top at Z=5.0.
+    ///
+    /// Bug 2 (found immediately after fixing Bug 1): once the stepping
+    /// loop's epsilon was widened enough to stop dropping the final layer,
+    /// the drift pushed that layer's order value *above* the true top
+    /// (5.000000000000002 > 5.0), so its contour-extraction sampling
+    /// plane landed just outside the solid -- the SDF reads positive
+    /// (outside) everywhere on that plane, so no point matches the wall
+    /// offset's negative iso value, and the layer comes back with zero
+    /// loops. The object's top 0.2mm still wouldn't print, just silently
+    /// (empty geometry) instead of via a missing layer.
+    #[test]
+    fn slice_mesh_reaches_true_top_with_nonempty_geometry_despite_float_drift() {
+        let vertices = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 0.0),
+            DVec3::new(10.0, 10.0, 0.0),
+            DVec3::new(0.0, 10.0, 0.0),
+            DVec3::new(0.0, 0.0, 5.0),
+            DVec3::new(10.0, 0.0, 5.0),
+            DVec3::new(10.0, 10.0, 5.0),
+            DVec3::new(0.0, 10.0, 5.0),
+        ];
+        let indices = vec![
+            0, 2, 1, 0, 3, 2, // -Z
+            4, 5, 6, 4, 6, 7, // +Z
+            0, 1, 5, 0, 5, 4, // -Y
+            3, 7, 6, 3, 6, 2, // +Y
+            0, 4, 7, 0, 7, 3, // -X
+            1, 2, 6, 1, 6, 5, // +X
+        ];
+        let mesh = Mesh::new(vertices, indices);
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            ..SlicerConfig::default()
+        };
+        let true_top_z = 5.0;
+
+        let layers = slice_mesh(&mesh, &config).unwrap();
+
+        assert_eq!(
+            layers.len(),
+            25,
+            "expected 25 layers (5.0mm / 0.2mm) to fully cover the object, got {}",
+            layers.len()
+        );
+
+        let top_layer = layers.last().unwrap();
+        assert!(
+            (true_top_z - top_layer.order).abs() < 0.01,
+            "topmost layer's order {} should be within 0.01mm of the true top {true_top_z}",
+            top_layer.order
+        );
+        assert!(
+            !top_layer.loops.is_empty(),
+            "topmost layer must have real contour geometry, not an empty layer sitting outside the solid"
+        );
+        assert!(
+            !top_layer.loops[0].points.is_empty(),
+            "topmost layer's wall loop must have actual points"
+        );
+    }
+
+    /// Regression test for the overshoot backoff inverting layer order at
+    /// fine layer heights. When `order_value` overshoots
+    /// `effective_order_max`, the loop backs it off toward the true top so
+    /// contour extraction still finds geometry (see the comment above
+    /// `capped_order_value` in `slice_mesh`). A fixed 0.005mm backoff would
+    /// push the topmost layer's order *below* the previous layer's order
+    /// once `layer_height` drops under ~0.01mm, since the previous layer
+    /// sits only `layer_height` back from the true top; Height mode has no
+    /// downstream sort/dedup to catch that inversion. The backoff must
+    /// scale down with `layer_height` (capped at half of it) so the
+    /// topmost layer's order always stays strictly greater than the one
+    /// before it.
+    #[test]
+    fn slice_mesh_height_order_values_stay_monotonic_at_fine_layer_height() {
+        let config = SlicerConfig {
+            layer_height: 0.002,
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&cube_mesh(), &config).unwrap();
+
+        assert!(
+            layers.len() >= 2,
+            "expected multiple layers, got {}",
+            layers.len()
+        );
+        for pair in layers.windows(2) {
+            let [earlier, later] = pair else {
+                unreachable!()
+            };
+            assert!(
+                later.order > earlier.order,
+                "layer order values must be strictly increasing going up the object, \
+                 found {} <= {} between consecutive layers",
+                later.order,
+                earlier.order
+            );
+        }
     }
 
     /// Regression test for a direction bug: `Layer::index` increases going
