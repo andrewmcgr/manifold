@@ -1101,7 +1101,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 // mesh semi-transparently so internal toolpaths remain clearly visible.
                 rpass.set_pipeline(&self.toolpath_line_pipeline);
                 rpass.set_vertex_buffer(0, tp.line_buffer.slice(..));
-                rpass.draw(0..6, 0..tp.line_instance_count);
+                // 24 vertices/instance: a rectangular-prism bead (4 faces x 6
+                // verts each), not a flat ribbon -- see toolpath_shader.wgsl's
+                // vs_main. Indices 6..23 degenerate to a zero-area point for
+                // travel moves, which only need the first 6.
+                rpass.draw(0..24, 0..tp.line_instance_count);
 
                 rpass.set_pipeline(&self.mesh_transparent_pipeline);
                 for mesh in meshes {
@@ -1197,5 +1201,43 @@ impl egui_wgpu::CallbackTrait for Viewport3dCallback {
     ) {
         let resources: &MeshRenderResources = callback_resources.get().unwrap();
         resources.paint_blit(render_pass);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Parses and validates every `.wgsl` shader embedded in this crate via
+    /// `include_str!`. WGSL syntax/type errors otherwise only surface at
+    /// runtime when `create_shader_module` first builds the pipeline (e.g.
+    /// when a user actually launches the GUI), so this is the only
+    /// `cargo test`-time guard against a broken shader edit.
+    ///
+    /// This only proves the WGSL text itself is syntactically and
+    /// type-correct -- it does NOT check that a shader's `@location`/
+    /// `@group`/`@binding` numbers match the `VertexBufferLayout`/
+    /// `BindGroupLayout` built on the Rust side, or that the real device
+    /// accepts the resulting pipeline. Those can still only be caught by
+    /// `create_render_pipeline` at runtime.
+    fn assert_wgsl_valid(label: &str, source: &str) {
+        let module = match wgpu::naga::front::wgsl::parse_str(source) {
+            Ok(module) => module,
+            Err(err) => panic!("{label}: WGSL parse error:\n{}", err.emit_to_string(source)),
+        };
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::empty(),
+        );
+        if let Err(err) = validator.validate(&module) {
+            panic!("{label}: WGSL validation error: {err}");
+        }
+    }
+
+    #[test]
+    fn all_embedded_shaders_are_valid_wgsl() {
+        assert_wgsl_valid("mesh_shader.wgsl", include_str!("mesh_shader.wgsl"));
+        assert_wgsl_valid("scene_shader.wgsl", include_str!("scene_shader.wgsl"));
+        assert_wgsl_valid("label_shader.wgsl", include_str!("label_shader.wgsl"));
+        assert_wgsl_valid("toolpath_shader.wgsl", include_str!("toolpath_shader.wgsl"));
+        assert_wgsl_valid("volume_raymarch.wgsl", include_str!("volume_raymarch.wgsl"));
     }
 }
