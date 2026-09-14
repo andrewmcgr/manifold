@@ -194,11 +194,43 @@ pub fn adaptive_wall_line_width(
 /// from the order field.
 ///
 /// Returns `(local_thickness_mm, surface_normal)`:
-/// - `local_thickness_mm`: physical distance along the normal between adjacent layers.
-///   Near folds or convergence regions where $\|\nabla \phi\| > 1.0$, the layers are compressed,
-///   so $h_{\text{local}} = h_{\text{nominal}} / \|\nabla \phi\| < h_{\text{nominal}}$.
-///   Bounded within $[0.1 \times h_{\text{nominal}}, 1.5 \times h_{\text{nominal}}]$.
-/// - `surface_normal`: outward/upward unit normal of the layer isosurface.
+/// - `local_thickness_mm`: the REAL physical distance, measured along the
+///   local surface normal, between `p` and the previous layer's isosurface
+///   -- the isosurface at `order(p) - nominal_layer_height`, matching
+///   exactly how `slicing::slice_workspace_with_progress` defines
+///   consecutive layers (stepping `order_value` by `layer_height` in raw
+///   order units). Found by ray-marching from `p` along `-normal` and
+///   bisecting to the order-value crossing, rather than by inverting the
+///   field's instantaneous gradient magnitude at `p` alone.
+///
+///   The one-line gradient-inversion shortcut used previously
+///   ($h_{\text{local}} = h_{\text{nominal}} / \|\nabla \phi\|$) is only
+///   physically correct when the order field is arc-length calibrated --
+///   i.e. one order unit equals one millimeter along the build direction,
+///   true for [`manifold_fidget::order::HeightOrderField`] by construction
+///   and true in the unconstrained (isotropic-speed) regions of an Eikonal
+///   field. It is NOT true for `AnisotropicFsm`'s boundary-metric-blended
+///   regions (see `order_field::fsm_field_for`'s `top_tangency`/`wall_ortho`
+///   aspect ratios), whose entire purpose is to distort front-propagation
+///   speed near walls for toolpath-sequencing quality -- not to preserve a
+///   physical distance calibration. Inverting that distorted gradient
+///   magnitude produced wildly wrong bead heights (and therefore wrong
+///   extrusion volume) specifically in the near-wall region the feature
+///   targets. Ray-marching to the actual order-value crossing is exact
+///   regardless of the field's local calibration, since it measures the
+///   real geometric gap the bead needs to fill rather than linearly
+///   extrapolating from an instantaneous, possibly-uncalibrated slope.
+///
+///   Bounded within $[0.1 \times h_{\text{nominal}}, 3.0 \times
+///   h_{\text{nominal}}]$ as a physical safety clamp against a
+///   degenerate/non-monotonic field search (e.g. no crossing found within
+///   the search bound), not as a correction-suppression mechanism -- wide
+///   enough to capture the several-times-nominal real gaps a heavily
+///   metric-distorted `AnisotropicFsm` region can produce.
+/// - `surface_normal`: outward/upward unit normal of the layer isosurface,
+///   from the field's local gradient DIRECTION at `p` -- unaffected by the
+///   magnitude-calibration issue above (already relied on this way by
+///   `corner_flow::calculate_corner_excess`).
 #[must_use]
 pub fn local_layer_geometry(
     field: &dyn manifold_fidget::order::OrderField,
@@ -206,15 +238,94 @@ pub fn local_layer_geometry(
     nominal_layer_height: f64,
 ) -> (f64, DVec3) {
     let h_nom = nominal_layer_height.abs().max(1e-4);
-    if let Some(grad) = crate::order_field::numeric_gradient(field, p) {
-        let grad_len = grad.length();
-        if grad_len > 1e-4 && grad_len.is_finite() {
-            let normal = grad / grad_len;
-            let h_local = (h_nom / grad_len).clamp(0.1 * h_nom, 1.5 * h_nom);
-            return (h_local, normal);
+    let Some(grad) = crate::order_field::numeric_gradient(field, p) else {
+        return (h_nom, DVec3::Z);
+    };
+    let grad_len = grad.length();
+    if grad_len <= 1e-4 || !grad_len.is_finite() {
+        return (h_nom, DVec3::Z);
+    }
+    let normal = grad / grad_len;
+
+    let order_p = field.order(p);
+    if !order_p.is_finite() {
+        // Direction is still trustworthy even if the scalar value at `p`
+        // itself is degenerate; fall back to the gradient-inversion
+        // estimate only for the magnitude.
+        let h_local = (h_nom / grad_len).clamp(0.1 * h_nom, 3.0 * h_nom);
+        return (h_local, normal);
+    }
+    let order_target = order_p - h_nom;
+
+    let h_local = probe_previous_layer_distance(field, p, normal, order_p, order_target, h_nom)
+        .unwrap_or_else(|| h_nom / grad_len)
+        .clamp(0.1 * h_nom, 3.0 * h_nom);
+    (h_local, normal)
+}
+
+/// Ray-marches from `p` along `-normal`, sampling `field.order()` at
+/// geometrically-growing distances (each 1.6x the last, starting at
+/// `0.05 * h_nom`, capped at `32.0 * h_nom`), to bracket the distance at
+/// which the field crosses `order_target` -- then bisects within that
+/// bracket to refine the crossing distance. The geometric growth covers a
+/// wide dynamic range (a real gap anywhere from a fraction of `h_nom` up to
+/// tens of times `h_nom`, matching how far a heavily metric-distorted
+/// `AnisotropicFsm` region can push the true physical spacing) in a bounded
+/// number of samples. Returns `None` if no sign change is found within the
+/// search bound (a degenerate or non-monotonic field locally), leaving the
+/// caller to fall back to the gradient-based estimate.
+fn probe_previous_layer_distance(
+    field: &dyn manifold_fidget::order::OrderField,
+    p: DVec3,
+    normal: DVec3,
+    order_p: f64,
+    order_target: f64,
+    h_nom: f64,
+) -> Option<f64> {
+    const GROWTH: f64 = 1.6;
+    let max_search = 32.0 * h_nom;
+
+    let signed = |v: f64| (v - order_target).signum();
+    let mut prev_d = 0.0;
+    let mut prev_sign = signed(order_p);
+
+    let mut bracket: Option<(f64, f64, f64)> = None;
+    let mut d = 0.05 * h_nom;
+    while d <= max_search {
+        let val = field.order(p - normal * d);
+        if !val.is_finite() {
+            break;
+        }
+        let sign = signed(val);
+        if sign == 0.0 {
+            return Some(d);
+        }
+        if sign != prev_sign && prev_sign != 0.0 {
+            bracket = Some((prev_d, d, prev_sign));
+            break;
+        }
+        prev_d = d;
+        prev_sign = sign;
+        d *= GROWTH;
+    }
+
+    let (mut d0, mut d1, sign_at_d0) = bracket?;
+    for _ in 0..25 {
+        if (d1 - d0) < 1e-4 {
+            break;
+        }
+        let dm = 0.5 * (d0 + d1);
+        let vm = field.order(p - normal * dm);
+        if !vm.is_finite() {
+            break;
+        }
+        if signed(vm) == sign_at_d0 {
+            d0 = dm;
+        } else {
+            d1 = dm;
         }
     }
-    (h_nom, DVec3::Z)
+    Some(0.5 * (d0 + d1))
 }
 
 /// Evaluates the surface inclination flow modulation factor for a flat horizontal nozzle tip.
@@ -245,6 +356,92 @@ mod tests {
         assert!((normal.y).abs() < 1e-4);
         assert!((normal.z - 1.0).abs() < 1e-4);
         assert!((surface_inclination_flow_factor(normal) - 1.0).abs() < 1e-4);
+    }
+
+    /// An order field whose calibration is NOT arc-length/mm-equal
+    /// everywhere -- the physical build-direction (Z) unit here is split
+    /// into a "steep" branch (order advances 2.0 units/mm, at/above
+    /// z=5.0) and a much "shallower" branch (order advances only 0.4
+    /// units/mm, below z=5.0), continuous at the z=5.0 seam. This models
+    /// exactly the failure mode `AnisotropicFsm`'s boundary-metric
+    /// blending produces: the SAME order field has genuinely different
+    /// mm-per-order-unit calibration in different regions.
+    struct KinkedCalibrationField;
+    impl manifold_fidget::order::OrderField for KinkedCalibrationField {
+        fn order(&self, p: glam::DVec3) -> f64 {
+            if p.z >= 5.0 {
+                2.0 * (p.z - 5.0)
+            } else {
+                0.4 * (p.z - 5.0)
+            }
+        }
+    }
+
+    #[test]
+    fn local_layer_geometry_recovers_true_physical_gap_across_a_calibration_kink() {
+        let field = KinkedCalibrationField;
+        // Just 0.02mm above the seam, still in the steep branch.
+        let p = DVec3::new(0.0, 0.0, 5.02);
+        let h_nom = 0.2;
+
+        let (h_local, normal) = local_layer_geometry(&field, p, h_nom);
+
+        // True answer, solved by hand: walking down from z=5.02 to z=5.0
+        // (0.02mm) drops order by 2.0*0.02 = 0.04 (order goes 0.04 -> 0.0).
+        // The remaining order to drop to reach order_target = 0.04 - 0.2 =
+        // -0.16 is (0.0 - (-0.16)) = 0.16, at the shallow branch's 0.4
+        // units/mm, requiring 0.16 / 0.4 = 0.4mm more. Total: 0.02 + 0.4 =
+        // 0.42mm -- a real physical gap 2.1x the nominal 0.2mm layer height.
+        assert!(
+            (h_local - 0.42).abs() < 1e-3,
+            "expected h_local close to the hand-solved 0.42mm, got {h_local}"
+        );
+        assert!((normal.z - 1.0).abs() < 1e-4, "normal={normal:?}");
+
+        // The removed gradient-inversion formula, evaluated at p (in the
+        // steep branch, gradient magnitude exactly 2.0 there), would have
+        // returned h_nom / 2.0 = 0.1mm -- off from the true 0.42mm gap by
+        // more than 4x. Confirm the fix's answer is nowhere near that
+        // wrong estimate.
+        let old_wrong_estimate = h_nom / 2.0;
+        assert!(
+            (h_local - old_wrong_estimate).abs() > 0.2,
+            "fix must diverge sharply from the old formula's wrong estimate \
+             {old_wrong_estimate}, got h_local={h_local}"
+        );
+    }
+
+    /// A field that plateaus (goes flat, zero gradient) below z=5.0 --
+    /// walking backward from a point just above the plateau never reaches
+    /// `order_target` no matter how far the search probes, since the
+    /// field asymptotically stops decreasing. Exercises the "no crossing
+    /// found" fallback path.
+    struct PlateauField;
+    impl manifold_fidget::order::OrderField for PlateauField {
+        fn order(&self, p: glam::DVec3) -> f64 {
+            if p.z >= 5.0 {
+                p.z - 5.0
+            } else {
+                0.0
+            }
+        }
+    }
+
+    #[test]
+    fn local_layer_geometry_falls_back_gracefully_when_no_crossing_is_found() {
+        let field = PlateauField;
+        let p = DVec3::new(0.0, 0.0, 5.05);
+        let h_nom = 0.2;
+
+        let (h_local, normal) = local_layer_geometry(&field, p, h_nom);
+
+        // Gradient at p (steep branch, slope 1.0) gives the pre-existing
+        // fallback estimate h_nom / 1.0 = h_nom exactly, clamped into
+        // range -- a safe, finite, sane result rather than a panic, NaN,
+        // or runaway value from an unbounded search.
+        assert!(h_local.is_finite());
+        assert!((h_local - h_nom).abs() < 1e-6, "h_local={h_local}");
+        assert!((normal.z - 1.0).abs() < 1e-4);
     }
 
     #[test]
