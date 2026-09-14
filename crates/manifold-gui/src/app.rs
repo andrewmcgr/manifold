@@ -1970,6 +1970,32 @@ impl ManifoldApp {
                 }
             }
 
+            ui.checkbox(
+                &mut self.config.fsm_seed_surfaces_enabled,
+                "Seed from upward-facing surfaces",
+            )
+            .on_hover_text(
+                "When checked, upward-facing surface patches away from the bed (e.g. an internal shelf) also seed the field, so it propagates outward from them too. When unchecked (default), only the bed seeds the field.",
+            );
+
+            if self.config.fsm_seed_surfaces_enabled {
+                let mut seed_max_angle = self.config.fsm_seed_max_angle_deg();
+                if drag_num(
+                    ui,
+                    &mut seed_max_angle,
+                    0.5,
+                    0.0..=90.0,
+                    "Seed surface angle (deg from horizontal)",
+                )
+                .on_hover_text(
+                    "Upward-facing surface patches within this angle of horizontal become additional seed regions.",
+                )
+                .changed()
+                {
+                    self.config.fsm_seed_max_angle_deg = Some(seed_max_angle);
+                }
+            }
+
             let mut sweeps = self.config.fsm_max_sweeps();
             if drag_num(
                 ui,

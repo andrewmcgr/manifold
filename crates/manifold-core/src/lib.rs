@@ -548,6 +548,26 @@ pub struct SlicerConfig {
     /// Defaults to 8.
     #[serde(default)]
     pub fsm_max_sweeps: Option<usize>,
+    /// Whether upward-facing surface patches away from the bed (e.g. an
+    /// internal shelf) act as additional seed regions for the anisotropic FSM
+    /// order field, alongside the bed plane. When `false` (default), only the
+    /// bed seeds the field -- matching every other order field's behavior,
+    /// including a mesh whose own top face is itself upward-facing (seeding
+    /// from both the bed and a flat top would collapse the field, as the two
+    /// wavefronts would meet and cancel out in the middle instead of spanning
+    /// the part's full height).
+    #[serde(default)]
+    pub fsm_seed_surfaces_enabled: bool,
+    /// Anisotropic FSM order field: maximum angle (degrees from horizontal) for an
+    /// upward-facing surface patch to become an additional seed region when
+    /// `fsm_seed_surfaces_enabled` is `true`. Grid nodes on the mesh surface
+    /// whose CAD normal points upward within this angle are pinned to order 0,
+    /// so the field also propagates outward from these patches -- adjacent
+    /// qualifying nodes merge into one seed patch by construction of the FSM
+    /// grid, no separate coalescing step required.
+    /// Defaults to 10.0 degrees.
+    #[serde(default)]
+    pub fsm_seed_max_angle_deg: Option<f64>,
     /// Whether to perform an automated pressure-bleed wipe and clearance move at the end of the print.
     /// Defaults to true.
     #[serde(default = "default_true")]
@@ -763,6 +783,8 @@ impl Default for SlicerConfig {
             fsm_wall_ortho_aspect: None,
             fsm_skin_depth_mm: None,
             fsm_max_sweeps: None,
+            fsm_seed_surfaces_enabled: false,
+            fsm_seed_max_angle_deg: None,
             wall_order: None,
             enable_corner_flow_compensation: true,
             corner_flow_compensation_ratio: None,
@@ -1319,6 +1341,13 @@ impl SlicerConfig {
     #[must_use]
     pub fn fsm_max_sweeps(&self) -> usize {
         self.fsm_max_sweeps.unwrap_or(8).max(1)
+    }
+
+    /// Returns the anisotropic FSM upward-facing seed-patch angle threshold
+    /// (degrees from horizontal), defaulting to 10.0.
+    #[must_use]
+    pub fn fsm_seed_max_angle_deg(&self) -> f64 {
+        self.fsm_seed_max_angle_deg.unwrap_or(10.0).clamp(0.0, 90.0)
     }
 
     /// Returns the resolved fluid dynamics engine, if configured.

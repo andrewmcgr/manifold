@@ -268,6 +268,21 @@ fn eikonal_field_for(
     )
 }
 
+/// Returns whether a CAD surface normal points upward within `max_angle_deg`
+/// of horizontal -- the shared criterion for every upward-facing seed-patch
+/// classification step of the anisotropic FSM order field.
+fn is_upward_within_angle(normal: DVec3, max_angle_deg: f64) -> bool {
+    let len = normal.length();
+    if len < 1e-6 || normal.z <= 0.0 {
+        return false;
+    }
+    let n = normal / len;
+    // Angle between the normal and vertical Z, which equals the surface's own
+    // tilt away from horizontal (a flat top has normal (0,0,1) and 0 tilt).
+    let tilt_from_flat_deg = n.x.hypot(n.y).atan2(n.z).to_degrees();
+    tilt_from_flat_deg <= max_angle_deg
+}
+
 /// Builds the [`OrderFieldKind::AnisotropicFsm`] field for `mesh`:
 /// constructs a background metric tensor grid steered toward near-tangency or
 /// near-orthogonality along surface boundaries, and solves the anisotropic
@@ -294,7 +309,7 @@ fn fsm_field_for(
     let cell_size = clamp_cell_size_to_node_budget(max - min, requested_cell_size);
 
     let seed_tolerance = cell_size * 0.5;
-    let is_seed_region = move |p: DVec3| p.z <= min.z + seed_tolerance;
+    let is_seed_region_bed = move |p: DVec3| p.z <= min.z + seed_tolerance;
 
     let faces: Vec<[usize; 3]> = mesh
         .indices
@@ -309,7 +324,7 @@ fn fsm_field_for(
             max,
             cell_size,
             &is_solid,
-            &is_seed_region,
+            &is_seed_region_bed,
         );
     }
 
@@ -322,6 +337,22 @@ fn fsm_field_for(
         }
     };
     let is_solid = |p: DVec3| sdf.sample(p).value <= cell_size;
+
+    let seed_surfaces_enabled = config.fsm_seed_surfaces_enabled;
+    let seed_max_angle_deg = config.fsm_seed_max_angle_deg();
+    let is_seed_region = move |p: DVec3| {
+        if is_seed_region_bed(p) {
+            return true;
+        }
+        if !seed_surfaces_enabled {
+            return false;
+        }
+        let sample = sdf.sample(p);
+        if sample.value.abs() > seed_tolerance {
+            return false;
+        }
+        is_upward_within_angle(sample.gradient, seed_max_angle_deg)
+    };
 
     let (dims, h, actual_min) = AnisotropicFsmOrderField::compute_grid_dims(min, max, cell_size);
     let mut tensor_grid = TensorGrid::new_isotropic(actual_min, dims, h);
@@ -1368,5 +1399,41 @@ mod tests {
             clamp_cell_size_to_node_budget(extent, f64::INFINITY),
             f64::INFINITY
         );
+    }
+
+    #[test]
+    fn is_upward_within_angle_accepts_a_flat_top_and_a_slight_tilt() {
+        assert!(is_upward_within_angle(DVec3::new(0.0, 0.0, 1.0), 10.0));
+        // 5 degrees off vertical, well within a 10 degree threshold.
+        let tilted = DVec3::new(5.0_f64.to_radians().sin(), 0.0, 5.0_f64.to_radians().cos());
+        assert!(is_upward_within_angle(tilted, 10.0));
+    }
+
+    #[test]
+    fn is_upward_within_angle_rejects_steep_walls_and_downward_normals() {
+        assert!(!is_upward_within_angle(DVec3::new(1.0, 0.0, 0.0), 10.0));
+        assert!(!is_upward_within_angle(DVec3::new(0.0, 0.0, -1.0), 10.0));
+        // 20 degrees off vertical exceeds a 10 degree threshold.
+        let tilted = DVec3::new(
+            20.0_f64.to_radians().sin(),
+            0.0,
+            20.0_f64.to_radians().cos(),
+        );
+        assert!(!is_upward_within_angle(tilted, 10.0));
+    }
+
+    #[test]
+    fn is_upward_within_angle_rejects_a_degenerate_zero_normal() {
+        assert!(!is_upward_within_angle(DVec3::ZERO, 10.0));
+    }
+
+    #[test]
+    fn fsm_seed_max_angle_deg_defaults_and_clamps() {
+        let mut config = SlicerConfig::default();
+        assert_eq!(config.fsm_seed_max_angle_deg(), 10.0);
+        config.fsm_seed_max_angle_deg = Some(200.0);
+        assert_eq!(config.fsm_seed_max_angle_deg(), 90.0);
+        config.fsm_seed_max_angle_deg = Some(-5.0);
+        assert_eq!(config.fsm_seed_max_angle_deg(), 0.0);
     }
 }
