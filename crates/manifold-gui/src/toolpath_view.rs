@@ -132,6 +132,11 @@ pub enum ToolpathDataView {
     TransientPressureMultiplier,
     /// `FlowBreakdown::slope_cosine` -- combined surface-inclination/trajectory-climb factor.
     SlopeCosine,
+    /// Normalized position of each segment's flow rate between the two-point fluid-dynamics
+    /// PA calibration plateaus (`FluidDynamicsConfig::pa_calibration_low`/`_high`): 0.0 = pinned
+    /// at or below the low-flow plateau, 1.0 = pinned at or above the high-flow plateau,
+    /// log-space interpolated in between.
+    PressureAdvanceBlend,
 }
 
 impl ToolpathDataView {
@@ -150,12 +155,13 @@ impl ToolpathDataView {
             Self::CornerFlowMultiplier => "Corner Flow Multiplier",
             Self::TransientPressureMultiplier => "Transient Pressure Multiplier",
             Self::SlopeCosine => "Slope Cosine",
+            Self::PressureAdvanceBlend => "PA Blend Zone",
         }
     }
 
     pub fn unit(&self) -> &'static str {
         match self {
-            Self::LineType => "",
+            Self::LineType | Self::PressureAdvanceBlend => "",
             Self::Speed => "mm/s",
             Self::ActualSpeed => "mm/s",
             Self::FlowRate => "mm³/s",
@@ -205,6 +211,30 @@ pub fn scalar_to_color(t: f64) -> [f32; 4] {
     ]
 }
 
+/// Volumetric flow rate (mm³/s) for a single segment, `0.0` for travel/wipe or zero-length moves.
+fn segment_flow_rate_mm3_s(
+    segment: &manifold_core::toolpath::Segment,
+    diff: glam::DVec3,
+    config: &manifold_core::SlicerConfig,
+) -> f64 {
+    if segment.kind == MoveKind::Travel || segment.extrusion_length <= 0.0 {
+        return 0.0;
+    }
+    let length = diff.length();
+    if length < 1e-6 {
+        return 0.0;
+    }
+    let speed_mm_s = segment.speed / 60.0;
+    if speed_mm_s <= 1e-6 {
+        return 0.0;
+    }
+    let duration = length / speed_mm_s;
+    let fil_radius = config.filament_diameter * 0.5;
+    let fil_area = std::f64::consts::PI * fil_radius * fil_radius;
+    let vol = segment.extrusion_length * fil_area;
+    vol / duration
+}
+
 /// Computes the scalar value for `segment` under `data_view`, optionally using a precomputed motion profile.
 pub fn segment_scalar_value_with_profile(
     segment: &manifold_core::toolpath::Segment,
@@ -242,24 +272,7 @@ pub fn segment_scalar_value_with_profile(
                 segment.speed.min(max_feed) / 60.0
             }
         }
-        ToolpathDataView::FlowRate => {
-            if segment.kind == MoveKind::Travel || segment.extrusion_length <= 0.0 {
-                return 0.0;
-            }
-            let length = diff.length();
-            if length < 1e-6 {
-                return 0.0;
-            }
-            let speed_mm_s = segment.speed / 60.0;
-            if speed_mm_s <= 1e-6 {
-                return 0.0;
-            }
-            let duration = length / speed_mm_s;
-            let fil_radius = config.filament_diameter * 0.5;
-            let fil_area = std::f64::consts::PI * fil_radius * fil_radius;
-            let vol = segment.extrusion_length * fil_area;
-            vol / duration
-        }
+        ToolpathDataView::FlowRate => segment_flow_rate_mm3_s(segment, diff, config),
         ToolpathDataView::Acceleration => {
             let model = config.resolved_motion_model(machine);
             let is_first_layer = (segment.order - config.first_layer_height()).abs() < 1e-4
@@ -304,6 +317,16 @@ pub fn segment_scalar_value_with_profile(
             .flow_breakdown
             .map_or(1.0, |fb| fb.transient_pressure_mult),
         ToolpathDataView::SlopeCosine => segment.flow_breakdown.map_or(1.0, |fb| fb.slope_cosine),
+        ToolpathDataView::PressureAdvanceBlend => {
+            let q = segment_flow_rate_mm3_s(segment, diff, config);
+            if q <= 1e-6 {
+                return 0.0;
+            }
+            let fd = config.fluid_dynamics.unwrap_or_default();
+            let q_low = fd.pa_calibration_low.1.max(0.1);
+            let q_high = fd.pa_calibration_high.1.max(q_low + 0.1);
+            ((q.ln() - q_low.ln()) / (q_high.ln() - q_low.ln())).clamp(0.0, 1.0)
+        }
     }
 }
 
@@ -353,6 +376,9 @@ pub fn data_view_range(
 ) -> Option<(f64, f64)> {
     if data_view == ToolpathDataView::LineType {
         return None;
+    }
+    if data_view == ToolpathDataView::PressureAdvanceBlend {
+        return Some((0.0, 1.0));
     }
     let mut min_val = f64::INFINITY;
     let mut max_val = f64::NEG_INFINITY;
@@ -619,6 +645,7 @@ pub fn build_toolpath_lines_filtered(
                     | ToolpathDataView::SwellMultiplier
                     | ToolpathDataView::CornerFlowMultiplier
                     | ToolpathDataView::TransientPressureMultiplier
+                    | ToolpathDataView::PressureAdvanceBlend
                     | ToolpathDataView::SlopeCosine => COLOR_TRAVEL,
                     _ => {
                         let val = segment_scalar_value(
@@ -722,6 +749,7 @@ pub fn build_toolpath_lines_filtered(
                 | ToolpathDataView::CornerFlowMultiplier
                 | ToolpathDataView::TransientPressureMultiplier
                 | ToolpathDataView::SlopeCosine
+                | ToolpathDataView::PressureAdvanceBlend
                     if segment.kind == MoveKind::Travel =>
                 {
                     COLOR_TRAVEL
@@ -1361,5 +1389,71 @@ mod tests {
                 view
             );
         }
+    }
+
+    #[test]
+    fn pressure_advance_blend_view_maps_flow_rate_to_calibration_plateaus() {
+        let fluid_dynamics = manifold_core::fluid_dynamics::FluidDynamicsConfig {
+            pa_calibration_low: (0.045, 2.0),
+            pa_calibration_high: (0.030, 8.0),
+            ..manifold_core::fluid_dynamics::FluidDynamicsConfig::default()
+        };
+        let config = manifold_core::SlicerConfig {
+            filament_diameter: 2.0,
+            fluid_dynamics: Some(fluid_dynamics),
+            ..manifold_core::SlicerConfig::default()
+        };
+        let start = DVec3::new(0.0, 0.0, 0.0);
+        let end = DVec3::new(10.0, 0.0, 0.0);
+
+        // q = extrusion_length * fil_area / duration, with fil_area = pi (diameter 2.0)
+        // and duration = 10.0 s (length 10mm at speed 60mm/min = 1mm/s).
+        let seg_for_flow = |q: f64| Segment {
+            kind: MoveKind::WallOuter,
+            extrusion_length: q * 10.0 / std::f64::consts::PI,
+            speed: 60.0,
+            ..Segment::default()
+        };
+
+        let cases = [
+            (1.0, 0.0),  // below q_low: pinned at the low plateau
+            (2.0, 0.0),  // exactly q_low
+            (4.0, 0.5),  // geometric mean of q_low/q_high: exact midpoint
+            (8.0, 1.0),  // exactly q_high
+            (16.0, 1.0), // above q_high: pinned at the high plateau
+        ];
+        for (q, expected) in cases {
+            let seg = seg_for_flow(q);
+            let val = segment_scalar_value(
+                &seg,
+                start,
+                end,
+                ToolpathDataView::PressureAdvanceBlend,
+                &config,
+                None,
+            );
+            assert!(
+                (val - expected).abs() < 1e-6,
+                "q={q} expected blend {expected}, got {val}"
+            );
+        }
+
+        // Travel moves and zero-extrusion segments carry no flow-rate signal
+        // and must report the low plateau, not stray into the gradient.
+        let travel = Segment {
+            kind: MoveKind::Travel,
+            extrusion_length: 0.0,
+            speed: 60.0,
+            ..Segment::default()
+        };
+        let val = segment_scalar_value(
+            &travel,
+            start,
+            end,
+            ToolpathDataView::PressureAdvanceBlend,
+            &config,
+            None,
+        );
+        assert_eq!(val, 0.0);
     }
 }

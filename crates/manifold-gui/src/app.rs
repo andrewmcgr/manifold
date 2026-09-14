@@ -3774,6 +3774,7 @@ impl ManifoldApp {
                                                 ToolpathDataView::CornerFlowMultiplier,
                                                 ToolpathDataView::TransientPressureMultiplier,
                                                 ToolpathDataView::SlopeCosine,
+                                                ToolpathDataView::PressureAdvanceBlend,
                                             ] {
                                                 ui.selectable_value(
                                                     &mut self.toolpath_data_view,
@@ -3907,6 +3908,7 @@ impl ManifoldApp {
                                             || view == ToolpathDataView::CornerFlowMultiplier
                                             || view == ToolpathDataView::TransientPressureMultiplier
                                             || view == ToolpathDataView::SlopeCosine
+                                            || view == ToolpathDataView::PressureAdvanceBlend
                                         {
                                             ui.horizontal(|ui| {
                                                 let (badge_rect, _) = ui.allocate_exact_size(
