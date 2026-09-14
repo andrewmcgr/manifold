@@ -299,7 +299,7 @@ fn fsm_field_for(
             DVec3::ONE,
             1.0,
             &|_| true,
-            &|_| false,
+            &|_| None,
         );
     };
 
@@ -309,7 +309,15 @@ fn fsm_field_for(
     let cell_size = clamp_cell_size_to_node_budget(max - min, requested_cell_size);
 
     let seed_tolerance = cell_size * 0.5;
-    let is_seed_region_bed = move |p: DVec3| p.z <= min.z + seed_tolerance;
+    // Bed contact is order 0 -- matches HeightOrderField/EikonalOrderField's
+    // convention that the mesh's contact surface itself is the origin.
+    let is_seed_region_bed = move |p: DVec3| {
+        if p.z <= min.z + seed_tolerance {
+            Some(0.0)
+        } else {
+            None
+        }
+    };
 
     let faces: Vec<[usize; 3]> = mesh
         .indices
@@ -341,17 +349,24 @@ fn fsm_field_for(
     let seed_surfaces_enabled = config.fsm_seed_surfaces_enabled;
     let seed_max_angle_deg = config.fsm_seed_max_angle_deg();
     let is_seed_region = move |p: DVec3| {
-        if is_seed_region_bed(p) {
-            return true;
+        if let Some(v) = is_seed_region_bed(p) {
+            return Some(v);
         }
         if !seed_surfaces_enabled {
-            return false;
+            return None;
         }
         let sample = sdf.sample(p);
         if sample.value.abs() > seed_tolerance {
-            return false;
+            return None;
         }
-        is_upward_within_angle(sample.gradient, seed_max_angle_deg)
+        if !is_upward_within_angle(sample.gradient, seed_max_angle_deg) {
+            return None;
+        }
+        // A patch seed partway up the model carries its own real height
+        // along the build direction, not the bed's 0.0 -- otherwise it
+        // becomes a spurious second build plate the sweep treats as
+        // equally "nearest" in every direction around it.
+        Some(p.dot(BUILD_DIRECTION))
     };
 
     let (dims, h, actual_min) = AnisotropicFsmOrderField::compute_grid_dims(min, max, cell_size);

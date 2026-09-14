@@ -72,7 +72,13 @@ impl AnisotropicFsmOrderField {
         max_corner: DVec3,
         requested_cell_size: f64,
         is_solid: &(dyn Fn(DVec3) -> bool + Sync),
-        is_seed: &(dyn Fn(DVec3) -> bool + Sync),
+        // `Some(v)` fixes this point as a Dirichlet boundary condition at
+        // order value `v` (not always 0.0 -- e.g. a seed patch partway up
+        // the model must carry its own real height-along-build-direction
+        // value, not the bed's zero, or it becomes a spurious second
+        // build plate the sweep treats as equally "nearest" from both
+        // sides). `None` leaves the point free to be solved for normally.
+        seed_value: &(dyn Fn(DVec3) -> Option<f64> + Sync),
     ) -> Self {
         let (dims, h, actual_min) =
             Self::compute_grid_dims(min_corner, max_corner, requested_cell_size);
@@ -83,7 +89,7 @@ impl AnisotropicFsmOrderField {
             h,
             &tensor_grid,
             is_solid,
-            is_seed,
+            seed_value,
             8,
             None,
             None,
@@ -98,7 +104,7 @@ impl AnisotropicFsmOrderField {
         h: f64,
         tensor_grid: &TensorGrid,
         is_solid: &(dyn Fn(DVec3) -> bool + Sync),
-        is_seed: &(dyn Fn(DVec3) -> bool + Sync),
+        seed_value: &(dyn Fn(DVec3) -> Option<f64> + Sync),
         max_sweeps: usize,
         slope_profile: Option<&SlopeProfile>,
         height_along: Option<&dyn HeightAlong>,
@@ -122,9 +128,9 @@ impl AnisotropicFsmOrderField {
                     );
                     if is_solid(p) {
                         occupied[idx] = true;
-                        if is_seed(p) {
+                        if let Some(v) = seed_value(p) {
                             is_fixed_seed[idx] = true;
-                            distances[idx] = 0.0;
+                            distances[idx] = v;
                         }
                     }
                 }
@@ -746,7 +752,7 @@ mod tests {
         let h = 1.0;
 
         let is_solid = |_p: DVec3| true;
-        let is_seed = |p: DVec3| p.distance(DVec3::new(0.0, 0.0, 0.0)) < 0.5;
+        let is_seed = |p: DVec3| (p.distance(DVec3::new(0.0, 0.0, 0.0)) < 0.5).then_some(0.0);
 
         let field = AnisotropicFsmOrderField::new_isotropic(min, max, h, &is_solid, &is_seed);
 
@@ -774,7 +780,7 @@ mod tests {
         }
 
         let is_solid = |_p: DVec3| true;
-        let is_seed = |p: DVec3| p.distance(DVec3::ZERO) < 0.5;
+        let is_seed = |p: DVec3| (p.distance(DVec3::ZERO) < 0.5).then_some(0.0);
 
         let field = AnisotropicFsmOrderField::solve_with_tensor_grid(
             min,
@@ -813,7 +819,7 @@ mod tests {
 
         let tensor_grid = TensorGrid::new_isotropic(min, dims, h);
         let is_solid = |_p: DVec3| true;
-        let is_seed = |p: DVec3| p.distance(DVec3::ZERO) < 0.25;
+        let is_seed = |p: DVec3| (p.distance(DVec3::ZERO) < 0.25).then_some(0.0);
 
         let max_angle_deg = 15.0;
         let profile = SlopeProfile::from_angle(max_angle_deg);
