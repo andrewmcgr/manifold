@@ -1259,6 +1259,7 @@ pub fn apply_wipe_moves(
         id: 0,
         island: last_seg.island,
         channel_width: last_seg.channel_width,
+        flow_breakdown: None,
     };
 
     points.push(p_wipe);
@@ -1447,6 +1448,13 @@ pub fn apply_scarf_joint(
         let flow_mult = flow_frac * scarf_flow_ratio.clamp(0.10, 2.0);
         seg.extrusion_rate *= flow_mult;
         seg.extrusion_length = e_per_mm * delta_s * flow_mult * swell_corr * downhill_corr;
+        // This ramp's actual extrusion_length was just recomputed with
+        // scarf-specific flow_mult/swell_corr/downhill_corr factors that
+        // have no home in FlowBreakdown's schema -- the breakdown Copy'd
+        // forward from `seg` (the original wall segment sampled at this
+        // point) no longer multiplies out to this segment's real
+        // extrusion_length, so null it rather than show stale numbers.
+        seg.flow_breakdown = None;
         seg.is_scarf = true;
         new_points.push(pt);
         new_segments.push(seg);
@@ -1520,6 +1528,11 @@ pub fn apply_scarf_joint(
         let flow_mult = flow_frac * scarf_flow_ratio.clamp(0.10, 2.0);
         seg.extrusion_rate *= flow_mult;
         seg.extrusion_length = e_per_mm * delta_s * flow_mult * swell_corr * downhill_corr;
+        // See the identical comment on the lead-in ramp above: this
+        // segment's extrusion_length was just recomputed with scarf-
+        // specific factors FlowBreakdown can't represent, so null the
+        // stale copied-forward breakdown.
+        seg.flow_breakdown = None;
         seg.is_scarf = false;
         new_segments.push(seg);
         new_points.push(lead_out_pts[k + 1]);
@@ -2278,6 +2291,87 @@ mod tests {
     }
 
     #[test]
+    fn apply_scarf_joint_nulls_stale_flow_breakdown_on_ramp_segments_but_preserves_it_on_body() {
+        use crate::toolpath::{FlowBreakdown, Segment};
+
+        // Every original wall segment carries a populated flow_breakdown --
+        // regression test for a bug where apply_scarf_joint's lead-in/lead-
+        // out ramp segments (which recompute extrusion_length with scarf-
+        // specific flow_mult/swell_corr/downhill_corr factors that don't
+        // exist as FlowBreakdown fields) copied the ORIGINAL segment's
+        // breakdown forward unchanged via Segment's Copy semantics --
+        // showing numbers that no longer multiplied out to the ramp
+        // segment's real extrusion_length.
+        let original_breakdown = FlowBreakdown {
+            slope_cosine: 0.95,
+            first_layer_mult: 1.0,
+            directional_flow_mult: 1.0,
+            swell_mult: 1.02,
+            corner_flow_mult: 1.0,
+            transient_pressure_mult: 1.0,
+        };
+        let mut points = vec![
+            DVec3::new(0.0, 0.0, 1.0),
+            DVec3::new(20.0, 0.0, 1.0),
+            DVec3::new(20.0, 20.0, 1.0),
+            DVec3::new(0.0, 20.0, 1.0),
+        ];
+        let mut segments = vec![
+            Segment {
+                kind: MoveKind::WallOuter,
+                extrusion_length: 10.0,
+                extrusion_rate: 1.0,
+                support_fraction: 1.0,
+                flow_breakdown: Some(original_breakdown),
+                ..Segment::default()
+            };
+            4
+        ];
+
+        apply_scarf_joint(
+            &mut points,
+            &mut segments,
+            8.0,
+            9,
+            0.10,
+            1.00,
+            0.2,
+            None,
+            None,
+            crate::SlopeCompensationMode::GeometricOffset,
+        );
+
+        // Same layout as the sibling test above: 9 lead-in + 1 body + 3
+        // remaining full segments + 9 lead-out = 22 segments.
+        assert_eq!(segments.len(), 22);
+
+        for seg in segments.iter().take(9) {
+            assert_eq!(
+                seg.flow_breakdown, None,
+                "lead-in ramp segment's stale flow_breakdown must be nulled, not copied forward"
+            );
+        }
+        for seg in segments.iter().skip(13).take(9) {
+            assert_eq!(
+                seg.flow_breakdown, None,
+                "lead-out ramp segment's stale flow_breakdown must be nulled, not copied forward"
+            );
+        }
+
+        // The remainder-of-spanning-segment and subsequent full body
+        // segments (indices 9..13) only prorate length -- no new
+        // multiplier factor is introduced, so the original breakdown
+        // still accurately describes them and must be preserved.
+        for seg in segments.iter().take(13).skip(9) {
+            assert_eq!(
+                seg.flow_breakdown,
+                Some(original_breakdown),
+                "body segments must keep their real, still-accurate flow_breakdown"
+            );
+        }
+    }
+
+    #[test]
     fn apply_scarf_joint_with_fluid_engine_applies_low_flow_swell_correction() {
         use crate::fluid_dynamics::{FluidDynamicsConfig, FluidDynamicsEngine};
         use crate::toolpath::Segment;
@@ -2378,6 +2472,7 @@ mod tests {
                 is_scarf: false,
                 id: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             };
             4
         ];
@@ -2424,6 +2519,7 @@ mod tests {
                 is_scarf: false,
                 id: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             };
             4
         ];

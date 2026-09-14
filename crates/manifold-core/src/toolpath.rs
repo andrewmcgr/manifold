@@ -1838,6 +1838,7 @@ fn route_travel_moves(
                         id: 0,
                         island: 0,
                         channel_width: f64::INFINITY,
+                        flow_breakdown: None,
                     })
                     .collect();
                 Some((
@@ -2526,6 +2527,7 @@ pub fn append_end_of_print_wipe_and_clearance(
         id: 0,
         island: last_extruding_seg.island,
         channel_width: last_extruding_seg.channel_width,
+        flow_breakdown: None,
     });
 
     // 2. Shear step
@@ -2542,6 +2544,7 @@ pub fn append_end_of_print_wipe_and_clearance(
         id: 0,
         island: last_extruding_seg.island,
         channel_width: last_extruding_seg.channel_width,
+        flow_breakdown: None,
     });
 
     // 3. Clearance travel move
@@ -2558,6 +2561,7 @@ pub fn append_end_of_print_wipe_and_clearance(
         id: 0,
         island: last_extruding_seg.island,
         channel_width: last_extruding_seg.channel_width,
+        flow_breakdown: None,
     });
 
     Ok(())
@@ -2601,6 +2605,57 @@ pub enum MoveKind {
     DebugExcluded,
 }
 
+/// Per-segment breakdown of the individual multiplicative flow adjustments
+/// that combine into a `Segment`'s final `extrusion_length`, for tuning-
+/// visualization purposes (see `crates/manifold-gui`'s `ToolpathDataView`).
+/// Each field is the *actual* value that pass applied to this segment, not
+/// a value re-derived after the fact -- re-deriving would risk silently
+/// diverging from what the printer actually receives, defeating the point
+/// of a tuning aid. All multipliers default to `1.0` (no adjustment) so a
+/// disabled feature reads as visibly neutral rather than zero.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlowBreakdown {
+    /// `cos(surface inclination angle) . cos(trajectory climb angle)`,
+    /// clamped -- see `toolpath::plan`'s `slope_cosine`. Shrinks the
+    /// *effective path length* used for volume calculation on steep
+    /// slopes/climbs, not `extrusion_length` directly, but still shows up
+    /// as a higher effective flow rate for the same nominal bead.
+    pub slope_cosine: f64,
+    /// `SlicerConfig::first_layer_extrusion_multiplier()`, applied only to
+    /// the first layer's segments; `1.0` for every other layer.
+    pub first_layer_mult: f64,
+    /// Directional slope-compensation flow multiplier from
+    /// `SlicerConfig::slope_compensation_mode()` (geometric-offset or
+    /// volumetric-modulation mode).
+    pub directional_flow_mult: f64,
+    /// Viscoelastic extrudate swell multiplier from the configured
+    /// `fluid_dynamics::FluidDynamicsEngine`, when enabled; `1.0` when no
+    /// fluid-dynamics model is configured.
+    pub swell_mult: f64,
+    /// Ratio applied by `corner_flow::apply_corner_flow_compensation`, when
+    /// `SlicerConfig::enable_corner_flow_compensation` is set; `1.0`
+    /// otherwise.
+    pub corner_flow_mult: f64,
+    /// Ratio applied by
+    /// `transient_pressure::apply_transient_flow_compensation`, when
+    /// `SlicerConfig::enable_transient_pressure_compensation` is set;
+    /// `1.0` otherwise.
+    pub transient_pressure_mult: f64,
+}
+
+impl Default for FlowBreakdown {
+    fn default() -> Self {
+        Self {
+            slope_cosine: 1.0,
+            first_layer_mult: 1.0,
+            directional_flow_mult: 1.0,
+            swell_mult: 1.0,
+            corner_flow_mult: 1.0,
+            transient_pressure_mult: 1.0,
+        }
+    }
+}
+
 /// Per-segment motion metadata for one `points[i] -> points[i+1]` edge of a
 /// [`Path]` (including the closing edge of a closed loop).
 #[derive(Debug, Clone, Copy)]
@@ -2642,6 +2697,12 @@ pub struct Segment {
     /// `extrusion::clamped_bead_cross_section_area` when
     /// `config.bead_clearance_compensation_enabled()`.
     pub channel_width: f64,
+    /// Breakdown of this segment's individual flow-adjustment multipliers,
+    /// for tuning-visualization purposes -- see `FlowBreakdown`'s own doc
+    /// comment. `None` for non-extruding moves (e.g. `MoveKind::Travel`)
+    /// and for any extruding segment produced by a construction path that
+    /// doesn't populate it (e.g. hand-built test fixtures).
+    pub flow_breakdown: Option<FlowBreakdown>,
 }
 
 impl Default for Segment {
@@ -2662,6 +2723,7 @@ impl Default for Segment {
             id: 0,
             island: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         }
     }
 }
@@ -2910,6 +2972,7 @@ pub fn plan_with_progress(
                                 id: 0,
                                 island: wall_loop.island,
                                 channel_width: f64::INFINITY,
+                                flow_breakdown: None,
                             })
                             .collect();
                         paths.push(Path {
@@ -3020,6 +3083,7 @@ pub fn plan_with_progress(
                             id: 0,
                             island: wall_loop.island,
                             channel_width: seg_channel_width,
+                            flow_breakdown: None,
                         }
                     })
                     .collect();
@@ -3541,6 +3605,20 @@ pub fn plan_with_progress(
                         * first_layer_mult
                         * directional_flow_mult
                         * swell_mult;
+
+                    // corner_flow_mult/transient_pressure_mult stay at their
+                    // FlowBreakdown::default() neutral 1.0 here -- both are
+                    // applied by separate passes further down/after this
+                    // closure (apply_corner_flow_compensation,
+                    // apply_transient_flow_compensation), which update this
+                    // same field in place rather than overwrite it.
+                    segment.flow_breakdown = Some(FlowBreakdown {
+                        slope_cosine,
+                        first_layer_mult,
+                        directional_flow_mult,
+                        swell_mult,
+                        ..FlowBreakdown::default()
+                    });
                 }
             }
 
@@ -3868,6 +3946,7 @@ mod tests {
                 is_scarf: false,
                 id: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             })
             .collect();
         Path {
@@ -4699,6 +4778,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let travel_segment = Segment {
             island: 0,
@@ -4712,6 +4792,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let path = Path {
             points: vec![p0, p1, p2, p3],
@@ -4794,6 +4875,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let travel_segment = Segment {
             island: 0,
@@ -4807,6 +4889,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let path = Path {
             points: vec![p0, p1, p2, p3],
@@ -4855,6 +4938,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let infill_segment = Segment {
             island: 0,
@@ -4868,6 +4952,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let path = Path {
             points: vec![p0, p1, p2],
@@ -4912,6 +4997,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let travel_segment = Segment {
             island: 0,
@@ -4925,6 +5011,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         // Only 2 segments for 3 points: no closing edge.
         let path = Path {
@@ -4988,6 +5075,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let travel_segment = Segment {
             island: 0,
@@ -5001,6 +5089,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let path = Path {
             points: vec![p0, p1, p2],
@@ -5045,6 +5134,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let travel_segment = Segment {
             island: 0,
@@ -5058,6 +5148,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let path = Path {
             points: vec![p0, p1, p2],
@@ -5122,6 +5213,7 @@ mod tests {
                 is_scarf: false,
                 id: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             })
             .collect();
         Path {
@@ -5147,6 +5239,7 @@ mod tests {
                 is_scarf: false,
                 id: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             })
             .collect();
         Path {
@@ -5689,6 +5782,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let short_travel = Segment {
             island: 0,
@@ -5702,6 +5796,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         let long_travel = Segment {
             island: 0,
@@ -5715,6 +5810,7 @@ mod tests {
             is_scarf: false,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
 
         let path = Path {
@@ -6442,6 +6538,14 @@ mod tests {
             (actual_e - expected_climbing_e).abs() < 1e-4,
             "Actual extrusion length ({actual_e}) should match horizontal projection ({expected_climbing_e})"
         );
+        let fb = path.segments[0]
+            .flow_breakdown
+            .expect("plan's main flow closure must populate flow_breakdown");
+        assert!(
+            fb.slope_cosine < 0.99,
+            "slope_cosine {} must reflect the climbing move's real inclination, not the neutral default 1.0",
+            fb.slope_cosine
+        );
     }
 
     #[test]
@@ -6561,6 +6665,7 @@ mod tests {
                 support_fraction: 1.0,
                 extrusion_length: 0.0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
                 order: 10.0,
                 line_width: 0.4,
                 is_scarf: false,
@@ -6654,6 +6759,7 @@ mod tests {
                     support_fraction: 1.0,
                     extrusion_length: 0.1,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                     order: 5.0,
                     line_width: 0.60, // Widened by +0.20 mm!
                     is_scarf: false,
@@ -6667,6 +6773,7 @@ mod tests {
                     support_fraction: 1.0,
                     extrusion_length: 0.1,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                     order: 5.0,
                     line_width: 0.60,
                     is_scarf: false,
@@ -6680,6 +6787,7 @@ mod tests {
                     support_fraction: 1.0,
                     extrusion_length: 0.1,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                     order: 5.0,
                     line_width: 0.40,
                     is_scarf: false,
@@ -6693,6 +6801,7 @@ mod tests {
                     support_fraction: 1.0,
                     extrusion_length: 0.1,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                     order: 5.0,
                     line_width: 0.40,
                     is_scarf: false,

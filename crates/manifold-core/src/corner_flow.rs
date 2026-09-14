@@ -34,7 +34,7 @@ use manifold_fidget::order::OrderField;
 use crate::{
     kinematics::klipper_corner_velocity,
     machine::Machine,
-    toolpath::{MoveKind, Path},
+    toolpath::{FlowBreakdown, MoveKind, Path},
     SlicerConfig,
 };
 
@@ -287,6 +287,20 @@ pub fn apply_corner_flow_compensation(
                 seg.extrusion_rate *= new_e / old_e;
             }
             seg.extrusion_length = new_e;
+
+            let corner_flow_mult = if old_e > 1e-6 {
+                (new_e / old_e).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            if let Some(fb) = seg.flow_breakdown.as_mut() {
+                fb.corner_flow_mult = corner_flow_mult;
+            } else {
+                seg.flow_breakdown = Some(FlowBreakdown {
+                    corner_flow_mult,
+                    ..FlowBreakdown::default()
+                });
+            }
         }
     }
 }
@@ -381,6 +395,7 @@ mod tests {
                     id: 0,
                     island: 0,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                 };
                 4
             ],
@@ -400,6 +415,16 @@ mod tests {
         for seg in &paths[0].segments {
             assert!(seg.extrusion_length < initial_e);
             assert!(seg.extrusion_length > 0.0);
+            let fb = seg
+                .flow_breakdown
+                .expect("corner flow compensation must populate flow_breakdown");
+            let expected_mult = (seg.extrusion_length / initial_e).clamp(0.0, 1.0);
+            assert!(
+                (fb.corner_flow_mult - expected_mult).abs() < 1e-9,
+                "corner_flow_mult {} must equal the actual applied ratio {}",
+                fb.corner_flow_mult,
+                expected_mult
+            );
         }
     }
 }

@@ -375,6 +375,7 @@ fn assemble_scanlines_into_paths(
                     id: 0,
                     island: 0,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                 });
             }
             points.push(world);
@@ -835,6 +836,7 @@ fn generate_tpms_infill(
                 id: 0,
                 island: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             })
             .collect();
         paths.push(Path {
@@ -1067,6 +1069,7 @@ impl InfillGenerator for ConcentricInfill {
                         id: 0,
                         island: 0,
                         channel_width: f64::INFINITY,
+                        flow_breakdown: None,
                     })
                     .collect();
                 Path {
@@ -1173,6 +1176,7 @@ impl InfillGenerator for AllWallsInfill {
                         id: 0,
                         island: 0,
                         channel_width: f64::INFINITY,
+                        flow_breakdown: None,
                     })
                     .collect();
                 Path {

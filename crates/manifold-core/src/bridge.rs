@@ -232,6 +232,7 @@ pub fn plan_bridges(layers: &[Layer], config: &SlicerConfig, tool: ToolId) -> Br
                     id: 0,
                     island: 0,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                 }];
 
                 paths.push(Path {

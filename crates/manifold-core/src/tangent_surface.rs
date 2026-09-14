@@ -290,6 +290,7 @@ pub fn plan_tangent_surfaces(
                                 id: 0,
                                 island: 0,
                                 channel_width: f64::INFINITY,
+                                flow_breakdown: None,
                             })
                             .collect();
 

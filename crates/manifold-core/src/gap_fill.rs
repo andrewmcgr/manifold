@@ -332,6 +332,7 @@ pub fn plan_gap_fill_for_wall(
                         id: 0,
                         island: wall_loop.island,
                         channel_width: f64::INFINITY,
+                        flow_breakdown: None,
                     }
                 })
                 .collect();

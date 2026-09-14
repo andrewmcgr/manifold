@@ -698,6 +698,7 @@ pub fn plan_wave_overhangs(
                                 id: 0,
                                 island: 0,
                                 channel_width: f64::INFINITY,
+                                flow_breakdown: None,
                             })
                             .collect();
 
@@ -974,6 +975,7 @@ pub fn plan_wave_overhangs(
                             id: 0,
                             island: 0,
                             channel_width: f64::INFINITY,
+                            flow_breakdown: None,
                         })
                         .collect();
 

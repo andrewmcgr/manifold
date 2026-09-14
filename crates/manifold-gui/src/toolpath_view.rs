@@ -120,6 +120,18 @@ pub enum ToolpathDataView {
     Acceleration,
     ActualAcceleration,
     TravelDurations,
+    /// `FlowBreakdown::first_layer_mult` -- see `SlicerConfig::first_layer_extrusion_multiplier`.
+    FirstLayerMultiplier,
+    /// `FlowBreakdown::directional_flow_mult` -- see `SlicerConfig::slope_compensation_mode`.
+    DirectionalFlowMultiplier,
+    /// `FlowBreakdown::swell_mult` -- see `fluid_dynamics::FluidDynamicsEngine`.
+    SwellMultiplier,
+    /// `FlowBreakdown::corner_flow_mult` -- see `corner_flow::apply_corner_flow_compensation`.
+    CornerFlowMultiplier,
+    /// `FlowBreakdown::transient_pressure_mult` -- see `transient_pressure::apply_transient_flow_compensation`.
+    TransientPressureMultiplier,
+    /// `FlowBreakdown::slope_cosine` -- combined surface-inclination/trajectory-climb factor.
+    SlopeCosine,
 }
 
 impl ToolpathDataView {
@@ -132,6 +144,12 @@ impl ToolpathDataView {
             Self::Acceleration => "Acceleration",
             Self::ActualAcceleration => "Actual Acceleration",
             Self::TravelDurations => "Travel Durations",
+            Self::FirstLayerMultiplier => "First Layer Multiplier",
+            Self::DirectionalFlowMultiplier => "Directional Flow Multiplier",
+            Self::SwellMultiplier => "Extrudate Swell Multiplier",
+            Self::CornerFlowMultiplier => "Corner Flow Multiplier",
+            Self::TransientPressureMultiplier => "Transient Pressure Multiplier",
+            Self::SlopeCosine => "Slope Cosine",
         }
     }
 
@@ -144,6 +162,12 @@ impl ToolpathDataView {
             Self::Acceleration => "mm/s²",
             Self::ActualAcceleration => "mm/s²",
             Self::TravelDurations => "s",
+            Self::FirstLayerMultiplier
+            | Self::DirectionalFlowMultiplier
+            | Self::SwellMultiplier
+            | Self::CornerFlowMultiplier
+            | Self::TransientPressureMultiplier
+            | Self::SlopeCosine => "x",
         }
     }
 }
@@ -266,6 +290,20 @@ pub fn segment_scalar_value_with_profile(
             let speed_mm_s = (segment.speed / 60.0).max(1e-3);
             length / speed_mm_s
         }
+        ToolpathDataView::FirstLayerMultiplier => {
+            segment.flow_breakdown.map_or(1.0, |fb| fb.first_layer_mult)
+        }
+        ToolpathDataView::DirectionalFlowMultiplier => segment
+            .flow_breakdown
+            .map_or(1.0, |fb| fb.directional_flow_mult),
+        ToolpathDataView::SwellMultiplier => segment.flow_breakdown.map_or(1.0, |fb| fb.swell_mult),
+        ToolpathDataView::CornerFlowMultiplier => {
+            segment.flow_breakdown.map_or(1.0, |fb| fb.corner_flow_mult)
+        }
+        ToolpathDataView::TransientPressureMultiplier => segment
+            .flow_breakdown
+            .map_or(1.0, |fb| fb.transient_pressure_mult),
+        ToolpathDataView::SlopeCosine => segment.flow_breakdown.map_or(1.0, |fb| fb.slope_cosine),
     }
 }
 
@@ -346,6 +384,7 @@ pub fn data_view_range(
                     id: 0,
                     island: 0,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                 };
                 let val = segment_scalar_value(
                     &travel_segment,
@@ -566,6 +605,7 @@ pub fn build_toolpath_lines_filtered(
                     id: 0,
                     island: 0,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                 };
                 let color = match data_view {
                     ToolpathDataView::LineType
@@ -573,7 +613,13 @@ pub fn build_toolpath_lines_filtered(
                     | ToolpathDataView::Speed
                     | ToolpathDataView::ActualSpeed
                     | ToolpathDataView::Acceleration
-                    | ToolpathDataView::ActualAcceleration => COLOR_TRAVEL,
+                    | ToolpathDataView::ActualAcceleration
+                    | ToolpathDataView::FirstLayerMultiplier
+                    | ToolpathDataView::DirectionalFlowMultiplier
+                    | ToolpathDataView::SwellMultiplier
+                    | ToolpathDataView::CornerFlowMultiplier
+                    | ToolpathDataView::TransientPressureMultiplier
+                    | ToolpathDataView::SlopeCosine => COLOR_TRAVEL,
                     _ => {
                         let val = segment_scalar_value(
                             &travel_segment,
@@ -670,6 +716,12 @@ pub fn build_toolpath_lines_filtered(
                 | ToolpathDataView::ActualSpeed
                 | ToolpathDataView::Acceleration
                 | ToolpathDataView::ActualAcceleration
+                | ToolpathDataView::FirstLayerMultiplier
+                | ToolpathDataView::DirectionalFlowMultiplier
+                | ToolpathDataView::SwellMultiplier
+                | ToolpathDataView::CornerFlowMultiplier
+                | ToolpathDataView::TransientPressureMultiplier
+                | ToolpathDataView::SlopeCosine
                     if segment.kind == MoveKind::Travel =>
                 {
                     COLOR_TRAVEL
@@ -758,6 +810,7 @@ mod tests {
                 is_scarf: false,
                 id: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             })
             .collect();
         Path {
@@ -829,6 +882,7 @@ mod tests {
                 id: 0,
                 island: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             },
             manifold_core::toolpath::Segment {
                 kind: MoveKind::Infill,
@@ -842,6 +896,7 @@ mod tests {
                 id: 0,
                 island: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             },
         ];
         let path = Path {
@@ -909,6 +964,7 @@ mod tests {
                     is_scarf: false,
                     id: 0,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                 },
                 Segment {
                     island: 0,
@@ -922,6 +978,7 @@ mod tests {
                     is_scarf: false,
                     id: 0,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                 },
             ],
             tool: ToolId(0),
@@ -942,6 +999,7 @@ mod tests {
                     is_scarf: false,
                     id: 0,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                 },
                 Segment {
                     island: 0,
@@ -955,6 +1013,7 @@ mod tests {
                     is_scarf: false,
                     id: 0,
                     channel_width: f64::INFINITY,
+                    flow_breakdown: None,
                 },
             ],
             tool: ToolId(0),
@@ -1031,6 +1090,7 @@ mod tests {
             is_scarf: true,
             id: 0,
             channel_width: f64::INFINITY,
+            flow_breakdown: None,
         };
         assert_eq!(palette_color(seg.kind, seg.is_scarf), COLOR_SCARF_JOINT);
         seg.is_scarf = false;
@@ -1077,6 +1137,7 @@ mod tests {
                 is_scarf: false,
                 id: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             },
             Segment {
                 island: 0,
@@ -1090,6 +1151,7 @@ mod tests {
                 is_scarf: false,
                 id: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             },
             Segment {
                 island: 0,
@@ -1103,6 +1165,7 @@ mod tests {
                 is_scarf: false,
                 id: 0,
                 channel_width: f64::INFINITY,
+                flow_breakdown: None,
             },
         ];
         let path = Path {
@@ -1231,5 +1294,72 @@ mod tests {
         assert!(w_low < w_full);
         assert!(h_low < h_full);
         assert!((w_low - 0.4 * 0.10_f64.sqrt()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn multiplier_data_views_read_the_matching_flow_breakdown_field() {
+        let config = manifold_core::SlicerConfig::default();
+        let start = DVec3::new(0.0, 0.0, 0.0);
+        let end = DVec3::new(10.0, 0.0, 0.0);
+        let breakdown = manifold_core::toolpath::FlowBreakdown {
+            slope_cosine: 0.81,
+            first_layer_mult: 1.15,
+            directional_flow_mult: 0.92,
+            swell_mult: 1.08,
+            corner_flow_mult: 0.77,
+            transient_pressure_mult: 0.65,
+        };
+        let seg = Segment {
+            kind: MoveKind::WallOuter,
+            extrusion_length: 1.0,
+            flow_breakdown: Some(breakdown),
+            ..Segment::default()
+        };
+
+        let cases = [
+            (ToolpathDataView::SlopeCosine, breakdown.slope_cosine),
+            (
+                ToolpathDataView::FirstLayerMultiplier,
+                breakdown.first_layer_mult,
+            ),
+            (
+                ToolpathDataView::DirectionalFlowMultiplier,
+                breakdown.directional_flow_mult,
+            ),
+            (ToolpathDataView::SwellMultiplier, breakdown.swell_mult),
+            (
+                ToolpathDataView::CornerFlowMultiplier,
+                breakdown.corner_flow_mult,
+            ),
+            (
+                ToolpathDataView::TransientPressureMultiplier,
+                breakdown.transient_pressure_mult,
+            ),
+        ];
+        for (view, expected) in cases {
+            let val = segment_scalar_value(&seg, start, end, view, &config, None);
+            assert!(
+                (val - expected).abs() < 1e-9,
+                "{:?} expected {expected}, got {val}",
+                view
+            );
+        }
+
+        // A segment with no flow_breakdown reports the neutral 1.0 for every
+        // multiplier view -- not 0.0 -- since these are ratios, and a
+        // missing/unpopulated breakdown means "no adjustment applied".
+        let unpopulated = Segment {
+            kind: MoveKind::Travel,
+            flow_breakdown: None,
+            ..Segment::default()
+        };
+        for (view, _) in cases {
+            let val = segment_scalar_value(&unpopulated, start, end, view, &config, None);
+            assert!(
+                (val - 1.0).abs() < 1e-9,
+                "{:?} with no flow_breakdown should default to the neutral 1.0, got {val}",
+                view
+            );
+        }
     }
 }

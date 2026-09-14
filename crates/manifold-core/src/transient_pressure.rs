@@ -15,7 +15,7 @@
 use crate::fluid_dynamics::FluidDynamicsEngine;
 use crate::kinematics::plan_path_velocities;
 use crate::machine::Machine;
-use crate::toolpath::{MoveKind, Path};
+use crate::toolpath::{FlowBreakdown, MoveKind, Path};
 use crate::SlicerConfig;
 use glam::DVec3;
 
@@ -352,6 +352,15 @@ pub fn apply_transient_flow_compensation(
                 segment.extrusion_length = v_compensated / filament_area;
                 segment.extrusion_rate *= multiplier;
 
+                if let Some(fb) = segment.flow_breakdown.as_mut() {
+                    fb.transient_pressure_mult = multiplier;
+                } else {
+                    segment.flow_breakdown = Some(FlowBreakdown {
+                        transient_pressure_mult: multiplier,
+                        ..FlowBreakdown::default()
+                    });
+                }
+
                 // Enforce physical pressure floor across pre-retract tapers:
                 // Pre-retract tapers slash extrusion_length down to ~20% over the last few millimeters.
                 // In physical hotends, viscous resistance prevents internal melt pressure from cratering to zero.
@@ -627,6 +636,15 @@ mod tests {
         assert!(
             (0.65..1.0).contains(&m),
             "expected path 2 start segment M in [0.65, 1.0) reflecting post-unretract pressure priming, got {m}"
+        );
+        let fb = paths[1].segments[0]
+            .flow_breakdown
+            .expect("transient pressure compensation must populate flow_breakdown");
+        assert!(
+            (fb.transient_pressure_mult - m).abs() < 1e-9,
+            "transient_pressure_mult {} must equal the actual applied multiplier {}",
+            fb.transient_pressure_mult,
+            m
         );
     }
 }

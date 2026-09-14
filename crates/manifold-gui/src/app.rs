@@ -3768,6 +3768,12 @@ impl ManifoldApp {
                                                 ToolpathDataView::Acceleration,
                                                 ToolpathDataView::ActualAcceleration,
                                                 ToolpathDataView::TravelDurations,
+                                                ToolpathDataView::FirstLayerMultiplier,
+                                                ToolpathDataView::DirectionalFlowMultiplier,
+                                                ToolpathDataView::SwellMultiplier,
+                                                ToolpathDataView::CornerFlowMultiplier,
+                                                ToolpathDataView::TransientPressureMultiplier,
+                                                ToolpathDataView::SlopeCosine,
                                             ] {
                                                 ui.selectable_value(
                                                     &mut self.toolpath_data_view,
@@ -3895,6 +3901,12 @@ impl ManifoldApp {
                                             || view == ToolpathDataView::ActualSpeed
                                             || view == ToolpathDataView::Acceleration
                                             || view == ToolpathDataView::ActualAcceleration
+                                            || view == ToolpathDataView::FirstLayerMultiplier
+                                            || view == ToolpathDataView::DirectionalFlowMultiplier
+                                            || view == ToolpathDataView::SwellMultiplier
+                                            || view == ToolpathDataView::CornerFlowMultiplier
+                                            || view == ToolpathDataView::TransientPressureMultiplier
+                                            || view == ToolpathDataView::SlopeCosine
                                         {
                                             ui.horizontal(|ui| {
                                                 let (badge_rect, _) = ui.allocate_exact_size(
