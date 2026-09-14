@@ -513,6 +513,118 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
     )
 }
 
+/// Order-value stepping calibration derived from a set of representative
+/// surface points, each paired with the order field's raw value there.
+///
+/// The layer-generation loop in [`slice_mesh_with_progress`] identifies
+/// layers by stepping an order-field scalar (`order_value += layer_height`),
+/// which is only correct if the field is arc-length-calibrated (one order
+/// unit == one physical mm along the field's own gradient). That holds for
+/// [`HeightOrderField`] by construction, but not for order fields (notably
+/// `AnisotropicFsm`) whose local order-per-mm rate is deliberately distorted
+/// for toolpath-sequencing purposes near walls/top surfaces -- see
+/// `extrusion::local_layer_geometry`'s doc comment for the same unit
+/// mismatch on the per-point bead-sizing side of this pipeline.
+///
+/// `adaptive_step` estimates, from nearby representative points, how much
+/// order actually accrues over `layer_height` mm of real distance at a
+/// given `order_value`, so the stepping loop can advance the field's own
+/// units by that amount instead of a constant `layer_height` -- keeping the
+/// *number and average spacing* of generated layers close to physically
+/// uniform even where the field's local calibration varies severalfold
+/// from one region to the next. This does not (and cannot, from a single
+/// scalar per layer) make every point on a given layer's isosurface
+/// uniformly spaced -- that residual per-point variation is what
+/// `extrusion::local_layer_geometry`'s own geometric probe already
+/// compensates for at bead-sizing time.
+struct StepCalibration {
+    /// `(order_value, position)` pairs, sorted ascending by `order_value`.
+    samples: Vec<(f64, DVec3)>,
+}
+
+impl StepCalibration {
+    /// Builds a calibration from one wall pass's precomputed isosurface
+    /// positions and their order-field values (as already computed for
+    /// `wall_meshes` above, at no extra cost). Non-finite order values are
+    /// dropped.
+    fn from_wall_pass(positions: &[DVec3], orders: &[f64]) -> Self {
+        let mut samples: Vec<(f64, DVec3)> = positions
+            .iter()
+            .zip(orders.iter())
+            .filter(|(_, o)| o.is_finite())
+            .map(|(&p, &o)| (o, p))
+            .collect();
+        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Self { samples }
+    }
+
+    /// Estimates the order-value delta that advances roughly `layer_height`
+    /// mm of real distance from `order_value`, as the median of per-sample
+    /// forward probes (`field.order(sample_pos + gradient_dir * layer_height)
+    /// - sample_order`) over representative points near `order_value`.
+    ///
+    /// Falls back to `layer_height` verbatim -- today's pre-fix behavior --
+    /// when no samples are available at all, or when no nearby sample
+    /// yields a usable probe (e.g. every nearby point's gradient is
+    /// degenerate, or probing steps outside the field's defined region).
+    /// The result is clamped to `[0.3, 3.0] * layer_height` as a safety
+    /// bound against a single unrepresentative sample producing a
+    /// pathologically small or large step -- mirroring the clamp already
+    /// used by `extrusion::local_layer_geometry` for the same reason.
+    fn adaptive_step(&self, field: &dyn OrderField, order_value: f64, layer_height: f64) -> f64 {
+        if self.samples.is_empty() {
+            return layer_height;
+        }
+
+        const MAX_SAMPLES: usize = 24;
+        const MIN_SAMPLES: usize = 4;
+        const MAX_WINDOW_GROWTHS: u32 = 6;
+
+        let mut window = 2.0 * layer_height;
+        let mut deltas: Vec<f64> = Vec::new();
+        for _ in 0..MAX_WINDOW_GROWTHS {
+            deltas.clear();
+            let lo = self
+                .samples
+                .partition_point(|(o, _)| *o < order_value - window);
+            let hi = self
+                .samples
+                .partition_point(|(o, _)| *o <= order_value + window);
+            let candidates = &self.samples[lo..hi];
+            let stride = (candidates.len() / MAX_SAMPLES).max(1);
+            for (order, pos) in candidates.iter().step_by(stride) {
+                let Some(grad) = order_field::numeric_gradient(field, *pos) else {
+                    continue;
+                };
+                let grad_len = grad.length();
+                if !grad_len.is_finite() || grad_len < 1e-9 {
+                    continue;
+                }
+                let normal = grad / grad_len;
+                let advanced = field.order(*pos + normal * layer_height);
+                if !advanced.is_finite() {
+                    continue;
+                }
+                let delta = advanced - order;
+                if delta.is_finite() && delta > 0.0 {
+                    deltas.push(delta);
+                }
+            }
+            if deltas.len() >= MIN_SAMPLES {
+                break;
+            }
+            window *= 2.0;
+        }
+
+        if deltas.is_empty() {
+            return layer_height;
+        }
+        deltas.sort_by(f64::total_cmp);
+        let median = deltas[deltas.len() / 2];
+        median.clamp(0.3 * layer_height, 3.0 * layer_height)
+    }
+}
+
 /// Same as [`slice_mesh`], but calls `on_progress` as work finishes with
 /// the fraction of total work completed so far (`0.0..=1.0`) — intended
 /// for a caller (e.g. the GUI, slicing on a background thread) to report
@@ -763,6 +875,31 @@ pub fn slice_mesh_with_progress(
 
     let effective_order_max = order_max;
 
+    // For non-planar order fields, calibrate the stepping loop's order-value
+    // increments against real physical distance instead of raw order units.
+    // `Height` is exempt: its order field is exactly arc-length-calibrated
+    // by construction (`order(p) = p.dot(direction)`, gradient magnitude
+    // always exactly 1), so the naive `+= layer_height` step is already
+    // exact there. Other fields (in particular `AnisotropicFsm`, whose
+    // boundary-metric blending near walls/top surfaces deliberately distorts
+    // local order-per-mm calibration for toolpath-sequencing purposes -- see
+    // `extrusion::local_layer_geometry`'s doc comment for the same unit
+    // mismatch on the per-point bead-sizing side) can have order-per-mm vary
+    // several-fold from one region to the next, so a constant order-value
+    // step lands wildly uneven real layer spacing. `StepCalibration` reuses
+    // wall pass 0's isosurface (already fully computed above, needed
+    // regardless for crown-layer detection below) as a set of representative
+    // points to measure the *actual* local order-per-mm rate near each step,
+    // so the loop advances roughly `layer_height` mm of real distance per
+    // step on average, not `layer_height` raw order units.
+    let calibration = if is_height {
+        None
+    } else {
+        wall_meshes
+            .first()
+            .map(|(positions, orders)| StepCalibration::from_wall_pass(positions, orders))
+    };
+
     // Precompute every order-field value this walk will sample, so the
     // per-layer contour extraction below can run in parallel (each layer
     // only reads the shared, immutable `sdf` — see `MeshSdf`, whose query
@@ -786,7 +923,11 @@ pub fn slice_mesh_with_progress(
             )));
         }
         order_values.push(order_value);
-        order_value += layer_height;
+        let step = calibration
+            .as_ref()
+            .map(|c| c.adaptive_step(&*field, order_value, layer_height))
+            .unwrap_or(layer_height);
+        order_value += step;
     }
     // If the model summit extends beyond the last stepped layer by more than a negligible
     // fraction, emit a final layer at effective_order_max for non-planar fields (DualIso,
@@ -3099,6 +3240,102 @@ mod tests {
             ],
             vec![0, 1, 2],
         )
+    }
+
+    /// An order field with a constant, deliberately non-1.0 gradient
+    /// magnitude (`order(p) = 2.5 * p.z`, so 2.5 order units accrue per mm
+    /// of real distance along Z). Models the far end of `AnisotropicFsm`'s
+    /// possible local calibration distortion in a form simple enough to
+    /// hand-verify the adaptive step's forward probe exactly.
+    struct ScaledLinearField {
+        rate: f64,
+    }
+    impl manifold_fidget::order::OrderField for ScaledLinearField {
+        fn order(&self, p: DVec3) -> f64 {
+            self.rate * p.z
+        }
+    }
+
+    #[test]
+    fn step_calibration_adaptive_step_recovers_true_rate_from_uniform_samples() {
+        let rate = 2.5;
+        let field = ScaledLinearField { rate };
+        let positions: Vec<DVec3> = (0..8).map(|i| DVec3::new(0.0, 0.0, i as f64)).collect();
+        let orders: Vec<f64> = positions.iter().map(|&p| field.order(p)).collect();
+        let calibration = StepCalibration::from_wall_pass(&positions, &orders);
+
+        let layer_height = 0.2;
+        let step = calibration.adaptive_step(&field, 4.0 * rate, layer_height);
+
+        // Every sample sits on the same constant-rate field, so the forward
+        // probe from any of them is exact: advancing `layer_height` mm along
+        // Z accrues exactly `rate * layer_height` order units, with zero
+        // spread across samples.
+        let expected = rate * layer_height;
+        assert!(
+            (step - expected).abs() < 1e-9,
+            "expected adaptive step {expected}, got {step}"
+        );
+        // Sanity check this genuinely differs from the naive constant step
+        // the fix replaces -- otherwise the test wouldn't be exercising the
+        // calibration at all.
+        assert!(
+            (step - layer_height).abs() > 0.1,
+            "adaptive step {step} should diverge from the naive raw-unit step {layer_height}"
+        );
+    }
+
+    #[test]
+    fn step_calibration_adaptive_step_takes_the_median_across_mixed_rate_regions() {
+        // Three samples calibrated at rate 1.0 (order == Z, arc-length exact)
+        // and two at rate 4.0 (steeply distorted), all placed so their order
+        // value is exactly 5.0 -- guaranteeing every sample lands in the same
+        // probe window regardless of how it grows (rather than relying on
+        // window growth to ever reach a widely separated second group, which
+        // it may not: window growth is bounded to 64x the nominal step). The
+        // median of {1x, 1x, 1x, 4x, 4x} (sorted by delta) is the 1x rate's
+        // contribution.
+        struct MixedRateField;
+        impl manifold_fidget::order::OrderField for MixedRateField {
+            fn order(&self, p: DVec3) -> f64 {
+                if p.x < 0.5 {
+                    p.z
+                } else {
+                    4.0 * p.z
+                }
+            }
+        }
+        let field = MixedRateField;
+        let positions = vec![
+            DVec3::new(0.0, 0.0, 5.0),
+            DVec3::new(0.0, 1.0, 5.0),
+            DVec3::new(0.0, 2.0, 5.0),
+            DVec3::new(1.0, 0.0, 1.25),
+            DVec3::new(1.0, 1.0, 1.25),
+        ];
+        let orders: Vec<f64> = positions.iter().map(|&p| field.order(p)).collect();
+        let calibration = StepCalibration::from_wall_pass(&positions, &orders);
+
+        let layer_height = 0.2;
+        let step = calibration.adaptive_step(&field, 5.0, layer_height);
+
+        let expected = 1.0 * layer_height;
+        assert!(
+            (step - expected).abs() < 1e-9,
+            "expected median-of-rate-1.0 step {expected}, got {step}"
+        );
+    }
+
+    #[test]
+    fn step_calibration_adaptive_step_falls_back_to_layer_height_with_no_samples() {
+        let field = ScaledLinearField { rate: 2.5 };
+        let calibration = StepCalibration::from_wall_pass(&[], &[]);
+        let layer_height = 0.2;
+        let step = calibration.adaptive_step(&field, 4.0, layer_height);
+        assert_eq!(
+            step, layer_height,
+            "with no calibration samples the step must fall back to the naive raw-unit step"
+        );
     }
 
     #[test]
