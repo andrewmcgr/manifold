@@ -3892,7 +3892,7 @@ impl ManifoldApp {
                                                     } else if (max_val - min_val).abs() > 10.0 {
                                                         format!("{val:.0} {unit}")
                                                     } else {
-                                                        format!("{val:.2} {unit}")
+                                                        format!("{val:.3} {unit}")
                                                     };
                                                 ui.label(egui::RichText::new(label_str).size(11.0));
                                             });
