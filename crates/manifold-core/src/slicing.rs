@@ -1119,7 +1119,7 @@ pub fn slice_mesh_with_progress(
                     })
                     .collect();
                 let wall0_loops =
-                    suppress_close_redundant_loops(wall0_loops, 1.5 * config.wall_line_width);
+                    suppress_close_redundant_loops(wall0_loops, config.max_bead_width());
 
                 let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
                 let canonical_2d = polygon2d::canonicalize(&loops_2d);
@@ -1210,10 +1210,8 @@ pub fn slice_mesh_with_progress(
                         }
                     }
 
-                    let extracted_w_loops = suppress_close_redundant_loops(
-                        extracted_w_loops,
-                        1.5 * config.wall_line_width,
-                    );
+                    let extracted_w_loops =
+                        suppress_close_redundant_loops(extracted_w_loops, config.max_bead_width());
 
                     for pts in extracted_w_loops {
                         let arc_fraction = compute_arc_fractions(&pts);
@@ -2372,6 +2370,15 @@ fn aabbs_within(a: (DVec3, DVec3), b: (DVec3, DVec3), threshold: f64) -> bool {
 /// real overextrusion, even though each loop is individually correct.
 /// Keeps the loop with the larger perimeter (the outer envelope) from each
 /// too-close pair.
+///
+/// Callers should pass `threshold = config.max_bead_width()`: two
+/// centerlines within that distance could have their beads touch or
+/// overlap if adaptive extrusion widens both to the maximum allowed bead
+/// width (the actual collision condition), while anything farther apart
+/// is guaranteed at least one full bead's worth of real, fillable space
+/// between them -- not redundant. A smaller threshold risks missing a
+/// genuine collision; a larger one risks discarding a real, separately
+/// printable wall pass.
 fn suppress_close_redundant_loops(loops: Vec<Vec<DVec3>>, threshold: f64) -> Vec<Vec<DVec3>> {
     let n = loops.len();
     if n < 2 {
