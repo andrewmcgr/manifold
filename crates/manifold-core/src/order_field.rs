@@ -856,7 +856,7 @@ pub fn reconstruct_on_order_field_near<F: OrderField + ?Sized>(
     axis: DVec3,
     apex: DVec3,
     target_order: f64,
-    _max_along: f64,
+    max_along: f64,
     field: &F,
 ) -> Vec<Vec<DVec3>> {
     // Project references once into (u, v, along) triples.
@@ -885,7 +885,7 @@ pub fn reconstruct_on_order_field_near<F: OrderField + ?Sized>(
                         .map(|&(_, _, along)| along)
                         .unwrap_or(0.0);
                     let planar = apex + basis1 * u + basis2 * v + axis * nearest_along;
-                    let bracket = 2.0;
+                    let bracket = max_along;
                     match solve_along_near(field, planar, axis, target_order, bracket) {
                         Some(SolveAlong::Exact(t)) | Some(SolveAlong::ClosestObserved(t)) => {
                             planar + axis * t
