@@ -63,6 +63,12 @@ pub struct AnisotropicFsmOrderField {
     h: f64,
     distances: Vec<f64>,
     gradients: Vec<DVec3>,
+    // Populated only via `with_seed_metadata` (called by callers that also
+    // seed from patches, not just the bed) -- see `seed_proximity`'s
+    // override below.
+    seed_baseline_distances: Option<Vec<f64>>,
+    seed_component_id: Option<Vec<i32>>,
+    seed_component_value: Option<Vec<f64>>,
 }
 
 impl AnisotropicFsmOrderField {
@@ -192,6 +198,9 @@ impl AnisotropicFsmOrderField {
             h,
             distances,
             gradients: Vec::new(),
+            seed_baseline_distances: None,
+            seed_component_id: None,
+            seed_component_value: None,
         };
 
         if let Some(profile) = slope_profile {
@@ -658,6 +667,28 @@ impl AnisotropicFsmOrderField {
     pub fn idx(&self, x: usize, y: usize, z: usize) -> usize {
         x + y * self.dims[0] + z * self.dims[0] * self.dims[1]
     }
+
+    /// Attaches seed-proximity metadata computed alongside a seeded solve
+    /// (a bed-only `baseline` field plus each patch component's grid
+    /// membership and consensus order value), enabling `seed_proximity`
+    /// queries to additionally account for the nearest patch, not just
+    /// the bed. Only ever called by builders that construct patch seeds
+    /// (e.g. `manifold_core::order_field::fsm_field_for` when
+    /// `fsm_seed_surfaces_enabled` is set); without it, `seed_proximity`
+    /// falls back to the `OrderField` trait's default (`order(p)`
+    /// itself, i.e. bed-distance only).
+    #[must_use]
+    pub fn with_seed_metadata(
+        mut self,
+        baseline: AnisotropicFsmOrderField,
+        component_id: Vec<i32>,
+        component_value: Vec<f64>,
+    ) -> Self {
+        self.seed_baseline_distances = Some(baseline.distances);
+        self.seed_component_id = Some(component_id);
+        self.seed_component_value = Some(component_value);
+        self
+    }
 }
 
 impl OrderField for AnisotropicFsmOrderField {
@@ -738,6 +769,32 @@ impl OrderField for AnisotropicFsmOrderField {
         let v_y1 = (1.0 - ty) * v_z1 + ty * v_z3;
 
         (1.0 - tx) * v_y0 + tx * v_y1
+    }
+
+    fn seed_proximity(&self, p: DVec3) -> Option<f64> {
+        let Some(baseline) = self.seed_baseline_distances.as_ref() else {
+            return Some(self.order(p));
+        };
+        let [nx, ny, nz] = self.dims;
+        let x = (((p.x - self.min_corner.x) / self.h).round() as isize).clamp(0, nx as isize - 1)
+            as usize;
+        let y = (((p.y - self.min_corner.y) / self.h).round() as isize).clamp(0, ny as isize - 1)
+            as usize;
+        let z = (((p.z - self.min_corner.z) / self.h).round() as isize).clamp(0, nz as isize - 1)
+            as usize;
+        let idx = self.idx(x, y, z);
+        let bed_distance = baseline.get(idx).copied().unwrap_or(f64::INFINITY);
+        let patch_distance = self
+            .seed_component_id
+            .as_ref()
+            .and_then(|ids| ids.get(idx))
+            .filter(|&&comp| comp >= 0)
+            .and_then(|&comp| self.seed_component_value.as_ref()?.get(comp as usize))
+            .map(|&seed_value| (self.order(p) - seed_value).abs());
+        Some(match patch_distance {
+            Some(pd) => bed_distance.min(pd),
+            None => bed_distance,
+        })
     }
 }
 

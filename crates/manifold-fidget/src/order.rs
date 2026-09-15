@@ -18,6 +18,21 @@ use glam::DVec3;
 pub trait OrderField: Send + Sync {
     /// Evaluates the order field at `p`.
     fn order(&self, p: DVec3) -> f64;
+
+    /// Order-space distance from `p` to whichever seed (the bed contact,
+    /// or -- for a field that supports it -- a top-surface patch) is
+    /// locally responsible for this region: approximately physical
+    /// distance along the climb direction for a well-behaved field.
+    ///
+    /// Default: `order(p)` itself. This is exact for a field with only a
+    /// bed seed (order already *is* bed-distance for `Height`, `Conical`,
+    /// `Eikonal`, `DualIso` -- none of these support patch seeds today),
+    /// and is overridden by implementations that also seed from patches
+    /// (see `AnisotropicFsmOrderField`) to additionally account for
+    /// proximity to the nearest patch.
+    fn seed_proximity(&self, p: DVec3) -> Option<f64> {
+        Some(self.order(p))
+    }
 }
 
 /// The simplest [`OrderField`]: a plain height field along `direction`,

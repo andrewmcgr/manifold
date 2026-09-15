@@ -427,7 +427,7 @@ fn fsm_field_for(
         (comp >= 0).then(|| component_value[comp as usize])
     };
 
-    AnisotropicFsmOrderField::solve_with_tensor_grid(
+    let field = AnisotropicFsmOrderField::solve_with_tensor_grid(
         actual_min,
         dims,
         h,
@@ -437,7 +437,8 @@ fn fsm_field_for(
         max_sweeps,
         Some(slope_profile),
         Some(&height_along),
-    )
+    );
+    field.with_seed_metadata(baseline, component_id, component_value)
 }
 
 /// Groups upward-facing surface-patch seed candidates (see `fsm_field_for`'s

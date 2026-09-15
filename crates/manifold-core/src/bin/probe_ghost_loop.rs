@@ -90,4 +90,33 @@ fn main() {
             dev_report,
         );
     }
+
+    // Verify seed_proximity() sanity: near-0 at bed contact and inside a
+    // known patch-seeded top-surface cluster, larger away from both.
+    if let Some(layer) = layers.first() {
+        let field = layer.order_field.as_ref();
+        let bed_point = glam::DVec3::new(155.0, 181.0, 0.01);
+        eprintln!(
+            "\nseed_proximity(bed contact z=0.01) = {:?}",
+            field.seed_proximity(bed_point)
+        );
+        let mid_air = glam::DVec3::new(155.0, 181.0, 0.8);
+        eprintln!(
+            "seed_proximity(mid-height z=4.0, far from any seed) = {:?}",
+            field.seed_proximity(mid_air)
+        );
+    }
+    // Known patch-seeded top-surface cluster from probe_top_seeds output:
+    // z=6.8 cx=33.331 cy=-0.000, area=29.35 (largest cluster).
+    let patch_layer = layers
+        .iter()
+        .min_by(|a, b| (a.order - 6.8).abs().total_cmp(&(b.order - 6.8).abs()));
+    if let Some(layer) = patch_layer {
+        let patch_point = glam::DVec3::new(155.0, 181.0, 8.5);
+        eprintln!(
+            "seed_proximity(patch top-surface cluster z=6.8) = {:?} (layer order={:.4})",
+            layer.order_field.seed_proximity(patch_point),
+            layer.order
+        );
+    }
 }
