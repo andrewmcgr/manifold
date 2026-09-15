@@ -237,9 +237,18 @@ pub fn plan_gap_fill_for_wall(
             // gap-fill-if-`ds > max_w` branch below always engages instead of
             // silently skipping -- this is exactly the regime
             // `fsm_top_tangency_aspect` deliberately produces near top surfaces.
+            //
+            // But cross_len -> 0 also happens when n_cad and n_order are simply
+            // ANTIPARALLEL, not tangent -- e.g. every bottom-layer wall point on a
+            // flat-bottomed model, where n_cad points straight down into the bed
+            // and n_order points straight up. That's ordinary bed contact, not a
+            // near-tangent surface needing gap fill, so only treat cross_len -> 0
+            // as tangency when the normals are actually close to parallel (not
+            // antiparallel).
+            let is_antiparallel_degeneracy = n_cad.dot(n_order) < -0.9;
             let ds = if cross_len.is_finite() && cross_len > 1e-4 {
                 config.wall_line_width / cross_len
-            } else if cross_len.is_finite() {
+            } else if cross_len.is_finite() && !is_antiparallel_degeneracy {
                 max_w + 1.0
             } else {
                 target_ds_list.push(config.wall_line_width);
