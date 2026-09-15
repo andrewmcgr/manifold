@@ -1275,10 +1275,12 @@ pub fn slice_mesh_with_progress(
                 if let Some(deepest_wall) = partitioned.last() {
                     let inset =
                         polygon2d::inward_offset(&deepest_wall.loops_2d, config.wall_line_width);
+                    // An inset that collapses to nothing means this island's
+                    // deepest wall genuinely can't support any further-inward
+                    // material -- leave this island's infill empty rather than
+                    // retracing the un-inset wall's own outline on top of it.
                     if !inset.is_empty() {
                         layer_infill_2d.extend(inset);
-                    } else if !deepest_wall.loops_2d.is_empty() {
-                        layer_infill_2d.extend(deepest_wall.loops_2d.clone());
                     }
                 }
                 polygon2d::from_2d(layer_infill_2d, basis1, basis2, origin)
@@ -3262,11 +3264,11 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                         .collect();
                     let wall0_2d = polygon2d::to_2d(&wall0, basis1, basis2, origin);
                     let inset = polygon2d::inward_offset(&wall0_2d, config.wall_line_width);
-                    if inset.is_empty() {
-                        wall0_2d
-                    } else {
-                        inset
-                    }
+                    // An inset that collapses to nothing means this island's
+                    // wall 0 genuinely can't support any further-inward
+                    // material -- leave this boundary empty rather than
+                    // retracing wall 0's own outline on top of itself.
+                    inset
                 } else {
                     let raw = polygon2d::to_2d(infill, basis1, basis2, origin);
                     polygon2d::canonicalize(&raw)
@@ -5818,11 +5820,14 @@ mod tests {
     }
 
     #[test]
-    fn slice_mesh_computes_infill_boundary_for_all_islands_regardless_of_wall_count() {
+    fn slice_mesh_leaves_infill_boundary_empty_when_a_narrow_islands_inset_collapses() {
         // Create a layer with two disconnected wall 0 islands:
-        // - Island 0: large (radius 10mm), easily fits 3 walls.
-        // - Island 1: small boss/summit (radius 0.6mm), fits only 1 wall.
-        // Both islands must generate infill boundaries so the narrow summit is not left with an open hole.
+        // - Island 0: large (radius 10mm), easily fits 3 walls, with real
+        //   room left over for an infill boundary.
+        // - Island 1: small boss/summit (radius 0.6mm) whose deepest wall's
+        //   own inward offset for infill collapses to nothing -- its wall
+        //   trace already covers essentially the whole island, so it must
+        //   NOT fall back to retracing that wall's own outline as infill.
         let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
         let origin = DVec3::ZERO;
 
@@ -5858,19 +5863,23 @@ mod tests {
             if let Some(deepest_wall) = partitioned.last() {
                 let inset =
                     polygon2d::inward_offset(&deepest_wall.loops_2d, config.wall_line_width);
+                // An inset that collapses to nothing means this island's
+                // deepest wall genuinely can't support any further-inward
+                // material -- leave it out rather than retracing the
+                // un-inset wall's own outline on top of it.
                 if !inset.is_empty() {
                     layer_infill_2d.extend(inset);
-                } else if !deepest_wall.loops_2d.is_empty() {
-                    layer_infill_2d.extend(deepest_wall.loops_2d.clone());
                 }
             }
         }
 
-        // Must produce 2 infill boundary loops (one for each island)
+        // Only the large island has real room for an infill boundary; the
+        // narrow summit's own wall trace already covers it.
         assert_eq!(
             layer_infill_2d.len(),
-            2,
-            "both the large island and the narrow summit must have infill boundaries"
+            1,
+            "only the large island should have an infill boundary once the \
+             narrow summit's inset collapses"
         );
     }
 
