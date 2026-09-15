@@ -10,7 +10,7 @@
 use crate::fsm_simplex::solve_anisotropic_octant_simplex;
 use crate::fsm_tensor::{MetricTensor3, TensorGrid};
 use crate::height_along::HeightAlong;
-use crate::order::OrderField;
+use crate::order::{OrderField, SeedKind};
 use crate::slope_profile::SlopeProfile;
 use glam::DVec3;
 use rayon::prelude::*;
@@ -771,9 +771,9 @@ impl OrderField for AnisotropicFsmOrderField {
         (1.0 - tx) * v_y0 + tx * v_y1
     }
 
-    fn seed_proximity(&self, p: DVec3) -> Option<f64> {
+    fn seed_proximity(&self, p: DVec3) -> Option<(SeedKind, f64)> {
         let Some(baseline) = self.seed_baseline_distances.as_ref() else {
-            return Some(self.order(p));
+            return Some((SeedKind::Bed, self.order(p)));
         };
         let [nx, ny, nz] = self.dims;
         let x = (((p.x - self.min_corner.x) / self.h).round() as isize).clamp(0, nx as isize - 1)
@@ -792,8 +792,8 @@ impl OrderField for AnisotropicFsmOrderField {
             .and_then(|&comp| self.seed_component_value.as_ref()?.get(comp as usize))
             .map(|&seed_value| (self.order(p) - seed_value).abs());
         Some(match patch_distance {
-            Some(pd) => bed_distance.min(pd),
-            None => bed_distance,
+            Some(pd) if pd < bed_distance => (SeedKind::Patch, pd),
+            _ => (SeedKind::Bed, bed_distance),
         })
     }
 }

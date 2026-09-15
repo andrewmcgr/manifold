@@ -11,6 +11,16 @@
 use crate::{FieldSample, ScalarField};
 use glam::DVec3;
 
+/// Which kind of seed a `seed_proximity` query resolved to -- the bed
+/// contact plane, or (for a field that supports it) a top-surface patch.
+/// Distinguishes which of `SlicerConfig::bottom_layers`/`::top_layers`
+/// governs solid-fill depth at that point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedKind {
+    Bed,
+    Patch,
+}
+
 /// A scalar field over 3D space whose isosurfaces (`order(p) == c` for a
 /// sequence of increasing `c`) define the slicing order — the simplest
 /// instance, [`HeightOrderField`], reduces this to conventional planar
@@ -30,8 +40,8 @@ pub trait OrderField: Send + Sync {
     /// and is overridden by implementations that also seed from patches
     /// (see `AnisotropicFsmOrderField`) to additionally account for
     /// proximity to the nearest patch.
-    fn seed_proximity(&self, p: DVec3) -> Option<f64> {
-        Some(self.order(p))
+    fn seed_proximity(&self, p: DVec3) -> Option<(SeedKind, f64)> {
+        Some((SeedKind::Bed, self.order(p)))
     }
 }
 

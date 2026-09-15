@@ -9,7 +9,7 @@ use manifold_fidget::contour::{
 };
 use manifold_fidget::marching_cubes::extract_sparse_isosurface_positions;
 use manifold_fidget::mesh_sdf::MeshSdf;
-use manifold_fidget::order::{order_range_over_bbox, HeightOrderField, OrderField};
+use manifold_fidget::order::{order_range_over_bbox, HeightOrderField, OrderField, SeedKind};
 use manifold_fidget::ScalarField;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -843,12 +843,15 @@ pub fn slice_mesh_with_progress(
     // fast path unchanged; anything else (e.g. `Conical`) uses the
     // generalized "contour-on-mesh" path, which extracts each wall pass's
     // isosurface once (not once per layer) and walks it per layer.
-    let wall_meshes: Vec<(Vec<DVec3>, Vec<f64>)> = if is_height {
-        Vec::new()
-    } else {
-        // Sparse narrow-band marching cubes: target a cell size proportional
-        // to bead dimensions (~0.20-0.35mm) to accurately extract perimeter
-        // isosurfaces directly in 3D without memory blowup or slowdowns on large meshes.
+    // Sparse narrow-band marching cubes: target a cell size proportional to
+    // bead dimensions (~0.20-0.35mm) to accurately extract perimeter
+    // isosurfaces directly in 3D without memory blowup or slowdowns on
+    // large meshes. Computed for every order-field kind (including
+    // `Height`, whose own wall generation uses a separate, faster 2D
+    // plane-sampling path below and never needed this) because
+    // `infill_boundary` needs a `wall_meshes[wall_count]` isosurface
+    // regardless of kind -- see its own comment for why.
+    let wall_meshes: Vec<(Vec<DVec3>, Vec<f64>)> = {
         let cell_size = (config.wall_offset / 2.0)
             .min(config.wall_line_width / 4.0)
             .clamp(0.04, 0.10);
@@ -1262,30 +1265,8 @@ pub fn slice_mesh_with_progress(
 
             let infill_boundary = if wall0_loops.is_empty() {
                 Vec::new()
-            } else if is_height {
-                let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
-                let canonical_2d = polygon2d::canonicalize(&loops_2d);
-                let partitioned = polygon2d::partition_walls_adaptive(
-                    &canonical_2d,
-                    config.wall_line_width,
-                    config.min_bead_width(),
-                    wall_count,
-                );
-                let mut layer_infill_2d: Vec<Vec<[f64; 2]>> = Vec::new();
-                if let Some(deepest_wall) = partitioned.last() {
-                    let inset =
-                        polygon2d::inward_offset(&deepest_wall.loops_2d, config.wall_line_width);
-                    // An inset that collapses to nothing means this island's
-                    // deepest wall genuinely can't support any further-inward
-                    // material -- leave this island's infill empty rather than
-                    // retracing the un-inset wall's own outline on top of it.
-                    if !inset.is_empty() {
-                        layer_infill_2d.extend(inset);
-                    }
-                }
-                polygon2d::from_2d(layer_infill_2d, basis1, basis2, origin)
             } else {
-                // Infill boundary for DualIso / Eikonal: try the deepest wall mesh (wall_count).
+                // Infill boundary: try the deepest wall mesh (wall_count).
                 let ib_outers: Vec<Vec<[f64; 2]>> = {
                     let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
                     let canonical_2d = polygon2d::canonicalize(&loops_2d);
@@ -3284,6 +3265,60 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
         // Preserves narrow top-flange crowns and rims while filtering microscopic numerical noise.
         let min_solid_area = 0.25 * config.nozzle_diameter * config.nozzle_diameter;
 
+        // Patch-adjacent solid fill: the layer-index top_layers/bottom_layers
+        // windowing above only reasons about the print's global top/bottom, so a
+        // patch seed's own local top surface gets no top-layer solid-fill
+        // treatment today -- a real gap (see
+        // thoughts/seed-distance-field-design.md's "Scope change" section).
+        // Classify per-POLYGON (not per-point, and not via a new isosurface
+        // contour): reconstruct each boundary region's centroid to a real 3D
+        // point on this layer's isosurface and query `seed_proximity` directly,
+        // keeping this a smaller, safer extension of the existing per-layer
+        // difference/union/intersect pipeline rather than a parallel geometry
+        // path.
+        let patch_threshold = config.top_layers as f64 * config.layer_height;
+        let patch_max_along = (config.layer_height * 20.0).max(5.0);
+        let patch_regions: Vec<Vec<Vec<[f64; 2]>>> = if config.top_layers == 0 {
+            vec![Vec::new(); n]
+        } else {
+            positions
+                .par_iter()
+                .zip(boundaries_2d.par_iter())
+                .map(|(&pos, boundary)| {
+                    let field = layers[pos].order_field.as_ref();
+                    let order = layers[pos].order;
+                    boundary
+                        .iter()
+                        .filter(|poly| {
+                            if poly.is_empty() {
+                                return false;
+                            }
+                            let (cu, cv) = poly
+                                .iter()
+                                .fold((0.0, 0.0), |(su, sv), p| (su + p[0], sv + p[1]));
+                            let vertex_count = poly.len() as f64;
+                            let planar =
+                                apex + basis1 * (cu / vertex_count) + basis2 * (cv / vertex_count);
+                            let Some(point) = order_field::reconstruct_point_on_order_field(
+                                planar,
+                                axis,
+                                order,
+                                patch_max_along,
+                                field,
+                            ) else {
+                                return false;
+                            };
+                            matches!(
+                                field.seed_proximity(point),
+                                Some((SeedKind::Patch, d)) if d <= patch_threshold
+                            )
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .collect()
+        };
+
         let solid_2d_per_k: Vec<Vec<Vec<[f64; 2]>>> = if z_increases {
             // Index increases with height: k + 1 is above k, k - 1 is below k.
             let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
@@ -3330,6 +3365,10 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                         for exposed in exposed_below.iter().take(k + 1).skip(start) {
                             regions.push(exposed.clone());
                         }
+                    }
+
+                    if !patch_regions[k].is_empty() {
+                        regions.push(patch_regions[k].clone());
                     }
 
                     // Near-tangent skin closure: if layer k is within `top_layers` of the top apex
@@ -3388,6 +3427,10 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                         for exposed in exposed_below.iter().take(end + 1).skip(k) {
                             regions.push(exposed.clone());
                         }
+                    }
+
+                    if !patch_regions[k].is_empty() {
+                        regions.push(patch_regions[k].clone());
                     }
 
                     // Near-tangent skin closure:
@@ -4865,7 +4908,13 @@ mod tests {
             if distance_from_top < config.top_layers || distance_from_bottom < config.bottom_layers
             {
                 assert!(
-                    (ratio - 1.0).abs() < 1e-6,
+                    // Height's infill_boundary now comes from the same
+                    // discretized marching-cubes isosurface extraction as
+                    // every other order-field kind (Threshold B unification)
+                    // rather than an exact closed-form 2D polygon offset, so
+                    // a few parts-per-million of grid-cell-scale numerical
+                    // noise is expected here, not a regression.
+                    (ratio - 1.0).abs() < 1e-5,
                     "layer at offset {offset} from the top-real layer should be \
                      essentially fully solid (top_layers={}, bottom_layers={}), got ratio {ratio}",
                     config.top_layers,
