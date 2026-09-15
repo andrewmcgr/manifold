@@ -1108,7 +1108,14 @@ pub fn slice_mesh_with_progress(
                 let wall0_loops: Vec<Vec<DVec3>> = wall0_loops
                     .into_iter()
                     .filter(|pts| {
-                        pts.len() >= 3 && loop_perimeter(pts) >= 3.0 * config.nozzle_diameter
+                        pts.len() >= 3
+                            && loop_perimeter(pts) >= 3.0 * config.nozzle_diameter
+                            && loop_matches_order_field(
+                                pts,
+                                field.as_ref(),
+                                order_value,
+                                config.layer_height,
+                            )
                     })
                     .collect();
 
@@ -1154,6 +1161,12 @@ pub fn slice_mesh_with_progress(
                         for pts in w_loops {
                             if pts.len() >= 3
                                 && loop_perimeter(&pts) >= 3.0 * config.nozzle_diameter
+                                && loop_matches_order_field(
+                                    &pts,
+                                    field.as_ref(),
+                                    order_value,
+                                    config.layer_height,
+                                )
                             {
                                 extracted_w_loops.push(pts);
                             }
@@ -2285,6 +2298,37 @@ fn loop_perimeter(points: &[DVec3]) -> f64 {
     (0..n)
         .map(|i| (points[(i + 1) % n] - points[i]).length())
         .sum()
+}
+
+/// Rejects a wall-isosurface loop whose points don't actually sit near
+/// `order_value` on the *order field*, as opposed to merely being on the
+/// 3D mesh that was marching-cubed to represent it.
+///
+/// `wall_meshes[w]`'s triangle geometry comes from marching cubes over a
+/// bed-floor-exclusion SDF (`bed_open_sdf`), which is documented
+/// (`MeshSdf::new_with_distance_faces`) to jump discontinuously in value at
+/// the exclusion boundary -- indistinguishable, to marching cubes, from a
+/// real surface crossing. That can produce a second, geometrically bogus
+/// closed loop (a "ghost sheet") sitting wherever that boundary falls,
+/// which still passes every size/perimeter filter despite not
+/// corresponding to any real isosurface of the layer's actual order field.
+/// A loop is rejected once a majority of its points evaluate more than
+/// `2 * layer_height` away from `order_value` on the real field.
+fn loop_matches_order_field(
+    points: &[DVec3],
+    field: &dyn OrderField,
+    order_value: f64,
+    layer_height: f64,
+) -> bool {
+    if points.is_empty() {
+        return false;
+    }
+    let tolerance = 2.0 * layer_height.abs().max(f64::EPSILON);
+    let mismatched = points
+        .iter()
+        .filter(|&&p| (field.order(p) - order_value).abs() > tolerance)
+        .count();
+    (mismatched as f64) < 0.5 * points.len() as f64
 }
 
 /// Computes each point's normalized cumulative arc-length position
