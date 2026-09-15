@@ -1212,6 +1212,15 @@ pub fn slice_mesh_with_progress(
 
                     let extracted_w_loops =
                         suppress_close_redundant_loops(extracted_w_loops, config.max_bead_width());
+                    let extracted_w_loops = drop_fragmented_wall_loops(
+                        extracted_w_loops,
+                        w - 1,
+                        &loops,
+                        &outers,
+                        origin,
+                        basis1,
+                        basis2,
+                    );
 
                     for pts in extracted_w_loops {
                         let arc_fraction = compute_arc_fractions(&pts);
@@ -1275,9 +1284,19 @@ pub fn slice_mesh_with_progress(
                 polygon2d::from_2d(layer_infill_2d, basis1, basis2, origin)
             } else {
                 // Infill boundary for DualIso / Eikonal: try the deepest wall mesh (wall_count).
+                let ib_outers: Vec<Vec<[f64; 2]>> = {
+                    let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
+                    let canonical_2d = polygon2d::canonicalize(&loops_2d);
+                    canonical_2d
+                        .into_iter()
+                        .filter(|l| polygon2d::signed_area(l) > 0.0)
+                        .collect()
+                };
                 // If the interior cavity has narrowed or capped under a roof, fall back to the
                 // deepest inner wall mesh that exists on this layer, or inset from wall 0.
                 let mut found_ib = Vec::new();
+                let mut satisfied_islands: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
                 for w in (1..=wall_count).rev() {
                     if w < wall_meshes.len() {
                         let (ib_loops, _) = extract_order_contours_on_mesh_with_debug(
@@ -1291,15 +1310,38 @@ pub fn slice_mesh_with_progress(
                             .filter(|pts| {
                                 pts.len() >= 3
                                     && loop_perimeter(pts) >= 3.0 * config.nozzle_diameter
+                                    && loop_matches_order_field(
+                                        pts,
+                                        field.as_ref(),
+                                        order_value,
+                                        config.layer_height,
+                                    )
                             })
                             .collect();
-                        if !valid_ib.is_empty() {
-                            found_ib = valid_ib;
-                            break;
+                        let valid_ib = drop_fragmented_wall_loops(
+                            valid_ib,
+                            w - 1,
+                            &loops,
+                            &ib_outers,
+                            origin,
+                            basis1,
+                            basis2,
+                        );
+                        // A wall depth can be valid for one island and
+                        // fragmented for another (e.g. a narrow groove on
+                        // one island bifurcates at wall_count while another
+                        // island genuinely supports it) -- satisfy islands
+                        // independently instead of accepting or rejecting
+                        // this whole `w` for every island at once.
+                        for pts in valid_ib {
+                            let island = loop_island(&pts, &ib_outers, origin, basis1, basis2);
+                            if satisfied_islands.insert(island) {
+                                found_ib.push(pts);
+                            }
                         }
                     }
                 }
-                if found_ib.is_empty() && !wall0_loops.is_empty() {
+                if !wall0_loops.is_empty() {
                     let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
                     let canonical_2d = polygon2d::canonicalize(&loops_2d);
                     let inset = polygon2d::inward_offset(&canonical_2d, config.wall_line_width);
@@ -1316,8 +1358,13 @@ pub fn slice_mesh_with_progress(
                             max_along,
                             field.as_ref(),
                         );
-                        if !inset_3d.is_empty() {
-                            found_ib = inset_3d;
+                        // Only fill in islands the wall-mesh pass above
+                        // didn't already satisfy -- don't discard those.
+                        for pts in inset_3d {
+                            let island = loop_island(&pts, &ib_outers, origin, basis1, basis2);
+                            if satisfied_islands.insert(island) {
+                                found_ib.push(pts);
+                            }
                         }
                     }
                 }
@@ -2415,6 +2462,123 @@ fn suppress_close_redundant_loops(loops: Vec<Vec<DVec3>>, threshold: f64) -> Vec
         .into_iter()
         .zip(suppressed)
         .filter_map(|(pts, sup)| (!sup).then_some(pts))
+        .collect()
+}
+
+/// Assigns a loop to an island by testing its first point against the
+/// outer-boundary polygons (`outers`, from wall 0's canonicalized 2D
+/// loops) -- the same island-detection convention used when wall loops are
+/// finally pushed onto `Layer::loops`.
+fn loop_island(
+    pts: &[DVec3],
+    outers: &[Vec<[f64; 2]>],
+    origin: DVec3,
+    basis1: DVec3,
+    basis2: DVec3,
+) -> usize {
+    let mid_2d = [(pts[0] - origin).dot(basis1), (pts[0] - origin).dot(basis2)];
+    outers
+        .iter()
+        .position(|out| polygon2d::point_in_polygon(mid_2d, out))
+        .unwrap_or(0)
+}
+
+/// Drops wall `w`'s loops, per island, that are a fragmentation artifact of
+/// a CAD groove narrower than this wall pass's inward-offset distance --
+/// see `suppress_close_redundant_loops`'s docs for the general mechanism.
+///
+/// Unlike a distance check, this compares wall `w`'s LOOP COUNT and TOTAL
+/// PERIMETER, per island, against the deepest already-accepted reference
+/// wall at or shallower than `max_reference_wall_index` on the same
+/// island (not necessarily exactly `max_reference_wall_index` itself --
+/// that level's own loops may already have been pruned as fragmentation,
+/// in which case the next-shallower real wall is the correct reference).
+/// A genuine deeper wall pass is one continuous loop with similar (usually
+/// slightly smaller) perimeter to that reference's; distance alone can't
+/// distinguish that from a bifurcation artifact, since a real deeper wall
+/// and a groove-collapsed fragment both naturally sit about one
+/// `wall_line_width` from the reference wall by design. A
+/// wall pass that instead splits into MORE, SMALLER pieces than the
+/// shallower wall had -- more loops *and* under `FRAGMENT_PERIMETER_RATIO`
+/// of its total perimeter -- is fragmentation, not a real wall, and is
+/// dropped in full for that island.
+const FRAGMENT_PERIMETER_RATIO: f64 = 0.7;
+
+fn drop_fragmented_wall_loops(
+    loops: Vec<Vec<DVec3>>,
+    max_reference_wall_index: usize,
+    accepted_loops: &[WallLoop],
+    outers: &[Vec<[f64; 2]>],
+    origin: DVec3,
+    basis1: DVec3,
+    basis2: DVec3,
+) -> Vec<Vec<DVec3>> {
+    if loops.is_empty() {
+        return loops;
+    }
+    let island_of = |pts: &[DVec3]| loop_island(pts, outers, origin, basis1, basis2);
+
+    // Per island, find the deepest wall_index actually present (<=
+    // max_reference_wall_index) to compare against -- a shallower level
+    // may have had its own fragments pruned already, in which case the
+    // next-shallower real wall is the right reference, not "no reference".
+    let mut deepest_index_by_island: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for accepted in accepted_loops
+        .iter()
+        .filter(|l| l.wall_index <= max_reference_wall_index)
+    {
+        let entry = deepest_index_by_island
+            .entry(accepted.island)
+            .or_insert(accepted.wall_index);
+        if accepted.wall_index > *entry {
+            *entry = accepted.wall_index;
+        }
+    }
+    let mut prev_by_island: std::collections::HashMap<usize, (usize, f64)> =
+        std::collections::HashMap::new();
+    for prev in accepted_loops.iter() {
+        if deepest_index_by_island.get(&prev.island) != Some(&prev.wall_index) {
+            continue;
+        }
+        let entry = prev_by_island.entry(prev.island).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 += loop_perimeter(&prev.points);
+    }
+
+    let mut by_island: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, pts) in loops.iter().enumerate() {
+        by_island.entry(island_of(pts)).or_default().push(i);
+    }
+
+    let mut drop = vec![false; loops.len()];
+    for (island, idxs) in &by_island {
+        let Some(&(prev_count, prev_perimeter)) = prev_by_island.get(island) else {
+            continue;
+        };
+        let total_perimeter: f64 = idxs.iter().map(|&i| loop_perimeter(&loops[i])).sum();
+        // Multiple fragments where one wall used to be is a strong signal on
+        // its own; a single loop can also be the collapsed remnant of a
+        // fragment merge, so use a stricter ratio when the count didn't
+        // grow -- catches drastic collapse (e.g. 222 vs 1010 points) without
+        // rejecting a legitimately tapering single wall's gradual shrinkage.
+        let ratio_limit = if idxs.len() > prev_count {
+            FRAGMENT_PERIMETER_RATIO
+        } else {
+            0.3
+        };
+        if total_perimeter < ratio_limit * prev_perimeter {
+            for &i in idxs {
+                drop[i] = true;
+            }
+        }
+    }
+
+    loops
+        .into_iter()
+        .zip(drop)
+        .filter_map(|(pts, d)| (!d).then_some(pts))
         .collect()
 }
 
