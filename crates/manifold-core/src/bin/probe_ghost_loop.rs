@@ -90,30 +90,4 @@ fn main() {
             dev_report,
         );
     }
-
-    // Sample a vertical column at the ghost loop's own XY to see the actual
-    // order(z) shape between the two crossings.
-    if let Some(ghost_path) = paths.get(156) {
-        if let Some(p0) = ghost_path.points.first() {
-            let target = ghost_path.segments.first().map(|s| s.order).unwrap_or(0.0);
-            let layer = layers
-                .iter()
-                .min_by(|a, b| {
-                    (a.order - target)
-                        .abs()
-                        .total_cmp(&(b.order - target).abs())
-                })
-                .unwrap();
-            eprintln!(
-                "\n--- column at ghost loop XY ({:.4},{:.4}) ---",
-                p0.x, p0.y
-            );
-            let mut z = 0.70;
-            while z <= 0.82 {
-                let p = glam::DVec3::new(p0.x, p0.y, z);
-                eprintln!("  z={z:.4} order={:.6}", layer.order_field.order(p));
-                z += 0.005;
-            }
-        }
-    }
 }

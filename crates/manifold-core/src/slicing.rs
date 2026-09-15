@@ -1118,6 +1118,8 @@ pub fn slice_mesh_with_progress(
                             )
                     })
                     .collect();
+                let wall0_loops =
+                    suppress_close_redundant_loops(wall0_loops, 1.5 * config.wall_line_width);
 
                 let loops_2d = polygon2d::to_2d(&wall0_loops, basis1, basis2, origin);
                 let canonical_2d = polygon2d::canonicalize(&loops_2d);
@@ -1207,6 +1209,11 @@ pub fn slice_mesh_with_progress(
                             }
                         }
                     }
+
+                    let extracted_w_loops = suppress_close_redundant_loops(
+                        extracted_w_loops,
+                        1.5 * config.wall_line_width,
+                    );
 
                     for pts in extracted_w_loops {
                         let arc_fraction = compute_arc_fractions(&pts);
@@ -2329,6 +2336,79 @@ fn loop_matches_order_field(
         .filter(|&&p| (field.order(p) - order_value).abs() > tolerance)
         .count();
     (mismatched as f64) < 0.5 * points.len() as f64
+}
+
+fn loop_aabb(points: &[DVec3]) -> (DVec3, DVec3) {
+    let mut min = points[0];
+    let mut max = points[0];
+    for &p in &points[1..] {
+        min = min.min(p);
+        max = max.max(p);
+    }
+    (min, max)
+}
+
+fn aabbs_within(a: (DVec3, DVec3), b: (DVec3, DVec3), threshold: f64) -> bool {
+    let (amin, amax) = a;
+    let (bmin, bmax) = b;
+    amin.x - threshold <= bmax.x
+        && bmin.x - threshold <= amax.x
+        && amin.y - threshold <= bmax.y
+        && bmin.y - threshold <= amax.y
+        && amin.z - threshold <= bmax.z
+        && bmin.z - threshold <= amax.z
+}
+
+/// Drops the smaller of any pair of same-`wall_index` loops that sit within
+/// `threshold` of each other in 3D.
+///
+/// A CAD groove/notch narrower than a wall pass's inward-offset distance
+/// forces that offset surface to bifurcate into two locally disjoint but
+/// individually order-field-correct sheets (one following the outer
+/// envelope, one following the groove floor at its own local offset --
+/// see `loop_matches_order_field`'s docs for the mesh-geometry side of
+/// this). Both sheets pass every other filter, so printing both means two
+/// physically-redundant wall passes stacked almost on top of each other --
+/// real overextrusion, even though each loop is individually correct.
+/// Keeps the loop with the larger perimeter (the outer envelope) from each
+/// too-close pair.
+fn suppress_close_redundant_loops(loops: Vec<Vec<DVec3>>, threshold: f64) -> Vec<Vec<DVec3>> {
+    let n = loops.len();
+    if n < 2 {
+        return loops;
+    }
+    let perimeters: Vec<f64> = loops.iter().map(|pts| loop_perimeter(pts)).collect();
+    let aabbs: Vec<(DVec3, DVec3)> = loops.iter().map(|pts| loop_aabb(pts)).collect();
+    let mut suppressed = vec![false; n];
+    for i in 0..n {
+        if suppressed[i] {
+            continue;
+        }
+        for j in (i + 1)..n {
+            if suppressed[j] {
+                continue;
+            }
+            if !aabbs_within(aabbs[i], aabbs[j], threshold) {
+                continue;
+            }
+            let close = loops[i]
+                .iter()
+                .any(|&a| loops[j].iter().any(|&b| a.distance(b) < threshold));
+            if close {
+                if perimeters[i] >= perimeters[j] {
+                    suppressed[j] = true;
+                } else {
+                    suppressed[i] = true;
+                    break;
+                }
+            }
+        }
+    }
+    loops
+        .into_iter()
+        .zip(suppressed)
+        .filter_map(|(pts, sup)| (!sup).then_some(pts))
+        .collect()
 }
 
 /// Computes each point's normalized cumulative arc-length position
