@@ -533,7 +533,7 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
 /// same thing (a window can span spatially unrelated regions of the
 /// isosurface), which produced real Z-spacing swings of up to ~35% of
 /// `layer_height` on a sloped test mesh -- see
-/// `step_calibration_keeps_order_step_stable_across_a_sloped_wedge`.
+/// `step_calibration_keeps_order_step_stable_across_a_sloped_wedge_and_not_degenerately_constant`.
 /// Reading the real per-step topology also means this naturally handles a
 /// cross-section splitting into multiple loops or merging, since whatever
 /// loops actually exist at `order_value` are exactly what gets probed.
@@ -4098,7 +4098,7 @@ mod tests {
     /// `StepCalibration` real-contour rewrite: on this mesh, the old
     /// order-value-window sampling produced real Z-spacing between
     /// consecutive layers ranging from 0.166mm to 0.328mm against a 0.25mm
-    /// target (a ~35% swing) -- see `step_calibration_keeps_order_step_stable_across_a_sloped_wedge`.
+    /// target (a ~35% swing) -- see `step_calibration_keeps_order_step_stable_across_a_sloped_wedge_and_not_degenerately_constant`.
     fn wedge_mesh() -> Mesh {
         let vertices = vec![
             DVec3::new(0.0, 0.0, 0.0),
@@ -4244,6 +4244,22 @@ mod tests {
             assert!(
                 d > clamp_lo + 1e-9 && d < clamp_hi - 1e-9,
                 "expected the calibrated step to sit strictly inside the clamp rails [{clamp_lo}, {clamp_hi}], got {d}"
+            );
+        }
+
+        // Also restore the ratio-stability check: consecutive order-value
+        // steps must stay within a tight band of each other on a smooth
+        // slope, since that's the actual defect the real-contour rewrite
+        // fixes (the old, buggy implementation's own recorded dorders on
+        // this exact mesh/config swing well outside this band even though
+        // they never happen to equal layer_height or sit exactly on the
+        // clamp rails, so the two checks above alone don't catch it).
+        for pair in interior.windows(2) {
+            let (prev, next) = (pair[0], pair[1]);
+            let ratio = next / prev;
+            assert!(
+                (0.85..=1.20).contains(&ratio),
+                "expected consecutive order-value steps to stay within the [0.85, 1.20] ratio band on a smooth slope, got {prev} then {next} (ratio {ratio})"
             );
         }
     }
