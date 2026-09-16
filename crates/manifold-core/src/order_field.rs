@@ -419,6 +419,41 @@ fn detect_top_surface_patches(
         .collect()
 }
 
+/// Wraps any [`OrderField`] to add real top-surface [`OrderField::seed_proximity`]
+/// support via [`detect_top_surface_patches`], without touching `order()` or
+/// the wrapped field's own geometry. This separates "where are the
+/// top-surface seeds" (always computed here, geometric, cheap) from "does
+/// the solver bend the field around them" (still exclusively
+/// `AnisotropicFsmOrderField::with_seed_metadata`, gated on
+/// `SlicerConfig::fsm_seed_surfaces_enabled` in `fsm_field_for`).
+struct PatchAwareOrderField {
+    inner: Box<dyn OrderField>,
+    patches: Vec<SeedPatch>,
+    footprint_tolerance: f64,
+}
+
+impl OrderField for PatchAwareOrderField {
+    fn order(&self, p: DVec3) -> f64 {
+        self.inner.order(p)
+    }
+
+    fn seed_proximity(&self, p: DVec3) -> Option<(manifold_fidget::order::SeedKind, f64)> {
+        let bed_distance = self.inner.order(p);
+        let patch_distance = self
+            .patches
+            .iter()
+            .filter(|patch| (p - patch.center).length() <= patch.radius + self.footprint_tolerance)
+            .map(|patch| (self.inner.order(p) - patch.order_value).abs())
+            .fold(None, |acc: Option<f64>, d| {
+                Some(acc.map_or(d, |best| best.min(d)))
+            });
+        Some(match patch_distance {
+            Some(pd) if pd < bed_distance => (manifold_fidget::order::SeedKind::Patch, pd),
+            _ => (manifold_fidget::order::SeedKind::Bed, bed_distance),
+        })
+    }
+}
+
 /// Builds the [`OrderFieldKind::AnisotropicFsm`] field for `mesh`:
 /// constructs a background metric tensor grid steered toward near-tangency or
 /// near-orthogonality along surface boundaries, and solves the anisotropic
@@ -1408,6 +1443,7 @@ pub fn numeric_gradient<F: OrderField + ?Sized>(field: &F, p: DVec3) -> Option<D
 mod tests {
     use super::*;
     use glam::DVec3;
+    use manifold_fidget::order::SeedKind;
 
     #[test]
     fn default_config_resolves_to_height_field_matching_build_direction() {
@@ -1804,5 +1840,41 @@ mod tests {
         assert_eq!(patches.len(), 2);
         assert!((patches[0].order_value - 5.0).abs() < 1e-9);
         assert!((patches[1].order_value - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn patch_aware_order_field_reports_patch_seed_near_a_raised_top_and_bed_seed_elsewhere() {
+        struct Fixed(f64);
+        impl OrderField for Fixed {
+            fn order(&self, p: DVec3) -> f64 {
+                p.z - self.0
+            }
+        }
+        let field = PatchAwareOrderField {
+            inner: Box::new(Fixed(0.0)),
+            patches: vec![SeedPatch {
+                center: DVec3::new(0.0, 0.0, 10.0),
+                radius: 1.0,
+                order_value: 10.0,
+            }],
+            footprint_tolerance: 0.5,
+        };
+
+        // Right at the patch's own center/height: order() == order_value,
+        // patch distance is 0, must win over the (much larger) bed distance.
+        let (kind, distance) = field.seed_proximity(DVec3::new(0.0, 0.0, 10.0)).unwrap();
+        assert_eq!(kind, SeedKind::Patch);
+        assert!(distance.abs() < 1e-9);
+
+        // Far outside the patch's footprint radius + tolerance: falls back
+        // to bed distance even though the height matches the patch.
+        let (kind, distance) = field.seed_proximity(DVec3::new(50.0, 50.0, 10.0)).unwrap();
+        assert_eq!(kind, SeedKind::Bed);
+        assert!((distance - 10.0).abs() < 1e-9);
+
+        // Near the bed: bed distance (order() itself) wins.
+        let (kind, distance) = field.seed_proximity(DVec3::new(0.0, 0.0, 0.1)).unwrap();
+        assert_eq!(kind, SeedKind::Bed);
+        assert!((distance - 0.1).abs() < 1e-9);
     }
 }
