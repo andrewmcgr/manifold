@@ -30,20 +30,23 @@ pub trait OrderField: Send + Sync {
     fn order(&self, p: DVec3) -> f64;
 
     /// Order-space distance from `p` to whichever seed (the bed contact,
-    /// or -- for a field that supports it -- a top-surface patch) is
+    /// or -- for a field that supports it -- a top-surface region) is
     /// locally responsible for this region: approximately physical
     /// distance along the climb direction for a well-behaved field.
     ///
     /// Default: `order(p)` itself, i.e. bed-distance only -- exact for a
-    /// field with no patch seeds. `manifold_core::order_field::order_field_for`
+    /// field with no top-surface awareness. `manifold_core::order_field::order_field_for`
     /// wraps every concrete field (`HeightOrderField`, `ConicalOrderField`,
     /// `EikonalOrderField`, and `AnisotropicFsmOrderField` when
-    /// `fsm_seed_surfaces_enabled` is `false`) in a `PatchAwareOrderField`
-    /// decorator that overrides this method using purely geometric
-    /// top-surface detection, independent of the field's own solving
-    /// mechanism. `AnisotropicFsmOrderField` overrides this method natively
-    /// instead (see its own doc) when `fsm_seed_surfaces_enabled` is `true`,
-    /// since its patch metadata is already solver-consistent.
+    /// `fsm_seed_surfaces_enabled` is `false`) in a `TopSurfaceAwareOrderField`
+    /// decorator that overrides this method by marching along the field's own
+    /// local climb direction against a bed-contact-excluded mesh SDF until it
+    /// exits the solid -- a direct per-point distance measurement that works
+    /// for any top-surface geometry (flat, tapered, domed), independent of
+    /// the field's own solving mechanism. `AnisotropicFsmOrderField` overrides
+    /// this method natively instead (see its own doc) when
+    /// `fsm_seed_surfaces_enabled` is `true`, since its patch metadata is
+    /// already solver-consistent.
     fn seed_proximity(&self, p: DVec3) -> Option<(SeedKind, f64)> {
         Some((SeedKind::Bed, self.order(p)))
     }

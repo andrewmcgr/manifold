@@ -790,28 +790,7 @@ pub fn slice_mesh_with_progress(
     // This allows wall passes and infill boundaries to extend cleanly down to the bed (layer 0)
     // without being pushed upward by the bottom floor, while preserving all top ceilings,
     // roofs, and side walls 100% closed and watertight, and avoiding 3D vertex-stretching distortions.
-    let non_bed_floor_faces: Vec<[usize; 3]> = mesh
-        .indices
-        .chunks_exact(3)
-        .filter_map(|chunk| {
-            let [i0, i1, i2] = [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
-            let v0 = mesh.vertices[i0];
-            let v1 = mesh.vertices[i1];
-            let v2 = mesh.vertices[i2];
-            let normal = (v1 - v0).cross(v2 - v0);
-            let normal_len_sq = normal.length_squared();
-            if normal_len_sq > 1e-12
-                && normal.z < 0.0
-                && (v0.z <= min.z + 0.02 || v1.z <= min.z + 0.02 || v2.z <= min.z + 0.02)
-            {
-                let nz_sq = normal.z * normal.z;
-                if nz_sq >= 0.998 * normal_len_sq {
-                    return None;
-                }
-            }
-            Some([i0, i1, i2])
-        })
-        .collect();
+    let non_bed_floor_faces: Vec<[usize; 3]> = crate::mesh::non_bed_floor_faces(mesh, min.z);
 
     let bed_open_sdf = if non_bed_floor_faces.len() == faces.len() {
         Arc::clone(&sdf)

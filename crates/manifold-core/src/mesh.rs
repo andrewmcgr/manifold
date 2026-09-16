@@ -37,6 +37,79 @@ impl Mesh {
     }
 }
 
+/// Triangle indices of `mesh` excluding downward-facing bed-contact
+/// triangles resting on the build plate (any vertex at `z <= min_z + 0.02`)
+/// -- the same "keep every top ceiling, roof, and side wall; drop only the
+/// literal bed floor" exclusion `slicing::slice_mesh_with_progress` already
+/// applies when building its own bed-exclusion SDF for wall/infill
+/// boundary extraction, extracted here so both that use and
+/// `order_field::order_field_for_with_sdf`'s directional top-surface
+/// distance can share the same filter logic instead of duplicating it.
+/// Returns the full unfiltered face list when the mesh has no bed-contact
+/// faces at all (i.e. `min_z` isn't actually touched by any downward face
+/// -- a floating or non-flat-bottomed mesh), matching the "no exclusion
+/// needed" case callers already handle by reusing their original SDF.
+pub(crate) fn non_bed_floor_faces(mesh: &Mesh, min_z: f64) -> Vec<[usize; 3]> {
+    mesh.indices
+        .chunks_exact(3)
+        .filter_map(|chunk| {
+            let [i0, i1, i2] = [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
+            let v0 = mesh.vertices[i0];
+            let v1 = mesh.vertices[i1];
+            let v2 = mesh.vertices[i2];
+            let normal = (v1 - v0).cross(v2 - v0);
+            let normal_len_sq = normal.length_squared();
+            if normal_len_sq > 1e-12
+                && normal.z < 0.0
+                && (v0.z <= min_z + 0.02 || v1.z <= min_z + 0.02 || v2.z <= min_z + 0.02)
+            {
+                let nz_sq = normal.z * normal.z;
+                if nz_sq >= 0.998 * normal_len_sq {
+                    return None;
+                }
+            }
+            Some([i0, i1, i2])
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod bed_floor_face_tests {
+    use super::*;
+
+    #[test]
+    fn non_bed_floor_faces_excludes_only_the_downward_bed_contact_cap() {
+        // A unit cube: bottom cap at z=0 (must be excluded), everything
+        // else (top cap, 4 side walls) must survive.
+        let vertices = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+            DVec3::new(0.0, 0.0, 1.0),
+            DVec3::new(1.0, 0.0, 1.0),
+            DVec3::new(1.0, 1.0, 1.0),
+            DVec3::new(0.0, 1.0, 1.0),
+        ];
+        let indices = vec![
+            0, 2, 1, 0, 3, 2, // -Z (bed contact, downward)
+            4, 5, 6, 4, 6, 7, // +Z (top, upward)
+            0, 1, 5, 0, 5, 4, // -Y
+            3, 7, 6, 3, 6, 2, // +Y
+            0, 4, 7, 0, 7, 3, // -X
+            1, 2, 6, 1, 6, 5, // +X
+        ];
+        let mesh = Mesh::new(vertices, indices);
+        let faces = non_bed_floor_faces(&mesh, 0.0);
+        // 12 total triangles minus the 2 bottom-cap triangles = 10.
+        assert_eq!(
+            faces.len(),
+            10,
+            "expected exactly the 2 bottom-cap triangles excluded"
+        );
+    }
+}
+
 /// Returns the 8 corner vertices of the axis-aligned bounding box defined by `min` and `max`.
 #[must_use]
 pub fn bounding_box_corners(min: DVec3, max: DVec3) -> [DVec3; 8] {

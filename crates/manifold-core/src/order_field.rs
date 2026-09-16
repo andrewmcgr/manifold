@@ -15,7 +15,7 @@ use manifold_fidget::eikonal::EikonalOrderField;
 use manifold_fidget::fsm::AnisotropicFsmOrderField;
 use manifold_fidget::fsm_tensor::TensorGrid;
 use manifold_fidget::mesh_sdf::MeshSdf;
-use manifold_fidget::order::{ConicalOrderField, HeightOrderField, OrderField};
+use manifold_fidget::order::{ConicalOrderField, HeightOrderField, OrderField, SeedKind};
 
 // Re-exported so downstream diagnostics (e.g. the manifold-cli
 // verification examples) can name the trait when calling helpers like
@@ -116,22 +116,29 @@ pub fn order_field_for_with_sdf(
     let Some((min, _max)) = mesh.bounding_box() else {
         return inner;
     };
-    let seed_tolerance = config.layer_height.abs().max(f64::EPSILON) / 2.0;
-    let footprint_tolerance = (config.layer_height * 20.0).max(5.0);
-    let patches = detect_top_surface_patches(
-        mesh,
-        min.z,
-        seed_tolerance,
-        config.fsm_seed_max_angle_deg(),
-        &|p| inner.order(p),
-    );
-    if patches.is_empty() {
+    let faces: Vec<[usize; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
+        .collect();
+    if faces.is_empty() {
         return inner;
     }
-    Box::new(PatchAwareOrderField {
+    let non_bed_faces = crate::mesh::non_bed_floor_faces(mesh, min.z);
+    // `MeshSdf` has no `Clone` impl, so always rebuild rather than trying
+    // to reuse `sdf` unchanged even when `non_bed_faces` happens to equal
+    // the full face list -- the extra BVH build only happens once per
+    // object per slice and is not worth threading a `Clone` bound through
+    // `MeshSdf` to avoid.
+    let bed_excluded_sdf =
+        MeshSdf::new_with_distance_faces(mesh.vertices.clone(), faces, non_bed_faces);
+    let max_search = (config.layer_height * 20.0).max(5.0);
+    let step = (config.layer_height.min(config.nozzle_diameter) / 4.0).max(0.01);
+    Box::new(TopSurfaceAwareOrderField {
         inner,
-        patches,
-        footprint_tolerance,
+        bed_excluded_sdf,
+        max_search,
+        step,
     })
 }
 
@@ -312,173 +319,119 @@ fn is_upward_within_angle(normal: DVec3, max_angle_deg: f64) -> bool {
     tilt_from_flat_deg <= max_angle_deg
 }
 
-/// A connected cluster of upward-facing, non-bed-contact mesh faces (see
-/// `is_upward_within_angle`) treated as a top-surface seed by
-/// `PatchAwareOrderField::seed_proximity`. Unlike `AnisotropicFsmOrderField`'s
-/// PDE-solver patches (`patch_seed_values`), this is a pure post-hoc
-/// geometric classification -- it never feeds back into any field solve, so
-/// it works for every `OrderField` kind, not just `AnisotropicFsm`.
-#[derive(Debug, Clone, PartialEq)]
-struct SeedPatch {
-    center: DVec3,
-    radius: f64,
-    order_value: f64,
-}
-
-/// Minimal union-find (disjoint set) over `0..n`, path-compressed, used to
-/// group mesh faces into edge-connected components.
-struct UnionFind {
-    parent: Vec<usize>,
-}
-
-impl UnionFind {
-    fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n).collect(),
-        }
-    }
-
-    fn find(&mut self, x: usize) -> usize {
-        if self.parent[x] != x {
-            self.parent[x] = self.find(self.parent[x]);
-        }
-        self.parent[x]
-    }
-
-    fn union(&mut self, a: usize, b: usize) {
-        let (ra, rb) = (self.find(a), self.find(b));
-        if ra != rb {
-            self.parent[ra] = rb;
-        }
-    }
-}
-
-/// Clusters `mesh`'s upward-facing, non-bed-contact triangles (CAD normal
-/// within `seed_max_angle_deg` of horizontal-up per `is_upward_within_angle`,
-/// and not touching the bed within `seed_tolerance` of `min_z`) into
-/// edge-connected components, each becoming one [`SeedPatch`] with a
-/// consensus `order_value`: the *maximum* `order_fn` value across the
-/// patch's vertices. `patch_seed_values` uses the same maximum convention
-/// to avoid creating an artificial local minimum when a patch is fed back
-/// into `AnisotropicFsmOrderField`'s solve as a boundary condition; that
-/// specific concern doesn't apply here since this function's result is only
-/// ever used as a read-only classification threshold in
-/// `PatchAwareOrderField::seed_proximity`, never fed back into a solve --
-/// the maximum is reused anyway to keep top-surface classification
-/// consistent with that convention.
-fn detect_top_surface_patches(
-    mesh: &crate::mesh::Mesh,
-    min_z: f64,
-    seed_tolerance: f64,
-    seed_max_angle_deg: f64,
-    order_fn: &dyn Fn(DVec3) -> f64,
-) -> Vec<SeedPatch> {
-    let face_count = mesh.indices.len() / 3;
-    let face_vertices = |face: usize| -> [DVec3; 3] {
-        let base = face * 3;
-        [
-            mesh.vertices[mesh.indices[base] as usize],
-            mesh.vertices[mesh.indices[base + 1] as usize],
-            mesh.vertices[mesh.indices[base + 2] as usize],
-        ]
-    };
-    let qualifies = |face: usize| -> bool {
-        let [v0, v1, v2] = face_vertices(face);
-        if v0.z <= min_z + seed_tolerance
-            && v1.z <= min_z + seed_tolerance
-            && v2.z <= min_z + seed_tolerance
-        {
-            return false;
-        }
-        let normal = (v1 - v0).cross(v2 - v0);
-        is_upward_within_angle(normal, seed_max_angle_deg)
-    };
-
-    let mut uf = UnionFind::new(face_count);
-    let mut edges: std::collections::HashMap<(u32, u32), Vec<usize>> =
-        std::collections::HashMap::new();
-    for face in 0..face_count {
-        if !qualifies(face) {
-            continue;
-        }
-        let base = face * 3;
-        let idx = [
-            mesh.indices[base],
-            mesh.indices[base + 1],
-            mesh.indices[base + 2],
-        ];
-        for &(a, b) in &[(idx[0], idx[1]), (idx[1], idx[2]), (idx[2], idx[0])] {
-            let key = (a.min(b), a.max(b));
-            if let Some(others) = edges.get(&key) {
-                for &other in others {
-                    uf.union(face, other);
-                }
-            }
-            edges.entry(key).or_default().push(face);
-        }
-    }
-
-    let mut groups: std::collections::HashMap<usize, Vec<DVec3>> = std::collections::HashMap::new();
-    for face in 0..face_count {
-        if !qualifies(face) {
-            continue;
-        }
-        let root = uf.find(face);
-        groups.entry(root).or_default().extend(face_vertices(face));
-    }
-
-    groups
-        .into_values()
-        .map(|vertices| {
-            let center = vertices.iter().copied().sum::<DVec3>() / vertices.len() as f64;
-            let radius = vertices
-                .iter()
-                .map(|&v| (v - center).length())
-                .fold(0.0_f64, f64::max);
-            let order_value = vertices
-                .iter()
-                .map(|&v| order_fn(v))
-                .fold(f64::NEG_INFINITY, f64::max);
-            SeedPatch {
-                center,
-                radius,
-                order_value,
-            }
-        })
-        .collect()
-}
-
-/// Wraps any [`OrderField`] to add real top-surface [`OrderField::seed_proximity`]
-/// support via [`detect_top_surface_patches`], without touching `order()` or
-/// the wrapped field's own geometry. This separates "where are the
-/// top-surface seeds" (always computed here, geometric, cheap) from "does
-/// the solver bend the field around them" (still exclusively
-/// `AnisotropicFsmOrderField::with_seed_metadata`, gated on
-/// `SlicerConfig::fsm_seed_surfaces_enabled` in `fsm_field_for`).
-struct PatchAwareOrderField {
+/// Wraps any [`OrderField`], replacing its default `seed_proximity`
+/// (bed-only) with a top-surface-aware version that works for any exposed
+/// top geometry -- flat, tapered, domed, doesn't matter -- unlike the
+/// earlier patch-clustering approach (`SeedPatch`/`UnionFind`/
+/// `detect_top_surface_patches`, removed by this change), which only
+/// recognized near-flat surfaces within a fixed angle threshold of
+/// horizontal and reduced each cluster to one approximate scalar.
+///
+/// For a query point `p`, marches along the field's own local climb
+/// direction ([`numeric_gradient`]) in `step`-sized hops,
+/// testing each hop against `bed_excluded_sdf` (a variant of the mesh's
+/// SDF with bed-contact faces excluded from distance evaluation, so the
+/// march can't be fooled by "exiting" near the bed itself -- see
+/// [`crate::mesh::non_bed_floor_faces`]) until it exits the solid or
+/// exceeds `max_search` -- the accumulated distance at exit is the real
+/// physical distance to this point's own local top surface, along the
+/// direction that actually matters for non-planar layer spacing.
+///
+/// Bounded by a cheap pre-filter: `bed_excluded_sdf`'s own ordinary
+/// Euclidean nearest-surface distance is always `<=` any climb-direction
+/// distance to that same surface, so when it already exceeds `max_search`
+/// the expensive directional march is skipped entirely -- this keeps the
+/// cost of the common case (points deep in the interior, far from any
+/// exposed surface) to one cheap BVH query, paying for the full march only
+/// within a thin shell near the object's own exterior.
+struct TopSurfaceAwareOrderField {
     inner: Box<dyn OrderField>,
-    patches: Vec<SeedPatch>,
-    footprint_tolerance: f64,
+    bed_excluded_sdf: MeshSdf,
+    max_search: f64,
+    step: f64,
 }
 
-impl OrderField for PatchAwareOrderField {
+impl TopSurfaceAwareOrderField {
+    /// Marches from `p` along the field's own local climb direction in
+    /// `step`-sized hops, testing `bed_excluded_sdf` at each hop, and
+    /// returns the physical distance to the point where it crosses from
+    /// inside (`<= 0.0`) to outside (`> 0.0`) the bed-excluded solid.
+    ///
+    /// Refines the crossing via linear interpolation between the last
+    /// inside sample and the first outside sample -- reporting the raw
+    /// step-quantized `traveled` distance at the moment a hop first lands
+    /// outside would systematically overestimate the true distance by up
+    /// to a full `step` (confirmed: on a flat-topped cube with `step ==
+    /// 0.1`, a point exactly `0.625` mm from the top reported `0.7` before
+    /// this fix, misclassifying it as farther from the top surface than it
+    /// actually was whenever that quantization error crossed a
+    /// solid-fill-threshold boundary). Also checks `p` itself before
+    /// taking any step, so a point already at or past the boundary reports
+    /// a near-zero distance instead of one full `step`.
+    fn march_to_top(&self, p: DVec3, initial_value: f64) -> Option<f64> {
+        let mut traveled = 0.0;
+        let mut pos = p;
+        let mut prev_value = initial_value;
+        if prev_value > 0.0 {
+            return Some(0.0);
+        }
+        while traveled < self.max_search {
+            let grad = numeric_gradient(self.inner.as_ref(), pos)?;
+            let len = grad.length();
+            if !len.is_finite() || len < 1e-9 {
+                return None;
+            }
+            let dir = grad / len;
+            pos += dir * self.step;
+            traveled += self.step;
+            let value = self.bed_excluded_sdf.sample(pos).value;
+            if value > 0.0 {
+                let denom = value - prev_value;
+                let t = if denom.abs() > 1e-12 {
+                    (-prev_value / denom).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                return Some(traveled - self.step * (1.0 - t));
+            }
+            prev_value = value;
+        }
+        None
+    }
+}
+
+impl OrderField for TopSurfaceAwareOrderField {
     fn order(&self, p: DVec3) -> f64 {
         self.inner.order(p)
     }
 
-    fn seed_proximity(&self, p: DVec3) -> Option<(manifold_fidget::order::SeedKind, f64)> {
+    fn seed_proximity(&self, p: DVec3) -> Option<(SeedKind, f64)> {
         let bed_distance = self.inner.order(p);
-        let patch_distance = self
-            .patches
-            .iter()
-            .filter(|patch| (p - patch.center).length() <= patch.radius + self.footprint_tolerance)
-            .map(|patch| (self.inner.order(p) - patch.order_value).abs())
-            .fold(None, |acc: Option<f64>, d| {
-                Some(acc.map_or(d, |best| best.min(d)))
-            });
-        Some(match patch_distance {
-            Some(pd) if pd < bed_distance => (manifold_fidget::order::SeedKind::Patch, pd),
-            _ => (manifold_fidget::order::SeedKind::Bed, bed_distance),
+
+        // Cheap pre-filter: skip the expensive march entirely once the
+        // point is already farther from *any* surface (bed-excluded SDF's
+        // ordinary Euclidean nearest-surface distance) than `max_search`
+        // could possibly reach. Must compare the *magnitude* of the signed
+        // SDF sample, not its raw signed value -- this codebase's SDF sign
+        // convention is negative = inside the solid, positive = outside
+        // (see `march_to_top`'s own `value > 0.0` exit check, and
+        // `fsm_field_for`'s `is_solid = |p| sdf.sample(p).value <=
+        // cell_size`), so a point deep in the interior has a very
+        // *negative* sample value and `value > self.max_search` (a
+        // positive number) would never be true there -- defeating the
+        // pre-filter for exactly the interior-point case it exists to
+        // skip. Reused as `march_to_top`'s own first `prev_value` below,
+        // avoiding a second identical query at the same point `p`.
+        let initial_value = self.bed_excluded_sdf.sample(p).value;
+        let top_distance = if initial_value.abs() > self.max_search {
+            None
+        } else {
+            self.march_to_top(p, initial_value)
+        };
+
+        Some(match top_distance {
+            Some(td) if td < bed_distance => (SeedKind::Patch, td),
+            _ => (SeedKind::Bed, bed_distance),
         })
     }
 }
@@ -1472,7 +1425,6 @@ pub fn numeric_gradient<F: OrderField + ?Sized>(field: &F, p: DVec3) -> Option<D
 mod tests {
     use super::*;
     use glam::DVec3;
-    use manifold_fidget::order::SeedKind;
 
     #[test]
     fn default_config_resolves_to_height_field_matching_build_direction() {
@@ -1799,119 +1751,69 @@ mod tests {
     }
 
     #[test]
-    fn detect_top_surface_patches_finds_the_flat_top_of_a_cube_but_not_its_base() {
-        // A 10x10x10 cube from (0,0,0) to (10,10,10): base at z=0 (bed
-        // contact, must be excluded), flat top at z=10 (must be found).
-        let mesh = crate::mesh::Mesh::new(
-            vec![
-                DVec3::new(0.0, 0.0, 0.0),
-                DVec3::new(10.0, 0.0, 0.0),
-                DVec3::new(10.0, 10.0, 0.0),
-                DVec3::new(0.0, 10.0, 0.0),
-                DVec3::new(0.0, 0.0, 10.0),
-                DVec3::new(10.0, 0.0, 10.0),
-                DVec3::new(10.0, 10.0, 10.0),
-                DVec3::new(0.0, 10.0, 10.0),
-            ],
-            vec![
-                // Bottom (z=0), normal points down.
-                0, 2, 1, 0, 3, 2, // Top (z=10), normal points up.
-                4, 5, 6, 4, 6, 7,
-            ],
+    fn top_surface_aware_order_field_finds_a_tapering_cone_apex_that_a_flat_angle_threshold_would_miss(
+    ) {
+        // A cone: base radius 5 at z=0, apex at z=10 -- the surface slope
+        // near the apex is far steeper than any reasonable
+        // `seed_max_angle_deg` threshold (a cone this narrow has a
+        // half-angle of atan(5/10) ≈ 26.6 degrees from vertical, i.e. ≈
+        // 63.4 degrees from horizontal -- nowhere near the old mechanism's
+        // 10-degree-from-horizontal cutoff). No mesh face here is "near
+        // flat," so the deleted patch-clustering mechanism would find
+        // nothing; the ray-march must still find the real top surface.
+        let base_radius = 5.0;
+        let apex_z = 10.0;
+        let segments = 32;
+        let mut vertices = vec![DVec3::new(0.0, 0.0, 0.0)]; // 0: base center
+        for i in 0..segments {
+            let angle = (i as f64) / (segments as f64) * std::f64::consts::TAU;
+            vertices.push(DVec3::new(
+                base_radius * angle.cos(),
+                base_radius * angle.sin(),
+                0.0,
+            ));
+        }
+        vertices.push(DVec3::new(0.0, 0.0, apex_z)); // last: apex
+        let apex_idx = vertices.len() as u32 - 1;
+        let mut indices = Vec::new();
+        for i in 0..segments {
+            let a = 1 + i as u32;
+            let b = 1 + ((i + 1) % segments) as u32;
+            // Base cap (downward normal, bed contact).
+            indices.extend_from_slice(&[0, b, a]);
+            // Side wall up to the apex.
+            indices.extend_from_slice(&[a, b, apex_idx]);
+        }
+        let mesh = Mesh::new(vertices, indices);
+        let config = crate::SlicerConfig {
+            order_field: OrderFieldKind::Height,
+            layer_height: 0.2,
+            top_layers: 3,
+            ..crate::SlicerConfig::default()
+        };
+        let field = order_field_for(
+            config.order_field,
+            &config,
+            &mesh,
+            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
         );
-        let patches = detect_top_surface_patches(&mesh, 0.0, 0.05, 10.0, &|p| p.z);
+        // A point right at the cone's own apex tip (order = height above
+        // bed = 10.0 for HeightOrderField) must be classified as a top-surface
+        // (Patch) seed with a near-zero distance -- it IS the top.
+        let (kind, distance) = field.seed_proximity(DVec3::new(0.0, 0.0, 9.99)).unwrap();
         assert_eq!(
-            patches.len(),
-            1,
-            "expected exactly one top patch, got {patches:?}"
+            kind,
+            SeedKind::Patch,
+            "expected the cone's steep apex to be classified as a top-surface seed"
         );
         assert!(
-            (patches[0].order_value - 10.0).abs() < 1e-9,
-            "expected top patch order_value near 10.0, got {}",
-            patches[0].order_value
+            distance < 0.1,
+            "expected near-zero distance to the top surface right at the apex, got {distance}"
         );
     }
 
     #[test]
-    fn detect_top_surface_patches_returns_empty_for_a_mesh_with_no_upward_faces() {
-        // A single vertical wall triangle: no face qualifies as upward-facing.
-        let mesh = crate::mesh::Mesh::new(
-            vec![
-                DVec3::new(0.0, 0.0, 0.0),
-                DVec3::new(1.0, 0.0, 0.0),
-                DVec3::new(0.0, 0.0, 1.0),
-            ],
-            vec![0, 1, 2],
-        );
-        let patches = detect_top_surface_patches(&mesh, 0.0, 0.05, 10.0, &|p| p.z);
-        assert!(patches.is_empty());
-    }
-
-    #[test]
-    fn detect_top_surface_patches_separates_two_disjoint_flat_regions_at_different_heights() {
-        // Two separate flat squares (not edge-connected to each other) at
-        // z=5 and z=10, both well clear of the bed at z=0.
-        let mesh = crate::mesh::Mesh::new(
-            vec![
-                DVec3::new(0.0, 0.0, 5.0),
-                DVec3::new(1.0, 0.0, 5.0),
-                DVec3::new(1.0, 1.0, 5.0),
-                DVec3::new(0.0, 1.0, 5.0),
-                DVec3::new(100.0, 0.0, 10.0),
-                DVec3::new(101.0, 0.0, 10.0),
-                DVec3::new(101.0, 1.0, 10.0),
-                DVec3::new(100.0, 1.0, 10.0),
-            ],
-            vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7],
-        );
-        let mut patches = detect_top_surface_patches(&mesh, 0.0, 0.05, 10.0, &|p| p.z);
-        patches.sort_by(|a, b| a.order_value.partial_cmp(&b.order_value).unwrap());
-        assert_eq!(patches.len(), 2);
-        assert!((patches[0].order_value - 5.0).abs() < 1e-9);
-        assert!((patches[1].order_value - 10.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn patch_aware_order_field_reports_patch_seed_near_a_raised_top_and_bed_seed_elsewhere() {
-        struct Fixed(f64);
-        impl OrderField for Fixed {
-            fn order(&self, p: DVec3) -> f64 {
-                p.z - self.0
-            }
-        }
-        let field = PatchAwareOrderField {
-            inner: Box::new(Fixed(0.0)),
-            patches: vec![SeedPatch {
-                center: DVec3::new(0.0, 0.0, 10.0),
-                radius: 1.0,
-                order_value: 10.0,
-            }],
-            footprint_tolerance: 0.5,
-        };
-
-        // Right at the patch's own center/height: order() == order_value,
-        // patch distance is 0, must win over the (much larger) bed distance.
-        let (kind, distance) = field.seed_proximity(DVec3::new(0.0, 0.0, 10.0)).unwrap();
-        assert_eq!(kind, SeedKind::Patch);
-        assert!(distance.abs() < 1e-9);
-
-        // Far outside the patch's footprint radius + tolerance: falls back
-        // to bed distance even though the height matches the patch.
-        let (kind, distance) = field.seed_proximity(DVec3::new(50.0, 50.0, 10.0)).unwrap();
-        assert_eq!(kind, SeedKind::Bed);
-        assert!((distance - 10.0).abs() < 1e-9);
-
-        // Near the bed: bed distance (order() itself) wins.
-        let (kind, distance) = field.seed_proximity(DVec3::new(0.0, 0.0, 0.1)).unwrap();
-        assert_eq!(kind, SeedKind::Bed);
-        assert!((distance - 0.1).abs() < 1e-9);
-    }
-
-    #[test]
-    fn order_field_for_height_kind_reports_patch_seed_near_a_flat_raised_top() {
-        // A step mesh: base block 10x10x4 (z 0..4), with a smaller raised
-        // platform 4x4x2 on top of it (z 4..6) -- the platform's own flat
-        // top (z=6) is a patch distinct from the bed (z=0).
+    fn top_surface_aware_order_field_prefers_bed_when_top_is_genuinely_far() {
         let mesh = step_platform_mesh();
         let config = crate::SlicerConfig {
             order_field: OrderFieldKind::Height,
@@ -1924,33 +1826,10 @@ mod tests {
             &mesh,
             &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
         );
-        // A point right on the raised platform's own top surface.
-        let (kind, _distance) = field.seed_proximity(DVec3::new(5.0, 5.0, 6.0)).unwrap();
-        assert_eq!(
-            kind,
-            SeedKind::Patch,
-            "expected the raised platform's own top to be classified as a Patch seed"
-        );
-    }
-
-    #[test]
-    fn order_field_for_anisotropic_fsm_with_seed_surfaces_disabled_still_gets_generic_patch_wrapping(
-    ) {
-        let mesh = step_platform_mesh();
-        let config = crate::SlicerConfig {
-            order_field: OrderFieldKind::AnisotropicFsm,
-            layer_height: 0.2,
-            fsm_seed_surfaces_enabled: false,
-            ..crate::SlicerConfig::default()
-        };
-        let field = order_field_for(
-            config.order_field,
-            &config,
-            &mesh,
-            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
-        );
-        let (kind, _distance) = field.seed_proximity(DVec3::new(5.0, 5.0, 6.0)).unwrap();
-        assert_eq!(kind, SeedKind::Patch);
+        // A point right at the base, far from the platform's own top (z=6):
+        // bed must win.
+        let (kind, _distance) = field.seed_proximity(DVec3::new(0.5, 0.5, 0.1)).unwrap();
+        assert_eq!(kind, SeedKind::Bed);
     }
 
     /// A 10x10x4 base block (z 0..4) with a 4x4x2 platform (z 4..6) centered
