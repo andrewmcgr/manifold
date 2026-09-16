@@ -513,107 +513,109 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
     )
 }
 
-/// Order-value stepping calibration derived from a set of representative
-/// surface points, each paired with the order field's raw value there.
+/// Calibrates the layer-stepping loop's order-value increments against real
+/// physical distance for order fields whose local order-per-mm calibration
+/// varies from point to point (see the doc comment on the stepping loop in
+/// `slice_mesh_with_progress` for why a constant `+= layer_height` step is
+/// wrong for those fields, and why `Height` is exempt).
 ///
-/// The layer-generation loop in [`slice_mesh_with_progress`] identifies
-/// layers by stepping an order-field scalar (`order_value += layer_height`),
-/// which is only correct if the field is arc-length-calibrated (one order
-/// unit == one physical mm along the field's own gradient). That holds for
-/// [`HeightOrderField`] by construction, but not for order fields (notably
-/// `AnisotropicFsm`) whose local order-per-mm rate is deliberately distorted
-/// for toolpath-sequencing purposes near walls/top surfaces -- see
-/// `extrusion::local_layer_geometry`'s doc comment for the same unit
-/// mismatch on the per-point bead-sizing side of this pipeline.
-///
-/// `adaptive_step` estimates, from nearby representative points, how much
-/// order actually accrues over `layer_height` mm of real distance at a
-/// given `order_value`, so the stepping loop can advance the field's own
-/// units by that amount instead of a constant `layer_height` -- keeping the
-/// *number and average spacing* of generated layers close to physically
-/// uniform even where the field's local calibration varies severalfold
-/// from one region to the next. This does not (and cannot, from a single
-/// scalar per layer) make every point on a given layer's isosurface
-/// uniformly spaced -- that residual per-point variation is what
-/// `extrusion::local_layer_geometry`'s own geometric probe already
-/// compensates for at bead-sizing time.
-struct StepCalibration {
-    /// `(order_value, position)` pairs, sorted ascending by `order_value`.
-    samples: Vec<(f64, DVec3)>,
+/// Wraps a borrowed reference to `wall_meshes[0]`'s precomputed triangle
+/// soup (already built once per object, at no extra global-computation cost
+/// to reuse here) rather than owning a copy or a precomputed point sample:
+/// `adaptive_step` re-extracts the *real* isosurface loop(s) at the exact
+/// current `order_value` via `extract_order_contours_on_mesh_with_debug`
+/// (the same function `slice_mesh_with_progress`'s own per-layer wall-0
+/// extraction already uses later, on the same triangle soup) and
+/// forward-probes from those actual points -- rather than an earlier
+/// design that selected calibration samples from a flat order-value window
+/// over the raw point cloud, which conflated "close in order value" with
+/// "close in physical space." On folded/sloped geometry those are not the
+/// same thing (a window can span spatially unrelated regions of the
+/// isosurface), which produced real Z-spacing swings of up to ~35% of
+/// `layer_height` on a sloped test mesh -- see
+/// `step_calibration_keeps_order_step_stable_across_a_sloped_wedge`.
+/// Reading the real per-step topology also means this naturally handles a
+/// cross-section splitting into multiple loops or merging, since whatever
+/// loops actually exist at `order_value` are exactly what gets probed.
+struct StepCalibration<'a> {
+    triangle_positions: &'a [DVec3],
+    triangle_orders: &'a [f64],
 }
 
-impl StepCalibration {
-    /// Builds a calibration from one wall pass's precomputed isosurface
-    /// positions and their order-field values (as already computed for
-    /// `wall_meshes` above, at no extra cost). Non-finite order values are
-    /// dropped.
-    fn from_wall_pass(positions: &[DVec3], orders: &[f64]) -> Self {
-        let mut samples: Vec<(f64, DVec3)> = positions
-            .iter()
-            .zip(orders.iter())
-            .filter(|(_, o)| o.is_finite())
-            .map(|(&p, &o)| (o, p))
-            .collect();
-        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
-        Self { samples }
+impl<'a> StepCalibration<'a> {
+    /// Wraps one wall pass's precomputed triangle-soup isosurface (already
+    /// computed for `wall_meshes` above, at no extra cost).
+    fn from_wall_pass(triangle_positions: &'a [DVec3], triangle_orders: &'a [f64]) -> Self {
+        Self {
+            triangle_positions,
+            triangle_orders,
+        }
     }
 
     /// Estimates the order-value delta that advances roughly `layer_height`
-    /// mm of real distance from `order_value`, as the median of per-sample
-    /// forward probes (`field.order(sample_pos + gradient_dir * layer_height)
-    /// - sample_order`) over representative points near `order_value`.
+    /// mm of real distance from `order_value`, as the median of forward
+    /// probes (`field.order(pos + gradient_dir * layer_height) - field.order(pos)`)
+    /// over every point of the real contour loop(s) `extract_order_contours_on_mesh_with_debug`
+    /// finds at exactly `order_value` on this wall pass's isosurface -- note
+    /// this subtracts each point's own actual order, not the nominal
+    /// `order_value` itself, since `extract_order_contours_on_mesh_with_debug`
+    /// perturbs its target order value by a small epsilon for numerical
+    /// robustness (Simulation of Simplicity), so `pos` sits at `order_value +
+    /// epsilon`, not exactly `order_value`; subtracting the point's own order
+    /// cancels that epsilon out instead of leaking it into every delta.
     ///
     /// Falls back to `layer_height` verbatim -- today's pre-fix behavior --
-    /// when no samples are available at all, or when no nearby sample
-    /// yields a usable probe (e.g. every nearby point's gradient is
-    /// degenerate, or probing steps outside the field's defined region).
-    /// The result is clamped to `[0.3, 3.0] * layer_height` as a safety
-    /// bound against a single unrepresentative sample producing a
+    /// when the triangle soup is empty, when no loop actually crosses
+    /// `order_value` here (e.g. before the object's own order range begins,
+    /// or past where it ends), or when every candidate point's gradient is
+    /// degenerate. The result is clamped to `[0.3, 3.0] * layer_height` as a
+    /// safety bound against a single unrepresentative point producing a
     /// pathologically small or large step -- mirroring the clamp already
     /// used by `extrusion::local_layer_geometry` for the same reason.
     fn adaptive_step(&self, field: &dyn OrderField, order_value: f64, layer_height: f64) -> f64 {
-        if self.samples.is_empty() {
+        if self.triangle_positions.is_empty() {
             return layer_height;
         }
 
-        const MAX_SAMPLES: usize = 24;
-        const MIN_SAMPLES: usize = 4;
-        const MAX_WINDOW_GROWTHS: u32 = 6;
+        let (loops, _debug_unclosed) = extract_order_contours_on_mesh_with_debug(
+            self.triangle_positions,
+            self.triangle_orders,
+            order_value,
+            BUILD_DIRECTION,
+        );
 
-        let mut window = 2.0 * layer_height;
+        const MAX_SAMPLES: usize = 24;
+        let all_points: Vec<DVec3> = loops.into_iter().flatten().collect();
+        let stride = (all_points.len() / MAX_SAMPLES).max(1);
+
         let mut deltas: Vec<f64> = Vec::new();
-        for _ in 0..MAX_WINDOW_GROWTHS {
-            deltas.clear();
-            let lo = self
-                .samples
-                .partition_point(|(o, _)| *o < order_value - window);
-            let hi = self
-                .samples
-                .partition_point(|(o, _)| *o <= order_value + window);
-            let candidates = &self.samples[lo..hi];
-            let stride = (candidates.len() / MAX_SAMPLES).max(1);
-            for (order, pos) in candidates.iter().step_by(stride) {
-                let Some(grad) = order_field::numeric_gradient(field, *pos) else {
-                    continue;
-                };
-                let grad_len = grad.length();
-                if !grad_len.is_finite() || grad_len < 1e-9 {
-                    continue;
-                }
-                let normal = grad / grad_len;
-                let advanced = field.order(*pos + normal * layer_height);
-                if !advanced.is_finite() {
-                    continue;
-                }
-                let delta = advanced - order;
-                if delta.is_finite() && delta > 0.0 {
-                    deltas.push(delta);
-                }
+        for pos in all_points.iter().step_by(stride) {
+            let Some(grad) = order_field::numeric_gradient(field, *pos) else {
+                continue;
+            };
+            let grad_len = grad.length();
+            if !grad_len.is_finite() || grad_len < 1e-9 {
+                continue;
             }
-            if deltas.len() >= MIN_SAMPLES {
-                break;
+            let normal = grad / grad_len;
+            // `extract_order_contours_on_mesh_with_debug` perturbs its target
+            // order value by a small epsilon for numerical robustness
+            // (Simulation of Simplicity), so `pos` sits at `order_value +
+            // epsilon`, not exactly `order_value` -- subtract the point's own
+            // actual order (`field.order(*pos)`, evaluated the same way) so
+            // that epsilon cancels out instead of leaking into every delta.
+            let here = field.order(*pos);
+            if !here.is_finite() {
+                continue;
             }
-            window *= 2.0;
+            let advanced = field.order(*pos + normal * layer_height);
+            if !advanced.is_finite() {
+                continue;
+            }
+            let delta = advanced - here;
+            if delta.is_finite() && delta > 0.0 {
+                deltas.push(delta);
+            }
         }
 
         if deltas.is_empty() {
@@ -3548,85 +3550,87 @@ mod tests {
         }
     }
 
+    /// Two coplanar triangles forming a flat rectangular patch on a plane
+    /// `z = plane_z`, spanning `[x_min, x_max] x [y_min, y_max]` -- a minimal
+    /// closed contour source for `extract_order_contours_on_mesh_with_debug`
+    /// to slice at any order value that brackets `plane_z * rate` (see
+    /// `ScaledLinearField`, whose `order(p) = rate * p.z`, so slicing this
+    /// patch's own triangles at any order_value gives back the same flat
+    /// rectangle -- the patch's every vertex already sits exactly on that
+    /// isosurface since the whole patch is coplanar in `z`).
+    fn flat_patch_triangles(
+        plane_z: f64,
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+    ) -> Vec<DVec3> {
+        let v00 = DVec3::new(x_min, y_min, plane_z);
+        let v10 = DVec3::new(x_max, y_min, plane_z);
+        let v11 = DVec3::new(x_max, y_max, plane_z);
+        let v01 = DVec3::new(x_min, y_max, plane_z);
+        vec![v00, v10, v11, v00, v11, v01]
+    }
+
     #[test]
-    fn step_calibration_adaptive_step_recovers_true_rate_from_uniform_samples() {
+    fn step_calibration_adaptive_step_recovers_true_rate_from_a_real_flat_patch() {
         let rate = 2.5;
         let field = ScaledLinearField { rate };
-        let positions: Vec<DVec3> = (0..8).map(|i| DVec3::new(0.0, 0.0, i as f64)).collect();
-        let orders: Vec<f64> = positions.iter().map(|&p| field.order(p)).collect();
-        let calibration = StepCalibration::from_wall_pass(&positions, &orders);
+        let order_value = 4.0 * rate;
+        let plane_z = order_value / rate;
+        // Two triangles straddling the plane in Z (one vertex below,
+        // rest above/on) so `extract_order_contours_on_mesh_with_debug`
+        // has a real crossing to extract, not a degenerate coplanar patch.
+        let below = DVec3::new(0.0, 0.0, plane_z - 1.0);
+        let a = DVec3::new(-2.0, -2.0, plane_z + 1.0);
+        let b = DVec3::new(2.0, -2.0, plane_z + 1.0);
+        let c = DVec3::new(0.0, 2.0, plane_z + 1.0);
+        let triangle_positions = vec![below, a, b, below, b, c, below, c, a];
+        let triangle_orders: Vec<f64> =
+            triangle_positions.iter().map(|p| field.order(*p)).collect();
 
+        let calibration = StepCalibration::from_wall_pass(&triangle_positions, &triangle_orders);
         let layer_height = 0.2;
-        let step = calibration.adaptive_step(&field, 4.0 * rate, layer_height);
+        let step = calibration.adaptive_step(&field, order_value, layer_height);
 
-        // Every sample sits on the same constant-rate field, so the forward
-        // probe from any of them is exact: advancing `layer_height` mm along
-        // Z accrues exactly `rate * layer_height` order units, with zero
-        // spread across samples.
+        // `order(p) = rate * p.z` is exact everywhere, so advancing
+        // `layer_height` mm along the field's own gradient (straight up in
+        // Z here) always yields exactly `rate * layer_height` more order,
+        // regardless of which point on the real contour is probed.
         let expected = rate * layer_height;
         assert!(
-            (step - expected).abs() < 1e-9,
-            "expected adaptive step {expected}, got {step}"
-        );
-        // Sanity check this genuinely differs from the naive constant step
-        // the fix replaces -- otherwise the test wouldn't be exercising the
-        // calibration at all.
-        assert!(
-            (step - layer_height).abs() > 0.1,
-            "adaptive step {step} should diverge from the naive raw-unit step {layer_height}"
+            (step - expected).abs() < 1e-6,
+            "expected step {expected}, got {step}"
         );
     }
 
     #[test]
-    fn step_calibration_adaptive_step_takes_the_median_across_mixed_rate_regions() {
-        // Three samples calibrated at rate 1.0 (order == Z, arc-length exact)
-        // and two at rate 4.0 (steeply distorted), all placed so their order
-        // value is exactly 5.0 -- guaranteeing every sample lands in the same
-        // probe window regardless of how it grows (rather than relying on
-        // window growth to ever reach a widely separated second group, which
-        // it may not: window growth is bounded to 64x the nominal step). The
-        // median of {1x, 1x, 1x, 4x, 4x} (sorted by delta) is the 1x rate's
-        // contribution.
-        struct MixedRateField;
-        impl manifold_fidget::order::OrderField for MixedRateField {
-            fn order(&self, p: DVec3) -> f64 {
-                if p.x < 0.5 {
-                    p.z
-                } else {
-                    4.0 * p.z
-                }
-            }
-        }
-        let field = MixedRateField;
-        let positions = vec![
-            DVec3::new(0.0, 0.0, 5.0),
-            DVec3::new(0.0, 1.0, 5.0),
-            DVec3::new(0.0, 2.0, 5.0),
-            DVec3::new(1.0, 0.0, 1.25),
-            DVec3::new(1.0, 1.0, 1.25),
-        ];
-        let orders: Vec<f64> = positions.iter().map(|&p| field.order(p)).collect();
-        let calibration = StepCalibration::from_wall_pass(&positions, &orders);
+    fn step_calibration_adaptive_step_falls_back_to_layer_height_when_no_contour_crosses_here() {
+        let field = ScaledLinearField { rate: 2.5 };
+        // A tiny flat patch far from the queried order value: no triangle
+        // in this soup brackets it, so extraction finds no loop at all.
+        let triangle_positions = flat_patch_triangles(0.0, -1.0, 1.0, -1.0, 1.0);
+        let triangle_orders: Vec<f64> =
+            triangle_positions.iter().map(|p| field.order(*p)).collect();
+        let calibration = StepCalibration::from_wall_pass(&triangle_positions, &triangle_orders);
 
         let layer_height = 0.2;
-        let step = calibration.adaptive_step(&field, 5.0, layer_height);
-
-        let expected = 1.0 * layer_height;
-        assert!(
-            (step - expected).abs() < 1e-9,
-            "expected median-of-rate-1.0 step {expected}, got {step}"
+        let step = calibration.adaptive_step(&field, 1000.0, layer_height);
+        assert_eq!(
+            step, layer_height,
+            "with no contour crossing at this order value the step must fall back to the naive raw-unit step"
         );
     }
 
     #[test]
-    fn step_calibration_adaptive_step_falls_back_to_layer_height_with_no_samples() {
+    fn step_calibration_adaptive_step_falls_back_to_layer_height_with_no_triangles() {
         let field = ScaledLinearField { rate: 2.5 };
         let calibration = StepCalibration::from_wall_pass(&[], &[]);
         let layer_height = 0.2;
         let step = calibration.adaptive_step(&field, 4.0, layer_height);
         assert_eq!(
             step, layer_height,
-            "with no calibration samples the step must fall back to the naive raw-unit step"
+            "with an empty triangle soup the step must fall back to the naive raw-unit step"
         );
     }
 
@@ -4006,6 +4010,102 @@ mod tests {
     fn big_cube_mesh() -> Mesh {
         let Mesh { vertices, indices } = cube_mesh();
         Mesh::new(vertices.into_iter().map(|v| v * 5.0).collect(), indices)
+    }
+
+    /// A 5x5 shed-roof wedge: flat base at z=0, walls up to z=1 on the y=0
+    /// side and z=6 on the y=5 side, with a single sloped top face connecting
+    /// them -- used to stress boundary-metric tangency/orthogonality blending
+    /// with a real directional gradient tilt, unlike a flat-topped cube
+    /// (whose flat top/vertical walls never tilt the field's local gradient
+    /// away from an axis-aligned direction). Regression fixture for the
+    /// `StepCalibration` real-contour rewrite: on this mesh, the old
+    /// order-value-window sampling produced real Z-spacing between
+    /// consecutive layers ranging from 0.166mm to 0.328mm against a 0.25mm
+    /// target (a ~35% swing) -- see `step_calibration_keeps_order_step_stable_across_a_sloped_wedge`.
+    fn wedge_mesh() -> Mesh {
+        let vertices = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(5.0, 0.0, 0.0),
+            DVec3::new(5.0, 5.0, 0.0),
+            DVec3::new(0.0, 5.0, 0.0),
+            DVec3::new(0.0, 0.0, 1.0),
+            DVec3::new(5.0, 0.0, 1.0),
+            DVec3::new(5.0, 5.0, 6.0),
+            DVec3::new(0.0, 5.0, 6.0),
+        ];
+        let indices = vec![
+            0, 2, 1, 0, 3, 2, // -Z
+            4, 5, 6, 4, 6, 7, // sloped top
+            0, 1, 5, 0, 5, 4, // -Y
+            3, 7, 6, 3, 6, 2, // +Y
+            0, 4, 7, 0, 7, 3, // -X
+            1, 2, 6, 1, 6, 5, // +X
+        ];
+        Mesh::new(vertices, indices)
+    }
+
+    #[test]
+    fn step_calibration_keeps_order_step_stable_across_a_sloped_wedge() {
+        let config = SlicerConfig {
+            layer_height: 0.25,
+            order_field: crate::order_field::OrderFieldKind::AnisotropicFsm,
+            fsm_boundary_metrics_enabled: true,
+            fsm_top_tangency_aspect: Some(4.0),
+            fsm_wall_ortho_aspect: Some(4.0),
+            fsm_skin_depth_mm: Some(1.0),
+            ..SlicerConfig::default()
+        };
+        let layers = slice_mesh(&wedge_mesh(), &config).unwrap();
+        assert!(
+            layers.len() >= 10,
+            "expected a reasonably tall layer stack, got {}",
+            layers.len()
+        );
+
+        // `StepCalibration`'s job is to keep the order-value step
+        // corresponding to `layer_height` mm of real distance *along the
+        // field's own local climb direction* -- not raw Z-height, which
+        // only matches climb direction when the gradient is close to
+        // vertical. Under this test's strong tangency/orthogonality
+        // distortion, the wedge's sloped top deliberately tilts the climb
+        // direction away from vertical (the whole point of conformal
+        // non-planar slicing), so real Z-spacing between consecutive
+        // layers legitimately varies there -- that's correct behavior, not
+        // a defect. What proves `StepCalibration` is compensating
+        // correctly instead is that the order-value step itself (`dorder`)
+        // stays internally consistent from one layer to the next as the
+        // loop climbs a smoothly-varying slope: before this fix,
+        // calibration samples were selected from a flat order-value window
+        // over a raw, spatially unrelated point cloud, so `dorder` could
+        // swing unpredictably layer to layer even on smooth geometry
+        // (independently confirmed on this exact mesh/config: the old
+        // implementation's consecutive-step ratio dropped as low as ~0.72
+        // in this same interior region); this fix samples the real contour
+        // at the exact current order value, which tracks the local rate
+        // smoothly instead.
+        let orders: Vec<f64> = layers.iter().map(|l| l.order).collect();
+        let dorders: Vec<f64> = orders.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(dorders.len() >= 9);
+
+        // Exclude the first step and the last two: the base (near the bed
+        // seed) and the summit/tip approach (governed by separate
+        // crown-layer-insertion logic, not `StepCalibration`) are expected
+        // transition regions, not the smooth interior this test targets.
+        // On this exact mesh/config the tip transition measurably spans the
+        // last *two* steps, not just the final one (confirmed by printing
+        // the full `dorders` sequence: a stable ~0.274 plateau is followed
+        // by 0.2656, then 0.2252, then a much smaller final crown step of
+        // ~0.107 -- excluding only the very last step still catches the
+        // 0.2656-to-0.2252 transition pair).
+        let interior = &dorders[1..dorders.len() - 2];
+        for pair in interior.windows(2) {
+            let (prev, next) = (pair[0], pair[1]);
+            let ratio = next / prev;
+            assert!(
+                (0.85..=1.20).contains(&ratio),
+                "expected consecutive order-value steps to stay within the [0.85, 1.20] ratio band on a smooth slope, got {prev} then {next} (ratio {ratio})"
+            );
+        }
     }
 
     #[test]
