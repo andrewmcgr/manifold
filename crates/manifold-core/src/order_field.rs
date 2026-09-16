@@ -283,6 +283,142 @@ fn is_upward_within_angle(normal: DVec3, max_angle_deg: f64) -> bool {
     tilt_from_flat_deg <= max_angle_deg
 }
 
+/// A connected cluster of upward-facing, non-bed-contact mesh faces (see
+/// `is_upward_within_angle`) treated as a top-surface seed by
+/// `PatchAwareOrderField::seed_proximity`. Unlike `AnisotropicFsmOrderField`'s
+/// PDE-solver patches (`patch_seed_values`), this is a pure post-hoc
+/// geometric classification -- it never feeds back into any field solve, so
+/// it works for every `OrderField` kind, not just `AnisotropicFsm`.
+#[derive(Debug, Clone, PartialEq)]
+struct SeedPatch {
+    center: DVec3,
+    radius: f64,
+    order_value: f64,
+}
+
+/// Minimal union-find (disjoint set) over `0..n`, path-compressed, used to
+/// group mesh faces into edge-connected components.
+struct UnionFind {
+    parent: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+        }
+    }
+
+    fn find(&mut self, x: usize) -> usize {
+        if self.parent[x] != x {
+            self.parent[x] = self.find(self.parent[x]);
+        }
+        self.parent[x]
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra != rb {
+            self.parent[ra] = rb;
+        }
+    }
+}
+
+/// Clusters `mesh`'s upward-facing, non-bed-contact triangles (CAD normal
+/// within `seed_max_angle_deg` of horizontal-up per `is_upward_within_angle`,
+/// and not touching the bed within `seed_tolerance` of `min_z`) into
+/// edge-connected components, each becoming one [`SeedPatch`] with a
+/// consensus `order_value`: the *maximum* `order_fn` value across the
+/// patch's vertices. `patch_seed_values` uses the same maximum convention
+/// to avoid creating an artificial local minimum when a patch is fed back
+/// into `AnisotropicFsmOrderField`'s solve as a boundary condition; that
+/// specific concern doesn't apply here since this function's result is only
+/// ever used as a read-only classification threshold in
+/// `PatchAwareOrderField::seed_proximity`, never fed back into a solve --
+/// the maximum is reused anyway to keep top-surface classification
+/// consistent with that convention.
+fn detect_top_surface_patches(
+    mesh: &crate::mesh::Mesh,
+    min_z: f64,
+    seed_tolerance: f64,
+    seed_max_angle_deg: f64,
+    order_fn: &dyn Fn(DVec3) -> f64,
+) -> Vec<SeedPatch> {
+    let face_count = mesh.indices.len() / 3;
+    let face_vertices = |face: usize| -> [DVec3; 3] {
+        let base = face * 3;
+        [
+            mesh.vertices[mesh.indices[base] as usize],
+            mesh.vertices[mesh.indices[base + 1] as usize],
+            mesh.vertices[mesh.indices[base + 2] as usize],
+        ]
+    };
+    let qualifies = |face: usize| -> bool {
+        let [v0, v1, v2] = face_vertices(face);
+        if v0.z <= min_z + seed_tolerance
+            && v1.z <= min_z + seed_tolerance
+            && v2.z <= min_z + seed_tolerance
+        {
+            return false;
+        }
+        let normal = (v1 - v0).cross(v2 - v0);
+        is_upward_within_angle(normal, seed_max_angle_deg)
+    };
+
+    let mut uf = UnionFind::new(face_count);
+    let mut edges: std::collections::HashMap<(u32, u32), Vec<usize>> =
+        std::collections::HashMap::new();
+    for face in 0..face_count {
+        if !qualifies(face) {
+            continue;
+        }
+        let base = face * 3;
+        let idx = [
+            mesh.indices[base],
+            mesh.indices[base + 1],
+            mesh.indices[base + 2],
+        ];
+        for &(a, b) in &[(idx[0], idx[1]), (idx[1], idx[2]), (idx[2], idx[0])] {
+            let key = (a.min(b), a.max(b));
+            if let Some(others) = edges.get(&key) {
+                for &other in others {
+                    uf.union(face, other);
+                }
+            }
+            edges.entry(key).or_default().push(face);
+        }
+    }
+
+    let mut groups: std::collections::HashMap<usize, Vec<DVec3>> = std::collections::HashMap::new();
+    for face in 0..face_count {
+        if !qualifies(face) {
+            continue;
+        }
+        let root = uf.find(face);
+        groups.entry(root).or_default().extend(face_vertices(face));
+    }
+
+    groups
+        .into_values()
+        .map(|vertices| {
+            let center = vertices.iter().copied().sum::<DVec3>() / vertices.len() as f64;
+            let radius = vertices
+                .iter()
+                .map(|&v| (v - center).length())
+                .fold(0.0_f64, f64::max);
+            let order_value = vertices
+                .iter()
+                .map(|&v| order_fn(v))
+                .fold(f64::NEG_INFINITY, f64::max);
+            SeedPatch {
+                center,
+                radius,
+                order_value,
+            }
+        })
+        .collect()
+}
+
 /// Builds the [`OrderFieldKind::AnisotropicFsm`] field for `mesh`:
 /// constructs a background metric tensor grid steered toward near-tangency or
 /// near-orthogonality along surface boundaries, and solves the anisotropic
@@ -1595,5 +1731,78 @@ mod tests {
         assert_eq!(config.fsm_seed_max_angle_deg(), 90.0);
         config.fsm_seed_max_angle_deg = Some(-5.0);
         assert_eq!(config.fsm_seed_max_angle_deg(), 0.0);
+    }
+
+    #[test]
+    fn detect_top_surface_patches_finds_the_flat_top_of_a_cube_but_not_its_base() {
+        // A 10x10x10 cube from (0,0,0) to (10,10,10): base at z=0 (bed
+        // contact, must be excluded), flat top at z=10 (must be found).
+        let mesh = crate::mesh::Mesh::new(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(10.0, 0.0, 0.0),
+                DVec3::new(10.0, 10.0, 0.0),
+                DVec3::new(0.0, 10.0, 0.0),
+                DVec3::new(0.0, 0.0, 10.0),
+                DVec3::new(10.0, 0.0, 10.0),
+                DVec3::new(10.0, 10.0, 10.0),
+                DVec3::new(0.0, 10.0, 10.0),
+            ],
+            vec![
+                // Bottom (z=0), normal points down.
+                0, 2, 1, 0, 3, 2, // Top (z=10), normal points up.
+                4, 5, 6, 4, 6, 7,
+            ],
+        );
+        let patches = detect_top_surface_patches(&mesh, 0.0, 0.05, 10.0, &|p| p.z);
+        assert_eq!(
+            patches.len(),
+            1,
+            "expected exactly one top patch, got {patches:?}"
+        );
+        assert!(
+            (patches[0].order_value - 10.0).abs() < 1e-9,
+            "expected top patch order_value near 10.0, got {}",
+            patches[0].order_value
+        );
+    }
+
+    #[test]
+    fn detect_top_surface_patches_returns_empty_for_a_mesh_with_no_upward_faces() {
+        // A single vertical wall triangle: no face qualifies as upward-facing.
+        let mesh = crate::mesh::Mesh::new(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(1.0, 0.0, 0.0),
+                DVec3::new(0.0, 0.0, 1.0),
+            ],
+            vec![0, 1, 2],
+        );
+        let patches = detect_top_surface_patches(&mesh, 0.0, 0.05, 10.0, &|p| p.z);
+        assert!(patches.is_empty());
+    }
+
+    #[test]
+    fn detect_top_surface_patches_separates_two_disjoint_flat_regions_at_different_heights() {
+        // Two separate flat squares (not edge-connected to each other) at
+        // z=5 and z=10, both well clear of the bed at z=0.
+        let mesh = crate::mesh::Mesh::new(
+            vec![
+                DVec3::new(0.0, 0.0, 5.0),
+                DVec3::new(1.0, 0.0, 5.0),
+                DVec3::new(1.0, 1.0, 5.0),
+                DVec3::new(0.0, 1.0, 5.0),
+                DVec3::new(100.0, 0.0, 10.0),
+                DVec3::new(101.0, 0.0, 10.0),
+                DVec3::new(101.0, 1.0, 10.0),
+                DVec3::new(100.0, 1.0, 10.0),
+            ],
+            vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7],
+        );
+        let mut patches = detect_top_surface_patches(&mesh, 0.0, 0.05, 10.0, &|p| p.z);
+        patches.sort_by(|a, b| a.order_value.partial_cmp(&b.order_value).unwrap());
+        assert_eq!(patches.len(), 2);
+        assert!((patches[0].order_value - 5.0).abs() < 1e-9);
+        assert!((patches[1].order_value - 10.0).abs() < 1e-9);
     }
 }
