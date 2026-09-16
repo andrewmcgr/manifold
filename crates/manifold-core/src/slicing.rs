@@ -3240,8 +3240,24 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
     let (basis1, basis2) = plane_basis(axis);
     let origin = apex;
 
-    let bottom_threshold = config.bottom_layers as f64 * config.layer_height;
-    let top_threshold = config.top_layers as f64 * config.layer_height;
+    // Grid-interpolated order fields (`EikonalOrderField`, used by both the
+    // `Eikonal` and `DualIso` kinds, and any `PatchAwareOrderField` wrapping
+    // one) can report a `seed_proximity` distance a few dozen nanometers to
+    // low microns off a layer's own declared `order` -- FMM/bisection
+    // numerical noise from re-solving the same isosurface independently,
+    // physically meaningless at 3D-printing scales, but enough to flip the
+    // strict `margin >= 0.0` solid/sparse cutoff below for the (common)
+    // layer whose height lands exactly on a `bottom_layers`/`top_layers`
+    // boundary (e.g. `bottom_layers * layer_height == 1.5` and this layer's
+    // own order is also `~1.5`). `HeightOrderField`'s exact closed-form
+    // `order()` has no such noise, so this bias is a no-op there. Baked
+    // into the thresholds themselves (rather than the comparison) so both
+    // `extract_contours`'s `iso = 0.0` crossing and the uniformly-solid
+    // disambiguation sample below inherit it automatically.
+    const SEED_MARGIN_TOLERANCE_MM: f64 = 1e-3;
+    let bottom_threshold =
+        config.bottom_layers as f64 * config.layer_height + SEED_MARGIN_TOLERANCE_MM;
+    let top_threshold = config.top_layers as f64 * config.layer_height + SEED_MARGIN_TOLERANCE_MM;
     // Minimum printable solid-fill area: 0.25 * nozzle_diameter^2 (~0.04 mm^2 for a 0.4mm nozzle).
     // Preserves narrow top-flange crowns and rims while filtering microscopic numerical noise.
     let min_solid_area = 0.25 * config.nozzle_diameter * config.nozzle_diameter;
