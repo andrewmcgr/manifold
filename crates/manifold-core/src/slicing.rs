@@ -10,7 +10,7 @@ use manifold_fidget::contour::{
 use manifold_fidget::marching_cubes::extract_sparse_isosurface_positions;
 use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::order::{order_range_over_bbox, HeightOrderField, OrderField, SeedKind};
-use manifold_fidget::ScalarField;
+use manifold_fidget::{FieldSample, ScalarField};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -3152,334 +3152,221 @@ fn serpentine_stitch_block<F: OrderField + ?Sized>(
     }
 }
 
-/// Post-pass computing every layer's [`Layer::solid_fill_boundary`] from
-/// its neighbors' [`Layer::infill_boundary`]s.
+/// Adapts a layer's own (possibly curved) isosurface into a flat-plane
+/// [`ScalarField`] so [`extract_contours`] -- which samples a literal flat
+/// plane through `origin` perpendicular to `basis1`/`basis2` -- can be
+/// reused to find the boundary between seed-eligible ("solid") and
+/// non-eligible ("sparse") regions on that curved surface, the same way
+/// walls/`infill_boundary` already reuse isosurface extraction rather than
+/// inventing a parallel geometry path.
 ///
-/// Runs once per object, over that object's full ordered layer stack, so
-/// one object's top/bottom detection never leaks into a neighboring
-/// object's layers (layers are grouped by [`Layer::object`], then ordered
-/// by [`Layer::index`] within each group — matching how [`slice_workspace`]
-/// concatenates each object's layer stack back-to-back).
-///
-/// For each layer `i` in an object's stack (`n` layers total, `0..n`):
-/// note `index`/position `i` increases going *down* the print (see
-/// [`BUILD_DIRECTION`]: `i == 0` is the top of the object, `i == n - 1` the
-/// bottom), so the layer physically above `i` is `i - 1` and the layer
-/// physically below is `i + 1`.
-/// - `exposed_above(i)` is the part of `infill_boundary(i)` not covered by
-///   `infill_boundary(i - 1)` (the layer above) — i.e. a top-facing surface
-///   at `i`. Treated as fully exposed (`= infill_boundary(i)`) when there
-///   is no layer `i - 1` (`i == 0`).
-/// - `exposed_below(i)` is symmetric, using `infill_boundary(i + 1)` (the
-///   layer below); fully exposed at `i == n - 1`.
-/// - `solid_fill_boundary(i)` is the union of `exposed_above(j)` for `j` in
-///   `i - top_layers + 1..=i` (clamped to the first layer, since a
-///   top-facing surface at `j` makes the `top_layers` layers *below* it
-///   solid) and `exposed_below(j)` for `j` in `i..=i + bottom_layers - 1`
-///   (clamped to the last layer, since a bottom-facing surface at `j` makes
-///   the `bottom_layers` layers *above* it solid), intersected with
-///   `infill_boundary(i)` so the result is always a subset of this layer's
-///   own fillable area.
-///
-/// Pure 2D geometry composition via [`polygon2d`]; no SDF/3D queries.
-/// `basis1`/`basis2`/`axis`/`apex`/`slope` are resolved from `config`'s
-/// order field (see [`order_field::resolve_axis_apex_slope`]) — matching
-/// whatever `slice_mesh_with_progress` actually used to build every
-/// layer's `infill_boundary` — rather than hardcoding [`BUILD_DIRECTION`],
-/// which is wrong for a curved (`Conical`) order field. Every layer is
-/// projected to 2D with the same fixed `origin` (`apex`) so loops from
-/// different layers are directly comparable regardless of their differing
-/// height along `axis` — `to_2d`'s `(u, v)` output only depends on a
-/// point's `basis1`/`basis2` components, which fully capture its in-plane
-/// position independent of origin. Reconstructing back to 3D, however,
-/// uses [`order_field::reconstruct_on_order_field`] with each layer's own
-/// `order`, so the rebuilt points land back on that layer's actual
-/// (possibly curved) surface instead of collapsing onto one flat plane.
-pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig) {
-    use std::collections::BTreeMap;
+/// For an incoming flat-plane query point `p` (as produced by
+/// [`extract_contours`]'s own grid sampling), first reconstructs the real
+/// point on this layer's `target_order` isosurface via
+/// [`order_field::reconstruct_point_on_order_field`] (falling back to the
+/// flat query point itself when reconstruction fails, e.g. outside the
+/// solid entirely -- consistent with `order()`'s own "unreached returns a
+/// sane fallback rather than panicking" convention used throughout this
+/// module), then evaluates [`OrderField::seed_proximity`] there and returns
+/// the margin `threshold_for_kind(kind) - distance`: positive means
+/// seed-eligible (should be solid), matching [`extract_contours`]'s own
+/// `iso = 0.0` isosurface-at-zero convention.
+struct SeedMarginField<'a> {
+    order_field: &'a dyn OrderField,
+    axis: DVec3,
+    target_order: f64,
+    max_along: f64,
+    bottom_threshold: f64,
+    top_threshold: f64,
+}
 
+impl ScalarField for SeedMarginField<'_> {
+    fn sample(&self, p: DVec3) -> FieldSample {
+        let real_point = order_field::reconstruct_point_on_order_field(
+            p,
+            self.axis,
+            self.target_order,
+            self.max_along,
+            self.order_field,
+        )
+        .unwrap_or(p);
+        let value = match self.order_field.seed_proximity(real_point) {
+            Some((SeedKind::Bed, d)) => self.bottom_threshold - d,
+            Some((SeedKind::Patch, d)) => self.top_threshold - d,
+            None => f64::NEG_INFINITY,
+        };
+        FieldSample {
+            value,
+            gradient: DVec3::ZERO,
+        }
+    }
+}
+
+/// Computes every layer's [`Layer::solid_fill_boundary`]: the sub-region of
+/// its own [`Layer::infill_boundary`] close enough to a seed (bed contact
+/// or, for a field that supports it, a top-surface patch) to need solid
+/// rather than sparse infill.
+///
+/// Each layer is computed independently -- unlike an earlier layer-index
+/// cross-referencing design (`exposed_above`/`exposed_below` differencing
+/// against adjacent layers' outlines, windowed by `top_layers`/
+/// `bottom_layers` layer counts), [`OrderField::seed_proximity`] is a true
+/// order-space/physical distance, so "within `bottom_layers` layers of the
+/// bed" is just `d <= bottom_layers * layer_height` at this layer's own
+/// isosurface, with no cross-layer bookkeeping needed. This also fixes a
+/// real correctness gap the old design couldn't express at all: a patch
+/// seed's own local top surface (see [`SeedKind::Patch`]) getting
+/// `top_layers`-style solid fill treatment, since "near the print's global
+/// top/bottom" (a layer-index concept) and "near a patch" (a spatial
+/// concept, independent of which layer index it happens to sit at) are
+/// different things.
+///
+/// For each layer, [`SeedMarginField`] wraps the classification margin
+/// (`threshold_for_kind(kind) - distance`, positive meaning seed-eligible)
+/// as a flat-plane-sampleable field on this layer's own (possibly curved)
+/// isosurface, reusing [`extract_contours`] to contour margin `== 0.0` --
+/// the same isosurface-extraction machinery walls/`infill_boundary` already
+/// use, rather than a parallel geometry path. The resulting seed-eligible
+/// polygon is intersected with this layer's own `infill_boundary` so the
+/// result is always a subset of its fillable area.
+///
+/// `basis1`/`basis2`/`axis`/`apex` are resolved from `config`'s order field
+/// (see [`order_field::resolve_axis_apex_slope`]) -- matching whatever
+/// `slice_mesh_with_progress` actually used to build every layer's
+/// `infill_boundary` -- rather than hardcoding [`BUILD_DIRECTION`], which is
+/// wrong for a curved (`Conical`) order field.
+pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig) {
     let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
     let (basis1, basis2) = plane_basis(axis);
     let origin = apex;
 
-    let mut groups: BTreeMap<ObjectId, Vec<usize>> = BTreeMap::new();
-    for (pos, layer) in layers.iter().enumerate() {
-        groups.entry(layer.object).or_default().push(pos);
-    }
+    let bottom_threshold = config.bottom_layers as f64 * config.layer_height;
+    let top_threshold = config.top_layers as f64 * config.layer_height;
+    // Minimum printable solid-fill area: 0.25 * nozzle_diameter^2 (~0.04 mm^2 for a 0.4mm nozzle).
+    // Preserves narrow top-flange crowns and rims while filtering microscopic numerical noise.
+    let min_solid_area = 0.25 * config.nozzle_diameter * config.nozzle_diameter;
+    let max_along = (config.layer_height * 20.0).max(5.0);
+    // Same cell-size heuristic wall_meshes' marching cubes uses, for
+    // consistent isosurface-extraction granularity across the slicer.
+    let cell_size = (config.wall_offset / 2.0)
+        .min(config.wall_line_width / 4.0)
+        .clamp(0.04, 0.10);
 
-    for mut positions in groups.into_values() {
-        positions.sort_by_key(|&pos| layers[pos].index);
-        let n = positions.len();
-        if n == 0 {
-            continue;
-        }
+    let results: Vec<(usize, Vec<Vec<DVec3>>)> = layers
+        .par_iter()
+        .enumerate()
+        .map(|(pos, layer)| {
+            if layer.infill_boundary.is_empty() {
+                return (pos, Vec::new());
+            }
+            let boundary_2d = {
+                let raw = polygon2d::to_2d(&layer.infill_boundary, basis1, basis2, origin);
+                polygon2d::canonicalize(&raw)
+            };
 
-        let outer_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
-            .par_iter()
-            .map(|&pos| {
-                let wall0: Vec<Vec<DVec3>> = layers[pos]
-                    .loops
-                    .iter()
-                    .filter(|w| w.wall_index == 0)
-                    .map(|w| w.points.clone())
-                    .collect();
-                let raw_2d = if wall0.is_empty() {
-                    polygon2d::to_2d(&layers[pos].infill_boundary, basis1, basis2, origin)
-                } else {
-                    polygon2d::to_2d(&wall0, basis1, basis2, origin)
-                };
-                polygon2d::canonicalize(&raw_2d)
-            })
-            .collect();
-
-        let boundaries_2d: Vec<Vec<Vec<[f64; 2]>>> = positions
-            .par_iter()
-            .map(|&pos| {
-                let infill = &layers[pos].infill_boundary;
-                if infill.is_empty() {
-                    let wall0: Vec<Vec<DVec3>> = layers[pos]
-                        .loops
-                        .iter()
-                        .filter(|w| w.wall_index == 0)
-                        .map(|w| w.points.clone())
-                        .collect();
-                    let wall0_2d = polygon2d::to_2d(&wall0, basis1, basis2, origin);
-                    let inset = polygon2d::inward_offset(&wall0_2d, config.wall_line_width);
-                    // An inset that collapses to nothing means this island's
-                    // wall 0 genuinely can't support any further-inward
-                    // material -- leave this boundary empty rather than
-                    // retracing wall 0's own outline on top of itself.
-                    inset
-                } else {
-                    let raw = polygon2d::to_2d(infill, basis1, basis2, origin);
-                    polygon2d::canonicalize(&raw)
+            let (mut min_u, mut min_v, mut max_u, mut max_v) = (
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            );
+            for loop_ in &boundary_2d {
+                for &[u, v] in loop_ {
+                    min_u = min_u.min(u);
+                    min_v = min_v.min(v);
+                    max_u = max_u.max(u);
+                    max_v = max_v.max(v);
                 }
-            })
-            .collect();
-        let empty_2d: Vec<Vec<[f64; 2]>> = Vec::new();
+            }
+            if !min_u.is_finite() || !min_v.is_finite() {
+                return (pos, Vec::new());
+            }
+            // Pad the sampled extent by a couple of cells so the contour can
+            // close cleanly at the boundary polygon's own edge.
+            let pad = cell_size * 2.0;
+            let width = (max_u - min_u) + pad * 2.0;
+            let height = (max_v - min_v) + pad * 2.0;
+            let center = apex + basis1 * ((min_u + max_u) * 0.5) + basis2 * ((min_v + max_v) * 0.5);
+            let resolution_u = ((width / cell_size).ceil() as usize).max(2);
+            let resolution_v = ((height / cell_size).ceil() as usize).max(2);
 
-        let group_layers: Vec<Layer> = positions.iter().map(|&p| layers[p].clone()).collect();
-        let z_increases = layer_z_increases(&group_layers);
+            let field = SeedMarginField {
+                order_field: layer.order_field.as_ref(),
+                axis,
+                target_order: layer.order,
+                max_along,
+                bottom_threshold,
+                top_threshold,
+            };
+            let seed_eligible_3d = extract_contours(
+                &field,
+                center,
+                basis1,
+                basis2,
+                width,
+                height,
+                resolution_u,
+                resolution_v,
+                0.0,
+            );
+            let seed_eligible_2d = if seed_eligible_3d.is_empty() {
+                // No crossing found anywhere in the sampled grid: the whole
+                // region is uniformly on one side of the seed-eligibility
+                // threshold. `extract_contours` (marching squares) only
+                // emits segments where the field crosses `iso`, so a
+                // uniformly-solid layer (e.g. a whole flat layer within
+                // `bottom_layers` of the bed, where the margin is constant
+                // across its entire footprint) collapses to an empty
+                // result exactly like a uniformly-sparse one -- the two
+                // cases are indistinguishable from `extract_contours`'s
+                // output alone. Disambiguate by sampling the field
+                // directly at the region's own center: a non-negative
+                // margin means every point here is seed-eligible (this
+                // layer is fully solid), a negative margin means the
+                // whole area is sparse (correctly stays empty).
+                if field.sample(center).value >= 0.0 {
+                    boundary_2d.clone()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                let raw = polygon2d::to_2d(&seed_eligible_3d, basis1, basis2, origin);
+                polygon2d::canonicalize(&raw)
+            };
+            let solid_2d = polygon2d::intersection(&seed_eligible_2d, &boundary_2d);
+            let solid_2d = polygon2d::filter_min_area(&solid_2d, min_solid_area);
 
-        // Minimum printable solid-fill area: 0.25 * nozzle_diameter^2 (~0.04 mm^2 for a 0.4mm nozzle).
-        // Preserves narrow top-flange crowns and rims while filtering microscopic numerical noise.
-        let min_solid_area = 0.25 * config.nozzle_diameter * config.nozzle_diameter;
-
-        // Patch-adjacent solid fill: the layer-index top_layers/bottom_layers
-        // windowing above only reasons about the print's global top/bottom, so a
-        // patch seed's own local top surface gets no top-layer solid-fill
-        // treatment today -- a real gap (see
-        // thoughts/seed-distance-field-design.md's "Scope change" section).
-        // Classify per-POLYGON (not per-point, and not via a new isosurface
-        // contour): reconstruct each boundary region's centroid to a real 3D
-        // point on this layer's isosurface and query `seed_proximity` directly,
-        // keeping this a smaller, safer extension of the existing per-layer
-        // difference/union/intersect pipeline rather than a parallel geometry
-        // path.
-        let patch_threshold = config.top_layers as f64 * config.layer_height;
-        let patch_max_along = (config.layer_height * 20.0).max(5.0);
-        let patch_regions: Vec<Vec<Vec<[f64; 2]>>> = if config.top_layers == 0 {
-            vec![Vec::new(); n]
-        } else {
-            positions
-                .par_iter()
-                .zip(boundaries_2d.par_iter())
-                .map(|(&pos, boundary)| {
-                    let field = layers[pos].order_field.as_ref();
-                    let order = layers[pos].order;
-                    boundary
-                        .iter()
-                        .filter(|poly| {
-                            if poly.is_empty() {
-                                return false;
-                            }
-                            let (cu, cv) = poly
-                                .iter()
-                                .fold((0.0, 0.0), |(su, sv), p| (su + p[0], sv + p[1]));
-                            let vertex_count = poly.len() as f64;
-                            let planar =
-                                apex + basis1 * (cu / vertex_count) + basis2 * (cv / vertex_count);
-                            let Some(point) = order_field::reconstruct_point_on_order_field(
-                                planar,
-                                axis,
-                                order,
-                                patch_max_along,
-                                field,
-                            ) else {
-                                return false;
-                            };
-                            matches!(
-                                field.seed_proximity(point),
-                                Some((SeedKind::Patch, d)) if d <= patch_threshold
-                            )
-                        })
-                        .cloned()
-                        .collect()
-                })
-                .collect()
-        };
-
-        let solid_2d_per_k: Vec<Vec<Vec<[f64; 2]>>> = if z_increases {
-            // Index increases with height: k + 1 is above k, k - 1 is below k.
-            let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
-                .into_par_iter()
-                .map(|k| {
-                    let next_outer = outer_2d.get(k + 1).unwrap_or(&empty_2d);
-                    let exp = if next_outer.is_empty() {
-                        boundaries_2d[k].clone()
-                    } else {
-                        polygon2d::difference(&boundaries_2d[k], next_outer)
-                    };
-                    polygon2d::filter_min_area(&exp, min_solid_area)
-                })
-                .collect();
-            let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
-                .into_par_iter()
-                .map(|k| {
-                    let prev_outer = if k == 0 { &empty_2d } else { &outer_2d[k - 1] };
-                    let exp = if prev_outer.is_empty() {
-                        boundaries_2d[k].clone()
-                    } else {
-                        polygon2d::difference(&boundaries_2d[k], prev_outer)
-                    };
-                    polygon2d::filter_min_area(&exp, min_solid_area)
-                })
-                .collect();
-
-            (0..n)
-                .into_par_iter()
-                .map(|k| {
-                    let mut regions: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
-                    if config.top_layers > 0 {
-                        // Top surface at layer j makes `top_layers` layers below it (j - top_layers + 1..=j) solid.
-                        // Layer k gets contributions from j in k..=min(n - 1, k + top_layers - 1).
-                        let end = (k + config.top_layers - 1).min(n - 1);
-                        for exposed in exposed_above.iter().take(end + 1).skip(k) {
-                            regions.push(exposed.clone());
-                        }
-                    }
-                    if config.bottom_layers > 0 {
-                        // Bottom surface at layer j makes `bottom_layers` layers above it (j..=j + bottom_layers - 1) solid.
-                        // Layer k gets contributions from j in max(0, k - bottom_layers + 1)..=k.
-                        let start = k.saturating_sub(config.bottom_layers - 1);
-                        for exposed in exposed_below.iter().take(k + 1).skip(start) {
-                            regions.push(exposed.clone());
-                        }
-                    }
-
-                    if !patch_regions[k].is_empty() {
-                        regions.push(patch_regions[k].clone());
-                    }
-
-                    // Near-tangent skin closure: if layer k is within `top_layers` of the top apex
-                    // or within `bottom_layers` of the bottom floor, its entire inner cavity is solid skin.
-                    if (config.top_layers > 0 && k + config.top_layers >= n)
-                        || (config.bottom_layers > 0 && k < config.bottom_layers)
-                    {
-                        regions.push(boundaries_2d[k].clone());
-                    }
-
-                    let exposed_union =
-                        polygon2d::filter_min_area(&polygon2d::union(&regions), min_solid_area);
-                    let solid = polygon2d::intersection(&exposed_union, &boundaries_2d[k]);
-                    polygon2d::filter_min_area(&solid, min_solid_area)
-                })
-                .collect()
-        } else {
-            // Index decreases with height (HeightOrderField): k - 1 is above k, k + 1 is below k.
-            let exposed_above: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
-                .into_par_iter()
-                .map(|k| {
-                    let prev_outer = if k == 0 { &empty_2d } else { &outer_2d[k - 1] };
-                    let exp = if prev_outer.is_empty() {
-                        boundaries_2d[k].clone()
-                    } else {
-                        polygon2d::difference(&boundaries_2d[k], prev_outer)
-                    };
-                    polygon2d::filter_min_area(&exp, min_solid_area)
-                })
-                .collect();
-            let exposed_below: Vec<Vec<Vec<[f64; 2]>>> = (0..n)
-                .into_par_iter()
-                .map(|k| {
-                    let next_outer = outer_2d.get(k + 1).unwrap_or(&empty_2d);
-                    let exp = if next_outer.is_empty() {
-                        boundaries_2d[k].clone()
-                    } else {
-                        polygon2d::difference(&boundaries_2d[k], next_outer)
-                    };
-                    polygon2d::filter_min_area(&exp, min_solid_area)
-                })
-                .collect();
-
-            (0..n)
-                .into_par_iter()
-                .map(|k| {
-                    let mut regions: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
-                    if config.top_layers > 0 {
-                        let start = k.saturating_sub(config.top_layers - 1);
-                        for exposed in exposed_above.iter().take(k + 1).skip(start) {
-                            regions.push(exposed.clone());
-                        }
-                    }
-                    if config.bottom_layers > 0 {
-                        let end = (k + config.bottom_layers - 1).min(n - 1);
-                        for exposed in exposed_below.iter().take(end + 1).skip(k) {
-                            regions.push(exposed.clone());
-                        }
-                    }
-
-                    if !patch_regions[k].is_empty() {
-                        regions.push(patch_regions[k].clone());
-                    }
-
-                    // Near-tangent skin closure:
-                    if (config.top_layers > 0 && k < config.top_layers)
-                        || (config.bottom_layers > 0 && k + config.bottom_layers >= n)
-                    {
-                        regions.push(boundaries_2d[k].clone());
-                    }
-
-                    let exposed_union =
-                        polygon2d::filter_min_area(&polygon2d::union(&regions), min_solid_area);
-                    let solid = polygon2d::intersection(&exposed_union, &boundaries_2d[k]);
-                    polygon2d::filter_min_area(&solid, min_solid_area)
-                })
-                .collect()
-        };
-
-        for (k, solid_2d) in solid_2d_per_k.into_iter().enumerate() {
-            let order = layers[positions[k]].order;
-            let field = Arc::clone(&layers[positions[k]].order_field);
             // Reference-seeded reconstruction (see
-            // `reconstruct_on_order_field_near`): the solid region is a
-            // boolean composition of this layer's (and neighbors')
-            // infill boundaries, all projected at the same (u, v) --
-            // this layer's own 3D infill boundary gives every rebuilt
-            // point a same-branch height seed, avoiding the wrong-branch
-            // axis-ray solves that spiked Eikonal solid fill.
-            let mut references = layers[positions[k]].infill_boundary.clone();
+            // `reconstruct_on_order_field_near`): this layer's own
+            // `infill_boundary` gives every rebuilt point a same-branch
+            // height seed, avoiding the wrong-branch axis-ray solves that
+            // spiked Eikonal solid fill.
+            let mut references = layer.infill_boundary.clone();
             if references.is_empty() {
-                references = layers[positions[k]]
+                references = layer
                     .loops
                     .iter()
                     .filter(|w| w.wall_index == 0)
                     .map(|w| w.points.clone())
                     .collect();
             }
-            let max_along = (config.layer_height * 20.0).max(5.0);
-            layers[positions[k]].solid_fill_boundary = order_field::reconstruct_on_order_field_near(
+            let solid_3d = order_field::reconstruct_on_order_field_near(
                 solid_2d,
                 &references,
                 basis1,
                 basis2,
                 axis,
                 apex,
-                order,
+                layer.order,
                 max_along,
-                field.as_ref(),
+                layer.order_field.as_ref(),
             );
-        }
+            (pos, solid_3d)
+        })
+        .collect();
+
+    for (pos, solid_fill_boundary) in results {
+        layers[pos].solid_fill_boundary = solid_fill_boundary;
     }
 }
 
