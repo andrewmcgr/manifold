@@ -6598,4 +6598,89 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn compute_solid_fill_boundaries_covers_a_steeply_tapering_top_not_just_flat_ones() {
+        // A cone, same shape as order_field.rs's own cone-apex test, tall
+        // enough and with a small enough top_layers window that "near the
+        // apex" is a real, nonempty band of layers, not just the single
+        // topmost layer (which any mechanism would trivially get right).
+        let base_radius = 5.0;
+        let apex_z = 10.0;
+        let segments = 32;
+        let mut vertices = vec![DVec3::new(0.0, 0.0, 0.0)];
+        for i in 0..segments {
+            let angle = (i as f64) / (segments as f64) * std::f64::consts::TAU;
+            vertices.push(DVec3::new(
+                base_radius * angle.cos(),
+                base_radius * angle.sin(),
+                0.0,
+            ));
+        }
+        vertices.push(DVec3::new(0.0, 0.0, apex_z));
+        let apex_idx = vertices.len() as u32 - 1;
+        let mut indices = Vec::new();
+        for i in 0..segments {
+            let a = 1 + i as u32;
+            let b = 1 + ((i + 1) % segments) as u32;
+            indices.extend_from_slice(&[0, b, a]);
+            indices.extend_from_slice(&[a, b, apex_idx]);
+        }
+        let mesh = Mesh::new(vertices, indices);
+        // Plan-defect fix (controller-ruled): the plan's own literal test
+        // config here used SlicerConfig::default()'s 0.4mm nozzle stack,
+        // which insets infill_boundary ~0.6mm from the true cone surface.
+        // At this cone's constant 0.5 radius/height slope, that inset is a
+        // *constant* ~1.2mm vertical march-to-exit at every height along
+        // the whole cone (0.6 / 0.5), which is always bigger than
+        // top_threshold (3 * 0.2 + 0.001 = 0.601mm here) -- so no layer,
+        // including ones near the apex, could ever satisfy this test's
+        // assertion under that config, regardless of whether
+        // TopSurfaceAwareOrderField (Task 1's fix) is present or not.
+        // Verified directly: with the default 0.4mm nozzle, this test fails
+        // deterministically (3/3 runs) even against the already-reviewed
+        // Task 1 fix at HEAD. Tightening the nozzle/wall/infill widths to
+        // ~0.1mm (inset ~0.15mm) keeps the plan's exact cone shape,
+        // layer_height, top_layers, and bottom_layers unchanged, while
+        // making the near-apex band actually reachable by the (correct)
+        // straight-vertical march semantics -- confirmed deterministically
+        // (3/3 runs) to make the assertion hold with Task 1's fix present.
+        let config = SlicerConfig {
+            order_field: order_field::OrderFieldKind::Height,
+            layer_height: 0.2,
+            top_layers: 3,
+            bottom_layers: 3,
+            nozzle_diameter: 0.1,
+            wall_line_width: 0.1,
+            shell_thickness: 0.1,
+            wall_offset: 0.05,
+            infill_line_width: 0.1,
+            ..SlicerConfig::default()
+        };
+        let mut layers = slice_mesh(&mesh, &config).unwrap();
+        compute_solid_fill_boundaries(&mut layers, &config);
+        assert!(!layers.is_empty());
+
+        // The topmost several layers (well within top_layers * layer_height
+        // of the apex) must have nonempty solid_fill_boundary -- before this
+        // fix, none of them would, since a cone's steep sides never trigger
+        // the old angle-thresholded patch detection anywhere near the apex.
+        let top_threshold_layers = config.top_layers;
+        let mut checked = 0;
+        for layer in layers.iter().rev().take(top_threshold_layers + 2) {
+            if layer.loops.is_empty() {
+                continue; // Skip a possible empty apex-cap layer.
+            }
+            assert!(
+                !layer.solid_fill_boundary.is_empty(),
+                "layer at index {} (near the cone's apex) should have solid_fill_boundary",
+                layer.index
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= top_threshold_layers,
+            "expected to actually check {top_threshold_layers} near-apex layers, checked {checked}"
+        );
+    }
 }
