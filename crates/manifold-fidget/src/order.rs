@@ -34,12 +34,16 @@ pub trait OrderField: Send + Sync {
     /// locally responsible for this region: approximately physical
     /// distance along the climb direction for a well-behaved field.
     ///
-    /// Default: `order(p)` itself. This is exact for a field with only a
-    /// bed seed (order already *is* bed-distance for `Height`, `Conical`,
-    /// `Eikonal`, `DualIso` -- none of these support patch seeds today),
-    /// and is overridden by implementations that also seed from patches
-    /// (see `AnisotropicFsmOrderField`) to additionally account for
-    /// proximity to the nearest patch.
+    /// Default: `order(p)` itself, i.e. bed-distance only -- exact for a
+    /// field with no patch seeds. `manifold_core::order_field::order_field_for`
+    /// wraps every concrete field (`HeightOrderField`, `ConicalOrderField`,
+    /// `EikonalOrderField`, and `AnisotropicFsmOrderField` when
+    /// `fsm_seed_surfaces_enabled` is `false`) in a `PatchAwareOrderField`
+    /// decorator that overrides this method using purely geometric
+    /// top-surface detection, independent of the field's own solving
+    /// mechanism. `AnisotropicFsmOrderField` overrides this method natively
+    /// instead (see its own doc) when `fsm_seed_surfaces_enabled` is `true`,
+    /// since its patch metadata is already solver-consistent.
     fn seed_proximity(&self, p: DVec3) -> Option<(SeedKind, f64)> {
         Some((SeedKind::Bed, self.order(p)))
     }

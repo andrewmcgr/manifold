@@ -92,7 +92,7 @@ pub fn order_field_for_with_sdf(
     slope_profile: &manifold_fidget::slope_profile::SlopeProfile,
     sdf: Option<&MeshSdf>,
 ) -> Box<dyn OrderField> {
-    match kind {
+    let inner: Box<dyn OrderField> = match kind {
         OrderFieldKind::Height => Box::new(HeightOrderField::new(BUILD_DIRECTION)),
         OrderFieldKind::Conical => Box::new(ConicalOrderField::new(
             config.order_field_apex,
@@ -103,7 +103,36 @@ pub fn order_field_for_with_sdf(
             Box::new(eikonal_field_for(config, mesh, slope_profile, sdf))
         }
         OrderFieldKind::AnisotropicFsm => Box::new(fsm_field_for(config, mesh, slope_profile, sdf)),
+    };
+
+    if kind == OrderFieldKind::AnisotropicFsm && config.fsm_seed_surfaces_enabled {
+        // AnisotropicFsmOrderField::seed_proximity already reflects the
+        // solver's own patch metadata (with_seed_metadata) -- wrapping it
+        // here would shadow that more accurate, solve-consistent answer
+        // with a purely geometric approximation.
+        return inner;
     }
+
+    let Some((min, _max)) = mesh.bounding_box() else {
+        return inner;
+    };
+    let seed_tolerance = config.layer_height.abs().max(f64::EPSILON) / 2.0;
+    let footprint_tolerance = (config.layer_height * 20.0).max(5.0);
+    let patches = detect_top_surface_patches(
+        mesh,
+        min.z,
+        seed_tolerance,
+        config.fsm_seed_max_angle_deg(),
+        &|p| inner.order(p),
+    );
+    if patches.is_empty() {
+        return inner;
+    }
+    Box::new(PatchAwareOrderField {
+        inner,
+        patches,
+        footprint_tolerance,
+    })
 }
 
 /// Builds the [`OrderFieldKind::Eikonal`] field for `mesh`: seeds the FMM
@@ -1876,5 +1905,103 @@ mod tests {
         let (kind, distance) = field.seed_proximity(DVec3::new(0.0, 0.0, 0.1)).unwrap();
         assert_eq!(kind, SeedKind::Bed);
         assert!((distance - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn order_field_for_height_kind_reports_patch_seed_near_a_flat_raised_top() {
+        // A step mesh: base block 10x10x4 (z 0..4), with a smaller raised
+        // platform 4x4x2 on top of it (z 4..6) -- the platform's own flat
+        // top (z=6) is a patch distinct from the bed (z=0).
+        let mesh = step_platform_mesh();
+        let config = crate::SlicerConfig {
+            order_field: OrderFieldKind::Height,
+            layer_height: 0.2,
+            ..crate::SlicerConfig::default()
+        };
+        let field = order_field_for(
+            config.order_field,
+            &config,
+            &mesh,
+            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        );
+        // A point right on the raised platform's own top surface.
+        let (kind, _distance) = field.seed_proximity(DVec3::new(5.0, 5.0, 6.0)).unwrap();
+        assert_eq!(
+            kind,
+            SeedKind::Patch,
+            "expected the raised platform's own top to be classified as a Patch seed"
+        );
+    }
+
+    #[test]
+    fn order_field_for_anisotropic_fsm_with_seed_surfaces_disabled_still_gets_generic_patch_wrapping(
+    ) {
+        let mesh = step_platform_mesh();
+        let config = crate::SlicerConfig {
+            order_field: OrderFieldKind::AnisotropicFsm,
+            layer_height: 0.2,
+            fsm_seed_surfaces_enabled: false,
+            ..crate::SlicerConfig::default()
+        };
+        let field = order_field_for(
+            config.order_field,
+            &config,
+            &mesh,
+            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        );
+        let (kind, _distance) = field.seed_proximity(DVec3::new(5.0, 5.0, 6.0)).unwrap();
+        assert_eq!(kind, SeedKind::Patch);
+    }
+
+    /// A 10x10x4 base block (z 0..4) with a 4x4x2 platform (z 4..6) centered
+    /// on top, used to test patch detection through the full
+    /// `order_field_for` pipeline. Base at (3,3) to (7,7) in XY.
+    fn step_platform_mesh() -> crate::mesh::Mesh {
+        // Watertight box index pattern (bottom/top caps plus 4 outward-facing
+        // side walls) reused for both the base and the platform below --
+        // both boxes share the same relative vertex layout (0-3 bottom
+        // perimeter, 4-7 top perimeter), just at different coordinates.
+        let box_indices = || -> Vec<u32> {
+            vec![
+                0, 2, 1, 0, 3, 2, // bottom, normal points down
+                4, 5, 6, 4, 6, 7, // top, normal points up
+                0, 4, 7, 0, 7, 3, // left (x=min), normal points -x
+                1, 2, 6, 1, 6, 5, // right (x=max), normal points +x
+                0, 1, 5, 0, 5, 4, // front (y=min), normal points -y
+                3, 7, 6, 3, 6, 2, // back (y=max), normal points +y
+            ]
+        };
+        let base = crate::mesh::Mesh::new(
+            vec![
+                DVec3::new(0.0, 0.0, 0.0),
+                DVec3::new(10.0, 0.0, 0.0),
+                DVec3::new(10.0, 10.0, 0.0),
+                DVec3::new(0.0, 10.0, 0.0),
+                DVec3::new(0.0, 0.0, 4.0),
+                DVec3::new(10.0, 0.0, 4.0),
+                DVec3::new(10.0, 10.0, 4.0),
+                DVec3::new(0.0, 10.0, 4.0),
+            ],
+            box_indices(),
+        );
+        let platform = crate::mesh::Mesh::new(
+            vec![
+                DVec3::new(3.0, 3.0, 4.0),
+                DVec3::new(7.0, 3.0, 4.0),
+                DVec3::new(7.0, 7.0, 4.0),
+                DVec3::new(3.0, 7.0, 4.0),
+                DVec3::new(3.0, 3.0, 6.0),
+                DVec3::new(7.0, 3.0, 6.0),
+                DVec3::new(7.0, 7.0, 6.0),
+                DVec3::new(3.0, 7.0, 6.0),
+            ],
+            box_indices(),
+        );
+        let offset = base.vertices.len() as u32;
+        let mut vertices = base.vertices;
+        vertices.extend(platform.vertices);
+        let mut indices = base.indices;
+        indices.extend(platform.indices.iter().map(|i| i + offset));
+        crate::mesh::Mesh::new(vertices, indices)
     }
 }
