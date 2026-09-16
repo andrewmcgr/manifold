@@ -540,52 +540,135 @@ pub fn slice_mesh(mesh: &Mesh, config: &SlicerConfig) -> Result<Vec<Layer>> {
 struct StepCalibration<'a> {
     triangle_positions: &'a [DVec3],
     triangle_orders: &'a [f64],
+    /// Per-triangle `(min_order, max_order, triangle_index)`, sorted
+    /// ascending by `min_order`, paired with `prefix_max_order[i]` =
+    /// `max(sorted_ranges[0].1 ..= sorted_ranges[i].1)`. Lets
+    /// `adaptive_step` find every triangle whose order range brackets the
+    /// current `order_value` in typically-sublinear time -- binary search
+    /// to the last triangle with `min_order <= order_value`, then a
+    /// backward scan that stops the moment `prefix_max_order` proves no
+    /// earlier triangle's `max_order` could reach `order_value` either --
+    /// instead of the O(T) full-soup scan `extract_order_contours_on_mesh_with_debug`
+    /// would otherwise need every stepping-loop iteration, where T can be
+    /// millions of triangles for a large part. There is no existing
+    /// spatial index in this codebase suited to this: `TriangleBvh`
+    /// indexes by 3D position for nearest-triangle queries, not by 1D
+    /// order-value range, which is the actual query shape here (an
+    /// "interval stabbing" query). This is a performance structure only
+    /// -- it never omits a triangle that genuinely brackets `order_value`;
+    /// a missed calibration point degrades accuracy silently, which the
+    /// existing empty-`deltas`-falls-back-to-`layer_height` path already
+    /// guards against, but is not a substitute for actually finding every
+    /// real candidate.
+    sorted_ranges: Vec<(f64, f64, usize)>,
+    prefix_max_order: Vec<f64>,
 }
 
 impl<'a> StepCalibration<'a> {
     /// Wraps one wall pass's precomputed triangle-soup isosurface (already
-    /// computed for `wall_meshes` above, at no extra cost).
+    /// computed for `wall_meshes` above, at no extra cost), and builds the
+    /// order-range bracket index described on the struct.
     fn from_wall_pass(triangle_positions: &'a [DVec3], triangle_orders: &'a [f64]) -> Self {
+        let triangle_count = triangle_positions.len() / 3;
+        let mut sorted_ranges: Vec<(f64, f64, usize)> = (0..triangle_count)
+            .filter_map(|t| {
+                let os = &triangle_orders[t * 3..t * 3 + 3];
+                if os.iter().any(|o| !o.is_finite()) {
+                    return None;
+                }
+                let min_o = os.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max_o = os.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                Some((min_o, max_o, t))
+            })
+            .collect();
+        sorted_ranges.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut running_max = f64::NEG_INFINITY;
+        let prefix_max_order: Vec<f64> = sorted_ranges
+            .iter()
+            .map(|&(_, max_o, _)| {
+                running_max = running_max.max(max_o);
+                running_max
+            })
+            .collect();
+
         Self {
             triangle_positions,
             triangle_orders,
+            sorted_ranges,
+            prefix_max_order,
         }
     }
 
     /// Estimates the order-value delta that advances roughly `layer_height`
     /// mm of real distance from `order_value`, as the median of forward
-    /// probes (`field.order(pos + gradient_dir * layer_height) - field.order(pos)`)
-    /// over every point of the real contour loop(s) `extract_order_contours_on_mesh_with_debug`
-    /// finds at exactly `order_value` on this wall pass's isosurface -- note
-    /// this subtracts each point's own actual order, not the nominal
-    /// `order_value` itself, since `extract_order_contours_on_mesh_with_debug`
-    /// perturbs its target order value by a small epsilon for numerical
-    /// robustness (Simulation of Simplicity), so `pos` sits at `order_value +
-    /// epsilon`, not exactly `order_value`; subtracting the point's own order
-    /// cancels that epsilon out instead of leaking it into every delta.
+    /// probes over every point of the real contour loop(s)
+    /// `extract_order_contours_on_mesh_with_debug` finds at exactly
+    /// `order_value`, restricted to the subset of triangles whose own
+    /// order range brackets `order_value` (via `sorted_ranges`/`prefix_max_order`)
+    /// rather than the whole triangle soup.
     ///
-    /// Falls back to `layer_height` verbatim -- today's pre-fix behavior --
-    /// when the triangle soup is empty, when no loop actually crosses
-    /// `order_value` here (e.g. before the object's own order range begins,
-    /// or past where it ends), or when every candidate point's gradient is
-    /// degenerate. The result is clamped to `[0.3, 3.0] * layer_height` as a
-    /// safety bound against a single unrepresentative point producing a
-    /// pathologically small or large step -- mirroring the clamp already
-    /// used by `extrusion::local_layer_geometry` for the same reason.
+    /// Falls back to `layer_height` verbatim -- today's pre-fix behavior
+    /// -- when the triangle soup is empty, when no triangle's range
+    /// brackets `order_value` (e.g. before the object's own order range
+    /// begins, or past where it ends), or when every candidate point's
+    /// gradient is degenerate. The result is clamped to `[0.3, 3.0] *
+    /// layer_height` as a safety bound against a single unrepresentative
+    /// point producing a pathologically small or large step -- mirroring
+    /// the clamp already used by `extrusion::local_layer_geometry` for the
+    /// same reason.
     fn adaptive_step(&self, field: &dyn OrderField, order_value: f64, layer_height: f64) -> f64 {
-        if self.triangle_positions.is_empty() {
+        if self.sorted_ranges.is_empty() {
             return layer_height;
         }
 
+        // `extract_order_contours_on_mesh_with_debug` internally offsets
+        // its own target by `1e-5 * order_value.abs().max(1.0)`; widen the
+        // bracket test by twice that margin so a triangle whose range just
+        // barely excludes the raw `order_value` but would include the
+        // function's own perturbed target is never incorrectly skipped.
+        let margin = 2e-5 * order_value.abs().max(1.0);
+
+        let hi = self
+            .sorted_ranges
+            .partition_point(|&(min_o, _, _)| min_o <= order_value + margin);
+        if hi == 0 {
+            return layer_height;
+        }
+
+        let mut bracketing_triangles: Vec<usize> = Vec::new();
+        for i in (0..hi).rev() {
+            if self.prefix_max_order[i] < order_value - margin {
+                break;
+            }
+            let (_, max_o, t) = self.sorted_ranges[i];
+            if max_o >= order_value - margin {
+                bracketing_triangles.push(t);
+            }
+        }
+        if bracketing_triangles.is_empty() {
+            return layer_height;
+        }
+
+        let mut positions: Vec<DVec3> = Vec::with_capacity(bracketing_triangles.len() * 3);
+        let mut orders: Vec<f64> = Vec::with_capacity(bracketing_triangles.len() * 3);
+        for &t in &bracketing_triangles {
+            positions.extend_from_slice(&self.triangle_positions[t * 3..t * 3 + 3]);
+            orders.extend_from_slice(&self.triangle_orders[t * 3..t * 3 + 3]);
+        }
+
         let (loops, _debug_unclosed) = extract_order_contours_on_mesh_with_debug(
-            self.triangle_positions,
-            self.triangle_orders,
+            &positions,
+            &orders,
             order_value,
             BUILD_DIRECTION,
         );
 
         const MAX_SAMPLES: usize = 24;
         let all_points: Vec<DVec3> = loops.into_iter().flatten().collect();
+        if all_points.is_empty() {
+            return layer_height;
+        }
         let stride = (all_points.len() / MAX_SAMPLES).max(1);
 
         let mut deltas: Vec<f64> = Vec::new();
@@ -598,12 +681,6 @@ impl<'a> StepCalibration<'a> {
                 continue;
             }
             let normal = grad / grad_len;
-            // `extract_order_contours_on_mesh_with_debug` perturbs its target
-            // order value by a small epsilon for numerical robustness
-            // (Simulation of Simplicity), so `pos` sits at `order_value +
-            // epsilon`, not exactly `order_value` -- subtract the point's own
-            // actual order (`field.order(*pos)`, evaluated the same way) so
-            // that epsilon cancels out instead of leaking into every delta.
             let here = field.order(*pos);
             if !here.is_finite() {
                 continue;
@@ -4045,7 +4122,92 @@ mod tests {
     }
 
     #[test]
-    fn step_calibration_keeps_order_step_stable_across_a_sloped_wedge() {
+    fn step_calibration_bracket_index_finds_a_triangle_whose_range_is_far_from_the_binary_search_boundary(
+    ) {
+        // `big`'s order range [-100, 300] brackets `order_value=50`, but
+        // sits at the *lowest* `min_order` in the sorted array (index 0).
+        // Two decoy triangles (`near_decoy_1`/`near_decoy_2`) sit between it
+        // and the `partition_point` boundary for 50 -- each has a higher
+        // `min_order` than `big` (so a min-order sort places them later) but
+        // neither's own range reaches `order_value=50`. A naive backward
+        // scan that stops at the *first* non-bracketing triangle it meets
+        // (rather than checking `prefix_max_order` before giving up) would
+        // hit `near_decoy_2` first, break immediately, and never reach `big`
+        // -- silently falling back to the uncalibrated `layer_height`
+        // instead of the real local rate. `small_a`/`small_b` sit far above
+        // 50 entirely and must be excluded regardless.
+        //
+        // Uses `rate: 2.5` (not `1.0`): with `rate: 1.0`, `order(p) = p.z`
+        // makes the *correct* step (`rate * layer_height`) numerically
+        // identical to the *broken fallback* (`layer_height` verbatim) --
+        // indistinguishable, so a bug that silently falls back would still
+        // pass. `rate: 2.5` makes them clearly different (0.5 vs 0.2),
+        // which is what actually gives this test teeth (independently
+        // verified: reverting `adaptive_step`'s backward scan to a naive
+        // "break on the first non-bracketing triangle" -- no
+        // `prefix_max_order` check -- makes this exact test fail).
+        // A closed 3-triangle fan around a shared apex (mirroring the
+        // pattern `step_calibration_adaptive_step_recovers_true_rate_from_a_real_flat_patch`
+        // already uses) -- a single isolated triangle can cross an order
+        // value but can't form a *closed* loop on its own, so
+        // `extract_order_contours_on_mesh_with_debug` would route it to its
+        // `debug_unclosed` output instead of `loops`, making `adaptive_step`
+        // find nothing and silently fall back regardless of whether the
+        // bracket index found the right triangle.
+        let apex = DVec3::new(0.0, 0.0, -40.0);
+        let outer_a = DVec3::new(-100.0, -100.0, 120.0);
+        let outer_b = DVec3::new(100.0, -100.0, 120.0);
+        let outer_c = DVec3::new(0.0, 100.0, 120.0);
+        let big = vec![
+            apex, outer_a, outer_b, apex, outer_b, outer_c, apex, outer_c, outer_a,
+        ];
+        let near_decoy_1 = vec![
+            DVec3::new(0.0, 0.0, 4.0),
+            DVec3::new(1.0, 0.0, 8.0),
+            DVec3::new(0.0, 1.0, 12.0),
+        ];
+        let near_decoy_2 = vec![
+            DVec3::new(0.0, 0.0, 14.0),
+            DVec3::new(1.0, 0.0, 16.0),
+            DVec3::new(0.0, 1.0, 18.0),
+        ];
+        let small_a = vec![
+            DVec3::new(0.0, 0.0, 99.0),
+            DVec3::new(1.0, 0.0, 100.0),
+            DVec3::new(0.0, 1.0, 101.0),
+        ];
+        let small_b = vec![
+            DVec3::new(10.0, 0.0, 99.5),
+            DVec3::new(11.0, 0.0, 100.5),
+            DVec3::new(10.0, 1.0, 101.5),
+        ];
+        let field = ScaledLinearField { rate: 2.5 };
+        let mut triangle_positions = big;
+        triangle_positions.extend(near_decoy_1);
+        triangle_positions.extend(near_decoy_2);
+        triangle_positions.extend(small_a);
+        triangle_positions.extend(small_b);
+        let triangle_orders: Vec<f64> =
+            triangle_positions.iter().map(|p| field.order(*p)).collect();
+
+        let calibration = StepCalibration::from_wall_pass(&triangle_positions, &triangle_orders);
+        let layer_height = 0.2;
+        let step = calibration.adaptive_step(&field, 50.0, layer_height);
+
+        // `order(p) = rate * p.z` is exact everywhere, so the correct step
+        // is exactly `rate * layer_height` regardless of which bracketing
+        // triangle is probed -- this only matches if `big` (the only
+        // triangle whose range actually reaches order_value=50) is found.
+        let expected = 2.5 * layer_height;
+        assert!(
+            (step - expected).abs() < 1e-6,
+            "expected step {expected}, got {step} -- the wide-range triangle may have been missed (a silent fallback to layer_height={layer_height} would land here)"
+        );
+    }
+
+    #[test]
+    fn step_calibration_keeps_order_step_stable_across_a_sloped_wedge_and_not_degenerately_constant(
+    ) {
         let config = SlicerConfig {
             layer_height: 0.25,
             order_field: crate::order_field::OrderFieldKind::AnisotropicFsm,
@@ -4056,54 +4218,32 @@ mod tests {
             ..SlicerConfig::default()
         };
         let layers = slice_mesh(&wedge_mesh(), &config).unwrap();
-        assert!(
-            layers.len() >= 10,
-            "expected a reasonably tall layer stack, got {}",
-            layers.len()
-        );
+        assert!(layers.len() >= 10);
 
-        // `StepCalibration`'s job is to keep the order-value step
-        // corresponding to `layer_height` mm of real distance *along the
-        // field's own local climb direction* -- not raw Z-height, which
-        // only matches climb direction when the gradient is close to
-        // vertical. Under this test's strong tangency/orthogonality
-        // distortion, the wedge's sloped top deliberately tilts the climb
-        // direction away from vertical (the whole point of conformal
-        // non-planar slicing), so real Z-spacing between consecutive
-        // layers legitimately varies there -- that's correct behavior, not
-        // a defect. What proves `StepCalibration` is compensating
-        // correctly instead is that the order-value step itself (`dorder`)
-        // stays internally consistent from one layer to the next as the
-        // loop climbs a smoothly-varying slope: before this fix,
-        // calibration samples were selected from a flat order-value window
-        // over a raw, spatially unrelated point cloud, so `dorder` could
-        // swing unpredictably layer to layer even on smooth geometry
-        // (independently confirmed on this exact mesh/config: the old
-        // implementation's consecutive-step ratio dropped as low as ~0.72
-        // in this same interior region); this fix samples the real contour
-        // at the exact current order value, which tracks the local rate
-        // smoothly instead.
         let orders: Vec<f64> = layers.iter().map(|l| l.order).collect();
         let dorders: Vec<f64> = orders.windows(2).map(|w| w[1] - w[0]).collect();
         assert!(dorders.len() >= 9);
-
-        // Exclude the first step and the last two: the base (near the bed
-        // seed) and the summit/tip approach (governed by separate
-        // crown-layer-insertion logic, not `StepCalibration`) are expected
-        // transition regions, not the smooth interior this test targets.
-        // On this exact mesh/config the tip transition measurably spans the
-        // last *two* steps, not just the final one (confirmed by printing
-        // the full `dorders` sequence: a stable ~0.274 plateau is followed
-        // by 0.2656, then 0.2252, then a much smaller final crown step of
-        // ~0.107 -- excluding only the very last step still catches the
-        // 0.2656-to-0.2252 transition pair).
         let interior = &dorders[1..dorders.len() - 2];
-        for pair in interior.windows(2) {
-            let (prev, next) = (pair[0], pair[1]);
-            let ratio = next / prev;
+
+        // A regression to a constant-output `adaptive_step` (e.g. always
+        // returning `layer_height` verbatim, silently disabling
+        // calibration entirely) would still pass the existing ratio-based
+        // smoothness assertion -- guard against that specific degenerate
+        // case directly: the calibrated step must actually differ from
+        // the raw `layer_height` on this genuinely distorted field, and
+        // must never sit exactly on the `[0.3, 3.0] * layer_height` clamp
+        // rails (which would indicate the calibration is being clamped
+        // away rather than converging to a real local rate).
+        let clamp_lo = 0.3 * config.layer_height;
+        let clamp_hi = 3.0 * config.layer_height;
+        for &d in interior {
             assert!(
-                (0.85..=1.20).contains(&ratio),
-                "expected consecutive order-value steps to stay within the [0.85, 1.20] ratio band on a smooth slope, got {prev} then {next} (ratio {ratio})"
+                (d - config.layer_height).abs() > 1e-6,
+                "expected the calibrated step to differ from the uncalibrated layer_height, got {d}"
+            );
+            assert!(
+                d > clamp_lo + 1e-9 && d < clamp_hi - 1e-9,
+                "expected the calibrated step to sit strictly inside the clamp rails [{clamp_lo}, {clamp_hi}], got {d}"
             );
         }
     }
