@@ -1348,6 +1348,23 @@ pub fn slice_mesh_with_progress(
                     _ => Vec::new(),
                 };
 
+                // Pre-clip record of each wall pass's own extracted contour,
+                // indexed by `wall_index`. The deeper-wall inset fallback
+                // below MUST inset from a wall's real, closed contour -- never
+                // from whatever survived clipping. A clipped inner wall is
+                // frequently an open arc (`is_open: true`), and
+                // `polygon2d::canonicalize`, which that fallback feeds, has no
+                // concept of an open polyline: it computes a signed area,
+                // implicitly joining the arc's two endpoints with a straight
+                // chord, and `inward_offset` then offsets that fictitious
+                // closed shape -- emitting "wall" geometry corresponding to no
+                // real part boundary. Recording the unclipped contours keeps
+                // the fallback reading exactly what it read before inner-wall
+                // clipping existed. (`SlicerConfig::wall_count` is documented
+                // to return at least 1, so index 0 always exists.)
+                let mut unclipped_by_wall: Vec<Vec<Vec<DVec3>>> = vec![Vec::new(); wall_count];
+                unclipped_by_wall[0] = wall0_loops.clone();
+
                 for (island_idx, pts) in wall0_loops.into_iter().enumerate() {
                     let mid_2d = [(pts[0] - origin).dot(basis1), (pts[0] - origin).dot(basis2)];
                     let island = outers
@@ -1396,11 +1413,13 @@ pub fn slice_mesh_with_progress(
                     }
 
                     if extracted_w_loops.is_empty() {
-                        let prev_wall_pts: Vec<Vec<DVec3>> = loops
-                            .iter()
-                            .filter(|l| l.wall_index == w - 1)
-                            .map(|l| l.points.clone())
-                            .collect();
+                        // Reads the PRE-CLIP contour of wall `w - 1` (see
+                        // `unclipped_by_wall`), deliberately not `loops`:
+                        // once inner-wall clipping exists, `loops` may hold
+                        // wall `w - 1` as an open arc, which the
+                        // `canonicalize` below would silently chord-close
+                        // into a shape that is not a part boundary.
+                        let prev_wall_pts: Vec<Vec<DVec3>> = unclipped_by_wall[w - 1].clone();
                         if !prev_wall_pts.is_empty() {
                             let prev_2d = polygon2d::to_2d(&prev_wall_pts, basis1, basis2, origin);
                             let canonical_prev = polygon2d::canonicalize(&prev_2d);
@@ -1441,6 +1460,11 @@ pub fn slice_mesh_with_progress(
                         basis1,
                         basis2,
                     );
+
+                    // Record this pass's real (pre-clip) contour, so a deeper
+                    // pass's inset fallback references the closed wall rather
+                    // than a clipped arc of it (see `unclipped_by_wall`).
+                    unclipped_by_wall[w] = extracted_w_loops.clone();
 
                     // `w >= 1` always holds in this loop, so every loop built
                     // here is an inner wall subject to clipping.
