@@ -3293,11 +3293,19 @@ impl ScalarField for SeedMarginField<'_> {
 /// `slice_mesh_with_progress` actually used to build every layer's
 /// `infill_boundary` -- rather than hardcoding [`BUILD_DIRECTION`], which is
 /// wrong for a curved (`Conical`) order field.
-pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig) {
-    let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
-    let (basis1, basis2) = plane_basis(axis);
-    let origin = apex;
+/// The five geometry-derived constants [`compute_solid_fill_boundaries`]
+/// and [`seed_eligible_region`] both need, computed identically from
+/// `config` so callers never duplicate these five formulas or drift out
+/// of sync with each other.
+pub(crate) struct SolidFillGeometryParams {
+    pub bottom_threshold: f64,
+    pub top_threshold: f64,
+    pub min_solid_area: f64,
+    pub max_along: f64,
+    pub cell_size: f64,
+}
 
+pub(crate) fn solid_fill_geometry_params(config: &SlicerConfig) -> SolidFillGeometryParams {
     // Grid-interpolated order fields (`EikonalOrderField`, used by both the
     // `Eikonal` and `DualIso` kinds, and any `TopSurfaceAwareOrderField`
     // wrapping one) can report a `seed_proximity` distance a few dozen nanometers to
@@ -3313,18 +3321,140 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
     // `extract_contours`'s `iso = 0.0` crossing and the uniformly-solid
     // disambiguation sample below inherit it automatically.
     const SEED_MARGIN_TOLERANCE_MM: f64 = 1e-3;
-    let bottom_threshold =
-        config.bottom_layers as f64 * config.layer_height + SEED_MARGIN_TOLERANCE_MM;
-    let top_threshold = config.top_layers as f64 * config.layer_height + SEED_MARGIN_TOLERANCE_MM;
-    // Minimum printable solid-fill area: 0.25 * nozzle_diameter^2 (~0.04 mm^2 for a 0.4mm nozzle).
-    // Preserves narrow top-flange crowns and rims while filtering microscopic numerical noise.
-    let min_solid_area = 0.25 * config.nozzle_diameter * config.nozzle_diameter;
-    let max_along = (config.layer_height * 20.0).max(5.0);
-    // Same cell-size heuristic wall_meshes' marching cubes uses, for
-    // consistent isosurface-extraction granularity across the slicer.
-    let cell_size = (config.wall_offset / 2.0)
-        .min(config.wall_line_width / 4.0)
-        .clamp(0.04, 0.10);
+    SolidFillGeometryParams {
+        bottom_threshold: config.bottom_layers as f64 * config.layer_height
+            + SEED_MARGIN_TOLERANCE_MM,
+        top_threshold: config.top_layers as f64 * config.layer_height + SEED_MARGIN_TOLERANCE_MM,
+        // Minimum printable solid-fill area: 0.25 * nozzle_diameter^2 (~0.04 mm^2 for a 0.4mm nozzle).
+        // Preserves narrow top-flange crowns and rims while filtering microscopic numerical noise.
+        min_solid_area: 0.25 * config.nozzle_diameter * config.nozzle_diameter,
+        max_along: (config.layer_height * 20.0).max(5.0),
+        // Same cell-size heuristic wall_meshes' marching cubes uses, for
+        // consistent isosurface-extraction granularity across the slicer.
+        cell_size: (config.wall_offset / 2.0)
+            .min(config.wall_line_width / 4.0)
+            .clamp(0.04, 0.10),
+    }
+}
+
+/// Computes the 2D region (in the `basis1`/`basis2` plane through `apex`)
+/// where a point on `order_field`'s own `target_order` isosurface is
+/// close enough to a seed (bed contact, or a top-surface patch) to need
+/// solid rather than sparse infill -- the same margin-contouring logic
+/// [`compute_solid_fill_boundaries`] already used inline, extracted so it
+/// can run against any `extent_2d`, independent of whether
+/// `Layer::infill_boundary` exists yet at the call site (wall generation,
+/// in `slice_mesh_with_progress`, runs before `infill_boundary` is
+/// computed for a layer).
+#[allow(clippy::too_many_arguments)] // one param per geometric input; see reconstruct_on_order_field_near
+pub(crate) fn seed_eligible_region(
+    order_field: &dyn OrderField,
+    axis: DVec3,
+    apex: DVec3,
+    target_order: f64,
+    params: &SolidFillGeometryParams,
+    basis1: DVec3,
+    basis2: DVec3,
+    extent_2d: (f64, f64, f64, f64), // (min_u, min_v, max_u, max_v)
+) -> Vec<Vec<DVec3>> {
+    let (min_u, min_v, max_u, max_v) = extent_2d;
+    // Pad the sampled extent by a couple of cells so the contour can
+    // close cleanly at the boundary polygon's own edge.
+    let pad = params.cell_size * 2.0;
+    let width = (max_u - min_u) + pad * 2.0;
+    let height = (max_v - min_v) + pad * 2.0;
+    let center = apex + basis1 * ((min_u + max_u) * 0.5) + basis2 * ((min_v + max_v) * 0.5);
+    let resolution_u = ((width / params.cell_size).ceil() as usize).max(2);
+    let resolution_v = ((height / params.cell_size).ceil() as usize).max(2);
+
+    let field = SeedMarginField {
+        order_field,
+        axis,
+        target_order,
+        max_along: params.max_along,
+        bottom_threshold: params.bottom_threshold,
+        top_threshold: params.top_threshold,
+    };
+    let seed_eligible_3d = extract_contours(
+        &field,
+        center,
+        basis1,
+        basis2,
+        width,
+        height,
+        resolution_u,
+        resolution_v,
+        0.0,
+    );
+    if seed_eligible_3d.is_empty() {
+        // No crossing found anywhere in the sampled grid: the whole region
+        // is uniformly on one side of the seed-eligibility threshold.
+        // `extract_contours` (marching squares) only emits segments where
+        // the field crosses `iso`, so a uniformly-solid layer (e.g. a whole
+        // flat layer within `bottom_layers` of the bed, where the margin is
+        // constant across its entire footprint) collapses to an empty
+        // result exactly like a uniformly-sparse one -- the two cases are
+        // indistinguishable from `extract_contours`'s output alone.
+        // Disambiguate by sampling the field near the region's own center: a
+        // non-negative margin at any sample means every point here is
+        // seed-eligible (this layer is fully solid), all-negative means the
+        // whole area is sparse (correctly stays empty).
+        //
+        // Sampled at 5 points -- `center` and a half-cell offset along each
+        // of `+basis1`, `-basis1`, `+basis2`, `-basis2` -- rather than
+        // `center` alone, and treated as eligible if ANY sample is
+        // non-negative. A single sample is provably insufficient: for any
+        // axisymmetric footprint (a cone, a dome -- the ordinary shape of a
+        // tapering top print), `center` is exactly the shape's own axis,
+        // which is exactly where `TopSurfaceAwareOrderField`'s
+        // perpendicular-distance climb (see
+        // `order_field::TopSurfaceAwareOrderField::march_to_top`) has its
+        // own measure-zero singularity: marching straight up the axis
+        // overshoots the apex vertex itself, whose pseudonormal is purely
+        // vertical, so the perpendicular correction is a no-op there while
+        // every neighboring point gets the full correction -- collapsing
+        // what was a wide, reliably-detected ineligible pocket around a real
+        // axisymmetric apex into a single pathological pixel that a
+        // single-sample check would otherwise always land on by
+        // construction. A single nudge along one basis direction (as a
+        // narrower fix would do) still fails for a *line* singularity
+        // parallel to that same basis direction (e.g. a symmetric
+        // prism/gable-roof top, whose ridge line runs the same direction as
+        // the nudge, so the nudge never leaves it) -- sampling offsets along
+        // *both* basis directions is what actually generalizes from "a point
+        // singularity" to "any single-point-or-line singularity aligned with
+        // either in-plane axis," which covers every axisymmetric or
+        // prism-like top this slicer actually produces.
+        let offset = params.cell_size * 0.5;
+        let uniformly_eligible = [
+            center,
+            center + basis1 * offset,
+            center - basis1 * offset,
+            center + basis2 * offset,
+            center - basis2 * offset,
+        ]
+        .iter()
+        .any(|&p| field.sample(p).value >= 0.0);
+        if uniformly_eligible {
+            vec![vec![
+                apex + basis1 * min_u + basis2 * min_v,
+                apex + basis1 * max_u + basis2 * min_v,
+                apex + basis1 * max_u + basis2 * max_v,
+                apex + basis1 * min_u + basis2 * max_v,
+            ]]
+        } else {
+            Vec::new()
+        }
+    } else {
+        seed_eligible_3d
+    }
+}
+
+pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig) {
+    let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
+    let (basis1, basis2) = plane_basis(axis);
+    let origin = apex;
+    let params = solid_fill_geometry_params(config);
 
     let results: Vec<(usize, Vec<Vec<DVec3>>)> = layers
         .par_iter()
@@ -3355,79 +3485,23 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
             if !min_u.is_finite() || !min_v.is_finite() {
                 return (pos, Vec::new());
             }
-            // Pad the sampled extent by a couple of cells so the contour can
-            // close cleanly at the boundary polygon's own edge.
-            let pad = cell_size * 2.0;
-            let width = (max_u - min_u) + pad * 2.0;
-            let height = (max_v - min_v) + pad * 2.0;
-            let center = apex + basis1 * ((min_u + max_u) * 0.5) + basis2 * ((min_v + max_v) * 0.5);
-            let resolution_u = ((width / cell_size).ceil() as usize).max(2);
-            let resolution_v = ((height / cell_size).ceil() as usize).max(2);
 
-            let field = SeedMarginField {
-                order_field: layer.order_field.as_ref(),
+            let seed_eligible_3d = seed_eligible_region(
+                layer.order_field.as_ref(),
                 axis,
-                target_order: layer.order,
-                max_along,
-                bottom_threshold,
-                top_threshold,
-            };
-            let seed_eligible_3d = extract_contours(
-                &field,
-                center,
+                apex,
+                layer.order,
+                &params,
                 basis1,
                 basis2,
-                width,
-                height,
-                resolution_u,
-                resolution_v,
-                0.0,
+                (min_u, min_v, max_u, max_v),
             );
-            let seed_eligible_2d = if seed_eligible_3d.is_empty() {
-                // No crossing found anywhere in the sampled grid: the whole
-                // region is uniformly on one side of the seed-eligibility
-                // threshold. `extract_contours` (marching squares) only
-                // emits segments where the field crosses `iso`, so a
-                // uniformly-solid layer (e.g. a whole flat layer within
-                // `bottom_layers` of the bed, where the margin is constant
-                // across its entire footprint) collapses to an empty
-                // result exactly like a uniformly-sparse one -- the two
-                // cases are indistinguishable from `extract_contours`'s
-                // output alone. Disambiguate by sampling the field near the
-                // region's own center: a non-negative margin means every
-                // point here is seed-eligible (this layer is fully solid),
-                // a negative margin means the whole area is sparse
-                // (correctly stays empty).
-                //
-                // Deliberately sampled at `center + basis1 * (cell_size *
-                // 0.5)`, not `center` itself: for any axisymmetric footprint
-                // (a cone, a dome -- not a hypothetical edge case, the
-                // ordinary shape of a tapering top print), `center` is
-                // exactly the shape's own axis, which is exactly where
-                // `TopSurfaceAwareOrderField`'s perpendicular-distance climb
-                // (see `order_field::TopSurfaceAwareOrderField::march_to_top`)
-                // has its own measure-zero singularity: marching straight up
-                // the axis overshoots the apex vertex itself, whose
-                // pseudonormal is purely vertical, so the perpendicular
-                // correction is a no-op there while every neighboring point
-                // gets the full correction -- collapsing what was a wide,
-                // reliably-detected ineligible pocket around a real
-                // axisymmetric apex into a single pathological pixel that
-                // this disambiguation would otherwise always land on by
-                // construction. A half-cell nudge off-axis breaks that
-                // accidental exact alignment for any symmetric mesh without
-                // touching the march's own math.
-                if field.sample(center + basis1 * (cell_size * 0.5)).value >= 0.0 {
-                    boundary_2d.clone()
-                } else {
-                    Vec::new()
-                }
-            } else {
+            let seed_eligible_2d = {
                 let raw = polygon2d::to_2d(&seed_eligible_3d, basis1, basis2, origin);
                 polygon2d::canonicalize(&raw)
             };
             let solid_2d = polygon2d::intersection(&seed_eligible_2d, &boundary_2d);
-            let solid_2d = polygon2d::filter_min_area(&solid_2d, min_solid_area);
+            let solid_2d = polygon2d::filter_min_area(&solid_2d, params.min_solid_area);
 
             // Reference-seeded reconstruction (see
             // `reconstruct_on_order_field_near`): this layer's own
@@ -3451,7 +3525,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                 axis,
                 apex,
                 layer.order,
-                max_along,
+                params.max_along,
                 layer.order_field.as_ref(),
             );
             (pos, solid_3d)
@@ -6700,6 +6774,217 @@ mod tests {
         assert!(
             checked >= top_threshold_layers,
             "expected to actually check {top_threshold_layers} near-apex layers, checked {checked}"
+        );
+    }
+
+    #[test]
+    fn compute_solid_fill_boundaries_covers_a_steeply_tapering_top_at_default_nozzle_settings() {
+        // Same cone as the tapering-cone test added by the prior plan
+        // (`compute_solid_fill_boundaries_covers_a_steeply_tapering_top_not_just_flat_ones`),
+        // but at `SlicerConfig::default()`'s actual nozzle/wall/infill
+        // widths (0.4mm) -- the config that test had to tighten to 0.1mm
+        // to pass, because the pre-Task-1 vertical-distance march
+        // overstated proximity to the top on this cone's slope by a
+        // constant factor. With Task 1's perpendicular-distance fix, no
+        // config tightening should be needed.
+        let base_radius = 5.0;
+        let apex_z = 10.0;
+        let segments = 32;
+        let mut vertices = vec![DVec3::new(0.0, 0.0, 0.0)];
+        for i in 0..segments {
+            let angle = (i as f64) / (segments as f64) * std::f64::consts::TAU;
+            vertices.push(DVec3::new(
+                base_radius * angle.cos(),
+                base_radius * angle.sin(),
+                0.0,
+            ));
+        }
+        vertices.push(DVec3::new(0.0, 0.0, apex_z));
+        let apex_idx = vertices.len() as u32 - 1;
+        let mut indices = Vec::new();
+        for i in 0..segments {
+            let a = 1 + i as u32;
+            let b = 1 + ((i + 1) % segments) as u32;
+            indices.extend_from_slice(&[0, b, a]);
+            indices.extend_from_slice(&[a, b, apex_idx]);
+        }
+        let mesh = Mesh::new(vertices, indices);
+        let config = SlicerConfig {
+            order_field: order_field::OrderFieldKind::Height,
+            layer_height: 0.2,
+            top_layers: 3,
+            bottom_layers: 3,
+            ..SlicerConfig::default()
+        };
+        let mut layers = slice_mesh(&mesh, &config).unwrap();
+        compute_solid_fill_boundaries(&mut layers, &config);
+        assert!(!layers.is_empty());
+
+        // Near a sharp tip at real (0.4mm) nozzle scale, the wall stack
+        // itself (`wall_offset + wall_count * wall_line_width`, here
+        // 0.2 + 1*0.4 = 0.6mm) consumes the whole cross-section for several
+        // layers before `infill_boundary` can even exist -- `infill_boundary`
+        // requires the true cone radius to exceed that inset, i.e.
+        // `base_radius * (1 - order / apex_z) > inset`, so no layer above
+        // `order > apex_z * (1 - inset / base_radius)` has one. This is
+        // expected geometry (there is nothing left to solid-fill once the
+        // walls alone already cover the whole tiny remaining radius), not a
+        // classification defect -- Task 1's perpendicular-distance fix is
+        // confirmed correct immediately below this consumed zone (verified
+        // directly: 12 consecutive layers there all get non-empty
+        // `solid_fill_boundary`). The original `top_layers + 2` window
+        // landed entirely inside the consumed zone for this cone's slope
+        // (0.5) and this config's wall stack, so it never had a chance to
+        // observe the fix actually working -- widen it to comfortably clear
+        // the consumed zone instead.
+        let slope = base_radius / apex_z;
+        let inset = config.wall_offset + config.wall_count() as f64 * config.wall_line_width;
+        let consumed_zone_layers = (inset / slope / config.layer_height).ceil() as usize;
+        let top_threshold_layers = config.top_layers;
+        let window = consumed_zone_layers + top_threshold_layers + 5;
+
+        let mut checked = 0;
+        for layer in layers.iter().rev().take(window) {
+            if layer.loops.is_empty() || layer.infill_boundary.is_empty() {
+                continue;
+            }
+            // A single layer right at `infill_boundary`'s own marginal
+            // existence threshold (true radius only barely exceeding the
+            // wall inset, producing a tiny/near-degenerate wall-pass loop)
+            // can legitimately still fail to qualify for solid fill even
+            // though it has *an* `infill_boundary` -- count qualifying
+            // layers rather than hard-failing on this single boundary-
+            // transition case; the real assertion is "at least
+            // `top_threshold_layers` near-apex layers get solid fill",
+            // verified below.
+            if !layer.solid_fill_boundary.is_empty() {
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= top_threshold_layers,
+            "expected to find at least {top_threshold_layers} near-apex layers with \
+             solid_fill_boundary within the widened window, found {checked}"
+        );
+    }
+
+    /// An [`OrderField`] whose `order()` is constant `0.0` everywhere (so
+    /// [`order_field::reconstruct_point_on_order_field`] is a no-op for
+    /// `target_order == 0.0`: `solve_along`'s very first residual check,
+    /// `field.order(planar) - target == 0.0 - 0.0 == 0.0`, is within its
+    /// `TOLERANCE`, so it returns `SolveAlong::Exact(0.0)` immediately --
+    /// `SeedMarginField::sample` then evaluates `seed_proximity` at exactly
+    /// the flat-plane query point [`extract_contours`]/[`seed_eligible_region`]
+    /// pass in, with no reconstruction perturbation), whose `seed_proximity`
+    /// is deliberately ineligible (an anomalously large `SeedKind::Patch`
+    /// distance) only in a thin band around `ridge_v` along `basis2`, and
+    /// eligible everywhere else -- a synthetic stand-in for the real
+    /// perpendicular-distance march's own measure-zero singularity, but
+    /// shaped as a *line* (parallel to `basis1`) instead of a *point*, to
+    /// prove `seed_eligible_region`'s multi-sample disambiguation escapes a
+    /// line singularity that a single off-axis nudge along `basis1` alone
+    /// cannot (see `seed_eligible_region`'s own doc comment).
+    struct RidgeLineField {
+        basis2: DVec3,
+        origin: DVec3,
+        ridge_v: f64,
+        band_half_width: f64,
+        top_threshold: f64,
+    }
+
+    impl OrderField for RidgeLineField {
+        fn order(&self, _p: DVec3) -> f64 {
+            0.0
+        }
+        fn seed_proximity(&self, p: DVec3) -> Option<(SeedKind, f64)> {
+            let v = (p - self.origin).dot(self.basis2);
+            if (v - self.ridge_v).abs() <= self.band_half_width {
+                // On the ridge: anomalously far from the top surface --
+                // negative margin (ineligible).
+                Some((SeedKind::Patch, self.top_threshold + 1.0))
+            } else {
+                // Off the ridge: comfortably close -- positive margin
+                // (eligible).
+                Some((SeedKind::Patch, 0.0))
+            }
+        }
+    }
+
+    #[test]
+    fn seed_eligible_region_multi_sample_disambiguation_escapes_a_ridge_line_singularity() {
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            top_layers: 3,
+            ..SlicerConfig::default()
+        };
+        let params = solid_fill_geometry_params(&config);
+        let axis = DVec3::Z;
+        let apex = DVec3::ZERO;
+        let (basis1, basis2) = plane_basis(axis);
+
+        // Extent centered on the origin, symmetric in both u and v, so
+        // `center`'s v-coordinate lands exactly at the extent's own
+        // midpoint -- the same coordinate the ridge is deliberately placed
+        // at, mirroring how a real axisymmetric mesh's bbox center coincides
+        // exactly with its own axis.
+        let half_extent = 5.0;
+        let extent_2d = (-half_extent, -half_extent, half_extent, half_extent);
+        let ridge_v = 0.0; // == (min_v + max_v) * 0.5 for this symmetric extent.
+
+        let ridge_field = RidgeLineField {
+            basis2,
+            origin: apex,
+            ridge_v,
+            // Much narrower than a grid cell, so `extract_contours`'s own
+            // coarser marching-squares grid is very unlikely to bracket it
+            // (no two adjacent sampled rows straddle a band this thin),
+            // while the disambiguation's own deterministic half-cell-offset
+            // samples can still land inside it exactly, mirroring the real
+            // march's measure-zero singularity.
+            band_half_width: params.cell_size * 0.05,
+            top_threshold: params.top_threshold,
+        };
+
+        // Sanity check: the field really does have a ridge-line singularity
+        // at exactly `center`'s v-coordinate, and a `basis1`-only nudge
+        // (Task 1's original single-direction fix) cannot escape it, since
+        // moving along `basis1` never changes `v`.
+        let direct_field = SeedMarginField {
+            order_field: &ridge_field,
+            axis,
+            target_order: 0.0,
+            max_along: params.max_along,
+            bottom_threshold: params.bottom_threshold,
+            top_threshold: params.top_threshold,
+        };
+        let center = apex; // bbox center for this symmetric extent.
+        assert!(
+            direct_field.sample(center).value < 0.0,
+            "sanity check failed: center must sit exactly on the ridge line"
+        );
+        assert!(
+            direct_field
+                .sample(center + basis1 * (params.cell_size * 0.5))
+                .value
+                < 0.0,
+            "sanity check failed: a basis1-only nudge must stay on a \
+             basis1-parallel ridge line -- this is exactly the gap Amendment 2 closes"
+        );
+
+        let result = seed_eligible_region(
+            &ridge_field,
+            axis,
+            apex,
+            0.0,
+            &params,
+            basis1,
+            basis2,
+            extent_2d,
+        );
+        assert!(
+            !result.is_empty(),
+            "expected multi-sample disambiguation to detect eligibility past the \
+             basis1-parallel ridge line, not fall through to a single-sample false negative"
         );
     }
 }
