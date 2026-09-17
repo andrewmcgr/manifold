@@ -3260,39 +3260,6 @@ impl ScalarField for SeedMarginField<'_> {
     }
 }
 
-/// Computes every layer's [`Layer::solid_fill_boundary`]: the sub-region of
-/// its own [`Layer::infill_boundary`] close enough to a seed (bed contact
-/// or, for a field that supports it, a top-surface patch) to need solid
-/// rather than sparse infill.
-///
-/// Each layer is computed independently -- unlike an earlier layer-index
-/// cross-referencing design (`exposed_above`/`exposed_below` differencing
-/// against adjacent layers' outlines, windowed by `top_layers`/
-/// `bottom_layers` layer counts), [`OrderField::seed_proximity`] is a true
-/// order-space/physical distance, so "within `bottom_layers` layers of the
-/// bed" is just `d <= bottom_layers * layer_height` at this layer's own
-/// isosurface, with no cross-layer bookkeeping needed. This also fixes a
-/// real correctness gap the old design couldn't express at all: a patch
-/// seed's own local top surface (see [`SeedKind::Patch`]) getting
-/// `top_layers`-style solid fill treatment, since "near the print's global
-/// top/bottom" (a layer-index concept) and "near a patch" (a spatial
-/// concept, independent of which layer index it happens to sit at) are
-/// different things.
-///
-/// For each layer, [`SeedMarginField`] wraps the classification margin
-/// (`threshold_for_kind(kind) - distance`, positive meaning seed-eligible)
-/// as a flat-plane-sampleable field on this layer's own (possibly curved)
-/// isosurface, reusing [`extract_contours`] to contour margin `== 0.0` --
-/// the same isosurface-extraction machinery walls/`infill_boundary` already
-/// use, rather than a parallel geometry path. The resulting seed-eligible
-/// polygon is intersected with this layer's own `infill_boundary` so the
-/// result is always a subset of its fillable area.
-///
-/// `basis1`/`basis2`/`axis`/`apex` are resolved from `config`'s order field
-/// (see [`order_field::resolve_axis_apex_slope`]) -- matching whatever
-/// `slice_mesh_with_progress` actually used to build every layer's
-/// `infill_boundary` -- rather than hardcoding [`BUILD_DIRECTION`], which is
-/// wrong for a curved (`Conical`) order field.
 /// The five geometry-derived constants [`compute_solid_fill_boundaries`]
 /// and [`seed_eligible_region`] both need, computed identically from
 /// `config` so callers never duplicate these five formulas or drift out
@@ -3450,6 +3417,39 @@ pub(crate) fn seed_eligible_region(
     }
 }
 
+/// Computes every layer's [`Layer::solid_fill_boundary`]: the sub-region of
+/// its own [`Layer::infill_boundary`] close enough to a seed (bed contact
+/// or, for a field that supports it, a top-surface patch) to need solid
+/// rather than sparse infill.
+///
+/// Each layer is computed independently -- unlike an earlier layer-index
+/// cross-referencing design (`exposed_above`/`exposed_below` differencing
+/// against adjacent layers' outlines, windowed by `top_layers`/
+/// `bottom_layers` layer counts), [`OrderField::seed_proximity`] is a true
+/// order-space/physical distance, so "within `bottom_layers` layers of the
+/// bed" is just `d <= bottom_layers * layer_height` at this layer's own
+/// isosurface, with no cross-layer bookkeeping needed. This also fixes a
+/// real correctness gap the old design couldn't express at all: a patch
+/// seed's own local top surface (see [`SeedKind::Patch`]) getting
+/// `top_layers`-style solid fill treatment, since "near the print's global
+/// top/bottom" (a layer-index concept) and "near a patch" (a spatial
+/// concept, independent of which layer index it happens to sit at) are
+/// different things.
+///
+/// For each layer, [`SeedMarginField`] wraps the classification margin
+/// (`threshold_for_kind(kind) - distance`, positive meaning seed-eligible)
+/// as a flat-plane-sampleable field on this layer's own (possibly curved)
+/// isosurface, reusing [`extract_contours`] to contour margin `== 0.0` --
+/// the same isosurface-extraction machinery walls/`infill_boundary` already
+/// use, rather than a parallel geometry path. The resulting seed-eligible
+/// polygon is intersected with this layer's own `infill_boundary` so the
+/// result is always a subset of its fillable area.
+///
+/// `basis1`/`basis2`/`axis`/`apex` are resolved from `config`'s order field
+/// (see [`order_field::resolve_axis_apex_slope`]) -- matching whatever
+/// `slice_mesh_with_progress` actually used to build every layer's
+/// `infill_boundary` -- rather than hardcoding [`BUILD_DIRECTION`], which is
+/// wrong for a curved (`Conical`) order field.
 pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig) {
     let (axis, apex, _slope) = order_field::resolve_axis_apex_slope(config.order_field, config);
     let (basis1, basis2) = plane_basis(axis);
