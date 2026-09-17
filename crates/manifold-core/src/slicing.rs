@@ -1108,6 +1108,15 @@ pub fn slice_mesh_with_progress(
         .map(|(index, &order_value)| {
             let origin =
                 bbox_center + BUILD_DIRECTION * (order_value - bbox_center.dot(BUILD_DIRECTION));
+            // `axis` is already captured from the enclosing function's own
+            // `let (axis, _apex, _) = resolve_axis_apex_slope(...)` above (it
+            // is read later in this same closure, in the non-Height branch's
+            // wall-inset-fallback and infill-boundary reconstruction calls) --
+            // only `apex` is newly needed here, so avoid a redundant `let`
+            // that would shadow `axis` and make that outer capture look
+            // unused to rustc/clippy.
+            let (_, apex, _) = order_field::resolve_axis_apex_slope(config.order_field, config);
+            let params = solid_fill_geometry_params(config);
             let mut loops = Vec::new();
             if is_height {
                 for wall_index in 0..wall_count {
@@ -1121,7 +1130,7 @@ pub fn slice_mesh_with_progress(
                         &*side_sdf, origin, basis1, basis2, extent, extent, resolution, resolution,
                         iso,
                     );
-                    loops.extend(wall_loops.iter().cloned().enumerate().map(|(li, points)| {
+                    for (li, points) in wall_loops.iter().cloned().enumerate() {
                         let arc_fraction = compute_arc_fractions(&points);
                         let channel_width = polygon2d::channel_widths_3d(
                             &points,
@@ -1129,18 +1138,86 @@ pub fn slice_mesh_with_progress(
                             li,
                             2.0 * config.wall_line_width,
                         );
-                        WallLoop {
-                            is_open: false,
-                            wall_index,
-                            island: 0,
-                            unsupported: vec![false; points.len()],
-                            top_surface: Vec::new(),
-                            arc_fraction,
-                            line_widths: vec![config.wall_line_width; points.len()],
-                            channel_width,
-                            points,
+                        if wall_index == 0 {
+                            loops.push(WallLoop {
+                                is_open: false,
+                                wall_index,
+                                island: 0,
+                                unsupported: vec![false; points.len()],
+                                top_surface: Vec::new(),
+                                arc_fraction,
+                                line_widths: vec![config.wall_line_width; points.len()],
+                                channel_width,
+                                points,
+                            });
+                            continue;
                         }
-                    }));
+
+                        // Inner wall (wall_index >= 1): clip against the
+                        // region solid infill will already cover, so this
+                        // wall and solid infill never print over the same
+                        // physical space.
+                        let points_2d: Vec<[f64; 2]> = points
+                            .iter()
+                            .map(|&p| [(p - origin).dot(basis1), (p - origin).dot(basis2)])
+                            .collect();
+                        let (mut min_u, mut min_v, mut max_u, mut max_v) = (
+                            f64::INFINITY,
+                            f64::INFINITY,
+                            f64::NEG_INFINITY,
+                            f64::NEG_INFINITY,
+                        );
+                        for &[u, v] in &points_2d {
+                            min_u = min_u.min(u);
+                            min_v = min_v.min(v);
+                            max_u = max_u.max(u);
+                            max_v = max_v.max(v);
+                        }
+                        let eligible_3d = if min_u.is_finite() {
+                            seed_eligible_region(
+                                field.as_ref(),
+                                axis,
+                                apex,
+                                order_value,
+                                &params,
+                                basis1,
+                                basis2,
+                                (min_u, min_v, max_u, max_v),
+                            )
+                        } else {
+                            Vec::new()
+                        };
+                        let eligible_2d = {
+                            let raw = polygon2d::to_2d(&eligible_3d, basis1, basis2, origin);
+                            polygon2d::canonicalize(&raw)
+                        };
+                        let clipped = clip_wall_loop_against_eligible_region(
+                            &points,
+                            false,
+                            &eligible_2d,
+                            basis1,
+                            basis2,
+                            origin,
+                        );
+                        for (clipped_points, clipped_is_open) in clipped {
+                            let n_pts = clipped_points.len();
+                            if n_pts < 2 {
+                                continue;
+                            }
+                            let arc_fraction = compute_arc_fractions(&clipped_points);
+                            loops.push(WallLoop {
+                                is_open: clipped_is_open,
+                                wall_index,
+                                island: 0,
+                                unsupported: vec![false; n_pts],
+                                top_surface: Vec::new(),
+                                arc_fraction,
+                                line_widths: vec![config.wall_line_width; n_pts],
+                                channel_width: vec![f64::INFINITY; n_pts],
+                                points: clipped_points,
+                            });
+                        }
+                    }
                 }
             } else {
                 // Wall 0: extracted directly from wall_meshes[0] in 3D
@@ -3229,6 +3306,82 @@ fn serpentine_stitch_block<F: OrderField + ?Sized>(
 /// the margin `threshold_for_kind(kind) - distance`: positive means
 /// seed-eligible (should be solid), matching [`extract_contours`]'s own
 /// `iso = 0.0` isosurface-at-zero convention.
+/// Splits `loop_points` into the sub-runs of points that fall outside
+/// every polygon in `eligible_2d`, dropping the runs that fall inside.
+/// This samples the loop's own existing points with
+/// [`polygon2d::point_in_polygon`] rather than using a filled-region
+/// boolean difference: `eligible_2d` is a filled region, but
+/// `loop_points` is a stroke centerline, not a filled region itself, so a
+/// polygon-polygon difference does not apply. Never synthesizes a new
+/// point -- at the wall extraction resolution (`cell_size`, `0.04..0.10`
+/// mm between points), sampling only the existing vertices is accurate
+/// enough without a dedicated curve-polygon intersection routine.
+///
+/// A run spanning the entire original point sequence with nothing
+/// dropped is returned closed (`is_open` matches `loop_is_open`); every
+/// other returned run is open (`is_open: true`), including a surviving
+/// arc of an originally-closed loop.
+fn clip_wall_loop_against_eligible_region(
+    loop_points: &[DVec3],
+    loop_is_open: bool,
+    eligible_2d: &[Vec<[f64; 2]>],
+    basis1: DVec3,
+    basis2: DVec3,
+    origin: DVec3,
+) -> Vec<(Vec<DVec3>, bool)> {
+    if loop_points.is_empty() || eligible_2d.is_empty() {
+        return vec![(loop_points.to_vec(), loop_is_open)];
+    }
+
+    let inside: Vec<bool> = loop_points
+        .iter()
+        .map(|&p| {
+            let uv = [(p - origin).dot(basis1), (p - origin).dot(basis2)];
+            eligible_2d
+                .iter()
+                .any(|poly| polygon2d::point_in_polygon(uv, poly))
+        })
+        .collect();
+
+    if inside.iter().all(|&i| !i) {
+        return vec![(loop_points.to_vec(), loop_is_open)];
+    }
+    if inside.iter().all(|&i| i) {
+        return Vec::new();
+    }
+
+    let n = loop_points.len();
+    // For a closed loop, rotate the scan to start right after an
+    // inside->outside transition, so a surviving run can never straddle
+    // the array's wrap-around boundary and no merge step is needed. An
+    // open loop already scans start-to-end with no wrap-around.
+    let start = if loop_is_open {
+        0
+    } else {
+        (0..n)
+            .find(|&i| !inside[i] && inside[(i + n - 1) % n])
+            .unwrap_or(0)
+    };
+
+    let mut runs: Vec<Vec<DVec3>> = Vec::new();
+    let mut current: Vec<DVec3> = Vec::new();
+    for offset in 0..n {
+        let idx = (start + offset) % n;
+        if inside[idx] {
+            if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(loop_points[idx]);
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+
+    runs.into_iter().map(|pts| (pts, true)).collect()
+}
+
 struct SeedMarginField<'a> {
     order_field: &'a dyn OrderField,
     axis: DVec3,
@@ -6986,5 +7139,123 @@ mod tests {
             "expected multi-sample disambiguation to detect eligibility past the \
              basis1-parallel ridge line, not fall through to a single-sample false negative"
         );
+    }
+
+    #[test]
+    fn clip_wall_loop_against_eligible_region_keeps_the_whole_loop_when_nothing_overlaps() {
+        let square = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 0.0),
+            DVec3::new(10.0, 10.0, 0.0),
+            DVec3::new(0.0, 10.0, 0.0),
+        ];
+        // Eligible region is far away from the wall loop -- no overlap.
+        let eligible = vec![vec![
+            [100.0, 100.0],
+            [110.0, 100.0],
+            [110.0, 110.0],
+            [100.0, 110.0],
+        ]];
+        let result = clip_wall_loop_against_eligible_region(
+            &square,
+            false,
+            &eligible,
+            DVec3::X,
+            DVec3::Y,
+            DVec3::ZERO,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0.len(), 4);
+        assert!(!result[0].1, "untouched loop should stay closed");
+    }
+
+    #[test]
+    fn clip_wall_loop_against_eligible_region_drops_the_loop_when_fully_inside() {
+        let square = vec![
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(2.0, 1.0, 0.0),
+            DVec3::new(2.0, 2.0, 0.0),
+            DVec3::new(1.0, 2.0, 0.0),
+        ];
+        // Eligible region fully contains the wall loop.
+        let eligible = vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]];
+        let result = clip_wall_loop_against_eligible_region(
+            &square,
+            false,
+            &eligible,
+            DVec3::X,
+            DVec3::Y,
+            DVec3::ZERO,
+        );
+        assert!(
+            result.is_empty(),
+            "fully-eligible loop should be dropped entirely"
+        );
+    }
+
+    #[test]
+    fn clip_wall_loop_against_eligible_region_returns_an_open_arc_for_a_partial_overlap() {
+        // A loop where two adjacent points (index 2, 3 of 6) fall inside
+        // the eligible region and the rest don't; the surviving arc must
+        // be the 4 remaining points, contiguous in original order and
+        // wrapping across the array boundary (`is_open: true`).
+        let hexagon = vec![
+            DVec3::new(0.0, -1.0, 0.0), // 0: outside
+            DVec3::new(1.0, -0.5, 0.0), // 1: outside
+            DVec3::new(1.5, 0.0, 0.0),  // 2: inside
+            DVec3::new(1.0, 0.5, 0.0),  // 3: inside
+            DVec3::new(0.0, 1.0, 0.0),  // 4: outside
+            DVec3::new(-1.0, 0.0, 0.0), // 5: outside
+        ];
+        let eligible = vec![vec![[0.8, -0.3], [2.0, -0.3], [2.0, 0.8], [0.8, 0.8]]];
+        let result = clip_wall_loop_against_eligible_region(
+            &hexagon,
+            false,
+            &eligible,
+            DVec3::X,
+            DVec3::Y,
+            DVec3::ZERO,
+        );
+        assert_eq!(
+            result.len(),
+            1,
+            "expected exactly one surviving arc, got {result:?}"
+        );
+        let (points, is_open) = &result[0];
+        assert!(
+            is_open,
+            "a partially-clipped closed loop must become an open arc"
+        );
+        // The surviving arc wraps from index 4 through 5, 0, to 1 --
+        // contiguous in the original cyclic order, starting right after
+        // the inside->outside transition.
+        assert_eq!(
+            points,
+            &vec![hexagon[4], hexagon[5], hexagon[0], hexagon[1]]
+        );
+    }
+
+    #[test]
+    fn clip_wall_loop_against_eligible_region_never_touches_an_already_open_loop_beyond_dropping_points(
+    ) {
+        let open_path = vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(3.0, 0.0, 0.0),
+        ];
+        // Only the last point falls inside the eligible region.
+        let eligible = vec![vec![[2.5, -1.0], [10.0, -1.0], [10.0, 1.0], [2.5, 1.0]]];
+        let result = clip_wall_loop_against_eligible_region(
+            &open_path,
+            true,
+            &eligible,
+            DVec3::X,
+            DVec3::Y,
+            DVec3::ZERO,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec![open_path[0], open_path[1], open_path[2]]);
+        assert!(result[0].1, "a clipped open loop stays open");
     }
 }
