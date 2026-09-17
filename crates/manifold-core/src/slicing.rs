@@ -1292,6 +1292,62 @@ pub fn slice_mesh_with_progress(
                     .filter(|l| polygon2d::signed_area(l) > 0.0)
                     .collect();
 
+                // Wall 0's contour, `apex`-anchored to match the frame
+                // `seed_eligible_region` reads its extent in and emits its
+                // geometry in -- NOT this layer's bbox-centered `origin`,
+                // which `outers` above is deliberately anchored at instead,
+                // since that one is only ever compared against equally
+                // origin-anchored island midpoints.
+                //
+                // Computed here, before `wall0_loops` is consumed below, and
+                // deliberately NOT hoisted to share with the `is_height`
+                // branch: that branch derives wall 0 from a different source
+                // entirely (flat-plane `extract_contours` over `side_sdf`),
+                // while this one order-contours `wall_meshes[0]` over
+                // `bed_open_sdf` and then applies three validity filters plus
+                // `suppress_close_redundant_loops`. There is no single shared
+                // wall-0 contour to hoist without restructuring both
+                // extractions into a common pre-step.
+                let wall0_2d = (!wall0_loops.is_empty()).then(|| {
+                    polygon2d::canonicalize(&polygon2d::to_2d(&wall0_loops, basis1, basis2, apex))
+                });
+
+                // Depth gate FIRST, eligible region only if it can matter --
+                // same ordering, and for the same reason, as the `is_height`
+                // branch above: an inner wall can only collide with solid fill
+                // on a layer whose `infill_boundary` collapsed onto a depth an
+                // inner wall is really printed at, and checking that first
+                // skips `seed_eligible_region`'s whole marching-squares grid
+                // on every layer that provably cannot need it.
+                let clip_depth = (wall_count >= 2 && wall0_2d.is_some())
+                    .then(|| {
+                        infill_boundary_depth(
+                            &wall_meshes,
+                            wall_count,
+                            order_value,
+                            config,
+                            field.as_ref(),
+                        )
+                    })
+                    .filter(|&depth| depth < wall_count);
+
+                // Computed ONCE per layer (not once per inner wall loop:
+                // same field, same layer, same answer), and only when
+                // `clip_depth` says some inner wall could actually overlap.
+                let inner_clip_2d = match (clip_depth, &wall0_2d) {
+                    (Some(_), Some(bound_2d)) => inner_wall_clip_region(
+                        bound_2d,
+                        field.as_ref(),
+                        axis,
+                        apex,
+                        order_value,
+                        &params,
+                        basis1,
+                        basis2,
+                    ),
+                    _ => Vec::new(),
+                };
+
                 for (island_idx, pts) in wall0_loops.into_iter().enumerate() {
                     let mid_2d = [(pts[0] - origin).dot(basis1), (pts[0] - origin).dot(basis2)];
                     let island = outers
@@ -1386,25 +1442,64 @@ pub fn slice_mesh_with_progress(
                         basis2,
                     );
 
+                    // `w >= 1` always holds in this loop, so every loop built
+                    // here is an inner wall subject to clipping.
+                    let overlaps_infill = clip_depth.is_some_and(|d| d <= w);
+
                     for pts in extracted_w_loops {
-                        let arc_fraction = compute_arc_fractions(&pts);
-                        let n_pts = pts.len();
                         let mid_2d = [(pts[0] - origin).dot(basis1), (pts[0] - origin).dot(basis2)];
                         let island = outers
                             .iter()
                             .position(|out| polygon2d::point_in_polygon(mid_2d, out))
                             .unwrap_or(0);
-                        loops.push(WallLoop {
-                            is_open: false,
-                            wall_index: w,
-                            island,
-                            unsupported: vec![false; n_pts],
-                            top_surface: Vec::new(),
-                            arc_fraction,
-                            line_widths: vec![config.wall_line_width; n_pts],
-                            channel_width: vec![f64::INFINITY; n_pts],
-                            points: pts,
-                        });
+
+                        if !overlaps_infill {
+                            let n_pts = pts.len();
+                            let arc_fraction = compute_arc_fractions(&pts);
+                            loops.push(WallLoop {
+                                is_open: false,
+                                wall_index: w,
+                                island,
+                                unsupported: vec![false; n_pts],
+                                top_surface: Vec::new(),
+                                arc_fraction,
+                                line_widths: vec![config.wall_line_width; n_pts],
+                                channel_width: vec![f64::INFINITY; n_pts],
+                                points: pts,
+                            });
+                            continue;
+                        }
+
+                        // Clip against the region solid infill will already
+                        // cover, so this wall and solid infill never print
+                        // over the same physical space. `apex`-anchored
+                        // throughout, to match `inner_clip_2d`'s own frame.
+                        let clipped = clip_wall_loop_against_eligible_region(
+                            &pts,
+                            false,
+                            &inner_clip_2d,
+                            basis1,
+                            basis2,
+                            apex,
+                        );
+                        for (clipped_points, clipped_is_open) in clipped {
+                            let n_pts = clipped_points.len();
+                            if n_pts < 2 {
+                                continue;
+                            }
+                            let arc_fraction = compute_arc_fractions(&clipped_points);
+                            loops.push(WallLoop {
+                                is_open: clipped_is_open,
+                                wall_index: w,
+                                island,
+                                unsupported: vec![false; n_pts],
+                                top_surface: Vec::new(),
+                                arc_fraction,
+                                line_widths: vec![config.wall_line_width; n_pts],
+                                channel_width: vec![f64::INFINITY; n_pts],
+                                points: clipped_points,
+                            });
+                        }
                     }
                 }
             }
@@ -7797,6 +7892,85 @@ mod tests {
             healthy_with_inner > 0,
             "expected intact inner walls below the collapsed zone; clipping must be \
              targeted at the collapse, not applied to every layer"
+        );
+    }
+
+    #[test]
+    fn non_height_inner_walls_are_clipped_where_solid_fill_will_cover_the_same_area() {
+        let base_radius = 5.0;
+        let apex_z = 10.0;
+        let segments = 32;
+        let mut vertices = vec![DVec3::new(0.0, 0.0, 0.0)];
+        for i in 0..segments {
+            let angle = (i as f64) / (segments as f64) * std::f64::consts::TAU;
+            vertices.push(DVec3::new(
+                base_radius * angle.cos(),
+                base_radius * angle.sin(),
+                0.0,
+            ));
+        }
+        vertices.push(DVec3::new(0.0, 0.0, apex_z));
+        let apex_idx = vertices.len() as u32 - 1;
+        let mut indices = Vec::new();
+        for i in 0..segments {
+            let a = 1 + i as u32;
+            let b = 1 + ((i + 1) % segments) as u32;
+            indices.extend_from_slice(&[0, b, a]);
+            indices.extend_from_slice(&[a, b, apex_idx]);
+        }
+        let mesh = Mesh::new(vertices, indices);
+        let config = SlicerConfig {
+            order_field: order_field::OrderFieldKind::AnisotropicFsm,
+            layer_height: 1.0,
+            nozzle_diameter: 1.0,
+            fsm_seed_surfaces_enabled: false,
+            top_layers: 3,
+            bottom_layers: 3,
+            shell_thickness: 3.0,
+            wall_line_width: 1.0,
+            ..SlicerConfig::default()
+        };
+        let mut layers = slice_mesh(&mesh, &config).unwrap();
+        compute_solid_fill_boundaries(&mut layers, &config);
+
+        // For every layer, no inner-wall point (wall_index >= 1) should
+        // fall inside that layer's own solid_fill_boundary -- this is
+        // the direct invariant this plan's fix exists to guarantee.
+        let (axis, apex, _) = order_field::resolve_axis_apex_slope(config.order_field, &config);
+        let (basis1, basis2) = plane_basis(axis);
+        let mut checked_any_inner_wall = false;
+        for layer in &layers {
+            if layer.solid_fill_boundary.is_empty() {
+                continue;
+            }
+            let solid_2d = {
+                let raw = polygon2d::to_2d(&layer.solid_fill_boundary, basis1, basis2, apex);
+                polygon2d::canonicalize(&raw)
+            };
+            for wall in layer
+                .loops
+                .iter()
+                .filter(|w| w.wall_index >= 1 && w.wall_index < 990)
+            {
+                checked_any_inner_wall = true;
+                for &p in &wall.points {
+                    let uv = [(p - apex).dot(basis1), (p - apex).dot(basis2)];
+                    assert!(
+                        !solid_2d
+                            .iter()
+                            .any(|poly| polygon2d::point_in_polygon(uv, poly)),
+                        "layer {} wall_index {} has a point inside its own \
+                         solid_fill_boundary -- overlap with solid infill",
+                        layer.index,
+                        wall.wall_index
+                    );
+                }
+            }
+        }
+        assert!(
+            checked_any_inner_wall,
+            "expected at least one non-empty inner wall loop to actually check \
+             (test setup produced no wall_index >= 1 loops at all)"
         );
     }
 }
