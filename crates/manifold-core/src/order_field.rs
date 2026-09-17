@@ -412,6 +412,20 @@ impl TopSurfaceAwareOrderField {
                 // `SeedKind::Patch` reflect true proximity to the top
                 // surface instead of overstating it by the taper's own
                 // slope factor.
+                //
+                // This projection is exact for a straight climb (e.g.
+                // `HeightOrderField`, where `dir` never changes hop to
+                // hop, so `traveled` is already a true chord length along
+                // a single straight line) but only an approximation for a
+                // curved inner field (`EikonalOrderField`/
+                // `AnisotropicFsmOrderField`), where `dir` is recomputed
+                // every hop and can turn along the march -- there,
+                // `traveled` is an accumulated arc length rather than a
+                // straight-line chord distance, and only the *final* hop's
+                // direction is used for the projection rather than the
+                // true (curved) path to the exit point. This is inherent
+                // to marching a locally-straight step through a field that
+                // may curve, not a bug to fix here.
                 let normal_len_sq = exit_sample.gradient.length_squared();
                 return Some(if normal_len_sq > 1e-12 {
                     let normal = exit_sample.gradient / normal_len_sq.sqrt();
@@ -454,16 +468,28 @@ impl OrderField for TopSurfaceAwareOrderField {
         // skip. Reused as `march_to_top`'s own first `prev_value` below,
         // avoiding a second identical query at the same point `p`.
         let initial_value = self.bed_excluded_sdf.sample(p).value;
-        // A marched distance is only ever used when it beats `bed_distance`
-        // (the `td < bed_distance` arm below); anything longer is discarded
-        // in favour of the bed seed. So bound the march at `bed_distance`
-        // too, rather than always walking the full `max_search`: every hop
-        // past that point can only produce a value this function would
-        // throw away. Output-equivalent -- it never changes which seed kind
-        // or distance is returned, only how many hops are wasted getting
-        // there -- but it keeps the march cheap for the low-altitude
-        // interior points of a tall object, where the bed always wins.
-        let search_bound = self.max_search.min(bed_distance);
+        // Bound the march at `max_search` alone -- the field's own
+        // configured maximum search distance, independent of
+        // `bed_distance`. This used to also cap at `bed_distance` ("a
+        // marched distance is only used when it beats `bed_distance`, so
+        // anything longer is thrown away regardless"), but that reasoning
+        // broke once `march_to_top` started returning a *projected*
+        // perpendicular distance (`raw_distance * |dir . n|`, always
+        // `<= raw_distance`) instead of the raw climb-direction travel
+        // distance: a march whose raw (pre-projection) distance would
+        // have exceeded `bed_distance` can still project down to a value
+        // smaller than `bed_distance` after accounting for slope, so
+        // truncating the march at `bed_distance` could cut it off before
+        // reaching that exit and silently discard a `Patch` distance that
+        // should have won -- the exact regression this plan exists to fix
+        // (concrete case: a taper where the true perpendicular distance
+        // is well under `bed_distance` but the raw vertical exit is
+        // farther away than `bed_distance` along the climb direction).
+        // `max_search` alone has no such coupling to the projection: it's
+        // a fixed geometric cap chosen independently of any per-query
+        // seed comparison, so bounding by it alone stays correct while
+        // still keeping the march's cost bounded.
+        let search_bound = self.max_search;
         let top_distance = if initial_value.abs() > self.max_search {
             None
         } else {
