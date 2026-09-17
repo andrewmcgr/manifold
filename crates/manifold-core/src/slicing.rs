@@ -1119,26 +1119,71 @@ pub fn slice_mesh_with_progress(
             let params = solid_fill_geometry_params(config);
             let mut loops = Vec::new();
             if is_height {
-                for wall_index in 0..wall_count {
-                    // Negative iso = inward (see `MeshSdf::sign_at`: positive
-                    // outside, negative inside). Wall 0 sits `wall_offset` in
-                    // from the true surface (nozzle-center offset so the
-                    // nozzle's outer edge lands on the surface); each further
-                    // wall steps another `wall_line_width` inward.
-                    let iso = -(config.wall_offset + wall_index as f64 * config.wall_line_width);
-                    let wall_loops = extract_contours(
-                        &*side_sdf, origin, basis1, basis2, extent, extent, resolution, resolution,
-                        iso,
-                    );
+                // Extract every wall pass's contours up front, plus one
+                // further inset pass at `wall_count` (where the infill
+                // boundary itself lands -- see the `infill_boundary`
+                // computation below, which takes the deepest available
+                // `wall_meshes[w]` for `w` down from `wall_count`). The
+                // inner-wall clip region (below) is bounded by that infill
+                // region, so it must be known before any inner wall is
+                // clipped.
+                let wall_passes: Vec<Vec<Vec<DVec3>>> = (0..=wall_count)
+                    .map(|wall_index| {
+                        // Negative iso = inward (see `MeshSdf::sign_at`: positive
+                        // outside, negative inside). Wall 0 sits `wall_offset` in
+                        // from the true surface (nozzle-center offset so the
+                        // nozzle's outer edge lands on the surface); each further
+                        // wall steps another `wall_line_width` inward.
+                        let iso =
+                            -(config.wall_offset + wall_index as f64 * config.wall_line_width);
+                        extract_contours(
+                            &*side_sdf, origin, basis1, basis2, extent, extent, resolution,
+                            resolution, iso,
+                        )
+                    })
+                    .collect();
+
+                // Computed ONCE per layer (not once per inner wall loop:
+                // same field, same layer, same answer), and anchored at
+                // `apex` rather than this layer's bbox-centered `origin`,
+                // because that is the frame `seed_eligible_region` reads
+                // its extent in and emits its geometry in.
+                let infill_depth = infill_boundary_depth(&wall_passes, wall_count);
+                let inner_clip_2d = wall_passes
+                    .first()
+                    .map(|wall0| {
+                        let wall0_2d =
+                            polygon2d::canonicalize(&polygon2d::to_2d(wall0, basis1, basis2, apex));
+                        inner_wall_clip_region(
+                            &wall0_2d,
+                            field.as_ref(),
+                            axis,
+                            apex,
+                            order_value,
+                            &params,
+                            basis1,
+                            basis2,
+                        )
+                    })
+                    .unwrap_or_default();
+
+                for (wall_index, wall_loops) in wall_passes.iter().enumerate().take(wall_count) {
+                    // An inner wall can only collide with solid fill when
+                    // this layer's `infill_boundary` collapsed onto its own
+                    // depth or shallower (see `infill_boundary_depth`); in
+                    // healthy nesting the boundary sits strictly inside
+                    // every printed wall and nothing should be clipped.
+                    let overlaps_infill =
+                        wall_index >= 1 && infill_depth.is_some_and(|d| d <= wall_index);
                     for (li, points) in wall_loops.iter().cloned().enumerate() {
                         let arc_fraction = compute_arc_fractions(&points);
                         let channel_width = polygon2d::channel_widths_3d(
                             &points,
-                            &wall_loops,
+                            wall_loops,
                             li,
                             2.0 * config.wall_line_width,
                         );
-                        if wall_index == 0 {
+                        if !overlaps_infill {
                             loops.push(WallLoop {
                                 is_open: false,
                                 wall_index,
@@ -1156,48 +1201,15 @@ pub fn slice_mesh_with_progress(
                         // Inner wall (wall_index >= 1): clip against the
                         // region solid infill will already cover, so this
                         // wall and solid infill never print over the same
-                        // physical space.
-                        let points_2d: Vec<[f64; 2]> = points
-                            .iter()
-                            .map(|&p| [(p - origin).dot(basis1), (p - origin).dot(basis2)])
-                            .collect();
-                        let (mut min_u, mut min_v, mut max_u, mut max_v) = (
-                            f64::INFINITY,
-                            f64::INFINITY,
-                            f64::NEG_INFINITY,
-                            f64::NEG_INFINITY,
-                        );
-                        for &[u, v] in &points_2d {
-                            min_u = min_u.min(u);
-                            min_v = min_v.min(v);
-                            max_u = max_u.max(u);
-                            max_v = max_v.max(v);
-                        }
-                        let eligible_3d = if min_u.is_finite() {
-                            seed_eligible_region(
-                                field.as_ref(),
-                                axis,
-                                apex,
-                                order_value,
-                                &params,
-                                basis1,
-                                basis2,
-                                (min_u, min_v, max_u, max_v),
-                            )
-                        } else {
-                            Vec::new()
-                        };
-                        let eligible_2d = {
-                            let raw = polygon2d::to_2d(&eligible_3d, basis1, basis2, origin);
-                            polygon2d::canonicalize(&raw)
-                        };
+                        // physical space. `apex`-anchored throughout, to
+                        // match `inner_clip_2d`'s own frame.
                         let clipped = clip_wall_loop_against_eligible_region(
                             &points,
                             false,
-                            &eligible_2d,
+                            &inner_clip_2d,
                             basis1,
                             basis2,
-                            origin,
+                            apex,
                         );
                         for (clipped_points, clipped_is_open) in clipped {
                             let n_pts = clipped_points.len();
@@ -3287,25 +3299,6 @@ fn serpentine_stitch_block<F: OrderField + ?Sized>(
     }
 }
 
-/// Adapts a layer's own (possibly curved) isosurface into a flat-plane
-/// [`ScalarField`] so [`extract_contours`] -- which samples a literal flat
-/// plane through `origin` perpendicular to `basis1`/`basis2` -- can be
-/// reused to find the boundary between seed-eligible ("solid") and
-/// non-eligible ("sparse") regions on that curved surface, the same way
-/// walls/`infill_boundary` already reuse isosurface extraction rather than
-/// inventing a parallel geometry path.
-///
-/// For an incoming flat-plane query point `p` (as produced by
-/// [`extract_contours`]'s own grid sampling), first reconstructs the real
-/// point on this layer's `target_order` isosurface via
-/// [`order_field::reconstruct_point_on_order_field`] (falling back to the
-/// flat query point itself when reconstruction fails, e.g. outside the
-/// solid entirely -- consistent with `order()`'s own "unreached returns a
-/// sane fallback rather than panicking" convention used throughout this
-/// module), then evaluates [`OrderField::seed_proximity`] there and returns
-/// the margin `threshold_for_kind(kind) - distance`: positive means
-/// seed-eligible (should be solid), matching [`extract_contours`]'s own
-/// `iso = 0.0` isosurface-at-zero convention.
 /// Splits `loop_points` into the sub-runs of points that fall outside
 /// every polygon in `eligible_2d`, dropping the runs that fall inside.
 /// This samples the loop's own existing points with
@@ -3337,9 +3330,23 @@ fn clip_wall_loop_against_eligible_region(
         .iter()
         .map(|&p| {
             let uv = [(p - origin).dot(basis1), (p - origin).dot(basis2)];
+            // Even-odd nesting parity, NOT `.any(...)`: `eligible_2d` is a
+            // canonicalized polygon set (see `polygon2d::canonicalize`),
+            // where a hole is carried as its own separate loop with
+            // flipped winding rather than being subtracted from its
+            // parent. A point sitting inside a hole is therefore inside
+            // BOTH the enclosing outer loop and the hole loop, so `.any()`
+            // would wrongly report it eligible (and clip away a wall that
+            // runs through a genuine sparse cavity). Counting containments
+            // and testing odd parity is the standard even-odd rule and
+            // matches how `point_in_polygon` itself resolves a single
+            // self-nesting loop.
             eligible_2d
                 .iter()
-                .any(|poly| polygon2d::point_in_polygon(uv, poly))
+                .filter(|poly| polygon2d::point_in_polygon(uv, poly))
+                .count()
+                % 2
+                == 1
         })
         .collect();
 
@@ -3382,6 +3389,134 @@ fn clip_wall_loop_against_eligible_region(
     runs.into_iter().map(|pts| (pts, true)).collect()
 }
 
+/// The 2D region, in the `apex`-anchored `basis1`/`basis2` frame, that a
+/// layer's inner wall loops (`wall_index >= 1`) must be clipped against so
+/// a wall and solid infill never print over the same physical space:
+/// [`seed_eligible_region`]'s solid-fill-eligible area, bounded to the
+/// part's own footprint by intersecting it with `bound_2d` (wall 0).
+///
+/// Computed once per layer rather than once per inner wall loop: it is the
+/// same field over the same layer, regardless of which wall is asking, and
+/// [`seed_eligible_region`] samples a whole marching-squares grid per call.
+///
+/// Bounding by wall 0 matters because [`seed_eligible_region`]'s uniform
+/// fallback -- taken whenever the entire sampled extent lands on one side
+/// of the eligibility threshold -- returns its whole padded sampling
+/// RECTANGLE, which extends outside the part. It is not on its own enough
+/// to decide *whether* an inner wall overlaps solid fill; see
+/// `infill_boundary_depth` for the gate that does that.
+#[allow(clippy::too_many_arguments)] // one param per geometric input; mirrors seed_eligible_region
+fn inner_wall_clip_region(
+    bound_2d: &[Vec<[f64; 2]>],
+    order_field: &dyn OrderField,
+    axis: DVec3,
+    apex: DVec3,
+    target_order: f64,
+    params: &SolidFillGeometryParams,
+    basis1: DVec3,
+    basis2: DVec3,
+) -> Vec<Vec<[f64; 2]>> {
+    if bound_2d.is_empty() {
+        return Vec::new();
+    }
+
+    let (mut min_u, mut min_v, mut max_u, mut max_v) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for loop_ in bound_2d {
+        for &[u, v] in loop_ {
+            min_u = min_u.min(u);
+            min_v = min_v.min(v);
+            max_u = max_u.max(u);
+            max_v = max_v.max(v);
+        }
+    }
+    if !min_u.is_finite() || !min_v.is_finite() {
+        return Vec::new();
+    }
+
+    let eligible_3d = seed_eligible_region(
+        order_field,
+        axis,
+        apex,
+        target_order,
+        params,
+        basis1,
+        basis2,
+        (min_u, min_v, max_u, max_v),
+    );
+    if eligible_3d.is_empty() {
+        return Vec::new();
+    }
+    // Anchored at `apex`, matching `seed_eligible_region`'s own contract:
+    // it reads `extent_2d` as offsets from `apex` and emits its geometry
+    // measured from `apex`, NOT from whatever per-layer origin a caller
+    // happens to slice with.
+    let eligible_2d =
+        polygon2d::canonicalize(&polygon2d::to_2d(&eligible_3d, basis1, basis2, apex));
+    polygon2d::canonicalize(&polygon2d::intersection(&eligible_2d, bound_2d))
+}
+
+/// The wall depth this layer's `infill_boundary` will actually be built
+/// at, given each wall pass's extracted contours in `wall_passes`
+/// (`wall_passes[w]` = the contours at wall pass `w`).
+///
+/// Mirrors the `infill_boundary` derivation below: it walks `w` from
+/// `wall_count` down to `1` and takes the deepest pass that actually
+/// produced usable loops, falling back to `inward_offset(wall0,
+/// wall_line_width)` -- which sits at exactly wall pass 1's own depth --
+/// when none of them did. Returns `None` for a layer with no wall 0 at
+/// all, which has no infill boundary either.
+///
+/// This depth is what decides whether an inner wall can overlap solid fill
+/// at all. In healthy nesting the infill boundary lands at `wall_count`,
+/// strictly inside every printed wall, so no inner wall can overlap it and
+/// none should be clipped. The overlap this clipping exists to prevent
+/// comes from depth COLLAPSE: near a taper tip, where the cross-section is
+/// narrower than the full wall stack, the deep insets vanish and the
+/// fallback drops `infill_boundary` onto a depth an inner wall is really
+/// printed at -- so infill (and the solid fill inside it) lands on top of
+/// that wall. Gating on depth rather than on a geometric containment test
+/// is both exact and numerically robust: in precisely the collapse case
+/// the wall loop and the infill boundary are the SAME extracted contour,
+/// so every one of the wall's points would sit exactly on the region's
+/// edge, where an even-odd point-in-polygon test is a coin flip.
+fn infill_boundary_depth(wall_passes: &[Vec<Vec<DVec3>>], wall_count: usize) -> Option<usize> {
+    if wall_passes.first().is_none_or(|w0| w0.is_empty()) {
+        return None;
+    }
+    for w in (1..=wall_count).rev() {
+        if wall_passes.get(w).is_some_and(|pass| !pass.is_empty()) {
+            return Some(w);
+        }
+    }
+    // No inner pass survived: `infill_boundary` falls back to insetting
+    // wall 0 by one `wall_line_width`, i.e. wall pass 1's own depth.
+    Some(1)
+}
+
+/// Adapts a layer's own (possibly curved) isosurface into a flat-plane
+/// [`ScalarField`] so [`extract_contours`] -- which samples a literal flat
+/// plane through `origin` perpendicular to `basis1`/`basis2` -- can be
+/// reused to find the boundary between seed-eligible ("solid") and
+/// non-eligible ("sparse") regions on that curved surface, the same way
+/// walls/`infill_boundary` already reuse isosurface extraction rather than
+/// inventing a parallel geometry path.
+///
+/// For an incoming flat-plane query point `p` (as produced by
+/// [`extract_contours`]'s own grid sampling), first reconstructs the real
+/// point on this layer's `target_order` isosurface via
+/// [`order_field::reconstruct_point_on_order_field`] (falling back to the
+/// flat query point itself when reconstruction fails, e.g. outside the
+/// solid entirely -- consistent with `order()`'s own "unreached returns a
+/// sane fallback rather than panicking" convention used throughout this
+/// module), then evaluates [`OrderField::seed_proximity`] there and returns
+/// the margin `threshold_for_kind(kind) - distance`: positive means
+/// seed-eligible (should be solid), matching [`extract_contours`]'s own
+/// `iso = 0.0` isosurface-at-zero convention.
 struct SeedMarginField<'a> {
     order_field: &'a dyn OrderField,
     axis: DVec3,
@@ -7257,5 +7392,289 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, vec![open_path[0], open_path[1], open_path[2]]);
         assert!(result[0].1, "a clipped open loop stays open");
+    }
+
+    #[test]
+    fn clip_wall_loop_against_eligible_region_treats_a_hole_in_the_region_as_not_eligible() {
+        // `eligible_2d` is a canonicalized polygon SET (see
+        // `polygon2d::canonicalize`): a hole is carried as its own separate
+        // loop with flipped winding, NOT subtracted from its parent. A
+        // point inside the hole is therefore contained by both the outer
+        // loop and the hole loop, so a containment test written as
+        // `.any(point_in_polygon)` reports it eligible and clips away a
+        // wall running through a genuine sparse cavity. Even-odd parity is
+        // what actually resolves the nesting.
+        let outer = vec![[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]];
+        let hole = vec![[-3.0, -3.0], [3.0, -3.0], [3.0, 3.0], [-3.0, 3.0]];
+        let eligible = vec![outer, hole];
+
+        // An open wall run crossing the annulus, through the hole, and out
+        // the other side: only the point inside the hole is ineligible.
+        let path = vec![
+            DVec3::new(-8.0, 0.0, 0.0), // annulus -> eligible -> clipped
+            DVec3::new(-5.0, 0.0, 0.0), // annulus -> eligible -> clipped
+            DVec3::new(0.0, 0.0, 0.0),  // hole -> NOT eligible -> survives
+            DVec3::new(5.0, 0.0, 0.0),  // annulus -> eligible -> clipped
+            DVec3::new(8.0, 0.0, 0.0),  // annulus -> eligible -> clipped
+        ];
+        let result = clip_wall_loop_against_eligible_region(
+            &path,
+            true,
+            &eligible,
+            DVec3::X,
+            DVec3::Y,
+            DVec3::ZERO,
+        );
+        assert_eq!(
+            result.len(),
+            1,
+            "expected exactly the hole-crossing run to survive, got {result:?}"
+        );
+        assert_eq!(
+            result[0].0,
+            vec![path[2]],
+            "only the point inside the region's own hole should survive the clip -- \
+             an `.any()` containment test would have dropped the whole loop"
+        );
+    }
+
+    /// A `segments`-sided cone: base of radius `base_radius` resting on the
+    /// bed centered at `center_xy`, apex `height` directly above it.
+    #[allow(dead_code)] // kept alongside `frustum_mesh_at` for cone-shaped fixtures
+    fn cone_mesh_at(center_xy: [f64; 2], base_radius: f64, height: f64, segments: usize) -> Mesh {
+        let [cx, cy] = center_xy;
+        let mut vertices = vec![DVec3::new(cx, cy, 0.0)];
+        for i in 0..segments {
+            let angle = (i as f64) / (segments as f64) * std::f64::consts::TAU;
+            vertices.push(DVec3::new(
+                cx + base_radius * angle.cos(),
+                cy + base_radius * angle.sin(),
+                0.0,
+            ));
+        }
+        vertices.push(DVec3::new(cx, cy, height));
+        let apex_idx = vertices.len() as u32 - 1;
+        let mut indices = Vec::new();
+        for i in 0..segments {
+            let a = 1 + i as u32;
+            let b = 1 + ((i + 1) % segments) as u32;
+            indices.extend_from_slice(&[0, b, a]);
+            indices.extend_from_slice(&[a, b, apex_idx]);
+        }
+        Mesh::new(vertices, indices)
+    }
+
+    /// A `segments`-sided circular frustum: base of radius `base_radius`
+    /// resting on the bed centered at `center_xy`, flat top face of radius
+    /// `top_radius` at `height`. `top_radius == base_radius` gives a plain
+    /// cylinder; `top_radius == 0.0` gives a cone.
+    fn frustum_mesh_at(
+        center_xy: [f64; 2],
+        base_radius: f64,
+        top_radius: f64,
+        height: f64,
+        segments: usize,
+    ) -> Mesh {
+        let [cx, cy] = center_xy;
+        let ring = |radius: f64, z: f64| -> Vec<DVec3> {
+            (0..segments)
+                .map(|i| {
+                    let angle = (i as f64) / (segments as f64) * std::f64::consts::TAU;
+                    DVec3::new(cx + radius * angle.cos(), cy + radius * angle.sin(), z)
+                })
+                .collect()
+        };
+
+        // 0 = base center, 1..=segments = base ring,
+        // segments+1 = top center, segments+2..  = top ring.
+        let mut vertices = vec![DVec3::new(cx, cy, 0.0)];
+        vertices.extend(ring(base_radius, 0.0));
+        let top_center = vertices.len() as u32;
+        vertices.push(DVec3::new(cx, cy, height));
+        vertices.extend(ring(top_radius, height));
+
+        let base_ring = |i: usize| 1 + (i % segments) as u32;
+        let top_ring = |i: usize| top_center + 1 + (i % segments) as u32;
+
+        let mut indices = Vec::new();
+        for i in 0..segments {
+            let (b0, b1) = (base_ring(i), base_ring(i + 1));
+            let (t0, t1) = (top_ring(i), top_ring(i + 1));
+            // Base cap (downward normal, bed contact).
+            indices.extend_from_slice(&[0, b1, b0]);
+            // Side wall quad, split into two triangles.
+            indices.extend_from_slice(&[b0, b1, t1]);
+            indices.extend_from_slice(&[b0, t1, t0]);
+            // Top cap (upward normal).
+            indices.extend_from_slice(&[top_center, t0, t1]);
+        }
+        Mesh::new(vertices, indices)
+    }
+
+    /// An axis-aligned rectangular box spanning `min`..`max`, flat-bottomed
+    /// on the bed.
+    fn box_mesh(min: DVec3, max: DVec3) -> Mesh {
+        let vertices = vec![
+            DVec3::new(min.x, min.y, min.z),
+            DVec3::new(max.x, min.y, min.z),
+            DVec3::new(max.x, max.y, min.z),
+            DVec3::new(min.x, max.y, min.z),
+            DVec3::new(min.x, min.y, max.z),
+            DVec3::new(max.x, min.y, max.z),
+            DVec3::new(max.x, max.y, max.z),
+            DVec3::new(min.x, max.y, max.z),
+        ];
+        let indices = vec![
+            0, 2, 1, 0, 3, 2, // -Z
+            4, 5, 6, 4, 6, 7, // +Z
+            0, 1, 5, 0, 5, 4, // -Y
+            3, 7, 6, 3, 6, 2, // +Y
+            0, 4, 7, 0, 7, 3, // -X
+            1, 2, 6, 1, 6, 5, // +X
+        ];
+        Mesh::new(vertices, indices)
+    }
+
+    /// Per-layer inner-wall (`wall_index >= 1`) profile:
+    /// `(wall-0 loops, inner loops, clipped-open inner loops)` for each
+    /// layer, in order. Clipping shows up either as a partially-clipped
+    /// loop (counted in the third field) or as a whole loop dropped
+    /// (a reduction in the second), so both are captured.
+    fn inner_wall_profile(layers: &[Layer]) -> Vec<(usize, usize, usize)> {
+        layers
+            .iter()
+            .map(|l| {
+                let real = l.loops.iter().filter(|w| w.wall_index < 990);
+                let outer = real.clone().filter(|w| w.wall_index == 0).count();
+                let inner: Vec<&WallLoop> = real.filter(|w| w.wall_index >= 1).collect();
+                let open = inner.iter().filter(|w| w.is_open).count();
+                (outer, inner.len(), open)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn height_inner_wall_clipping_is_anchored_at_the_apex_not_the_layer_bbox_center() {
+        // `seed_eligible_region` reads its `extent_2d` as offsets from
+        // `apex` and emits its geometry measured from `apex` -- NOT from
+        // `slice_mesh_with_progress`'s own per-layer `origin`, whose
+        // in-plane component is the mesh's bbox center. Wiring the two
+        // together in the `origin` frame happens to work for a mesh sitting
+        // on the world origin (where the two frames coincide) and silently
+        // breaks for one placed anywhere else -- i.e. for every real print,
+        // since objects get centered on the bed.
+        //
+        // `OrderFieldKind::Height`'s order is `p.dot(BUILD_DIRECTION)`,
+        // invariant under in-plane translation, so the same part sliced at
+        // the origin and sliced 140mm away must produce identical wall
+        // geometry and therefore identical inner-wall clipping. Any
+        // divergence is a frame-anchoring bug.
+        //
+        // The fixture is a thin flat-topped pillar, chosen so all three
+        // conditions for a real clip coincide: radius 0.9mm leaves wall 0
+        // (inset 0.2) and wall 1 (inset 0.6) extractable while wall pass 2
+        // (inset 1.0) collapses -- so `infill_boundary` falls back onto
+        // wall 1's own depth -- and the flat top makes the perpendicular
+        // distance equal the vertical one, putting the topmost layers
+        // genuinely inside `top_threshold`.
+        let config = SlicerConfig {
+            order_field: order_field::OrderFieldKind::Height,
+            layer_height: 0.2,
+            nozzle_diameter: 0.4,
+            wall_offset: 0.2,
+            wall_line_width: 0.4,
+            shell_thickness: 0.8, // wall_count == 2, so inner walls exist
+            top_layers: 3,
+            bottom_layers: 3,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(config.wall_count(), 2, "test needs a real inner wall");
+
+        let pillar = |center_xy: [f64; 2]| frustum_mesh_at(center_xy, 0.9, 0.9, 5.0, 48);
+        let centered = slice_mesh(&pillar([0.0, 0.0]), &config).unwrap();
+        let displaced = slice_mesh(&pillar([120.0, 80.0]), &config).unwrap();
+
+        assert_eq!(
+            centered.len(),
+            displaced.len(),
+            "in-plane translation must not change the layer stack under a Height field"
+        );
+
+        let centered_profile = inner_wall_profile(&centered);
+        let displaced_profile = inner_wall_profile(&displaced);
+
+        // Guard against a vacuous pass: without a real clip somewhere, the
+        // equality below would hold trivially even with a broken frame.
+        // On this pillar every layer extracts a wall-1 contour, so a layer
+        // that ends up with a wall 0 and no inner wall at all is one whose
+        // inner wall the clip dropped outright (the whole ring sits under
+        // solid fill once `infill_boundary` collapses onto wall 1's depth).
+        let dropped_layers = centered_profile
+            .iter()
+            .filter(|&&(outer, inner, _)| outer > 0 && inner == 0)
+            .count();
+        assert!(
+            dropped_layers > 0,
+            "test fixture produced no inner-wall clipping at all \
+             (profile {centered_profile:?}) -- it cannot detect a frame-anchoring bug"
+        );
+        assert_eq!(
+            centered_profile, displaced_profile,
+            "inner-wall clipping must be invariant under in-plane translation; a \
+             bbox-center-anchored eligible region samples the field ~140mm away from \
+             the displaced part and silently stops clipping"
+        );
+    }
+
+    #[test]
+    fn height_inner_walls_survive_on_a_uniformly_solid_fill_eligible_layer() {
+        // Every layer within `bottom_layers` of the bed is uniformly
+        // solid-fill-eligible, so `seed_eligible_region` takes its uniform
+        // fallback and reports its whole padded sampling RECTANGLE as
+        // eligible. Clipping inner walls against that raw rectangle would
+        // delete every inner wall on the first (and last) few layers of
+        // essentially every print -- but solid fill never reaches them: it
+        // only ever occupies the intersection with `infill_boundary`, which
+        // sits a further `wall_line_width` inside the innermost wall.
+        let config = SlicerConfig {
+            order_field: order_field::OrderFieldKind::Height,
+            layer_height: 0.2,
+            nozzle_diameter: 0.4,
+            wall_offset: 0.2,
+            wall_line_width: 0.4,
+            shell_thickness: 0.8, // wall_count == 2
+            top_layers: 3,
+            bottom_layers: 3,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(config.wall_count(), 2, "test needs a real inner wall");
+
+        let layers = slice_mesh(
+            &box_mesh(DVec3::new(-10.0, -10.0, 0.0), DVec3::new(10.0, 10.0, 6.0)),
+            &config,
+        )
+        .unwrap();
+        assert!(!layers.is_empty());
+
+        // The bottom `bottom_layers` layers are the uniformly-eligible ones.
+        for layer in layers.iter().take(config.bottom_layers) {
+            let inner: Vec<&WallLoop> = layer
+                .loops
+                .iter()
+                .filter(|w| w.wall_index >= 1 && w.wall_index < 990)
+                .collect();
+            assert!(
+                !inner.is_empty(),
+                "layer {} (within bottom_layers, uniformly solid-fill-eligible) lost \
+                 all of its inner walls to clipping",
+                layer.index
+            );
+            assert!(
+                inner.iter().all(|w| !w.is_open),
+                "layer {} (within bottom_layers) had an inner wall clipped open, but \
+                 solid fill never reaches an inner wall on a healthy nesting layer",
+                layer.index
+            );
+        }
     }
 }
