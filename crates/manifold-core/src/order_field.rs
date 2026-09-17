@@ -2002,6 +2002,110 @@ mod tests {
     }
 
     #[test]
+    fn top_surface_aware_order_field_reaches_a_full_march_bound_of_max_search_not_bed_distance() {
+        // Same cone as the other top_surface_aware_order_field_* tests
+        // (base_radius=5, apex_z=10, 32 segments). Regression test for the
+        // `search_bound` truncation bug: `seed_proximity` used to bound
+        // the march at `max_search.min(bed_distance)`, on the (now-false)
+        // assumption that a march whose *raw* exit distance exceeds
+        // `bed_distance` could only ever be discarded anyway. Once
+        // `march_to_top` started projecting its raw distance onto the
+        // local surface normal (perpendicular, not vertical), that
+        // assumption broke: a raw exit distance that exceeds
+        // `bed_distance` can still *project* down to something smaller
+        // than `bed_distance` once slope is accounted for, so truncating
+        // the march at `bed_distance` could silently prevent it from ever
+        // reaching that exit, falling through to `SeedKind::Bed` instead
+        // of the correct `SeedKind::Patch`.
+        let base_radius = 5.0;
+        let apex_z = 10.0;
+        let segments = 32;
+        let mut vertices = vec![DVec3::new(0.0, 0.0, 0.0)];
+        for i in 0..segments {
+            let angle = (i as f64) / (segments as f64) * std::f64::consts::TAU;
+            vertices.push(DVec3::new(
+                base_radius * angle.cos(),
+                base_radius * angle.sin(),
+                0.0,
+            ));
+        }
+        vertices.push(DVec3::new(0.0, 0.0, apex_z));
+        let apex_idx = vertices.len() as u32 - 1;
+        let mut indices = Vec::new();
+        for i in 0..segments {
+            let a = 1 + i as u32;
+            let b = 1 + ((i + 1) % segments) as u32;
+            indices.extend_from_slice(&[0, b, a]);
+            indices.extend_from_slice(&[a, b, apex_idx]);
+        }
+        let mesh = Mesh::new(vertices.clone(), indices);
+        let config = crate::SlicerConfig {
+            order_field: OrderFieldKind::Height,
+            layer_height: 0.2,
+            top_layers: 3,
+            ..crate::SlicerConfig::default()
+        };
+        let field = order_field_for(
+            config.order_field,
+            &config,
+            &mesh,
+            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        );
+
+        // Query along the *azimuthal midline* of one flat triangular side
+        // face (halfway between two adjacent base vertices), not along a
+        // vertex-to-apex ridge line (`theta = 0`, as the other cone tests
+        // in this file use): a ridge line is a genuine mesh *edge*, where
+        // `MeshSdf`'s edge-pseudonormal blending between the two adjacent
+        // faces is numerically ill-conditioned for a query landing almost
+        // exactly on that edge (confirmed directly -- an earlier version
+        // of this test queried at `theta=0` and got a visibly wrong,
+        // asymmetric gradient with a nonzero y-component and a negative
+        // z-component, despite querying exactly on the mesh's own y=0
+        // symmetry plane). Querying through a face's *interior* instead
+        // gives a single, unambiguous face normal with no edge blending,
+        // so the expected value below is derived directly from that one
+        // triangular face's own plane geometry (exact, not merely
+        // approximate against the idealized smooth cone).
+        let v_a = vertices[1]; // vertex at angle 0
+        let v_b = vertices[2]; // vertex at angle 2*pi/segments
+        let apex = vertices[apex_idx as usize];
+        let face_normal = (v_b - v_a).cross(apex - v_a).normalize();
+        let theta_mid = 0.5 * (std::f64::consts::TAU / segments as f64);
+        let rho = 2.5;
+        let z0 = 2.0;
+        let query = DVec3::new(rho * theta_mid.cos(), rho * theta_mid.sin(), z0);
+
+        // Exit height where the vertical ray at (query.x, query.y) crosses
+        // this face's plane: `face_normal . (p - v_a) == 0`.
+        let z_exit = v_a.z
+            - (face_normal.x * (query.x - v_a.x) + face_normal.y * (query.y - v_a.y))
+                / face_normal.z;
+        let raw_vertical_distance = z_exit - z0;
+        let bed_distance = z0;
+        assert!(
+            raw_vertical_distance > bed_distance,
+            "test setup should reproduce the regression condition: raw exit \
+             distance ({raw_vertical_distance}) must exceed bed_distance ({bed_distance})"
+        );
+
+        let (kind, distance) = field.seed_proximity(query).unwrap();
+        assert_eq!(
+            kind,
+            manifold_fidget::order::SeedKind::Patch,
+            "expected a full march past bed_distance={bed_distance} to reach the real top-surface exit"
+        );
+
+        let cos_theta = face_normal.z.abs(); // angle between +Z climb direction and this face's own normal
+        let expected_perpendicular = raw_vertical_distance * cos_theta;
+
+        assert!(
+            (distance - expected_perpendicular).abs() < 0.001,
+            "expected perpendicular distance ~{expected_perpendicular}, got {distance}"
+        );
+    }
+
+    #[test]
     fn top_surface_aware_order_field_prefers_bed_when_top_is_genuinely_far() {
         let mesh = step_platform_mesh();
         let config = crate::SlicerConfig {
