@@ -333,17 +333,30 @@ fn is_upward_within_angle(normal: DVec3, max_angle_deg: f64) -> bool {
 /// SDF with bed-contact faces excluded from distance evaluation, so the
 /// march can't be fooled by "exiting" near the bed itself -- see
 /// [`crate::mesh::non_bed_floor_faces`]) until it exits the solid or
-/// exceeds `max_search` -- the accumulated distance at exit is the real
-/// physical distance to this point's own local top surface, along the
-/// direction that actually matters for non-planar layer spacing.
+/// exceeds `max_search` -- the distance at exit, projected onto the exit
+/// surface's own outward normal (see [`TopSurfaceAwareOrderField::march_to_top`]),
+/// is the real perpendicular physical distance to this point's own local
+/// top surface, which is what actually matters for non-planar layer
+/// spacing. Reporting the raw along-the-climb travel distance instead
+/// would overstate that proximity on any surface not perpendicular to the
+/// climb direction (i.e. any taper or dome), by exactly the surface's own
+/// slope factor.
 ///
 /// Bounded by a cheap pre-filter: `bed_excluded_sdf`'s own ordinary
-/// Euclidean nearest-surface distance is always `<=` any climb-direction
-/// distance to that same surface, so when it already exceeds `max_search`
-/// the expensive directional march is skipped entirely -- this keeps the
-/// cost of the common case (points deep in the interior, far from any
-/// exposed surface) to one cheap BVH query, paying for the full march only
-/// within a thin shell near the object's own exterior.
+/// Euclidean nearest-surface distance is (in the overwhelmingly common
+/// case) `<=` the reported distance to that same surface, so when it
+/// already exceeds `max_search` the expensive directional march is skipped
+/// entirely -- this keeps the cost of the common case (points deep in the
+/// interior, far from any exposed surface) to one cheap BVH query, paying
+/// for the full march only within a thin shell near the object's own
+/// exterior. Note this is a near-universal approximation rather than an
+/// absolute guarantee: since the march now reports a *projected*
+/// (perpendicular) distance, which is always `<=` the raw climb-direction
+/// distance, a projected result can in principle dip below the true
+/// Euclidean nearest-surface distance. Doing so requires a near-tangent
+/// exit surface very close to the query point (`|dir . n|` near zero with
+/// a short raw distance), which does not arise for the bed-excluded
+/// top-surface geometry this field is used on.
 struct TopSurfaceAwareOrderField {
     inner: Box<dyn OrderField>,
     bed_excluded_sdf: MeshSdf,
@@ -353,10 +366,21 @@ struct TopSurfaceAwareOrderField {
 
 impl TopSurfaceAwareOrderField {
     /// Marches from `p` along the field's own local climb direction in
-    /// `step`-sized hops, testing `bed_excluded_sdf` at each hop, and
-    /// returns the physical distance to the point where it crosses from
-    /// inside (`<= 0.0`) to outside (`> 0.0`) the bed-excluded solid,
-    /// giving up once `traveled` reaches `search_bound`.
+    /// `step`-sized hops, testing `bed_excluded_sdf` at each hop, locates
+    /// the point where it crosses from inside (`<= 0.0`) to outside
+    /// (`> 0.0`) the bed-excluded solid, and returns the *perpendicular*
+    /// distance to that crossing -- the along-the-climb travel distance
+    /// projected onto the exit surface's own outward normal
+    /// (`raw_distance * |dir . n|`, see the projection block in the body
+    /// for why). Gives up once `traveled` reaches `search_bound`.
+    ///
+    /// The projection is what makes the result a true measure of how much
+    /// material separates `p` from its local top surface: the raw travel
+    /// distance equals the perpendicular distance only where the surface
+    /// is perpendicular to the climb direction (a flat top), and
+    /// overstates it everywhere else by the surface's own slope factor.
+    /// It is exact for a straight climb and an approximation for a curved
+    /// inner field -- see the body's own comment for that distinction.
     ///
     /// Refines the crossing via linear interpolation between the last
     /// inside sample and the first outside sample -- reporting the raw
@@ -467,6 +491,11 @@ impl OrderField for TopSurfaceAwareOrderField {
         // pre-filter for exactly the interior-point case it exists to
         // skip. Reused as `march_to_top`'s own first `prev_value` below,
         // avoiding a second identical query at the same point `p`.
+        //
+        // See this type's own doc comment for why this skip is a
+        // near-universal approximation rather than an absolute guarantee
+        // now that `march_to_top` reports a projected (perpendicular)
+        // distance, which is always `<=` the raw climb-direction one.
         let initial_value = self.bed_excluded_sdf.sample(p).value;
         // Bound the march at `max_search` alone -- the field's own
         // configured maximum search distance, independent of

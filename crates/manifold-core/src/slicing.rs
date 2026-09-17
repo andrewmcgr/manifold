@@ -1217,6 +1217,21 @@ pub fn slice_mesh_with_progress(
                         // wall and solid infill never print over the same
                         // physical space. `apex`-anchored throughout, to
                         // match `inner_clip_2d`'s own frame.
+                        //
+                        // Frame caveat: `basis1`/`basis2` here come from
+                        // `plane_basis(BUILD_DIRECTION)` (see this function's
+                        // own in-plane frame setup), NOT `plane_basis(axis)`.
+                        // The two coincide only for `OrderFieldKind::Height`,
+                        // where `axis == BUILD_DIRECTION`. For `Conical` --
+                        // the only kind whose `axis` genuinely differs -- this
+                        // clip is therefore a known, accepted geometric
+                        // approximation rather than an exact result: the
+                        // eligible region is evaluated in a plane tilted away
+                        // from the layer's own. Reconciling the two frames is
+                        // tracked as separate future work, not fixed here; see
+                        // the "Known Interaction" section and the "Plan C"
+                        // Backlog item in
+                        // `docs/superpowers/specs/2026-09-17-perpendicular-top-distance-and-wall-overlap-design.md`.
                         let clipped = clip_wall_loop_against_eligible_region(
                             &points,
                             false,
@@ -1225,6 +1240,23 @@ pub fn slice_mesh_with_progress(
                             basis2,
                             apex,
                         );
+                        // Nothing was actually removed: the clip returned this
+                        // loop intact (a single still-closed run of the same
+                        // length). `channel_widths_3d` was already computed
+                        // for exactly these points above and remains valid, so
+                        // reuse it rather than discarding the narrow-channel
+                        // clamp -- dropping to `INFINITY` (no clamping) here
+                        // would silently disable bead-width clamping on every
+                        // inner wall of a collapsed-nesting layer, which is
+                        // precisely where narrow channels are most likely.
+                        // A genuinely clipped loop (an open arc, a different
+                        // point count, or a split into several runs) still
+                        // falls back to `INFINITY`, matching the non-Height
+                        // path: recomputing `channel_widths_3d` for an
+                        // arbitrary sub-arc is out of scope here.
+                        let clip_was_noop = clipped.len() == 1
+                            && !clipped[0].1
+                            && clipped[0].0.len() == points.len();
                         for (clipped_points, clipped_is_open) in clipped {
                             let n_pts = clipped_points.len();
                             if n_pts < 2 {
@@ -1239,7 +1271,11 @@ pub fn slice_mesh_with_progress(
                                 top_surface: Vec::new(),
                                 arc_fraction,
                                 line_widths: vec![config.wall_line_width; n_pts],
-                                channel_width: vec![f64::INFINITY; n_pts],
+                                channel_width: if clip_was_noop {
+                                    channel_width.clone()
+                                } else {
+                                    vec![f64::INFINITY; n_pts]
+                                },
                                 points: clipped_points,
                             });
                         }
@@ -1498,6 +1534,21 @@ pub fn slice_mesh_with_progress(
                         // cover, so this wall and solid infill never print
                         // over the same physical space. `apex`-anchored
                         // throughout, to match `inner_clip_2d`'s own frame.
+                        //
+                        // Frame caveat: `basis1`/`basis2` here come from
+                        // `plane_basis(BUILD_DIRECTION)` (see this function's
+                        // own in-plane frame setup), NOT `plane_basis(axis)`.
+                        // The two coincide only for `OrderFieldKind::Height`,
+                        // where `axis == BUILD_DIRECTION`. For `Conical` --
+                        // the only kind whose `axis` genuinely differs -- this
+                        // clip is therefore a known, accepted geometric
+                        // approximation rather than an exact result: the
+                        // eligible region is evaluated in a plane tilted away
+                        // from the layer's own. Reconciling the two frames is
+                        // tracked as separate future work, not fixed here; see
+                        // the "Known Interaction" section and the "Plan C"
+                        // Backlog item in
+                        // `docs/superpowers/specs/2026-09-17-perpendicular-top-distance-and-wall-overlap-design.md`.
                         let clipped = clip_wall_loop_against_eligible_region(
                             &pts,
                             false,
@@ -7995,6 +8046,106 @@ mod tests {
             checked_any_inner_wall,
             "expected at least one non-empty inner wall loop to actually check \
              (test setup produced no wall_index >= 1 loops at all)"
+        );
+    }
+
+    #[test]
+    fn height_inner_walls_never_overlap_solid_fill_at_default_nozzle_settings() {
+        // The branch's only end-to-end check that the two halves of this
+        // plan hold TOGETHER, on the `Height` path, at production-realistic
+        // settings:
+        //
+        //   1. the perpendicular-distance fix actually produces solid fill
+        //      (`solid_fill_boundary` is non-empty somewhere), and
+        //   2. inner-wall clipping keeps every inner wall out of it.
+        //
+        // Each is covered separately elsewhere, but never together on this
+        // path at these settings: the three Height clipping tests never
+        // call `compute_solid_fill_boundaries` at all (so they cannot see
+        // the overlap invariant), and the one default-nozzle test that does
+        // leaves `shell_thickness` at its default -- which equals
+        // `wall_line_width`, so `wall_count() == 1`, there are no inner
+        // walls, and the clip path is never even entered.
+        //
+        // Everything here is `SlicerConfig::default()`'s real 0.4mm nozzle
+        // stack (0.4 nozzle / 0.4 wall line / 0.2 wall offset / 0.2 layer
+        // height) EXCEPT `shell_thickness`, doubled to 0.8 purely so
+        // `wall_count() == 2` and a genuine inner wall exists to clip.
+        let config = SlicerConfig {
+            order_field: order_field::OrderFieldKind::Height,
+            shell_thickness: 0.8,
+            top_layers: 3,
+            bottom_layers: 3,
+            ..SlicerConfig::default()
+        };
+        assert_eq!(
+            config.wall_count(),
+            2,
+            "test needs a real inner wall -- `shell_thickness` must give wall_count() == 2"
+        );
+
+        let mut layers = slice_mesh(
+            &box_mesh(DVec3::new(-10.0, -10.0, 0.0), DVec3::new(10.0, 10.0, 6.0)),
+            &config,
+        )
+        .unwrap();
+        compute_solid_fill_boundaries(&mut layers, &config);
+        assert!(!layers.is_empty());
+
+        let (axis, apex, _) = order_field::resolve_axis_apex_slope(config.order_field, &config);
+        let (basis1, basis2) = plane_basis(axis);
+
+        // Same invariant, and the same assertion structure, as
+        // `non_height_inner_walls_are_clipped_where_solid_fill_will_cover_the_same_area`
+        // -- but on the `Height` path and at default nozzle settings.
+        let mut layers_with_solid_fill = 0;
+        let mut checked_any_inner_wall = false;
+        for layer in &layers {
+            if layer.solid_fill_boundary.is_empty() {
+                continue;
+            }
+            layers_with_solid_fill += 1;
+            let solid_2d = {
+                let raw = polygon2d::to_2d(&layer.solid_fill_boundary, basis1, basis2, apex);
+                polygon2d::canonicalize(&raw)
+            };
+            for wall in layer
+                .loops
+                .iter()
+                .filter(|w| w.wall_index >= 1 && w.wall_index < 990)
+            {
+                checked_any_inner_wall = true;
+                for &p in &wall.points {
+                    let uv = [(p - apex).dot(basis1), (p - apex).dot(basis2)];
+                    assert!(
+                        !solid_2d
+                            .iter()
+                            .any(|poly| polygon2d::point_in_polygon(uv, poly)),
+                        "layer {} wall_index {} has a point inside its own \
+                         solid_fill_boundary -- overlap with solid infill",
+                        layer.index,
+                        wall.wall_index
+                    );
+                }
+            }
+        }
+
+        // Half 1: the coverage fix works here at all. Without it, a
+        // vacuously-empty `solid_fill_boundary` everywhere would satisfy
+        // the overlap assertion above for entirely the wrong reason.
+        assert!(
+            layers_with_solid_fill >= config.top_layers,
+            "expected at least {} layers with solid fill on a flat-topped box at \
+             default nozzle settings, found {layers_with_solid_fill}",
+            config.top_layers
+        );
+        // Half 2: inner walls genuinely coexist with those solid-fill
+        // layers, so the overlap assertion above actually examined
+        // something rather than skipping every layer.
+        assert!(
+            checked_any_inner_wall,
+            "expected at least one inner wall on a solid-fill layer to actually check \
+             (test setup produced no wall_index >= 1 loops to examine)"
         );
     }
 }
