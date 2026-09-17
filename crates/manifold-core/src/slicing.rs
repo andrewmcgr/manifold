@@ -3393,12 +3393,31 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                 // across its entire footprint) collapses to an empty
                 // result exactly like a uniformly-sparse one -- the two
                 // cases are indistinguishable from `extract_contours`'s
-                // output alone. Disambiguate by sampling the field
-                // directly at the region's own center: a non-negative
-                // margin means every point here is seed-eligible (this
-                // layer is fully solid), a negative margin means the
-                // whole area is sparse (correctly stays empty).
-                if field.sample(center).value >= 0.0 {
+                // output alone. Disambiguate by sampling the field near the
+                // region's own center: a non-negative margin means every
+                // point here is seed-eligible (this layer is fully solid),
+                // a negative margin means the whole area is sparse
+                // (correctly stays empty).
+                //
+                // Deliberately sampled at `center + basis1 * (cell_size *
+                // 0.5)`, not `center` itself: for any axisymmetric footprint
+                // (a cone, a dome -- not a hypothetical edge case, the
+                // ordinary shape of a tapering top print), `center` is
+                // exactly the shape's own axis, which is exactly where
+                // `TopSurfaceAwareOrderField`'s perpendicular-distance climb
+                // (see `order_field::TopSurfaceAwareOrderField::march_to_top`)
+                // has its own measure-zero singularity: marching straight up
+                // the axis overshoots the apex vertex itself, whose
+                // pseudonormal is purely vertical, so the perpendicular
+                // correction is a no-op there while every neighboring point
+                // gets the full correction -- collapsing what was a wide,
+                // reliably-detected ineligible pocket around a real
+                // axisymmetric apex into a single pathological pixel that
+                // this disambiguation would otherwise always land on by
+                // construction. A half-cell nudge off-axis breaks that
+                // accidental exact alignment for any symmetric mesh without
+                // touching the march's own math.
+                if field.sample(center + basis1 * (cell_size * 0.5)).value >= 0.0 {
                     boundary_2d.clone()
                 } else {
                     Vec::new()

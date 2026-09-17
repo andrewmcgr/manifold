@@ -385,7 +385,8 @@ impl TopSurfaceAwareOrderField {
             let dir = grad / len;
             pos += dir * self.step;
             traveled += self.step;
-            let value = self.bed_excluded_sdf.sample(pos).value;
+            let exit_sample = self.bed_excluded_sdf.sample(pos);
+            let value = exit_sample.value;
             if value > 0.0 {
                 let denom = value - prev_value;
                 let t = if denom.abs() > 1e-12 {
@@ -393,7 +394,36 @@ impl TopSurfaceAwareOrderField {
                 } else {
                     1.0
                 };
-                return Some(traveled - self.step * (1.0 - t));
+                let raw_distance = traveled - self.step * (1.0 - t);
+
+                // Project the raw climb-direction (vertical) travel
+                // distance onto the local surface normal at the exit
+                // point (`exit_sample.gradient`, already the outward
+                // normal -- `MeshSdf::sample` always returns a gradient
+                // oriented away from the surface, regardless of which
+                // side `pos` is on). For a locally planar exit surface
+                // with unit normal `n` and climb direction `dir`, the
+                // true perpendicular distance from the query point to
+                // that surface is `raw_distance * |dir . n|`, not
+                // `raw_distance` itself -- the two only coincide when the
+                // surface is perpendicular to the climb direction (a flat
+                // top). On a taper, `|dir . n| < 1` and this correction is
+                // what makes `seed_proximity`'s reported distance for
+                // `SeedKind::Patch` reflect true proximity to the top
+                // surface instead of overstating it by the taper's own
+                // slope factor.
+                let normal_len_sq = exit_sample.gradient.length_squared();
+                return Some(if normal_len_sq > 1e-12 {
+                    let normal = exit_sample.gradient / normal_len_sq.sqrt();
+                    raw_distance * dir.dot(normal).abs()
+                } else {
+                    // Degenerate normal (should not happen for a
+                    // non-empty mesh, but `MeshSdf::sample` can return a
+                    // zero gradient for an empty triangle set) -- fall
+                    // back to the raw distance rather than dividing by a
+                    // near-zero length or reporting zero.
+                    raw_distance
+                });
             }
             prev_value = value;
         }
@@ -1868,6 +1898,80 @@ mod tests {
         assert!(
             (distance - expected).abs() < 0.005,
             "expected the marched distance to the flat top to be ~{expected}, got {distance}"
+        );
+    }
+
+    #[test]
+    fn top_surface_aware_order_field_reports_perpendicular_not_vertical_distance_on_a_slope() {
+        // Same cone as `top_surface_aware_order_field_finds_a_tapering_cone_apex_...`
+        // (base_radius=5, apex_z=10, 32 segments), but queried at a
+        // non-apex, non-step-aligned point on the slope, where the raw
+        // vertical march distance and the true perpendicular distance
+        // genuinely differ -- the apex-tip query in the existing test
+        // exits on its very first hop, so it can't distinguish "reports
+        // vertical distance" from "reports perpendicular distance."
+        let base_radius = 5.0;
+        let apex_z = 10.0;
+        let segments = 32;
+        let mut vertices = vec![DVec3::new(0.0, 0.0, 0.0)];
+        for i in 0..segments {
+            let angle = (i as f64) / (segments as f64) * std::f64::consts::TAU;
+            vertices.push(DVec3::new(
+                base_radius * angle.cos(),
+                base_radius * angle.sin(),
+                0.0,
+            ));
+        }
+        vertices.push(DVec3::new(0.0, 0.0, apex_z));
+        let apex_idx = vertices.len() as u32 - 1;
+        let mut indices = Vec::new();
+        for i in 0..segments {
+            let a = 1 + i as u32;
+            let b = 1 + ((i + 1) % segments) as u32;
+            indices.extend_from_slice(&[0, b, a]);
+            indices.extend_from_slice(&[a, b, apex_idx]);
+        }
+        let mesh = Mesh::new(vertices, indices);
+        let config = crate::SlicerConfig {
+            order_field: OrderFieldKind::Height,
+            layer_height: 0.2,
+            top_layers: 3,
+            ..crate::SlicerConfig::default()
+        };
+        let field = order_field_for(
+            config.order_field,
+            &config,
+            &mesh,
+            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        );
+
+        // Query point at (r0=1.03, z0=5.0), on the cone's axis-aligned
+        // radial slice: radius(z) = 5.0 * (1.0 - z / 10.0), so this point
+        // is inside the solid (radius(5.0) = 2.5 > 1.03). Marching
+        // straight up, it exits exactly where radius(z_exit) == 1.03:
+        // z_exit = 10.0 * (1.0 - 1.03 / 5.0) = 7.94, so raw vertical
+        // march distance = 7.94 - 5.0 = 2.94. The default step
+        // (layer_height.min(nozzle_diameter) / 4 = 0.05 here) does not
+        // divide 2.94 evenly, so this genuinely exercises the march's
+        // interpolation, unlike a step-aligned point.
+        let query = DVec3::new(1.03, 0.0, 5.0);
+        let (kind, distance) = field.seed_proximity(query).unwrap();
+        assert_eq!(kind, manifold_fidget::order::SeedKind::Patch);
+
+        let raw_vertical_distance = 2.94_f64;
+        let k = base_radius / apex_z; // radial slope magnitude, dr/dz
+        let cos_theta = k / (1.0 + k * k).sqrt(); // angle between climb direction and surface normal
+        let expected_perpendicular = raw_vertical_distance * cos_theta;
+
+        assert!(
+            (distance - expected_perpendicular).abs() < 0.02,
+            "expected perpendicular distance ~{expected_perpendicular}, got {distance} \
+             (raw vertical distance would have been {raw_vertical_distance})"
+        );
+        assert!(
+            distance < raw_vertical_distance - 0.1,
+            "distance {distance} should be meaningfully less than the raw vertical \
+             distance {raw_vertical_distance} on a sloped surface"
         );
     }
 
