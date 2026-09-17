@@ -355,7 +355,8 @@ impl TopSurfaceAwareOrderField {
     /// Marches from `p` along the field's own local climb direction in
     /// `step`-sized hops, testing `bed_excluded_sdf` at each hop, and
     /// returns the physical distance to the point where it crosses from
-    /// inside (`<= 0.0`) to outside (`> 0.0`) the bed-excluded solid.
+    /// inside (`<= 0.0`) to outside (`> 0.0`) the bed-excluded solid,
+    /// giving up once `traveled` reaches `search_bound`.
     ///
     /// Refines the crossing via linear interpolation between the last
     /// inside sample and the first outside sample -- reporting the raw
@@ -368,14 +369,14 @@ impl TopSurfaceAwareOrderField {
     /// solid-fill-threshold boundary). Also checks `p` itself before
     /// taking any step, so a point already at or past the boundary reports
     /// a near-zero distance instead of one full `step`.
-    fn march_to_top(&self, p: DVec3, initial_value: f64) -> Option<f64> {
+    fn march_to_top(&self, p: DVec3, initial_value: f64, search_bound: f64) -> Option<f64> {
         let mut traveled = 0.0;
         let mut pos = p;
         let mut prev_value = initial_value;
         if prev_value > 0.0 {
             return Some(0.0);
         }
-        while traveled < self.max_search {
+        while traveled < search_bound {
             let grad = numeric_gradient(self.inner.as_ref(), pos)?;
             let len = grad.length();
             if !len.is_finite() || len < 1e-9 {
@@ -423,10 +424,20 @@ impl OrderField for TopSurfaceAwareOrderField {
         // skip. Reused as `march_to_top`'s own first `prev_value` below,
         // avoiding a second identical query at the same point `p`.
         let initial_value = self.bed_excluded_sdf.sample(p).value;
+        // A marched distance is only ever used when it beats `bed_distance`
+        // (the `td < bed_distance` arm below); anything longer is discarded
+        // in favour of the bed seed. So bound the march at `bed_distance`
+        // too, rather than always walking the full `max_search`: every hop
+        // past that point can only produce a value this function would
+        // throw away. Output-equivalent -- it never changes which seed kind
+        // or distance is returned, only how many hops are wasted getting
+        // there -- but it keeps the march cheap for the low-altitude
+        // interior points of a tall object, where the bed always wins.
+        let search_bound = self.max_search.min(bed_distance);
         let top_distance = if initial_value.abs() > self.max_search {
             None
         } else {
-            self.march_to_top(p, initial_value)
+            self.march_to_top(p, initial_value, search_bound)
         };
 
         Some(match top_distance {
@@ -1393,9 +1404,11 @@ pub(crate) fn project_onto_isosurface<F: OrderField + ?Sized>(
 
 /// Central-difference numeric gradient of `field.order` at `p` (`field`
 /// exposes only a scalar `order`, no analytic gradient). Shared by
-/// [`project_onto_isosurface`] and `toolpath::compensate_flat_nozzle`,
-/// which both need a local surface-normal-like direction from an
-/// arbitrary [`OrderField`].
+/// [`project_onto_isosurface`], `TopSurfaceAwareOrderField::march_to_top`
+/// (by far the highest-frequency caller -- once per hop of every
+/// top-surface march), and `toolpath::compensate_flat_nozzle`, which all
+/// need a local surface-normal-like direction from an arbitrary
+/// [`OrderField`].
 ///
 /// Returns `None` if `field.order` is non-finite at any of the six sample
 /// points (e.g. `p` is outside the region the field has information about
@@ -1813,6 +1826,52 @@ mod tests {
     }
 
     #[test]
+    fn top_surface_aware_order_field_marches_an_exact_closed_form_distance_to_a_flat_top() {
+        // Pins the marched *distance*, not just the seed kind: every other
+        // top-surface test here would still pass against a march that
+        // returned ~0 unconditionally, or one that reported the raw
+        // step-quantized `traveled` instead of interpolating the crossing
+        // (the exact bug this mechanism has already been fixed for once).
+        //
+        // Deliberately measured against `step_platform_mesh`'s flat top
+        // rather than the cone's apex: a cone tip is a geometric
+        // singularity, where the bed-excluded SDF along the climb direction
+        // is *not* linear in z (inside, it tracks perpendicular distance to
+        // the lateral surface; outside, distance to the apex point), so
+        // interpolating between the bracketing samples legitimately lands
+        // ~0.01mm off the true crossing and there is no exact closed form
+        // to pin. Against a flat top the SDF *is* exactly linear along the
+        // march, so the closed form is exact and the tolerance can be tight
+        // enough to catch a one-step error decisively.
+        let mesh = step_platform_mesh();
+        let config = crate::SlicerConfig {
+            order_field: OrderFieldKind::Height,
+            layer_height: 0.2,
+            ..crate::SlicerConfig::default()
+        };
+        let field = order_field_for(
+            config.order_field,
+            &config,
+            &mesh,
+            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        );
+        // Chosen so the march does *not* reach the top exactly on a step
+        // boundary (step = layer_height.min(nozzle_diameter) / 4 = 0.05mm,
+        // and 4.52 + 30 * 0.05 = 6.02 overshoots the top at z=6.0), forcing
+        // the crossing interpolation to actually do work -- a query whose
+        // march lands exactly on the surface passes even without it.
+        let platform_top_z = 6.0;
+        let query = DVec3::new(5.0, 5.0, 4.52);
+        let (kind, distance) = field.seed_proximity(query).unwrap();
+        assert_eq!(kind, SeedKind::Patch);
+        let expected = platform_top_z - query.z;
+        assert!(
+            (distance - expected).abs() < 0.005,
+            "expected the marched distance to the flat top to be ~{expected}, got {distance}"
+        );
+    }
+
+    #[test]
     fn top_surface_aware_order_field_prefers_bed_when_top_is_genuinely_far() {
         let mesh = step_platform_mesh();
         let config = crate::SlicerConfig {
@@ -1832,9 +1891,85 @@ mod tests {
         assert_eq!(kind, SeedKind::Bed);
     }
 
+    #[test]
+    fn top_surface_aware_order_field_reports_patch_seed_near_a_flat_raised_top() {
+        // The complement of the cone test: a *flat* top that isn't the
+        // mesh's global maximum-Z surface either (the platform's own top at
+        // z=6 sits above the surrounding base block's top at z=4). This is
+        // the near-flat case the deleted angle-thresholded patch clustering
+        // used to be the only mechanism for -- the ray-march must cover it
+        // just as well as it covers the steep taper.
+        let mesh = step_platform_mesh();
+        let config = crate::SlicerConfig {
+            order_field: OrderFieldKind::Height,
+            layer_height: 0.2,
+            ..crate::SlicerConfig::default()
+        };
+        let field = order_field_for(
+            config.order_field,
+            &config,
+            &mesh,
+            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        );
+        // 0.1mm below the platform's own flat top (z=6), and 5.9mm above
+        // the bed -- the top is nearer, so it must win.
+        let (kind, distance) = field.seed_proximity(DVec3::new(5.0, 5.0, 5.9)).unwrap();
+        assert_eq!(
+            kind,
+            SeedKind::Patch,
+            "expected a point just under the raised platform's flat top to be a top-surface seed"
+        );
+        assert!(
+            distance < 1.0,
+            "expected a small distance to the platform's own top, got {distance}"
+        );
+    }
+
+    #[test]
+    fn order_field_for_anisotropic_fsm_without_native_seeds_still_gets_top_surface_wrapping() {
+        // `AnisotropicFsm` with `fsm_seed_surfaces_enabled: true` keeps its
+        // own solve-consistent `seed_proximity` unwrapped; with it *false*
+        // (the default) it has no native top-surface seeds of its own, so
+        // `order_field_for_with_sdf` must wrap it in
+        // `TopSurfaceAwareOrderField` like any other kind. Proven
+        // behaviourally: a point just under the raised platform's top comes
+        // back as a `Patch` seed, which an unwrapped bed-seeded FSM field
+        // would never report.
+        let mesh = step_platform_mesh();
+        let config = crate::SlicerConfig {
+            order_field: OrderFieldKind::AnisotropicFsm,
+            // Coarse enough to keep this test's FSM solve cheap while still
+            // resolving the 4x4x2mm platform across many cells.
+            layer_height: 1.0,
+            nozzle_diameter: 1.0,
+            ..crate::SlicerConfig::default()
+        };
+        assert!(
+            !config.fsm_seed_surfaces_enabled,
+            "this test covers the no-native-seeds path, so the default must stay false"
+        );
+        let field = order_field_for(
+            config.order_field,
+            &config,
+            &mesh,
+            &manifold_fidget::slope_profile::SlopeProfile::new(Vec::new()),
+        );
+        let (kind, distance) = field.seed_proximity(DVec3::new(5.0, 5.0, 5.9)).unwrap();
+        assert_eq!(
+            kind,
+            SeedKind::Patch,
+            "expected FSM-without-native-seeds to still be wrapped in the top-surface march"
+        );
+        assert!(
+            distance < 1.0,
+            "expected a small distance to the platform's own top, got {distance}"
+        );
+    }
+
     /// A 10x10x4 base block (z 0..4) with a 4x4x2 platform (z 4..6) centered
-    /// on top, used to test patch detection through the full
-    /// `order_field_for` pipeline. Base at (3,3) to (7,7) in XY.
+    /// on top, used to test [`TopSurfaceAwareOrderField`]'s top-surface
+    /// ray-march through the full `order_field_for` pipeline. Base at (3,3)
+    /// to (7,7) in XY.
     fn step_platform_mesh() -> crate::mesh::Mesh {
         // Watertight box index pattern (bottom/top caps plus 4 outward-facing
         // side walls) reused for both the base and the platform below --

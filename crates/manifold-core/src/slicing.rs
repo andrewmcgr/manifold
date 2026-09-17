@@ -3299,8 +3299,8 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
     let origin = apex;
 
     // Grid-interpolated order fields (`EikonalOrderField`, used by both the
-    // `Eikonal` and `DualIso` kinds, and any `PatchAwareOrderField` wrapping
-    // one) can report a `seed_proximity` distance a few dozen nanometers to
+    // `Eikonal` and `DualIso` kinds, and any `TopSurfaceAwareOrderField`
+    // wrapping one) can report a `seed_proximity` distance a few dozen nanometers to
     // low microns off a layer's own declared `order` -- FMM/bisection
     // numerical noise from re-solving the same isosurface independently,
     // physically meaningless at 3D-printing scales, but enough to flip the
