@@ -352,6 +352,7 @@ impl ManifoldApp {
                             .device
                             .clone();
                         self.reupload(&device);
+                        self.reupload_volume_audit(&device);
                     }
                 }
                 crate::mcp::Command::ImportFile(path) => {
@@ -2801,6 +2802,7 @@ impl ManifoldApp {
                     .device
                     .clone();
                 self.reupload(&device);
+                self.reupload_volume_audit(&device);
             }
             if self.objects.len() > 1 && ui.button("Clear all objects").clicked() {
                 let device = frame
@@ -3158,6 +3160,7 @@ impl ManifoldApp {
                             .clone();
                         self.update_camera_bounds();
                         self.reupload(&device);
+                        self.reupload_volume_audit(&device);
                     }
                 }
             }
@@ -3559,6 +3562,7 @@ impl ManifoldApp {
                                         .clone();
                                     self.update_camera_bounds();
                                     self.reupload(&device);
+                                    self.reupload_volume_audit(&device);
                                 }
                             }
                         }
@@ -3786,6 +3790,7 @@ impl ManifoldApp {
                                     .clone();
                                 self.update_camera_bounds();
                                 self.reupload(&device);
+                                self.reupload_volume_audit(&device);
                             }
                         }
                     }
@@ -3839,6 +3844,7 @@ impl ManifoldApp {
                                         .clone();
                                     self.update_camera_bounds();
                                     self.reupload(&device);
+                                    self.reupload_volume_audit(&device);
                                     self.lay_on_face_active = false;
                                     self.cached_hull = None;
                                 }
