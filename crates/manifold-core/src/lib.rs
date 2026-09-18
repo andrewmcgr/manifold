@@ -36,6 +36,7 @@ pub mod transform;
 pub mod transient_pressure;
 pub mod verification;
 pub mod version;
+pub mod volume_audit;
 pub mod wave_overhang;
 pub mod workspace;
 
