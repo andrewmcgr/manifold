@@ -7,12 +7,17 @@
 //! `docs/superpowers/specs/2026-09-18-extrusion-volume-audit-design.md`
 //! for the full design rationale.
 //!
-//! Note one measured limitation before relying on the whole-grid
-//! assertions: the sparse-infill expected-volume model can mismatch real
-//! geometry by ~1.5x-6x depending on `cell_size`, which is enough to swamp
-//! a real wall-duplication defect in the global max-ratio signal. See
-//! [`VolumeAuditGrid::assert_no_overfill`] for the measured numbers and
-//! what to use instead.
+//! Solid-shell material (wall-shell, top-facing, bottom-facing) and
+//! sparse interior infill are checked separately, at different
+//! resolutions: [`VolumeAuditGrid::overfilled_cells`]/
+//! [`VolumeAuditGrid::underfilled_cells`] (and their `assert_no_*`
+//! wrappers) are precise per-cell checks restricted to solid-shell
+//! material; [`VolumeAuditGrid::infill_aggregate_ratio`]/
+//! [`VolumeAuditGrid::assert_infill_volume_within`] give sparse infill a
+//! deliberately coarser, whole-grid check instead, since its flat
+//! nominal-density expected model is only accurate in aggregate. See
+//! `docs/superpowers/specs/2026-09-18-infill-aware-volume-audit-design.md`
+//! for why.
 
 use std::collections::HashMap;
 
@@ -45,6 +50,7 @@ pub struct VolumeAuditGrid {
     pub(crate) dims: [usize; 3],
     pub(crate) accumulated: HashMap<VolumeKindBucket, Vec<f64>>,
     pub(crate) expected: Vec<f64>,
+    pub(crate) zone: Vec<FillZone>,
 }
 
 /// Whether `p` is within `threshold` of the mesh surface in *any*
@@ -112,10 +118,33 @@ fn directional_march(
     None
 }
 
-/// The expected fill fraction (`0.0`..`1.0`) at world-space point `p`:
-/// `0.0` outside the mesh entirely, `1.0` within the wall-shell,
-/// top-facing, or bottom-facing zones (see this function's body for each
-/// threshold), else `config.infill_density`.
+/// Which physical zone a world-space point falls into, used to route grid
+/// cells to the right check in `VolumeAuditGrid`'s query methods. See
+/// `expected_fill_fraction`'s doc comment for why this classification --
+/// like the fraction it's derived from -- is computed only from `MeshSdf`
+/// and `SlicerConfig`, never from pipeline outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillZone {
+    /// Outside the mesh entirely -- no material should ever land here.
+    Outside,
+    /// Wall-shell, top-facing, or bottom-facing solid material -- expected
+    /// fill fraction is always `1.0`.
+    Solid,
+    /// Sparse interior infill -- expected fill fraction is
+    /// `config.infill_density`, a flat nominal value that is only accurate
+    /// in aggregate over many infill periods, not per fine cell -- see
+    /// `VolumeAuditGrid::overfilled_cells`'s doc comment.
+    SparseInfill,
+}
+
+/// Classifies which physical zone `p` falls into: `Outside` the mesh
+/// entirely, `Solid` (wall-shell, top-facing, or bottom-facing material),
+/// or `SparseInfill` (interior). See this function's own logic below --
+/// identical to `expected_fill_fraction`'s previous inline branching,
+/// factored out so `VolumeAuditGrid` can route cells by zone without
+/// re-deriving it from the numeric fraction (which cannot distinguish
+/// `Outside` from a `SparseInfill` cell at zero density -- both would
+/// read `0.0`).
 ///
 /// **Computed entirely from `mesh_sdf`/`bed_excluded_sdf` and `config` --
 /// never from `Layer`, `WallLoop`, `solid_fill_boundary`,
@@ -128,19 +157,19 @@ fn directional_march(
 /// canceling out. See the design spec's "Central Design Constraint"
 /// section. Do not "simplify" this function by threading a `&Layer` or
 /// `&dyn OrderField` through it.
-fn expected_fill_fraction(
+fn classify_fill_zone(
     mesh_sdf: &MeshSdf,
     bed_excluded_sdf: &MeshSdf,
     p: DVec3,
     config: &SlicerConfig,
-) -> f64 {
+) -> FillZone {
     if mesh_sdf.sample(p).value > 0.0 {
-        return 0.0;
+        return FillZone::Outside;
     }
 
     let wall_threshold = config.wall_offset + config.wall_count() as f64 * config.wall_line_width;
     if wall_shell_zone(mesh_sdf, p, wall_threshold) {
-        return 1.0;
+        return FillZone::Solid;
     }
 
     let step = (config.layer_height.min(config.nozzle_diameter) / 4.0).max(0.01);
@@ -149,18 +178,58 @@ fn expected_fill_fraction(
     let top_threshold = config.top_layers as f64 * config.layer_height;
     if let Some(d) = directional_march(bed_excluded_sdf, p, BUILD_DIRECTION, step, max_search) {
         if d <= top_threshold {
-            return 1.0;
+            return FillZone::Solid;
         }
     }
 
     let bottom_threshold = config.bottom_layers as f64 * config.layer_height;
     if let Some(d) = directional_march(mesh_sdf, p, -BUILD_DIRECTION, step, max_search) {
         if d <= bottom_threshold {
-            return 1.0;
+            return FillZone::Solid;
         }
     }
 
-    config.infill_density
+    FillZone::SparseInfill
+}
+
+/// The expected fill fraction for a given `FillZone`: `0.0` for `Outside`,
+/// `1.0` for `Solid`, `config.infill_density` for `SparseInfill`. The
+/// single source of truth for this mapping, shared by
+/// `expected_fill_fraction` and `audit_extrusion_volume`'s grid-building
+/// loop so the two never drift apart.
+fn fraction_for_zone(zone: FillZone, config: &SlicerConfig) -> f64 {
+    match zone {
+        FillZone::Outside => 0.0,
+        FillZone::Solid => 1.0,
+        FillZone::SparseInfill => config.infill_density,
+    }
+}
+
+/// The expected fill fraction (`0.0`..`1.0`) at world-space point `p`:
+/// `0.0` outside the mesh entirely, `1.0` within the wall-shell,
+/// top-facing, or bottom-facing zones, else `config.infill_density`. A
+/// thin wrapper over `classify_fill_zone` + `fraction_for_zone` -- see
+/// `classify_fill_zone`'s doc comment for the zone boundaries and the
+/// load-bearing SDF-only grounding constraint.
+///
+/// No production caller: `audit_extrusion_volume`'s grid-building loop
+/// calls `classify_fill_zone`/`fraction_for_zone` directly (one SDF
+/// sample instead of two) rather than through this wrapper. Kept
+/// (`#[allow(dead_code)]`) purely so its own tests below continue to pin
+/// `classify_fill_zone` + `fraction_for_zone`'s combined behavior against
+/// the exact fractions the pre-refactor inline implementation produced --
+/// this is a permanent self-check, not a gap awaiting a future caller.
+#[allow(dead_code)]
+fn expected_fill_fraction(
+    mesh_sdf: &MeshSdf,
+    bed_excluded_sdf: &MeshSdf,
+    p: DVec3,
+    config: &SlicerConfig,
+) -> f64 {
+    fraction_for_zone(
+        classify_fill_zone(mesh_sdf, bed_excluded_sdf, p, config),
+        config,
+    )
 }
 
 impl VolumeKindBucket {
@@ -275,18 +344,25 @@ pub fn audit_extrusion_volume(
 
     use rayon::prelude::*;
     let mut expected = vec![0.0f64; cell_count];
-    expected.par_iter_mut().enumerate().for_each(|(idx, e)| {
-        let k = idx / (dims[0] * dims[1]);
-        let j = (idx / dims[0]) % dims[1];
-        let i = idx % dims[0];
-        let p = origin
-            + DVec3::new(
-                (i as f64 + 0.5) * cell_size,
-                (j as f64 + 0.5) * cell_size,
-                (k as f64 + 0.5) * cell_size,
-            );
-        *e = expected_fill_fraction(&mesh_sdf, &bed_excluded_sdf, p, config) * cell_size.powi(3);
-    });
+    let mut zone = vec![FillZone::Outside; cell_count];
+    expected
+        .par_iter_mut()
+        .zip(zone.par_iter_mut())
+        .enumerate()
+        .for_each(|(idx, (e, z))| {
+            let k = idx / (dims[0] * dims[1]);
+            let j = (idx / dims[0]) % dims[1];
+            let i = idx % dims[0];
+            let p = origin
+                + DVec3::new(
+                    (i as f64 + 0.5) * cell_size,
+                    (j as f64 + 0.5) * cell_size,
+                    (k as f64 + 0.5) * cell_size,
+                );
+            let classification = classify_fill_zone(&mesh_sdf, &bed_excluded_sdf, p, config);
+            *z = classification;
+            *e = fraction_for_zone(classification, config) * cell_size.powi(3);
+        });
 
     let mut accumulated: HashMap<VolumeKindBucket, Vec<f64>> = [
         VolumeKindBucket::Wall,
@@ -360,6 +436,7 @@ pub fn audit_extrusion_volume(
         dims,
         accumulated,
         expected,
+        zone,
     }
 }
 
@@ -414,89 +491,82 @@ impl VolumeAuditGrid {
             .expect("every VolumeKindBucket is initialized by audit_extrusion_volume")[flat]
     }
 
-    /// `(cell index, ratio)` for every cell where total accumulated
+    /// `(cell index, ratio)` for every `Solid`-zone cell (wall-shell,
+    /// top-facing, or bottom-facing material) where total accumulated
     /// volume (summed across all buckets) exceeds `expected * max_ratio`.
     ///
-    /// Only cells with `expected > 0` are considered: a ratio against zero
-    /// expected volume is not a meaningful multiple, so material deposited
-    /// entirely outside the mesh is a separate, binary defect with no
-    /// tolerance knob to tune -- see
-    /// [`VolumeAuditGrid::extrusion_outside_mesh_cells`] for that case. The
-    /// two queries partition the grid between them: this one (and
-    /// [`VolumeAuditGrid::underfilled_cells`]) covers tunable-tolerance
-    /// defects within real geometry, that one covers extrusion into open
-    /// air.
+    /// Only `Solid`-zone cells are considered. Two other zones are
+    /// deliberately excluded, each for a different reason:
+    /// - `Outside`-zone cells (material deposited entirely outside the
+    ///   mesh) are a separate, binary defect with no tolerance knob to
+    ///   tune -- see [`VolumeAuditGrid::extrusion_outside_mesh_cells`].
+    /// - `SparseInfill`-zone cells are excluded because the flat
+    ///   nominal-density expected model for infill is only accurate in
+    ///   aggregate over many infill periods, not per fine cell: mixing
+    ///   them into this per-cell query would swamp genuine solid-shell
+    ///   defects in sampling noise (measured, before this exclusion
+    ///   existed: a healthy print's worst cell by this metric was always
+    ///   a sparse-infill artifact, unrelated to any real defect, which
+    ///   made this query and [`VolumeAuditGrid::assert_no_overfill`] blind
+    ///   to real wall-shell duplication). See
+    ///   [`VolumeAuditGrid::infill_aggregate_ratio`] for infill's own
+    ///   coarser, whole-grid check instead.
     pub fn overfilled_cells(&self, max_ratio: f64) -> Vec<([usize; 3], f64)> {
         (0..self.cell_count())
             .filter_map(|idx| {
-                let expected = self.expected[idx];
-                if expected <= 0.0 {
+                if self.zone[idx] != FillZone::Solid {
                     return None;
                 }
-                let ratio = self.total_accumulated(idx) / expected;
+                let ratio = self.total_accumulated(idx) / self.expected[idx];
                 (ratio > max_ratio).then(|| (self.unflatten(idx), ratio))
             })
             .collect()
     }
 
-    /// `(cell index, fraction)` for every cell where total accumulated
-    /// volume is below `expected * min_fraction`, among cells with
-    /// `expected > 0`.
+    /// `(cell index, fraction)` for every `Solid`-zone cell where total
+    /// accumulated volume is below `expected * min_fraction`. See
+    /// [`VolumeAuditGrid::overfilled_cells`] for why `SparseInfill`- and
+    /// `Outside`-zone cells are excluded.
     pub fn underfilled_cells(&self, min_fraction: f64) -> Vec<([usize; 3], f64)> {
         (0..self.cell_count())
             .filter_map(|idx| {
-                let expected = self.expected[idx];
-                if expected <= 0.0 {
+                if self.zone[idx] != FillZone::Solid {
                     return None;
                 }
-                let fraction = self.total_accumulated(idx) / expected;
+                let fraction = self.total_accumulated(idx) / self.expected[idx];
                 (fraction < min_fraction).then(|| (self.unflatten(idx), fraction))
             })
             .collect()
     }
 
-    /// Cell indices holding accumulated volume where *no* material is
-    /// expected at all (`expected == 0`) -- extrusion into open air.
+    /// Cell indices holding accumulated volume in a cell classified
+    /// `Outside` the mesh entirely -- extrusion into open air.
     ///
-    /// Deliberately binary rather than ratio-based: with zero expected
-    /// volume there is no meaningful multiple to compare against, so unlike
+    /// Deliberately binary rather than ratio-based: outside the mesh there
+    /// is no meaningful multiple to compare against, so unlike
     /// [`VolumeAuditGrid::overfilled_cells`] this takes no tolerance
     /// argument. Any material here is a defect.
     ///
-    /// Note that `expected == 0` also arises for interior cells when
-    /// `config.infill_density` is `0.0`, in which case sparse-interior
-    /// extrusion is reported here too -- correctly, in the sense that no
-    /// material was expected there either, though the cause is a zero
-    /// density rather than being outside the mesh.
+    /// Zone-based rather than `expected == 0.0`-based: a `SparseInfill`
+    /// cell with `config.infill_density == 0.0` also has `expected == 0.0`
+    /// but is a different situation entirely (a configured zero-density
+    /// interior, not "outside the mesh") -- see
+    /// [`VolumeAuditGrid::infill_aggregate_ratio`] for that case instead.
     pub fn extrusion_outside_mesh_cells(&self) -> Vec<[usize; 3]> {
         (0..self.cell_count())
-            .filter(|&idx| self.expected[idx] == 0.0 && self.total_accumulated(idx) > 0.0)
+            .filter(|&idx| self.zone[idx] == FillZone::Outside && self.total_accumulated(idx) > 0.0)
             .map(|idx| self.unflatten(idx))
             .collect()
     }
 
     /// Panics, naming the single worst offending cell (highest ratio),
-    /// if any cell's accumulated volume exceeds `expected * max_ratio`.
-    ///
-    /// **Known limitation (measured, not hypothetical):** this whole-grid
-    /// assertion is dominated by the sparse-infill expected-volume model
-    /// (nominal `infill_density * cell_size^3`, sampled once at the cell
-    /// center), which mismatches real infill geometry badly enough to swamp
-    /// genuine defects elsewhere. On a healthy sliced 20mm box the worst
-    /// cell is always a pure sparse-infill cell -- 1.46x at `cell_size` 2.0,
-    /// 5.94x at 0.8, where 3629 of 14558 non-empty cells already exceed 2.0x
-    /// with nothing wrong. Because that worst cell contains no wall
-    /// material, duplicating wall paths does not move this assertion's
-    /// signal at all: the global max ratio is unchanged to 13 significant
-    /// figures whether 0, 1, 95, or all 193 wall paths are duplicated.
-    ///
-    /// So do not rely on `assert_no_overfill` alone to catch wall-shell
-    /// duplication on real prints. To detect that class, compare
-    /// [`VolumeAuditGrid::overfilled_cells`] per-cell against a known-good
-    /// baseline (see this module's
-    /// `duplicated_walls_on_real_pipeline_output_raise_per_cell_ratios`
-    /// test), or restrict analysis to non-`Infill` buckets via
-    /// [`VolumeAuditGrid::accumulated_volume`].
+    /// if any `Solid`-zone cell's (wall-shell, top-facing, or
+    /// bottom-facing) accumulated volume exceeds `expected * max_ratio`.
+    /// See [`VolumeAuditGrid::overfilled_cells`] for why `SparseInfill`-
+    /// and `Outside`-zone cells are excluded, and
+    /// [`VolumeAuditGrid::infill_aggregate_ratio`] /
+    /// [`VolumeAuditGrid::assert_infill_volume_within`] for sparse
+    /// infill's separate, coarser coverage.
     pub fn assert_no_overfill(&self, max_ratio: f64) {
         let worst = self
             .overfilled_cells(max_ratio)
@@ -512,7 +582,9 @@ impl VolumeAuditGrid {
     }
 
     /// Panics, naming the single worst offending cell (lowest fraction),
-    /// if any cell's accumulated volume is below `expected * min_fraction`.
+    /// if any `Solid`-zone cell's accumulated volume is below `expected *
+    /// min_fraction`. See [`VolumeAuditGrid::underfilled_cells`] for why
+    /// `SparseInfill`- and `Outside`-zone cells are excluded.
     pub fn assert_no_underfill(&self, min_fraction: f64) {
         let worst = self
             .underfilled_cells(min_fraction)
@@ -1090,16 +1162,26 @@ mod tests {
         // artifacts documented there.
         let grid = audit_extrusion_volume(&mesh, &paths, &config, 2.0);
 
-        // Tolerances tuned from real observed output on this exact
-        // fixture (measured directly by temporarily setting both bounds to
-        // 1.0 and reading the panic message's own reported worst cell):
-        // worst observed overfill ratio 1.46x, worst observed underfill
-        // fraction 0.32. Both bounds below are set comfortably past those
-        // measured values, not guessed -- `assert_no_overfill`/
-        // `assert_no_underfill` name the exact offending cell and its
-        // exact ratio/fraction in their own panic message if either ever
-        // regresses past these margins.
-        grid.assert_no_overfill(2.0);
+        // Tolerances re-measured after restricting overfilled_cells/
+        // underfilled_cells to Solid-zone cells only (this task): measured
+        // directly by temporarily setting both bounds to 1.0 and printing
+        // the exact max overfill ratio / min underfill fraction across
+        // every Solid-zone cell. Worst observed overfill ratio 0.839
+        // (no Solid-zone cell overfills at all on this healthy print, now
+        // that the sparse-infill cell that used to dominate this metric --
+        // 1.46x at this cell_size -- is excluded), worst observed
+        // underfill fraction 0.324 (essentially unchanged from the
+        // pre-restriction measurement of 0.32, confirming this is a
+        // genuine partial-fill Solid-zone cell unrelated to the
+        // sparse-infill swamping this task fixes). Both bounds below are
+        // set comfortably past those measured values, not guessed --
+        // `assert_no_overfill`/`assert_no_underfill` name the exact
+        // offending cell and its exact ratio/fraction in their own panic
+        // message if either ever regresses past these margins. The
+        // overfill bound is now meaningfully tighter than the old 2.0 --
+        // that headroom existed only to tolerate the sparse-infill
+        // artifact this task removes from this check entirely.
+        grid.assert_no_overfill(1.2);
         grid.assert_no_underfill(0.25);
     }
 
@@ -1112,17 +1194,12 @@ mod tests {
         // and audits at `cell_size = 2.0`, the same recommended setting the
         // golden-path test uses.
         //
-        // It deliberately asserts on the PER-CELL query, not on
-        // `assert_no_overfill`, because the global assertion provably cannot
-        // see this defect. Measured on exactly this fixture: the healthy
-        // print's worst cell is a pure sparse-infill cell (cell [6,9,5],
-        // world (11,17,9), expected 1.6mm^3 from nominal density, actual
-        // infill 2.34mm^3, wall 0.0), so it carries no wall material and
-        // duplicating walls leaves it untouched -- the global max ratio stays
-        // 1.4609534807622 whether 0, 1, 95, or all 193 wall paths are
-        // duplicated. That is a limitation of the sparse-infill expected
-        // model, documented on `assert_no_overfill`, not of the accumulation
-        // pass: the per-cell signal below is clean and strong.
+        // Asserts on the PER-CELL query directly (rather than the global
+        // `assert_no_overfill`) because comparing each cell against its own
+        // healthy baseline cancels sampling artifacts both runs share,
+        // leaving only the injected duplication -- a cleaner signal than a
+        // single global max. See the companion test below for the
+        // equivalent proof via `assert_no_overfill` itself.
         let mesh = box_mesh(DVec3::ZERO, DVec3::new(20.0, 20.0, 20.0));
         let config = SlicerConfig {
             layer_height: 0.2,
@@ -1189,27 +1266,89 @@ mod tests {
              its healthy baseline: worst per-cell increase was {worst_increase}x (expected \
              ~1.42x)"
         );
+    }
 
-        // Pin the limitation itself, so it cannot regress silently in either
-        // direction. If the sparse-infill expected model is ever corrected
-        // (tracked as a follow-up), this assertion is expected to start
-        // failing -- at which point the global `assert_no_overfill` may
-        // finally be able to catch this defect class and this test, plus
-        // `assert_no_overfill`'s own limitation note, should be revisited.
-        let global_max = |g: &VolumeAuditGrid| {
-            g.overfilled_cells(0.0)
-                .into_iter()
-                .map(|(_, r)| r)
-                .fold(0.0f64, f64::max)
+    #[test]
+    fn assert_no_overfill_catches_wall_duplication_on_real_pipeline_output() {
+        // Companion to `duplicated_walls_on_real_pipeline_output_raise_per_cell_ratios`
+        // above, proving the same defect is now caught by the public,
+        // panic-based `assert_no_overfill` API directly -- not just the
+        // per-cell query -- now that `Solid`-zone restriction (this task)
+        // keeps sparse-infill sampling noise from swamping the signal.
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(20.0, 20.0, 20.0));
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            nozzle_diameter: 0.4,
+            wall_line_width: 0.4,
+            shell_thickness: 0.8,
+            top_layers: 3,
+            bottom_layers: 3,
+            infill_density: 0.2,
+            ..SlicerConfig::default()
         };
-        let healthy_max = global_max(&baseline);
-        let defective_max = global_max(&defective);
+        let tool_id = crate::ids::ToolId(0);
+        let object = crate::object::Object::new(crate::ids::ObjectId(0), mesh.clone(), tool_id);
+        let tool = crate::tool::Tool::new(tool_id, config.nozzle_diameter);
+        let layers = crate::slicing::slice_object(&object, &config)
+            .expect("slicing a plain box must succeed");
+        let paths = crate::toolpath::plan(
+            &layers,
+            std::slice::from_ref(&object),
+            std::slice::from_ref(&tool),
+            &config,
+        )
+        .expect("planning toolpaths for a plain box must succeed");
+
+        let cell_size = 2.0;
+        let mut injected = paths.clone();
+        let duplicated: Vec<_> = paths
+            .iter()
+            .filter(|p| p.segments.iter().any(|s| s.kind == MoveKind::WallInner))
+            .cloned()
+            .collect();
         assert!(
-            (defective_max - healthy_max).abs() < 1e-9,
-            "the global max ratio is expected to be blind to wall duplication (both ~1.4610, \
-             set by a pure sparse-infill cell): healthy {healthy_max}, defective \
-             {defective_max}. If these now differ, the sparse-infill expected-volume model may \
-             have been fixed -- revisit assert_no_overfill's documented limitation."
+            !duplicated.is_empty(),
+            "the planner should emit inner wall paths for a 20mm box -- nothing to duplicate"
+        );
+        injected.extend(duplicated);
+
+        // Measured directly on this exact fixture (temporarily set
+        // max_ratio to 100.0 on both grids, printed each grid's own
+        // `overfilled_cells(0.0)` max ratio, then deleted the prints):
+        // healthy baseline max 0.8392593691769967 (same Solid-zone-only
+        // measurement as the golden-path test above, since this is the
+        // identical fixture), defective (all inner walls duplicated) max
+        // 1.0159057233105697. The two signals sit close together at this
+        // cell_size, so the margin on each side is necessarily tighter than
+        // the golden-path test's -- 0.93 gives ~10.8% headroom above the
+        // healthy max and ~8.4% headroom below the defective max, still
+        // strictly between them and well past ordinary floating-point
+        // noise between runs.
+        let max_ratio = 0.93;
+
+        let baseline = audit_extrusion_volume(&mesh, &paths, &config, cell_size);
+        // Negative control: the healthy baseline must NOT trip the
+        // assertion. If this panics, the test fails here.
+        baseline.assert_no_overfill(max_ratio);
+
+        // Positive control: the same box with every inner wall path
+        // duplicated MUST trip it.
+        let defective = audit_extrusion_volume(&mesh, &injected, &config, cell_size);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            defective.assert_no_overfill(max_ratio);
+        }));
+        let payload = panicked.expect_err(
+            "assert_no_overfill must now catch wall duplication on real pipeline output -- if \
+             this doesn't panic, the Solid-zone restriction did not fix the swamping",
+        );
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("<non-string panic payload>");
+        assert!(
+            message.contains("extrusion volume audit"),
+            "panic message should identify itself as an extrusion volume audit failure, got: {message}"
         );
     }
 
@@ -1253,8 +1392,22 @@ mod tests {
         let cell_size = 1.0;
 
         // An inner wall loop (a short straight bead standing in for one) ...
-        let wall_bead_start = DVec3::new(1.0, 1.0, 1.5);
-        let wall_bead_end = DVec3::new(2.0, 1.0, 1.5);
+        //
+        // Deviation from the brief: the original fixture placed this bead at
+        // the dead center of the cube (z=1.5), which classifies as
+        // `SparseInfill` under this task's zone restriction (distance to
+        // every face is 1.5mm, past both the wall_threshold of 1.0mm and the
+        // bottom_threshold of 0.6mm) -- so `overfilled_cells` now correctly
+        // excludes it entirely, making the whole test vacuous (confirmed:
+        // `single_max`/baseline_ratio measured 0 before this fix). Moved to
+        // z=0.3, within 0.5mm of the z=0 face -- inside wall_threshold
+        // (1.0mm) via the plain omnidirectional wall_shell_zone check, no
+        // directional march involved. This is also more faithful to the
+        // test's own narrative: the wall/solid-fill overlap bug this
+        // reproduces occurs near a taper's tip, i.e. near a top/bottom/wall
+        // boundary, not deep in a part's interior.
+        let wall_bead_start = DVec3::new(1.0, 1.0, 0.3);
+        let wall_bead_end = DVec3::new(2.0, 1.0, 0.3);
         let wall_path = straight_extruding_path(
             wall_bead_start,
             wall_bead_end,
