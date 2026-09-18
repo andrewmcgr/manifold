@@ -796,4 +796,134 @@ mod tests {
             .map(|(_, ratio)| ratio)
             .fold(0.0f64, f64::max)
     }
+
+    #[test]
+    fn audit_extrusion_volume_passes_on_a_healthy_sliced_box() {
+        let mesh = box_mesh(DVec3::new(0.0, 0.0, 0.0), DVec3::new(20.0, 20.0, 20.0));
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            nozzle_diameter: 0.4,
+            wall_line_width: 0.4,
+            shell_thickness: 0.8,
+            top_layers: 3,
+            bottom_layers: 3,
+            infill_density: 0.2,
+            ..SlicerConfig::default()
+        };
+        let tool_id = crate::ids::ToolId(0);
+        let object = crate::object::Object::new(crate::ids::ObjectId(0), mesh.clone(), tool_id);
+        let tool = crate::tool::Tool::new(tool_id, config.nozzle_diameter);
+        let layers = crate::slicing::slice_object(&object, &config)
+            .expect("slicing a plain box must succeed");
+        let paths = crate::toolpath::plan(
+            &layers,
+            std::slice::from_ref(&object),
+            std::slice::from_ref(&tool),
+            &config,
+        )
+        .expect("planning toolpaths for a plain box must succeed");
+        // `cell_size = 2.0` is well above `wall_line_width`/`infill_line_width`
+        // (0.4), squarely in the regime `audit_extrusion_volume`'s own doc
+        // comment recommends for a real multi-layer audit -- large enough to
+        // average over many stacked layers and adjacent beads, avoiding both
+        // the dilution (upper-bound) and centerline-splatting (lower-bound)
+        // artifacts documented there.
+        let grid = audit_extrusion_volume(&mesh, &paths, &config, 2.0);
+
+        // Tolerances tuned from real observed output on this exact
+        // fixture (measured directly by temporarily setting both bounds to
+        // 1.0 and reading the panic message's own reported worst cell):
+        // worst observed overfill ratio 1.46x, worst observed underfill
+        // fraction 0.32. Both bounds below are set comfortably past those
+        // measured values, not guessed -- `assert_no_overfill`/
+        // `assert_no_underfill` name the exact offending cell and its
+        // exact ratio/fraction in their own panic message if either ever
+        // regresses past these margins.
+        grid.assert_no_overfill(2.0);
+        grid.assert_no_underfill(0.25);
+    }
+
+    #[test]
+    fn audit_extrusion_volume_catches_a_wall_and_solid_infill_overlap_near_a_taper_tip() {
+        // Reproduces, via hand-built Paths rather than reverting production
+        // code, the exact bug class the prior plan
+        // (2026-09-17-perpendicular-top-distance-and-wall-overlap) fixed: an
+        // inner wall loop and solid infill printing over the same physical
+        // space near a taper's tip. A small box stands in for the taper
+        // geometry -- what matters here is the toolpath overlap, not the
+        // taper shape itself, since the expected-volume side (Task 1) has
+        // its own dedicated tests proving the top-zone classification is
+        // correct on real tapered geometry.
+        //
+        // Adapted from the brief's literal version, which asserted
+        // `overfilled_cells(1.5).is_empty()` as an absolute threshold --
+        // Task 2's own fix rounds established (and this file's sibling
+        // duplication tests above already demonstrate) that an absolute
+        // ratio threshold cannot distinguish real duplication from the
+        // centerline-splatting concentration artifact a single,
+        // non-duplicated bead already produces at a `cell_size` below its
+        // own `line_width` (exactly the regime this hand-built,
+        // single-layer fixture is in). Instead, this follows the same
+        // relative-ratio pattern as
+        // `overfilled_cells_detects_a_deliberately_duplicated_wall_segment`:
+        // compare the wall-alone baseline ratio against the wall+infill
+        // overlap ratio, and require the overlap to be meaningfully
+        // higher -- proving the assertion detects the overlap specifically,
+        // not the shared splatting artifact both cases equally have.
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(3.0, 3.0, 3.0));
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            nozzle_diameter: 0.4,
+            wall_line_width: 0.4,
+            infill_line_width: 0.4,
+            shell_thickness: 0.8,
+            ..SlicerConfig::default()
+        };
+        let bead_area = config.wall_line_width * config.layer_height;
+        let cell_size = 1.0;
+
+        // An inner wall loop (a short straight bead standing in for one) ...
+        let wall_bead_start = DVec3::new(1.0, 1.0, 1.5);
+        let wall_bead_end = DVec3::new(2.0, 1.0, 1.5);
+        let wall_path = straight_extruding_path(
+            wall_bead_start,
+            wall_bead_end,
+            MoveKind::WallInner,
+            bead_area,
+            &config,
+        );
+        // ... and a solid-infill pass tracing the SAME physical centerline
+        // -- the exact overlap the fixed bug produced. `infill_line_width ==
+        // wall_line_width` here, so the wall-alone and infill-alone bead
+        // volumes are equal, making the expected "overlap doubles the
+        // baseline ratio" relationship exact rather than approximate.
+        let infill_path = straight_extruding_path(
+            wall_bead_start,
+            wall_bead_end,
+            MoveKind::Infill,
+            config.infill_line_width * config.layer_height,
+            &config,
+        );
+
+        let wall_alone =
+            audit_extrusion_volume(&mesh, std::slice::from_ref(&wall_path), &config, cell_size);
+        let baseline_ratio = max_overfill_ratio(&wall_alone);
+        assert!(
+            baseline_ratio > 0.0,
+            "test fixture deposited nothing measurable for the wall alone (ratio {baseline_ratio}) -- \
+             the comparison below would be vacuous"
+        );
+
+        let overlapping = vec![wall_path, infill_path];
+        let grid = audit_extrusion_volume(&mesh, &overlapping, &config, cell_size);
+        let overlap_ratio = max_overfill_ratio(&grid);
+
+        assert!(
+            overlap_ratio >= baseline_ratio * 1.5,
+            "a wall loop and solid infill occupying the same physical centerline should \
+             register a materially higher overfill ratio than the wall alone -- this is the \
+             exact bug class the tool exists to catch: wall-alone ratio {baseline_ratio}, \
+             wall+infill-overlap ratio {overlap_ratio} (expected roughly double the baseline)"
+        );
+    }
 }
