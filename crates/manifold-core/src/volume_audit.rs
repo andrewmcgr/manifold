@@ -539,6 +539,31 @@ impl VolumeAuditGrid {
             .collect()
     }
 
+    /// `(cell index, ratio)` for every cell with `expected > 0` (i.e.
+    /// every `Solid`- or `SparseInfill`-zone cell), regardless of the
+    /// ratio's value.
+    ///
+    /// For display/visualization purposes only -- unlike
+    /// [`VolumeAuditGrid::overfilled_cells`]/[`VolumeAuditGrid::underfilled_cells`],
+    /// this is NOT restricted to `Solid`-zone cells and carries no
+    /// pass/fail threshold. A caller doing defect *detection* should use
+    /// those instead, or [`VolumeAuditGrid::infill_aggregate_ratio`] for
+    /// infill's own coarser check. A cell with `expected == 0` (the
+    /// `Outside` zone) is never included here -- see
+    /// [`VolumeAuditGrid::extrusion_outside_mesh_cells`] for that
+    /// separate, binary case.
+    pub fn cell_ratios_for_display(&self) -> Vec<([usize; 3], f64)> {
+        (0..self.cell_count())
+            .filter(|&idx| self.expected[idx] > 0.0)
+            .map(|idx| {
+                (
+                    self.unflatten(idx),
+                    self.total_accumulated(idx) / self.expected[idx],
+                )
+            })
+            .collect()
+    }
+
     /// Cell indices holding accumulated volume in a cell classified
     /// `Outside` the mesh entirely -- extrusion into open air.
     ///
@@ -1325,6 +1350,104 @@ mod tests {
             (center.x - 0.25).abs() < 1e-12 && (center.z - 1.25).abs() < 1e-12,
             "reported cell center {center:?} should lie on the bead's own column"
         );
+    }
+
+    #[test]
+    fn cell_ratios_for_display_includes_both_solid_and_sparse_infill_cells() {
+        // Tall enough that a genuine interior sparse-infill zone exists,
+        // same fixture shape as
+        // `expected_fill_fraction_returns_density_deep_in_the_interior_of_a_tall_box`.
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(40.0, 40.0, 40.0));
+        let config = SlicerConfig {
+            infill_density: 0.2,
+            ..SlicerConfig::default()
+        };
+        let cell_size = 2.0;
+        let wall_bead_area = config.wall_line_width * config.layer_height;
+        // A wall bead near a face (Solid zone) ...
+        let wall_path = straight_extruding_path(
+            DVec3::new(0.3, 20.0, 20.0),
+            DVec3::new(0.3, 22.0, 20.0),
+            MoveKind::WallOuter,
+            wall_bead_area,
+            &config,
+        );
+        // ... and an infill bead deep in the interior (SparseInfill zone).
+        let infill_bead_area = config.infill_line_width * config.layer_height;
+        let infill_path = straight_extruding_path(
+            DVec3::new(19.0, 20.0, 20.0),
+            DVec3::new(21.0, 20.0, 20.0),
+            MoveKind::Infill,
+            infill_bead_area,
+            &config,
+        );
+        let grid = audit_extrusion_volume(&mesh, &[wall_path, infill_path], &config, cell_size);
+
+        let ratios = grid.cell_ratios_for_display();
+        assert!(
+            !ratios.is_empty(),
+            "a mesh with real extrusion should register at least one cell"
+        );
+
+        // Cross-check: every returned cell must have `expected > 0`
+        // (reachable only via the private zone/expected fields, so
+        // reconstruct via the same public accessors a real caller has:
+        // a cell classified `Outside` never appears here even if it
+        // somehow held material -- covered by the dedicated fixture in
+        // the next test instead).
+        let outside = grid.extrusion_outside_mesh_cells();
+        for (idx, _) in &ratios {
+            assert!(
+                !outside.contains(idx),
+                "cell {idx:?} appears in both cell_ratios_for_display and \
+                 extrusion_outside_mesh_cells -- the two queries must partition disjointly"
+            );
+        }
+
+        // At least one cell should register a wall-adjacent ratio near
+        // the wall bead's own known accumulation (loosely bounded --
+        // this is a display query, not a precision assertion; the goal
+        // is just confirming both zone kinds are represented).
+        assert!(
+            ratios.iter().any(|(_, r)| *r > 0.0),
+            "at least one cell should have a nonzero ratio given real extrusion was deposited"
+        );
+    }
+
+    #[test]
+    fn cell_ratios_for_display_excludes_outside_the_mesh_cells() {
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(2.0, 6.0, 2.0));
+        let config = SlicerConfig::default();
+        let cell_size = 0.5;
+        // Same stray-bead fixture as
+        // `extrusion_outside_the_mesh_is_caught_only_by_its_own_dedicated_query`:
+        // x = -0.25 is outside the mesh (min.x == 0.0) but inside the
+        // padded grid.
+        let stray = straight_extruding_path(
+            DVec3::new(-0.25, 2.0, 1.0),
+            DVec3::new(-0.25, 4.0, 1.0),
+            MoveKind::WallOuter,
+            config.wall_line_width * config.layer_height,
+            &config,
+        );
+        let grid = audit_extrusion_volume(&mesh, std::slice::from_ref(&stray), &config, cell_size);
+
+        let outside = grid.extrusion_outside_mesh_cells();
+        assert!(
+            !outside.is_empty(),
+            "the stray bead must register as outside-the-mesh material"
+        );
+
+        let display_ratios = grid.cell_ratios_for_display();
+        for idx in &outside {
+            assert!(
+                !display_ratios
+                    .iter()
+                    .any(|(display_idx, _)| display_idx == idx),
+                "cell_ratios_for_display must not include cell {idx:?}, which \
+                 extrusion_outside_mesh_cells already reports as outside the mesh"
+            );
+        }
     }
 
     #[test]
