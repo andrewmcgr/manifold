@@ -463,6 +463,14 @@ impl VolumeAuditGrid {
         idx[0] + idx[1] * self.dims[0] + idx[2] * self.dims[0] * self.dims[1]
     }
 
+    /// The grid's cell size (mm) -- the same value passed to
+    /// [`audit_extrusion_volume`], exposed so an out-of-crate caller
+    /// (e.g. a GUI visualization) can size its own rendering of a cell
+    /// without re-deriving or re-threading that value separately.
+    pub fn cell_size(&self) -> f64 {
+        self.cell_size
+    }
+
     /// The world-space center of cell `idx`, for decoding the indices
     /// returned by [`VolumeAuditGrid::overfilled_cells`],
     /// [`VolumeAuditGrid::underfilled_cells`], and

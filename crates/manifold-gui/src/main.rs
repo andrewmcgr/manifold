@@ -18,6 +18,7 @@ mod render;
 mod scene;
 mod text_raster;
 mod toolpath_view;
+mod volume_audit_view;
 
 use app::ManifoldApp;
 

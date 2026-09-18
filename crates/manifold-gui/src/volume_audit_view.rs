@@ -1,0 +1,322 @@
+//! Pure geometry builder for the volume-audit fill visualization: turns a
+//! `manifold_core::volume_audit::VolumeAuditGrid`'s per-cell fill ratios
+//! into flat-colored cube triangles. No GPU/wgpu types here — mirrors
+//! `toolpath_view.rs`'s existing separation from `render.rs`'s GPU
+//! upload/pipeline concerns. See
+//! `docs/superpowers/specs/2026-09-18-volume-audit-fill-visualization-design.md`
+//! for the full design rationale.
+
+use glam::DVec3;
+use manifold_core::volume_audit::VolumeAuditGrid;
+
+/// One GPU vertex for a flat-colored cube face: position + face normal +
+/// RGBA color, all in world space. Bit-identical layout to `render.rs`'s
+/// private `Vertex`, so `UploadedMesh::upload_colored_cells` can build
+/// its buffer directly from a slice of these.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VolumeAuditCellVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub color: [f32; 4],
+}
+
+/// Fixed color for a cell reported by `VolumeAuditGrid::extrusion_outside_mesh_cells`
+/// (material where none is expected at all) -- a defect at any
+/// magnitude, so distinct from the ratio-based blue/green/red scale and
+/// never hidden by `deviation_threshold`.
+const OUTSIDE_MESH_COLOR: [f32; 4] = [0.95, 0.05, 0.85, 1.0];
+
+/// The six axis-aligned face normals of a cube, in the same face order
+/// `push_cube`'s vertex generation below uses.
+///
+/// `#[allow(dead_code)]`: this module's public API (`build_volume_audit_cells`)
+/// has no production caller yet -- Task 3 of this plan wires it into
+/// `render.rs`/`app.rs`. Remove this allow once that lands.
+#[allow(dead_code)]
+const FACE_NORMALS: [DVec3; 6] = [
+    DVec3::new(1.0, 0.0, 0.0),
+    DVec3::new(-1.0, 0.0, 0.0),
+    DVec3::new(0.0, 1.0, 0.0),
+    DVec3::new(0.0, -1.0, 0.0),
+    DVec3::new(0.0, 0.0, 1.0),
+    DVec3::new(0.0, 0.0, -1.0),
+];
+
+/// Appends 36 vertices (12 triangles, non-indexed, one flat color for
+/// the whole cube) for an axis-aligned cube centered at `center` with
+/// half-extent `half_size` in every axis.
+#[allow(dead_code)]
+fn push_cube(out: &mut Vec<VolumeAuditCellVertex>, center: DVec3, half_size: f64, color: [f32; 4]) {
+    let h = half_size;
+    // Per-face 4 corners (in a consistent winding), split into 2
+    // triangles each. Corner order per face matches `FACE_NORMALS`'s
+    // ordering: +X, -X, +Y, -Y, +Z, -Z.
+    let faces: [[DVec3; 4]; 6] = [
+        // +X
+        [
+            center + DVec3::new(h, -h, -h),
+            center + DVec3::new(h, h, -h),
+            center + DVec3::new(h, h, h),
+            center + DVec3::new(h, -h, h),
+        ],
+        // -X
+        [
+            center + DVec3::new(-h, -h, h),
+            center + DVec3::new(-h, h, h),
+            center + DVec3::new(-h, h, -h),
+            center + DVec3::new(-h, -h, -h),
+        ],
+        // +Y
+        [
+            center + DVec3::new(h, h, -h),
+            center + DVec3::new(-h, h, -h),
+            center + DVec3::new(-h, h, h),
+            center + DVec3::new(h, h, h),
+        ],
+        // -Y
+        [
+            center + DVec3::new(-h, -h, -h),
+            center + DVec3::new(h, -h, -h),
+            center + DVec3::new(h, -h, h),
+            center + DVec3::new(-h, -h, h),
+        ],
+        // +Z
+        [
+            center + DVec3::new(-h, -h, h),
+            center + DVec3::new(h, -h, h),
+            center + DVec3::new(h, h, h),
+            center + DVec3::new(-h, h, h),
+        ],
+        // -Z
+        [
+            center + DVec3::new(-h, h, -h),
+            center + DVec3::new(h, h, -h),
+            center + DVec3::new(h, -h, -h),
+            center + DVec3::new(-h, -h, -h),
+        ],
+    ];
+
+    for (face_idx, corners) in faces.iter().enumerate() {
+        let normal = FACE_NORMALS[face_idx].as_vec3().to_array();
+        // Two triangles per quad: (0,1,2) and (0,2,3).
+        for &(a, b, c) in &[(0usize, 1usize, 2usize), (0, 2, 3)] {
+            for &i in &[a, b, c] {
+                out.push(VolumeAuditCellVertex {
+                    position: corners[i].as_vec3().to_array(),
+                    normal,
+                    color,
+                });
+            }
+        }
+    }
+}
+
+/// Maps a fill ratio (`accumulated / expected`) to a color on the
+/// existing blue (under) -> green (healthy at 1.0) -> red (over) scale.
+/// See this plan's design spec's "Color mapping" section for the exact
+/// formula.
+#[allow(dead_code)]
+fn ratio_to_color(ratio: f64) -> [f32; 4] {
+    let deviation = (ratio - 1.0).clamp(-1.0, 1.0);
+    let t = 0.5 + 0.5 * deviation;
+    crate::toolpath_view::scalar_to_color(t)
+}
+
+/// Builds a non-indexed triangle-list cube (12 triangles, 36 vertices)
+/// per qualifying cell in `grid`, colored by
+/// `VolumeAuditGrid::cell_ratios_for_display`'s ratio (blue = under,
+/// green = healthy at ratio 1.0, red = over) or a fixed magenta for
+/// cells reported by `VolumeAuditGrid::extrusion_outside_mesh_cells`
+/// (material where none is expected at all -- shown unconditionally,
+/// never hidden by `deviation_threshold`).
+///
+/// `deviation_threshold` (`>= 0.0`) hides every ratio-based cube whose
+/// `|ratio - 1.0|` is below it -- sparse-infill cells legitimately never
+/// read near 1.0 per-cell (see this module's own doc comment / the
+/// design spec for why), so without this filter a healthy sparse-infill
+/// interior would visually swamp genuine wall-shell defects.
+///
+/// `shrink_factor` (`(0.0, 1.0]`) draws each cube at
+/// `cell_size * shrink_factor` rather than the full cell size, leaving a
+/// visible gap between adjacent cells.
+#[allow(dead_code)]
+pub fn build_volume_audit_cells(
+    grid: &VolumeAuditGrid,
+    deviation_threshold: f64,
+    shrink_factor: f64,
+) -> Vec<VolumeAuditCellVertex> {
+    // Deviation from the brief: `grid.cell_size()` (method call), not
+    // `grid.cell_size` (field access) -- see this module's own report
+    // for why (the field is `pub(crate)` in `manifold-core`, invisible
+    // from this separate `manifold-gui` crate). A matching public
+    // accessor was added to `VolumeAuditGrid` alongside this task.
+    let half_size = grid.cell_size() * shrink_factor * 0.5;
+    let mut vertices = Vec::new();
+
+    for (idx, ratio) in grid.cell_ratios_for_display() {
+        if (ratio - 1.0).abs() < deviation_threshold {
+            continue;
+        }
+        push_cube(
+            &mut vertices,
+            grid.cell_center(idx),
+            half_size,
+            ratio_to_color(ratio),
+        );
+    }
+
+    for idx in grid.extrusion_outside_mesh_cells() {
+        push_cube(
+            &mut vertices,
+            grid.cell_center(idx),
+            half_size,
+            OUTSIDE_MESH_COLOR,
+        );
+    }
+
+    vertices
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use manifold_core::toolpath::{MoveKind, Path, Segment};
+    use manifold_core::{mesh::Mesh, volume_audit::audit_extrusion_volume, SlicerConfig};
+
+    /// Same box-mesh fixture shape as `manifold_core::volume_audit`'s own
+    /// tests (independently built here since that helper is private to
+    /// that crate's test module).
+    fn box_mesh(min: DVec3, max: DVec3) -> Mesh {
+        let vertices = vec![
+            DVec3::new(min.x, min.y, min.z),
+            DVec3::new(max.x, min.y, min.z),
+            DVec3::new(max.x, max.y, min.z),
+            DVec3::new(min.x, max.y, min.z),
+            DVec3::new(min.x, min.y, max.z),
+            DVec3::new(max.x, min.y, max.z),
+            DVec3::new(max.x, max.y, max.z),
+            DVec3::new(min.x, max.y, max.z),
+        ];
+        let indices = vec![
+            0, 2, 1, 0, 3, 2, // -Z
+            4, 5, 6, 4, 6, 7, // +Z
+            0, 1, 5, 0, 5, 4, // -Y
+            3, 7, 6, 3, 6, 2, // +Y
+            0, 4, 7, 0, 7, 3, // -X
+            1, 2, 6, 1, 6, 5, // +X
+        ];
+        Mesh::new(vertices, indices)
+    }
+
+    fn straight_extruding_path(
+        start: DVec3,
+        end: DVec3,
+        kind: MoveKind,
+        bead_area: f64,
+        config: &SlicerConfig,
+    ) -> Path {
+        let distance = start.distance(end);
+        let filament_area =
+            manifold_core::extrusion::filament_cross_section_area(config.filament_diameter);
+        let extrusion_length =
+            manifold_core::extrusion::segment_extrusion_length(distance, bead_area, filament_area);
+        Path {
+            points: vec![start, end],
+            segments: vec![Segment {
+                kind,
+                extrusion_length,
+                line_width: bead_area / config.layer_height,
+                ..Segment::default()
+            }],
+            tool: manifold_core::ids::ToolId(0),
+            object: manifold_core::ids::ObjectId(0),
+        }
+    }
+
+    #[test]
+    fn build_volume_audit_cells_emits_36_vertices_per_qualifying_cell() {
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(2.0, 6.0, 2.0));
+        let config = SlicerConfig::default();
+        let cell_size = 0.5;
+        let path = straight_extruding_path(
+            DVec3::new(0.3, 2.0, 1.0),
+            DVec3::new(0.3, 4.0, 1.0),
+            MoveKind::WallOuter,
+            config.wall_line_width * config.layer_height,
+            &config,
+        );
+        let grid = audit_extrusion_volume(&mesh, std::slice::from_ref(&path), &config, cell_size);
+
+        // Threshold of 0.0 keeps everything with any deviation at all --
+        // a wall bead's own cells should qualify (their ratio is never
+        // exactly 1.0 for a hand-built single-segment fixture).
+        let vertices = build_volume_audit_cells(&grid, 0.0, 0.9);
+        assert!(
+            !vertices.is_empty(),
+            "a grid with real wall extrusion should produce at least one cube"
+        );
+        assert_eq!(
+            vertices.len() % 36,
+            0,
+            "every cube must contribute exactly 36 vertices (12 triangles), got {} total",
+            vertices.len()
+        );
+    }
+
+    #[test]
+    fn build_volume_audit_cells_respects_the_deviation_threshold() {
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(2.0, 6.0, 2.0));
+        let config = SlicerConfig::default();
+        let cell_size = 0.5;
+        let path = straight_extruding_path(
+            DVec3::new(0.3, 2.0, 1.0),
+            DVec3::new(0.3, 4.0, 1.0),
+            MoveKind::WallOuter,
+            config.wall_line_width * config.layer_height,
+            &config,
+        );
+        let grid = audit_extrusion_volume(&mesh, std::slice::from_ref(&path), &config, cell_size);
+
+        let permissive = build_volume_audit_cells(&grid, 0.0, 0.9);
+        // A threshold far above any real cell's deviation must hide
+        // every ratio-based cube.
+        let strict = build_volume_audit_cells(&grid, 1e6, 0.9);
+        assert!(
+            strict.len() < permissive.len(),
+            "an extreme deviation_threshold should hide ratio-based cubes: \
+             permissive={}, strict={}",
+            permissive.len(),
+            strict.len()
+        );
+    }
+
+    #[test]
+    fn build_volume_audit_cells_never_hides_outside_the_mesh_defects() {
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(2.0, 6.0, 2.0));
+        let config = SlicerConfig::default();
+        let cell_size = 0.5;
+        // Same stray-bead fixture as `manifold_core::volume_audit`'s own
+        // `extrusion_outside_the_mesh_is_caught_only_by_its_own_dedicated_query`.
+        let stray = straight_extruding_path(
+            DVec3::new(-0.25, 2.0, 1.0),
+            DVec3::new(-0.25, 4.0, 1.0),
+            MoveKind::WallOuter,
+            config.wall_line_width * config.layer_height,
+            &config,
+        );
+        let grid = audit_extrusion_volume(&mesh, std::slice::from_ref(&stray), &config, cell_size);
+        assert!(
+            !grid.extrusion_outside_mesh_cells().is_empty(),
+            "test fixture must produce an outside-the-mesh cell -- otherwise this test is vacuous"
+        );
+
+        // Even an extreme deviation_threshold must not hide the
+        // outside-mesh defect cube.
+        let vertices = build_volume_audit_cells(&grid, 1e6, 0.9);
+        assert!(
+            vertices.iter().any(|v| v.color == OUTSIDE_MESH_COLOR),
+            "outside-the-mesh defect cubes must never be hidden by deviation_threshold"
+        );
+    }
+}
