@@ -592,6 +592,7 @@ impl ManifoldApp {
             self.gcode = None;
             self.toolpaths = None;
             self.uploaded_toolpaths = None;
+            self.uploaded_volume_audit = None;
             self.toolpath_order_range = None;
             self.print_statistics = None;
             self.slice_error = None;
@@ -617,6 +618,7 @@ impl ManifoldApp {
         self.gcode = None;
         self.toolpaths = None;
         self.uploaded_toolpaths = None;
+        self.uploaded_volume_audit = None;
         self.toolpath_order_range = None;
         self.print_statistics = None;
         self.slice_error = None;
@@ -3592,7 +3594,11 @@ impl ManifoldApp {
                         scene: self.uploaded_scene.clone(),
                         meshes: self.uploaded_meshes.clone(),
                         overlay: self.sdf_overlay_mesh.clone(),
-                        volume_audit_cells: self.uploaded_volume_audit.clone(),
+                        volume_audit_cells: if self.show_volume_audit && self.objects.len() == 1 {
+                            self.uploaded_volume_audit.clone()
+                        } else {
+                            None
+                        },
                         toolpaths: if self.show_toolpaths {
                             self.uploaded_toolpaths.clone()
                         } else {
