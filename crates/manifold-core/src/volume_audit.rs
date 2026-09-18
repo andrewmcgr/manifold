@@ -1264,10 +1264,6 @@ mod tests {
              the healthy baseline: baseline {baseline_ratio}, defective {defective_ratio}"
         );
 
-        // The healthy baseline (1.461) must not itself trip a reasonable
-        // tolerance; the duplicated case (2.922) must. 2.0 sits strictly
-        // between them with comfortable margin on both sides (~37% below
-        // the defective ratio, ~37% above the baseline ratio).
         // The healthy baseline (1.262) must not itself trip a reasonable
         // tolerance; the duplicated case (2.524) must. 1.9 sits strictly
         // between them with comfortable margin on both sides (~50.6% above
