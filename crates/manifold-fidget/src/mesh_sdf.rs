@@ -438,8 +438,8 @@ impl MeshSdf {
         // Barycentric weights for (a, b, c) respectively; `bary_b` is the
         // weight on `b`, etc. Weight ~0 on a vertex means `closest` lies on
         // the edge opposite that vertex.
-        let bary_c = (d11 * d20 - d01 * d21) / denom;
-        let bary_b = (d00 * d21 - d01 * d20) / denom;
+        let bary_b = (d11 * d20 - d01 * d21) / denom;
+        let bary_c = (d00 * d21 - d01 * d20) / denom;
         let bary_a = 1.0 - bary_b - bary_c;
 
         const EDGE_EPSILON: f64 = 1e-9;
@@ -796,6 +796,37 @@ mod tests {
             sample.value
         );
         assert!(approx_eq(sample.value, 26.248457115795734, 1e-6));
+    }
+
+    #[test]
+    fn edge_containing_point_identifies_the_edge_opposite_the_zero_weight_vertex() {
+        // A scalene right triangle (|ab|=4, |ac|=3) so swapping the b/c
+        // barycentric weights produces a genuinely different, detectably
+        // wrong edge -- an isoceles/symmetric triangle would not catch a
+        // b<->c swap.
+        let verts = [10, 20, 30];
+        let mut positions = vec![DVec3::ZERO; 40];
+        positions[10] = DVec3::new(0.0, 0.0, 0.0);
+        positions[20] = DVec3::new(4.0, 0.0, 0.0);
+        positions[30] = DVec3::new(0.0, 3.0, 0.0);
+
+        // Midpoint of edge (a,b): true weight of c is 0, so the point lies
+        // on the edge OPPOSITE c, i.e. edge (a,b) = (10,20).
+        let midpoint_ab = DVec3::new(2.0, 0.0, 0.0);
+        assert_eq!(
+            MeshSdf::edge_containing_point(verts, &positions, midpoint_ab),
+            Some((10, 20)),
+            "a point on edge (a,b) must report edge (a,b), not the edge opposite b"
+        );
+
+        // Midpoint of edge (a,c): true weight of b is 0, so the point lies
+        // on the edge OPPOSITE b, i.e. edge (a,c) = (10,30).
+        let midpoint_ac = DVec3::new(0.0, 1.5, 0.0);
+        assert_eq!(
+            MeshSdf::edge_containing_point(verts, &positions, midpoint_ac),
+            Some((10, 30)),
+            "a point on edge (a,c) must report edge (a,c), not the edge opposite c"
+        );
     }
 
     #[test]
