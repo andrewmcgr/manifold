@@ -117,6 +117,22 @@ pub struct ManifoldApp {
     show_toolpaths: bool,
     /// Mesh visualization mode (None, Conformal Regions, or Surface Order Gradient).
     mesh_overlay_mode: MeshOverlayMode,
+    /// Whether the extrusion-volume-audit cell visualization is drawn in
+    /// the viewport (single-object scope only -- see
+    /// `docs/superpowers/specs/2026-09-18-volume-audit-fill-visualization-design.md`).
+    show_volume_audit: bool,
+    /// Grid cell size (mm) for the volume-audit visualization. See
+    /// `manifold_core::volume_audit::audit_extrusion_volume`'s own doc
+    /// comment for choosing this value relative to line widths.
+    volume_audit_cell_size: f64,
+    /// Cells whose fill ratio deviates from 1.0 by less than this are
+    /// hidden from the volume-audit visualization (declutters routine
+    /// sparse-infill noise -- see the design spec's "Decluttering
+    /// threshold" section).
+    volume_audit_deviation_threshold: f64,
+    /// GPU-uploaded copy of the volume-audit cell geometry, rebuilt by
+    /// `Self::reupload_volume_audit`.
+    uploaded_volume_audit: Option<std::sync::Arc<UploadedMesh>>,
     /// Order-based scrub slider value (Phase 13 subtask 05): segments with
     /// `order <= scrub_order` are drawn, others hidden ("up to and
     /// including" semantics). `f64::INFINITY` (the default) shows every
@@ -257,6 +273,10 @@ impl ManifoldApp {
             uploaded_toolpaths: None,
             show_toolpaths: true,
             mesh_overlay_mode: MeshOverlayMode::default(),
+            show_volume_audit: false,
+            volume_audit_cell_size: 2.0,
+            volume_audit_deviation_threshold: 0.15,
+            uploaded_volume_audit: None,
             scrub_order: f64::INFINITY,
             toolpath_order_range: None,
             slice_error: None,
@@ -647,6 +667,53 @@ impl ManifoldApp {
             );
             Arc::new(UploadedToolpaths::upload(device, &instances))
         });
+    }
+
+    /// Rebuilds and re-uploads `uploaded_volume_audit` from the current
+    /// `objects`/`toolpaths`/`config`, mirroring `reupload_toolpaths`'s
+    /// pattern. No-op (clears the uploaded copy) if the visualization is
+    /// off, there isn't exactly one object, or there's no planned
+    /// toolpath yet -- `audit_extrusion_volume` takes a single `&Mesh`,
+    /// so multi-object scenes are out of scope for this visualization
+    /// (see the design spec's "Known Limitation").
+    fn reupload_volume_audit(&mut self, device: &eframe::egui_wgpu::wgpu::Device) {
+        self.uploaded_volume_audit = None;
+        if !self.show_volume_audit {
+            return;
+        }
+        let (Some(paths), [object]) = (&self.toolpaths, self.objects.as_slice()) else {
+            return;
+        };
+        // `object.mesh` is in local/object space, but `paths` are planned
+        // in world space -- see `toolpath::append_end_of_print_wipe_and_clearance`
+        // for the same world-space-mesh-from-object-transform pattern. A
+        // literal `&object.mesh` here (deviating from the brief) would
+        // silently misclassify every cell whenever the object has a
+        // non-identity transform, i.e. almost any object actually placed
+        // on the bed rather than left at the origin.
+        let world_mesh = manifold_core::mesh::Mesh::new(
+            object
+                .mesh
+                .vertices
+                .iter()
+                .map(|&v| object.transform.transform_point(v))
+                .collect(),
+            object.mesh.indices.clone(),
+        );
+        let grid = manifold_core::volume_audit::audit_extrusion_volume(
+            &world_mesh,
+            paths,
+            &self.config,
+            self.volume_audit_cell_size,
+        );
+        let vertices = crate::volume_audit_view::build_volume_audit_cells(
+            &grid,
+            self.volume_audit_deviation_threshold,
+            0.9,
+        );
+        self.uploaded_volume_audit = Some(std::sync::Arc::new(UploadedMesh::upload_colored_cells(
+            device, &vertices,
+        )));
     }
 
     /// Interact with the transform gizmo, but only let it capture pointer
@@ -3231,6 +3298,51 @@ impl ManifoldApp {
                     .clone();
                 self.reupload(&device);
             }
+            ensure_row_space(ui, 130.0);
+            let single_object = self.objects.len() == 1;
+            ui.add_enabled_ui(single_object, |ui| {
+                let mut audit_changed = false;
+                if ui
+                    .checkbox(&mut self.show_volume_audit, "Show volume audit")
+                    .changed()
+                {
+                    audit_changed = true;
+                }
+                if self.show_volume_audit {
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.volume_audit_cell_size)
+                                .speed(0.1)
+                                .range(0.05..=50.0)
+                                .prefix("Cell size: ")
+                                .suffix(" mm"),
+                        )
+                        .changed()
+                    {
+                        audit_changed = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.volume_audit_deviation_threshold, 0.0..=2.0)
+                                .text("Declutter threshold"),
+                        )
+                        .changed()
+                    {
+                        audit_changed = true;
+                    }
+                }
+                if audit_changed {
+                    let device = frame
+                        .wgpu_render_state()
+                        .expect("wgpu renderer is required")
+                        .device
+                        .clone();
+                    self.reupload_volume_audit(&device);
+                }
+            });
+            if !single_object {
+                ui.label("Volume audit requires exactly one object in the scene.");
+            }
             if let Some(stats) = &self.print_statistics {
                 ensure_row_space(ui, 250.0);
                 ui.separator();
@@ -3480,6 +3592,7 @@ impl ManifoldApp {
                         scene: self.uploaded_scene.clone(),
                         meshes: self.uploaded_meshes.clone(),
                         overlay: self.sdf_overlay_mesh.clone(),
+                        volume_audit_cells: self.uploaded_volume_audit.clone(),
                         toolpaths: if self.show_toolpaths {
                             self.uploaded_toolpaths.clone()
                         } else {
@@ -4208,6 +4321,7 @@ impl eframe::App for ManifoldApp {
                         .device
                         .clone();
                     self.reupload_toolpaths(&device);
+                    self.reupload_volume_audit(&device);
                 }
             } else {
                 // Still in progress: keep polling every frame rather than

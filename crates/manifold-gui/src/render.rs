@@ -198,6 +198,30 @@ impl UploadedMesh {
         Self::from_vertices(device, &vertices, "manifold sdf overlay vertex buffer")
     }
 
+    /// Uploads pre-colored triangle geometry (already-computed
+    /// per-vertex colors, e.g. from
+    /// `crate::volume_audit_view::build_volume_audit_cells`) directly --
+    /// unlike `Self::upload`/`Self::upload_from_vertices`, applies no
+    /// overlay-mode color logic of its own.
+    pub fn upload_colored_cells(
+        device: &wgpu::Device,
+        vertices: &[crate::volume_audit_view::VolumeAuditCellVertex],
+    ) -> Self {
+        let vertices: Vec<Vertex> = vertices
+            .iter()
+            .map(|v| Vertex {
+                position: v.position,
+                normal: v.normal,
+                color: v.color,
+            })
+            .collect();
+        Self::from_vertices(
+            device,
+            &vertices,
+            "manifold volume audit cells vertex buffer",
+        )
+    }
+
     /// Shared buffer-creation tail for [`Self::upload`] and
     /// [`Self::upload_from_vertices`].
     fn from_vertices(device: &wgpu::Device, vertices: &[Vertex], label: &str) -> Self {
@@ -1018,6 +1042,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         scene: &UploadedScene,
         meshes: &[UploadedMesh],
         overlay: Option<&UploadedMesh>,
+        volume_audit_cells: Option<&UploadedMesh>,
         toolpaths: Option<&UploadedToolpaths>,
     ) {
         let ppp = screen_descriptor.pixels_per_point;
@@ -1139,6 +1164,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             rpass.set_vertex_buffer(0, overlay_mesh.vertex_buffer.slice(..));
             rpass.draw(0..overlay_mesh.vertex_count, 0..1);
         }
+
+        // Draw volume-audit fill-visualization cells (if any) -- same
+        // pipeline/bind-group setup as the overlay above, since
+        // `VolumeAuditCellVertex`'s buffer layout is bit-identical to
+        // `Vertex`'s.
+        if let Some(volume_audit_mesh) = volume_audit_cells {
+            rpass.set_pipeline(&self.overlay_pipeline);
+            rpass.set_vertex_buffer(0, volume_audit_mesh.vertex_buffer.slice(..));
+            rpass.draw(0..volume_audit_mesh.vertex_count, 0..1);
+        }
     }
 
     pub fn paint_blit(&self, render_pass: &mut wgpu::RenderPass<'static>) {
@@ -1163,6 +1198,7 @@ pub struct Viewport3dCallback {
     pub scene: std::sync::Arc<UploadedScene>,
     pub meshes: std::sync::Arc<Vec<UploadedMesh>>,
     pub overlay: Option<std::sync::Arc<UploadedMesh>>,
+    pub volume_audit_cells: Option<std::sync::Arc<UploadedMesh>>,
     pub toolpaths: Option<std::sync::Arc<UploadedToolpaths>>,
 }
 
@@ -1188,6 +1224,7 @@ impl egui_wgpu::CallbackTrait for Viewport3dCallback {
             &self.scene,
             &self.meshes,
             self.overlay.as_deref(),
+            self.volume_audit_cells.as_deref(),
             self.toolpaths.as_deref(),
         );
         Vec::new()
