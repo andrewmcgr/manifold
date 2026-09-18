@@ -13,11 +13,9 @@ use glam::DVec3;
 use manifold_fidget::mesh_sdf::MeshSdf;
 use manifold_fidget::ScalarField;
 
+use crate::mesh::Mesh;
 use crate::slicing::BUILD_DIRECTION;
 use crate::SlicerConfig;
-
-#[cfg(test)]
-use crate::mesh::Mesh;
 
 /// Which `MoveKind` family a segment's accumulated volume is bucketed
 /// into. `Travel`/`Wipe`/`DebugExcluded` segments have no bucket (see
@@ -34,13 +32,6 @@ pub enum VolumeKindBucket {
 /// A coarse 3D voxel grid over a print's bounding volume, holding both
 /// the actual accumulated extruded volume (Task 2) and an independently-
 /// computed expected volume (this task) per cell, in mm^3.
-///
-/// `#[allow(dead_code)]` here is temporary: this task builds the grid and
-/// its expected-volume primitives, but nothing in production code reads
-/// these fields until Task 2's `audit_extrusion_volume` constructs and
-/// populates a real `VolumeAuditGrid` -- only this module's own tests
-/// touch them today. Remove this allow when Task 2 lands.
-#[allow(dead_code)]
 pub struct VolumeAuditGrid {
     pub(crate) origin: DVec3,
     pub(crate) cell_size: f64,
@@ -53,12 +44,6 @@ pub struct VolumeAuditGrid {
 /// direction -- the wall-shell zone. Direction-agnostic because a
 /// printed wall shell exists uniformly around the whole perimeter
 /// regardless of vertical position, unlike the top/bottom zones below.
-///
-/// `#[allow(dead_code)]`: only called by `expected_fill_fraction` below
-/// and this module's own tests until Task 2's `audit_extrusion_volume`
-/// calls `expected_fill_fraction` from production code. Remove this
-/// allow when Task 2 lands.
-#[allow(dead_code)]
 fn wall_shell_zone(mesh_sdf: &MeshSdf, p: DVec3, threshold: f64) -> bool {
     mesh_sdf.sample(p).value.abs() <= threshold
 }
@@ -81,12 +66,6 @@ fn wall_shell_zone(mesh_sdf: &MeshSdf, p: DVec3, threshold: f64) -> bool {
 /// disambiguation production code carries -- see this module's own doc
 /// comment and the design spec's "Central Design Constraint" section for
 /// why that independence is the entire point of this module.
-///
-/// `#[allow(dead_code)]`: only called by `expected_fill_fraction` below
-/// and this module's own tests until Task 2's `audit_extrusion_volume`
-/// calls `expected_fill_fraction` from production code. Remove this
-/// allow when Task 2 lands.
-#[allow(dead_code)]
 fn directional_march(
     sdf: &MeshSdf,
     p: DVec3,
@@ -142,11 +121,6 @@ fn directional_march(
 /// canceling out. See the design spec's "Central Design Constraint"
 /// section. Do not "simplify" this function by threading a `&Layer` or
 /// `&dyn OrderField` through it.
-///
-/// `#[allow(dead_code)]`: only called by this module's own tests until
-/// Task 2's `audit_extrusion_volume` calls this from production code.
-/// Remove this allow when Task 2 lands.
-#[allow(dead_code)]
 fn expected_fill_fraction(
     mesh_sdf: &MeshSdf,
     bed_excluded_sdf: &MeshSdf,
@@ -180,6 +154,240 @@ fn expected_fill_fraction(
     }
 
     config.infill_density
+}
+
+impl VolumeKindBucket {
+    /// The four extrusion-carrying `MoveKind` families this module
+    /// tracks. `Travel`/`Wipe`/`DebugExcluded` (zero or non-physical
+    /// extrusion) have no bucket and are excluded from accumulation.
+    fn from_move_kind(kind: crate::toolpath::MoveKind) -> Option<Self> {
+        use crate::toolpath::MoveKind;
+        match kind {
+            MoveKind::WallOuter | MoveKind::WallInner => Some(Self::Wall),
+            MoveKind::TopSurface => Some(Self::TopSurface),
+            MoveKind::Infill | MoveKind::Bridge => Some(Self::Infill),
+            MoveKind::Overhang => Some(Self::Overhang),
+            MoveKind::Travel | MoveKind::Wipe | MoveKind::DebugExcluded => None,
+        }
+    }
+}
+
+fn cell_index(origin: DVec3, cell_size: f64, dims: [usize; 3], p: DVec3) -> Option<usize> {
+    let rel = (p - origin) / cell_size;
+    if rel.x < 0.0 || rel.y < 0.0 || rel.z < 0.0 {
+        return None;
+    }
+    let i = rel.x as usize;
+    let j = rel.y as usize;
+    let k = rel.z as usize;
+    if i >= dims[0] || j >= dims[1] || k >= dims[2] {
+        return None;
+    }
+    Some(i + j * dims[0] + k * dims[0] * dims[1])
+}
+
+/// Computes a [`VolumeAuditGrid`] over `mesh`'s bounding volume (padded
+/// by one `cell_size`), comparing `paths`' actual accumulated extruded
+/// volume against an expected volume computed independently from `mesh`
+/// alone -- see [`expected_fill_fraction`]'s doc comment for why `paths`
+/// (or any `Layer` it might have come from) never influences the
+/// expected side.
+///
+/// **Choosing `cell_size`:** pick a value comparable to (not much larger
+/// than) `layer_height`/a single bead's physical scale. A coarse
+/// `cell_size` relative to one bead's footprint means each cell's
+/// expected volume (`expected_fill_fraction(..) * cell_size^3`)
+/// implicitly assumes enough STACKED layers eventually fill that whole
+/// voxel -- so a duplication confined to a single layer's worth of
+/// material can be diluted below any reasonable overfill threshold even
+/// when it's a real bug. This is a verified, real limitation (confirmed
+/// directly: a duplicated single-layer wall bead at `cell_size = 2.0`
+/// registers only ~0.04x its expected volume -- nowhere near
+/// overfilled -- while the identical duplication at `cell_size = 0.2`
+/// registers ~4.0x), not a hypothetical one.
+pub fn audit_extrusion_volume(
+    mesh: &Mesh,
+    paths: &[crate::toolpath::Path],
+    config: &SlicerConfig,
+    cell_size: f64,
+) -> VolumeAuditGrid {
+    let (min, max) = mesh.bounding_box().unwrap_or((DVec3::ZERO, DVec3::ZERO));
+    let origin = min - DVec3::splat(cell_size);
+    let extent = (max - min) + DVec3::splat(cell_size * 2.0);
+    let dims = [
+        ((extent.x / cell_size).ceil() as usize).max(1),
+        ((extent.y / cell_size).ceil() as usize).max(1),
+        ((extent.z / cell_size).ceil() as usize).max(1),
+    ];
+    let cell_count = dims[0] * dims[1] * dims[2];
+
+    let faces: Vec<[usize; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
+        .collect();
+    let mesh_sdf = MeshSdf::new(mesh.vertices.clone(), faces.clone());
+    let non_bed_faces = crate::mesh::non_bed_floor_faces(mesh, min.z);
+    let bed_excluded_sdf =
+        MeshSdf::new_with_distance_faces(mesh.vertices.clone(), faces, non_bed_faces);
+
+    use rayon::prelude::*;
+    let mut expected = vec![0.0f64; cell_count];
+    expected.par_iter_mut().enumerate().for_each(|(idx, e)| {
+        let k = idx / (dims[0] * dims[1]);
+        let j = (idx / dims[0]) % dims[1];
+        let i = idx % dims[0];
+        let p = origin
+            + DVec3::new(
+                (i as f64 + 0.5) * cell_size,
+                (j as f64 + 0.5) * cell_size,
+                (k as f64 + 0.5) * cell_size,
+            );
+        *e = expected_fill_fraction(&mesh_sdf, &bed_excluded_sdf, p, config) * cell_size.powi(3);
+    });
+
+    let mut accumulated: HashMap<VolumeKindBucket, Vec<f64>> = [
+        VolumeKindBucket::Wall,
+        VolumeKindBucket::TopSurface,
+        VolumeKindBucket::Infill,
+        VolumeKindBucket::Overhang,
+    ]
+    .into_iter()
+    .map(|bucket| (bucket, vec![0.0f64; cell_count]))
+    .collect();
+
+    for path in paths {
+        let is_open = path.segments.len() + 1 == path.points.len();
+        for (i, segment) in path.segments.iter().enumerate() {
+            let Some(bucket) = VolumeKindBucket::from_move_kind(segment.kind) else {
+                continue;
+            };
+            let start = path.points[i];
+            let end_idx = if is_open {
+                i + 1
+            } else {
+                (i + 1) % path.points.len()
+            };
+            let end = path.points[end_idx];
+            let length = start.distance(end);
+            if length < f64::EPSILON {
+                continue;
+            }
+            let bead_volume = segment.extrusion_length
+                * crate::extrusion::filament_cross_section_area(config.filament_diameter);
+            let steps = ((length / (cell_size / 4.0)).ceil() as usize).max(1);
+            let volume_per_step = bead_volume / steps as f64;
+            let grid = accumulated
+                .get_mut(&bucket)
+                .expect("bucket initialized above");
+            for s in 0..steps {
+                let t = (s as f64 + 0.5) / steps as f64;
+                let p = start.lerp(end, t);
+                if let Some(cell) = cell_index(origin, cell_size, dims, p) {
+                    grid[cell] += volume_per_step;
+                }
+            }
+        }
+    }
+
+    VolumeAuditGrid {
+        origin,
+        cell_size,
+        dims,
+        accumulated,
+        expected,
+    }
+}
+
+impl VolumeAuditGrid {
+    fn cell_count(&self) -> usize {
+        self.dims[0] * self.dims[1] * self.dims[2]
+    }
+
+    fn unflatten(&self, idx: usize) -> [usize; 3] {
+        let i = idx % self.dims[0];
+        let j = (idx / self.dims[0]) % self.dims[1];
+        let k = idx / (self.dims[0] * self.dims[1]);
+        [i, j, k]
+    }
+
+    fn cell_center(&self, idx: [usize; 3]) -> DVec3 {
+        self.origin
+            + DVec3::new(
+                (idx[0] as f64 + 0.5) * self.cell_size,
+                (idx[1] as f64 + 0.5) * self.cell_size,
+                (idx[2] as f64 + 0.5) * self.cell_size,
+            )
+    }
+
+    fn total_accumulated(&self, idx: usize) -> f64 {
+        self.accumulated.values().map(|v| v[idx]).sum()
+    }
+
+    /// `(cell index, ratio)` for every cell where total accumulated
+    /// volume (summed across all buckets) exceeds `expected * max_ratio`.
+    /// Only cells with `expected > 0` are considered -- see
+    /// `overfilled_cells`'s doc note on cells outside the mesh entirely.
+    pub fn overfilled_cells(&self, max_ratio: f64) -> Vec<([usize; 3], f64)> {
+        (0..self.cell_count())
+            .filter_map(|idx| {
+                let expected = self.expected[idx];
+                if expected <= 0.0 {
+                    return None;
+                }
+                let ratio = self.total_accumulated(idx) / expected;
+                (ratio > max_ratio).then(|| (self.unflatten(idx), ratio))
+            })
+            .collect()
+    }
+
+    /// `(cell index, fraction)` for every cell where total accumulated
+    /// volume is below `expected * min_fraction`, among cells with
+    /// `expected > 0`.
+    pub fn underfilled_cells(&self, min_fraction: f64) -> Vec<([usize; 3], f64)> {
+        (0..self.cell_count())
+            .filter_map(|idx| {
+                let expected = self.expected[idx];
+                if expected <= 0.0 {
+                    return None;
+                }
+                let fraction = self.total_accumulated(idx) / expected;
+                (fraction < min_fraction).then(|| (self.unflatten(idx), fraction))
+            })
+            .collect()
+    }
+
+    /// Panics, naming the single worst offending cell (highest ratio),
+    /// if any cell's accumulated volume exceeds `expected * max_ratio`.
+    pub fn assert_no_overfill(&self, max_ratio: f64) {
+        let worst = self
+            .overfilled_cells(max_ratio)
+            .into_iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((idx, ratio)) = worst {
+            let p = self.cell_center(idx);
+            panic!(
+                "extrusion volume audit: cell {idx:?} (world {p:?}) has {ratio:.2}x its \
+                 expected volume (max allowed {max_ratio:.2}x)"
+            );
+        }
+    }
+
+    /// Panics, naming the single worst offending cell (lowest fraction),
+    /// if any cell's accumulated volume is below `expected * min_fraction`.
+    pub fn assert_no_underfill(&self, min_fraction: f64) {
+        let worst = self
+            .underfilled_cells(min_fraction)
+            .into_iter()
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((idx, fraction)) = worst {
+            let p = self.cell_center(idx);
+            panic!(
+                "extrusion volume audit: cell {idx:?} (world {p:?}) only has {fraction:.2} \
+                 of its expected volume (min allowed {min_fraction:.2})"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -323,5 +531,163 @@ mod tests {
         let fraction =
             expected_fill_fraction(&sdf, &bed_sdf, DVec3::new(20.0, 20.0, 20.0), &config);
         assert_eq!(fraction, config.infill_density);
+    }
+
+    use crate::toolpath::{MoveKind, Path, Segment};
+
+    /// A single-segment open `Path` extruding in a straight line from
+    /// `start` to `end`, with `extrusion_length` derived so the bead
+    /// volume conserves exactly (see `extrusion::segment_extrusion_length`'s
+    /// own doc comment: `distance * bead_area == filament_length *
+    /// filament_area`).
+    fn straight_extruding_path(
+        start: DVec3,
+        end: DVec3,
+        kind: MoveKind,
+        bead_area: f64,
+        config: &SlicerConfig,
+    ) -> Path {
+        let distance = start.distance(end);
+        let filament_area = crate::extrusion::filament_cross_section_area(config.filament_diameter);
+        let extrusion_length =
+            crate::extrusion::segment_extrusion_length(distance, bead_area, filament_area);
+        Path {
+            points: vec![start, end],
+            segments: vec![Segment {
+                kind,
+                extrusion_length,
+                line_width: bead_area / config.layer_height,
+                ..Segment::default()
+            }],
+            tool: crate::ids::ToolId(0),
+            object: crate::ids::ObjectId(0),
+        }
+    }
+
+    #[test]
+    fn audit_extrusion_volume_tracks_wall_and_infill_buckets_separately() {
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(40.0, 40.0, 40.0));
+        let config = SlicerConfig::default();
+        let bead_area = config.wall_line_width * config.layer_height;
+        let wall_path = straight_extruding_path(
+            DVec3::new(5.0, 20.0, 20.0),
+            DVec3::new(5.0, 25.0, 20.0),
+            MoveKind::WallOuter,
+            bead_area,
+            &config,
+        );
+        let infill_bead_area = config.infill_line_width * config.layer_height;
+        let infill_path = straight_extruding_path(
+            DVec3::new(20.0, 20.0, 20.0),
+            DVec3::new(25.0, 20.0, 20.0),
+            MoveKind::Infill,
+            infill_bead_area,
+            &config,
+        );
+        let grid = audit_extrusion_volume(
+            &mesh,
+            &[wall_path.clone(), infill_path.clone()],
+            &config,
+            2.0,
+        );
+
+        let expected_wall_volume = wall_path.segments[0].extrusion_length
+            * crate::extrusion::filament_cross_section_area(config.filament_diameter);
+        let expected_infill_volume = infill_path.segments[0].extrusion_length
+            * crate::extrusion::filament_cross_section_area(config.filament_diameter);
+
+        let wall_total: f64 = grid.accumulated[&VolumeKindBucket::Wall].iter().sum();
+        let infill_total: f64 = grid.accumulated[&VolumeKindBucket::Infill].iter().sum();
+        assert!(
+            (wall_total - expected_wall_volume).abs() < expected_wall_volume * 0.01,
+            "wall bucket total {wall_total} should match {expected_wall_volume} within 1%"
+        );
+        assert!(
+            (infill_total - expected_infill_volume).abs() < expected_infill_volume * 0.01,
+            "infill bucket total {infill_total} should match {expected_infill_volume} within 1%"
+        );
+        // Cross-contamination check: infill volume must not have leaked
+        // into the wall bucket or vice versa.
+        let wall_bucket_infill_leak: f64 = grid.accumulated[&VolumeKindBucket::Wall]
+            .iter()
+            .zip(grid.accumulated[&VolumeKindBucket::Infill].iter())
+            .map(|(w, i)| if *w > 0.0 && *i > 0.0 { 1.0 } else { 0.0 })
+            .sum();
+        assert_eq!(
+            wall_bucket_infill_leak, 0.0,
+            "no cell should have both nonzero wall and nonzero infill volume for these two well-separated paths"
+        );
+    }
+
+    #[test]
+    fn overfilled_cells_detects_a_deliberately_duplicated_wall_segment() {
+        // A much smaller mesh than this file's other fixtures (40mm cube):
+        // at `cell_size = 0.2` (see below), a 40mm mesh produces a
+        // ~202^3 = 8.24 million cell grid -- confirmed directly to take
+        // 75+ seconds per test. This test only needs the duplicated
+        // path's own small neighborhood to be inside solid material near
+        // a face; a tightly-sized mesh keeps the grid small (~4600
+        // cells) without changing the verified bead/cell_size math below
+        // (which depends only on bead cross-section area and cell_size,
+        // not on path length or mesh size, as long as the path is
+        // several cells long -- reconfirmed by direct calculation).
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(2.0, 6.0, 2.0));
+        let config = SlicerConfig::default();
+        let bead_area = config.wall_line_width * config.layer_height;
+        let path = straight_extruding_path(
+            DVec3::new(0.3, 2.0, 1.0),
+            DVec3::new(0.3, 4.0, 1.0),
+            MoveKind::WallOuter,
+            bead_area,
+            &config,
+        );
+        // The same wall geometry printed twice -- the exact duplication
+        // bug class this tool exists to catch.
+        //
+        // `cell_size = 0.2` (== `layer_height`, comparable to a single
+        // bead's own physical scale), NOT the plan's originally-drafted
+        // `2.0`: at a coarse `cell_size`, `expected_fill_fraction`'s
+        // `1.0` (fully solid) is multiplied by the FULL `cell_size^3` --
+        // implicitly assuming enough stacked layers eventually fill that
+        // whole voxel. A single duplicated ONE-LAYER bead (even doubled)
+        // is nowhere near that full-voxel volume at `cell_size = 2.0`
+        // (predicted ratio ~0.04, confirmed by direct calculation --
+        // this test provably could not have passed at that cell_size,
+        // regardless of overfill/underfill), but at `cell_size = 0.2` a
+        // doubled single-layer bead's volume is comparable to the
+        // voxel's own expected volume (predicted ratio ~4.0, verified
+        // below). See `audit_extrusion_volume`'s own doc comment for the
+        // general `cell_size`-choice gotcha this discovery motivated.
+        let duplicated = vec![path.clone(), path];
+        let grid = audit_extrusion_volume(&mesh, &duplicated, &config, 0.2);
+        let overfilled = grid.overfilled_cells(1.5);
+        assert!(
+            !overfilled.is_empty(),
+            "duplicated wall segment should register at least one overfilled cell"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "extrusion volume audit")]
+    fn assert_no_overfill_panics_on_duplicated_extrusion() {
+        // Same small-mesh rationale as
+        // `overfilled_cells_detects_a_deliberately_duplicated_wall_segment`
+        // above (a 40mm mesh at this test's `cell_size = 0.2` would
+        // produce an 8.24-million-cell grid, confirmed to take 75+
+        // seconds; this ~4600-cell mesh runs near-instantly with
+        // identical bead/cell_size math).
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(2.0, 6.0, 2.0));
+        let config = SlicerConfig::default();
+        let bead_area = config.wall_line_width * config.layer_height;
+        let path = straight_extruding_path(
+            DVec3::new(0.3, 2.0, 1.0),
+            DVec3::new(0.3, 4.0, 1.0),
+            MoveKind::WallOuter,
+            bead_area,
+            &config,
+        );
+        let duplicated = vec![path.clone(), path];
+        let grid = audit_extrusion_volume(&mesh, &duplicated, &config, 0.2);
+        grid.assert_no_overfill(1.5);
     }
 }
