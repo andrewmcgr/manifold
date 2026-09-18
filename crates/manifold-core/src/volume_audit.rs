@@ -193,18 +193,43 @@ fn cell_index(origin: DVec3, cell_size: f64, dims: [usize; 3], p: DVec3) -> Opti
 /// (or any `Layer` it might have come from) never influences the
 /// expected side.
 ///
-/// **Choosing `cell_size`:** pick a value comparable to (not much larger
-/// than) `layer_height`/a single bead's physical scale. A coarse
-/// `cell_size` relative to one bead's footprint means each cell's
-/// expected volume (`expected_fill_fraction(..) * cell_size^3`)
-/// implicitly assumes enough STACKED layers eventually fill that whole
-/// voxel -- so a duplication confined to a single layer's worth of
-/// material can be diluted below any reasonable overfill threshold even
-/// when it's a real bug. This is a verified, real limitation (confirmed
-/// directly: a duplicated single-layer wall bead at `cell_size = 2.0`
-/// registers only ~0.04x its expected volume -- nowhere near
-/// overfilled -- while the identical duplication at `cell_size = 0.2`
-/// registers ~4.0x), not a hypothetical one.
+/// **Choosing `cell_size`:** it is bounded on BOTH sides, for different
+/// reasons, and both bounds have been confirmed by direct measurement
+/// rather than inferred.
+///
+/// *Upper bound -- dilution.* A `cell_size` much larger than a single
+/// bead's footprint means each cell's expected volume
+/// (`expected_fill_fraction(..) * cell_size^3`) implicitly assumes
+/// enough STACKED layers eventually fill that whole voxel, so a
+/// duplication confined to a single layer's worth of material can be
+/// diluted below any reasonable overfill threshold even when it's a
+/// real bug. Measured: a duplicated single-layer wall bead at
+/// `cell_size = 2.0` registers only ~0.04x its expected volume --
+/// nowhere near overfilled.
+///
+/// *Lower bound -- centerline-splatting concentration.* `cell_size`
+/// should generally be at least the widest `line_width` in play (the
+/// widest bead's own footprint). This module's accumulation splats each
+/// segment's whole bead volume onto its CENTERLINE, sampled point by
+/// point along the segment -- it is not spread across the bead's actual
+/// cross-sectional footprint. So when a cell is narrower than the bead
+/// itself, volume that physically belongs spread across the full
+/// `line_width` is instead concentrated into the single narrow column
+/// of cells the centerline passes through, inflating those cells'
+/// ratios while leaving the cells to either side empty. Measured: for a
+/// straight bead the centerline cell accumulates
+/// `bead_area * cell_size` against an expected `cell_size^3`, i.e. a
+/// ratio of `bead_area / cell_size^2` -- so a single, correctly-printed,
+/// non-duplicated bead reads 2.0x at `cell_size = 0.2` (below the 0.4
+/// `wall_line_width`), but a correct 0.5x at `cell_size = 0.4` (at it).
+/// Going below the widest `line_width` therefore manufactures
+/// false-positive "overfill" from correct geometry.
+///
+/// In practice, for auditing a real multi-layer print, pick a
+/// `cell_size` at or moderately above the widest `line_width`: large
+/// enough to average over several adjacent beads and stacked layers
+/// (where a correct print converges on ~1.0x), small enough to still
+/// localize a defect.
 pub fn audit_extrusion_volume(
     mesh: &Mesh,
     paths: &[crate::toolpath::Path],
@@ -641,41 +666,77 @@ mod tests {
             bead_area,
             &config,
         );
-        // The same wall geometry printed twice -- the exact duplication
-        // bug class this tool exists to catch.
+
+        // This test asserts the *relative* increase duplication causes,
+        // not an absolute ratio threshold, and that distinction is
+        // load-bearing.
         //
-        // `cell_size = 0.2` (== `layer_height`, comparable to a single
-        // bead's own physical scale), NOT the plan's originally-drafted
-        // `2.0`: at a coarse `cell_size`, `expected_fill_fraction`'s
-        // `1.0` (fully solid) is multiplied by the FULL `cell_size^3` --
-        // implicitly assuming enough stacked layers eventually fill that
-        // whole voxel. A single duplicated ONE-LAYER bead (even doubled)
-        // is nowhere near that full-voxel volume at `cell_size = 2.0`
-        // (predicted ratio ~0.04, confirmed by direct calculation --
-        // this test provably could not have passed at that cell_size,
-        // regardless of overfill/underfill), but at `cell_size = 0.2` a
-        // doubled single-layer bead's volume is comparable to the
-        // voxel's own expected volume (predicted ratio ~4.0, verified
-        // below). See `audit_extrusion_volume`'s own doc comment for the
-        // general `cell_size`-choice gotcha this discovery motivated.
-        let duplicated = vec![path.clone(), path];
-        let grid = audit_extrusion_volume(&mesh, &duplicated, &config, 0.2);
-        let overfilled = grid.overfilled_cells(1.5);
+        // These hand-built fixtures deposit a single LAYER's worth of
+        // bead, which deliberately sits outside the `cell_size` regime
+        // `audit_extrusion_volume`'s own doc comment recommends for real
+        // multi-layer audits (see it for both the upper- and lower-bound
+        // gotchas). Concretely, for a straight bead the centerline cell
+        // accumulates `bead_area * cell_size` against an expected
+        // `cell_size^3`, i.e. ratio `= bead_area / cell_size^2` -- so at
+        // `cell_size = 0.2` even a SINGLE, correctly-printed,
+        // non-duplicated bead already reads 2.0x (measured directly),
+        // purely as a centerline-splatting concentration artifact. An
+        // absolute assertion like `overfilled_cells(1.5)` being non-empty
+        // would therefore pass here with or without any duplication at
+        // all -- proving nothing about duplication detection.
+        //
+        // What IS a genuine duplication signal is the ratio between the
+        // duplicated and single-path cases: duplication doubles the
+        // deposited volume while leaving expected volume untouched, so
+        // the max ratio must double. Measured directly at cell_size
+        // 0.2/0.4/0.5/0.6/0.8: single = 2.0/0.5/0.32/0.21/0.125,
+        // duplicated = 4.0/1.0/0.64/0.42/0.25 -- an exactly 2.0x
+        // increase at every one, independent of the artifact baseline.
+        let cell_size = 0.2;
+        let single = audit_extrusion_volume(&mesh, std::slice::from_ref(&path), &config, cell_size);
+        let single_max = max_overfill_ratio(&single);
+        let duplicated = vec![path.clone(), path.clone()];
+        let doubled = audit_extrusion_volume(&mesh, &duplicated, &config, cell_size);
+        let doubled_max = max_overfill_ratio(&doubled);
+
         assert!(
-            !overfilled.is_empty(),
-            "duplicated wall segment should register at least one overfilled cell"
+            single_max > 0.0,
+            "test fixture deposited nothing measurable (single-path max ratio {single_max}) -- \
+             the comparison below would be vacuous"
+        );
+        assert!(
+            doubled_max >= single_max * 1.5,
+            "duplicating a wall segment must produce a materially higher overfill ratio than \
+             printing it once: single-path max {single_max}, duplicated max {doubled_max} \
+             (expected ~2.0x the single-path value)"
         );
     }
 
     #[test]
-    #[should_panic(expected = "extrusion volume audit")]
-    fn assert_no_overfill_panics_on_duplicated_extrusion() {
+    fn assert_no_overfill_does_not_false_positive_but_panics_on_duplication() {
+        // Chose option (a) from the fix dispatch -- a paired
+        // negative/positive control in one test -- over option (b)
+        // (narrowing this to a message-format check), because the
+        // measured numbers separate cleanly enough to calibrate a
+        // threshold strictly between them, making this a genuinely
+        // stronger assertion than either half alone: it proves
+        // `assert_no_overfill` does NOT fire on correct (non-duplicated)
+        // geometry *and* DOES fire on duplicated geometry, at one
+        // threshold.
+        //
+        // Deliberately NOT `#[should_panic]`: under that attribute a
+        // panic from the negative-control call would still "pass" the
+        // test, which is the exact failure mode this fix round exists to
+        // eliminate. The negative control is instead verified by the
+        // call simply not unwinding (a panic there fails the test
+        // normally), and the positive control via `catch_unwind`, which
+        // also lets the panic message be checked explicitly.
+        //
         // Same small-mesh rationale as
         // `overfilled_cells_detects_a_deliberately_duplicated_wall_segment`
-        // above (a 40mm mesh at this test's `cell_size = 0.2` would
-        // produce an 8.24-million-cell grid, confirmed to take 75+
-        // seconds; this ~4600-cell mesh runs near-instantly with
-        // identical bead/cell_size math).
+        // above (a 40mm mesh at this `cell_size` would produce an
+        // 8.24-million-cell grid, confirmed to take 75+ seconds; this
+        // ~4600-cell mesh runs near-instantly with identical math).
         let mesh = box_mesh(DVec3::ZERO, DVec3::new(2.0, 6.0, 2.0));
         let config = SlicerConfig::default();
         let bead_area = config.wall_line_width * config.layer_height;
@@ -686,8 +747,53 @@ mod tests {
             bead_area,
             &config,
         );
-        let duplicated = vec![path.clone(), path];
-        let grid = audit_extrusion_volume(&mesh, &duplicated, &config, 0.2);
-        grid.assert_no_overfill(1.5);
+        let cell_size = 0.2;
+
+        // Measured directly at this cell_size: a single (correct,
+        // non-duplicated) bead peaks at 2.0x, the duplicated pair at
+        // 4.0x (see the sibling test above for why a single bead reads
+        // above 1.0x at all -- centerline-splatting concentration, not a
+        // defect). A threshold of 3.0 therefore sits strictly between
+        // them, which is what makes the pairing below meaningful rather
+        // than trivially satisfiable from either side.
+        let max_ratio = 3.0;
+
+        // Negative control: correct, non-duplicated geometry must NOT
+        // trip the assertion. If this panics, the test fails here.
+        let single = audit_extrusion_volume(&mesh, std::slice::from_ref(&path), &config, cell_size);
+        single.assert_no_overfill(max_ratio);
+
+        // Positive control: the same geometry printed twice MUST trip it.
+        let duplicated = vec![path.clone(), path.clone()];
+        let doubled = audit_extrusion_volume(&mesh, &duplicated, &config, cell_size);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doubled.assert_no_overfill(max_ratio);
+        }));
+        let payload = panicked.expect_err(
+            "assert_no_overfill must panic on duplicated extrusion exceeding max_ratio",
+        );
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("<non-string panic payload>");
+        assert!(
+            message.contains("extrusion volume audit"),
+            "panic message should identify itself as an extrusion volume audit failure, got: {message}"
+        );
+    }
+
+    /// The highest overfill ratio (accumulated / expected) across every
+    /// cell with a nonzero expected volume, or `0.0` if no such cell
+    /// registered any material. Expressed via the public
+    /// [`VolumeAuditGrid::overfilled_cells`] query (with a `0.0`
+    /// threshold, so every cell carrying material is returned) rather
+    /// than by reaching into the grid's private fields, so these tests
+    /// exercise the same API a real caller would.
+    fn max_overfill_ratio(grid: &VolumeAuditGrid) -> f64 {
+        grid.overfilled_cells(0.0)
+            .into_iter()
+            .map(|(_, ratio)| ratio)
+            .fold(0.0f64, f64::max)
     }
 }
