@@ -6,6 +6,13 @@
 //! the two diverge. See
 //! `docs/superpowers/specs/2026-09-18-extrusion-volume-audit-design.md`
 //! for the full design rationale.
+//!
+//! Note one measured limitation before relying on the whole-grid
+//! assertions: the sparse-infill expected-volume model can mismatch real
+//! geometry by ~1.5x-6x depending on `cell_size`, which is enough to swamp
+//! a real wall-duplication defect in the global max-ratio signal. See
+//! [`VolumeAuditGrid::assert_no_overfill`] for the measured numbers and
+//! what to use instead.
 
 use std::collections::HashMap;
 
@@ -236,6 +243,16 @@ pub fn audit_extrusion_volume(
     config: &SlicerConfig,
     cell_size: f64,
 ) -> VolumeAuditGrid {
+    debug_assert!(
+        cell_size > 0.0,
+        "cell_size must be positive, got {cell_size} -- a zero or negative cell_size \
+         silently produces a degenerate or absurdly-dimensioned grid rather than failing"
+    );
+    debug_assert!(
+        mesh.bounding_box().is_some(),
+        "mesh has no vertices -- the resulting grid is degenerate and every assertion on \
+         it passes vacuously, which is worse than failing"
+    );
     let (min, max) = mesh.bounding_box().unwrap_or((DVec3::ZERO, DVec3::ZERO));
     let origin = min - DVec3::splat(cell_size);
     let extent = (max - min) + DVec3::splat(cell_size * 2.0);
@@ -281,6 +298,13 @@ pub fn audit_extrusion_volume(
     .map(|bucket| (bucket, vec![0.0f64; cell_count]))
     .collect();
 
+    // Volume that landed outside the grid entirely is silently lost from
+    // every subsequent comparison, which would quietly weaken an audit whose
+    // whole purpose is being loud. Track it so the `debug_assert!` below can
+    // surface it rather than letting it vanish.
+    let mut splatted_volume = 0.0f64;
+    let mut dropped_volume = 0.0f64;
+
     for path in paths {
         let is_open = path.segments.len() + 1 == path.points.len();
         for (i, segment) in path.segments.iter().enumerate() {
@@ -310,10 +334,25 @@ pub fn audit_extrusion_volume(
                 let p = start.lerp(end, t);
                 if let Some(cell) = cell_index(origin, cell_size, dims, p) {
                     grid[cell] += volume_per_step;
+                    splatted_volume += volume_per_step;
+                } else {
+                    dropped_volume += volume_per_step;
                 }
             }
         }
     }
+
+    // The grid spans the mesh's bounding box padded by one `cell_size`, so a
+    // well-formed toolpath for this mesh lands entirely inside it. Anything
+    // material falling outside means either the paths don't belong to this
+    // mesh or they stray far beyond its bounds -- both of which invalidate
+    // the comparison this grid exists to make.
+    debug_assert!(
+        dropped_volume <= 0.01 * (splatted_volume + dropped_volume),
+        "{dropped_volume} mm^3 of extrusion fell outside the audit grid \
+         (vs {splatted_volume} mm^3 inside) and was dropped from every comparison -- \
+         the paths likely do not correspond to this mesh"
+    );
 
     VolumeAuditGrid {
         origin,
@@ -336,7 +375,23 @@ impl VolumeAuditGrid {
         [i, j, k]
     }
 
-    fn cell_center(&self, idx: [usize; 3]) -> DVec3 {
+    /// The flat index of cell `idx`, panicking if it is out of bounds --
+    /// the inverse of [`VolumeAuditGrid::unflatten`].
+    fn flatten(&self, idx: [usize; 3]) -> usize {
+        assert!(
+            idx[0] < self.dims[0] && idx[1] < self.dims[1] && idx[2] < self.dims[2],
+            "cell index {idx:?} is outside this grid's dimensions {:?}",
+            self.dims
+        );
+        idx[0] + idx[1] * self.dims[0] + idx[2] * self.dims[0] * self.dims[1]
+    }
+
+    /// The world-space center of cell `idx`, for decoding the indices
+    /// returned by [`VolumeAuditGrid::overfilled_cells`],
+    /// [`VolumeAuditGrid::underfilled_cells`], and
+    /// [`VolumeAuditGrid::extrusion_outside_mesh_cells`] back into positions
+    /// a caller can locate in the model.
+    pub fn cell_center(&self, idx: [usize; 3]) -> DVec3 {
         self.origin
             + DVec3::new(
                 (idx[0] as f64 + 0.5) * self.cell_size,
@@ -349,10 +404,28 @@ impl VolumeAuditGrid {
         self.accumulated.values().map(|v| v[idx]).sum()
     }
 
+    /// The accumulated extruded volume (mm^3) in cell `idx` attributable to
+    /// `bucket` alone, for attributing a flagged cell to a specific kind of
+    /// move. Panics if `idx` is outside the grid.
+    pub fn accumulated_volume(&self, idx: [usize; 3], bucket: VolumeKindBucket) -> f64 {
+        let flat = self.flatten(idx);
+        self.accumulated
+            .get(&bucket)
+            .expect("every VolumeKindBucket is initialized by audit_extrusion_volume")[flat]
+    }
+
     /// `(cell index, ratio)` for every cell where total accumulated
     /// volume (summed across all buckets) exceeds `expected * max_ratio`.
-    /// Only cells with `expected > 0` are considered -- see
-    /// `overfilled_cells`'s doc note on cells outside the mesh entirely.
+    ///
+    /// Only cells with `expected > 0` are considered: a ratio against zero
+    /// expected volume is not a meaningful multiple, so material deposited
+    /// entirely outside the mesh is a separate, binary defect with no
+    /// tolerance knob to tune -- see
+    /// [`VolumeAuditGrid::extrusion_outside_mesh_cells`] for that case. The
+    /// two queries partition the grid between them: this one (and
+    /// [`VolumeAuditGrid::underfilled_cells`]) covers tunable-tolerance
+    /// defects within real geometry, that one covers extrusion into open
+    /// air.
     pub fn overfilled_cells(&self, max_ratio: f64) -> Vec<([usize; 3], f64)> {
         (0..self.cell_count())
             .filter_map(|idx| {
@@ -382,8 +455,48 @@ impl VolumeAuditGrid {
             .collect()
     }
 
+    /// Cell indices holding accumulated volume where *no* material is
+    /// expected at all (`expected == 0`) -- extrusion into open air.
+    ///
+    /// Deliberately binary rather than ratio-based: with zero expected
+    /// volume there is no meaningful multiple to compare against, so unlike
+    /// [`VolumeAuditGrid::overfilled_cells`] this takes no tolerance
+    /// argument. Any material here is a defect.
+    ///
+    /// Note that `expected == 0` also arises for interior cells when
+    /// `config.infill_density` is `0.0`, in which case sparse-interior
+    /// extrusion is reported here too -- correctly, in the sense that no
+    /// material was expected there either, though the cause is a zero
+    /// density rather than being outside the mesh.
+    pub fn extrusion_outside_mesh_cells(&self) -> Vec<[usize; 3]> {
+        (0..self.cell_count())
+            .filter(|&idx| self.expected[idx] == 0.0 && self.total_accumulated(idx) > 0.0)
+            .map(|idx| self.unflatten(idx))
+            .collect()
+    }
+
     /// Panics, naming the single worst offending cell (highest ratio),
     /// if any cell's accumulated volume exceeds `expected * max_ratio`.
+    ///
+    /// **Known limitation (measured, not hypothetical):** this whole-grid
+    /// assertion is dominated by the sparse-infill expected-volume model
+    /// (nominal `infill_density * cell_size^3`, sampled once at the cell
+    /// center), which mismatches real infill geometry badly enough to swamp
+    /// genuine defects elsewhere. On a healthy sliced 20mm box the worst
+    /// cell is always a pure sparse-infill cell -- 1.46x at `cell_size` 2.0,
+    /// 5.94x at 0.8, where 3629 of 14558 non-empty cells already exceed 2.0x
+    /// with nothing wrong. Because that worst cell contains no wall
+    /// material, duplicating wall paths does not move this assertion's
+    /// signal at all: the global max ratio is unchanged to 13 significant
+    /// figures whether 0, 1, 95, or all 193 wall paths are duplicated.
+    ///
+    /// So do not rely on `assert_no_overfill` alone to catch wall-shell
+    /// duplication on real prints. To detect that class, compare
+    /// [`VolumeAuditGrid::overfilled_cells`] per-cell against a known-good
+    /// baseline (see this module's
+    /// `duplicated_walls_on_real_pipeline_output_raise_per_cell_ratios`
+    /// test), or restrict analysis to non-`Infill` buckets via
+    /// [`VolumeAuditGrid::accumulated_volume`].
     pub fn assert_no_overfill(&self, max_ratio: f64) {
         let worst = self
             .overfilled_cells(max_ratio)
@@ -410,6 +523,25 @@ impl VolumeAuditGrid {
             panic!(
                 "extrusion volume audit: cell {idx:?} (world {p:?}) only has {fraction:.2} \
                  of its expected volume (min allowed {min_fraction:.2})"
+            );
+        }
+    }
+
+    /// Panics, naming the cell holding the most stray material, if any
+    /// volume was deposited where none is expected at all -- see
+    /// [`VolumeAuditGrid::extrusion_outside_mesh_cells`].
+    pub fn assert_no_extrusion_outside_mesh(&self) {
+        let cells = self.extrusion_outside_mesh_cells();
+        let worst = cells
+            .iter()
+            .map(|&idx| (idx, self.total_accumulated(self.flatten(idx))))
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((idx, volume)) = worst {
+            let p = self.cell_center(idx);
+            panic!(
+                "extrusion volume audit: {} cell(s) hold extrusion where none is expected; \
+                 worst is cell {idx:?} (world {p:?}) with {volume:.4} mm^3",
+                cells.len()
             );
         }
     }
@@ -798,6 +930,134 @@ mod tests {
     }
 
     #[test]
+    fn extrusion_outside_the_mesh_is_caught_only_by_its_own_dedicated_query() {
+        // The design names this defect class explicitly: "Outside the mesh
+        // entirely: expected = 0 -- any accumulated volume there is extrusion
+        // into open air, a defect regardless of everything else in this
+        // design." It cannot be expressed as a ratio (there is nothing to
+        // take a multiple of), so `overfilled_cells` -- which necessarily
+        // skips `expected == 0` cells to avoid dividing by zero -- is
+        // structurally blind to it. This test pins both halves of that split:
+        // the dedicated query sees it, and the ratio query provably does not.
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(2.0, 6.0, 2.0));
+        let config = SlicerConfig::default();
+        let cell_size = 0.5;
+        // The grid spans the mesh's bounding box padded by one `cell_size`,
+        // so x = -0.25 is outside the mesh (min.x == 0.0) but still inside
+        // the grid -- material here is deposited into thin air, not merely
+        // dropped for falling off the edge of the grid.
+        let stray = straight_extruding_path(
+            DVec3::new(-0.25, 2.0, 1.0),
+            DVec3::new(-0.25, 4.0, 1.0),
+            MoveKind::WallOuter,
+            config.wall_line_width * config.layer_height,
+            &config,
+        );
+        let grid = audit_extrusion_volume(&mesh, std::slice::from_ref(&stray), &config, cell_size);
+
+        let outside = grid.extrusion_outside_mesh_cells();
+        assert!(
+            !outside.is_empty(),
+            "a bead extruded entirely outside the mesh must be reported by \
+             extrusion_outside_mesh_cells"
+        );
+        for &idx in &outside {
+            assert!(
+                grid.cell_center(idx).x < 0.0,
+                "every reported cell should be on the outside-the-mesh side, got {:?}",
+                grid.cell_center(idx)
+            );
+        }
+        // The gap this query exists to close: with a `0.0` threshold
+        // `overfilled_cells` returns every cell carrying any material at
+        // all, and still cannot see this one.
+        assert!(
+            grid.overfilled_cells(0.0).is_empty(),
+            "overfilled_cells is structurally unable to report extrusion into open air -- \
+             if this ever starts reporting it, the two queries' split has changed"
+        );
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            grid.assert_no_extrusion_outside_mesh();
+        }));
+        let payload = panicked
+            .expect_err("assert_no_extrusion_outside_mesh must panic on extrusion into open air");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("<non-string panic payload>");
+        assert!(
+            message.contains("extrusion volume audit"),
+            "panic message should identify itself as an extrusion volume audit failure, got: {message}"
+        );
+    }
+
+    #[test]
+    fn assert_no_extrusion_outside_mesh_passes_when_every_bead_is_inside() {
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(2.0, 6.0, 2.0));
+        let config = SlicerConfig::default();
+        let inside = straight_extruding_path(
+            DVec3::new(0.3, 2.0, 1.0),
+            DVec3::new(0.3, 4.0, 1.0),
+            MoveKind::WallOuter,
+            config.wall_line_width * config.layer_height,
+            &config,
+        );
+        let grid = audit_extrusion_volume(&mesh, std::slice::from_ref(&inside), &config, 0.5);
+        assert!(grid.extrusion_outside_mesh_cells().is_empty());
+        grid.assert_no_extrusion_outside_mesh();
+    }
+
+    #[test]
+    fn cell_center_and_accumulated_volume_decode_a_reported_cell() {
+        // The query methods hand back bare `[usize; 3]` indices; without
+        // these two accessors an out-of-crate caller has no way to turn one
+        // into a position it can locate, or to attribute it to a move kind.
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(2.0, 6.0, 2.0));
+        let config = SlicerConfig::default();
+        let cell_size = 0.5;
+        let wall = straight_extruding_path(
+            DVec3::new(0.3, 2.0, 1.0),
+            DVec3::new(0.3, 4.0, 1.0),
+            MoveKind::WallInner,
+            config.wall_line_width * config.layer_height,
+            &config,
+        );
+        let grid = audit_extrusion_volume(&mesh, std::slice::from_ref(&wall), &config, cell_size);
+
+        // The grid's origin is the mesh's min corner padded outward by one
+        // `cell_size`, so cell [0,0,0]'s center sits half a cell inside that.
+        let corner = grid.cell_center([0, 0, 0]);
+        let expected_corner = DVec3::splat(-cell_size / 2.0);
+        assert!(
+            corner.abs_diff_eq(expected_corner, 1e-12),
+            "cell [0,0,0] center should be {expected_corner:?}, got {corner:?}"
+        );
+
+        let (idx, _) = grid
+            .overfilled_cells(0.0)
+            .into_iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("the wall bead should register in at least one cell");
+        assert!(
+            grid.accumulated_volume(idx, VolumeKindBucket::Wall) > 0.0,
+            "a WallInner bead's volume should be attributed to the Wall bucket"
+        );
+        assert_eq!(
+            grid.accumulated_volume(idx, VolumeKindBucket::Infill),
+            0.0,
+            "no infill was planned, so the Infill bucket must be empty here"
+        );
+        // The reported cell should be the one the bead actually runs through.
+        let center = grid.cell_center(idx);
+        assert!(
+            (center.x - 0.25).abs() < 1e-12 && (center.z - 1.25).abs() < 1e-12,
+            "reported cell center {center:?} should lie on the bead's own column"
+        );
+    }
+
+    #[test]
     fn audit_extrusion_volume_passes_on_a_healthy_sliced_box() {
         let mesh = box_mesh(DVec3::new(0.0, 0.0, 0.0), DVec3::new(20.0, 20.0, 20.0));
         let config = SlicerConfig {
@@ -841,6 +1101,116 @@ mod tests {
         // regresses past these margins.
         grid.assert_no_overfill(2.0);
         grid.assert_no_underfill(0.25);
+    }
+
+    #[test]
+    fn duplicated_walls_on_real_pipeline_output_raise_per_cell_ratios() {
+        // Every other duplication test on this module uses hand-built
+        // `Path`s at a `cell_size` below the recommended lower bound. This
+        // one injects the defect into REAL pipeline output -- slice a box,
+        // plan its toolpaths, then duplicate every planned inner-wall path --
+        // and audits at `cell_size = 2.0`, the same recommended setting the
+        // golden-path test uses.
+        //
+        // It deliberately asserts on the PER-CELL query, not on
+        // `assert_no_overfill`, because the global assertion provably cannot
+        // see this defect. Measured on exactly this fixture: the healthy
+        // print's worst cell is a pure sparse-infill cell (cell [6,9,5],
+        // world (11,17,9), expected 1.6mm^3 from nominal density, actual
+        // infill 2.34mm^3, wall 0.0), so it carries no wall material and
+        // duplicating walls leaves it untouched -- the global max ratio stays
+        // 1.4609534807622 whether 0, 1, 95, or all 193 wall paths are
+        // duplicated. That is a limitation of the sparse-infill expected
+        // model, documented on `assert_no_overfill`, not of the accumulation
+        // pass: the per-cell signal below is clean and strong.
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(20.0, 20.0, 20.0));
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            nozzle_diameter: 0.4,
+            wall_line_width: 0.4,
+            shell_thickness: 0.8,
+            top_layers: 3,
+            bottom_layers: 3,
+            infill_density: 0.2,
+            ..SlicerConfig::default()
+        };
+        let tool_id = crate::ids::ToolId(0);
+        let object = crate::object::Object::new(crate::ids::ObjectId(0), mesh.clone(), tool_id);
+        let tool = crate::tool::Tool::new(tool_id, config.nozzle_diameter);
+        let layers = crate::slicing::slice_object(&object, &config)
+            .expect("slicing a plain box must succeed");
+        let paths = crate::toolpath::plan(
+            &layers,
+            std::slice::from_ref(&object),
+            std::slice::from_ref(&tool),
+            &config,
+        )
+        .expect("planning toolpaths for a plain box must succeed");
+
+        let cell_size = 2.0;
+        let baseline = audit_extrusion_volume(&mesh, &paths, &config, cell_size);
+        let baseline_ratios: HashMap<[usize; 3], f64> =
+            baseline.overfilled_cells(0.0).into_iter().collect();
+        assert!(
+            !baseline_ratios.is_empty(),
+            "the healthy baseline should register material in some cells"
+        );
+
+        // Inject the defect: print every inner wall loop twice. This is the
+        // same shape as the bug the prior plan fixed (wall material laid down
+        // on top of material already there), but on genuinely planned
+        // geometry rather than a hand-built stand-in.
+        let mut injected = paths.clone();
+        let duplicated: Vec<_> = paths
+            .iter()
+            .filter(|p| p.segments.iter().any(|s| s.kind == MoveKind::WallInner))
+            .cloned()
+            .collect();
+        assert!(
+            !duplicated.is_empty(),
+            "the planner should emit inner wall paths for a 20mm box -- nothing to duplicate"
+        );
+        injected.extend(duplicated);
+        let defective = audit_extrusion_volume(&mesh, &injected, &config, cell_size);
+
+        // The signal: compare each cell against its own healthy baseline.
+        // This cancels the sampling artifacts both runs share, leaving only
+        // the injected duplication.
+        let worst_increase = defective
+            .overfilled_cells(0.0)
+            .into_iter()
+            .filter_map(|(idx, ratio)| baseline_ratios.get(&idx).map(|base| ratio / base))
+            .fold(0.0f64, f64::max);
+        // Measured 1.4196 on this fixture; 1.3 leaves margin without being a
+        // round number the observation does not support.
+        assert!(
+            worst_increase >= 1.3,
+            "duplicating every inner wall path should raise some cell's fill ratio well above \
+             its healthy baseline: worst per-cell increase was {worst_increase}x (expected \
+             ~1.42x)"
+        );
+
+        // Pin the limitation itself, so it cannot regress silently in either
+        // direction. If the sparse-infill expected model is ever corrected
+        // (tracked as a follow-up), this assertion is expected to start
+        // failing -- at which point the global `assert_no_overfill` may
+        // finally be able to catch this defect class and this test, plus
+        // `assert_no_overfill`'s own limitation note, should be revisited.
+        let global_max = |g: &VolumeAuditGrid| {
+            g.overfilled_cells(0.0)
+                .into_iter()
+                .map(|(_, r)| r)
+                .fold(0.0f64, f64::max)
+        };
+        let healthy_max = global_max(&baseline);
+        let defective_max = global_max(&defective);
+        assert!(
+            (defective_max - healthy_max).abs() < 1e-9,
+            "the global max ratio is expected to be blind to wall duplication (both ~1.4610, \
+             set by a pure sparse-infill cell): healthy {healthy_max}, defective \
+             {defective_max}. If these now differ, the sparse-infill expected-volume model may \
+             have been fixed -- revisit assert_no_overfill's documented limitation."
+        );
     }
 
     #[test]
