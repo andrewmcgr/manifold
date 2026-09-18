@@ -30,6 +30,15 @@ lists what an agent would otherwise guess wrong.
   when running these commands manually or from a script — omitting it
   silently falls back to the shared default `target/` and reintroduces the
   thrashing.
+- `sccache` is configured globally as the `rustc-wrapper` (`~/.cargo/config.toml`)
+  but is currently non-functional on this machine: an immediate, unmodified
+  rebuild after `cargo clean` produces cache misses, not hits (`sccache
+  --show-stats` stays at 0% hit rate even on a true no-op rebuild). Root
+  cause not yet diagnosed. Separating `CARGO_TARGET_DIR` per command (above)
+  already restores fast warm rebuilds via cargo's own incremental
+  compilation, independent of `sccache`, so this has not been chased
+  further. If `sccache` is ever relied on (e.g. for CI or debug↔release
+  cache sharing), verify it actually produces hits before trusting it.
 
 ### Architecture
 
