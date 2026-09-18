@@ -617,6 +617,51 @@ impl VolumeAuditGrid {
             );
         }
     }
+
+    /// The ratio of total accumulated volume to total expected volume,
+    /// summed across every `SparseInfill`-zone cell in the grid. `None` if
+    /// the grid has no `SparseInfill`-zone cells with nonzero expected
+    /// volume at all (e.g. `infill_density == 1.0`, collapsing every
+    /// interior cell to `Solid`; a mesh too small to have an interior; or
+    /// `infill_density == 0.0`, where every `SparseInfill` cell's own
+    /// expected volume is itself `0.0` and this ratio is undefined -- see
+    /// [`VolumeAuditGrid::extrusion_outside_mesh_cells`]'s doc comment for
+    /// why that specific zero-density case is a known, separate gap this
+    /// method does not cover).
+    ///
+    /// Deliberately whole-grid and unlocalized: the flat nominal-density
+    /// expected model this ratio is checked against is only accurate in
+    /// aggregate, not per fine cell -- see
+    /// [`VolumeAuditGrid::overfilled_cells`] for why sparse infill isn't
+    /// checked at that resolution. This catches gross infill
+    /// under/over-deposition, not a single duplicated infill line.
+    pub fn infill_aggregate_ratio(&self) -> Option<f64> {
+        let (accumulated, expected) = (0..self.cell_count())
+            .filter(|&idx| self.zone[idx] == FillZone::SparseInfill)
+            .fold((0.0f64, 0.0f64), |(acc, exp), idx| {
+                (acc + self.total_accumulated(idx), exp + self.expected[idx])
+            });
+        if expected <= 0.0 {
+            return None;
+        }
+        Some(accumulated / expected)
+    }
+
+    /// Panics if [`VolumeAuditGrid::infill_aggregate_ratio`] falls outside
+    /// `[min_fraction, max_ratio]`. No-op (does not panic) if
+    /// `infill_aggregate_ratio` returns `None` -- see its doc comment for
+    /// when that happens.
+    pub fn assert_infill_volume_within(&self, min_fraction: f64, max_ratio: f64) {
+        let Some(ratio) = self.infill_aggregate_ratio() else {
+            return;
+        };
+        if ratio < min_fraction || ratio > max_ratio {
+            panic!(
+                "extrusion volume audit: aggregate sparse-infill volume is {ratio:.2}x its \
+                 expected total (allowed range {min_fraction:.2}x-{max_ratio:.2}x)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1079,6 +1124,163 @@ mod tests {
         let grid = audit_extrusion_volume(&mesh, std::slice::from_ref(&inside), &config, 0.5);
         assert!(grid.extrusion_outside_mesh_cells().is_empty());
         grid.assert_no_extrusion_outside_mesh();
+    }
+
+    #[test]
+    fn infill_aggregate_ratio_sums_across_the_whole_grid_not_per_cell() {
+        // Tall enough that a genuine interior sparse-infill zone exists,
+        // same shape as `expected_fill_fraction_returns_density_deep_in_the_interior_of_a_tall_box`.
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(40.0, 40.0, 40.0));
+        let config = SlicerConfig {
+            infill_density: 0.2,
+            ..SlicerConfig::default()
+        };
+        let cell_size = 2.0;
+        let bead_area = config.infill_line_width * config.layer_height;
+        // A short infill bead centered deep in the interior (20,20,20 is
+        // >15mm from every face of this 40mm box, well beyond
+        // wall_shell/top_layers/bottom_layers -- squarely SparseInfill).
+        let infill_path = straight_extruding_path(
+            DVec3::new(19.0, 20.0, 20.0),
+            DVec3::new(21.0, 20.0, 20.0),
+            MoveKind::Infill,
+            bead_area,
+            &config,
+        );
+        let grid = audit_extrusion_volume(
+            &mesh,
+            std::slice::from_ref(&infill_path),
+            &config,
+            cell_size,
+        );
+
+        let ratio = grid
+            .infill_aggregate_ratio()
+            .expect("a 40mm box's interior must contain SparseInfill-zone cells");
+
+        // Manually compute the same ratio a different way (summing
+        // `accumulated_volume`/`expected` per reported cell rather than
+        // relying on the grid's own internal fold) to catch a
+        // sign/indexing bug in `infill_aggregate_ratio`'s implementation
+        // that summing over the exact same cells the same way could not.
+        let bead_volume = infill_path.segments[0].extrusion_length
+            * crate::extrusion::filament_cross_section_area(config.filament_diameter);
+        // No wall/top/bottom material is present anywhere in this fixture,
+        // so the reported total accumulated volume across ALL SparseInfill
+        // cells must equal the single bead's own volume exactly (within
+        // floating-point tolerance), since accumulation conserves volume
+        // exactly by construction.
+        let total_infill_accumulated: f64 = (0..grid.dims[0] * grid.dims[1] * grid.dims[2])
+            .filter(|&idx| grid.zone[idx] == FillZone::SparseInfill)
+            .map(|idx| grid.accumulated[&VolumeKindBucket::Infill][idx])
+            .sum();
+        assert!(
+            (total_infill_accumulated - bead_volume).abs() < bead_volume * 0.01,
+            "total accumulated infill volume across SparseInfill cells {total_infill_accumulated} \
+             should match the bead's own volume {bead_volume} within 1%"
+        );
+        assert!(
+            ratio > 0.0,
+            "a real bead's worth of infill volume should register a nonzero ratio, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn infill_aggregate_ratio_is_none_when_no_sparse_infill_cells_exist() {
+        // A box small enough that every interior point falls within the
+        // wall-shell/top/bottom thresholds -- no SparseInfill zone exists
+        // at all, so the ratio must be `None`, not a division-by-zero
+        // artifact or a silently-wrong `0.0`/`1.0`.
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0));
+        let config = SlicerConfig::default();
+        let grid = audit_extrusion_volume(&mesh, &[], &config, 0.5);
+        assert_eq!(
+            grid.infill_aggregate_ratio(),
+            None,
+            "a box entirely covered by Solid zones should have no SparseInfill cells at all"
+        );
+        // Must not panic either -- a `None` ratio is a no-op, not a defect.
+        grid.assert_infill_volume_within(0.5, 1.5);
+    }
+
+    #[test]
+    fn assert_infill_volume_within_catches_duplicated_infill_on_real_pipeline_output() {
+        let mesh = box_mesh(DVec3::ZERO, DVec3::new(20.0, 20.0, 20.0));
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            nozzle_diameter: 0.4,
+            wall_line_width: 0.4,
+            shell_thickness: 0.8,
+            top_layers: 3,
+            bottom_layers: 3,
+            infill_density: 0.2,
+            ..SlicerConfig::default()
+        };
+        let tool_id = crate::ids::ToolId(0);
+        let object = crate::object::Object::new(crate::ids::ObjectId(0), mesh.clone(), tool_id);
+        let tool = crate::tool::Tool::new(tool_id, config.nozzle_diameter);
+        let layers = crate::slicing::slice_object(&object, &config)
+            .expect("slicing a plain box must succeed");
+        let paths = crate::toolpath::plan(
+            &layers,
+            std::slice::from_ref(&object),
+            std::slice::from_ref(&tool),
+            &config,
+        )
+        .expect("planning toolpaths for a plain box must succeed");
+
+        let cell_size = 2.0;
+        let baseline = audit_extrusion_volume(&mesh, &paths, &config, cell_size);
+        let baseline_ratio = baseline
+            .infill_aggregate_ratio()
+            .expect("a 20mm box with infill_density 0.2 must have SparseInfill cells");
+
+        let mut injected = paths.clone();
+        let duplicated: Vec<_> = paths
+            .iter()
+            .filter(|p| p.segments.iter().any(|s| s.kind == MoveKind::Infill))
+            .cloned()
+            .collect();
+        assert!(
+            !duplicated.is_empty(),
+            "the planner should emit sparse infill paths for a 20mm box -- nothing to duplicate"
+        );
+        injected.extend(duplicated);
+        let defective = audit_extrusion_volume(&mesh, &injected, &config, cell_size);
+        let defective_ratio = defective
+            .infill_aggregate_ratio()
+            .expect("the defective grid must also have SparseInfill cells");
+
+        // Measured directly on this exact fixture (temporarily printed both
+        // ratios via `println!`, ran with `--no-capture`, then deleted the
+        // print): baseline_ratio = 1.2620500014927434, defective (all
+        // sparse infill paths duplicated) = 2.5241000029854863 -- almost
+        // exactly double, as expected: duplicating every infill path
+        // doubles deposited volume in every SparseInfill cell while
+        // leaving expected volume untouched.
+        assert!(
+            defective_ratio >= baseline_ratio * 1.3,
+            "duplicating every sparse infill path should raise the aggregate ratio well above \
+             the healthy baseline: baseline {baseline_ratio}, defective {defective_ratio}"
+        );
+
+        // The healthy baseline (1.461) must not itself trip a reasonable
+        // tolerance; the duplicated case (2.922) must. 2.0 sits strictly
+        // between them with comfortable margin on both sides (~37% below
+        // the defective ratio, ~37% above the baseline ratio).
+        // The healthy baseline (1.262) must not itself trip a reasonable
+        // tolerance; the duplicated case (2.524) must. 1.9 sits strictly
+        // between them with comfortable margin on both sides (~50.6% above
+        // the baseline ratio, ~24.7% below the defective ratio).
+        baseline.assert_infill_volume_within(0.0, 1.9);
+        // The duplicated case, at the SAME tolerance, must panic.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            defective.assert_infill_volume_within(0.0, 1.9);
+        }));
+        panicked.expect_err(
+            "assert_infill_volume_within must panic when infill paths are duplicated \
+             wholesale on real pipeline output",
+        );
     }
 
     #[test]
