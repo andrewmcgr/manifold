@@ -10,13 +10,26 @@ lists what an agent would otherwise guess wrong.
 
 ### Commands
 
-- Build: `cargo build --workspace`
-- Test (full suite): `cargo test --workspace`
-- Test (single crate): `cargo test -p manifold-core`
-- Lint: `cargo clippy --workspace --all-targets`
+- Build: `CARGO_TARGET_DIR=target/build cargo build --workspace`
+- Test (full suite): `CARGO_TARGET_DIR=target/test cargo nextest run --workspace`
+- Test (single crate): `CARGO_TARGET_DIR=target/test cargo nextest run -p manifold-core`
+- Test (doc-tests, rarely needed — nextest does not run these): `CARGO_TARGET_DIR=target/test cargo test --doc --workspace`
+- Lint: `CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets`
 - Format: `cargo fmt --all`
-- Required order before committing: `cargo fmt --all` -> `cargo clippy
-  --workspace --all-targets` -> `cargo test --workspace`
+- Required order before committing: `cargo fmt --all` -> `CARGO_TARGET_DIR=target/clippy
+  cargo clippy --workspace --all-targets` -> `CARGO_TARGET_DIR=target/test cargo nextest run
+  --workspace`
+- Each command above uses its own `CARGO_TARGET_DIR` subdirectory
+  (`target/build`, `target/test`, `target/clippy`) rather than sharing one
+  `target/`. `cargo build`/`test`/`clippy` compile with different flags and
+  produce different fingerprint metadata for the same crate; sharing one
+  target dir means alternating between them invalidates each other's
+  incremental-compilation cache and forces a full rebuild every time you
+  switch commands. Separate directories let each command's cache stay warm
+  across repeated runs. Always include the `CARGO_TARGET_DIR=...` prefix
+  when running these commands manually or from a script — omitting it
+  silently falls back to the shared default `target/` and reintroduces the
+  thrashing.
 
 ### Architecture
 
