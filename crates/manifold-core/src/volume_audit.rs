@@ -1358,8 +1358,22 @@ mod tests {
         // same fixture shape as
         // `expected_fill_fraction_returns_density_deep_in_the_interior_of_a_tall_box`.
         let mesh = box_mesh(DVec3::ZERO, DVec3::new(40.0, 40.0, 40.0));
+        // `wall_offset` widened from the default 0.2 to 1.5: at `cell_size`
+        // 2.0 on this mesh, grid cell centers land at exactly {-1, 1, 3,
+        // 5, ...} along every axis (origin = min - cell_size, centers at
+        // origin + (i+0.5)*cell_size) -- so the closest an interior cell
+        // center can ever get to a face is exactly 1.0mm. The default
+        // wall threshold (`wall_offset + wall_count() * wall_line_width`
+        // = 0.2 + 1*0.4 = 0.6mm) is smaller than that 1.0mm floor, so
+        // with the default config NO cell in this grid could ever
+        // classify `Solid`, regardless of where the wall bead below is
+        // placed -- confirmed by direct calculation, and originally by
+        // this exact test failing after the zone-membership assertions
+        // below were added. Widening `wall_offset` to 1.5 raises the
+        // threshold to 1.9mm, comfortably past that 1.0mm floor.
         let config = SlicerConfig {
             infill_density: 0.2,
+            wall_offset: 1.5,
             ..SlicerConfig::default()
         };
         let cell_size = 2.0;
@@ -1404,10 +1418,33 @@ mod tests {
             );
         }
 
-        // At least one cell should register a wall-adjacent ratio near
-        // the wall bead's own known accumulation (loosely bounded --
-        // this is a display query, not a precision assertion; the goal
-        // is just confirming both zone kinds are represented).
+        // The test's own name claims both zone kinds are represented --
+        // prove it directly against the private `zone` field (same
+        // pattern `infill_aggregate_ratio_sums_across_the_whole_grid_not_per_cell`
+        // uses), rather than relying on indirect signals like non-emptiness
+        // or a nonzero ratio, neither of which can distinguish a
+        // Solid-only fixture from a mixed one.
+        assert!(
+            ratios
+                .iter()
+                .any(|(idx, _)| grid.zone[grid.flatten(*idx)] == FillZone::Solid),
+            "expected at least one Solid-zone cell (the wall bead) among the returned ratios"
+        );
+        assert!(
+            ratios
+                .iter()
+                .any(|(idx, _)| grid.zone[grid.flatten(*idx)] == FillZone::SparseInfill),
+            "expected at least one SparseInfill-zone cell (the interior infill bead) among the \
+             returned ratios"
+        );
+
+        // The zone-membership checks above only prove structural
+        // classification (a cell can be `Solid`/`SparseInfill` without
+        // ever having received any extrusion, e.g. an untouched
+        // wall-shell cell far from the wall bead) -- this checks that
+        // real deposited material actually registers a nonzero ratio
+        // somewhere in the returned set, with no claim about which cell
+        // or its position relative to either bead.
         assert!(
             ratios.iter().any(|(_, r)| *r > 0.0),
             "at least one cell should have a nonzero ratio given real extrusion was deposited"
