@@ -1609,8 +1609,6 @@ pub fn slice_mesh_with_progress(
                 // If the interior cavity has narrowed or capped under a roof, fall back to the
                 // deepest inner wall mesh that exists on this layer, or inset from wall 0.
                 let mut found_ib = Vec::new();
-                let mut satisfied_islands: std::collections::HashSet<usize> =
-                    std::collections::HashSet::new();
                 for w in (1..=wall_count).rev() {
                     if w < wall_meshes.len() {
                         let (ib_loops, _) = extract_order_contours_on_mesh_with_debug(
@@ -1646,10 +1644,15 @@ pub fn slice_mesh_with_progress(
                         // one island bifurcates at wall_count while another
                         // island genuinely supports it) -- satisfy islands
                         // independently instead of accepting or rejecting
-                        // this whole `w` for every island at once.
+                        // this whole `w` for every island at once. See
+                        // `infill_boundary_already_covers`'s doc comment for
+                        // why this checks direct geometric containment
+                        // against `found_ib` rather than a coarse
+                        // `loop_island` id.
                         for pts in valid_ib {
-                            let island = loop_island(&pts, &ib_outers, origin, basis1, basis2);
-                            if satisfied_islands.insert(island) {
+                            if !infill_boundary_already_covers(
+                                &pts, &found_ib, origin, basis1, basis2,
+                            ) {
                                 found_ib.push(pts);
                             }
                         }
@@ -1672,11 +1675,16 @@ pub fn slice_mesh_with_progress(
                             max_along,
                             field.as_ref(),
                         );
-                        // Only fill in islands the wall-mesh pass above
-                        // didn't already satisfy -- don't discard those.
+                        // Only fill in regions the wall-mesh pass above
+                        // didn't already satisfy -- don't discard those. See
+                        // `infill_boundary_already_covers`'s doc comment for
+                        // why this checks direct geometric containment
+                        // against `found_ib` rather than a coarse
+                        // `loop_island` id.
                         for pts in inset_3d {
-                            let island = loop_island(&pts, &ib_outers, origin, basis1, basis2);
-                            if satisfied_islands.insert(island) {
+                            if !infill_boundary_already_covers(
+                                &pts, &found_ib, origin, basis1, basis2,
+                            ) {
                                 found_ib.push(pts);
                             }
                         }
@@ -2795,6 +2803,85 @@ fn loop_island(
         .iter()
         .position(|out| polygon2d::point_in_polygon(mid_2d, out))
         .unwrap_or(0)
+}
+
+/// Whether candidate infill-boundary loop `pts` represents the same
+/// physical region as one already accepted into `found_ib`, tested via
+/// direct 2D point-in-polygon containment between the two loops'
+/// AREA-WEIGHTED CENTROIDS (via [`polygon2d::centroid`]) -- NOT via
+/// `loop_island`'s coarse outer-wall-topology id, and NOT via either
+/// loop's own boundary point (see below for why each of those is wrong).
+///
+/// Two loops are considered the same region if EITHER's centroid falls
+/// inside the other's polygon. Checking both directions covers both
+/// possible nesting orientations this function's caller encounters: a
+/// shallower wall's larger candidate loop nesting an already-accepted
+/// deeper (more inset, smaller) loop -- the common single-region case,
+/// where the deeper loop's own centroid falls inside the shallower
+/// candidate's larger polygon -- and the reverse.
+///
+/// **Why not a boundary point (e.g. `pts[0]`):** an earlier version of
+/// this function tested containment using each loop's own first point,
+/// which is a point ON that loop's own boundary by construction. Two
+/// loops representing the SAME physical region but derived at different
+/// depths/via different code paths (e.g. the wall-mesh-based extraction
+/// vs. the wall0-inset fallback a few lines below, which insets by only
+/// `wall_line_width` rather than the wall-mesh path's
+/// `wall_offset + wall_line_width * wall_count()`) are, in general,
+/// different shapes, not just uniformly-scaled copies of each other --
+/// especially under a curved (non-`Height`) order field. A point sitting
+/// exactly on one loop's boundary can easily fall just outside a
+/// same-region loop of a different shape/size, causing this check to
+/// wrongly treat two genuinely-the-same-region loops as disjoint (caught
+/// by `slice_mesh_curved_field_infill_boundary_is_smoothed_identically_to_inner_wall`,
+/// an existing test this exact regression broke during development).
+/// Each loop's own centroid, by contrast, sits well inside that loop's
+/// own interior (not on its boundary) and is far more likely to also
+/// fall inside a same-region loop of a different shape.
+///
+/// **Why not `loop_island`:** `loop_island` assigns an id via point-in-
+/// polygon against `ib_outers`, the OUTER (`wall_index == 0`) boundary's
+/// own topology, which is fixed for the whole layer and does not
+/// re-split when the interior bifurcates into multiple physically
+/// disjoint regions at a wall depth deeper than 0. When a cross-section
+/// is still a single connected region at wall 0 but has already split by
+/// the depth `infill_boundary` is computed at, every one of the now-
+/// disjoint candidate loops resolves to the SAME `loop_island` id against
+/// that single outer polygon -- so a `HashSet<usize>`-keyed dedup on that
+/// id treats every region after the first as an already-satisfied
+/// duplicate and silently drops it, even though each is real, physically
+/// separate geometry needing its own infill boundary. Testing direct
+/// containment between the loops THEMSELVES (not their shared outer
+/// ancestor's id) distinguishes "a redundant, shallower duplicate of a
+/// region already covered by a deeper wall pass" from "a genuinely
+/// separate physical region that happens to share an outer-topology
+/// island id" -- see
+/// `docs/superpowers/specs/2026-09-19-first-layer-infill-boundary-dropout-design.md`
+/// for the full defect writeup and
+/// `slice_mesh_infill_boundary_keeps_both_lobes_when_only_the_infill_depth_bifurcates`
+/// for the regression test this fixes.
+fn infill_boundary_already_covers(
+    pts: &[DVec3],
+    found_ib: &[Vec<DVec3>],
+    origin: DVec3,
+    basis1: DVec3,
+    basis2: DVec3,
+) -> bool {
+    if pts.is_empty() {
+        return false;
+    }
+    let to_2d = |p: DVec3| [(p - origin).dot(basis1), (p - origin).dot(basis2)];
+    let candidate_2d: Vec<[f64; 2]> = pts.iter().map(|&p| to_2d(p)).collect();
+    let candidate_centroid = polygon2d::centroid(&candidate_2d);
+    found_ib.iter().any(|existing| {
+        if existing.is_empty() {
+            return false;
+        }
+        let existing_2d: Vec<[f64; 2]> = existing.iter().map(|&p| to_2d(p)).collect();
+        let existing_centroid = polygon2d::centroid(&existing_2d);
+        polygon2d::point_in_polygon(candidate_centroid, &existing_2d)
+            || polygon2d::point_in_polygon(existing_centroid, &candidate_2d)
+    })
 }
 
 /// Drops wall `w`'s loops, per island, that are a fragmentation artifact of
@@ -7751,12 +7838,13 @@ mod tests {
     /// dropped when the interior bifurcates deeper than the outer wall
     /// has, confirmed live against the real reported case via
     /// `crates/manifold-cli/examples/probe_island_partitioning.rs`'s
-    /// instrumented output (both split loops compute the SAME `island` id
-    /// via point-in-polygon against the still-unsplit `wall_index == 0`
-    /// outline, so `slicing.rs`'s `satisfied_islands: HashSet<usize>`
-    /// dedup in the infill-boundary derivation loop -- around the
-    /// `for w in (1..=wall_count).rev() { ... if satisfied_islands.insert(island) { ... } }`
-    /// block -- silently keeps only the first of the two loops).
+    /// instrumented output (both split loops used to compute the SAME
+    /// `island` id via point-in-polygon against the still-unsplit
+    /// `wall_index == 0` outline, so the infill-boundary derivation
+    /// loop's now-removed `satisfied_islands: HashSet<usize>` dedup
+    /// silently kept only the first of the two loops -- fixed by
+    /// `infill_boundary_already_covers`, which checks direct geometric
+    /// containment between candidate loops instead of that coarse id).
     fn dumbbell_mesh(z_min: f64, z_max: f64, waist_width: f64) -> Mesh {
         let hw = waist_width / 2.0;
         // Outline, counter-clockwise as viewed from above (+Z looking down
