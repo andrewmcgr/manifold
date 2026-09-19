@@ -92,7 +92,9 @@ impl UploadedMesh {
                 .collect();
             let faces: Vec<[usize; 3]> = mesh
                 .indices
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
                 .collect();
             Some(manifold_fidget::surface_eikonal::solve_surface_eikonal(
@@ -117,7 +119,7 @@ impl UploadedMesh {
             .unwrap_or(1.0);
 
         let mut vertices = Vec::with_capacity(mesh.indices.len());
-        for triangle in mesh.indices.chunks_exact(3) {
+        for triangle in mesh.indices.as_chunks::<3>().0 {
             let [a, b, c] = [triangle[0], triangle[1], triangle[2]];
             let world = |i: u32| object_transform.transform_point(mesh.vertices[i as usize]);
             let (pa, pb, pc) = (world(a), world(b), world(c));

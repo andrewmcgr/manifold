@@ -693,7 +693,9 @@ impl GpuDualFieldToolpath {
             let data = lines_slice.get_mapped_range();
             let raw_vecs: &[[f32; 4]] = bytemuck::cast_slice(&data[0..line_count * 2 * 16]);
             raw_vecs
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     (
                         DVec3::new(pair[0][0] as f64, pair[0][1] as f64, pair[0][2] as f64),
@@ -1189,7 +1191,9 @@ impl GpuTpmsInfill {
             let data = lines_slice.get_mapped_range();
             let raw_vecs: &[[f32; 4]] = bytemuck::cast_slice(&data[0..line_count * 2 * 16]);
             raw_vecs
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     (
                         DVec3::new(pair[0][0] as f64, pair[0][1] as f64, pair[0][2] as f64),

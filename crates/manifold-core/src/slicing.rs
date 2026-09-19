@@ -742,14 +742,18 @@ pub fn slice_mesh_with_progress(
 
     let faces: Vec<[usize; 3]> = mesh
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
         .collect();
     let sdf = Arc::new(MeshSdf::new(mesh.vertices.clone(), faces.clone()));
 
     let non_cap_faces: Vec<[usize; 3]> = mesh
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .filter_map(|chunk| {
             let [i0, i1, i2] = [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
             let v0 = mesh.vertices[i0];

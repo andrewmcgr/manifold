@@ -43,7 +43,9 @@ fn main() {
     // Build order field (same as slicing pipeline)
     let faces: Vec<[usize; 3]> = mesh
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
         .collect();
     let sdf = MeshSdf::new(mesh.vertices.clone(), faces);

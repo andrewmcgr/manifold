@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
     let sample_spacing = 0.75;
     let mesh = &objects[0].mesh;
     let mut samples: Vec<(DVec3, DVec3)> = Vec::new(); // (point, face normal)
-    for tri in mesh.indices.chunks_exact(3) {
+    for tri in mesh.indices.as_chunks::<3>().0 {
         let (a, b, c) = (
             vertices[tri[0] as usize],
             vertices[tri[1] as usize],

@@ -2435,7 +2435,9 @@ pub fn append_end_of_print_wipe_and_clearance(
         .as_ref()
         .map(|m| {
             m.indices
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
                 .collect()
         })
@@ -5866,7 +5868,9 @@ mod tests {
         let sdf = test_cube_mesh();
         let faces: Vec<[usize; 3]> = sdf
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
             .collect();
         let mesh_sdf = MeshSdf::new(sdf.vertices.clone(), faces);
@@ -6718,7 +6722,9 @@ mod tests {
         let mesh = test_cube_mesh(); // Cube from (0,0,0) to (10,10,10)
         let faces: Vec<[usize; 3]> = mesh
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
             .collect();
         let sdf = Arc::new(manifold_fidget::mesh_sdf::MeshSdf::new(

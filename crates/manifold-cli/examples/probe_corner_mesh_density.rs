@@ -33,7 +33,9 @@ fn main() -> anyhow::Result<()> {
 
     let faces: Vec<[usize; 3]> = mesh
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
         .collect();
     println!(

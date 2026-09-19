@@ -473,7 +473,7 @@ impl ManifoldApp {
             }
 
             // Triangle intersection
-            for chunk in object.mesh.indices.chunks_exact(3) {
+            for chunk in object.mesh.indices.as_chunks::<3>().0 {
                 let v0 = object.mesh.vertices[chunk[0] as usize];
                 let v1 = object.mesh.vertices[chunk[1] as usize];
                 let v2 = object.mesh.vertices[chunk[2] as usize];
@@ -2897,7 +2897,9 @@ impl ManifoldApp {
         let mesh = &object.mesh;
         let faces: Vec<[usize; 3]> = mesh
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
             .collect();
         let mut sdf = manifold_fidget::mesh_sdf::MeshSdf::new(mesh.vertices.clone(), faces);
@@ -3055,7 +3057,9 @@ impl ManifoldApp {
             .collect();
         let faces: Vec<[usize; 3]> = mesh
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|tri| [tri[0] as usize, tri[1] as usize, tri[2] as usize])
             .collect();
 

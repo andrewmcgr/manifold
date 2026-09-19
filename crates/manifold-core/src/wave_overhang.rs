@@ -567,7 +567,9 @@ pub fn plan_wave_overhangs(
             let mesh = &obj.mesh;
             let faces: Vec<[usize; 3]> = mesh
                 .indices
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
                 .collect();
             let (min, _) = match mesh.bounding_box() {

@@ -341,7 +341,7 @@ pub fn generate_straight_bridge_paths_2d(
         t_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         // Group into segments inside the polygon
-        for chunk in t_values.chunks_exact(2) {
+        for chunk in t_values.as_chunks::<2>().0 {
             let t_start = chunk[0];
             let t_end = chunk[1];
             if t_end - t_start < nozzle_diameter * 0.75 {

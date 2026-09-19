@@ -118,7 +118,9 @@ pub fn order_field_for_with_sdf(
     };
     let faces: Vec<[usize; 3]> = mesh
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
         .collect();
     if faces.is_empty() {
@@ -264,7 +266,9 @@ fn eikonal_field_for(
 
     let faces: Vec<[usize; 3]> = mesh
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
         .collect();
     if faces.is_empty() {
@@ -570,7 +574,9 @@ fn fsm_field_for(
 
     let faces: Vec<[usize; 3]> = mesh
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
         .collect();
 

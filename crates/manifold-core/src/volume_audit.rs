@@ -334,7 +334,9 @@ pub fn audit_extrusion_volume(
 
     let faces: Vec<[usize; 3]> = mesh
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
         .collect();
     let mesh_sdf = MeshSdf::new(mesh.vertices.clone(), faces.clone());
@@ -730,7 +732,9 @@ mod tests {
     fn mesh_sdf_for(mesh: &Mesh) -> MeshSdf {
         let faces: Vec<[usize; 3]> = mesh
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
             .collect();
         MeshSdf::new(mesh.vertices.clone(), faces)
@@ -739,7 +743,9 @@ mod tests {
     fn bed_excluded_sdf_for(mesh: &Mesh, min_z: f64) -> MeshSdf {
         let faces: Vec<[usize; 3]> = mesh
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
             .collect();
         let non_bed_faces = crate::mesh::non_bed_floor_faces(mesh, min_z);

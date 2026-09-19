@@ -1084,8 +1084,10 @@ pub fn extract_order_contours_on_mesh_with_debug(
     let target_order = order_value + 1e-5 * order_value.abs().max(1.0);
 
     for (tri, v_chunk) in triangle_positions
-        .chunks_exact(3)
-        .zip(triangle_orders.chunks_exact(3))
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(triangle_orders.as_chunks::<3>().0.iter())
     {
         let p = [tri[0], tri[1], tri[2]];
         let v = [v_chunk[0], v_chunk[1], v_chunk[2]];

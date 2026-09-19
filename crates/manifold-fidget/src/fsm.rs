@@ -832,9 +832,7 @@ mod tests {
         // Metric tensor M = D^-1 = diag(0.25, 1.0, 1.0)
         let mut tensor_grid = TensorGrid::new_isotropic(min, dims, h);
         let m = MetricTensor3::from_diagonal(0.25, 1.0, 1.0);
-        for t in &mut tensor_grid.tensors {
-            *t = m;
-        }
+        tensor_grid.tensors.fill(m);
 
         let is_solid = |_p: DVec3| true;
         let is_seed = |p: DVec3| (p.distance(DVec3::ZERO) < 0.5).then_some(0.0);

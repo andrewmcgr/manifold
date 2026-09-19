@@ -51,7 +51,9 @@ impl Mesh {
 /// needed" case callers already handle by reusing their original SDF.
 pub(crate) fn non_bed_floor_faces(mesh: &Mesh, min_z: f64) -> Vec<[usize; 3]> {
     mesh.indices
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .filter_map(|chunk| {
             let [i0, i1, i2] = [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize];
             let v0 = mesh.vertices[i0];

@@ -46,7 +46,7 @@ fn main() {
     let verts = &mesh.vertices;
     let idx = &mesh.indices;
     let mut tops: Vec<(f64, f64, f64, f64)> = Vec::new(); // (cx, cy, cz, area)
-    for tri in idx.chunks_exact(3) {
+    for tri in idx.as_chunks::<3>().0 {
         let a = verts[tri[0] as usize];
         let b = verts[tri[1] as usize];
         let c = verts[tri[2] as usize];
@@ -90,7 +90,9 @@ fn main() {
 
     // Build the order field once.
     let faces: Vec<[usize; 3]> = idx
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|chunk| [chunk[0] as usize, chunk[1] as usize, chunk[2] as usize])
         .collect();
     let sdf = MeshSdf::new(verts.clone(), faces);

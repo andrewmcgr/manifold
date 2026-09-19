@@ -244,7 +244,7 @@ fn find_scanline_crossings(
     crossings.sort_by(|a, b| a.u.total_cmp(&b.u));
 
     let mut pairs: Vec<ScanSegment> = Vec::new();
-    for pair in crossings.chunks_exact(2) {
+    for pair in crossings.as_chunks::<2>().0 {
         pairs.push((pair[0].point, pair[1].point));
     }
     pairs
