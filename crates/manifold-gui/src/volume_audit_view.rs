@@ -29,11 +29,6 @@ const OUTSIDE_MESH_COLOR: [f32; 4] = [0.95, 0.05, 0.85, 1.0];
 
 /// The six axis-aligned face normals of a cube, in the same face order
 /// `push_cube`'s vertex generation below uses.
-///
-/// `#[allow(dead_code)]`: this module's public API (`build_volume_audit_cells`)
-/// has no production caller yet -- Task 3 of this plan wires it into
-/// `render.rs`/`app.rs`. Remove this allow once that lands.
-#[allow(dead_code)]
 const FACE_NORMALS: [DVec3; 6] = [
     DVec3::new(1.0, 0.0, 0.0),
     DVec3::new(-1.0, 0.0, 0.0),
@@ -46,7 +41,6 @@ const FACE_NORMALS: [DVec3; 6] = [
 /// Appends 36 vertices (12 triangles, non-indexed, one flat color for
 /// the whole cube) for an axis-aligned cube centered at `center` with
 /// half-extent `half_size` in every axis.
-#[allow(dead_code)]
 fn push_cube(out: &mut Vec<VolumeAuditCellVertex>, center: DVec3, half_size: f64, color: [f32; 4]) {
     let h = half_size;
     // Per-face 4 corners (in a consistent winding), split into 2
@@ -112,13 +106,40 @@ fn push_cube(out: &mut Vec<VolumeAuditCellVertex>, center: DVec3, half_size: f64
     }
 }
 
-/// Maps a fill ratio (`accumulated / expected`) to a color on the
-/// existing blue (under) -> green (healthy at 1.0) -> red (over) scale.
-/// See this plan's design spec's "Color mapping" section for the exact
-/// formula.
-#[allow(dead_code)]
-fn ratio_to_color(ratio: f64) -> [f32; 4] {
-    let deviation = (ratio - 1.0).clamp(-1.0, 1.0);
+/// Maps a fill ratio (`accumulated / expected`) to a color on the blue
+/// (under) -> green (healthy at 1.0) -> red (over) scale, auto-normalized
+/// against `min_ratio`/`max_ratio` -- the actual minimum and maximum
+/// ratio observed across every cell in the current audit run (see
+/// [`build_volume_audit_cells`]).
+///
+/// A fixed absolute scale (e.g. always clamping to `[0, 2]`) made nearly
+/// every cell in a real print read the same narrow shade, because the
+/// systematic sparse-infill nominal-density mismatch (documented on
+/// `VolumeAuditGrid::overfilled_cells`) dominates the range with a
+/// roughly constant, non-defect deviation -- observed directly: a real
+/// slice's cells clustered around ratio ~1.6-1.8, all rendering as the
+/// same shade of orange, leaving no visible distinction between a
+/// genuine defect and routine sparse-infill noise. Auto-normalizing
+/// spreads whatever variation is actually present across the full
+/// color range instead.
+///
+/// `ratio == 1.0` always maps to the exact green midpoint regardless of
+/// `min_ratio`/`max_ratio`, and the two sides are scaled independently
+/// (`[min_ratio, 1.0]` stretched to blue..green, `[1.0, max_ratio]`
+/// stretched to green..red) so a healthy print's true center is never
+/// skewed by an asymmetric spread of over- vs. under-fill.
+fn ratio_to_color(ratio: f64, min_ratio: f64, max_ratio: f64) -> [f32; 4] {
+    let deviation = if ratio >= 1.0 {
+        if max_ratio > 1.0 {
+            ((ratio - 1.0) / (max_ratio - 1.0)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    } else if min_ratio < 1.0 {
+        -((1.0 - ratio) / (1.0 - min_ratio)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let t = 0.5 + 0.5 * deviation;
     crate::toolpath_view::scalar_to_color(t)
 }
@@ -137,10 +158,13 @@ fn ratio_to_color(ratio: f64) -> [f32; 4] {
 /// design spec for why), so without this filter a healthy sparse-infill
 /// interior would visually swamp genuine wall-shell defects.
 ///
+/// Color is auto-normalized against the actual min/max ratio observed
+/// across every cell in this run -- see [`ratio_to_color`]'s doc comment
+/// for why a fixed absolute scale doesn't work here.
+///
 /// `shrink_factor` (`(0.0, 1.0]`) draws each cube at
 /// `cell_size * shrink_factor` rather than the full cell size, leaving a
 /// visible gap between adjacent cells.
-#[allow(dead_code)]
 pub fn build_volume_audit_cells(
     grid: &VolumeAuditGrid,
     deviation_threshold: f64,
@@ -154,7 +178,14 @@ pub fn build_volume_audit_cells(
     let half_size = grid.cell_size() * shrink_factor * 0.5;
     let mut vertices = Vec::new();
 
-    for (idx, ratio) in grid.cell_ratios_for_display() {
+    let ratios = grid.cell_ratios_for_display();
+    let (min_ratio, max_ratio) = ratios
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &(_, r)| {
+            (lo.min(r), hi.max(r))
+        });
+
+    for (idx, ratio) in ratios {
         if (ratio - 1.0).abs() < deviation_threshold {
             continue;
         }
@@ -162,7 +193,7 @@ pub fn build_volume_audit_cells(
             &mut vertices,
             grid.cell_center(idx),
             half_size,
-            ratio_to_color(ratio),
+            ratio_to_color(ratio, min_ratio, max_ratio),
         );
     }
 
@@ -318,5 +349,78 @@ mod tests {
             vertices.iter().any(|v| v.color == OUTSIDE_MESH_COLOR),
             "outside-the-mesh defect cubes must never be hidden by deviation_threshold"
         );
+    }
+
+    #[test]
+    fn ratio_to_color_maps_extremes_to_the_scale_endpoints() {
+        // Healthy ratio (== 1.0) is always exact green, regardless of spread.
+        assert_eq!(
+            ratio_to_color(1.0, 0.2, 3.0),
+            crate::toolpath_view::scalar_to_color(0.5)
+        );
+        // The observed maximum maps to the pure red end (t = 1.0).
+        assert_eq!(
+            ratio_to_color(3.0, 0.2, 3.0),
+            crate::toolpath_view::scalar_to_color(1.0)
+        );
+        // The observed minimum maps to the pure blue end (t = 0.0).
+        assert_eq!(
+            ratio_to_color(0.2, 0.2, 3.0),
+            crate::toolpath_view::scalar_to_color(0.0)
+        );
+    }
+
+    #[test]
+    fn ratio_to_color_spreads_a_tight_cluster_across_the_full_range() {
+        // The bug this normalization fixes: a fixed absolute scale made a
+        // tight cluster of ratios (e.g. 1.55-1.65, all landing near one
+        // shade of orange) visually indistinguishable from each other,
+        // hiding real defects among routine sparse-infill noise. Once
+        // normalized against their own min/max, the two ends of even a
+        // tight cluster must still be visually distinct.
+        let low = ratio_to_color(1.55, 1.55, 1.65);
+        let high = ratio_to_color(1.65, 1.55, 1.65);
+        assert_ne!(
+            low, high,
+            "a tight, non-trivial ratio spread must still produce visually distinct colors"
+        );
+    }
+
+    #[test]
+    fn ratio_to_color_flat_population_at_healthy_ratio_is_green() {
+        // If every displayed cell happens to have ratio exactly 1.0 (the
+        // designed special case, independent of min/max), the result
+        // must be exact green.
+        let flat_healthy = ratio_to_color(1.0, 1.0, 1.0);
+        assert_eq!(flat_healthy, crate::toolpath_view::scalar_to_color(0.5));
+    }
+
+    #[test]
+    fn ratio_to_color_flat_population_away_from_healthy_never_panics_or_produces_nan() {
+        // If every displayed cell shares the SAME non-1.0 ratio (min ==
+        // max == ratio), that single value is trivially both the min
+        // and the max of its own population, so it legitimately renders
+        // at the corresponding scale extreme rather than green -- what
+        // this test actually checks is that the division by
+        // `max_ratio - 1.0` (or the mirrored underfill formula) never
+        // divides by zero or produces NaN in that case.
+        let overfilled_flat = ratio_to_color(1.3, 1.3, 1.3);
+        assert!(overfilled_flat.iter().all(|c| c.is_finite()));
+        let underfilled_flat = ratio_to_color(0.4, 0.4, 0.4);
+        assert!(underfilled_flat.iter().all(|c| c.is_finite()));
+    }
+
+    #[test]
+    fn ratio_to_color_defensive_branches_never_panic_on_inconsistent_input() {
+        // These inputs are internally inconsistent (the ratio falls
+        // outside its own claimed min/max) and should never arise from
+        // a real `build_volume_audit_cells` call, since min/max are
+        // always derived from the exact same population being colored
+        // -- but the function must still degrade safely (no panic, no
+        // NaN) rather than assume its caller is well-behaved.
+        let a = ratio_to_color(0.5, 1.5, 2.0);
+        assert!(a.iter().all(|c| c.is_finite()));
+        let b = ratio_to_color(2.0, 0.5, 0.8);
+        assert!(b.iter().all(|c| c.is_finite()));
     }
 }

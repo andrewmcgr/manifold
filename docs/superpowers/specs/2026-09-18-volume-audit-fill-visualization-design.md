@@ -41,13 +41,7 @@ of a new, plain `#[repr(C)]` vertex struct with an explicit color field.
 
 ### Color mapping
 
-For a cell with ratio `r = accumulated / expected`:
-- `deviation = (r - 1.0).clamp(-1.0, 1.0)`
-- `t = 0.5 + 0.5 * deviation` (`t` in `[0, 1]`)
-- `color = toolpath_view::scalar_to_color(t)` (the existing 5-stop
-  blue->cyan->green->yellow->red gradient already used for toolpath
-  data-view heatmaps) — `r = 0` -> blue, `r = 1` -> green, `r >= 2` ->
-  red, clamped beyond.
+**Superseded by direct user feedback after this feature shipped and was visually tested:** a fixed absolute scale (`deviation = (r - 1.0).clamp(-1.0, 1.0)`, `r = 0 -> blue`, `r = 1 -> green`, `r >= 2 -> red`) made nearly every visible cell in a real print read the same narrow shade of orange, because the systematic sparse-infill nominal-density mismatch (see `VolumeAuditGrid::overfilled_cells`'s doc comment) dominates the range with a roughly constant, non-defect deviation -- observed directly at ratio ~1.6-1.8 across most displayed cells. The mapping now auto-normalizes against the actual minimum and maximum ratio observed across every cell in the current audit run: `ratio == 1.0` always maps to the exact green midpoint, and the two sides are scaled independently against that run's own observed extremes (`[min_ratio, 1.0]` stretched to blue..green, `[1.0, max_ratio]` stretched to green..red), so whatever real variation is present is always visible regardless of scale. See `crates/manifold-gui/src/volume_audit_view.rs`'s `ratio_to_color` for the exact formula.
 
 A cell holding material where **none** is expected at all (`expected ==
 0`, i.e. the `extrusion_outside_mesh_cells` binary defect case) has no
