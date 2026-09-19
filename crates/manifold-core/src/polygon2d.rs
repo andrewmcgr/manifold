@@ -523,6 +523,38 @@ pub fn signed_area(loop_: &[[f64; 2]]) -> f64 {
     area * 0.5
 }
 
+/// Area-weighted (shoelace) centroid of a closed 2D loop -- unlike a plain
+/// average of the loop's own points, this is invariant to how densely or
+/// unevenly the loop happens to be sampled, and (for reasonably-shaped,
+/// non-pathologically-concave loops) reliably lands inside the polygon's
+/// own interior rather than on its boundary. Fewer than 3 points, or a
+/// degenerate (zero-area) loop, falls back to the arithmetic mean of the
+/// loop's points (or `[0.0, 0.0]` for an empty loop) rather than dividing
+/// by zero.
+pub fn centroid(loop_: &[[f64; 2]]) -> [f64; 2] {
+    let area = signed_area(loop_);
+    if loop_.len() < 3 || area.abs() < 1e-12 {
+        if loop_.is_empty() {
+            return [0.0, 0.0];
+        }
+        let n = loop_.len() as f64;
+        let (sx, sy) = loop_
+            .iter()
+            .fold((0.0, 0.0), |(sx, sy), &[x, y]| (sx + x, sy + y));
+        return [sx / n, sy / n];
+    }
+    let (mut cx, mut cy) = (0.0, 0.0);
+    for i in 0..loop_.len() {
+        let [x0, y0] = loop_[i];
+        let [x1, y1] = loop_[(i + 1) % loop_.len()];
+        let cross = x0 * y1 - x1 * y0;
+        cx += (x0 + x1) * cross;
+        cy += (y0 + y1) * cross;
+    }
+    let scale = 1.0 / (6.0 * area);
+    [cx * scale, cy * scale]
+}
+
 /// Standard even-odd point-in-polygon ray cast. `loop_` is treated as closed.
 pub fn point_in_polygon(point: [f64; 2], loop_: &[[f64; 2]]) -> bool {
     if loop_.len() < 3 {
@@ -838,6 +870,48 @@ mod tests {
 
     fn approx_eq(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn centroid_of_an_axis_aligned_square_is_its_geometric_center() {
+        let sq = square(2.0, 3.0, 4.0);
+        let [cx, cy] = centroid(&sq);
+        assert!(approx_eq(cx, 4.0), "expected cx 4.0, got {cx}");
+        assert!(approx_eq(cy, 5.0), "expected cy 5.0, got {cy}");
+    }
+
+    #[test]
+    fn centroid_is_unaffected_by_starting_vertex_or_uneven_sampling() {
+        // Same square as a triangle-fan-style asymmetric point distribution
+        // (extra points crowded near one corner) -- the area-weighted
+        // centroid must still land at the true geometric center, unlike a
+        // plain average of the loop's own points (which would be pulled
+        // toward the crowded corner).
+        let lopsided = vec![
+            [0.0, 0.0],
+            [0.5, 0.0],
+            [1.0, 0.0],
+            [1.5, 0.0],
+            [2.0, 0.0],
+            [2.0, 2.0],
+            [0.0, 2.0],
+        ];
+        let [cx, cy] = centroid(&lopsided);
+        assert!(approx_eq(cx, 1.0), "expected cx 1.0, got {cx}");
+        assert!(approx_eq(cy, 1.0), "expected cy 1.0, got {cy}");
+    }
+
+    #[test]
+    fn centroid_falls_back_to_point_average_for_a_degenerate_loop() {
+        // Fewer than 3 points: no meaningful area, so the fallback (plain
+        // average) is the only sane definition -- must not divide by zero.
+        let degenerate = vec![[0.0, 0.0], [2.0, 0.0]];
+        let [cx, cy] = centroid(&degenerate);
+        assert!(approx_eq(cx, 1.0));
+        assert!(approx_eq(cy, 0.0));
+
+        let empty: Vec<[f64; 2]> = Vec::new();
+        assert_eq!(centroid(&empty), [0.0, 0.0]);
     }
 
     /// Signed shoelace area of a single loop (positive for CCW, negative for CW).
