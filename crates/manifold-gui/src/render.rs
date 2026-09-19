@@ -472,6 +472,7 @@ struct OffscreenTarget {
 pub struct MeshRenderResources {
     pipeline: wgpu::RenderPipeline,
     mesh_transparent_pipeline: wgpu::RenderPipeline,
+    mesh_transparent_single_sided_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     scene_line_pipeline: wgpu::RenderPipeline,
     scene_tri_pipeline: wgpu::RenderPipeline,
@@ -585,6 +586,51 @@ impl MeshRenderResources {
                 }),
                 primitive: wgpu::PrimitiveState {
                     cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(depth_stencil_state(false)),
+                multisample: multisample_state,
+                multiview: None,
+                cache: None,
+            });
+
+        // Single-sided semi-transparent mesh variant used when the
+        // volume-audit visualization is active without toolpaths. Reuses
+        // `fs_transparent` exactly (same alpha, same lighting) -- only
+        // `cull_mode` differs from `mesh_transparent_pipeline` above.
+        //
+        // `mesh_transparent_pipeline`'s `cull_mode: None` is deliberate for
+        // toolpath x-ray viewing (see internal toolpaths from any angle,
+        // through both the near AND far mesh surface), but reusing it for
+        // volume-audit produced a confusing "inside-out" look: with both
+        // surfaces rendered and no back-to-front alpha sort, the normally-
+        // hidden far (back-facing) triangles blend visibly over the near
+        // surface. Volume-audit only needs the model to look like its
+        // normal single-sided shape, just partially see-through, so audit
+        // cubes sitting near the outer surface aren't hidden by ordinary
+        // opaque depth testing -- not full double-sided x-ray.
+        let mesh_transparent_single_sided_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("manifold mesh transparent single-sided pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &vertex_buffers,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_transparent",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: Some(wgpu::Face::Back),
                     ..Default::default()
                 },
                 depth_stencil: Some(depth_stencil_state(false)),
@@ -926,6 +972,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         Self {
             pipeline,
             mesh_transparent_pipeline,
+            mesh_transparent_single_sided_pipeline,
             overlay_pipeline,
             scene_line_pipeline,
             scene_tri_pipeline,
@@ -1131,21 +1178,42 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 rpass.draw(0..24, 0..tp.line_instance_count);
             }
 
-            // Draw the mesh semi-transparently (rather than opaque) whenever
-            // toolpaths OR volume-audit cells are visible, so both auxiliary
-            // overlays remain visible through the model shell instead of
-            // being hidden by ordinary depth testing against the opaque
-            // mesh. The volume-audit case specifically needs this: a cell
-            // marking MISSING wall material sits essentially at the mesh's
-            // own outer surface (within `wall_offset + wall_count *
-            // wall_line_width` of it, by definition), so its depth is
-            // nearly identical to the opaque surface facing the camera at
-            // that XY position -- the opaque mesh pipeline (depth-writing)
-            // would silently discard the audit cube behind it, exactly
-            // where a real defect is most likely to be, even though the
-            // mesh geometry itself is intact and unaffected by the defect.
-            if toolpaths.is_some() || volume_audit_cells.is_some() {
+            // Choose a mesh render mode based on which auxiliary overlays
+            // are active. Three modes, in priority order:
+            //
+            // 1. Toolpaths visible: double-sided x-ray transparency
+            //    (`mesh_transparent_pipeline`, `cull_mode: None`) so
+            //    internal toolpaths remain visible from any angle, through
+            //    both the near and far mesh surface -- takes priority over
+            //    volume-audit's mode below since toolpaths genuinely need
+            //    the full x-ray view.
+            // 2. Volume-audit cells visible (toolpaths off): single-sided
+            //    transparency (`mesh_transparent_single_sided_pipeline`,
+            //    `cull_mode: Back`) -- the model keeps its normal single-
+            //    sided shape, just partially see-through, so audit cubes
+            //    sitting near the outer surface aren't hidden by ordinary
+            //    opaque depth testing. A cell marking MISSING wall
+            //    material sits essentially at the mesh's own outer surface
+            //    (within `wall_offset + wall_count * wall_line_width` of
+            //    it, by definition), so its depth is nearly identical to
+            //    the opaque surface facing the camera at that XY position
+            //    -- the fully opaque pipeline would silently discard the
+            //    audit cube behind it, exactly where a real defect is most
+            //    likely to be. Deliberately NOT the double-sided pipeline
+            //    above: with both mesh surfaces rendered and no back-to-
+            //    front alpha sort, the normally-hidden far (back-facing)
+            //    triangles blend visibly over the near surface, producing
+            //    a confusing "inside-out" look that double-sided x-ray
+            //    transparency doesn't need to pay for here.
+            // 3. Neither visible: normal opaque, depth-writing mesh.
+            if toolpaths.is_some() {
                 rpass.set_pipeline(&self.mesh_transparent_pipeline);
+                for mesh in meshes {
+                    rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    rpass.draw(0..mesh.vertex_count, 0..1);
+                }
+            } else if volume_audit_cells.is_some() {
+                rpass.set_pipeline(&self.mesh_transparent_single_sided_pipeline);
                 for mesh in meshes {
                     rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     rpass.draw(0..mesh.vertex_count, 0..1);

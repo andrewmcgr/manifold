@@ -25,7 +25,14 @@ pub struct VolumeAuditCellVertex {
 /// (material where none is expected at all) -- a defect at any
 /// magnitude, so distinct from the ratio-based blue/green/red scale and
 /// never hidden by `deviation_threshold`.
-const OUTSIDE_MESH_COLOR: [f32; 4] = [0.95, 0.05, 0.85, 1.0];
+const OUTSIDE_MESH_COLOR: [f32; 4] = [0.95, 0.05, 0.85, CUBE_ALPHA];
+
+/// Shared opacity for every volume-audit cube (both the ratio-based scale
+/// and [`OUTSIDE_MESH_COLOR`]). Semi-transparent rather than fully opaque
+/// so overlapping/nearby cubes, and the now-semi-transparent mesh surface
+/// itself (see `render.rs`'s `mesh_transparent_single_sided_pipeline`),
+/// remain individually distinguishable instead of a solid colored mass.
+const CUBE_ALPHA: f32 = 0.7;
 
 /// The six axis-aligned face normals of a cube, in the same face order
 /// `push_cube`'s vertex generation below uses.
@@ -141,7 +148,8 @@ fn ratio_to_color(ratio: f64, min_ratio: f64, max_ratio: f64) -> [f32; 4] {
         0.0
     };
     let t = 0.5 + 0.5 * deviation;
-    crate::toolpath_view::scalar_to_color(t)
+    let [r, g, b, _] = crate::toolpath_view::scalar_to_color(t);
+    [r, g, b, CUBE_ALPHA]
 }
 
 /// Builds a non-indexed triangle-list cube (12 triangles, 36 vertices)
@@ -353,21 +361,36 @@ mod tests {
 
     #[test]
     fn ratio_to_color_maps_extremes_to_the_scale_endpoints() {
+        // Compare RGB against `scalar_to_color`'s reference gradient; alpha
+        // is deliberately CUBE_ALPHA (not scalar_to_color's own 1.0), see
+        // `ratio_to_color_uses_the_shared_cube_alpha_not_scalar_to_colors_own`.
+        let rgb = |c: [f32; 4]| [c[0], c[1], c[2]];
+
         // Healthy ratio (== 1.0) is always exact green, regardless of spread.
         assert_eq!(
-            ratio_to_color(1.0, 0.2, 3.0),
-            crate::toolpath_view::scalar_to_color(0.5)
+            rgb(ratio_to_color(1.0, 0.2, 3.0)),
+            rgb(crate::toolpath_view::scalar_to_color(0.5))
         );
         // The observed maximum maps to the pure red end (t = 1.0).
         assert_eq!(
-            ratio_to_color(3.0, 0.2, 3.0),
-            crate::toolpath_view::scalar_to_color(1.0)
+            rgb(ratio_to_color(3.0, 0.2, 3.0)),
+            rgb(crate::toolpath_view::scalar_to_color(1.0))
         );
         // The observed minimum maps to the pure blue end (t = 0.0).
         assert_eq!(
-            ratio_to_color(0.2, 0.2, 3.0),
-            crate::toolpath_view::scalar_to_color(0.0)
+            rgb(ratio_to_color(0.2, 0.2, 3.0)),
+            rgb(crate::toolpath_view::scalar_to_color(0.0))
         );
+    }
+
+    #[test]
+    fn ratio_to_color_uses_the_shared_cube_alpha_not_scalar_to_colors_own() {
+        // `scalar_to_color` itself always returns alpha 1.0 (used elsewhere,
+        // e.g. toolpath heatmaps, at full opacity); `ratio_to_color` must
+        // override that with the shared `CUBE_ALPHA` so audit cubes render
+        // semi-transparently.
+        assert_eq!(ratio_to_color(1.0, 0.2, 3.0)[3], CUBE_ALPHA);
+        assert_ne!(CUBE_ALPHA, 1.0, "test is vacuous if CUBE_ALPHA is opaque");
     }
 
     #[test]
@@ -392,7 +415,11 @@ mod tests {
         // designed special case, independent of min/max), the result
         // must be exact green.
         let flat_healthy = ratio_to_color(1.0, 1.0, 1.0);
-        assert_eq!(flat_healthy, crate::toolpath_view::scalar_to_color(0.5));
+        let [r, g, b, _] = crate::toolpath_view::scalar_to_color(0.5);
+        assert_eq!(
+            [flat_healthy[0], flat_healthy[1], flat_healthy[2]],
+            [r, g, b]
+        );
     }
 
     #[test]
