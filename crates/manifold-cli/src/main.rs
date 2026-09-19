@@ -30,6 +30,19 @@ struct Cli {
     #[arg(short, long, default_value = "out.gcode")]
     output: std::path::PathBuf,
 
+    /// Load machine + slicer settings from a saved profile JSON file (the
+    /// same format `manifold-gui`'s Settings panel writes via its Save
+    /// Profile action: a top-level `{"machine": ..., "config": ...}`
+    /// object). When given, this fully replaces both the machine (build
+    /// volume, tools, slope-profile clearance, etc.) and the slicer
+    /// config that would otherwise be built from the individual flags
+    /// below -- layer height, nozzle diameter, order field, infill
+    /// settings, and every other slicing flag are all ignored in favor
+    /// of the profile's own values. `--inputs`/`--output` and the
+    /// printer upload flags still apply normally.
+    #[arg(long)]
+    profile: Option<std::path::PathBuf>,
+
     /// Layer height in millimeters.
     #[arg(long, default_value_t = 0.2)]
     layer_height: f64,
@@ -318,65 +331,11 @@ fn main() -> Result<()> {
         objects.extend(load_objects(&path, tool, &mut next_object_id)?);
     }
 
-    let eikonal_slope_profile = match &cli.eikonal_slope_profile {
-        Some(s) => parse_slope_profile(s).map_err(|e| anyhow::anyhow!(e))?,
-        None => Vec::new(),
-    };
-
-    let config = SlicerConfig {
-        layer_height: cli.layer_height,
-        nozzle_diameter: cli.nozzle_diameter,
-        order_field: cli.order_field.into(),
-        wave_overhangs_enabled: cli.wave_overhangs,
-        wave_overhang_overlap: cli.wave_overhang_overlap,
-        wave_overhang_speed: cli.wave_overhang_speed.map(|s| s * 60.0),
-        wave_overhang_flow: cli.wave_overhang_flow,
-        fan_speed_percent: cli.fan_speed,
-        overhang_fan_speed_percent: cli.overhang_fan_speed,
-        fan_layer_delay: cli.fan_layer_delay,
-        speed_deadband_percent: cli.speed_deadband,
-        acceleration_deadband_percent: cli.acceleration_deadband,
-        square_corner_velocity: cli.square_corner_velocity,
-        default_nozzle_temperature: cli.nozzle_temp,
-        bed_temperature: cli.bed_temp,
-        chamber_temperature: cli.chamber_temp,
-        fluid_dynamics: if cli.fluid_dynamics || cli.static_retraction.is_some() {
-            let mut cfg = manifold_core::fluid_dynamics::FluidDynamicsConfig::default();
-            if let Some(sr) = cli.static_retraction {
-                cfg.static_retraction_mm = sr;
-            }
-            Some(cfg)
-        } else {
-            None
-        },
-        sparse_infill_pattern: cli.sparse_infill_pattern.map(Into::into),
-        solid_infill_pattern: cli.solid_infill_pattern.map(Into::into),
-        infill_pattern: cli.infill_pattern.into(),
-        wall_order: cli.wall_order.map(Into::into),
-        fsm_boundary_metrics_enabled: cli.fsm_boundary_metrics,
-        fsm_top_tangency_aspect: cli.fsm_top_tangency,
-        fsm_wall_ortho_aspect: cli.fsm_wall_ortho,
-        fsm_skin_depth_mm: cli.fsm_skin_depth,
-        fsm_max_sweeps: cli.fsm_sweeps,
-        enable_corner_flow_compensation: !cli.no_corner_flow_compensation,
-        corner_flow_compensation_ratio: cli.corner_flow_compensation_ratio,
-        enable_transient_pressure_compensation: cli.transient_pressure_compensation,
-        transient_pressure_min_multiplier: cli.transient_pressure_min_multiplier,
-        transient_pressure_beta: cli.transient_pressure_beta,
-        enable_slicer_checkpoints: cli.slicer_checkpoints,
-        slicer_checkpoint_interval_seconds: cli.slicer_checkpoint_interval,
-        ..SlicerConfig::default()
-    };
-
-    let mut machine = Machine::new(
-        BoundingVolume::Aabb {
-            min: DVec3::ZERO,
-            max: DVec3::new(200.0, 200.0, 200.0),
-        },
-        tools_for(&objects, cli.nozzle_diameter, cli.nozzle_temp),
-    );
+    let (config, mut machine) = resolve_config_and_machine(&cli, &objects)?;
     manifold_core::object::center_on_bed(&mut objects, &machine.build_volume);
-    machine.eikonal_slope_profile = eikonal_slope_profile;
+    if let Some(s) = &cli.eikonal_slope_profile {
+        machine.eikonal_slope_profile = parse_slope_profile(s).map_err(|e| anyhow::anyhow!(e))?;
+    }
     let workspace = Workspace::new(objects, machine, config);
 
     let gcode = slice_to_gcode(&workspace)?;
@@ -435,6 +394,90 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolves the `SlicerConfig` + `Machine` to use for this run: loaded
+/// wholesale from `--profile` when given (see `Cli::profile`'s doc
+/// comment for why the individual slicing flags are ignored in that
+/// case), or built from `cli`'s individual flags otherwise, exactly as
+/// before `--profile` existed.
+///
+/// Extracted as its own function (rather than inlined in `main`) so it's
+/// directly unit-testable without exercising `main`'s I/O side effects
+/// (writing Gcode, uploading, etc.).
+fn resolve_config_and_machine(cli: &Cli, objects: &[Object]) -> Result<(SlicerConfig, Machine)> {
+    if let Some(profile_path) = &cli.profile {
+        let json: serde_json::Value = serde_json::from_reader(BufReader::new(
+            File::open(profile_path)
+                .with_context(|| format!("opening profile {}", profile_path.display()))?,
+        ))
+        .with_context(|| format!("parsing profile {} as JSON", profile_path.display()))?;
+        let machine: Machine =
+            serde_json::from_value(json["machine"].clone()).with_context(|| {
+                format!(
+                    "reading \"machine\" from profile {}",
+                    profile_path.display()
+                )
+            })?;
+        let config: SlicerConfig =
+            serde_json::from_value(json["config"].clone()).with_context(|| {
+                format!("reading \"config\" from profile {}", profile_path.display())
+            })?;
+        return Ok((config, machine));
+    }
+
+    let config = SlicerConfig {
+        layer_height: cli.layer_height,
+        nozzle_diameter: cli.nozzle_diameter,
+        order_field: cli.order_field.into(),
+        wave_overhangs_enabled: cli.wave_overhangs,
+        wave_overhang_overlap: cli.wave_overhang_overlap,
+        wave_overhang_speed: cli.wave_overhang_speed.map(|s| s * 60.0),
+        wave_overhang_flow: cli.wave_overhang_flow,
+        fan_speed_percent: cli.fan_speed,
+        overhang_fan_speed_percent: cli.overhang_fan_speed,
+        fan_layer_delay: cli.fan_layer_delay,
+        speed_deadband_percent: cli.speed_deadband,
+        acceleration_deadband_percent: cli.acceleration_deadband,
+        square_corner_velocity: cli.square_corner_velocity,
+        default_nozzle_temperature: cli.nozzle_temp,
+        bed_temperature: cli.bed_temp,
+        chamber_temperature: cli.chamber_temp,
+        fluid_dynamics: if cli.fluid_dynamics || cli.static_retraction.is_some() {
+            let mut cfg = manifold_core::fluid_dynamics::FluidDynamicsConfig::default();
+            if let Some(sr) = cli.static_retraction {
+                cfg.static_retraction_mm = sr;
+            }
+            Some(cfg)
+        } else {
+            None
+        },
+        sparse_infill_pattern: cli.sparse_infill_pattern.map(Into::into),
+        solid_infill_pattern: cli.solid_infill_pattern.map(Into::into),
+        infill_pattern: cli.infill_pattern.into(),
+        wall_order: cli.wall_order.map(Into::into),
+        fsm_boundary_metrics_enabled: cli.fsm_boundary_metrics,
+        fsm_top_tangency_aspect: cli.fsm_top_tangency,
+        fsm_wall_ortho_aspect: cli.fsm_wall_ortho,
+        fsm_skin_depth_mm: cli.fsm_skin_depth,
+        fsm_max_sweeps: cli.fsm_sweeps,
+        enable_corner_flow_compensation: !cli.no_corner_flow_compensation,
+        corner_flow_compensation_ratio: cli.corner_flow_compensation_ratio,
+        enable_transient_pressure_compensation: cli.transient_pressure_compensation,
+        transient_pressure_min_multiplier: cli.transient_pressure_min_multiplier,
+        transient_pressure_beta: cli.transient_pressure_beta,
+        enable_slicer_checkpoints: cli.slicer_checkpoints,
+        slicer_checkpoint_interval_seconds: cli.slicer_checkpoint_interval,
+        ..SlicerConfig::default()
+    };
+    let machine = Machine::new(
+        BoundingVolume::Aabb {
+            min: DVec3::ZERO,
+            max: DVec3::new(200.0, 200.0, 200.0),
+        },
+        tools_for(objects, cli.nozzle_diameter, cli.nozzle_temp),
+    );
+    Ok((config, machine))
 }
 
 /// Parse one `inputs` entry: `path` or `path:tool`. The tool suffix must be
@@ -616,5 +659,248 @@ mod tests {
         assert!(cli.upload);
         assert!(cli.print);
         assert!(cli.monitor);
+    }
+
+    #[test]
+    fn cli_accepts_profile_flag() {
+        use clap::Parser;
+        let args = vec!["manifold", "model.stl", "--profile", "profile.json"];
+        let cli = Cli::parse_from(args);
+        assert_eq!(
+            cli.profile.as_deref(),
+            Some(std::path::Path::new("profile.json"))
+        );
+    }
+
+    /// A trimmed but structurally faithful copy of a real profile saved by
+    /// `manifold-gui`'s Settings panel (the exact bug report this feature
+    /// fixes: the CLI previously had no way to load this file at all).
+    /// Keeps every field `Machine`/`Tool` require (no `#[serde(default)]`)
+    /// plus a handful of `config` values distinctive enough to prove real
+    /// fields actually round-trip, not just that parsing doesn't error.
+    const SAMPLE_PROFILE_JSON: &str = r#"{
+        "machine": {
+            "substrate_transform": [1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0, 0.0,0.0,0.0],
+            "build_volume": {
+                "kind": "Aabb",
+                "min": [0.0, 0.0, 0.0],
+                "max": [350.0, 350.0, 300.0]
+            },
+            "tools": [
+                {
+                    "id": 0,
+                    "nozzle_diameter": 0.4,
+                    "mount": [1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0, 0.0,0.0,0.0],
+                    "collision_envelope": { "kind": "Sphere", "center": [0.0,0.0,0.0], "radius": 0.0 },
+                    "extrusion_multiplier": 1.05
+                }
+            ],
+            "axis_count": 3
+        },
+        "config": {
+            "description": "Voron 2.4",
+            "layer_height": 0.2,
+            "first_layer_height": null,
+            "first_layer_print_speed": 4800.0,
+            "first_layer_extrusion_multiplier": 1.0,
+            "first_layer_line_width": 0.4,
+            "fan_speed_percent": 35.0,
+            "overhang_fan_speed_percent": 66.0,
+            "fan_layer_delay": null,
+            "nozzle_diameter": 0.4,
+            "object_ordering": "Sequential",
+            "wall_line_width": 0.4,
+            "shell_thickness": 1.2,
+            "wall_offset": 0.2,
+            "slope_compensation_mode": "VolumetricModulation",
+            "wall_order": "OutsideIn",
+            "min_bead_width_ratio": null,
+            "max_bead_width_ratio": null,
+            "bead_clearance_compensation_enabled": null,
+            "sparse_infill_pattern": "SchwarzD",
+            "solid_infill_pattern": "AllWalls",
+            "infill_pattern": "Cubic",
+            "infill_line_width": 0.4,
+            "infill_angle_deg": 45.0,
+            "infill_density": 0.2,
+            "top_layers": 3,
+            "bottom_layers": 3,
+            "order_field": "AnisotropicFsm",
+            "eikonal_surface_order_weight": 0.0,
+            "eikonal_conform_top_surfaces": false,
+            "eikonal_enforce_monotonic_growth": false,
+            "eikonal_conform_bottom_surfaces": false,
+            "eikonal_conformal_max_angle_deg": null,
+            "eikonal_conformal_bottom_max_angle_deg": 10.0,
+            "eikonal_conformal_skin_depth_mm": null,
+            "order_field_apex": [0.0, 0.0, 0.0],
+            "order_field_axis": [0.0, 0.0, 1.0],
+            "order_field_slope": 0.0,
+            "filament_density_g_cm3": null,
+            "filament_diameter": 1.75,
+            "start_gcode": "",
+            "end_gcode": "",
+            "travel_speed": 41400.0,
+            "print_speed": 22200.0,
+            "outer_wall_speed": 21600.0,
+            "inner_wall_speed": 21600.0,
+            "infill_speed": 21600.0,
+            "solid_infill_speed": 21600.0,
+            "bridge_speed": 7200.0,
+            "default_acceleration": 7000.0,
+            "outer_wall_acceleration": 5000.0,
+            "inner_wall_acceleration": 5000.0,
+            "infill_acceleration": 7000.0,
+            "travel_acceleration": 7000.0,
+            "first_layer_acceleration": 5000.0,
+            "max_volumetric_speed": 35.0,
+            "pressure_advance": 0.034,
+            "pre_retract_taper_distance": 1.0,
+            "min_travel_for_retract": 1.3,
+            "retraction_length": 0.7,
+            "retraction_speed": 2400.0,
+            "unretract_speed": null,
+            "unretract_extra_length": 0.0,
+            "wipe_distance": 2.0,
+            "wipe_enabled": true,
+            "use_firmware_retraction": false,
+            "scarf_joint_enabled": false,
+            "scarf_joint_length": 4.5,
+            "scarf_joint_steps": 18,
+            "scarf_joint_start_height_fraction": 0.25,
+            "scarf_joint_flow_ratio": 0.8,
+            "seam_gap": 0.4,
+            "z_hop_enabled": false,
+            "z_hop_height": 0.02,
+            "path_simplify_enabled": false,
+            "path_simplify_tolerance": 0.04,
+            "nozzle_flat_diameter": null,
+            "travel_order_optimization_enabled": true,
+            "travel_collision_avoidance_enabled": true,
+            "z_travel_penalty": 8.0,
+            "wave_overhangs_enabled": true,
+            "wave_overhang_overlap": 0.1,
+            "wave_overhang_speed": 3000.0,
+            "wave_overhang_flow": 1.0,
+            "speed_deadband_percent": 10.0,
+            "acceleration_deadband_percent": 20.0,
+            "square_corner_velocity": 6.0,
+            "default_nozzle_temperature": 255.0,
+            "bed_temperature": 105.0,
+            "chamber_temperature": 55.0,
+            "fluid_dynamics": {
+                "pa_calibration_low": [0.049, 6.5],
+                "pa_calibration_high": [0.031, 32.0],
+                "heater_block_temp_c": 240.0,
+                "reference_temp_c": 240.0,
+                "max_fan_temp_drop_c": 8.0,
+                "ooze_time_constant_ref_s": 0.1,
+                "ooze_max_length_ref_mm": 0.0,
+                "static_retraction_mm": 0.6,
+                "max_retraction_mm": 1.5,
+                "pa_deadband": 0.1,
+                "swell_ratio_low": 1.0,
+                "swell_ratio_high": 1.0
+            },
+            "minimum_cruise_ratio": null,
+            "enable_corner_flow_compensation": true,
+            "corner_flow_compensation_ratio": 1.0,
+            "enable_transient_pressure_compensation": false,
+            "transient_pressure_min_multiplier": 0.95,
+            "transient_pressure_beta": 0.5,
+            "enable_slicer_pressure_advance": true,
+            "slicer_pa_tolerance_mm": 0.005,
+            "slicer_pa_min_segment_length": 0.4,
+            "slicer_pa_max_frequency_hz": 960.0,
+            "fsm_boundary_metrics_enabled": true,
+            "fsm_top_tangency_aspect": 0.4,
+            "fsm_wall_ortho_aspect": 0.8,
+            "fsm_skin_depth_mm": null,
+            "fsm_max_sweeps": 13,
+            "fsm_seed_surfaces_enabled": true,
+            "fsm_seed_max_angle_deg": null,
+            "end_of_print_wipe_enabled": true,
+            "end_of_print_wipe_distance": null,
+            "end_of_print_clearance_z_lift": null,
+            "enable_slicer_checkpoints": false,
+            "slicer_checkpoint_interval_seconds": null
+        },
+        "moonraker": {
+            "url": "http://example.local:7125/",
+            "api_key": null,
+            "auto_connect": true
+        }
+    }"#;
+
+    fn write_temp_profile(json: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "manifold_cli_profile_test_{}_{}.json",
+            std::process::id(),
+            seq
+        ));
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    #[test]
+    fn resolve_config_and_machine_loads_a_real_saved_profile() {
+        let path = write_temp_profile(SAMPLE_PROFILE_JSON);
+        let cli = Cli::parse_from(["manifold", "--profile", path.to_str().unwrap()]);
+
+        let (config, machine) = resolve_config_and_machine(&cli, &[]).unwrap();
+
+        assert_eq!(config.order_field, OrderFieldKind::AnisotropicFsm);
+        assert_eq!(config.wall_offset, 0.2);
+        assert_eq!(config.shell_thickness, 1.2);
+        assert_eq!(config.bottom_layers, 3);
+        assert_eq!(config.top_layers, 3);
+        assert_eq!(config.infill_density, 0.2);
+        assert_eq!(
+            machine.build_volume,
+            BoundingVolume::Aabb {
+                min: DVec3::ZERO,
+                max: DVec3::new(350.0, 350.0, 300.0),
+            }
+        );
+        assert_eq!(machine.tools.len(), 1);
+        assert_eq!(machine.tools[0].nozzle_diameter, 0.4);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn resolve_config_and_machine_profile_overrides_individual_flags() {
+        // The profile's own layer_height (0.2) must win over a conflicting
+        // --layer-height flag passed alongside --profile -- see Cli::profile's
+        // doc comment: when a profile is given, the individual slicing
+        // flags are ignored entirely, not merged.
+        let path = write_temp_profile(SAMPLE_PROFILE_JSON);
+        let cli = Cli::parse_from([
+            "manifold",
+            "--profile",
+            path.to_str().unwrap(),
+            "--layer-height",
+            "0.35",
+        ]);
+
+        let (config, _machine) = resolve_config_and_machine(&cli, &[]).unwrap();
+        assert_eq!(
+            config.layer_height, 0.2,
+            "profile's layer_height must win over a conflicting --layer-height flag"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn resolve_config_and_machine_reports_a_clear_error_for_a_missing_profile() {
+        let cli = Cli::parse_from(["manifold", "--profile", "/nonexistent/profile.json"]);
+        let err = resolve_config_and_machine(&cli, &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("profile"),
+            "error should mention the profile path, got: {err}"
+        );
     }
 }

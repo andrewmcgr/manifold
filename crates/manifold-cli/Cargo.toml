@@ -20,6 +20,7 @@ indicatif = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # Used only by scratch verification examples (e.g.
@@ -27,11 +28,6 @@ tracing-subscriber.workspace = true
 # the mesh SDF; the `manifold` binary itself never depends on it.
 manifold-fidget.workspace = true
 serde.workspace = true
-# Used only by scratch diagnostic examples (e.g.
-# diagnose_missing_overhang) that load a real saved machine+config
-# profile.json (the same shape manifold-gui's Profile serializes); the
-# `manifold` binary itself never depends on it.
-serde_json.workspace = true
 # Loopback protocol and subprocess regressions only.
 tempfile = "3"
 futures-util = { version = "0.3", features = ["sink"] }
