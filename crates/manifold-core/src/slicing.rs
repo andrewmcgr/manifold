@@ -7966,6 +7966,139 @@ mod tests {
         );
     }
 
+    /// A three-lobe "trident" prism: three 4mm x 4mm square lobes (`x in
+    /// [-4,0]`, `x in [4,8]`, and `x in [12,16]`, all `y in [-2,2]`)
+    /// connected by two `waist_width`-wide bridges (`x in [0,4]` and `x in
+    /// [8,12]`, both `y in [-waist_width/2, waist_width/2]`), extruded from
+    /// `z_min` to `z_max`. Same construction convention as
+    /// [`dumbbell_mesh`] (five non-overlapping axis-aligned rectangles,
+    /// manually triangulated), extended to a second waist to pin down that
+    /// the `infill_boundary_already_covers` fix (see
+    /// [`slice_mesh_infill_boundary_keeps_both_lobes_when_only_the_infill_depth_bifurcates`])
+    /// generalizes to more than two simultaneously-bifurcated regions, not
+    /// just the two-island case that test happens to exercise.
+    fn tribell_mesh(z_min: f64, z_max: f64, waist_width: f64) -> Mesh {
+        let hw = waist_width / 2.0;
+        let outline: [[f64; 2]; 20] = [
+            [-4.0, -2.0], // 0
+            [0.0, -2.0],  // 1
+            [0.0, -hw],   // 2
+            [4.0, -hw],   // 3
+            [4.0, -2.0],  // 4
+            [8.0, -2.0],  // 5
+            [8.0, -hw],   // 6
+            [12.0, -hw],  // 7
+            [12.0, -2.0], // 8
+            [16.0, -2.0], // 9
+            [16.0, 2.0],  // 10
+            [12.0, 2.0],  // 11
+            [12.0, hw],   // 12
+            [8.0, hw],    // 13
+            [8.0, 2.0],   // 14
+            [4.0, 2.0],   // 15
+            [4.0, hw],    // 16
+            [0.0, hw],    // 17
+            [0.0, 2.0],   // 18
+            [-4.0, 2.0],  // 19
+        ];
+
+        let mut vertices = Vec::with_capacity(40);
+        for &[x, y] in &outline {
+            vertices.push(DVec3::new(x, y, z_min));
+        }
+        for &[x, y] in &outline {
+            vertices.push(DVec3::new(x, y, z_max));
+        }
+        let bottom = |i: usize| i as u32;
+        let top = |i: usize| 20 + i as u32;
+
+        let mut indices = Vec::new();
+        // Caps: the outline decomposes exactly into five non-overlapping
+        // axis-aligned rectangles (lobe1: 0,1,18,19; waist1: 2,3,16,17;
+        // lobe2: 4,5,14,15; waist2: 6,7,12,13; lobe3: 8,9,10,11), each
+        // split into two CCW-from-above triangles -- same pattern as
+        // `dumbbell_mesh`'s own `cap_triangles`.
+        let cap_triangles: [[usize; 3]; 10] = [
+            [0, 1, 18],
+            [0, 18, 19],
+            [2, 3, 16],
+            [2, 16, 17],
+            [4, 5, 14],
+            [4, 14, 15],
+            [6, 7, 12],
+            [6, 12, 13],
+            [8, 9, 10],
+            [8, 10, 11],
+        ];
+        for &[a, b, c] in &cap_triangles {
+            indices.extend_from_slice(&[bottom(a), bottom(c), bottom(b)]);
+            indices.extend_from_slice(&[top(a), top(b), top(c)]);
+        }
+        for i in 0..outline.len() {
+            let j = (i + 1) % outline.len();
+            indices.extend_from_slice(&[bottom(i), bottom(j), top(j)]);
+            indices.extend_from_slice(&[bottom(i), top(j), top(i)]);
+        }
+
+        Mesh::new(vertices, indices)
+    }
+
+    #[test]
+    fn slice_mesh_infill_boundary_keeps_all_three_lobes_when_two_waists_bifurcate_at_once() {
+        // Same waist_width/margin reasoning as the two-lobe dumbbell test
+        // above -- both waists open (0.4mm) at wall_offset depth (single
+        // wall_index == 0 loop through the whole trident) and both closed
+        // (-0.4mm) at the infill-boundary depth (three disjoint regions).
+        // This is the same fix (`infill_boundary_already_covers`), but
+        // proves it correctly keeps ALL of N>2 simultaneously-bifurcated
+        // regions, not just the N=2 case -- a bug that special-cased "keep
+        // one redundant duplicate, keep one genuine second region" could
+        // still pass the two-lobe test above while dropping a third.
+        let mesh = tribell_mesh(0.0, 1.0, 0.8);
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            order_field: crate::order_field::OrderFieldKind::Eikonal,
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&mesh, &config).unwrap();
+        let layer = layers
+            .first()
+            .expect("a 1mm-tall prism at layer_height 0.2 must produce at least one layer");
+
+        let wall0_count = layer.loops.iter().filter(|w| w.wall_index == 0).count();
+        assert_eq!(
+            wall0_count, 1,
+            "wall_index 0 must still be a single connected loop through both \
+             waists at this depth -- if this fails, the mesh's waist_width no \
+             longer matches the wall_offset margin this test's geometry was \
+             sized for, not the defect this test targets"
+        );
+
+        assert_eq!(
+            layer.infill_boundary.len(),
+            3,
+            "all three lobes of the trident must have their own infill_boundary \
+             polygon once both waists have pinched shut at the infill-boundary \
+             depth -- got {} (a dedup keyed on outer-wall topology, or one that \
+             only handles a single bifurcation, would drop the second and/or \
+             third lobe here even if it happened to pass the two-lobe test)",
+            layer.infill_boundary.len()
+        );
+
+        let mut bbox_mins: Vec<f64> = layer
+            .infill_boundary
+            .iter()
+            .map(|poly| poly.iter().map(|p| p.x).fold(f64::INFINITY, f64::min))
+            .collect();
+        bbox_mins.sort_by(f64::total_cmp);
+        assert!(
+            bbox_mins[0] < 0.0 && bbox_mins[1] > 4.0 && bbox_mins[1] < 8.0 && bbox_mins[2] > 12.0,
+            "expected one infill_boundary polygon per lobe (min x < 0, min x in \
+             (4,8), min x > 12), got min-x values {bbox_mins:?}"
+        );
+    }
+
     /// Per-layer inner-wall (`wall_index >= 1`) profile:
     /// `(wall-0 loops, inner loops, clipped-open inner loops)` for each
     /// layer, in order. Clipping shows up either as a partially-clipped
