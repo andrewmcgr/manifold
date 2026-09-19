@@ -1122,8 +1122,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         let draw_geometry = |rpass: &mut wgpu::RenderPass| {
             if let Some(tp) = toolpaths {
-                // When toolpaths are visible: draw toolpaths first, then draw the
-                // mesh semi-transparently so internal toolpaths remain clearly visible.
                 rpass.set_pipeline(&self.toolpath_line_pipeline);
                 rpass.set_vertex_buffer(0, tp.line_buffer.slice(..));
                 // 24 vertices/instance: a rectangular-prism bead (4 faces x 6
@@ -1131,7 +1129,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 // vs_main. Indices 6..23 degenerate to a zero-area point for
                 // travel moves, which only need the first 6.
                 rpass.draw(0..24, 0..tp.line_instance_count);
+            }
 
+            // Draw the mesh semi-transparently (rather than opaque) whenever
+            // toolpaths OR volume-audit cells are visible, so both auxiliary
+            // overlays remain visible through the model shell instead of
+            // being hidden by ordinary depth testing against the opaque
+            // mesh. The volume-audit case specifically needs this: a cell
+            // marking MISSING wall material sits essentially at the mesh's
+            // own outer surface (within `wall_offset + wall_count *
+            // wall_line_width` of it, by definition), so its depth is
+            // nearly identical to the opaque surface facing the camera at
+            // that XY position -- the opaque mesh pipeline (depth-writing)
+            // would silently discard the audit cube behind it, exactly
+            // where a real defect is most likely to be, even though the
+            // mesh geometry itself is intact and unaffected by the defect.
+            if toolpaths.is_some() || volume_audit_cells.is_some() {
                 rpass.set_pipeline(&self.mesh_transparent_pipeline);
                 for mesh in meshes {
                     rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
