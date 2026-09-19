@@ -57,18 +57,23 @@ fn fs_transparent(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color.rgb * intensity, 0.25);
 }
 
-// Overlay variant: used for the SDF isosurface debug overlay
-// (`MESH_SDF_VISUALIZATION.md` Phase D) so it is visually distinguishable
-// from the real, opaque mesh render above — semi-transparent orange,
-// alpha-blended, sharing the same vertex layout/pipeline layout as
-// `fs_main` (only the render pipeline's blend state and this fragment
-// entry point differ).
+// Overlay variant: a shared, alpha-blended pipeline for auxiliary,
+// non-opaque triangle geometry drawn on top of the real mesh render
+// above -- currently the SDF isosurface debug overlay
+// (`MESH_SDF_VISUALIZATION.md` Phase D) and the volume-audit fill
+// visualization cubes (see `crates/manifold-gui/src/volume_audit_view.rs`).
+// Reads color (including alpha) from per-vertex data like `fs_main` does,
+// rather than a fixed tint: the SDF isosurface's own CPU-side vertex data
+// already hardcodes a translucent orange (`UploadedMesh::upload_from_vertices`),
+// so its on-screen appearance is unchanged by this; callers that upload
+// their own colors (`UploadedMesh::upload_colored_cells`) now actually see
+// them rendered instead of a fixed tint. Only the render pipeline's blend
+// state and this fragment entry point differ from `fs_main`.
 @fragment
 fn fs_overlay(in: VertexOutput) -> @location(0) vec4<f32> {
     let light_dir = normalize(vec3<f32>(0.4, 0.6, 0.8));
     let ambient = 0.35;
     let diffuse = max(dot(normalize(in.normal), light_dir), 0.0);
     let intensity = ambient + (1.0 - ambient) * diffuse;
-    let base_color = vec3<f32>(1.0, 0.55, 0.15);
-    return vec4<f32>(base_color * intensity, 0.45);
+    return vec4<f32>(in.color.rgb * intensity, in.color.a);
 }
