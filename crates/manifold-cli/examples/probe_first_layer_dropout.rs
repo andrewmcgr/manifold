@@ -49,7 +49,10 @@ fn main() -> anyhow::Result<()> {
     center_on_bed(&mut objects, &profile.machine.build_volume);
 
     // Mesh bounding box in world space, for orientation.
-    let (mut mmin, mut mmax) = (glam::DVec3::splat(f64::INFINITY), glam::DVec3::splat(f64::NEG_INFINITY));
+    let (mut mmin, mut mmax) = (
+        glam::DVec3::splat(f64::INFINITY),
+        glam::DVec3::splat(f64::NEG_INFINITY),
+    );
     for &v in &objects[0].mesh.vertices {
         let w = objects[0].transform.transform_point(v);
         mmin = mmin.min(w);
@@ -177,9 +180,10 @@ fn main() -> anyhow::Result<()> {
         let planned_wall0_region = paths
             .iter()
             .filter(|p| {
-                p.segments.iter().any(|s| {
-                    s.kind == MoveKind::WallOuter && (s.order - layer.order).abs() < 1e-9
-                }) && p.points.iter().any(|q| q.x > x_threshold)
+                p.segments
+                    .iter()
+                    .any(|s| s.kind == MoveKind::WallOuter && (s.order - layer.order).abs() < 1e-9)
+                    && p.points.iter().any(|q| q.x > x_threshold)
             })
             .count();
         println!(

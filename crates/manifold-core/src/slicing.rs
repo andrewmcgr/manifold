@@ -7727,6 +7727,157 @@ mod tests {
         Mesh::new(vertices, indices)
     }
 
+    /// A "dumbbell"/dog-bone prism: two 4mm x 4mm square lobes (`x in
+    /// [-4,0]` and `x in [4,8]`, `y in [-2,2]`) connected by a narrow
+    /// `waist_width`-wide bridge (`x in [0,4]`, `y in
+    /// [-waist_width/2, waist_width/2]`), extruded from `z_min` to
+    /// `z_max`. A single watertight, non-self-overlapping mesh (three
+    /// non-overlapping axis-aligned rectangles sharing only boundary
+    /// edges, not a boolean union of separately-capped boxes), built by
+    /// extruding one 12-point outline polygon -- see this function's own
+    /// triangle list below for the manual (non-generic) triangulation,
+    /// chosen because the outline's decomposition into three rectangles is
+    /// exact and simple enough not to need a real ear-clipping algorithm.
+    ///
+    /// Deliberately sized so the waist survives `SlicerConfig::default()`'s
+    /// `wall_offset` (0.2mm) inset -- keeping wall_index 0 a single,
+    /// unsplit loop through the waist -- but pinches shut by
+    /// `wall_offset + wall_line_width * wall_count()` (0.6mm at defaults,
+    /// since `shell_thickness == wall_line_width` there gives
+    /// `wall_count() == 1`) -- the depth `infill_boundary` is derived
+    /// from. This is the exact defect class
+    /// `docs/superpowers/specs/2026-09-19-first-layer-infill-boundary-dropout-design.md`
+    /// documents: a real per-island infill-boundary region silently
+    /// dropped when the interior bifurcates deeper than the outer wall
+    /// has, confirmed live against the real reported case via
+    /// `crates/manifold-cli/examples/probe_island_partitioning.rs`'s
+    /// instrumented output (both split loops compute the SAME `island` id
+    /// via point-in-polygon against the still-unsplit `wall_index == 0`
+    /// outline, so `slicing.rs`'s `satisfied_islands: HashSet<usize>`
+    /// dedup in the infill-boundary derivation loop -- around the
+    /// `for w in (1..=wall_count).rev() { ... if satisfied_islands.insert(island) { ... } }`
+    /// block -- silently keeps only the first of the two loops).
+    fn dumbbell_mesh(z_min: f64, z_max: f64, waist_width: f64) -> Mesh {
+        let hw = waist_width / 2.0;
+        // Outline, counter-clockwise as viewed from above (+Z looking down
+        // -Z), matching this file's established outward-normal convention
+        // (see `frustum_mesh_at`'s base/top cap winding just above).
+        let outline: [[f64; 2]; 12] = [
+            [-4.0, -2.0], // 0
+            [0.0, -2.0],  // 1
+            [0.0, -hw],   // 2
+            [4.0, -hw],   // 3
+            [4.0, -2.0],  // 4
+            [8.0, -2.0],  // 5
+            [8.0, 2.0],   // 6
+            [4.0, 2.0],   // 7
+            [4.0, hw],    // 8
+            [0.0, hw],    // 9
+            [0.0, 2.0],   // 10
+            [-4.0, 2.0],  // 11
+        ];
+
+        let mut vertices = Vec::with_capacity(24);
+        for &[x, y] in &outline {
+            vertices.push(DVec3::new(x, y, z_min));
+        }
+        for &[x, y] in &outline {
+            vertices.push(DVec3::new(x, y, z_max));
+        }
+        let bottom = |i: usize| i as u32;
+        let top = |i: usize| 12 + i as u32;
+
+        let mut indices = Vec::new();
+        // Caps: the outline decomposes exactly into three non-overlapping
+        // axis-aligned rectangles (left lobe: 0,1,10,11; bridge: 2,3,8,9;
+        // right lobe: 4,5,6,7), each split into two CCW-from-above
+        // triangles.
+        let cap_triangles: [[usize; 3]; 6] = [
+            [0, 1, 10],
+            [0, 10, 11],
+            [2, 3, 8],
+            [2, 8, 9],
+            [4, 5, 6],
+            [4, 6, 7],
+        ];
+        for &[a, b, c] in &cap_triangles {
+            // Bottom cap: reversed order for a downward (-Z, outward) normal.
+            indices.extend_from_slice(&[bottom(a), bottom(c), bottom(b)]);
+            // Top cap: forward order for an upward (+Z, outward) normal.
+            indices.extend_from_slice(&[top(a), top(b), top(c)]);
+        }
+        // Side walls: one quad (two triangles) per outline edge.
+        for i in 0..outline.len() {
+            let j = (i + 1) % outline.len();
+            indices.extend_from_slice(&[bottom(i), bottom(j), top(j)]);
+            indices.extend_from_slice(&[bottom(i), top(j), top(i)]);
+        }
+
+        Mesh::new(vertices, indices)
+    }
+
+    #[test]
+    fn slice_mesh_infill_boundary_keeps_both_lobes_when_only_the_infill_depth_bifurcates() {
+        // waist_width = 0.8mm: at SlicerConfig::default()'s wall_offset
+        // (0.2mm), the waist is still 0.8 - 2*0.2 = 0.4mm wide (open, a
+        // single connected wall_index == 0 loop through it); at the
+        // infill-boundary depth wall_offset + wall_line_width*wall_count()
+        // (0.2 + 0.4*1 = 0.6mm at defaults), it's 0.8 - 2*0.6 = -0.4mm
+        // (closed, splitting the interior into two disjoint regions) --
+        // comfortable 0.4mm margin on both sides of the transition.
+        let mesh = dumbbell_mesh(0.0, 1.0, 0.8);
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            order_field: crate::order_field::OrderFieldKind::Eikonal,
+            ..SlicerConfig::default()
+        };
+
+        let layers = slice_mesh(&mesh, &config).unwrap();
+        let layer = layers
+            .first()
+            .expect("a 1mm-tall prism at layer_height 0.2 must produce at least one layer");
+
+        assert!(
+            !layer.loops.is_empty(),
+            "the bottom layer must have wall geometry -- otherwise this test is vacuous"
+        );
+        let wall0_count = layer.loops.iter().filter(|w| w.wall_index == 0).count();
+        assert_eq!(
+            wall0_count, 1,
+            "wall_index 0 must still be a single connected loop through the \
+             waist at this depth -- if this fails, the mesh's waist_width no \
+             longer matches the wall_offset margin this test's geometry was \
+             sized for, not the defect this test targets"
+        );
+
+        // The actual defect: both lobes are real, physically separate
+        // regions needing their own infill, but the buggy dedup keeps only
+        // one. A correct fix must produce 2 infill_boundary polys here, one
+        // per lobe (bbox roughly x<0 for the left lobe, x>4 for the right).
+        assert_eq!(
+            layer.infill_boundary.len(),
+            2,
+            "both lobes of the dumbbell must have their own infill_boundary \
+             polygon once the waist has pinched shut at the infill-boundary \
+             depth -- got {} (the known bug silently drops the second lobe's \
+             region because both lobes compute the same island id against \
+             the still-unsplit wall_index 0 outline)",
+            layer.infill_boundary.len()
+        );
+
+        let mut bbox_mins: Vec<f64> = layer
+            .infill_boundary
+            .iter()
+            .map(|poly| poly.iter().map(|p| p.x).fold(f64::INFINITY, f64::min))
+            .collect();
+        bbox_mins.sort_by(f64::total_cmp);
+        assert!(
+            bbox_mins[0] < 0.0 && bbox_mins[1] > 4.0,
+            "expected one infill_boundary polygon in the left lobe (min x < 0) \
+             and one in the right lobe (min x > 4), got min-x values {bbox_mins:?}"
+        );
+    }
+
     /// Per-layer inner-wall (`wall_index >= 1`) profile:
     /// `(wall-0 loops, inner loops, clipped-open inner loops)` for each
     /// layer, in order. Clipping shows up either as a partially-clipped
