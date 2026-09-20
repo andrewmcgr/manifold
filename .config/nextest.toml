@@ -1,0 +1,12 @@
+# cargo-nextest configuration.
+# Docs: https://nextest.readthedocs.io/en/stable/user/config.html
+#
+# Project convention (AGENTS.md):
+#   CARGO_TARGET_DIR=target/test cargo nextest run --workspace
+
+[profile.default]
+# Run the whole test binary after a failure instead of aborting early.
+fail-fast = false
+# Flag tests slower than this in the summary (period only; the default
+# termination policy stays in force — the slowest tests here run ~6 min).
+slow-timeout = { period = "30s" }

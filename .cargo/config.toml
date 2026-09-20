@@ -1,0 +1,9 @@
+# Cache rustc compilations with sccache (local disk cache: ~/.cache/sccache).
+# With this wrapper, clean rebuilds of the workspace and its dependencies are
+# served from the cache instead of being recompiled from scratch.
+#
+# Verified on sccache 0.13.0 that rustc invocations in the dev profile
+# (incremental compilation) are cached, so no profile changes are needed.
+# Check hit rate with: sccache --show-stats
+[build]
+rustc-wrapper = "sccache"
