@@ -1,0 +1,237 @@
+{
+  "machine": {
+    "substrate_transform": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "build_volume": {
+      "kind": "Aabb",
+      "min": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "max": [
+        350.0,
+        350.0,
+        300.0
+      ]
+    },
+    "tools": [
+      {
+        "id": 0,
+        "nozzle_diameter": 0.4,
+        "nozzle_flat_diameter": 0.8,
+        "mount": [
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "collision_envelope": {
+          "kind": "Sphere",
+          "center": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "radius": 0.0
+        },
+        "extrusion_multiplier": 1.05,
+        "nozzle_temperature": 265.0
+      }
+    ],
+    "axis_count": 3,
+    "eikonal_slope_profile": [
+      [
+        3.8,
+        0.8
+      ],
+      [
+        32.0,
+        11.0
+      ]
+    ],
+    "use_stepper_dynamics": true,
+    "zero_speed_acceleration": 50000.0,
+    "max_available_speed": 1500.0,
+    "acceleration_limit": 12500.0,
+    "speed_limit": 700.0,
+    "minimum_cruise_ratio": null,
+    "axis_limits": {
+      "Z": {
+        "speed_limit": 100.0,
+        "acceleration_limit": 1200.0,
+        "use_stepper_dynamics": false,
+        "zero_speed_acceleration": null,
+        "max_available_speed": null
+      }
+    },
+    "arrangement_clearance": null
+  },
+  "config": {
+    "description": "Voron 2.4",
+    "layer_height": 0.2,
+    "first_layer_height": null,
+    "first_layer_print_speed": 4800.0,
+    "first_layer_extrusion_multiplier": 1.0,
+    "first_layer_line_width": 0.4,
+    "fan_speed_percent": 35.0,
+    "overhang_fan_speed_percent": 66.0,
+    "fan_layer_delay": null,
+    "nozzle_diameter": 0.4,
+    "object_ordering": "Sequential",
+    "wall_line_width": 0.4,
+    "shell_thickness": 1.2,
+    "wall_offset": 0.2,
+    "slope_compensation_mode": "VolumetricModulation",
+    "wall_order": "OutsideIn",
+    "min_bead_width_ratio": null,
+    "max_bead_width_ratio": null,
+    "bead_clearance_compensation_enabled": null,
+    "sparse_infill_pattern": "SchwarzD",
+    "solid_infill_pattern": "AllWalls",
+    "infill_pattern": "Cubic",
+    "infill_line_width": 0.4,
+    "infill_angle_deg": 45.0,
+    "infill_density": 0.2,
+    "top_layers": 3,
+    "bottom_layers": 3,
+    "order_field": "AnisotropicFsm",
+    "eikonal_surface_order_weight": 0.0,
+    "eikonal_conform_top_surfaces": false,
+    "eikonal_enforce_monotonic_growth": false,
+    "eikonal_conform_bottom_surfaces": false,
+    "eikonal_conformal_max_angle_deg": null,
+    "eikonal_conformal_bottom_max_angle_deg": 10.0,
+    "eikonal_conformal_skin_depth_mm": null,
+    "order_field_apex": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "order_field_axis": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "order_field_slope": 0.0,
+    "filament_density_g_cm3": null,
+    "filament_diameter": 1.75,
+    "start_gcode": "PRINT_START T_TOOL={nozzle_temperature} T_BED={bed_temperature} T_CHAMBER={chamber_temperature} PRINT_MIN={print_min_x},{print_min_y} PRINT_MAX={print_max_x},{print_max_y}",
+    "end_gcode": "G91\nG0 Z10\nG90\nPRINT_END",
+    "travel_speed": 41400.0,
+    "print_speed": 22200.0,
+    "outer_wall_speed": 21600.0,
+    "inner_wall_speed": 21600.0,
+    "infill_speed": 21600.0,
+    "solid_infill_speed": 21600.0,
+    "bridge_speed": 7200.0,
+    "default_acceleration": 7000.0,
+    "outer_wall_acceleration": 5000.0,
+    "inner_wall_acceleration": 5000.0,
+    "infill_acceleration": 7000.0,
+    "travel_acceleration": 7000.0,
+    "first_layer_acceleration": 5000.0,
+    "max_volumetric_speed": 35.0,
+    "pressure_advance": 0.034,
+    "pre_retract_taper_distance": 1.0,
+    "min_travel_for_retract": 1.3,
+    "retraction_length": 0.7,
+    "retraction_speed": 2400.0,
+    "unretract_speed": null,
+    "unretract_extra_length": 0.0,
+    "wipe_distance": 2.0,
+    "wipe_enabled": true,
+    "use_firmware_retraction": false,
+    "scarf_joint_enabled": false,
+    "scarf_joint_length": 4.5,
+    "scarf_joint_steps": 18,
+    "scarf_joint_start_height_fraction": 0.25,
+    "scarf_joint_flow_ratio": 0.8,
+    "seam_gap": 0.4,
+    "z_hop_enabled": false,
+    "z_hop_height": 0.02,
+    "path_simplify_enabled": false,
+    "path_simplify_tolerance": 0.04,
+    "nozzle_flat_diameter": null,
+    "travel_order_optimization_enabled": true,
+    "travel_collision_avoidance_enabled": true,
+    "z_travel_penalty": 8.0,
+    "wave_overhangs_enabled": true,
+    "wave_overhang_overlap": 0.1,
+    "wave_overhang_speed": 3000.0,
+    "wave_overhang_flow": 1.0,
+    "speed_deadband_percent": 10.0,
+    "acceleration_deadband_percent": 20.0,
+    "square_corner_velocity": 6.0,
+    "default_nozzle_temperature": 255.0,
+    "bed_temperature": 105.0,
+    "chamber_temperature": 55.0,
+    "fluid_dynamics": {
+      "pa_calibration_low": [
+        0.049,
+        6.5
+      ],
+      "pa_calibration_high": [
+        0.031,
+        32.0
+      ],
+      "heater_block_temp_c": 240.0,
+      "reference_temp_c": 240.0,
+      "max_fan_temp_drop_c": 8.0,
+      "ooze_time_constant_ref_s": 0.1,
+      "ooze_max_length_ref_mm": 0.0,
+      "static_retraction_mm": 0.6,
+      "max_retraction_mm": 1.5,
+      "pa_deadband": 0.1,
+      "swell_ratio_low": 1.0,
+      "swell_ratio_high": 1.0
+    },
+    "minimum_cruise_ratio": null,
+    "enable_corner_flow_compensation": true,
+    "corner_flow_compensation_ratio": 1.0,
+    "enable_transient_pressure_compensation": false,
+    "transient_pressure_min_multiplier": 0.95,
+    "transient_pressure_beta": 0.5,
+    "enable_slicer_pressure_advance": true,
+    "slicer_pa_tolerance_mm": 0.005,
+    "slicer_pa_min_segment_length": 0.4,
+    "slicer_pa_max_frequency_hz": 960.0,
+    "fsm_boundary_metrics_enabled": true,
+    "fsm_top_tangency_aspect": 0.4,
+    "fsm_wall_ortho_aspect": 0.8,
+    "fsm_skin_depth_mm": null,
+    "fsm_max_sweeps": 13,
+    "fsm_seed_surfaces_enabled": true,
+    "fsm_seed_max_angle_deg": null,
+    "end_of_print_wipe_enabled": true,
+    "end_of_print_wipe_distance": null,
+    "end_of_print_clearance_z_lift": null,
+    "enable_slicer_checkpoints": false,
+    "slicer_checkpoint_interval_seconds": null
+  },
+  "moonraker": {
+    "url": "http://v24p4.local:7125/",
+    "api_key": null,
+    "auto_connect": true
+  }
+}
