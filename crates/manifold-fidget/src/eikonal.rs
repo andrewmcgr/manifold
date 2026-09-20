@@ -2012,14 +2012,14 @@ mod tests {
 
     #[test]
     fn point_seed_reduces_to_approximate_euclidean_distance() {
-        let min_corner = DVec3::new(-5.0, -5.0, -5.0);
-        let max_corner = DVec3::new(5.0, 5.0, 5.0);
+        let min_corner = DVec3::new(-3.0, -3.0, -3.0);
+        let max_corner = DVec3::new(3.0, 3.0, 3.0);
         let seeds = [DVec3::ZERO];
         let field = EikonalOrderField::new(min_corner, max_corner, &seeds, 0.1);
 
         for p in [
             DVec3::new(2.0, 0.0, 0.0),
-            DVec3::new(0.0, 3.0, 0.0),
+            DVec3::new(0.0, 2.8, 0.0),
             DVec3::new(1.0, 1.0, 1.0),
             DVec3::new(-2.0, -1.0, 0.5),
         ] {
@@ -2096,17 +2096,17 @@ mod tests {
         // a planar front; order should grow with |z| (distance from the
         // plane), matching the monotonicity `reconstruct_on_order_field`
         // depends on.
-        let min_corner = DVec3::new(-5.0, -5.0, -5.0);
-        let max_corner = DVec3::new(5.0, 5.0, 5.0);
+        let min_corner = DVec3::new(-3.0, -3.0, -3.0);
+        let max_corner = DVec3::new(3.0, 3.0, 3.0);
         let mut seeds = Vec::new();
-        let mut x = -5.0;
-        while x <= 5.0 {
+        let mut x = -3.0;
+        while x <= 3.0 {
             seeds.push(DVec3::new(x, 0.0, 0.0));
             x += 0.2;
         }
         let field = EikonalOrderField::new(min_corner, max_corner, &seeds, 0.1);
 
-        let samples: Vec<f64> = [0.0, 0.5, 1.0, 2.0, 3.0]
+        let samples: Vec<f64> = [0.0, 0.5, 1.0, 2.0, 2.5]
             .iter()
             .map(|&z| field.order(DVec3::new(0.0, 0.0, z)))
             .collect();

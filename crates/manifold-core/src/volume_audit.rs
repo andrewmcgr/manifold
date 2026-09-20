@@ -1242,34 +1242,54 @@ mod tests {
         grid.assert_infill_volume_within(0.5, 1.5);
     }
 
+    /// The "real pipeline" fixture shared by the four
+    /// `*_on_real_pipeline_output` tests below plus
+    /// `audit_extrusion_volume_passes_on_a_healthy_sliced_box`: a plain 20mm
+    /// box sliced and planned exactly as the production pipeline does (0.2mm
+    /// layers, 0.4mm nozzle, 0.8mm shell, 20% infill).
+    ///
+    /// Slicing + planning this box is the dominant cost of those tests
+    /// (minutes in debug; the audits over a `cell_size = 2.0` grid are
+    /// milliseconds). All five tests use the *same* mesh and config, so the
+    /// fixture computes slice+plan once per test binary and each test only
+    /// runs its own audit/assertions on the shared, immutable result.
+    fn real_pipeline_fixture() -> &'static (Mesh, SlicerConfig, Vec<Path>) {
+        use std::sync::OnceLock;
+        static FIXTURE: OnceLock<(Mesh, SlicerConfig, Vec<Path>)> = OnceLock::new();
+        FIXTURE.get_or_init(|| {
+            let mesh = box_mesh(DVec3::ZERO, DVec3::new(20.0, 20.0, 20.0));
+            let config = SlicerConfig {
+                layer_height: 0.2,
+                nozzle_diameter: 0.4,
+                wall_line_width: 0.4,
+                shell_thickness: 0.8,
+                top_layers: 3,
+                bottom_layers: 3,
+                infill_density: 0.2,
+                ..SlicerConfig::default()
+            };
+            let tool_id = crate::ids::ToolId(0);
+            let object = crate::object::Object::new(crate::ids::ObjectId(0), mesh.clone(), tool_id);
+            let tool = crate::tool::Tool::new(tool_id, config.nozzle_diameter);
+            let layers = crate::slicing::slice_object(&object, &config)
+                .expect("slicing a plain box must succeed");
+            let paths = crate::toolpath::plan(
+                &layers,
+                std::slice::from_ref(&object),
+                std::slice::from_ref(&tool),
+                &config,
+            )
+            .expect("planning toolpaths for a plain box must succeed");
+            (mesh, config, paths)
+        })
+    }
+
     #[test]
     fn assert_infill_volume_within_catches_duplicated_infill_on_real_pipeline_output() {
-        let mesh = box_mesh(DVec3::ZERO, DVec3::new(20.0, 20.0, 20.0));
-        let config = SlicerConfig {
-            layer_height: 0.2,
-            nozzle_diameter: 0.4,
-            wall_line_width: 0.4,
-            shell_thickness: 0.8,
-            top_layers: 3,
-            bottom_layers: 3,
-            infill_density: 0.2,
-            ..SlicerConfig::default()
-        };
-        let tool_id = crate::ids::ToolId(0);
-        let object = crate::object::Object::new(crate::ids::ObjectId(0), mesh.clone(), tool_id);
-        let tool = crate::tool::Tool::new(tool_id, config.nozzle_diameter);
-        let layers = crate::slicing::slice_object(&object, &config)
-            .expect("slicing a plain box must succeed");
-        let paths = crate::toolpath::plan(
-            &layers,
-            std::slice::from_ref(&object),
-            std::slice::from_ref(&tool),
-            &config,
-        )
-        .expect("planning toolpaths for a plain box must succeed");
+        let (mesh, config, paths) = real_pipeline_fixture();
 
         let cell_size = 2.0;
-        let baseline = audit_extrusion_volume(&mesh, &paths, &config, cell_size);
+        let baseline = audit_extrusion_volume(mesh, paths, config, cell_size);
         let baseline_ratio = baseline
             .infill_aggregate_ratio()
             .expect("a 20mm box with infill_density 0.2 must have SparseInfill cells");
@@ -1285,7 +1305,7 @@ mod tests {
             "the planner should emit sparse infill paths for a 20mm box -- nothing to duplicate"
         );
         injected.extend(duplicated);
-        let defective = audit_extrusion_volume(&mesh, &injected, &config, cell_size);
+        let defective = audit_extrusion_volume(mesh, &injected, config, cell_size);
         let defective_ratio = defective
             .infill_aggregate_ratio()
             .expect("the defective grid must also have SparseInfill cells");
@@ -1503,36 +1523,14 @@ mod tests {
 
     #[test]
     fn audit_extrusion_volume_passes_on_a_healthy_sliced_box() {
-        let mesh = box_mesh(DVec3::new(0.0, 0.0, 0.0), DVec3::new(20.0, 20.0, 20.0));
-        let config = SlicerConfig {
-            layer_height: 0.2,
-            nozzle_diameter: 0.4,
-            wall_line_width: 0.4,
-            shell_thickness: 0.8,
-            top_layers: 3,
-            bottom_layers: 3,
-            infill_density: 0.2,
-            ..SlicerConfig::default()
-        };
-        let tool_id = crate::ids::ToolId(0);
-        let object = crate::object::Object::new(crate::ids::ObjectId(0), mesh.clone(), tool_id);
-        let tool = crate::tool::Tool::new(tool_id, config.nozzle_diameter);
-        let layers = crate::slicing::slice_object(&object, &config)
-            .expect("slicing a plain box must succeed");
-        let paths = crate::toolpath::plan(
-            &layers,
-            std::slice::from_ref(&object),
-            std::slice::from_ref(&tool),
-            &config,
-        )
-        .expect("planning toolpaths for a plain box must succeed");
+        let (mesh, config, paths) = real_pipeline_fixture();
         // `cell_size = 2.0` is well above `wall_line_width`/`infill_line_width`
         // (0.4), squarely in the regime `audit_extrusion_volume`'s own doc
         // comment recommends for a real multi-layer audit -- large enough to
         // average over many stacked layers and adjacent beads, avoiding both
         // the dilution (upper-bound) and centerline-splatting (lower-bound)
         // artifacts documented there.
-        let grid = audit_extrusion_volume(&mesh, &paths, &config, 2.0);
+        let grid = audit_extrusion_volume(mesh, paths, config, 2.0);
 
         // Tolerances re-measured after restricting overfilled_cells/
         // underfilled_cells to Solid-zone cells only (this task): measured
@@ -1561,10 +1559,11 @@ mod tests {
     fn duplicated_walls_on_real_pipeline_output_raise_per_cell_ratios() {
         // Every other duplication test on this module uses hand-built
         // `Path`s at a `cell_size` below the recommended lower bound. This
-        // one injects the defect into REAL pipeline output -- slice a box,
-        // plan its toolpaths, then duplicate every planned inner-wall path --
-        // and audits at `cell_size = 2.0`, the same recommended setting the
-        // golden-path test uses.
+        // one injects the defect into REAL pipeline output -- the shared
+        // real-pipeline fixture (slice a box, plan its toolpaths, see
+        // `real_pipeline_fixture`), then duplicate every planned inner-wall
+        // path -- and audits at `cell_size = 2.0`, the same recommended
+        // setting the golden-path test uses.
         //
         // Asserts on the PER-CELL query directly (rather than the global
         // `assert_no_overfill`) because comparing each cell against its own
@@ -1572,32 +1571,10 @@ mod tests {
         // leaving only the injected duplication -- a cleaner signal than a
         // single global max. See the companion test below for the
         // equivalent proof via `assert_no_overfill` itself.
-        let mesh = box_mesh(DVec3::ZERO, DVec3::new(20.0, 20.0, 20.0));
-        let config = SlicerConfig {
-            layer_height: 0.2,
-            nozzle_diameter: 0.4,
-            wall_line_width: 0.4,
-            shell_thickness: 0.8,
-            top_layers: 3,
-            bottom_layers: 3,
-            infill_density: 0.2,
-            ..SlicerConfig::default()
-        };
-        let tool_id = crate::ids::ToolId(0);
-        let object = crate::object::Object::new(crate::ids::ObjectId(0), mesh.clone(), tool_id);
-        let tool = crate::tool::Tool::new(tool_id, config.nozzle_diameter);
-        let layers = crate::slicing::slice_object(&object, &config)
-            .expect("slicing a plain box must succeed");
-        let paths = crate::toolpath::plan(
-            &layers,
-            std::slice::from_ref(&object),
-            std::slice::from_ref(&tool),
-            &config,
-        )
-        .expect("planning toolpaths for a plain box must succeed");
+        let (mesh, config, paths) = real_pipeline_fixture();
 
         let cell_size = 2.0;
-        let baseline = audit_extrusion_volume(&mesh, &paths, &config, cell_size);
+        let baseline = audit_extrusion_volume(mesh, paths, config, cell_size);
         let baseline_ratios: HashMap<[usize; 3], f64> =
             baseline.overfilled_cells(0.0).into_iter().collect();
         assert!(
@@ -1620,7 +1597,7 @@ mod tests {
             "the planner should emit inner wall paths for a 20mm box -- nothing to duplicate"
         );
         injected.extend(duplicated);
-        let defective = audit_extrusion_volume(&mesh, &injected, &config, cell_size);
+        let defective = audit_extrusion_volume(mesh, &injected, config, cell_size);
 
         // The signal: compare each cell against its own healthy baseline.
         // This cancels the sampling artifacts both runs share, leaving only
@@ -1647,29 +1624,7 @@ mod tests {
         // panic-based `assert_no_overfill` API directly -- not just the
         // per-cell query -- now that `Solid`-zone restriction (this task)
         // keeps sparse-infill sampling noise from swamping the signal.
-        let mesh = box_mesh(DVec3::ZERO, DVec3::new(20.0, 20.0, 20.0));
-        let config = SlicerConfig {
-            layer_height: 0.2,
-            nozzle_diameter: 0.4,
-            wall_line_width: 0.4,
-            shell_thickness: 0.8,
-            top_layers: 3,
-            bottom_layers: 3,
-            infill_density: 0.2,
-            ..SlicerConfig::default()
-        };
-        let tool_id = crate::ids::ToolId(0);
-        let object = crate::object::Object::new(crate::ids::ObjectId(0), mesh.clone(), tool_id);
-        let tool = crate::tool::Tool::new(tool_id, config.nozzle_diameter);
-        let layers = crate::slicing::slice_object(&object, &config)
-            .expect("slicing a plain box must succeed");
-        let paths = crate::toolpath::plan(
-            &layers,
-            std::slice::from_ref(&object),
-            std::slice::from_ref(&tool),
-            &config,
-        )
-        .expect("planning toolpaths for a plain box must succeed");
+        let (mesh, config, paths) = real_pipeline_fixture();
 
         let cell_size = 2.0;
         let mut injected = paths.clone();
@@ -1698,14 +1653,14 @@ mod tests {
         // noise between runs.
         let max_ratio = 0.93;
 
-        let baseline = audit_extrusion_volume(&mesh, &paths, &config, cell_size);
+        let baseline = audit_extrusion_volume(mesh, paths, config, cell_size);
         // Negative control: the healthy baseline must NOT trip the
         // assertion. If this panics, the test fails here.
         baseline.assert_no_overfill(max_ratio);
 
         // Positive control: the same box with every inner wall path
         // duplicated MUST trip it.
-        let defective = audit_extrusion_volume(&mesh, &injected, &config, cell_size);
+        let defective = audit_extrusion_volume(mesh, &injected, config, cell_size);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             defective.assert_no_overfill(max_ratio);
         }));

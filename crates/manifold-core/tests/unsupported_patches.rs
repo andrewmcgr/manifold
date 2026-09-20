@@ -123,6 +123,32 @@ fn plan_and_find_patches(mesh: Mesh, config: &SlicerConfig) -> Vec<String> {
         .collect()
 }
 
+/// The shared Eikonal-frustum pipeline for the two frustum regression
+/// tests below: a minimal inverted frustum (4mm top square, 15mm bottom
+/// square, 3mm tall -- flared ~15 degree underside overhangs) sliced and
+/// planned with the Eikonal order field and default 0.4/0.8 settings.
+///
+/// The Eikonal FMM solve + full toolpath planning is the dominant cost of
+/// these tests (minutes in debug; the patch detection itself is
+/// milliseconds). Both tests use the identical mesh and config, so the
+/// fixture runs slice+plan once per test binary and each test only runs
+/// patch detection on the shared, immutable result.
+fn eikonal_frustum_patches() -> &'static [String] {
+    use std::sync::OnceLock;
+    static PATCHES: OnceLock<Vec<String>> = OnceLock::new();
+    PATCHES
+        .get_or_init(|| {
+            let config = SlicerConfig {
+                layer_height: 0.4,
+                nozzle_diameter: 0.8,
+                order_field: OrderFieldKind::Eikonal,
+                ..SlicerConfig::default()
+            };
+            plan_and_find_patches(inverted_frustum_mesh(4.0, 15.0, 3.0), &config)
+        })
+        .as_slice()
+}
+
 /// Soundness guard: a plain box sliced with the flat `Height` field has
 /// every bead either on the bed or on the previous layer — the detector
 /// must stay silent, or every other test here is meaningless.
@@ -145,23 +171,24 @@ fn height_field_box_has_no_unsupported_patches() {
     );
 }
 
-/// Regression: bottom-surface conformal Eikonal slicing of shallow
-/// underside overhangs must not schedule beads over not-yet-printed
-/// material. Reproduces the pug_v4_m_sop_85mm.stl "unsupported patches
-/// around order 4.8" defect on a minimal inverted frustum whose four
-/// flared sides are ~15 degree underside overhangs (well within the 30
-/// degree default bottom detach angle, so they *are* conformed to).
+/// Regression: Eikonal slicing of the inverted frustum must not schedule
+/// beads over not-yet-printed material. Reproduces the
+/// pug_v4_m_sop_85mm.stl "unsupported patches around order 4.8" defect on
+/// a minimal inverted frustum whose four flared sides are ~15 degree
+/// underside overhangs (well within the 30 degree default bottom detach
+/// angle).
+///
+/// NOTE: `eikonal_conform_bottom_surfaces` is currently NOT read by the
+/// core pipeline (the conformal FMM constructor has no core caller; the
+/// flag only selects it in manifold-fidget's standalone API), so this test
+/// exercises the same plain-Eikonal path as
+/// `plain_eikonal_frustum_has_no_unsupported_patches` until the conformal
+/// path is wired into the core pipeline. Both tests intentionally share the
+/// sliced/planned frustum fixture; give this test a conforming config of its
+/// own when conforming lands.
 #[test]
 fn bottom_conformal_eikonal_frustum_has_no_unsupported_patches() {
-    let config = SlicerConfig {
-        layer_height: 0.4,
-        nozzle_diameter: 0.8,
-        order_field: OrderFieldKind::Eikonal,
-        ..SlicerConfig::default()
-    };
-    // Underside slope: atan(height / (top_half - bottom_half))
-    //   = atan(3 / 11) ~= 15.3 degrees from horizontal.
-    let patches = plan_and_find_patches(inverted_frustum_mesh(4.0, 15.0, 3.0), &config);
+    let patches = eikonal_frustum_patches();
     assert!(
         patches.is_empty(),
         "expected no unsupported patches on bottom-conformal frustum, found:\n{}",
@@ -169,18 +196,16 @@ fn bottom_conformal_eikonal_frustum_has_no_unsupported_patches() {
     );
 }
 
-/// Same frustum without bottom conforming: the plain Eikonal field must
-/// already be clean here, pinning any failure of the test above on the
+/// Same shared frustum fixture: the plain Eikonal field must already be
+/// clean here, pinning any failure of the conformal-named test above on the
 /// bottom-conformal path rather than on Eikonal slicing in general.
+///
+/// Runs on the shared `eikonal_frustum_patches()` pipeline (see that
+/// helper): the Eikonal FMM solve + toolpath planning is computed once per
+/// test binary and shared with the other frustum regression test.
 #[test]
 fn plain_eikonal_frustum_has_no_unsupported_patches() {
-    let config = SlicerConfig {
-        layer_height: 0.4,
-        nozzle_diameter: 0.8,
-        order_field: OrderFieldKind::Eikonal,
-        ..SlicerConfig::default()
-    };
-    let patches = plan_and_find_patches(inverted_frustum_mesh(4.0, 15.0, 3.0), &config);
+    let patches = eikonal_frustum_patches();
     assert!(
         patches.is_empty(),
         "expected no unsupported patches on plain Eikonal frustum, found:\n{}",

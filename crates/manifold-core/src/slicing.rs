@@ -4759,15 +4759,16 @@ mod tests {
     }
 
     /// A 5x5 shed-roof wedge: flat base at z=0, walls up to z=1 on the y=0
-    /// side and z=6 on the y=5 side, with a single sloped top face connecting
+    /// side and z=4 on the y=5 side, with a single sloped top face connecting
     /// them -- used to stress boundary-metric tangency/orthogonality blending
     /// with a real directional gradient tilt, unlike a flat-topped cube
     /// (whose flat top/vertical walls never tilt the field's local gradient
     /// away from an axis-aligned direction). Regression fixture for the
-    /// `StepCalibration` real-contour rewrite: on this mesh, the old
-    /// order-value-window sampling produced real Z-spacing between
-    /// consecutive layers ranging from 0.166mm to 0.328mm against a 0.25mm
-    /// target (a ~35% swing) -- see `step_calibration_keeps_order_step_stable_across_a_sloped_wedge_and_not_degenerately_constant`.
+    /// `StepCalibration` real-contour rewrite: on this wedge shape (before it
+    /// was shrunk for test speed), the old order-value-window sampling
+    /// produced real Z-spacing between consecutive layers ranging from
+    /// 0.166mm to 0.328mm against a 0.25mm target (a ~35% swing) -- see
+    /// `step_calibration_keeps_order_step_stable_across_a_sloped_wedge_and_not_degenerately_constant`.
     fn wedge_mesh() -> Mesh {
         let vertices = vec![
             DVec3::new(0.0, 0.0, 0.0),
@@ -4776,8 +4777,8 @@ mod tests {
             DVec3::new(0.0, 5.0, 0.0),
             DVec3::new(0.0, 0.0, 1.0),
             DVec3::new(5.0, 0.0, 1.0),
-            DVec3::new(5.0, 5.0, 6.0),
-            DVec3::new(0.0, 5.0, 6.0),
+            DVec3::new(5.0, 5.0, 4.0),
+            DVec3::new(0.0, 5.0, 4.0),
         ];
         let indices = vec![
             0, 2, 1, 0, 3, 2, // -Z
@@ -8158,7 +8159,7 @@ mod tests {
         };
         assert_eq!(config.wall_count(), 2, "test needs a real inner wall");
 
-        let pillar = |center_xy: [f64; 2]| frustum_mesh_at(center_xy, 0.9, 0.9, 5.0, 48);
+        let pillar = |center_xy: [f64; 2]| frustum_mesh_at(center_xy, 0.9, 0.9, 3.0, 48);
         let centered = slice_mesh(&pillar([0.0, 0.0]), &config).unwrap();
         let displaced = slice_mesh(&pillar([120.0, 80.0]), &config).unwrap();
 
@@ -8218,7 +8219,7 @@ mod tests {
         assert_eq!(config.wall_count(), 2, "test needs a real inner wall");
 
         let layers = slice_mesh(
-            &box_mesh(DVec3::new(-10.0, -10.0, 0.0), DVec3::new(10.0, 10.0, 6.0)),
+            &box_mesh(DVec3::new(-10.0, -10.0, 0.0), DVec3::new(10.0, 10.0, 2.0)),
             &config,
         )
         .unwrap();
@@ -8279,7 +8280,7 @@ mod tests {
         };
         assert_eq!(config.wall_count(), 2, "test needs a real inner wall");
 
-        let box_height = 6.0;
+        let box_height = 3.0;
         let layers = slice_mesh(
             &box_mesh(
                 DVec3::new(-10.0, -10.0, 0.0),
@@ -8461,7 +8462,7 @@ mod tests {
         );
 
         let mut layers = slice_mesh(
-            &box_mesh(DVec3::new(-10.0, -10.0, 0.0), DVec3::new(10.0, 10.0, 6.0)),
+            &box_mesh(DVec3::new(-5.0, -5.0, 0.0), DVec3::new(5.0, 5.0, 3.0)),
             &config,
         )
         .unwrap();
