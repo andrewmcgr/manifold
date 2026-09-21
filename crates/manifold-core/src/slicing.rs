@@ -1694,6 +1694,54 @@ pub fn slice_mesh_with_progress(
                         }
                     }
                 }
+                // Solid-bottom band: restore material the 3D inset passes
+                // excluded. Every point of the wall-`wall_count` isosurface on
+                // this layer sits at least the infill depth from every solid
+                // face in 3D, hence at least that far in 2D from this layer's
+                // material cross-section boundary too (faces above the plane
+                // only add 3D constraints; the bed face is excluded from both
+                // the bed-open wall meshes and this cross-section), so the
+                // found 3D region is always contained in the planar
+                // reference: the layer's material cross-section inset by the
+                // infill depth. When a deep inset reaches under a thin solid
+                // band (a wall pass one `wall_line_width` deeper than a
+                // shallow floor slab), the 3D cross-section splits into
+                // disconnected lobes that silently exclude the solid material
+                // between them; on solid-bottom layers the planar-equivalent
+                // reference is unambiguously correct, so union it back in
+                // whenever it covers more material than the 3D pass found.
+                if order_value <= config.bottom_layers as f64 * config.layer_height + 1e-9 {
+                    let infill_depth =
+                        config.wall_offset + wall_count as f64 * config.wall_line_width;
+                    let material = extract_contours(
+                        &*sdf, origin, basis1, basis2, extent, extent, resolution, resolution, 0.0,
+                    );
+                    let material_2d = polygon2d::canonicalize(&polygon2d::to_2d(
+                        &material, basis1, basis2, origin,
+                    ));
+                    if !material_2d.is_empty() {
+                        let reference = polygon2d::inward_offset(&material_2d, infill_depth);
+                        if !reference.is_empty() {
+                            let found_2d = polygon2d::canonicalize(&polygon2d::to_2d(
+                                &found_ib, basis1, basis2, origin,
+                            ));
+                            let lost = polygon2d::difference(&reference, &found_2d);
+                            let lost_area: f64 = lost
+                                .iter()
+                                .map(|loop_| polygon2d::signed_area(loop_).abs())
+                                .sum();
+                            if lost_area > 0.25 * config.nozzle_diameter * config.nozzle_diameter {
+                                let merged = polygon2d::union(&[reference, found_2d]);
+                                found_ib = polygon2d::from_2d(
+                                    polygon2d::densify_loops(merged, config.nozzle_diameter),
+                                    basis1,
+                                    basis2,
+                                    origin,
+                                );
+                            }
+                        }
+                    }
+                }
                 found_ib
             };
             Layer {
@@ -7968,6 +8016,159 @@ mod tests {
             bbox_mins[0] < 0.0 && bbox_mins[1] > 4.0,
             "expected one infill_boundary polygon in the left lobe (min x < 0) \
              and one in the right lobe (min x > 4), got min-x values {bbox_mins:?}"
+        );
+    }
+    /// A "U-channel" prism: the U-shaped (x, z) cross-section below, extruded
+    /// over `y in [0, 45]`. The channel (`x in [6, 14]`) sits above a 0.9mm
+    /// floor slab that spans the full width, flanked by 3mm-tall columns.
+    ///
+    /// This is the TestObj1.stl midline-floor defect class in miniature: the
+    /// slab under the channel is solid material, yet it is thinner than the
+    /// deep wall/infill inset depths, so the `bed_open_sdf` isosurface
+    /// cross-sections at the bottom layers split into two lobes around the
+    /// channel (the inset punches through the thin slab). Related prior art:
+    /// `docs/superpowers/specs/2026-09-19-first-layer-infill-boundary-dropout-
+    /// design.md`.
+    fn u_channel_mesh() -> Mesh {
+        // Outline in the (x, z) plane, counter-clockwise as viewed from +Y
+        // (the extrusion axis), matching this file's outward-normal
+        // convention (see `dumbbell_mesh`).
+        let outline: [[f64; 2]; 8] = [
+            [0.0, 0.0],  // 0 bottom-left
+            [0.0, 3.0],  // 1 top of left column
+            [6.0, 3.0],  // 2 top of channel, left
+            [6.0, 0.9],  // 3 channel floor, left
+            [14.0, 0.9], // 4 channel floor, right
+            [14.0, 3.0], // 5 top of channel, right
+            [20.0, 3.0], // 6 top of right column
+            [20.0, 0.0], // 7 bottom-right
+        ];
+        const Y0: f64 = 0.0;
+        const Y1: f64 = 45.0;
+        let bottom = |i: usize| i as u32;
+        let top = |i: usize| 10 + i as u32;
+        // Ring layout: indices 0..8 are the outline at y=Y0, index 8=(6,0)
+        // and 9=(14,0) are two extra bottom-edge vertices (so the U
+        // cross-section decomposes into three axis-aligned rectangles), then
+        // 10..18 repeat the outline at y=Y1 and 18/19 the extras.
+        let mut vertices = Vec::with_capacity(20);
+        for &[x, z] in &outline {
+            vertices.push(DVec3::new(x, Y0, z));
+        }
+        vertices.push(DVec3::new(6.0, Y0, 0.0));
+        vertices.push(DVec3::new(14.0, Y0, 0.0));
+        for &[x, z] in &outline {
+            vertices.push(DVec3::new(x, Y1, z));
+        }
+        vertices.push(DVec3::new(6.0, Y1, 0.0));
+        vertices.push(DVec3::new(14.0, Y1, 0.0));
+        let mut indices = Vec::new();
+        // Cap triangulation: the U cross-section tiles exactly into three
+        // axis-aligned rectangles, given as (bottom-left, bottom-right,
+        // top-right, top-left) in the (x, z) plane: left column, floor
+        // slab, right column.
+        let cap_rects: [[usize; 4]; 3] = [[0, 8, 2, 1], [8, 9, 4, 3], [9, 7, 6, 5]];
+        for [a, b, c, d] in cap_rects {
+            // Bottom cap: reversed order for a downward (-Y, outward) normal.
+            indices.extend_from_slice(&[bottom(a), bottom(c), bottom(d)]);
+            indices.extend_from_slice(&[bottom(a), bottom(b), bottom(c)]);
+            // Top cap: forward order for an upward (+Y, outward) normal.
+            indices.extend_from_slice(&[top(a), top(d), top(c)]);
+            indices.extend_from_slice(&[top(a), top(c), top(b)]);
+        }
+        // Side walls: one quad (two triangles) per outline edge.
+        for i in 0..outline.len() {
+            let j = (i + 1) % outline.len();
+            indices.extend_from_slice(&[bottom(i), bottom(j), top(j)]);
+            indices.extend_from_slice(&[bottom(i), top(j), top(i)]);
+        }
+        Mesh::new(vertices, indices)
+    }
+
+    #[test]
+    fn slice_mesh_solid_bottom_layers_keep_thin_floor_strip_in_infill_boundary() {
+        // `shell_thickness: 1.2` with `wall_offset` 0.2 and `wall_line_width`
+        // 0.4 gives `wall_count() == 3`: the w2 inset depth is
+        // 0.2 + 2*0.4 = 1.0mm and the infill-boundary depth is
+        // 0.2 + 3*0.4 = 1.4mm -- both deeper than the 0.9mm channel floor
+        // slab but far shallower than the 3mm side columns, so the
+        // deep-isosurface cross-sections at the bottom layers split into two
+        // lobes around the channel while the slab between them stays solid.
+        let mesh = u_channel_mesh();
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            nozzle_diameter: 0.4,
+            wall_line_width: 0.4,
+            wall_offset: 0.2,
+            shell_thickness: 1.2,
+            bottom_layers: 3,
+            order_field: crate::order_field::OrderFieldKind::default(),
+            ..SlicerConfig::default()
+        };
+        assert_eq!(
+            config.wall_count(),
+            3,
+            "the test geometry is sized for wall_count 3"
+        );
+
+        let mut layers = slice_mesh(&mesh, &config).unwrap();
+        compute_solid_fill_boundaries(&mut layers, &config);
+
+        let layer = &layers[0];
+        assert!(
+            !layer.infill_boundary.is_empty(),
+            "layer 0 must have an infill boundary -- otherwise this test is vacuous"
+        );
+        // Sanity check: the defect is actually present in the wall loops (the
+        // w2 pass splits into two lobe loops around the channel, plus a third
+        // loop tracing the channel walls' offset at the layer plane). If this
+        // fails the geometry no longer reproduces the defect class this test
+        // targets.
+        let w2_count = layer.loops.iter().filter(|w| w.wall_index == 2).count();
+        assert_eq!(
+            w2_count, 3,
+            "the w2 wall pass must split into lobe loops plus a channel loop at layer 0"
+        );
+
+        // The channel-center strip (x in [6, 14], all y) is solid material on
+        // the bottom layer: the mesh SDF says the floor slab spans z in
+        // [0, 0.9] across the full width. It must therefore stay inside
+        // `infill_boundary` and `solid_fill_boundary` on the solid-bottom
+        // layers, even though the w2/infill-depth cross-section split leaves
+        // it between the two lobes.
+        let (basis1, basis2) = plane_basis(BUILD_DIRECTION);
+        let ib_2d = polygon2d::canonicalize(&polygon2d::to_2d(
+            &layer.infill_boundary,
+            basis1,
+            basis2,
+            DVec3::ZERO,
+        ));
+        let sf_2d = polygon2d::canonicalize(&polygon2d::to_2d(
+            &layer.solid_fill_boundary,
+            basis1,
+            basis2,
+            DVec3::ZERO,
+        ));
+        // Project the 3D midline point into the 2D frame (plane_basis(
+        // BUILD_DIRECTION) is not plain x/y).
+        let midline_3d = DVec3::new(10.0, 22.5, 0.2);
+        let midline = polygon2d::to_2d(
+            std::slice::from_ref(&vec![midline_3d]),
+            basis1,
+            basis2,
+            DVec3::ZERO,
+        )
+        .pop()
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert!(
+            polygon2d::contains_point(&ib_2d, midline),
+            "the solid channel-floor strip must stay inside layer 0's infill boundary; the deep-inset lobe split must not exclude it"
+        );
+        assert!(
+            polygon2d::contains_point(&sf_2d, midline),
+            "the solid channel-floor strip must stay inside layer 0's solid fill boundary; the deep-inset lobe split must not exclude it"
         );
     }
 

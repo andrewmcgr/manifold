@@ -1029,24 +1029,44 @@ fn solve_along_near<F: OrderField + ?Sized>(
     let mut f_lo = f_zero;
     let mut f_hi = f_zero;
     let mut bracketed = false;
+    // A non-finite sample observed after the current `lo` was placed. A
+    // sign change across such a gap can never enclose a root: the field is
+    // undefined between the two samples, so the bisection would chase the
+    // edge of the undefined region instead of an isosurface crossing.
+    let mut gap_since_lo = false;
 
     for i in 0..=steps {
         let t = min_bound + (max_bound - min_bound) * (i as f64 / steps as f64);
         let r = residual(t);
         consider(t, r);
         if r.is_finite() {
+            // An exact finite root is always a valid answer, even if a gap
+            // was observed earlier in the scan (matches the old behavior of
+            // bracketing an exact-zero sample and returning it).
+            if r == 0.0 {
+                return Some(SolveAlong::Exact(t));
+            }
+            let sign_change = (f_lo > 0.0 && r <= 0.0) || (f_lo < 0.0 && r >= 0.0);
             if !bracketed {
                 lo = t;
                 f_lo = r;
                 bracketed = true;
-            } else if (f_lo > 0.0 && r <= 0.0) || (f_lo < 0.0 && r >= 0.0) {
+                gap_since_lo = false;
+            } else if sign_change && !gap_since_lo {
                 hi = t;
                 f_hi = r;
                 break;
             } else {
+                // Same sign, or a sign change across a non-finite gap:
+                // move the bracket's lower edge to this sample instead of
+                // bracketing the gap (a gap-crossing "sign change" is not
+                // a root bracket).
                 lo = t;
                 f_lo = r;
+                gap_since_lo = false;
             }
+        } else if bracketed {
+            gap_since_lo = true;
         }
     }
 
@@ -1055,10 +1075,19 @@ fn solve_along_near<F: OrderField + ?Sized>(
         && f_hi.is_finite()
         && ((f_lo <= 0.0 && f_hi >= 0.0) || (f_lo >= 0.0 && f_hi <= 0.0))
     {
+        let mut aborted = false;
         for _ in 0..MAX_BISECT_ITERS {
             let mid = (lo + hi) * 0.5;
             let f_mid = residual(mid);
             consider(mid, f_mid);
+            if !f_mid.is_finite() {
+                // The bracket still straddles a region the field is
+                // undefined in (a non-finite midpoint): no root can be
+                // pinned down inside it. Fall through to the closest
+                // finite sample instead of converging on the gap's edge.
+                aborted = true;
+                break;
+            }
             if f_mid.abs() <= TOLERANCE || (hi - lo).abs() <= TOLERANCE {
                 return Some(SolveAlong::Exact(mid));
             }
@@ -1069,7 +1098,9 @@ fn solve_along_near<F: OrderField + ?Sized>(
                 hi = mid;
             }
         }
-        return Some(SolveAlong::Exact((lo + hi) * 0.5));
+        if !aborted {
+            return Some(SolveAlong::Exact((lo + hi) * 0.5));
+        }
     }
 
     if found_any_finite && best_residual.is_finite() {
@@ -1083,8 +1114,9 @@ fn solve_along_near<F: OrderField + ?Sized>(
 /// from the nearest (in `(u, v)`) point of `references` -- 3D loops already
 /// known to lie on (or very near) the layer's `target_order` isosurface,
 /// e.g. the layer's own `infill_boundary` before a 2D boolean op -- and
-/// then refines with [`project_onto_isosurface`]'s local Newton descent
-/// instead of an axis-ray bracket search from the `along == 0` plane.
+/// then refines with [`solve_along_near`]'s seed-anchored bracket search,
+/// falling back to [`project_onto_isosurface`]'s local Newton descent when
+/// no valid bracket is found.
 ///
 /// This exists because [`reconstruct_on_order_field`]'s axis-ray solve is
 /// launched from the world `axis == 0` plane with its initial bracket
@@ -1143,8 +1175,17 @@ pub fn reconstruct_on_order_field_near<F: OrderField + ?Sized>(
                     let planar = apex + basis1 * u + basis2 * v + axis * nearest_along;
                     let bracket = max_along;
                     match solve_along_near(field, planar, axis, target_order, bracket) {
-                        Some(SolveAlong::Exact(t)) | Some(SolveAlong::ClosestObserved(t)) => {
-                            planar + axis * t
+                        Some(SolveAlong::Exact(t)) => planar + axis * t,
+                        Some(SolveAlong::ClosestObserved(t)) => {
+                            // No valid bracket (e.g. the column straddles a
+                            // region the field is undefined in): refine the
+                            // seed locally. Newton descent from the seed
+                            // converges to the local branch when the seed is
+                            // finite; if it can't (non-finite seed, a step
+                            // out of the field's known region), keep the
+                            // closest finite sample the scan observed.
+                            refine_point_onto_order_field(planar, target_order, bracket, field)
+                                .unwrap_or_else(|| planar + axis * t)
                         }
                         None => planar,
                     }
@@ -1255,6 +1296,17 @@ pub(crate) fn refine_point_onto_order_field<F: OrderField + ?Sized>(
 /// never reached at all. `None` forces callers to make an explicit choice
 /// for a column with *zero* information instead of silently fabricating
 /// one.
+///
+/// A sign change bracketed *across a region where the field is
+/// non-finite* (an undefined gap between two finite sheets) is an
+/// artifact of the gap, not an isosurface crossing: the doubling search
+/// therefore only accepts *finite* samples as the bracketing sign, and a
+/// bisection midpoint that turns out non-finite aborts the search to the
+/// closest finite sample instead of converging on the gap's edge. The old
+/// behavior treated a `+inf` sample as positive and a `+inf` midpoint as
+/// 'same sign as the positive end', which collapsed the bracket onto the
+/// lower finite sheet and reported a bogus "exact" root at the void
+/// floor of two-sheeted columns.
 fn solve_along<F: OrderField + ?Sized>(
     field: &F,
     planar: DVec3,
@@ -1320,7 +1372,11 @@ fn solve_along<F: OrderField + ?Sized>(
             hi = (hi + step).min(max_bound);
             let f_hi = residual(hi);
             consider(hi, f_hi);
-            if f_hi >= 0.0 {
+            // A non-finite sample (the field is undefined here) can never
+            // be evidence of a sign change: requiring finiteness keeps the
+            // doubling search from treating a +inf void sample as a
+            // bracketing positive value.
+            if f_hi.is_finite() && f_hi >= 0.0 {
                 bracketed = true;
                 break;
             }
@@ -1336,7 +1392,7 @@ fn solve_along<F: OrderField + ?Sized>(
             lo = (lo - step).max(min_bound);
             let f_lo_candidate = residual(lo);
             consider(lo, f_lo_candidate);
-            if f_lo_candidate <= 0.0 {
+            if f_lo_candidate.is_finite() && f_lo_candidate <= 0.0 {
                 bracketed = true;
                 break;
             }
@@ -1383,6 +1439,24 @@ fn solve_along<F: OrderField + ?Sized>(
     for _ in 0..MAX_BISECT_ITERS {
         let mid = 0.5 * (lo + hi);
         let f_mid = residual(mid);
+        consider(mid, f_mid);
+        if !f_mid.is_finite() {
+            // The bracket spans a region the field is undefined in (a
+            // non-finite midpoint): the bisection is chasing the edge of
+            // the undefined region, not an isosurface crossing. Run the
+            // same dense evenly-spaced scan as the no-bracket path so the
+            // fallback lands on a sample the field actually defines
+            // instead of the sparse doubling samples.
+            const FALLBACK_SCAN_STEPS: u32 = 256;
+            let span = max_bound - min_bound;
+            if span.is_finite() && span > 0.0 {
+                for i in 0..=FALLBACK_SCAN_STEPS {
+                    let along = min_bound + span * (f64::from(i) / f64::from(FALLBACK_SCAN_STEPS));
+                    consider(along, residual(along));
+                }
+            }
+            return found_any_finite.then_some(SolveAlong::ClosestObserved(best_along));
+        }
         if f_mid.abs() <= TOLERANCE {
             return Some(SolveAlong::Exact(mid));
         }
@@ -1710,6 +1784,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reconstruct_near_keeps_a_seed_on_its_own_sheet_when_the_column_straddles_a_void_gap() {
+        // Regression test for the TestObj1 top-slab sliver collapse
+        // (defect-2): an `AnisotropicFsm` column above a Y-parallel bore
+        // is finite on the bottom slab, `+inf` through the entire void,
+        // and finite again on the top slab. The old `solve_along_near`
+        // scan treated the seed's own finite top-slab sample as a sign
+        // change against the first finite bottom-slab sample, bracketing
+        // the *void* between them; the bisection then read `+inf`
+        // midpoints as positive, collapsed the bracket onto the
+        // bottom-slab sample, and reported a bogus "exact" root at the
+        // void floor -- dragging ~0.5mm-tall top-slab infill slivers
+        // down ~10mm into the void. A sign change observed across a
+        // non-finite gap must be rejected; the point must stay on its
+        // own sheet.
+        struct TwoSheetsWithVoidGap;
+        impl OrderField for TwoSheetsWithVoidGap {
+            fn order(&self, p: DVec3) -> f64 {
+                // Bottom sheet: order == z up to z == 2.9; void: +inf
+                // through (2.9, 11.6); top sheet: order == z on
+                // [11.6, 12.9] -- deliberately thin, so the seed's own
+                // sample is the only finite top-sheet sample the scan
+                // sees (thicker slabs would give the old code a valid
+                // adjacent bracket and pass both implementations).
+                // Undefined (+inf) above the object.
+                match p.z {
+                    z if z <= 2.9 => z,
+                    z if (11.6..=12.9).contains(&z) => z,
+                    _ => f64::INFINITY,
+                }
+            }
+        }
+        let field = TwoSheetsWithVoidGap;
+        let target_order = 12.0;
+        let max_along = 10.0;
+        // One contour point at (u, v) == (0, 0); the single reference
+        // point sits on the TOP sheet at z == 12.5, so the seed's own
+        // residual is a small positive value (+0.5) -- exactly the
+        // TestObj1 configuration that used to fold to the void floor.
+        let contours = vec![vec![[0.0_f64, 0.0_f64]]];
+        let references = vec![vec![DVec3::new(0.0, 0.0, 12.5)]];
+        let out = reconstruct_on_order_field_near(
+            contours,
+            &references,
+            DVec3::X,
+            DVec3::Y,
+            DVec3::Z,
+            DVec3::ZERO,
+            target_order,
+            max_along,
+            &field,
+        );
+        let point = &out[0][0];
+        assert!(
+            point.z > 11.6,
+            "expected the point to stay on its own top sheet (z >= 11.6), got {point:?} -- the old solver reported a bogus 'exact' root at the void floor (~z == 2.9) instead"
+        );
+        assert!(
+            (point.z - target_order).abs() < 0.01,
+            "expected the seed's sheet to be refined onto the isosurface (z == {target_order}), got {point:?}"
+        );
+    }
+    #[test]
+    fn solve_along_falls_back_to_the_dense_scan_when_the_bracket_spans_a_void_gap() {
+        // Regression test, sibling of the void-gap test above, for the
+        // non-near `solve_along` used by `reconstruct_point_on_order_field`
+        // (the path `MonotonicInfill` scan-line crossings take): the
+        // doubling search must not treat a `+inf` void sample as a
+        // bracketing sign, and a bisection whose midpoints fall in the
+        // void must abort to the dense evenly-spaced fallback scan
+        // instead of converging on the void's edge.
+        struct RootAcrossVoidGap;
+        impl OrderField for RootAcrossVoidGap {
+            fn order(&self, p: DVec3) -> f64 {
+                // Bottom sheet: order == z up to z == 2.9; void: +inf
+                // through (2.9, 11.6); top sheet: order == 2z - 20 for
+                // z >= 11.6, whose root for the target (5.0) sits at
+                // z == 12.5.
+                match p.z {
+                    z if z <= 2.9 => z,
+                    z if z >= 11.6 => 2.0 * z - 20.0,
+                    _ => f64::INFINITY,
+                }
+            }
+        }
+        let field = RootAcrossVoidGap;
+        let axis = DVec3::Z;
+        let planar = DVec3::new(0.0, 0.0, 0.0);
+        let target = 5.0;
+        let max_along = 20.0;
+        let point = reconstruct_point_on_order_field(planar, axis, target, max_along, &field)
+            .expect("finite samples exist on both sheets, so reconstruction must succeed");
+        assert!(
+            point.z > 11.6,
+            "expected the fallback to land on the top sheet, got {point:?} -- the old solver collapsed the gap-spanning bracket onto the void's edge (~z == 2.9) instead"
+        );
+        assert!(
+            (point.z - 12.5).abs() < 0.25,
+            "expected the dense fallback scan to find the true root at z == 12.5, got {point:?}"
+        );
+    }
     #[test]
     fn solve_along_returns_none_when_no_finite_sample_is_ever_observed() {
         // Regression test for the "infill scan-line crossings snap to a
