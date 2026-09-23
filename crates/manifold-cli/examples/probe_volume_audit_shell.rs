@@ -108,11 +108,35 @@ fn main() -> anyhow::Result<()> {
     println!("\n--- Outside-the-mesh material (extrusion into open air) ---");
     let outside = grid.extrusion_outside_mesh_cells();
     println!("{} cells", outside.len());
-    for idx in outside.iter().take(20) {
-        let center = grid.cell_center(*idx);
+    let mut zhist: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+    for idx in &outside {
+        let c = grid.cell_center(*idx);
+        *zhist.entry((c.z / 2.0) as i32).or_default() += 1;
+    }
+    println!("z-band (2mm) histogram:");
+    for (zb, n) in &zhist {
+        println!("  z {:4}..{:4} : {}", 2 * zb, 2 * zb + 2, n);
+    }
+    println!("\ncentral-region (world x,y in 166..184) outside-mesh cells, kind volumes:");
+    for idx in outside.iter().filter(|idx| {
+        let c = grid.cell_center(**idx);
+        (166.0..184.0).contains(&c.x) && (166.0..184.0).contains(&c.y)
+    }) {
+        let c = grid.cell_center(*idx);
+        let wall = grid.accumulated_volume(*idx, VolumeKindBucket::Wall);
+        let top = grid.accumulated_volume(*idx, VolumeKindBucket::TopSurface);
+        let infill = grid.accumulated_volume(*idx, VolumeKindBucket::Infill);
+        let overhang = grid.accumulated_volume(*idx, VolumeKindBucket::Overhang);
         println!(
-            "  cell {idx:?} world({:.1},{:.1},{:.1})",
-            center.x, center.y, center.z
+            "  cell {idx:?} world({x:.1},{y:.1},{z:.1}) wall={wall:.3} top={top:.3} infill={infill:.3} overhang={overhang:.3}",
+            x = c.x,
+            y = c.y,
+            z = c.z,
+            idx = *idx,
+            wall = wall,
+            top = top,
+            infill = infill,
+            overhang = overhang
         );
     }
 
