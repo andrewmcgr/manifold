@@ -1650,13 +1650,21 @@ pub fn slice_mesh_with_progress(
                         // independently instead of accepting or rejecting
                         // this whole `w` for every island at once. See
                         // `infill_boundary_already_covers`'s doc comment for
-                        // why this checks direct geometric containment
-                        // against `found_ib` rather than a coarse
+                        // why this checks containment-aware dedup
+                        // against `found_ib` (close-inset duplicates are
+                        // dropped; nested hole/void boundaries are kept)
+                        // rather than a coarse
                         // `loop_island` id.
                         for pts in valid_ib {
-                            if !infill_boundary_already_covers(
-                                &pts, &found_ib, origin, basis1, basis2,
-                            ) {
+                            let covered = infill_boundary_already_covers(
+                                &pts,
+                                &found_ib,
+                                origin,
+                                basis1,
+                                basis2,
+                                &bed_open_sdf,
+                            );
+                            if !covered {
                                 found_ib.push(pts);
                             }
                         }
@@ -1687,7 +1695,12 @@ pub fn slice_mesh_with_progress(
                         // `loop_island` id.
                         for pts in inset_3d {
                             if !infill_boundary_already_covers(
-                                &pts, &found_ib, origin, basis1, basis2,
+                                &pts,
+                                &found_ib,
+                                origin,
+                                basis1,
+                                basis2,
+                                &bed_open_sdf,
                             ) {
                                 found_ib.push(pts);
                             }
@@ -2864,13 +2877,41 @@ fn loop_island(
 /// `loop_island`'s coarse outer-wall-topology id, and NOT via either
 /// loop's own boundary point (see below for why each of those is wrong).
 ///
-/// Two loops are considered the same region if EITHER's centroid falls
-/// inside the other's polygon. Checking both directions covers both
-/// possible nesting orientations this function's caller encounters: a
-/// shallower wall's larger candidate loop nesting an already-accepted
-/// deeper (more inset, smaller) loop -- the common single-region case,
-/// where the deeper loop's own centroid falls inside the shallower
-/// candidate's larger polygon -- and the reverse.
+/// Two loops are candidates for the same region if EITHER's centroid falls
+/// inside the other's polygon (covering both nesting orientations this
+/// caller encounters: a shallower wall's larger candidate nesting an
+/// accepted deeper loop, or the reverse). Containment alone is NOT enough
+/// to call them the same region, though: a loop that encloses AIR at this
+/// layer's order plane (a hole/void boundary, or an inner-island boundary)
+/// nested inside an outer boundary is a genuinely separate physical feature
+/// even though its centroid falls inside the outer loop. So containment is
+/// confirmed by a 3D same-feature signature (see `same_feature_loops_3d`):
+/// the inner loop must be a CLOSE PARALLEL INSET of the outer one in 3D --
+/// a large majority (>= 60%) of its sampled points must sit within a small
+/// slack of the 3D distance implied by the loops' SDF-level difference
+/// (`|sdf(p) - sdf_outer| + 0.5mm`), AND it must wrap most of the outer
+/// perimeter (>= 75% of its 3D length), so a small fragment hugging part of
+/// the boundary cannot mark the whole loop as a duplicate. The 3D test is
+/// used instead of a 2D point-to-boundary distance because the 2D gap
+/// between two SDF-offset contours of the same surface stretches past any
+/// fixed threshold where the contours cross a shallow-slope top surface
+/// (2D gap = 3D gap / sin(tilt)), whereas the 3D gap along the surface
+/// normal stays exactly the SDF-level difference. That is the original
+/// dedup case of one wall depth duplicating another's region: two wall
+/// passes of the SAME boundary feature are near-parallel offsets a
+/// wall-depth or two apart. Any containment at a larger 3D range is a
+/// distinct topological feature (a hole/void boundary, an island or band
+/// boundary) nested in or around the other and is kept: the even-odd infill
+/// region needs the hole boundary to exclude the void, and needs the outer
+/// boundary to flip the void's parity back to air.
+///
+/// Centroid containment remains only a cheap prefilter for the nesting
+/// relationship; the close-inset test runs on the loops' own boundary
+/// points, never on a single representative point, so two same-region
+/// loops derived at different depths or via different code paths (the
+/// wall-mesh extraction vs. the wall0-inset fallback below) are matched by
+/// their shapes rather than by one sampled point falling just outside the
+/// other loop.
 ///
 /// **Why not a boundary point (e.g. `pts[0]`):** an earlier version of
 /// this function tested containment using each loop's own first point,
@@ -2918,6 +2959,7 @@ fn infill_boundary_already_covers(
     origin: DVec3,
     basis1: DVec3,
     basis2: DVec3,
+    sdf: &MeshSdf,
 ) -> bool {
     if pts.is_empty() {
         return false;
@@ -2931,9 +2973,115 @@ fn infill_boundary_already_covers(
         }
         let existing_2d: Vec<[f64; 2]> = existing.iter().map(|&p| to_2d(p)).collect();
         let existing_centroid = polygon2d::centroid(&existing_2d);
-        polygon2d::point_in_polygon(candidate_centroid, &existing_2d)
-            || polygon2d::point_in_polygon(existing_centroid, &candidate_2d)
+        let candidate_inside = polygon2d::point_in_polygon(candidate_centroid, &existing_2d);
+        let existing_inside = polygon2d::point_in_polygon(existing_centroid, &candidate_2d);
+        match (candidate_inside, existing_inside) {
+            // Candidate nested inside an existing loop: a duplicate only
+            // when the two are close parallel 3D offsets of the same
+            // surface feature.
+            (true, _) => same_feature_loops_3d(pts, existing, sdf),
+            // Existing loop nested inside the candidate: a duplicate only
+            // when the existing loop is a close parallel 3D offset of the
+            // candidate.
+            (false, true) => same_feature_loops_3d(existing, pts, sdf),
+            // No nesting: disjoint or merely overlapping features.
+            _ => false,
+        }
     })
+}
+
+/// True when `a` and `b` are close parallel 3D offsets of the same surface
+/// feature: a large majority (>= 60%) of the DENSER loop's evenly-spaced
+/// sample points lie within `|sdf(p) - ref_sdf| + SLACK` of the sparser
+/// loop's closed boundary, where `ref_sdf` is the mean SDF level of the
+/// sparser loop's boundary (a loop extracted at one wall depth sits on one
+/// SDF isosurface, so the 3D offset between two SDF levels equals their
+/// SDF-level difference exactly, independent of slope).
+///
+/// The test runs in 3D, not in the layer plane: the 2D gap between two
+/// SDF-offset contours of the same surface stretches without bound as the
+/// surface becomes tangent to the layer plane (2D gap = 3D gap / sin(tilt)),
+/// so any fixed 2D threshold either keeps same-depth duplicates (missing the
+/// dedup) or drops genuinely distinct nested features. The 3D distance along
+/// the surface normal between two SDF levels is exactly the SDF-level
+/// difference, independent of slope.
+///
+/// Sampling the DENSER loop (rather than a fixed role) makes the test
+/// robust to one loop being a coarse fallback inset: a coarse loop's sparse
+/// vertices sit on long chords that deviate from the true boundary, so
+/// measuring the coarse loop against the dense one fails. Measuring the
+/// dense boundary against the coarse one is stable. A small fragment that
+/// merely hugs a portion of a larger loop's boundary also fails naturally:
+/// the larger (denser) loop's points are far from the fragment over most of
+/// its perimeter, so the majority test rejects the pair.
+///
+/// `sdf` must be the SDF the wall loops were EXTRACTED from (the
+/// bed-floor-excluded `bed_open_sdf`, not the all-faces SDF): the SDF-level
+/// comparison is only meaningful against the same face set that defines the
+/// isosurfaces the loops sit on. Near the bed the all-faces SDF is dominated
+/// by the bed floor itself, so loops a full wall step apart all read the
+/// same (bed-distance) level and the tolerance collapses to SLACK alone --
+/// same-feature dedup then misses exactly the bottom layers where the
+/// shallower wall duplicates live.
+fn same_feature_loops_3d(a: &[DVec3], b: &[DVec3], sdf: &MeshSdf) -> bool {
+    if a.len() < 3 || b.len() < 3 {
+        return false;
+    }
+    // Tolerance slack beyond the SDF-level difference: marching-cubes facet
+    // error plus re-projection error of fallback-inset loops.
+    const SLACK: f64 = 0.5;
+    // Sample the denser loop (better boundary representation) and measure its
+    // points against the sparser loop's boundary.
+    let (dense, sparse) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    // Mean SDF level of the sparse loop's boundary (its isosurface depth).
+    // Sample up to 32 evenly-spaced points so huge loops stay cheap.
+    let step = (sparse.len() / 32).max(1);
+    let (mut acc, mut count) = (0.0, 0usize);
+    for i in (0..sparse.len()).step_by(step) {
+        acc += sdf.sample(sparse[i]).value;
+        count += 1;
+    }
+    let ref_sdf = if count > 0 { acc / count as f64 } else { 0.0 };
+    let (omn, omx) = loop_aabb(sparse);
+    let step = (dense.len() / 64).max(1);
+    let (mut ok, mut total) = (0usize, 0usize);
+    for i in (0..dense.len()).step_by(step) {
+        total += 1;
+        let p = dense[i];
+        let tol = (sdf.sample(p).value - ref_sdf).abs() + SLACK;
+        let t2 = tol * tol;
+        // Fast reject: closest point on the sparse loop's AABB already beyond tol.
+        let cx = p.x.max(omn.x).min(omx.x);
+        let cy = p.y.max(omn.y).min(omx.y);
+        let cz = p.z.max(omn.z).min(omx.z);
+        let d_box = (p - DVec3::new(cx, cy, cz)).length_squared();
+        if d_box > t2 {
+            continue;
+        }
+        let mut dmin2 = d_box;
+        for e in 0..sparse.len() {
+            let e0 = sparse[e];
+            let e1 = sparse[(e + 1) % sparse.len()];
+            let ab = e1 - e0;
+            let ab2 = ab.length_squared();
+            let t = if ab2 > 0.0 {
+                ((p - e0).dot(ab) / ab2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let d2 = (e0 + ab * t - p).length_squared();
+            if d2 < dmin2 {
+                dmin2 = d2;
+                if d2 <= t2 {
+                    break;
+                }
+            }
+        }
+        if dmin2 <= t2 {
+            ok += 1;
+        }
+    }
+    ok as f64 / total as f64 >= 0.6
 }
 
 /// Drops wall `w`'s loops, per island, that are a fragmentation artifact of
@@ -3764,6 +3912,7 @@ fn inner_wall_clip_region(
         basis1,
         basis2,
         (min_u, min_v, max_u, max_v),
+        bound_2d,
     );
     if eligible_3d.is_empty() {
         return Vec::new();
@@ -3881,10 +4030,48 @@ struct SeedMarginField<'a> {
     max_along: f64,
     bottom_threshold: f64,
     top_threshold: f64,
+    // Clip the seed-eligible region to this layer's infill boundary so the
+    // `+` (eligible) region is always enclosed within the sampled grid and its
+    // margin contour closes cleanly. The raw seed margin extends to the object
+    // surface -- and, with an anisotropic order field, a little past it --
+    // which is wider than the infill boundary that sizes the grid, so without
+    // this clip the contour runs off the grid edge and shatters into fragments.
+    // Empty slice (None bbox) means no clipping.
+    boundary: &'a [Vec<[f64; 2]>],
+    clip_bbox: Option<(f64, f64, f64, f64)>, // (min_u, min_v, max_u, max_v)
+    apex: DVec3,
+    basis1: DVec3,
+    basis2: DVec3,
+    // Set by `sample` the first time it sees a grid point strictly inside
+    // `boundary` with a negative margin. Lets `seed_eligible_region` detect the
+    // uniformly-eligible case (interior never goes negative) without a second
+    // grid pass: a fully-solid layer's eligible region is then exactly
+    // `boundary` and is returned directly, not as a grid-resolution contour.
+    interior_has_negative: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl ScalarField for SeedMarginField<'_> {
     fn sample(&self, p: DVec3) -> FieldSample {
+        // Clip the eligible region to this layer's infill boundary so the `+`
+        // region is always enclosed by the sampled grid (see struct doc). The
+        // bbox is the layer's infill-boundary extent: reject it in O(1) before
+        // the per-edge containment test.
+        if let Some((min_u, min_v, max_u, max_v)) = self.clip_bbox {
+            let u = (p - self.apex).dot(self.basis1);
+            let v = (p - self.apex).dot(self.basis2);
+            if u < min_u || u > max_u || v < min_v || v > max_v {
+                return FieldSample {
+                    value: f64::NEG_INFINITY,
+                    gradient: DVec3::ZERO,
+                };
+            }
+            if !polygon2d::contains_point(self.boundary, [u, v]) {
+                return FieldSample {
+                    value: f64::NEG_INFINITY,
+                    gradient: DVec3::ZERO,
+                };
+            }
+        }
         let real_point = order_field::reconstruct_point_on_order_field(
             p,
             self.axis,
@@ -3898,6 +4085,12 @@ impl ScalarField for SeedMarginField<'_> {
             Some((SeedKind::Patch, d)) => self.top_threshold - d,
             None => f64::NEG_INFINITY,
         };
+        // A point that reached this far either had no clip (empty boundary, in
+        // which case the flag is ignored) or is strictly inside `boundary`.
+        // A negative margin there means the interior is not uniformly eligible.
+        if value < 0.0 {
+            self.interior_has_negative.set(true);
+        }
         FieldSample {
             value,
             gradient: DVec3::ZERO,
@@ -3968,6 +4161,7 @@ pub(crate) fn seed_eligible_region(
     basis1: DVec3,
     basis2: DVec3,
     extent_2d: (f64, f64, f64, f64), // (min_u, min_v, max_u, max_v)
+    boundary_2d: &[Vec<[f64; 2]>],   // infill boundary to clip the eligible region to
 ) -> Vec<Vec<DVec3>> {
     let (min_u, min_v, max_u, max_v) = extent_2d;
     // Pad the sampled extent by a couple of cells so the contour can
@@ -3978,7 +4172,17 @@ pub(crate) fn seed_eligible_region(
     let center = apex + basis1 * ((min_u + max_u) * 0.5) + basis2 * ((min_v + max_v) * 0.5);
     let resolution_u = ((width / params.cell_size).ceil() as usize).max(2);
     let resolution_v = ((height / params.cell_size).ceil() as usize).max(2);
+    // The geometry cell is tuned for wall-scale features. On a sub-millimeter
+    // footprint it becomes coarser than the very feature this contour exists
+    // to resolve (e.g. the top-skin annulus around a near-apex layer, whose
+    // eligible band is a fraction of a millimeter wide), so guarantee ~30
+    // cells across each dimension: the cost stays bounded (both are 30 when
+    // the footprint is small), and large layers keep their fixed-cell grid
+    // unchanged.
+    let resolution_u = resolution_u.max(30);
+    let resolution_v = resolution_v.max(30);
 
+    let interior_has_negative = std::rc::Rc::new(std::cell::Cell::new(false));
     let field = SeedMarginField {
         order_field,
         axis,
@@ -3986,6 +4190,16 @@ pub(crate) fn seed_eligible_region(
         max_along: params.max_along,
         bottom_threshold: params.bottom_threshold,
         top_threshold: params.top_threshold,
+        boundary: boundary_2d,
+        clip_bbox: if boundary_2d.is_empty() {
+            None
+        } else {
+            Some((min_u, min_v, max_u, max_v))
+        },
+        apex,
+        basis1,
+        basis2,
+        interior_has_negative: interior_has_negative.clone(),
     };
     let seed_eligible_3d = extract_contours(
         &field,
@@ -3998,6 +4212,15 @@ pub(crate) fn seed_eligible_region(
         resolution_v,
         0.0,
     );
+    // A fully-solid layer: during the contour's grid sampling the interior of
+    // `boundary_2d` never went negative, so the eligible region is exactly the
+    // infill boundary. Return it directly (as 3D) rather than the clip's
+    // grid-resolution contour, which traces the infill boundary's own perimeter
+    // and would either leak a ~0.1mm hairline gap into the skin or, for a small
+    // near-apex layer, fall below `min_solid_area` and vanish entirely.
+    if !boundary_2d.is_empty() && !interior_has_negative.get() {
+        return polygon2d::from_2d(boundary_2d.to_vec(), basis1, basis2, apex);
+    }
     if seed_eligible_3d.is_empty() {
         // No crossing found anywhere in the sampled grid: the whole region
         // is uniformly on one side of the seed-eligibility threshold.
@@ -4140,6 +4363,7 @@ pub fn compute_solid_fill_boundaries(layers: &mut [Layer], config: &SlicerConfig
                 basis1,
                 basis2,
                 (min_u, min_v, max_u, max_v),
+                &boundary_2d,
             );
             let seed_eligible_2d = {
                 let raw = polygon2d::to_2d(&seed_eligible_3d, basis1, basis2, origin);
@@ -5714,6 +5938,149 @@ mod tests {
         assert!(
             any_layer_had_walls,
             "fixture produced no layers with contour loops at all"
+        );
+    }
+
+    /// A 12x12x12 cube with a 4x4 square hole through its center, parallel to
+    /// Z (hole spans x,y 4..8). The material ring between the hole and the
+    /// outer faces is 4mm wide, so the `wall_count` isosurface (1.4mm inset
+    /// with 0.2 offset + 3 x 0.4 walls) exists on both the outer faces and
+    /// the hole walls for every layer.
+    fn cube_with_z_hole_mesh() -> Mesh {
+        let vertices = vec![
+            DVec3::new(0.0, 0.0, 0.0),    // 0 outer bottom
+            DVec3::new(12.0, 0.0, 0.0),   // 1
+            DVec3::new(12.0, 12.0, 0.0),  // 2
+            DVec3::new(0.0, 12.0, 0.0),   // 3
+            DVec3::new(0.0, 0.0, 12.0),   // 4 outer top
+            DVec3::new(12.0, 0.0, 12.0),  // 5
+            DVec3::new(12.0, 12.0, 12.0), // 6
+            DVec3::new(0.0, 12.0, 12.0),  // 7
+            DVec3::new(4.0, 4.0, 0.0),    // 8 hole bottom
+            DVec3::new(8.0, 4.0, 0.0),    // 9
+            DVec3::new(8.0, 8.0, 0.0),    // 10
+            DVec3::new(4.0, 8.0, 0.0),    // 11
+            DVec3::new(4.0, 4.0, 12.0),   // 12 hole top
+            DVec3::new(8.0, 4.0, 12.0),   // 13
+            DVec3::new(8.0, 8.0, 12.0),   // 14
+            DVec3::new(4.0, 8.0, 12.0),   // 15
+            DVec3::new(0.0, 4.0, 0.0),    // 16 outer bottom ring
+            DVec3::new(0.0, 8.0, 0.0),    // 17
+            DVec3::new(12.0, 4.0, 0.0),   // 18
+            DVec3::new(12.0, 8.0, 0.0),   // 19
+            DVec3::new(0.0, 4.0, 12.0),   // 20 outer top ring
+            DVec3::new(0.0, 8.0, 12.0),   // 21
+            DVec3::new(12.0, 4.0, 12.0),  // 22
+            DVec3::new(12.0, 8.0, 12.0),  // 23
+        ];
+        let indices = vec![
+            // Outer side faces.
+            0, 1, 5, 0, 5, 4, // -Y
+            3, 7, 6, 3, 6, 2, // +Y
+            0, 4, 7, 0, 7, 3, // -X
+            1, 2, 6, 1, 6, 5, // +X
+            // Bottom annulus (normal -Z).
+            0, 8, 9, 0, 9, 1, // front
+            18, 9, 10, 18, 10, 19, // right
+            3, 2, 10, 3, 10, 11, // back
+            16, 11, 8, 16, 17, 8, // left
+            // Top annulus (normal +Z).
+            4, 13, 12, 4, 5, 13, // front
+            22, 23, 14, 22, 14, 13, // right
+            7, 14, 6, 7, 15, 14, // back
+            20, 15, 12, 20, 12, 21, // left
+            // Hole walls.
+            8, 9, 13, 8, 13, 12, // -Y (hole front)
+            9, 14, 13, 9, 10, 14, // +X (hole right)
+            10, 11, 15, 10, 15, 14, // +Y (hole back)
+            11, 8, 12, 11, 12, 15, // -X (hole left)
+        ];
+        Mesh::new(vertices, indices)
+    }
+
+    /// Even-odd containment count of a point (in XY) across the loops of an
+    /// infill boundary.
+    fn even_odd_count_xy(loops: &[Vec<DVec3>], x: f64, y: f64) -> usize {
+        loops
+            .iter()
+            .filter(|lp| {
+                let n = lp.len();
+                if n < 3 {
+                    return false;
+                }
+                let mut inside = false;
+                let mut j = n - 1;
+                for i in 0..n {
+                    let xi = lp[i].x;
+                    let yi = lp[i].y;
+                    let xj = lp[j].x;
+                    let yj = lp[j].y;
+                    if (yi > y) != (yj > y) {
+                        let xint = (xj - xi) * (y - yi) / (yj - yi) + xi;
+                        if x < xint {
+                            inside = !inside;
+                        }
+                    }
+                    j = i;
+                }
+                inside
+            })
+            .count()
+    }
+
+    #[test]
+    fn slice_mesh_infill_boundary_keeps_hole_boundary_so_hole_interior_stays_air() {
+        let config = SlicerConfig {
+            layer_height: 0.5,
+            wall_line_width: 0.4,
+            shell_thickness: 1.4, // wall_count 3 -> infill depth 1.4mm
+            ..SlicerConfig::default()
+        };
+        assert_eq!(config.wall_count(), 3);
+
+        let layers = slice_mesh(&cube_with_z_hole_mesh(), &config).unwrap();
+
+        // The hole center must be OUTSIDE the even-odd infill region on every
+        // layer with an infill boundary (enclosed by the outer AND the hole
+        // boundary loops -> even count), and a material ring point must be
+        // INSIDE it (odd count). The pre-fix dedup dropped the hole-boundary
+        // loop (its centroid sits inside the outer perimeter loop), leaving
+        // the hole interior inside the infill region -- sparse infill printed
+        // into the void.
+        let max_order = layers.iter().map(|l| l.order).fold(0.0f64, f64::max);
+        let mut checked = 0usize;
+        for layer in layers
+            .iter()
+            .filter(|l| !l.infill_boundary.is_empty())
+            // Skip layers whose cap above the layer plane is thinner than
+            // the infill depth: the w3 isosurface no longer intersects the
+            // part, so the boundary degenerates to the fallback inset
+            // (pre-existing regime, unrelated to the dedup).
+            .filter(|l| max_order - l.order >= config.shell_thickness)
+        {
+            assert!(
+                layer.infill_boundary.len() >= 2,
+                "layer at order {} lost its hole-boundary loop ({} infill loops)",
+                layer.order,
+                layer.infill_boundary.len()
+            );
+            assert_eq!(
+                even_odd_count_xy(&layer.infill_boundary, 6.0, 6.0) % 2,
+                0,
+                "layer at order {}: hole center (6,6) inside the infill region -- hole boundary loop was dropped by the dedup",
+                layer.order
+            );
+            assert_eq!(
+                even_odd_count_xy(&layer.infill_boundary, 2.0, 6.0) % 2,
+                1,
+                "layer at order {}: material ring point (2,6) outside the infill region -- outer boundary loop was dropped",
+                layer.order
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 8,
+            "expected most of the 24 layers to have an infill boundary, got {checked}"
         );
     }
 
@@ -7433,6 +7800,22 @@ mod tests {
         // overstated proximity to the top on this cone's slope by a
         // constant factor. With Task 1's perpendicular-distance fix, no
         // config tightening should be needed.
+        //
+        // `top_layers` is 4, not 3, deliberately: at 3 the top band
+        // (`3 * layer_height + 1e-3 = 0.601mm` from the top surface, measured
+        // perpendicular to it) coincides with the wall stack itself
+        // (`wall_offset + wall_count * wall_line_width = 0.6mm`), so the
+        // layer-plane solid band begins exactly where the infill boundary
+        // ends and the correct-side solid sliver is ~0-wide (below
+        // `min_solid_area` at every near-apex layer). A `top_layers` of 3
+        // therefore cannot observe any correct-side solid fill at this
+        // nozzle -- only a wrong-side (interior-pocket) fill, which the
+        // bed-clipped seed field no longer produces. `top_layers: 4` makes
+        // the band exceed the wall stack by a full layer height, leaving a
+        // real ~0.2mm-wide correct-side sliver inside the infill interior.
+        // (The sibling 0.1mm-nozzle test avoids the same coincidence the
+        // other way: its wall stack is so thin the default band reaches
+        // well past it.)
         let base_radius = 5.0;
         let apex_z = 10.0;
         let segments = 32;
@@ -7458,7 +7841,7 @@ mod tests {
         let config = SlicerConfig {
             order_field: order_field::OrderFieldKind::Height,
             layer_height: 0.2,
-            top_layers: 3,
+            top_layers: 4,
             bottom_layers: 3,
             ..SlicerConfig::default()
         };
@@ -7602,6 +7985,12 @@ mod tests {
             max_along: params.max_along,
             bottom_threshold: params.bottom_threshold,
             top_threshold: params.top_threshold,
+            boundary: &[],
+            clip_bbox: None,
+            apex,
+            basis1,
+            basis2,
+            interior_has_negative: std::rc::Rc::new(std::cell::Cell::new(false)),
         };
         let center = apex; // bbox center for this symmetric extent.
         assert!(
@@ -7626,6 +8015,7 @@ mod tests {
             basis1,
             basis2,
             extent_2d,
+            &[], // no clip: the disambiguation path is unchanged
         );
         assert!(
             !result.is_empty(),

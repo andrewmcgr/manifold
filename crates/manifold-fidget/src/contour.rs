@@ -467,55 +467,6 @@ pub fn stitch_loops_with_debug(
         by_exact_point.entry(point_key(b)).or_default().push(i);
     }
 
-    if std::env::var("MANIFOLD_DEBUG_CORNER").is_ok() && segments.len() > 500 {
-        let mut degree_hist: HashMap<usize, usize> = HashMap::new();
-        for v in by_exact_point.values() {
-            *degree_hist.entry(v.len()).or_default() += 1;
-        }
-        let mut hist: Vec<(usize, usize)> = degree_hist.into_iter().collect();
-        hist.sort();
-        tracing::warn!(
-            ?hist,
-            total_segments = segments.len(),
-            "CORNER-DEBUG exact-point degree histogram"
-        );
-    }
-
-    if std::env::var("MANIFOLD_DEBUG_CORNER").is_ok() {
-        if let Some((minx, maxx, miny, maxy, minz, maxz)) =
-            segments
-                .iter()
-                .fold(None::<(f64, f64, f64, f64, f64, f64)>, |acc, (a, b)| {
-                    let mut acc =
-                        acc.unwrap_or((f64::MAX, f64::MIN, f64::MAX, f64::MIN, f64::MAX, f64::MIN));
-                    for p in [a, b] {
-                        acc.0 = acc.0.min(p.x);
-                        acc.1 = acc.1.max(p.x);
-                        acc.2 = acc.2.min(p.y);
-                        acc.3 = acc.3.max(p.y);
-                        acc.4 = acc.4.min(p.z);
-                        acc.5 = acc.5.max(p.z);
-                    }
-                    Some(acc)
-                })
-        {
-            tracing::warn!(minx, maxx, miny, maxy, minz, maxz, "CORNER-DEBUG bounds");
-        }
-        let region: Vec<&(DVec3, DVec3)> = segments
-            .iter()
-            .filter(|(a, b)| {
-                let in_region = |p: DVec3| p.x < 90.0 && p.y < 90.0 && p.z > 11.9 && p.z < 12.1;
-                in_region(*a) || in_region(*b)
-            })
-            .collect();
-        if !region.is_empty() {
-            tracing::warn!(count = region.len(), "CORNER-DEBUG segments in region");
-            for (a, b) in &region {
-                tracing::warn!(?a, ?b, len = a.distance(*b), "CORNER-DEBUG segment");
-            }
-        }
-    }
-
     let mut used = vec![false; segments.len()];
     let mut loops = Vec::new();
 
