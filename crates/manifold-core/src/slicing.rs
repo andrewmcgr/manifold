@@ -1613,6 +1613,13 @@ pub fn slice_mesh_with_progress(
                 // If the interior cavity has narrowed or capped under a roof, fall back to the
                 // deepest inner wall mesh that exists on this layer, or inset from wall 0.
                 let mut found_ib = Vec::new();
+                // Track the deepest wall depth that produced at least one
+                // valid loop, plus the largest enclosed 2D area among that
+                // depth's loops. The split-outer repair below uses this to
+                // detect layers where the deepest sheet's outer boundary was
+                // fragmented rather than missing as a whole.
+                let mut deepest_valid_w: Option<usize> = None;
+                let mut deepest_valid_max_area = 0.0f64;
                 for w in (1..=wall_count).rev() {
                     if w < wall_meshes.len() {
                         let (ib_loops, _) = extract_order_contours_on_mesh_with_debug(
@@ -1621,6 +1628,7 @@ pub fn slice_mesh_with_progress(
                             order_value,
                             BUILD_DIRECTION,
                         );
+                        let _raw_ib_n = ib_loops.len();
                         let valid_ib: Vec<Vec<DVec3>> = ib_loops
                             .into_iter()
                             .filter(|pts| {
@@ -1643,6 +1651,14 @@ pub fn slice_mesh_with_progress(
                             basis1,
                             basis2,
                         );
+                        if deepest_valid_w.is_none() && !valid_ib.is_empty() {
+                            deepest_valid_w = Some(w);
+                            deepest_valid_max_area =
+                                polygon2d::to_2d(&valid_ib, basis1, basis2, origin)
+                                    .iter()
+                                    .map(|l| polygon2d::signed_area(l).abs())
+                                    .fold(0.0f64, f64::max);
+                        }
                         // A wall depth can be valid for one island and
                         // fragmented for another (e.g. a narrow groove on
                         // one island bifurcates at wall_count while another
@@ -1704,6 +1720,69 @@ pub fn slice_mesh_with_progress(
                             ) {
                                 found_ib.push(pts);
                             }
+                        }
+                    }
+                }
+                // Split-outer repair: when the deepest valid wall depth's loops
+                // do not span the wall-0 outer footprint, that sheet's outer
+                // boundary was fragmented on this layer — e.g. the offset patch
+                // of a horizontal face just above the layer plane sits exactly
+                // at the sheet level, cutting the outer ring into pieces along
+                // that face's shadow. Pairwise dedup cannot reconcile such
+                // fragments with the shallower complete rings that survive in
+                // `found_ib`, leaving broken even-odd parity (hole air reading
+                // as infill). Rebuild the found region from the planar
+                // reference — the material cross-section on the layer plane
+                // inset by the infill depth — the same construction the
+                // solid-bottom band below uses; it is exact on the
+                // near-planar order surfaces that produce the split.
+                let wall0_area: f64 = ib_outers
+                    .iter()
+                    .map(|l| polygon2d::signed_area(l).abs())
+                    .sum();
+                let fragmented_or_fallback_only = match deepest_valid_w {
+                    // No wall depth produced any loop: fire only when the
+                    // accumulated region is the coarse one-width fallback
+                    // inset (non-empty), which can swallow small hole air
+                    // pockets in the cap-thickness regime -- rebuild it from
+                    // the planar reference. A fully empty region means this
+                    // layer has no infill material at all (e.g. a top cap
+                    // past the part's top face); leaving it empty avoids
+                    // giving the solid-fill post-pass a boundary that would
+                    // place a top band on the air side of the face.
+                    None => !found_ib.is_empty(),
+                    // The deepest sheet's outer did not span the wall-0
+                    // footprint: the outer boundary was fragmented on this
+                    // layer.
+                    Some(_) => deepest_valid_max_area < 0.75 * wall0_area,
+                };
+                if wall0_area > 0.0 && fragmented_or_fallback_only {
+                    let infill_depth =
+                        config.wall_offset + wall_count as f64 * config.wall_line_width;
+                    // Bias the iso slightly INTO the material (-1e-3): at iso
+                    // 0.0 a horizontal face coincident with the layer plane
+                    // (e.g. a groove floor) is a zero SDF plateau and the
+                    // contour walk can leak spurious loops through it, while a
+                    // tiny negative iso puts the cross-section strictly on the
+                    // material side of the plane so the face's air strip drops
+                    // out of the cross-section.
+                    // Non-coincident layers shift by 1 micron -- negligible.
+                    let material = extract_contours(
+                        &*sdf, origin, basis1, basis2, extent, extent, resolution, resolution,
+                        -1e-3,
+                    );
+                    let material_2d = polygon2d::canonicalize(&polygon2d::to_2d(
+                        &material, basis1, basis2, origin,
+                    ));
+                    if !material_2d.is_empty() {
+                        let reference = polygon2d::inward_offset(&material_2d, infill_depth);
+                        if !reference.is_empty() {
+                            found_ib = polygon2d::from_2d(
+                                polygon2d::densify_loops(reference, config.nozzle_diameter),
+                                basis1,
+                                basis2,
+                                origin,
+                            );
                         }
                     }
                 }
@@ -6082,6 +6161,173 @@ mod tests {
             checked >= 8,
             "expected most of the 24 layers to have an infill boundary, got {checked}"
         );
+    }
+
+    /// A 30x30x5 plate with a 3mm-diameter (r 1.5) circular through-hole
+    /// centered at (7,15) and a 10mm-wide, 1.8mm-deep groove running the
+    /// full y-span of the top face (x 16..26, z 3.2..5). The groove floor
+    /// puts the w3 SDF level (-1.4 with 0.2 offset + 3 x 0.4 walls) just
+    /// above the z = 1.8 mark, where the deepest outer sheet splits into a
+    /// left lobe and a right strip while the shallower wall sheets are
+    /// still complete rings -- the Test6 split-outer defect.
+    fn groove_with_hole_mesh() -> Mesh {
+        let vertices = vec![
+            DVec3::new(0.0, 0.0, 0.0),   // outer bottom
+            DVec3::new(30.0, 0.0, 0.0),  // outer bottom
+            DVec3::new(30.0, 30.0, 0.0), // outer bottom
+            DVec3::new(0.0, 30.0, 0.0),  // outer bottom
+            DVec3::new(0.0, 0.0, 5.0),   // outer top
+            DVec3::new(30.0, 0.0, 5.0),  // outer top
+            DVec3::new(30.0, 30.0, 5.0), // outer top
+            DVec3::new(0.0, 30.0, 5.0),  // outer top
+            DVec3::new(16.0, 0.0, 5.0),  // groove top
+            DVec3::new(26.0, 0.0, 5.0),
+            DVec3::new(26.0, 30.0, 5.0),
+            DVec3::new(16.0, 30.0, 5.0),
+            DVec3::new(16.0, 0.0, 3.2), // groove floor
+            DVec3::new(26.0, 0.0, 3.2),
+            DVec3::new(26.0, 30.0, 3.2),
+            DVec3::new(16.0, 30.0, 3.2),
+            DVec3::new(0.0, 13.5, 5.0), // top-face split
+            DVec3::new(16.0, 13.5, 5.0),
+            DVec3::new(0.0, 16.5, 5.0),
+            DVec3::new(16.0, 16.5, 5.0),
+            DVec3::new(0.0, 13.5, 0.0), // bottom-face split
+            DVec3::new(30.0, 13.5, 0.0),
+            DVec3::new(0.0, 16.5, 0.0),
+            DVec3::new(30.0, 16.5, 0.0),
+            DVec3::new(8.5, 15.0, 0.0), // hole bottom ring
+            DVec3::new(8.471178, 15.292635, 0.0),
+            DVec3::new(8.385819, 15.574025, 0.0),
+            DVec3::new(8.247204, 15.833355, 0.0),
+            DVec3::new(8.06066, 16.06066, 0.0),
+            DVec3::new(7.833355, 16.247204, 0.0),
+            DVec3::new(7.574025, 16.385819, 0.0),
+            DVec3::new(7.292635, 16.471178, 0.0),
+            DVec3::new(7.0, 16.5, 0.0),
+            DVec3::new(6.707365, 16.471178, 0.0),
+            DVec3::new(6.425975, 16.385819, 0.0),
+            DVec3::new(6.166645, 16.247204, 0.0),
+            DVec3::new(5.93934, 16.06066, 0.0),
+            DVec3::new(5.752796, 15.833355, 0.0),
+            DVec3::new(5.614181, 15.574025, 0.0),
+            DVec3::new(5.528822, 15.292635, 0.0),
+            DVec3::new(5.5, 15.0, 0.0),
+            DVec3::new(5.528822, 14.707365, 0.0),
+            DVec3::new(5.614181, 14.425975, 0.0),
+            DVec3::new(5.752796, 14.166645, 0.0),
+            DVec3::new(5.93934, 13.93934, 0.0),
+            DVec3::new(6.166645, 13.752796, 0.0),
+            DVec3::new(6.425975, 13.614181, 0.0),
+            DVec3::new(6.707365, 13.528822, 0.0),
+            DVec3::new(7.0, 13.5, 0.0),
+            DVec3::new(7.292635, 13.528822, 0.0),
+            DVec3::new(7.574025, 13.614181, 0.0),
+            DVec3::new(7.833355, 13.752796, 0.0),
+            DVec3::new(8.06066, 13.93934, 0.0),
+            DVec3::new(8.247204, 14.166645, 0.0),
+            DVec3::new(8.385819, 14.425975, 0.0),
+            DVec3::new(8.471178, 14.707365, 0.0),
+            DVec3::new(8.5, 15.0, 5.0), // hole top ring
+            DVec3::new(8.471178, 15.292635, 5.0),
+            DVec3::new(8.385819, 15.574025, 5.0),
+            DVec3::new(8.247204, 15.833355, 5.0),
+            DVec3::new(8.06066, 16.06066, 5.0),
+            DVec3::new(7.833355, 16.247204, 5.0),
+            DVec3::new(7.574025, 16.385819, 5.0),
+            DVec3::new(7.292635, 16.471178, 5.0),
+            DVec3::new(7.0, 16.5, 5.0),
+            DVec3::new(6.707365, 16.471178, 5.0),
+            DVec3::new(6.425975, 16.385819, 5.0),
+            DVec3::new(6.166645, 16.247204, 5.0),
+            DVec3::new(5.93934, 16.06066, 5.0),
+            DVec3::new(5.752796, 15.833355, 5.0),
+            DVec3::new(5.614181, 15.574025, 5.0),
+            DVec3::new(5.528822, 15.292635, 5.0),
+            DVec3::new(5.5, 15.0, 5.0),
+            DVec3::new(5.528822, 14.707365, 5.0),
+            DVec3::new(5.614181, 14.425975, 5.0),
+            DVec3::new(5.752796, 14.166645, 5.0),
+            DVec3::new(5.93934, 13.93934, 5.0),
+            DVec3::new(6.166645, 13.752796, 5.0),
+            DVec3::new(6.425975, 13.614181, 5.0),
+            DVec3::new(6.707365, 13.528822, 5.0),
+            DVec3::new(7.0, 13.5, 5.0),
+            DVec3::new(7.292635, 13.528822, 5.0),
+            DVec3::new(7.574025, 13.614181, 5.0),
+            DVec3::new(7.833355, 13.752796, 5.0),
+            DVec3::new(8.06066, 13.93934, 5.0),
+            DVec3::new(8.247204, 14.166645, 5.0),
+            DVec3::new(8.385819, 14.425975, 5.0),
+            DVec3::new(8.471178, 14.707365, 5.0),
+        ];
+        let indices = vec![
+            0, 20, 21, 0, 21, 1, 22, 23, 2, 22, 2, 3, 20, 22, 32, 20, 32, 33, 20, 33, 34, 20, 34,
+            35, 20, 35, 36, 20, 36, 37, 20, 37, 38, 20, 38, 39, 20, 39, 40, 20, 40, 41, 20, 41, 42,
+            20, 42, 43, 20, 43, 44, 20, 44, 45, 20, 45, 46, 20, 46, 47, 20, 47, 48, 23, 21, 48, 23,
+            48, 47, 23, 47, 46, 23, 46, 45, 23, 45, 44, 23, 44, 43, 23, 43, 42, 23, 42, 41, 23, 41,
+            40, 23, 40, 39, 23, 39, 38, 23, 38, 37, 23, 37, 36, 23, 36, 35, 23, 35, 34, 23, 34, 33,
+            23, 33, 32, 0, 1, 5, 0, 5, 4, 3, 6, 2, 3, 2, 6, 0, 7, 3, 0, 3, 7, 1, 2, 6, 1, 6, 5, 4,
+            8, 17, 4, 17, 16, 18, 19, 11, 18, 11, 7, 16, 80, 79, 16, 79, 78, 16, 78, 77, 16, 77,
+            76, 16, 76, 75, 16, 75, 74, 16, 74, 73, 16, 73, 72, 16, 72, 71, 16, 71, 70, 16, 70, 69,
+            16, 69, 68, 16, 68, 67, 16, 67, 66, 16, 66, 65, 16, 65, 64, 16, 64, 18, 19, 64, 63, 19,
+            63, 62, 19, 62, 61, 19, 61, 60, 19, 60, 59, 19, 59, 58, 19, 58, 57, 19, 57, 56, 19, 56,
+            87, 19, 87, 86, 19, 86, 85, 19, 85, 84, 19, 84, 83, 19, 83, 82, 19, 82, 81, 19, 81, 80,
+            19, 80, 17, 9, 5, 6, 9, 6, 10, 12, 13, 14, 12, 14, 15, 12, 8, 11, 12, 11, 15, 13, 14,
+            10, 13, 10, 9, 24, 56, 25, 56, 57, 25, 25, 57, 26, 57, 58, 26, 26, 58, 27, 58, 59, 27,
+            27, 59, 28, 59, 60, 28, 28, 60, 29, 60, 61, 29, 29, 61, 30, 61, 62, 30, 30, 62, 31, 62,
+            63, 31, 31, 63, 32, 63, 64, 32, 32, 64, 33, 64, 65, 33, 33, 65, 34, 65, 66, 34, 34, 66,
+            35, 66, 67, 35, 35, 67, 36, 67, 68, 36, 36, 68, 37, 68, 69, 37, 37, 69, 38, 69, 70, 38,
+            38, 70, 39, 70, 71, 39, 39, 71, 40, 71, 72, 40, 40, 72, 41, 72, 73, 41, 41, 73, 42, 73,
+            74, 42, 42, 74, 43, 74, 75, 43, 43, 75, 44, 75, 76, 44, 44, 76, 45, 76, 77, 45, 45, 77,
+            46, 77, 78, 46, 46, 78, 47, 78, 79, 47, 47, 79, 48, 79, 80, 48, 48, 80, 49, 80, 81, 49,
+            49, 81, 50, 81, 82, 50, 50, 82, 51, 82, 83, 51, 51, 83, 52, 83, 84, 52, 52, 84, 53, 84,
+            85, 53, 53, 85, 54, 85, 86, 54, 54, 86, 55, 86, 87, 55, 55, 87, 24, 87, 56, 24,
+        ];
+        Mesh::new(vertices, indices)
+    }
+
+    /// Above the w3 patch under the groove floor (z > 1.8) the deepest
+    /// outer sheet splits; the pre-fix
+    /// dedup kept a shallower complete outer alongside the fragments,
+    /// flipping the hole center to odd parity (in-air infill) -- the Test6
+    /// defect. The hole center must stay at even parity on every layer,
+    /// and material points must stay inside the infill region.
+    #[test]
+    fn slice_mesh_infill_boundary_keeps_even_parity_at_hole_with_split_outer_sheets() {
+        let config = SlicerConfig {
+            layer_height: 0.4,
+            wall_line_width: 0.4,
+            shell_thickness: 1.2, // wall_count 3 -> infill depth 1.4mm
+            ..SlicerConfig::default()
+        };
+        assert_eq!(config.wall_count(), 3);
+
+        let layers = slice_mesh(&groove_with_hole_mesh(), &config).unwrap();
+
+        let mut checked = 0usize;
+        for layer in layers.iter().filter(|l| !l.infill_boundary.is_empty()) {
+            assert_eq!(
+                even_odd_count_xy(&layer.infill_boundary, 7.0, 15.0) % 2,
+                0,
+                "layer at order {}: hole center (7,15) inside the infill region -- split-outer fragments left a stale full outer",
+                layer.order
+            );
+            assert_eq!(
+                even_odd_count_xy(&layer.infill_boundary, 2.0, 15.0) % 2,
+                1,
+                "layer at order {}: material point (2,15) outside the infill region",
+                layer.order
+            );
+            assert_eq!(
+                even_odd_count_xy(&layer.infill_boundary, 21.0, 15.0) % 2,
+                usize::from(layer.order < 3.2 - 1e-9),
+                "layer at order {}: groove-floor point (21,15) parity wrong",
+                layer.order
+            );
+            checked += 1;
+        }
+        assert!(checked >= 8);
     }
 
     /// Symmetric-`top_layers`/`bottom_layers` complement to
