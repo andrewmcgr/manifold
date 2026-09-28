@@ -658,7 +658,7 @@ fn fsm_field_for(
         Some(slope_profile),
         Some(&height_along),
     );
-    let (component_id, component_value) = patch_seed_values(
+    let patch_seeds = patch_seed_values(
         dims,
         h,
         actual_min,
@@ -667,6 +667,7 @@ fn fsm_field_for(
         sdf,
         seed_tolerance,
         seed_max_angle_deg,
+        (config.top_layers as f64) * layer_height,
         &baseline,
     );
     let [nx, ny, _nz] = dims;
@@ -678,8 +679,8 @@ fn fsm_field_for(
         let y = ((p.y - actual_min.y) / h).round() as usize;
         let z = ((p.z - actual_min.z) / h).round() as usize;
         let idx = x + y * nx + z * nx * ny;
-        let comp = *component_id.get(idx)?;
-        (comp >= 0).then(|| component_value[comp as usize])
+        let comp = *patch_seeds.dirichlet_id.get(idx)?;
+        (comp >= 0).then(|| patch_seeds.dirichlet_value[comp as usize])
     };
 
     let field = AnisotropicFsmOrderField::solve_with_tensor_grid(
@@ -693,14 +694,44 @@ fn fsm_field_for(
         Some(slope_profile),
         Some(&height_along),
     );
-    field.with_seed_metadata(baseline, component_id, component_value)
+    field.with_seed_metadata(
+        baseline,
+        patch_seeds.eligibility_id,
+        patch_seeds.eligibility_value,
+    )
+}
+
+/// The two patch-seed arrays for [`fsm_field_for`]: the *Dirichlet* grid
+/// marks solid nodes sitting on an upward-facing surface itself (within
+/// `seed_tolerance`); it seeds the final solve as equality constraints, so
+/// isosurfaces run flat and tangent across each face. The *eligibility* grid
+/// marks the face-plane sliver *plus* the material on the face's downward side
+/// within the top band (`top_layers * layer_height`); it is handed to
+/// `with_seed_metadata` so `seed_proximity` reports `SeedKind::Patch` for
+/// points inside the top band below a face. Without the downward-side claim, a
+/// *flat* top face is never seed-eligible for any layer: it is the
+/// order-maximum surface, no layer isosurface crosses it, and its sliver-only
+/// claim leaves every top-band layer plane sampling `SeedKind::Bed` with a
+/// large distance. The solid-fill top band (seed-eligible region intersected
+/// with the infill boundary) then never fires and the face prints as wall
+/// rings plus sparse infill only -- the same material-side claim
+/// `TopSurfaceAwareOrderField::march_to_top` provides for the non-FSM order
+/// fields.
+struct FsmPatchSeeds {
+    dirichlet_id: Vec<i32>,
+    dirichlet_value: Vec<f64>,
+    eligibility_id: Vec<i32>,
+    eligibility_value: Vec<f64>,
 }
 
 /// Groups upward-facing surface-patch seed candidates (see `fsm_field_for`'s
 /// `is_seed_region`) into 6-connected components on the FSM grid and assigns each
 /// component a single consensus order value -- the *maximum* order value an unseeded
 /// ("bed-only") baseline solve of the same tensor grid already assigned any of that
-/// component's member nodes.
+/// component's member nodes. Runs once for the Dirichlet marking and once for the
+/// eligibility marking; the eligibility components are supersets of the Dirichlet
+/// ones (each face's downward slab connects through its sliver), so the face-plane
+/// sliver's max baseline value dominates each component's consensus in both grids.
 ///
 /// Seeding a patch at its own geometric height (`p.dot(BUILD_DIRECTION)`, the
 /// pre-existing approach) makes it a second Dirichlet source that
@@ -729,8 +760,9 @@ fn patch_seed_values(
     sdf: &MeshSdf,
     seed_tolerance: f64,
     seed_max_angle_deg: f64,
+    top_band: f64,
     baseline: &AnisotropicFsmOrderField,
-) -> (Vec<i32>, Vec<f64>) {
+) -> FsmPatchSeeds {
     let [nx, ny, nz] = dims;
     let total = nx * ny * nz;
     let idx_of = |x: usize, y: usize, z: usize| x + y * nx + z * nx * ny;
@@ -738,6 +770,7 @@ fn patch_seed_values(
         |x: usize, y: usize, z: usize| actual_min + DVec3::new(x as f64, y as f64, z as f64) * h;
 
     let mut is_patch = vec![false; total];
+    let mut is_eligible = vec![false; total];
     for z in 0..nz {
         for y in 0..ny {
             for x in 0..nx {
@@ -746,11 +779,25 @@ fn patch_seed_values(
                     continue;
                 }
                 let sample = sdf.sample(p);
-                if sample.value.abs() > seed_tolerance {
+                if !is_upward_within_angle(sample.gradient, seed_max_angle_deg) {
                     continue;
                 }
-                if is_upward_within_angle(sample.gradient, seed_max_angle_deg) {
-                    is_patch[idx_of(x, y, z)] = true;
+                let idx = idx_of(x, y, z);
+                // Dirichlet marking: the face-plane sliver only -- the final
+                // solve's equality-constraint seeds stay exactly where they
+                // always were, so the solved order field is unchanged.
+                if sample.value.abs() <= seed_tolerance {
+                    is_patch[idx] = true;
+                }
+                // Eligibility marking: the sliver plus material on the face's
+                // downward side within the top band (the SDF is the signed
+                // distance to the nearest surface, negative inside the solid,
+                // so `value > -top_band` is "within top_band below some face").
+                // With `top_band == 0` this collapses back to the sliver.
+                if sample.value.abs() <= seed_tolerance
+                    || sample.value > -top_band.max(seed_tolerance)
+                {
+                    is_eligible[idx] = true;
                 }
             }
         }
@@ -758,52 +805,67 @@ fn patch_seed_values(
 
     // 6-connected flood fill: each connected component of qualifying nodes gets its
     // own consensus value, since a mesh can have several disjoint flat/near-flat
-    // regions (e.g. several flat mechanical faces at different heights).
-    let mut component_id = vec![-1i32; total];
-    let mut component_max: Vec<f64> = Vec::new();
-    let mut stack = Vec::new();
-    for z in 0..nz {
-        for y in 0..ny {
-            for x in 0..nx {
-                let start = idx_of(x, y, z);
-                if !is_patch[start] || component_id[start] >= 0 {
-                    continue;
-                }
-                let comp = component_max.len() as i32;
-                component_max.push(f64::NEG_INFINITY);
-                component_id[start] = comp;
-                stack.push((x, y, z));
-                while let Some((cx, cy, cz)) = stack.pop() {
-                    let v = baseline.order(node_pos(cx, cy, cz));
-                    let slot = &mut component_max[comp as usize];
-                    if v.is_finite() && v > *slot {
-                        *slot = v;
+    // regions (e.g. several flat mechanical faces at different heights). Runs
+    // once per marking: the eligibility components are supersets of the
+    // Dirichlet ones (each face's downward slab connects through its sliver),
+    // so the face-plane sliver's max baseline value still dominates each
+    // component's consensus in both grids.
+    let flood = |is_marked: &[bool]| -> (Vec<i32>, Vec<f64>) {
+        let mut component_id = vec![-1i32; total];
+        let mut component_max: Vec<f64> = Vec::new();
+        let mut stack = Vec::new();
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let start = idx_of(x, y, z);
+                    if !is_marked[start] || component_id[start] >= 0 {
+                        continue;
                     }
-                    let neighbors = [
-                        cx.checked_sub(1).map(|x| (x, cy, cz)),
-                        (cx + 1 < nx).then_some((cx + 1, cy, cz)),
-                        cy.checked_sub(1).map(|y| (cx, y, cz)),
-                        (cy + 1 < ny).then_some((cx, cy + 1, cz)),
-                        cz.checked_sub(1).map(|z| (cx, cy, z)),
-                        (cz + 1 < nz).then_some((cx, cy, cz + 1)),
-                    ];
-                    for (nx_, ny_, nz_) in neighbors.into_iter().flatten() {
-                        let nidx = idx_of(nx_, ny_, nz_);
-                        if is_patch[nidx] && component_id[nidx] < 0 {
-                            component_id[nidx] = comp;
-                            stack.push((nx_, ny_, nz_));
+                    let comp = component_max.len() as i32;
+                    component_max.push(f64::NEG_INFINITY);
+                    component_id[start] = comp;
+                    stack.push((x, y, z));
+                    while let Some((cx, cy, cz)) = stack.pop() {
+                        let v = baseline.order(node_pos(cx, cy, cz));
+                        let slot = &mut component_max[comp as usize];
+                        if v.is_finite() && v > *slot {
+                            *slot = v;
+                        }
+                        let neighbors = [
+                            cx.checked_sub(1).map(|x| (x, cy, cz)),
+                            (cx + 1 < nx).then_some((cx + 1, cy, cz)),
+                            cy.checked_sub(1).map(|y| (cx, y, cz)),
+                            (cy + 1 < ny).then_some((cx, cy + 1, cz)),
+                            cz.checked_sub(1).map(|z| (cx, cy, z)),
+                            (cz + 1 < nz).then_some((cx, cy, cz + 1)),
+                        ];
+                        for (nx_, ny_, nz_) in neighbors.into_iter().flatten() {
+                            let nidx = idx_of(nx_, ny_, nz_);
+                            if is_marked[nidx] && component_id[nidx] < 0 {
+                                component_id[nidx] = comp;
+                                stack.push((nx_, ny_, nz_));
+                            }
                         }
                     }
                 }
             }
         }
-    }
+        let component_value: Vec<f64> = component_max
+            .into_iter()
+            .map(|v| if v.is_finite() { v } else { 0.0 })
+            .collect();
+        (component_id, component_value)
+    };
 
-    let component_value: Vec<f64> = component_max
-        .into_iter()
-        .map(|v| if v.is_finite() { v } else { 0.0 })
-        .collect();
-    (component_id, component_value)
+    let (dirichlet_id, dirichlet_value) = flood(&is_patch);
+    let (eligibility_id, eligibility_value) = flood(&is_eligible);
+
+    FsmPatchSeeds {
+        dirichlet_id,
+        dirichlet_value,
+        eligibility_id,
+        eligibility_value,
+    }
 }
 
 /// Hard cap on the dense Eikonal grid's total node count (`dims[0] *

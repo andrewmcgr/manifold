@@ -4127,6 +4127,9 @@ struct SeedMarginField<'a> {
     // grid pass: a fully-solid layer's eligible region is then exactly
     // `boundary` and is returned directly, not as a grid-resolution contour.
     interior_has_negative: std::rc::Rc<std::cell::Cell<bool>>,
+    // Scratch debug: when this layer's order matches MANIFOLD_SF_DBG_ORDER,
+    // `sample` dumps a strided subset of its evaluations to stderr.
+    sf_dbg: bool,
 }
 
 impl ScalarField for SeedMarginField<'_> {
@@ -4164,6 +4167,26 @@ impl ScalarField for SeedMarginField<'_> {
             Some((SeedKind::Patch, d)) => self.top_threshold - d,
             None => f64::NEG_INFINITY,
         };
+        if self.sf_dbg {
+            let du = (p - self.apex).dot(self.basis1);
+            let dv = (p - self.apex).dot(self.basis2);
+            if ((du * 4.0).round() as i64 + (dv * 4.0).round() as i64) % 8 == 0 {
+                eprintln!(
+                    "[SFDBG] apex({:.3},{:.3},{:.3}) grid({:.3},{:.3},{:.3}) lifted({:.3},{:.3},{:.3}) ord={:.4} margin={:+.4}",
+                    self.apex.x,
+                    self.apex.y,
+                    self.apex.z,
+                    p.x,
+                    p.y,
+                    p.z,
+                    real_point.x,
+                    real_point.y,
+                    real_point.z,
+                    self.order_field.order(real_point),
+                    value
+                );
+            }
+        }
         // A point that reached this far either had no clip (empty boundary, in
         // which case the flag is ignored) or is strictly inside `boundary`.
         // A negative margin there means the interior is not uniformly eligible.
@@ -4279,6 +4302,10 @@ pub(crate) fn seed_eligible_region(
         basis1,
         basis2,
         interior_has_negative: interior_has_negative.clone(),
+        sf_dbg: std::env::var("MANIFOLD_SF_DBG_ORDER")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .is_some_and(|t| (t - target_order).abs() < 2e-2),
     };
     let seed_eligible_3d = extract_contours(
         &field,
@@ -5098,6 +5125,111 @@ mod tests {
             solid_flags[first_real + 2],
             Some(false),
             "bottom_layers = 2 must not reach a third layer up from the bottom"
+        );
+    }
+
+    /// Regression test for the flat-top-face top-band defect: with the
+    /// top-surface-aware anisotropic FSM order field
+    /// (`fsm_seed_surfaces_enabled`), the face-patch seed's *eligibility*
+    /// claim must extend to the material on the face's downward side within
+    /// `top_layers * layer_height`. A flat top face is the order-maximum
+    /// surface, so no layer isosurface crosses it; with a face-plane-only
+    /// (sliver) claim, every top-band layer plane sampled `SeedKind::Bed`
+    /// with a large distance, no top-band layer was seed-eligible,
+    /// `compute_solid_fill_boundaries` never emitted a solid-fill top band,
+    /// and the face printed as wall rings plus sparse infill only. The
+    /// non-FSM order fields never had this defect because
+    /// `TopSurfaceAwareOrderField::march_to_top` already claims the material
+    /// side -- which is what
+    /// `compute_solid_fill_boundaries_propagates_top_and_bottom_in_the_correct_direction`
+    /// pins down on the default `Height` field.
+    #[test]
+    fn compute_solid_fill_boundaries_flat_top_face_solid_band_with_fsm_seed_surfaces() {
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            top_layers: 3,
+            bottom_layers: 0,
+            order_field: order_field::OrderFieldKind::AnisotropicFsm,
+            fsm_seed_surfaces_enabled: true,
+            ..SlicerConfig::default()
+        };
+
+        let mut layers = slice_mesh(&big_cube_mesh(), &config).unwrap();
+        compute_solid_fill_boundaries(&mut layers, &config);
+
+        fn area(loops: &[Vec<DVec3>]) -> f64 {
+            loops
+                .iter()
+                .map(|pts| {
+                    let n = pts.len();
+                    if n < 3 {
+                        return 0.0;
+                    }
+                    (0..n)
+                        .map(|i| {
+                            let a = pts[i];
+                            let b = pts[(i + 1) % n];
+                            a.x * b.y - b.x * a.y
+                        })
+                        .sum::<f64>()
+                        * 0.5
+                })
+                .sum()
+        }
+
+        let solid_ratios: Vec<(usize, f64)> = layers
+            .iter()
+            .enumerate()
+            .map(|(i, layer)| {
+                let infill = area(&layer.infill_boundary).abs();
+                let solid = area(&layer.solid_fill_boundary).abs();
+                (
+                    i,
+                    if infill > 1e-9 {
+                        solid / infill
+                    } else {
+                        f64::NAN
+                    },
+                )
+            })
+            .collect();
+
+        let real: Vec<(usize, f64)> = solid_ratios
+            .into_iter()
+            .filter(|(_, ratio)| ratio.is_finite())
+            .collect();
+        let last = real.len() - 1;
+        assert!(
+            last >= 3,
+            "fixture needs at least 4 layers with a nonempty infill region, got {}",
+            real.len()
+        );
+
+        // Top band: the two topmost layers with a fillable infill region are
+        // fully solid (ratio ~ 1). (The face-owning layer just above them has
+        // an empty infill boundary on a flat top -- no closed w-pass loop
+        // exists on its plane -- so it is not a `real` layer here; its band
+        // carries the perimeter wall.)
+        for k in 0..2 {
+            let (idx, ratio) = real[last - k];
+            assert!(
+                (ratio - 1.0).abs() < 1e-3,
+                "layer {} ({}th down from the top face) must be fully solid, got ratio {}",
+                idx,
+                k + 1,
+                ratio
+            );
+        }
+
+        // The third layer down is beyond the top band (top_layers = 3 at
+        // 0.2mm layer height, with the face-owning layer consuming the
+        // topmost band) and must stay sparse.
+        let (idx, ratio) = real[last - 2];
+        assert!(
+            ratio < 0.5,
+            "layer {} is below the top band; the top band (top_layers = 3) must not reach it, got ratio {}",
+            idx,
+            ratio
         );
     }
 
@@ -8237,6 +8369,7 @@ mod tests {
             basis1,
             basis2,
             interior_has_negative: std::rc::Rc::new(std::cell::Cell::new(false)),
+            sf_dbg: false,
         };
         let center = apex; // bbox center for this symmetric extent.
         assert!(

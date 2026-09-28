@@ -669,14 +669,18 @@ impl AnisotropicFsmOrderField {
     }
 
     /// Attaches seed-proximity metadata computed alongside a seeded solve
-    /// (a bed-only `baseline` field plus each patch component's grid
+    /// (a bed-only `baseline` field plus each seed component's grid
     /// membership and consensus order value), enabling `seed_proximity`
     /// queries to additionally account for the nearest patch, not just
-    /// the bed. Only ever called by builders that construct patch seeds
-    /// (e.g. `manifold_core::order_field::fsm_field_for` when
-    /// `fsm_seed_surfaces_enabled` is set); without it, `seed_proximity`
-    /// falls back to the `OrderField` trait's default (`order(p)`
-    /// itself, i.e. bed-distance only).
+    /// the bed. The attached grid is the *eligibility* grid: in addition
+    /// to each upward-facing face plane, the material on the face's
+    /// downward side within the top band (`top_layers * layer_height`),
+    /// so top-band layer planes sample a nearby Patch seed instead of a
+    /// distant Bed seed on flat top faces. Only ever called by builders
+    /// that construct patch seeds (e.g. `manifold_core::order_field::
+    /// fsm_field_for` when `fsm_seed_surfaces_enabled` is set); without
+    /// it, `seed_proximity` falls back to the `OrderField` trait's default
+    /// (`order(p)` itself, i.e. bed-distance only).
     #[must_use]
     pub fn with_seed_metadata(
         mut self,
