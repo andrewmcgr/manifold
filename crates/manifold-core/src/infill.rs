@@ -144,6 +144,92 @@ impl InfillRegion {
     }
 }
 
+/// SDF slack shared by the region-gate thresholds (see `gate_sparse_loops`
+/// / `gate_skin_loops`): a point is treated as contained when its SDF
+/// sample is finite and `<=` the threshold; SDF sampling error on the
+/// meshes in this codebase is well under this value.
+pub const SDF_REGION_GATE_SLACK: f64 = 0.1;
+
+/// Clip 3D region loops to the region where `SDF <= max_sdf`.
+///
+/// Each loop is a closed point ring. Points with a non-finite SDF or
+/// `SDF > max_sdf` are removed; a maximal removed run between retained
+/// neighbours `a` and `b` is re-closed by inserting the chord midpoint
+/// `(a + b) * 0.5` when that midpoint is contained, otherwise by nothing
+/// (direct chord `a -> b`). A loop reduced to fewer than 3 points is
+/// dropped. This is a monotone shrink: loops only lose area, toward the
+/// side of the surface where material exists.
+pub fn clip_loops_to_sdf(
+    loops: Vec<Vec<DVec3>>,
+    sdf: &manifold_fidget::mesh_sdf::MeshSdf,
+    max_sdf: f64,
+) -> Vec<Vec<DVec3>> {
+    let contained = |p: DVec3| {
+        let v = sdf.sample(p).value;
+        v.is_finite() && v <= max_sdf
+    };
+
+    let mut out: Vec<Vec<DVec3>> = Vec::with_capacity(loops.len());
+    for loop_ in loops.into_iter() {
+        let n = loop_.len();
+        if n < 2 {
+            continue;
+        }
+        let flags: Vec<bool> = (0..n).map(|i| contained(loop_[i])).collect();
+        let kept = flags.iter().filter(|&&f| f).count();
+        // 0 kept: nothing survives. 1 kept: the loop reduces to a point.
+        if kept <= 1 {
+            continue;
+        }
+        if kept == n {
+            out.push(loop_);
+            continue;
+        }
+        // Rotate the cyclic walk to start at a contained index, so no
+        // uncontained run can wrap the index boundary.
+        let start = flags.iter().position(|&f| f).expect("kept >= 2");
+        let mut result: Vec<DVec3> = Vec::with_capacity(kept + 1);
+        let mut i = start;
+        loop {
+            result.push(loop_[i]);
+            let mut j = i;
+            let mut run_len = 0;
+            while !flags[(j + 1) % n] {
+                j = (j + 1) % n;
+                run_len += 1;
+            }
+            if run_len > 0 {
+                let after = (j + 1) % n;
+                let m = (loop_[i] + loop_[after]) * 0.5;
+                if contained(m) {
+                    result.push(m);
+                }
+                i = after;
+            } else {
+                i = (i + 1) % n;
+            }
+            if i == start {
+                break;
+            }
+        }
+        // Drop consecutive duplicates (linear and cyclic).
+        let mut dedup: Vec<DVec3> = Vec::with_capacity(result.len());
+        for p in result {
+            match dedup.last() {
+                Some(l) if l.distance_squared(p) < 1e-18 => {}
+                _ => dedup.push(p),
+            }
+        }
+        if dedup.len() >= 2 && dedup[0].distance_squared(*dedup.last().unwrap()) < 1e-18 {
+            dedup.pop();
+        }
+        if dedup.len() >= 3 {
+            out.push(dedup);
+        }
+    }
+    out
+}
+
 /// Generates infill [`Path`]s for one layer's [`InfillRegion`].
 pub trait InfillGenerator {
     /// `object_transform` is the source object's placement — used to keep
@@ -2188,5 +2274,119 @@ mod tests {
                 i - 1
             );
         }
+    }
+
+    /// Closed box [−5, 5]^3 with outward normals; interior SDF at p is
+    /// exactly -min(5-|p.x|, 5-|p.y|, 5-|p.z|).
+    fn unit_box_sdf() -> manifold_fidget::mesh_sdf::MeshSdf {
+        let v: [glam::DVec3; 8] = [
+            glam::DVec3::new(-5.0, -5.0, -5.0), glam::DVec3::new(5.0, -5.0, -5.0),
+            glam::DVec3::new(5.0, 5.0, -5.0),  glam::DVec3::new(-5.0, 5.0, -5.0),
+            glam::DVec3::new(-5.0, -5.0, 5.0), glam::DVec3::new(5.0, -5.0, 5.0),
+            glam::DVec3::new(5.0, 5.0, 5.0),   glam::DVec3::new(-5.0, 5.0, 5.0),
+        ];
+        // two triangles per face, outward normals (right-hand rule)
+        let faces: Vec<[usize; 3]> = vec![
+            [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
+            [0, 4, 7], [0, 7, 3], [1, 6, 5], [2, 6, 5],
+            [0, 1, 5], [0, 5, 4], [3, 7, 6], [3, 6, 2],
+        ];
+        manifold_fidget::mesh_sdf::MeshSdf::new(v.to_vec(), faces)
+    }
+
+    fn pt(x: f64, y: f64, z: f64) -> glam::DVec3 {
+        glam::DVec3::new(x, y, z)
+    }
+
+    #[test]
+    fn clip_keeps_loop_fully_inside() {
+        let sdf = unit_box_sdf();
+        let loop_ = vec![
+            pt(0.0, 0.0, 0.0),
+            pt(2.0, 0.0, 0.0),
+            pt(0.0, 2.0, 0.0),
+            pt(-2.0, 0.0, 0.0),
+        ];
+        let out = clip_loops_to_sdf(vec![loop_.clone()], &sdf, -1.0);
+        assert_eq!(out.len(), 1, "fully-contained loop must survive");
+        assert_eq!(out[0], loop_, "fully-contained loop must be unchanged");
+    }
+
+    #[test]
+    fn clip_drops_loop_fully_outside() {
+        let sdf = unit_box_sdf();
+        let loop_ = vec![
+            pt(4.5, 4.5, 0.0),
+            pt(4.5, 0.0, 0.0),
+            pt(4.5, -4.5, 0.0),
+            pt(0.0, -4.5, 0.0),
+        ];
+        let out = clip_loops_to_sdf(vec![loop_], &sdf, -1.0);
+        assert!(out.is_empty(), "fully-outside loop must be dropped");
+    }
+
+    #[test]
+    fn clip_bridges_outside_run_with_passing_midpoint() {
+        let sdf = unit_box_sdf();
+        // P0..P2 and P6,P7 are at SDF -2 (kept); P3,P4,P5 at SDF -0.5 (dropped).
+        let loop_ = vec![
+            pt(0.0, 3.0, 0.0),
+            pt(1.5, 3.0, 0.0),
+            pt(3.0, 3.0, 0.0),
+            pt(4.5, 3.0, 0.0),
+            pt(4.5, 1.5, 0.0),
+            pt(4.5, 0.0, 0.0),
+            pt(3.0, 0.0, 0.0),
+            pt(1.5, 0.0, 0.0),
+        ];
+        let out = clip_loops_to_sdf(vec![loop_], &sdf, -1.0);
+        assert_eq!(out.len(), 1, "one loop in, one loop out");
+        assert_eq!(out[0].len(), 6, "3 dropped points replaced by 1 midpoint");
+        let mid = out[0][3];
+        assert!(
+            (mid - pt(3.0, 1.5, 0.0)).length() < 1e-9,
+            "midpoint must sit on the chord between the retained neighbours, got {mid:?}"
+        );
+        for p in &out[0] {
+            assert!(
+                sdf.sample(*p).value <= -1.0 + 1e-9,
+                "retained/bridged point out of gate: {p:?} -> {}", sdf.sample(*p).value
+            );
+        }
+    }
+
+    #[test]
+    fn clip_drops_loop_with_single_retained_point() {
+        let sdf = unit_box_sdf();
+        // Only P0 (SDF -5) is contained; the rest at SDF -0.5.
+        let loop_ = vec![
+            pt(0.0, 0.0, 0.0),
+            pt(4.5, 0.0, 0.0),
+            pt(4.5, 4.5, 0.0),
+            pt(0.0, 4.5, 0.0),
+        ];
+        let out = clip_loops_to_sdf(vec![loop_], &sdf, -1.0);
+        assert!(out.is_empty(), "a loop reduced to one point is not a region boundary");
+    }
+
+    #[test]
+    fn clip_handles_run_wrapping_loop_start() {
+        let sdf = unit_box_sdf();
+        // Cyclic order P0..P3: P3 (dropped) -> P0 (dropped) is one run that
+        // wraps the index boundary; retained P1, P2.
+        let loop_ = vec![
+            pt(4.5, 0.0, 0.0),  // P0: SDF -0.5, dropped
+            pt(0.0, 0.0, 0.0),  // P1: SDF -5, kept
+            pt(-3.0, 0.0, 0.0), // P2: SDF -2, kept
+            pt(4.5, 2.0, 0.0),  // P3: SDF -0.5, dropped
+        ];
+        let out = clip_loops_to_sdf(vec![loop_], &sdf, -1.0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), 3, "P1, P2, and the chord midpoint (P2->P1)");
+        let mid = out[0][2];
+        assert!(
+            (mid - pt(-1.5, 0.0, 0.0)).length() < 1e-9,
+            "bridge midpoint must be (P2+P1)/2, got {mid:?}"
+        );
     }
 }
