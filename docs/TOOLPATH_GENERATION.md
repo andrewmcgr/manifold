@@ -265,14 +265,14 @@ Each planner's result is a small plan struct indexed by `layer.index`; per-layer
 1. **Look up** the layer's `Object` (error if missing); decide `is_layer_0`; resolve the (axis, apex) plane-basis triple and the in-plane basis (§1.3).
 2. **Assemble 2D footprints** for the layer: the tangent-surface total footprint, and the *unsupported* void footprint = wave-overhang footprints ∪ bridge footprints ∪ downward tangent footprints. Both are canonicalized (`polygon2d::canonicalize`) into single multi-loops for point-in-polygon tests.
 3. **Build wall paths** in `wall_print_order` (§3): for each wall loop in print order, create the `Path` (debug loops become open `DebugExcluded` polylines), classify every segment's `MoveKind` (§3), assign per-point line widths (gap-fit widths for inner walls, §5.4) and channel widths, and append that wall's gap-fill paths.
-4. **Plan infill and solid fill** over `InfillRegion::from_layer`, with the void footprints subtracted (§4).
+4. **Plan infill and solid fill** over `InfillRegion::from_layer`, with the region loops gated to the mesh SDF (§4.1) and the void footprints subtracted (§4).
 5. **Append dedicated surface paths** — bridges, wave overhangs, tangent surfaces — each kept only if all its points are contained in the mesh SDF (§5).
 6. **Drop too-short open extrusion paths** (total length < `2 × nozzle_diameter`), adjusting the wall-path count used later for travel ordering.
 7. **Safety nets and corrections**: `retain_contained_paths` (§6), `compensate_flat_nozzle` (§6), `simplify_paths` (§7), and void reclassification of wall segments that landed inside an unsupported footprint (§6).
 8. **Travel moves**: `optimize_travel_order` (order-aware sorting over the wall-prefix boundary), then `route_travel_moves` (collision-avoidance A* routing, layer's `order_field` + `mesh_sdf`, layer max-Z bound, slope profile, Z penalty) — both in §8.
 9. **`insert_z_hops`** on travels (§9) and **`subdivide_long_traverses`** on long extrusion moves using the layer's order field (§9).
 10. **Per-segment extrusion/flow finalization** (the big closure: support fractions, SDF surface classification, local layer geometry, slope cosines, bead areas, speeds, volumetric clamps, fluid swell — §10), plus `pin_outer_wall_centerline` on each path (§6).
-11. **Post-passes**: corner-flow compensation, scarf joints, seam gaps, pre-retract tapers, perimeter wipes (§11); then drop negligible micro-paths and clamp all points up to the build-bed floor along `BUILD_DIRECTION`.
+11. **Post-passes**: corner-flow compensation, scarf joints, seam gaps, pre-retract tapers, perimeter wipes (§11); then the SDF backstop re-tags fill segments that end outside the solid as travel (§4.5); then drop negligible micro-paths and clamp all points up to the build-bed floor along `BUILD_DIRECTION`.
 12. Report progress: `(completed_layers / total_layers) × 0.9` through a `Mutex`-guarded callback (the final 0.9 → 1.0 is reported after the global passes).
 
 ### 2.4 Phase 3 — global post-passes
@@ -355,6 +355,8 @@ Infill is **two generator passes** over two regions of the layer, and both are t
 
 The sparse region is generated at `config.infill_density`; the solid region at `density = 1.0` (the generator's density argument is exactly what distinguishes them — `InfillGenerator::generate(region, config, layer, object_transform, density)`).
 
+Both region sets pass through the **SDF containment gate** before the generators consume them (`infill::gate_sparse_loops` / `infill::gate_skin_loops`): every region-boundary point must satisfy `SDF ≤ −(wall_offset + wall_line_width) + 0.1` for the sparse loops — at least one full wall line inside the outer surface, the same depth relationship the walls themselves have — and `SDF ≤ +0.1` for the solid-skin loops (no inset: skin material belongs on the surface). The gate matters because the region pipeline is 2D on a 3D surface: flattening the layer's order-field isosurface onto the layer plane folds where the isosurface is non-monotonic (curved tops, voids — the same XY column crossing the isosurface at several heights), the 2D boolean then leaks points outside the subject polygon, and the re-lift (`reconstruct_on_order_field_near`) seeds them from the nearest XY reference, which can be a different branch or a point in air. The clipping (`infill::clip_loops_to_sdf`) removes failing points and re-closes the loop locally: for a maximal removed run between retained neighbours `a` and `b`, the chord midpoint `m = (a+b)/2` is inserted iff `SDF(m)` passes, else `a→b` is taken directly; a loop whose whole boundary fails — or which shrinks to fewer than 3 points — is dropped, and a non-finite SDF sample counts as failing. It is a *monotone shrink* (the region only loses area, toward the safe side), is re-applied after the §4.2 footprint-mask reconstruction (which re-runs the re-lift and can reintroduce off-surface points), and is a no-op when `layer.mesh_sdf` is `None`.
+
 ### 4.2 Footprint masking before generation
 
 Before either pass generates paths, the *unsupported void footprint* (wave-overhang ∪ bridge ∪ downward-tangent, §2.2) is subtracted:
@@ -378,6 +380,10 @@ All generators emit open `Path`s (Monotonic) or closed ring `Path`s (Concentric/
 ### 4.4 Post-generation filter
 
 After both passes, *open extrusion paths* whose total geometric length is under `2 × nozzle_diameter` are dropped from the layer (they can't lay a bead). This filter tracks which dropped paths were wall paths (by index vs `wall_path_count`) so the wall-prefix boundary for `optimize_travel_order` stays exact (§8.1).
+
+### 4.5 SDF backstop for fill extrusion
+
+The region gate (§4.1) constrains the region *boundaries*; the generators still re-lift interior pattern points onto the layer's isosurface (§4.3), and on non-monotonic order fields that re-lift can leave dangling chords in air (verified on TestObj1: up to +2.86 mm on fully gated layers). As a final per-layer pass — after the wipe, before the micro-path filter — every `Infill` or `TopSurface` segment whose destination point has `SDF > 0.5 × nozzle_diameter` is re-tagged `MoveKind::Travel` with zero extrusion length: the path topology is preserved, the dangling chord simply travels without extruding, and the micro-path filter drops any stub that results. Bridge/Overhang segments are exempt — a bridge spans a void by construction, so positive SDF at its midpoints is expected. This is the §6.1 "never print infill in open air" policy at segment granularity: §6.1 drops a whole path on gross violation, the backstop keeps the valid part of a mostly-good path instead of dropping it.
 
 
 ---
@@ -430,7 +436,7 @@ All four passes feed per-layer planning through small per-layer slices of their 
 
 ## 6. Containment, safety nets & geometric corrections
 
-Between generation (§3–§5) and travel/extrusion finalization (§8–§10), each layer's path set is checked against the real solid and geometrically corrected. These passes run per layer, in this order: `retain_contained_paths` → `compensate_flat_nozzle` → `simplify_paths` (§7) → void reclassification → (later) micro-path filter and bed-floor clamp (§2.3).
+Between generation (§3–§5) and travel/extrusion finalization (§8–§10), each layer's path set is checked against the real solid and geometrically corrected. These passes run per layer, in this order: `retain_contained_paths` → `compensate_flat_nozzle` → `simplify_paths` (§7) → void reclassification → SDF backstop for fill extrusion (§4.5) → (later) micro-path filter and bed-floor clamp (§2.3).
 
 ### 6.1 Mesh-SDF containment safety net — `retain_contained_paths`
 
@@ -440,6 +446,7 @@ Wall/infill loops derive from contour extraction and 2D polygon booleans on `inf
 - A path is **contained** when `gross_outside_fraction ≤ 0.10` *and* `outside_fraction ≤ CONTAINMENT_OUTSIDE_FRACTION` (`0.25`). A genuine wall loop has thousands of points with a handful of outliers; a spurious fragment is small and mostly outside. The threshold is deliberately low — a fragment loop anchored at both ends to real surface can otherwise float mostly in open air near an arch while still averaging under a lenient fraction.
 - **Contained**: kept. **Not contained, pure `Infill` path**: dropped entirely — "never print infill in open air". **Not contained, any other kind**: the path is kept but every segment is retagged `MoveKind::DebugExcluded` (still rendered for inspection, never emitted to G-code), with a `tracing::warn!` summary. A partially-valid path is dropped/retagged *wholesale* rather than clipped: splitting would risk a spurious partial loop that's arguably worse than omitting the already-wrong path.
 - No-op when `mesh_sdf` is `None` (synthetic/test layers): containment is treated as *unknown*, not as failure.
+- The §4.5 SDF backstop complements this at segment granularity: for `Infill`/`TopSurface` segments whose destination point sits more than `0.5 × nozzle_diameter` outside the solid, the segment is re-tagged `MoveKind::Travel` (no extrusion) rather than dropping the whole path — the dangling-chord counterpart of this safety net, needed because the region pipeline's 2D re-lift (§4.1) can place interior chords in air even on gated boundaries.
 
 ### 6.2 Flat-nozzle slope clearance — `compensate_flat_nozzle`
 
