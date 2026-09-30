@@ -3100,7 +3100,7 @@ pub fn plan_with_progress(
             let wall_path_count = paths.len();
 
             let region = InfillRegion::from_layer(layer, config);
-            let (mut sparse_loops, narrow_solid_loops): (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) =
+            let (mut sparse_loops, mut narrow_solid_loops): (Vec<Vec<DVec3>>, Vec<Vec<DVec3>>) =
                 region.loops.into_iter().partition(|l| {
                     let mut min = glam::DVec3::splat(f64::INFINITY);
                     let mut max = glam::DVec3::splat(f64::NEG_INFINITY);
@@ -3112,7 +3112,15 @@ pub fn plan_with_progress(
                     extent >= config.nozzle_diameter * 15.0
                 });
 
-            let mut all_solid_loops = layer.solid_fill_boundary.clone();
+            // SDF containment gate: region boundaries must never carry
+            // points outside the solid (or, for sparse loops, inside the
+            // wall shell) -- the 2D flatten/boolean/re-lift pipeline leaks
+            // them on non-monotonic order-field isosurfaces.
+            sparse_loops = infill::gate_sparse_loops(layer, config, sparse_loops);
+            narrow_solid_loops = infill::gate_sparse_loops(layer, config, narrow_solid_loops);
+
+            let mut all_solid_loops =
+                infill::gate_skin_loops(layer, config, layer.solid_fill_boundary.clone());
             all_solid_loops.extend(narrow_solid_loops);
 
             // Mask infill and solid skin against wave overhang, bridge, and tangent surface footprints
@@ -3176,6 +3184,11 @@ pub fn plan_with_progress(
                         layer.order_field.as_ref(),
                     );
                 }
+
+                // The mask re-ran `reconstruct_on_order_field_near`, which can
+                // reintroduce off-surface points: re-gate both sets.
+                sparse_loops = infill::gate_sparse_loops(layer, config, sparse_loops);
+                all_solid_loops = infill::gate_skin_loops(layer, config, all_solid_loops);
             }
 
             if !sparse_loops.is_empty() {
@@ -3695,6 +3708,44 @@ pub fn plan_with_progress(
                         &mut path.points,
                         &mut path.segments,
                         wipe_dist,
+                    );
+                }
+            }
+
+            // SDF backstop for fill extrusion: even after the region-boundary
+            // gates, re-lifted pattern points and interior chords can dangle in
+            // air on non-monotonic order-field isosurfaces. Re-tag
+            // Infill/TopSurface segments whose destination point sits more than
+            // half a nozzle diameter outside the solid as Travel so they move
+            // without extruding. Path topology is preserved; the micro-path
+            // drop below removes any stub that results.
+            if let Some(sdf) = layer.mesh_sdf.as_deref() {
+                let backstop_tol = config.nozzle_diameter * 0.5;
+                let mut re_tagged = 0usize;
+                for path in &mut paths {
+                    let n = path.points.len();
+                    if n < 2 {
+                        continue;
+                    }
+                    for (i, segment) in path.segments.iter_mut().enumerate() {
+                        if segment.kind != MoveKind::Infill && segment.kind != MoveKind::TopSurface
+                        {
+                            continue;
+                        }
+                        let dest = path.points[(i + 1) % n];
+                        let v = sdf.sample(dest).value;
+                        if v > backstop_tol {
+                            re_tagged += 1;
+                            segment.kind = MoveKind::Travel;
+                            segment.extrusion_length = 0.0;
+                        }
+                    }
+                }
+                if re_tagged > 0 {
+                    tracing::debug!(
+                        layer.order = layer.order,
+                        re_tagged,
+                        "SDF backstop re-tagged fill segments to travel"
                     );
                 }
             }

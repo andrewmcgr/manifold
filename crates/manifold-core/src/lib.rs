@@ -1500,6 +1500,7 @@ pub fn plan_toolpaths_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use manifold_fidget::ScalarField;
 
     #[test]
     fn default_config_is_sane() {
@@ -1716,6 +1717,93 @@ mod tests {
         assert_eq!(gcode.matches("T0\n").count(), 1);
         assert!(gcode.matches("G0 X").count() >= 3);
         assert!(gcode.matches("G1 X").count() > 0);
+    }
+
+    #[test]
+    fn plan_toolpaths_keeps_infill_and_topsurface_inside_the_solid_on_testobj1() {
+        // Regression test for the TestObj1 "infill in air" defect: with the
+        // AnisotropicFsm order field, the 2D sparse-region pipeline (flatten
+        // the layer's 3D isosurface contours, boolean-inset, re-lift) leaked
+        // region points and re-lifted chords outside the solid on the part's
+        // curved top (worst case SDF +2.22 pre-fix). No Infill or
+        // TopSurface segment may end more than half a nozzle diameter
+        // outside the solid (the codebase's documented containment slack
+        // is 0.35 mm; 0.2 mm leaves margin for SDF tolerance).
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../TestObj1.stl"));
+        let file = std::fs::File::open(path).expect("open TestObj1.stl fixture");
+        let mesh = crate::stl::load_stl(std::io::BufReader::new(file)).expect("parse TestObj1.stl");
+
+        let faces: Vec<[usize; 3]> = mesh
+            .indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
+            .collect();
+        let sdf = manifold_fidget::mesh_sdf::MeshSdf::new(mesh.vertices.clone(), faces);
+
+        let machine = crate::machine::Machine::new(
+            crate::bounds::BoundingVolume::Aabb {
+                min: glam::DVec3::new(-200.0, -200.0, -50.0),
+                max: glam::DVec3::new(200.0, 200.0, 200.0),
+            },
+            Vec::new(),
+        );
+        let object = crate::object::Object::new(
+            crate::ids::ObjectId(0),
+            mesh.clone(),
+            crate::ids::ToolId(0),
+        );
+        let config = SlicerConfig {
+            layer_height: 0.2,
+            nozzle_diameter: 0.4,
+            wall_line_width: 0.4,
+            shell_thickness: 1.2,
+            wall_offset: 0.2,
+            order_field: order_field::OrderFieldKind::AnisotropicFsm,
+            infill_density: 0.2,
+            travel_order_optimization_enabled: true,
+            ..SlicerConfig::default()
+        };
+        let workspace = Workspace::new(vec![object], machine, config);
+
+        let paths = plan_toolpaths(&workspace).expect("plan toolpaths");
+
+        let mut infill_points = 0usize;
+        let mut worst_infill = f64::NEG_INFINITY;
+        let mut worst_topsurface = f64::NEG_INFINITY;
+        for p in &paths {
+            let n = p.points.len();
+            if n < 2 {
+                continue;
+            }
+            for (i, s) in p.segments.iter().enumerate() {
+                let dest = p.points[(i + 1) % n];
+                let v = sdf.sample(dest).value;
+                match s.kind {
+                    crate::toolpath::MoveKind::Infill => {
+                        infill_points += 1;
+                        worst_infill = worst_infill.max(v);
+                    }
+                    crate::toolpath::MoveKind::TopSurface => {
+                        worst_topsurface = worst_topsurface.max(v);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            infill_points >= 1000,
+            "test must be non-vacuous: expected >= 1000 infill points, got {infill_points}"
+        );
+        assert!(
+            worst_infill <= 0.2,
+            "no infill point may sit in air: worst SDF {worst_infill}"
+        );
+        assert!(
+            worst_topsurface <= 0.2,
+            "top-surface points must stay on the surface: worst SDF {worst_topsurface}"
+        );
     }
 
     /// A build volume too small to contain the sliced object must fail the

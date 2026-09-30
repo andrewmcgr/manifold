@@ -230,6 +230,39 @@ pub fn clip_loops_to_sdf(
     out
 }
 
+/// Apply the sparse-region SDF containment gate: every region-boundary
+/// point must sit at least one full wall line inside the outer surface
+/// (the walls themselves live at `SDF = -(wall_offset + w *
+/// wall_line_width)`), so sparse infill can never print inside the wall
+/// shell or in air. No-op when `layer.mesh_sdf` is `None`.
+pub fn gate_sparse_loops(
+    layer: &Layer,
+    config: &SlicerConfig,
+    loops: Vec<Vec<DVec3>>,
+) -> Vec<Vec<DVec3>> {
+    match &layer.mesh_sdf {
+        Some(sdf) => {
+            let max_sdf = -(config.wall_offset + config.wall_line_width) + SDF_REGION_GATE_SLACK;
+            clip_loops_to_sdf(loops, sdf, max_sdf)
+        }
+        None => loops,
+    }
+}
+
+/// Apply the solid-skin SDF containment gate: skin-region boundary points
+/// must be inside the solid (no inset -- skin material belongs on the
+/// surface). No-op when `layer.mesh_sdf` is `None`.
+pub fn gate_skin_loops(
+    layer: &Layer,
+    _config: &SlicerConfig,
+    loops: Vec<Vec<DVec3>>,
+) -> Vec<Vec<DVec3>> {
+    match &layer.mesh_sdf {
+        Some(sdf) => clip_loops_to_sdf(loops, sdf, SDF_REGION_GATE_SLACK),
+        None => loops,
+    }
+}
+
 /// Generates infill [`Path`]s for one layer's [`InfillRegion`].
 pub trait InfillGenerator {
     /// `object_transform` is the source object's placement — used to keep
@@ -2280,16 +2313,29 @@ mod tests {
     /// exactly -min(5-|p.x|, 5-|p.y|, 5-|p.z|).
     fn unit_box_sdf() -> manifold_fidget::mesh_sdf::MeshSdf {
         let v: [glam::DVec3; 8] = [
-            glam::DVec3::new(-5.0, -5.0, -5.0), glam::DVec3::new(5.0, -5.0, -5.0),
-            glam::DVec3::new(5.0, 5.0, -5.0),  glam::DVec3::new(-5.0, 5.0, -5.0),
-            glam::DVec3::new(-5.0, -5.0, 5.0), glam::DVec3::new(5.0, -5.0, 5.0),
-            glam::DVec3::new(5.0, 5.0, 5.0),   glam::DVec3::new(-5.0, 5.0, 5.0),
+            glam::DVec3::new(-5.0, -5.0, -5.0),
+            glam::DVec3::new(5.0, -5.0, -5.0),
+            glam::DVec3::new(5.0, 5.0, -5.0),
+            glam::DVec3::new(-5.0, 5.0, -5.0),
+            glam::DVec3::new(-5.0, -5.0, 5.0),
+            glam::DVec3::new(5.0, -5.0, 5.0),
+            glam::DVec3::new(5.0, 5.0, 5.0),
+            glam::DVec3::new(-5.0, 5.0, 5.0),
         ];
         // two triangles per face, outward normals (right-hand rule)
         let faces: Vec<[usize; 3]> = vec![
-            [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
-            [0, 4, 7], [0, 7, 3], [1, 6, 5], [2, 6, 5],
-            [0, 1, 5], [0, 5, 4], [3, 7, 6], [3, 6, 2],
+            [0, 2, 1],
+            [0, 3, 2],
+            [4, 5, 6],
+            [4, 6, 7],
+            [0, 4, 7],
+            [0, 7, 3],
+            [1, 6, 5],
+            [2, 6, 5],
+            [0, 1, 5],
+            [0, 5, 4],
+            [3, 7, 6],
+            [3, 6, 2],
         ];
         manifold_fidget::mesh_sdf::MeshSdf::new(v.to_vec(), faces)
     }
@@ -2350,7 +2396,8 @@ mod tests {
         for p in &out[0] {
             assert!(
                 sdf.sample(*p).value <= -1.0 + 1e-9,
-                "retained/bridged point out of gate: {p:?} -> {}", sdf.sample(*p).value
+                "retained/bridged point out of gate: {p:?} -> {}",
+                sdf.sample(*p).value
             );
         }
     }
@@ -2366,7 +2413,10 @@ mod tests {
             pt(0.0, 4.5, 0.0),
         ];
         let out = clip_loops_to_sdf(vec![loop_], &sdf, -1.0);
-        assert!(out.is_empty(), "a loop reduced to one point is not a region boundary");
+        assert!(
+            out.is_empty(),
+            "a loop reduced to one point is not a region boundary"
+        );
     }
 
     #[test]
