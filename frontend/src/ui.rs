@@ -328,6 +328,13 @@ pub fn ui_workspace_system(
                                     egui::Slider::new(&mut config.eikonal.voxel_size_mm, 0.15..=3.0)
                                         .text("Voxel (mm)"),
                                 );
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut config.eikonal.solver_iterations,
+                                        1..=12,
+                                    )
+                                    .text("Iters"),
+                                );
                                 if ui.small_button("Recompute Fields").clicked() {
                                     sync_config_to_backend(&config);
                                     if ffi::recompute_object_fields(
@@ -338,8 +345,10 @@ pub fn ui_workspace_system(
                                         vis_state.mark_all_dirty();
                                         vis_state.refresh_stats_for(sel_id);
                                         plate.status_message = format!(
-                                            "Recomputed OpenVDB SDF & scalar fields for '{}' (voxel {:.2} mm).",
-                                            obj_name, config.eikonal.voxel_size_mm
+                                            "Recomputed OpenVDB SDF & constrained Eikonal fields for '{}' (voxel {:.2} mm, {} iters).",
+                                            obj_name,
+                                            config.eikonal.voxel_size_mm,
+                                            config.eikonal.solver_iterations
                                         );
                                     }
                                 }
@@ -627,6 +636,28 @@ pub fn ui_workspace_system(
                         {
                             dirty_backend_sync = true;
                         }
+                        if ui
+                            .checkbox(
+                                &mut tool.has_rotational_axes,
+                                "Tool Has Rotational Axes (5/6-Axis)",
+                            )
+                            .changed()
+                        {
+                            dirty_backend_sync = true;
+                        }
+                        if tool.has_rotational_axes
+                            && ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut tool.max_angle_from_bed_normal_deg,
+                                        0.0..=85.0,
+                                    )
+                                    .text("Max Angle from Bed Normal (°)"),
+                                )
+                                .changed()
+                        {
+                            dirty_backend_sync = true;
+                        }
 
                         ui.add_space(4.0);
                         ui.label(
@@ -896,8 +927,8 @@ pub fn ui_workspace_system(
 }
 
 /// Synchronizes the Rust `SlicerConfig` (nozzle axis, bed-coordinate gravity vector,
-/// multi-tool specifications & XZ clearance profiles, and variable layer height)
-/// into the C++ compute backend.
+/// multi-tool specifications & XZ clearance profiles, variable layer height, and
+/// Eikonal solver iterations) into the C++ compute backend.
 pub fn sync_config_to_backend(config: &SlicerConfig) {
     ffi::set_nozzle_axis_bed(config.machine.nozzle_axis_bed);
     ffi::set_gravity_direction_bed(config.machine.gravity_direction_bed);
@@ -910,6 +941,8 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
             name: t.name.clone(),
             nozzle_diameter_mm: t.nozzle_diameter_mm,
             temperature_celsius: t.temperature_celsius,
+            has_rotational_axes: t.has_rotational_axes,
+            max_angle_from_bed_normal_deg: t.max_angle_from_bed_normal_deg,
             clearance_profile_xz: t
                 .clearance_profile_xz
                 .iter()
@@ -927,6 +960,8 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         min_mm: config.slicing.layer_height.min_mm,
         max_mm: config.slicing.layer_height.max_mm,
     });
+
+    ffi::set_eikonal_solver_iterations(config.eikonal.solver_iterations);
 }
 
 /// Polls background import/export tasks on each frame without blocking the macOS main thread.

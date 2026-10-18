@@ -91,8 +91,9 @@ impl ClearancePointXZ {
     }
 }
 
-/// Properties and local-frame clearance envelope for one machine extrusion tool.
+/// Properties, rotational axis capabilities, and local-frame clearance envelope for one machine extrusion tool.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ToolConfig {
     pub id: u32,
     pub name: String,
@@ -100,6 +101,10 @@ pub struct ToolConfig {
     pub nozzle_diameter_mm: f32,
     /// Target extrusion temperature in degrees Celsius (°C).
     pub temperature_celsius: f32,
+    /// Whether this tool has rotational axes capable of orienting the nozzle away from the bed normal.
+    pub has_rotational_axes: bool,
+    /// Maximum allowable angle (in degrees) between the tool axis (`nozzle_axis`) and the bed normal (`+Z_bed`).
+    pub max_angle_from_bed_normal_deg: f32,
     /// Piecewise-linear clearance profile in the nozzle frame `(radius_x_mm, height_z_mm)`,
     /// ordered by ascending `z_height_mm` from the nozzle tip (`z = 0`).
     pub clearance_profile_xz: Vec<ClearancePointXZ>,
@@ -126,6 +131,8 @@ impl ToolConfig {
             name: name.into(),
             nozzle_diameter_mm,
             temperature_celsius,
+            has_rotational_axes: id > 0,
+            max_angle_from_bed_normal_deg: 45.0,
             clearance_profile_xz: vec![
                 ClearancePointXZ::new(tip_outer_r, 0.0),
                 ClearancePointXZ::new(2.5, 2.0),
@@ -284,6 +291,8 @@ pub struct EikonalFieldConfig {
     pub voxel_size_mm: f32,
     pub narrow_band_width_voxels: u32,
     pub curvature_regularization: f32,
+    /// Number of outer constraint & tool-orientation relaxation iterations (`>= 1`).
+    pub solver_iterations: u32,
 }
 
 impl Default for EikonalFieldConfig {
@@ -292,6 +301,7 @@ impl Default for EikonalFieldConfig {
             voxel_size_mm: 0.50,
             narrow_band_width_voxels: 6,
             curvature_regularization: 0.05,
+            solver_iterations: 4,
         }
     }
 }

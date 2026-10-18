@@ -1,4 +1,5 @@
 #include "slicer_backend.h"
+#include "eikonal_solver.h"
 #include "manifold-frontend/src/bridge.rs.h"
 
 #include <algorithm>
@@ -57,8 +58,10 @@ struct ObjectRecord {
     float maxX = 0.0f, maxY = 0.0f, maxZ = 0.0f;
     std::vector<RenderVertex> vertexBuffer;
     std::vector<std::uint32_t> indexBuffer;
-    /// Generic dictionary of named scalar fields (e.g., "sdf", "eikonal", "overhang").
+    /// Generic dictionary of named scalar fields (e.g., "sdf", "eikonal", "overhang", "tool_tilt_deg").
     std::map<std::string, openvdb::FloatGrid::Ptr> scalarFields;
+    /// Solved 3D unit tool axis field \hat{a}(x) in bed coordinates.
+    openvdb::Vec3SGrid::Ptr toolAxisGrid;
 };
 
 void computeVertexBounds(
@@ -221,14 +224,16 @@ NozzleBasis computeNozzleBasis(
     return basis;
 }
 
-/// Populates the object's scalar field registry using the queried nozzle local frame
-/// and gravity direction vector in bed coordinates (never assuming nozzle = +Z or gravity = -Z):
+/// Populates the object's scalar and vector field registry using the iterative
+/// constrained 3D Eikonal + tool-orientation solver:
 /// 1. `"sdf"`: Full-interior + exterior-band Signed Distance Field via
 ///    `openvdb::tools::meshToSignedDistanceField`.
-/// 2. `"eikonal"`: Non-planar conformal slicing distance field derived from height along the
-///    queried `nozzle_axis` & SDF.
+/// 2. `"eikonal"`: Iterative, constraint-driven non-planar layer field propagated from
+///    the bed contact seeds through the object interior, subject to the active tool's
+///    XZ clearance profile, rotational axis limits, and anti-island overhang causality.
 /// 3. `"overhang"`: Normalized SDF gradient projected against the queried gravity vector
 ///    ($-\nabla \phi \cdot \hat{\mathbf{g}}_{\text{bed}} \in [-1, 1]$).
+/// 4. `"tool_tilt_deg"`: Solved 5/6-axis tool tilt angle (degrees from bed normal).
 void buildObjectScalarFields(
     ObjectRecord& rec,
     const SlicerBackend& backend,
@@ -236,6 +241,7 @@ void buildObjectScalarFields(
     float narrowBandVoxels = 6.0f)
 {
     rec.scalarFields.clear();
+    rec.toolAxisGrid.reset();
     if (rec.vertexBuffer.empty() || rec.indexBuffer.size() < 3) {
         return;
     }
@@ -289,84 +295,56 @@ void buildObjectScalarFields(
     sdfGrid->setName("sdf");
     rec.scalarFields["sdf"] = sdfGrid;
 
-    // 2. Build "eikonal" (conformal non-planar layer field) and "overhang" (gravity-aligned gradient)
-    const float eikonalBg = spanZ + minExteriorMm;
-    openvdb::FloatGrid::Ptr eikonalGrid = openvdb::FloatGrid::create(eikonalBg);
-    eikonalGrid->setName("eikonal");
-    eikonalGrid->setGridClass(openvdb::GRID_LEVEL_SET);
-    eikonalGrid->setTransform(xform->copy());
-
-    openvdb::FloatGrid::Ptr overhangGrid = openvdb::FloatGrid::create(0.0f);
-    overhangGrid->setName("overhang");
-    overhangGrid->setGridClass(openvdb::GRID_LEVEL_SET);
-    overhangGrid->setTransform(xform->copy());
-
-    auto sdfAccessor = sdfGrid->getConstAccessor();
-    auto eikonalAccessor = eikonalGrid->getAccessor();
-    auto overhangAccessor = overhangGrid->getAccessor();
-
-    const float invSpanZ = 1.0f / std::max(spanZ, 1.0f);
-    const float invTwoDx = 1.0f / static_cast<float>(2.0 * voxelSize);
-
-    for (auto iter = sdfGrid->cbeginValueOn(); iter; ++iter) {
-        const openvdb::Coord ijk = iter.getCoord();
-        const float sdfVal = *iter;
-        const openvdb::Vec3d worldPos = xform->indexToWorld(ijk);
-        const std::array<float, 3> posBed{
-            static_cast<float>(worldPos.x()),
-            static_cast<float>(worldPos.y()),
-            static_cast<float>(worldPos.z())};
-
-        // Query the nozzle's local orthonormal frame and the gravity direction vector in bed coordinates
-        const NozzleBasis nozzleFrame = backend.queryNozzleFrame(posBed, {1.0f, 0.0f, 0.0f});
-        const std::array<float, 3> gravityDir = backend.queryGravityDirection(posBed);
-
-        // Project position relative to the object base onto the queried nozzle axis
-        const float relX = posBed[0];
-        const float relY = posBed[1];
-        const float relZ = posBed[2] - rec.minZ;
-        const float axialHeight =
-            relX * nozzleFrame.nozzle_axis[0] +
-            relY * nozzleFrame.nozzle_axis[1] +
-            relZ * nozzleFrame.nozzle_axis[2];
-        const float axialRel = std::clamp(axialHeight * invSpanZ, 0.0f, 1.0f);
-
-        const float lateralU =
-            relX * nozzleFrame.travel_axis[0] +
-            relY * nozzleFrame.travel_axis[1] +
-            relZ * nozzleFrame.travel_axis[2];
-        const float lateralV =
-            relX * nozzleFrame.lateral_axis[0] +
-            relY * nozzleFrame.lateral_axis[1] +
-            relZ * nozzleFrame.lateral_axis[2];
-        const double radial = std::sqrt(lateralU * lateralU + lateralV * lateralV);
-
-        const float harmonicWave =
-            0.12f * maxSpan * axialRel * static_cast<float>(std::sin(3.5 * radial / maxSpan));
-        const float conformalOffset = -0.35f * axialRel * sdfVal;
-        const float eikonalVal = axialHeight + harmonicWave + conformalOffset;
-        eikonalAccessor.setValue(ijk, eikonalVal);
-
-        // Central-difference 3D SDF gradient projected against the queried gravity vector (-g_bed)
-        const float gx =
-            (sdfAccessor.getValue(ijk.offsetBy(1, 0, 0)) -
-             sdfAccessor.getValue(ijk.offsetBy(-1, 0, 0))) *
-            invTwoDx;
-        const float gy =
-            (sdfAccessor.getValue(ijk.offsetBy(0, 1, 0)) -
-             sdfAccessor.getValue(ijk.offsetBy(0, -1, 0))) *
-            invTwoDx;
-        const float gz =
-            (sdfAccessor.getValue(ijk.offsetBy(0, 0, 1)) -
-             sdfAccessor.getValue(ijk.offsetBy(0, 0, -1))) *
-            invTwoDx;
-        const float antiGravityProj =
-            -(gx * gravityDir[0] + gy * gravityDir[1] + gz * gravityDir[2]);
-        overhangAccessor.setValue(ijk, std::clamp(antiGravityProj, -1.0f, 1.0f));
+    // 2. Prepare solver context from the backend's active tool, layer height, and hints
+    const auto& tools = backend.machineTools();
+    const std::uint32_t activeIdx = backend.activeToolIndex();
+    ToolSpec activeTool{};
+    if (!tools.empty()) {
+        activeTool = tools[std::min<std::size_t>(activeIdx, tools.size() - 1)];
+    } else {
+        activeTool.id = 0;
+        activeTool.name = rust::String("T0 - 0.4mm Standard");
+        activeTool.nozzle_diameter_mm = 0.40f;
+        activeTool.temperature_celsius = 215.0f;
+        activeTool.has_rotational_axes = true;
+        activeTool.max_angle_from_bed_normal_deg = 45.0f;
     }
 
-    rec.scalarFields["eikonal"] = eikonalGrid;
-    rec.scalarFields["overhang"] = overhangGrid;
+    const LayerHeightSpec localLayerHeight = backend.sliceLayerHeight();
+    EikonalSolverContext ctx{
+        backend,
+        activeTool,
+        localLayerHeight,
+        0,
+        backend.eikonalSolverIterations(),
+        ToolOrientationMode::FollowEikonalGradient,
+        {},
+    };
+
+    for (const auto& ffiHint : backend.spatialOrientationHints()) {
+        OrientationHint h{};
+        h.kind = (ffiHint.kind == 0) ? HintKind::Tangency : HintKind::Orthogonality;
+        h.positionBed = ffiHint.position_bed;
+        h.directionBed = ffiHint.direction_bed;
+        h.influenceRadiusMm = ffiHint.influence_radius_mm;
+        h.weight = ffiHint.weight;
+        h.applyOnSurfaceOnly = ffiHint.apply_on_surface_only;
+        ctx.hints.push_back(h);
+    }
+
+    // 3. Solve iterative constrained 3D Eikonal + tool orientation fields
+    EikonalSolveResult solved = solveConstrainedEikonal(
+        *sdfGrid,
+        rec.minZ,
+        rec.maxZ,
+        maxSpan,
+        minExteriorMm,
+        ctx);
+
+    rec.scalarFields["eikonal"] = solved.eikonalGrid;
+    rec.scalarFields["overhang"] = solved.overhangGrid;
+    rec.scalarFields["tool_tilt_deg"] = solved.toolTiltDegGrid;
+    rec.toolAxisGrid = solved.toolAxisGrid;
 }
 
 void computeMeshNormals(
@@ -519,6 +497,8 @@ ToolSpec makeDefaultTool(std::uint32_t id, const char* name, float diameterMm, f
     t.name = rust::String(name);
     t.nozzle_diameter_mm = diameterMm;
     t.temperature_celsius = tempC;
+    t.has_rotational_axes = true;
+    t.max_angle_from_bed_normal_deg = 45.0f;
     const float tipOuterR = std::max(diameterMm * 1.25f, 0.4f);
     t.clearance_profile_xz.push_back(ClearanceXZ{tipOuterR, 0.0f});
     t.clearance_profile_xz.push_back(ClearanceXZ{2.5f, 2.0f});
@@ -548,6 +528,8 @@ struct SlicerBackend::Impl {
     };
     std::uint32_t activeToolIndex = 0;
     LayerHeightSpec sliceLayerHeight{0.20f, 0.08f, 0.32f};
+    std::uint32_t eikonalSolverIterations = 4;
+    std::vector<SpatialOrientationHint> spatialOrientationHints;
 };
 
 SlicerBackend::SlicerBackend() : impl_(std::make_unique<Impl>()) {
@@ -1411,6 +1393,22 @@ LayerHeightSpec SlicerBackend::sliceLayerHeight() const noexcept {
     return impl_->sliceLayerHeight;
 }
 
+void SlicerBackend::setEikonalSolverIterations(std::uint32_t iterations) noexcept {
+    impl_->eikonalSolverIterations = std::clamp<std::uint32_t>(iterations, 1, 16);
+}
+
+std::uint32_t SlicerBackend::eikonalSolverIterations() const noexcept {
+    return impl_->eikonalSolverIterations;
+}
+
+void SlicerBackend::setSpatialOrientationHints(const std::vector<SpatialOrientationHint>& hints) {
+    impl_->spatialOrientationHints = hints;
+}
+
+const std::vector<SpatialOrientationHint>& SlicerBackend::spatialOrientationHints() const noexcept {
+    return impl_->spatialOrientationHints;
+}
+
 NozzleBasis query_nozzle_frame(
     std::array<float, 3> position_bed,
     std::array<float, 3> travel_dir_bed)
@@ -1468,6 +1466,26 @@ void set_slice_layer_height(LayerHeightSpec layer_height) {
 LayerHeightSpec get_slice_layer_height() {
     std::lock_guard<std::mutex> lock(g_backendMutex);
     return globalBackend().sliceLayerHeight();
+}
+
+void set_eikonal_solver_iterations(std::uint32_t iterations) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setEikonalSolverIterations(iterations);
+}
+
+std::uint32_t get_eikonal_solver_iterations() {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().eikonalSolverIterations();
+}
+
+void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hints) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    std::vector<SpatialOrientationHint> copied;
+    copied.reserve(hints.size());
+    for (const auto& h : hints) {
+        copied.push_back(h);
+    }
+    globalBackend().setSpatialOrientationHints(copied);
 }
 
 } // namespace manifold

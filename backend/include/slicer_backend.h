@@ -19,6 +19,7 @@ struct NozzleBasis;
 struct ClearanceXZ;
 struct ToolSpec;
 struct LayerHeightSpec;
+struct SpatialOrientationHint;
 
 /// Core C++20 compute engine handling CAD B-Rep ingestion (OCCT), assembly
 /// decomposition, surface tessellation, STL/3MF triangle mesh registration,
@@ -73,7 +74,7 @@ public:
     /// Queries statistics (active voxel count, min/max value, voxel size) for a named field.
     FieldStats getObjectFieldStats(std::uint64_t objectId, const std::string& fieldName) const;
 
-    /// Rebuilds the OpenVDB SDF and derived scalar fields (`eikonal`, `overhang`)
+    /// Rebuilds the OpenVDB SDF and derived scalar fields (`eikonal`, `overhang`, `tool_tilt_deg`)
     /// for `objectId` at the requested `voxelSize` and `narrowBandVoxels`.
     bool recomputeObjectFields(std::uint64_t objectId, float voxelSize, float narrowBandVoxels);
 
@@ -124,6 +125,18 @@ public:
 
     /// Returns the current variable layer height specification.
     LayerHeightSpec sliceLayerHeight() const noexcept;
+
+    /// Sets the number of outer constraint & tool-orientation relaxation iterations for the Eikonal solver.
+    void setEikonalSolverIterations(std::uint32_t iterations) noexcept;
+
+    /// Returns the configured number of outer Eikonal solver iterations.
+    std::uint32_t eikonalSolverIterations() const noexcept;
+
+    /// Sets spatial/surface tangency and orthogonality hints for the Eikonal solver.
+    void setSpatialOrientationHints(const std::vector<SpatialOrientationHint>& hints);
+
+    /// Returns the configured spatial/surface orientation hints.
+    const std::vector<SpatialOrientationHint>& spatialOrientationHints() const noexcept;
 
     /// Returns a reference to the most recently loaded object's vertices.
     const std::vector<RenderVertex>& vertices() const noexcept;
@@ -180,5 +193,8 @@ rust::Vec<ToolSpec> get_machine_tools();
 std::uint32_t get_active_tool_index();
 void set_slice_layer_height(LayerHeightSpec layer_height);
 LayerHeightSpec get_slice_layer_height();
+void set_eikonal_solver_iterations(std::uint32_t iterations);
+std::uint32_t get_eikonal_solver_iterations();
+void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hints);
 
 } // namespace manifold

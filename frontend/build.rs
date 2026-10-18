@@ -10,6 +10,7 @@ fn main() {
     let mut build = cxx_build::bridge("src/bridge.rs");
     build
         .file(backend_dir.join("src/slicer_backend.cpp"))
+        .file(backend_dir.join("src/eikonal_solver.cpp"))
         .include(backend_dir.join("include"))
         .std("c++20")
         .flag_if_supported("-Wno-deprecated-declarations");
@@ -54,6 +55,8 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/bridge.rs");
     println!("cargo:rerun-if-changed=../backend/include/slicer_backend.h");
+    println!("cargo:rerun-if-changed=../backend/include/eikonal_solver.h");
     println!("cargo:rerun-if-changed=../backend/src/slicer_backend.cpp");
+    println!("cargo:rerun-if-changed=../backend/src/eikonal_solver.cpp");
     println!("cargo:rerun-if-changed=../backend/CMakeLists.txt");
 }

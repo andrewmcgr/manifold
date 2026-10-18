@@ -99,6 +99,8 @@ pub mod ffi {
         pub name: String,
         pub nozzle_diameter_mm: f32,
         pub temperature_celsius: f32,
+        pub has_rotational_axes: bool,
+        pub max_angle_from_bed_normal_deg: f32,
         pub clearance_profile_xz: Vec<ClearanceXZ>,
     }
 
@@ -108,6 +110,18 @@ pub mod ffi {
         pub target_mm: f32,
         pub min_mm: f32,
         pub max_mm: f32,
+    }
+
+    /// Spatial/surface orientation hint (`kind`: 0 = Tangency, 1 = Orthogonality)
+    /// guiding the iterative constrained Eikonal & tool-orientation solver.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct SpatialOrientationHint {
+        pub kind: u8,
+        pub position_bed: [f32; 3],
+        pub direction_bed: [f32; 3],
+        pub influence_radius_mm: f32,
+        pub weight: f32,
+        pub apply_on_surface_only: bool,
     }
 
     unsafe extern "C++" {
@@ -146,7 +160,7 @@ pub mod ffi {
         pub fn export_object_step_to_path(object_id: u64, path: &str) -> bool;
 
         /// Lists all scalar `openvdb::FloatGrid` field names available on `object_id`
-        /// (e.g., `"sdf"`, `"eikonal"`, `"overhang"`).
+        /// (e.g., `"sdf"`, `"eikonal"`, `"overhang"`, `"tool_tilt_deg"`).
         pub fn list_object_fields(object_id: u64) -> Vec<String>;
 
         /// Queries voxel count, min/max scalar range, and voxel size for a named field on `object_id`.
@@ -209,6 +223,15 @@ pub mod ffi {
 
         /// Retrieves the current variable slice layer height (`target_mm`, `min_mm`, `max_mm`) from the C++ backend.
         pub fn get_slice_layer_height() -> LayerHeightSpec;
+
+        /// Sets the number of outer constraint & tool-orientation relaxation iterations for the Eikonal solver.
+        pub fn set_eikonal_solver_iterations(iterations: u32);
+
+        /// Retrieves the number of outer constraint & tool-orientation relaxation iterations.
+        pub fn get_eikonal_solver_iterations() -> u32;
+
+        /// Sets spatial/surface tangency and orthogonality hints for the Eikonal solver.
+        pub fn set_spatial_orientation_hints(hints: &[SpatialOrientationHint]);
     }
 }
 
@@ -279,6 +302,8 @@ mod tests {
                 name: "T0 - 0.4mm".to_string(),
                 nozzle_diameter_mm: 0.40,
                 temperature_celsius: 215.0,
+                has_rotational_axes: true,
+                max_angle_from_bed_normal_deg: 45.0,
                 clearance_profile_xz: vec![
                     ClearanceXZ {
                         x_radius_mm: 0.5,
@@ -295,6 +320,8 @@ mod tests {
                 name: "T1 - 0.8mm".to_string(),
                 nozzle_diameter_mm: 0.80,
                 temperature_celsius: 245.0,
+                has_rotational_axes: false,
+                max_angle_from_bed_normal_deg: 0.0,
                 clearance_profile_xz: vec![
                     ClearanceXZ {
                         x_radius_mm: 1.0,
@@ -313,6 +340,9 @@ mod tests {
         assert_eq!(read_tools.len(), 2);
         assert_eq!(read_tools[1].nozzle_diameter_mm, 0.80);
         assert_eq!(read_tools[1].temperature_celsius, 245.0);
+        assert!(!read_tools[1].has_rotational_axes);
+        assert!(read_tools[0].has_rotational_axes);
+        assert!((read_tools[0].max_angle_from_bed_normal_deg - 45.0).abs() < 1e-6);
         assert_eq!(read_tools[1].clearance_profile_xz.len(), 2);
 
         ffi::set_slice_layer_height(LayerHeightSpec {
@@ -324,5 +354,98 @@ mod tests {
         assert!((lh.target_mm - 0.22).abs() < 1e-6);
         assert!((lh.min_mm - 0.08).abs() < 1e-6);
         assert!((lh.max_mm - 0.36).abs() < 1e-6);
+
+        ffi::set_eikonal_solver_iterations(4);
+        assert_eq!(ffi::get_eikonal_solver_iterations(), 4);
+
+        // Register a closed 12mm x 12mm x 16mm box mesh resting on the bed
+        #[rustfmt::skip]
+        let positions: [f32; 24] = [
+            -6.0, -6.0,  0.0,
+             6.0, -6.0,  0.0,
+             6.0,  6.0,  0.0,
+            -6.0,  6.0,  0.0,
+            -6.0, -6.0, 16.0,
+             6.0, -6.0, 16.0,
+             6.0,  6.0, 16.0,
+            -6.0,  6.0, 16.0,
+        ];
+        #[rustfmt::skip]
+        let indices: [u32; 36] = [
+            0, 2, 1,  0, 3, 2, // bottom (Z=0)
+            4, 5, 6,  4, 6, 7, // top (Z=16)
+            0, 1, 5,  0, 5, 4, // front
+            1, 2, 6,  1, 6, 5, // right
+            2, 3, 7,  2, 7, 6, // back
+            3, 0, 4,  3, 4, 7, // left
+        ];
+
+        let info = ffi::register_triangle_mesh("TestBox", &positions, &indices);
+        assert!(info.object_id > 0);
+
+        // 1. With T1 active (has_rotational_axes = false), tool_tilt_deg must be 0 everywhere
+        assert!(ffi::recompute_object_fields(info.object_id, 1.5, 4.0));
+        let fields = ffi::list_object_fields(info.object_id);
+        assert!(fields.contains(&"sdf".to_string()));
+        assert!(fields.contains(&"eikonal".to_string()));
+        assert!(fields.contains(&"overhang".to_string()));
+        assert!(fields.contains(&"tool_tilt_deg".to_string()));
+
+        let tilt_fixed = ffi::get_object_field_stats(info.object_id, "tool_tilt_deg");
+        assert!(tilt_fixed.valid);
+        assert!(tilt_fixed.max_value.abs() < 1e-4);
+
+        // 2. Switch to T0 (has_rotational_axes = true, max_angle_from_bed_normal_deg = 30.0)
+        //    and add an orthogonality orientation hint tilted at 45 degrees
+        let rot_tools = [ToolSpec {
+            id: 0,
+            name: "T0 - 6-Axis".to_string(),
+            nozzle_diameter_mm: 0.40,
+            temperature_celsius: 215.0,
+            has_rotational_axes: true,
+            max_angle_from_bed_normal_deg: 30.0,
+            clearance_profile_xz: vec![
+                ClearanceXZ {
+                    x_radius_mm: 0.5,
+                    z_height_mm: 0.0,
+                },
+                ClearanceXZ {
+                    x_radius_mm: 2.0,
+                    z_height_mm: 2.5,
+                },
+                ClearanceXZ {
+                    x_radius_mm: 6.0,
+                    z_height_mm: 10.0,
+                },
+            ],
+        }];
+        ffi::set_machine_tools(&rot_tools, 0);
+        ffi::set_spatial_orientation_hints(&[super::ffi::SpatialOrientationHint {
+            kind: 1, // Orthogonality
+            position_bed: [0.0, 0.0, 12.0],
+            direction_bed: [0.70710677, 0.0, 0.70710677],
+            influence_radius_mm: 15.0,
+            weight: 1.0,
+            apply_on_surface_only: false,
+        }]);
+
+        assert!(ffi::recompute_object_fields(info.object_id, 1.5, 4.0));
+        ffi::set_spatial_orientation_hints(&[]);
+
+        let eik_stats = ffi::get_object_field_stats(info.object_id, "eikonal");
+        assert!(eik_stats.valid);
+        assert!(eik_stats.min_value >= -0.01 && eik_stats.min_value <= 2.0);
+        assert!(eik_stats.max_value >= 12.0);
+
+        // Verify tool tilt is clamped to <= 30.0 deg (max_angle_from_bed_normal_deg)
+        let tilt_rot = ffi::get_object_field_stats(info.object_id, "tool_tilt_deg");
+        assert!(tilt_rot.valid);
+        assert!(tilt_rot.max_value <= 30.05);
+
+        // Extract an intermediate Eikonal isosurface and verify it intersects the object cleanly
+        let iso = ffi::extract_field_isosurface(info.object_id, "eikonal", 8.0, 0.0);
+        assert!(!iso.interior_indices.is_empty());
+
+        let _ = ffi::remove_cad_object(info.object_id);
     }
 }
