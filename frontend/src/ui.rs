@@ -4,7 +4,9 @@ use bevy::tasks::futures_lite::future;
 use bevy::tasks::{block_on, IoTaskPool};
 use bevy_egui::{egui, EguiContexts};
 
+use crate::bridge::ffi;
 use crate::config::{BedShape, SlicerConfig};
+use crate::field_vis::{FieldColormap, FieldVisualizationState, SliceAxis};
 use crate::hull::rotation_to_place_face_on_bed;
 use crate::io::threemf::{save_project_to_3mf, ExportableObject};
 use crate::io::load_files_into_backend;
@@ -20,6 +22,7 @@ pub fn ui_workspace_system(
     mut contexts: EguiContexts,
     mut plate: ResMut<BuildPlateState>,
     mut config: ResMut<SlicerConfig>,
+    mut vis_state: ResMut<FieldVisualizationState>,
     mut object_transforms: Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
     mut camera_query: Query<(&mut OrbitCamera, &mut Transform), Without<CadObjectEntity>>,
 ) {
@@ -59,7 +62,7 @@ pub fn ui_workspace_system(
     // 2. Left Inspector, File I/O, Object Tree & Bed Configuration Panel
     // ========================================================================
     egui::SidePanel::left("slicer_control_panel")
-        .default_width(350.0)
+        .default_width(360.0)
         .resizable(true)
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -295,6 +298,204 @@ pub fn ui_workspace_system(
                                 snap_object_to_bed(&plate.objects[obj_idx], &mut tf);
                             }
                         }
+
+                        // --- Generic Volumetric Field Visualization (OpenVDB) ---
+                        ui.add_space(8.0);
+                        ui.separator();
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new("Volumetric Field Visualization (OpenVDB)").strong(),
+                        )
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            // Field Selector
+                            ui.horizontal(|ui| {
+                                ui.label("Scalar Field:");
+                                let avail = vis_state.available_fields.clone();
+                                for fname in &avail {
+                                    let selected = &vis_state.active_field_name == fname;
+                                    if ui.selectable_label(selected, fname).clicked() && !selected {
+                                        vis_state.active_field_name = fname.clone();
+                                        vis_state.mark_all_dirty();
+                                        vis_state.refresh_stats_for(sel_id);
+                                    }
+                                }
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Slider::new(&mut config.eikonal.voxel_size_mm, 0.15..=3.0)
+                                        .text("Voxel (mm)"),
+                                );
+                                if ui.small_button("Recompute Fields").clicked() {
+                                    if ffi::recompute_object_fields(
+                                        sel_id,
+                                        config.eikonal.voxel_size_mm,
+                                        config.eikonal.narrow_band_width_voxels as f32,
+                                    ) {
+                                        vis_state.mark_all_dirty();
+                                        vis_state.refresh_stats_for(sel_id);
+                                        plate.status_message = format!(
+                                            "Recomputed OpenVDB SDF & scalar fields for '{}' (voxel {:.2} mm).",
+                                            obj_name, config.eikonal.voxel_size_mm
+                                        );
+                                    }
+                                }
+                            });
+
+                            let (min_val, max_val) = if let Some(ref stats) = vis_state.cached_stats
+                            {
+                                ui.small(format!(
+                                    "Active Voxels: {} | Voxel Size: {:.2} mm | Range: [{:.2}, {:.2}]",
+                                    stats.active_voxel_count,
+                                    stats.voxel_size,
+                                    stats.min_value,
+                                    stats.max_value
+                                ));
+                                (stats.min_value, stats.max_value)
+                            } else {
+                                (-10.0, 10.0)
+                            };
+
+                            ui.add(
+                                egui::Slider::new(&mut vis_state.solid_opacity, 0.0..=1.0)
+                                    .text("CAD Mesh Opacity"),
+                            );
+
+                            ui.separator();
+
+                            // 1. 3D Isosurface controls (volumeToMesh)
+                            if ui
+                                .checkbox(
+                                    &mut vis_state.show_isosurface,
+                                    "Show 3D Isosurface (volumeToMesh)",
+                                )
+                                .changed()
+                            {
+                                vis_state.dirty_isosurface = true;
+                                if vis_state.show_isosurface && vis_state.solid_opacity > 0.5 {
+                                    vis_state.solid_opacity = 0.25;
+                                }
+                            }
+
+                            if vis_state.show_isosurface {
+                                let lo = min_val.min(max_val - 0.01);
+                                let hi = max_val.max(lo + 0.01);
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut vis_state.isovalue, lo..=hi)
+                                            .text("Isovalue"),
+                                    )
+                                    .changed()
+                                {
+                                    vis_state.dirty_isosurface = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut vis_state.adaptivity, 0.0..=0.5)
+                                            .text("Adaptivity"),
+                                    )
+                                    .changed()
+                                {
+                                    vis_state.dirty_isosurface = true;
+                                }
+                                ui.small(format!(
+                                    "Isosurface Mesh: {} triangles",
+                                    vis_state.isosurface_triangles
+                                ));
+                            }
+
+                            ui.separator();
+
+                            // 2. 2D Cross-Section Slice Plane controls (GridSampler)
+                            if ui
+                                .checkbox(
+                                    &mut vis_state.show_slice_plane,
+                                    "Show 2D Cross-Section Slice Plane",
+                                )
+                                .changed()
+                            {
+                                vis_state.dirty_slice = true;
+                                if vis_state.show_slice_plane && vis_state.solid_opacity > 0.5 {
+                                    vis_state.solid_opacity = 0.25;
+                                }
+                            }
+
+                            if vis_state.show_slice_plane {
+                                ui.horizontal(|ui| {
+                                    ui.label("Plane:");
+                                    for axis in [SliceAxis::X, SliceAxis::Y, SliceAxis::Z] {
+                                        if ui
+                                            .selectable_label(
+                                                vis_state.slice_axis == axis,
+                                                axis.label(),
+                                            )
+                                            .clicked()
+                                        {
+                                            vis_state.slice_axis = axis;
+                                            vis_state.dirty_slice = true;
+                                        }
+                                    }
+                                });
+
+                                let plane_coord = vis_state.slice_plane_coord;
+                                if ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut vis_state.slice_normalized_pos,
+                                            0.0..=1.0,
+                                        )
+                                        .text(format!(
+                                            "Slice Offset ({plane_coord:.1} mm)"
+                                        )),
+                                    )
+                                    .changed()
+                                {
+                                    vis_state.dirty_slice = true;
+                                }
+
+                                egui::ComboBox::from_label("Colormap")
+                                    .selected_text(vis_state.colormap.label())
+                                    .show_ui(ui, |ui| {
+                                        for cmap in [
+                                            FieldColormap::CoolWarmSigned,
+                                            FieldColormap::ViridisSequential,
+                                            FieldColormap::ZebraIsoBands,
+                                        ] {
+                                            if ui
+                                                .selectable_label(
+                                                    vis_state.colormap == cmap,
+                                                    cmap.label(),
+                                                )
+                                                .clicked()
+                                            {
+                                                vis_state.colormap = cmap;
+                                                vis_state.dirty_slice = true;
+                                            }
+                                        }
+                                    });
+
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .checkbox(
+                                            &mut vis_state.show_iso_contours,
+                                            "Iso-Contour Lines",
+                                        )
+                                        .changed()
+                                    {
+                                        vis_state.dirty_slice = true;
+                                    }
+                                    if ui
+                                        .checkbox(
+                                            &mut vis_state.fade_exterior_background,
+                                            "Fade Background",
+                                        )
+                                        .changed()
+                                    {
+                                        vis_state.dirty_slice = true;
+                                    }
+                                });
+                            }
+                        });
                     }
                 }
 

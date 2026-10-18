@@ -1,6 +1,7 @@
 pub mod arrange;
 pub mod bridge;
 pub mod config;
+pub mod field_vis;
 pub mod hull;
 pub mod io;
 pub mod scene;
@@ -11,6 +12,7 @@ use bevy::render::renderer::RenderDevice;
 use bevy_egui::EguiPlugin;
 use bridge::ffi::RenderVertex;
 use config::SlicerConfig;
+use field_vis::{sync_field_visualization_system, FieldVisualizationState};
 use scene::{
     compute_orbit_eye, draw_viewport_gizmos_system, update_selection_materials_system,
     viewport_interaction_system, BuildPlateState, OrbitCamera,
@@ -65,6 +67,7 @@ fn main() {
         })
         .init_resource::<SlicerConfig>()
         .init_resource::<BuildPlateState>()
+        .init_resource::<FieldVisualizationState>()
         .add_systems(Startup, setup_viewport_scene_and_pipeline)
         .add_systems(
             Update,
@@ -72,9 +75,11 @@ fn main() {
                 ui_workspace_system,
                 poll_io_tasks_system,
                 viewport_interaction_system,
+                sync_field_visualization_system,
                 update_selection_materials_system,
                 draw_viewport_gizmos_system,
-            ),
+            )
+                .chain(),
         )
         .run();
 }

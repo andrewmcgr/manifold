@@ -27,6 +27,43 @@ pub mod ffi {
         pub has_brep: bool,
     }
 
+    /// Summary statistics for a named `openvdb::FloatGrid` scalar field on an object.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct FieldStats {
+        pub valid: bool,
+        pub field_name: String,
+        pub active_voxel_count: u64,
+        pub min_value: f32,
+        pub max_value: f32,
+        pub background_value: f32,
+        pub voxel_size: f32,
+    }
+
+    /// Triangle mesh extracted from any scalar `openvdb::FloatGrid` via `openvdb::tools::volumeToMesh`.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct IsoSurfaceMesh {
+        pub vertices: Vec<RenderVertex>,
+        pub indices: Vec<u32>,
+    }
+
+    /// 2D uniform grid sample of any scalar `openvdb::FloatGrid` across an axis-aligned
+    /// cross-section plane (`axis`: 0 = YZ/X-slice, 1 = XZ/Y-slice, 2 = XY/Z-slice).
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct FieldSlice2D {
+        pub valid: bool,
+        pub width: u32,
+        pub height: u32,
+        pub origin: [f32; 3],
+        pub u_vec: [f32; 3],
+        pub v_vec: [f32; 3],
+        pub normal: [f32; 3],
+        pub plane_coord: f32,
+        pub min_value: f32,
+        pub max_value: f32,
+        pub background_value: f32,
+        pub values: Vec<f32>,
+    }
+
     unsafe extern "C++" {
         include!("slicer_backend.h");
 
@@ -43,7 +80,7 @@ pub mod ffi {
         pub fn load_step_assembly(path: &str) -> Vec<DecomposedPartInfo>;
 
         /// Registers an indexed triangle mesh (from STL or 3MF) in the C++ backend,
-        /// computing vertex normals and initializing an OpenVDB Eikonal grid.
+        /// computing vertex normals and initializing OpenVDB SDF & Eikonal grids.
         pub fn register_triangle_mesh(
             name: &str,
             positions: &[f32],
@@ -61,6 +98,40 @@ pub mod ffi {
 
         /// Exports the original OCCT B-Rep `TopoDS_Shape` for `object_id` to a STEP file.
         pub fn export_object_step_to_path(object_id: u64, path: &str) -> bool;
+
+        /// Lists all scalar `openvdb::FloatGrid` field names available on `object_id`
+        /// (e.g., `"sdf"`, `"eikonal"`, `"overhang"`).
+        pub fn list_object_fields(object_id: u64) -> Vec<String>;
+
+        /// Queries voxel count, min/max scalar range, and voxel size for a named field on `object_id`.
+        pub fn get_object_field_stats(object_id: u64, field_name: &str) -> FieldStats;
+
+        /// Recomputes the OpenVDB SDF and derived scalar fields for `object_id` at the
+        /// specified `voxel_size` (mm) and `narrow_band_voxels` half-width.
+        pub fn recompute_object_fields(
+            object_id: u64,
+            voxel_size: f32,
+            narrow_band_voxels: f32,
+        ) -> bool;
+
+        /// Extracts a 3D polygonal isosurface mesh at `isovalue` from any named scalar field
+        /// on `object_id` using `openvdb::tools::volumeToMesh`.
+        pub fn extract_field_isosurface(
+            object_id: u64,
+            field_name: &str,
+            isovalue: f32,
+            adaptivity: f32,
+        ) -> IsoSurfaceMesh;
+
+        /// Samples a 2D cross-section slice of any named scalar field on `object_id`
+        /// along `axis` (0 = X, 1 = Y, 2 = Z) at `normalized_pos` in `[0.0, 1.0]`.
+        pub fn sample_field_slice(
+            object_id: u64,
+            field_name: &str,
+            axis: u8,
+            normalized_pos: f32,
+            resolution: u32,
+        ) -> FieldSlice2D;
     }
 }
 

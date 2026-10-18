@@ -11,10 +11,13 @@ namespace manifold {
 
 struct RenderVertex;
 struct DecomposedPartInfo;
+struct FieldStats;
+struct IsoSurfaceMesh;
+struct FieldSlice2D;
 
 /// Core C++20 compute engine handling CAD B-Rep ingestion (OCCT), assembly
 /// decomposition, surface tessellation, STL/3MF triangle mesh registration,
-/// and volumetric Eikonal distance fields (OpenVDB).
+/// OpenVDB Signed Distance Fields (SDF), and generic scalar field visualization.
 class SlicerBackend {
 public:
     SlicerBackend();
@@ -28,15 +31,15 @@ public:
 
     /// Loads an ISO 10303-21 STEP file, decomposes any assembly hierarchy
     /// (compounds/solids/shells) into independent objects, tessellates each
-    /// part in its local centered frame, and initializes its OpenVDB Eikonal grid.
+    /// part in its local centered frame, and computes its OpenVDB SDF & scalar fields.
     std::vector<DecomposedPartInfo> loadStepAssembly(
         const std::string& filePath,
         double linearDeflection = 0.05,
         double angularDeflection = 0.5);
 
     /// Registers an indexed triangle mesh (e.g., from STL or 3MF), computes
-    /// area-weighted normals, centers local coordinates, and initializes its
-    /// OpenVDB Eikonal FloatGrid.
+    /// area-weighted normals, centers local coordinates, and computes its
+    /// OpenVDB SDF & scalar fields.
     DecomposedPartInfo registerTriangleMesh(
         const std::string& name,
         const float* positions,
@@ -57,6 +60,33 @@ public:
 
     /// Returns the tessellated triangle indices for a specific object ID.
     std::vector<std::uint32_t> objectIndices(std::uint64_t objectId) const;
+
+    /// Lists all named OpenVDB scalar fields stored on `objectId`.
+    std::vector<std::string> listObjectFields(std::uint64_t objectId) const;
+
+    /// Queries statistics (active voxel count, min/max value, voxel size) for a named field.
+    FieldStats getObjectFieldStats(std::uint64_t objectId, const std::string& fieldName) const;
+
+    /// Rebuilds the OpenVDB SDF (`meshToLevelSet`) and derived scalar fields (`eikonal`, `overhang`)
+    /// for `objectId` at the requested `voxelSize` and `narrowBandVoxels`.
+    bool recomputeObjectFields(std::uint64_t objectId, float voxelSize, float narrowBandVoxels);
+
+    /// Extracts an isosurface triangle mesh from any named scalar field on `objectId`
+    /// using `openvdb::tools::volumeToMesh`.
+    IsoSurfaceMesh extractFieldIsosurface(
+        std::uint64_t objectId,
+        const std::string& fieldName,
+        float isovalue,
+        float adaptivity) const;
+
+    /// Samples a 2D cross-section plane from any named scalar field on `objectId`
+    /// using trilinear interpolation (`openvdb::tools::GridSampler`).
+    FieldSlice2D sampleFieldSlice(
+        std::uint64_t objectId,
+        const std::string& fieldName,
+        std::uint8_t axis,
+        float normalizedPos,
+        std::uint32_t resolution) const;
 
     /// Returns a reference to the most recently loaded object's vertices.
     const std::vector<RenderVertex>& vertices() const noexcept;
@@ -86,5 +116,20 @@ rust::Vec<RenderVertex> get_object_vertices(std::uint64_t object_id);
 rust::Vec<std::uint32_t> get_object_indices(std::uint64_t object_id);
 bool remove_cad_object(std::uint64_t object_id);
 bool export_object_step_to_path(std::uint64_t object_id, rust::Str path);
+
+rust::Vec<rust::String> list_object_fields(std::uint64_t object_id);
+FieldStats get_object_field_stats(std::uint64_t object_id, rust::Str field_name);
+bool recompute_object_fields(std::uint64_t object_id, float voxel_size, float narrow_band_voxels);
+IsoSurfaceMesh extract_field_isosurface(
+    std::uint64_t object_id,
+    rust::Str field_name,
+    float isovalue,
+    float adaptivity);
+FieldSlice2D sample_field_slice(
+    std::uint64_t object_id,
+    rust::Str field_name,
+    std::uint8_t axis,
+    float normalized_pos,
+    std::uint32_t resolution);
 
 } // namespace manifold

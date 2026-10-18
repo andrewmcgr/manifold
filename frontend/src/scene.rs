@@ -393,23 +393,47 @@ pub fn run_auto_arrange_on_plate(
     }
 }
 
-/// Updates object material highlights so the selected object is visually distinct.
+/// Updates object material highlights so the selected object is visually distinct,
+/// while preserving translucency (with backface culling) when volumetric field visualization is active.
 pub fn update_selection_materials_system(
     plate: Res<BuildPlateState>,
+    vis_state: Res<crate::field_vis::FieldVisualizationState>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    if !plate.is_changed() {
+    if !plate.is_changed() && !vis_state.is_changed() {
         return;
     }
 
     for obj in &plate.objects {
         if let Some(mat) = materials.get_mut(&obj.material_handle) {
             let is_selected = plate.selected_object_id == Some(obj.object_id);
-            mat.base_color = if is_selected {
-                Color::srgb(0.32, 0.76, 0.98)
+            if is_selected {
+                let field_active = vis_state.show_isosurface || vis_state.show_slice_plane;
+                let alpha = if field_active {
+                    vis_state.solid_opacity.clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                mat.base_color = Color::srgba(0.32, 0.76, 0.98, alpha);
+                if alpha < 0.02 {
+                    mat.alpha_mode = AlphaMode::Mask(1.0);
+                    mat.cull_mode = Some(wgpu::Face::Back);
+                } else if alpha < 0.99 {
+                    mat.alpha_mode = AlphaMode::Blend;
+                    // Backface culling prevents the translucent CAD shell from self-interfering
+                    mat.cull_mode = Some(wgpu::Face::Back);
+                    mat.double_sided = false;
+                } else {
+                    mat.alpha_mode = AlphaMode::Opaque;
+                    mat.cull_mode = None;
+                    mat.double_sided = true;
+                }
             } else {
-                Color::srgb(0.22, 0.52, 0.78)
-            };
+                mat.base_color = Color::srgb(0.22, 0.52, 0.78);
+                mat.alpha_mode = AlphaMode::Opaque;
+                mat.cull_mode = None;
+                mat.double_sided = true;
+            }
         }
     }
 }

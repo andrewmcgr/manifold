@@ -5,6 +5,7 @@
 #include <cmath>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 
@@ -36,6 +37,9 @@
 // OpenVDB headers
 #include <openvdb/openvdb.h>
 #include <openvdb/math/Transform.h>
+#include <openvdb/tools/Interpolation.h>
+#include <openvdb/tools/MeshToVolume.h>
+#include <openvdb/tools/VolumeToMesh.h>
 
 namespace manifold {
 
@@ -49,10 +53,37 @@ struct ObjectRecord {
     float originX = 0.0f;
     float originY = 0.0f;
     float originZ = 0.0f;
+    float minX = 0.0f, minY = 0.0f, minZ = 0.0f;
+    float maxX = 0.0f, maxY = 0.0f, maxZ = 0.0f;
     std::vector<RenderVertex> vertexBuffer;
     std::vector<std::uint32_t> indexBuffer;
-    openvdb::FloatGrid::Ptr eikonalGrid;
+    /// Generic dictionary of named scalar fields (e.g., "sdf", "eikonal", "overhang").
+    std::map<std::string, openvdb::FloatGrid::Ptr> scalarFields;
 };
+
+void computeVertexBounds(
+    const std::vector<RenderVertex>& vertices,
+    float& minX, float& minY, float& minZ,
+    float& maxX, float& maxY, float& maxZ)
+{
+    if (vertices.empty()) {
+        minX = minY = minZ = 0.0f;
+        maxX = maxY = maxZ = 0.0f;
+        return;
+    }
+
+    minX = minY = minZ = std::numeric_limits<float>::max();
+    maxX = maxY = maxZ = std::numeric_limits<float>::lowest();
+
+    for (const auto& v : vertices) {
+        minX = std::min(minX, v.x);
+        minY = std::min(minY, v.y);
+        minZ = std::min(minZ, v.z);
+        maxX = std::max(maxX, v.x);
+        maxY = std::max(maxY, v.y);
+        maxZ = std::max(maxZ, v.z);
+    }
+}
 
 /// Recursively decomposes a TopoDS_Shape assembly hierarchy (compounds and
 /// compsolids) into independent leaf solids/shells while preserving composed
@@ -87,7 +118,6 @@ void collectDecomposedLeaves(const TopoDS_Shape& shape, std::vector<TopoDS_Shape
         }
 
         if (!hasSubSolidsOrCompounds) {
-            // The compound consists solely of faces/edges; keep it as a single part
             leaves.push_back(shape);
         } else if (hasLooseFaces) {
             leaves.push_back(looseFacesCompound);
@@ -99,101 +129,199 @@ void collectDecomposedLeaves(const TopoDS_Shape& shape, std::vector<TopoDS_Shape
 
 /// Centers a vertex buffer in-place so that its XY centroid is at (0, 0) and
 /// its minimum Z is at 0.0, returning the original world offset (originX, originY, originZ).
-void recenterVertexBuffer(
-    std::vector<RenderVertex>& vertices,
-    float& outOriginX,
-    float& outOriginY,
-    float& outOriginZ)
-{
-    if (vertices.empty()) {
-        outOriginX = 0.0f;
-        outOriginY = 0.0f;
-        outOriginZ = 0.0f;
+void recenterVertexBuffer(ObjectRecord& rec) {
+    if (rec.vertexBuffer.empty()) {
+        rec.originX = rec.originY = rec.originZ = 0.0f;
+        rec.minX = rec.minY = rec.minZ = 0.0f;
+        rec.maxX = rec.maxY = rec.maxZ = 0.0f;
         return;
     }
 
-    float minX = std::numeric_limits<float>::max();
-    float minY = std::numeric_limits<float>::max();
-    float minZ = std::numeric_limits<float>::max();
-    float maxX = std::numeric_limits<float>::lowest();
-    float maxY = std::numeric_limits<float>::lowest();
-    float maxZ = std::numeric_limits<float>::lowest();
+    float minX = 0.0f, minY = 0.0f, minZ = 0.0f;
+    float maxX = 0.0f, maxY = 0.0f, maxZ = 0.0f;
+    computeVertexBounds(rec.vertexBuffer, minX, minY, minZ, maxX, maxY, maxZ);
 
-    for (const auto& v : vertices) {
-        minX = std::min(minX, v.x);
-        minY = std::min(minY, v.y);
-        minZ = std::min(minZ, v.z);
-        maxX = std::max(maxX, v.x);
-        maxY = std::max(maxY, v.y);
-        maxZ = std::max(maxZ, v.z);
+    rec.originX = 0.5f * (minX + maxX);
+    rec.originY = 0.5f * (minY + maxY);
+    rec.originZ = minZ;
+
+    for (auto& v : rec.vertexBuffer) {
+        v.x -= rec.originX;
+        v.y -= rec.originY;
+        v.z -= rec.originZ;
     }
 
-    outOriginX = 0.5f * (minX + maxX);
-    outOriginY = 0.5f * (minY + maxY);
-    outOriginZ = minZ;
-
-    for (auto& v : vertices) {
-        v.x -= outOriginX;
-        v.y -= outOriginY;
-        v.z -= outOriginZ;
-    }
+    computeVertexBounds(
+        rec.vertexBuffer,
+        rec.minX, rec.minY, rec.minZ,
+        rec.maxX, rec.maxY, rec.maxZ);
 }
 
-/// Initializes a coarse OpenVDB Eikonal scalar field over the centered vertex bounds.
-openvdb::FloatGrid::Ptr createEikonalGridForVertices(
-    const std::vector<RenderVertex>& vertices,
-    double voxelSize = 0.5)
+/// Populates the object's scalar field registry:
+/// 1. `"sdf"`: Full-interior + exterior-band Signed Distance Field via
+///    `openvdb::tools::meshToSignedDistanceField` so that `min_value` reaches the
+///    deepest medial axis of the solid and `max_value` spans a consistent physical
+///    millimeter offset regardless of voxel resolution.
+/// 2. `"eikonal"`: Non-planar conformal slicing distance field derived from height & SDF.
+/// 3. `"overhang"`: Normalized vertical SDF gradient ($\partial \phi / \partial z \in [-1, 1]$).
+void buildObjectScalarFields(
+    ObjectRecord& rec,
+    float requestedVoxelSize = 0.5f,
+    float narrowBandVoxels = 6.0f)
 {
-    const float backgroundDistance = static_cast<float>(voxelSize * 3.0);
-    openvdb::FloatGrid::Ptr grid = openvdb::FloatGrid::create(backgroundDistance);
-    grid->setName("eikonal_nonplanar_field");
-    grid->setGridClass(openvdb::GRID_LEVEL_SET);
-    grid->setTransform(openvdb::math::Transform::createLinearTransform(voxelSize));
-
-    if (vertices.empty()) {
-        return grid;
+    rec.scalarFields.clear();
+    if (rec.vertexBuffer.empty() || rec.indexBuffer.size() < 3) {
+        return;
     }
 
-    float minX = std::numeric_limits<float>::max();
-    float minY = std::numeric_limits<float>::max();
-    float minZ = std::numeric_limits<float>::max();
-    float maxX = std::numeric_limits<float>::lowest();
-    float maxY = std::numeric_limits<float>::lowest();
-    float maxZ = std::numeric_limits<float>::lowest();
+    const float spanX = rec.maxX - rec.minX;
+    const float spanY = rec.maxY - rec.minY;
+    const float spanZ = rec.maxZ - rec.minZ;
+    const float maxSpan = std::max({spanX, spanY, spanZ, 1.0f});
 
-    for (const auto& v : vertices) {
-        minX = std::min(minX, v.x);
-        minY = std::min(minY, v.y);
-        minZ = std::min(minZ, v.z);
-        maxX = std::max(maxX, v.x);
-        maxY = std::max(maxY, v.y);
-        maxZ = std::max(maxZ, v.z);
+    // Allow fine voxel sizes up to ~220 voxels along the longest bounding box axis
+    const double voxelSize = std::max<double>(
+        std::max(requestedVoxelSize, 0.05f),
+        static_cast<double>(maxSpan) / 220.0);
+
+    // Maintain a consistent physical exterior band (at least 20% of maxSpan or narrowBandVoxels * voxelSize)
+    // and a full interior band (60% of maxSpan) so the SDF isovalue range in millimeters
+    // never shrinks when the user selects a finer voxel resolution.
+    const float minExteriorMm = std::max(0.20f * maxSpan, narrowBandVoxels * static_cast<float>(voxelSize));
+    const float exBandVoxels = std::clamp(
+        minExteriorMm / static_cast<float>(voxelSize),
+        3.0f,
+        120.0f);
+    const float inBandVoxels = std::clamp(
+        (0.60f * maxSpan) / static_cast<float>(voxelSize),
+        4.0f,
+        220.0f);
+
+    openvdb::math::Transform::Ptr xform =
+        openvdb::math::Transform::createLinearTransform(voxelSize);
+
+    std::vector<openvdb::Vec3s> points;
+    points.reserve(rec.vertexBuffer.size());
+    for (const auto& v : rec.vertexBuffer) {
+        points.emplace_back(v.x, v.y, v.z);
     }
 
-    // Clamp grid resolution for fast interactive initialization on large CAD parts
-    const double maxSpan = std::max({maxX - minX, maxY - minY, maxZ - minZ, 1.0f});
-    const double effectiveVoxel = std::max(voxelSize, maxSpan / 32.0);
-    grid->setTransform(openvdb::math::Transform::createLinearTransform(effectiveVoxel));
+    std::vector<openvdb::Vec3I> triangles;
+    triangles.reserve(rec.indexBuffer.size() / 3);
+    for (std::size_t t = 0; t + 2 < rec.indexBuffer.size(); t += 3) {
+        triangles.emplace_back(
+            rec.indexBuffer[t + 0],
+            rec.indexBuffer[t + 1],
+            rec.indexBuffer[t + 2]);
+    }
+    std::vector<openvdb::Vec4I> quads;
 
-    openvdb::FloatGrid::Accessor accessor = grid->getAccessor();
-    const openvdb::math::Transform& xform = grid->transform();
+    // 1. Compute full-interior + exterior Signed Distance Field ("sdf")
+    openvdb::FloatGrid::Ptr sdfGrid =
+        openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
+            *xform, points, triangles, quads, exBandVoxels, inBandVoxels);
+    sdfGrid->setName("sdf");
+    rec.scalarFields["sdf"] = sdfGrid;
 
-    const openvdb::Coord ijkMin = xform.worldToIndexCellCentered(openvdb::Vec3d(minX, minY, minZ));
-    const openvdb::Coord ijkMax = xform.worldToIndexCellCentered(openvdb::Vec3d(maxX, maxY, maxZ));
+    // 2. Build "eikonal" (conformal non-planar layer field) and "overhang" (vertical gradient)
+    const float eikonalBg = spanZ + minExteriorMm;
+    openvdb::FloatGrid::Ptr eikonalGrid = openvdb::FloatGrid::create(eikonalBg);
+    eikonalGrid->setName("eikonal");
+    eikonalGrid->setGridClass(openvdb::GRID_LEVEL_SET);
+    eikonalGrid->setTransform(xform->copy());
 
-    for (int i = ijkMin.x(); i <= ijkMax.x(); ++i) {
-        for (int j = ijkMin.y(); j <= ijkMax.y(); ++j) {
-            for (int k = ijkMin.z(); k <= ijkMax.z(); ++k) {
-                const openvdb::Coord ijk(i, j, k);
-                const openvdb::Vec3d worldPos = xform.indexToWorld(ijk);
-                const double radialSq = worldPos.x() * worldPos.x() + worldPos.y() * worldPos.y();
-                const double phi = (worldPos.z() - minZ) + 0.05 * std::sin(0.1 * std::sqrt(radialSq));
-                accessor.setValue(ijk, static_cast<float>(phi));
-            }
+    openvdb::FloatGrid::Ptr overhangGrid = openvdb::FloatGrid::create(0.0f);
+    overhangGrid->setName("overhang");
+    overhangGrid->setGridClass(openvdb::GRID_LEVEL_SET);
+    overhangGrid->setTransform(xform->copy());
+
+    auto sdfAccessor = sdfGrid->getConstAccessor();
+    auto eikonalAccessor = eikonalGrid->getAccessor();
+    auto overhangAccessor = overhangGrid->getAccessor();
+
+    const float invSpanZ = 1.0f / std::max(spanZ, 1.0f);
+    const float invTwoDx = 1.0f / static_cast<float>(2.0 * voxelSize);
+
+    for (auto iter = sdfGrid->cbeginValueOn(); iter; ++iter) {
+        const openvdb::Coord ijk = iter.getCoord();
+        const float sdfVal = *iter;
+        const openvdb::Vec3d worldPos = xform->indexToWorld(ijk);
+
+        // Conformal non-planar Eikonal scalar field:
+        // smoothly transitions from flat Z-planar at the build plate (z = 0)
+        // to shell-conformal curved layers weighted by the signed distance field.
+        const float zRel = std::clamp(static_cast<float>(worldPos.z() - rec.minZ) * invSpanZ, 0.0f, 1.0f);
+        const double radial = std::sqrt(worldPos.x() * worldPos.x() + worldPos.y() * worldPos.y());
+        const float harmonicWave =
+            0.12f * maxSpan * zRel * static_cast<float>(std::sin(3.5 * radial / maxSpan));
+        const float conformalOffset = -0.35f * zRel * sdfVal;
+        const float eikonalVal =
+            static_cast<float>(worldPos.z() - rec.minZ) + harmonicWave + conformalOffset;
+        eikonalAccessor.setValue(ijk, eikonalVal);
+
+        // Central-difference SDF gradient to measure local 3D surface/field overhang (dz/ds)
+        const float dz =
+            (sdfAccessor.getValue(ijk.offsetBy(0, 0, 1)) -
+             sdfAccessor.getValue(ijk.offsetBy(0, 0, -1))) *
+            invTwoDx;
+        overhangAccessor.setValue(ijk, std::clamp(dz, -1.0f, 1.0f));
+    }
+
+    rec.scalarFields["eikonal"] = eikonalGrid;
+    rec.scalarFields["overhang"] = overhangGrid;
+}
+
+void computeMeshNormals(
+    std::vector<RenderVertex>& vertexBuffer,
+    const std::vector<std::uint32_t>& indexBuffer)
+{
+    const std::size_t numVertices = vertexBuffer.size();
+    for (auto& v : vertexBuffer) {
+        v.nx = 0.0f;
+        v.ny = 0.0f;
+        v.nz = 0.0f;
+    }
+
+    for (std::size_t t = 0; t + 2 < indexBuffer.size(); t += 3) {
+        const std::uint32_t idx0 = indexBuffer[t + 0];
+        const std::uint32_t idx1 = indexBuffer[t + 1];
+        const std::uint32_t idx2 = indexBuffer[t + 2];
+        if (idx0 >= numVertices || idx1 >= numVertices || idx2 >= numVertices) {
+            continue;
+        }
+
+        const auto& v0 = vertexBuffer[idx0];
+        const auto& v1 = vertexBuffer[idx1];
+        const auto& v2 = vertexBuffer[idx2];
+
+        const float e1x = v1.x - v0.x;
+        const float e1y = v1.y - v0.y;
+        const float e1z = v1.z - v0.z;
+        const float e2x = v2.x - v0.x;
+        const float e2y = v2.y - v0.y;
+        const float e2z = v2.z - v0.z;
+
+        const float cx = e1y * e2z - e1z * e2y;
+        const float cy = e1z * e2x - e1x * e2z;
+        const float cz = e1x * e2y - e1y * e2x;
+
+        for (const std::uint32_t idx : {idx0, idx1, idx2}) {
+            vertexBuffer[idx].nx += cx;
+            vertexBuffer[idx].ny += cy;
+            vertexBuffer[idx].nz += cz;
         }
     }
 
-    return grid;
+    for (auto& v : vertexBuffer) {
+        const float len = std::sqrt(v.nx * v.nx + v.ny * v.ny + v.nz * v.nz);
+        if (len > 1.0e-7f) {
+            v.nx /= len;
+            v.ny /= len;
+            v.nz /= len;
+        } else {
+            v.nz = 1.0f;
+        }
+    }
 }
 
 void tessellateTopoShape(
@@ -357,15 +485,13 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
             continue;
         }
 
-        recenterVertexBuffer(rec.vertexBuffer, rec.originX, rec.originY, rec.originZ);
+        recenterVertexBuffer(rec);
 
-        // Shift the stored B-Rep shape by the same local recentering translation so
-        // exporting the individual part to STEP preserves its local centered frame.
         gp_Trsf localShift;
         localShift.SetTranslation(gp_Vec(-rec.originX, -rec.originY, -rec.originZ));
         rec.shape.Move(TopLoc_Location(localShift));
 
-        rec.eikonalGrid = createEikonalGridForVertices(rec.vertexBuffer);
+        buildObjectScalarFields(rec);
 
         DecomposedPartInfo info;
         info.object_id = rec.id;
@@ -421,50 +547,9 @@ DecomposedPartInfo SlicerBackend::registerTriangleMesh(
         v.nz = 0.0f;
     }
 
-    // Compute area-weighted vertex normals across all triangles
-    for (std::size_t t = 0; t + 2 < indexCount; t += 3) {
-        const std::uint32_t idx0 = rec.indexBuffer[t + 0];
-        const std::uint32_t idx1 = rec.indexBuffer[t + 1];
-        const std::uint32_t idx2 = rec.indexBuffer[t + 2];
-        if (idx0 >= numVertices || idx1 >= numVertices || idx2 >= numVertices) {
-            continue;
-        }
-
-        const auto& v0 = rec.vertexBuffer[idx0];
-        const auto& v1 = rec.vertexBuffer[idx1];
-        const auto& v2 = rec.vertexBuffer[idx2];
-
-        const float e1x = v1.x - v0.x;
-        const float e1y = v1.y - v0.y;
-        const float e1z = v1.z - v0.z;
-        const float e2x = v2.x - v0.x;
-        const float e2y = v2.y - v0.y;
-        const float e2z = v2.z - v0.z;
-
-        const float cx = e1y * e2z - e1z * e2y;
-        const float cy = e1z * e2x - e1x * e2z;
-        const float cz = e1x * e2y - e1y * e2x;
-
-        for (const std::uint32_t idx : {idx0, idx1, idx2}) {
-            rec.vertexBuffer[idx].nx += cx;
-            rec.vertexBuffer[idx].ny += cy;
-            rec.vertexBuffer[idx].nz += cz;
-        }
-    }
-
-    for (auto& v : rec.vertexBuffer) {
-        const float len = std::sqrt(v.nx * v.nx + v.ny * v.ny + v.nz * v.nz);
-        if (len > 1.0e-7f) {
-            v.nx /= len;
-            v.ny /= len;
-            v.nz /= len;
-        } else {
-            v.nz = 1.0f;
-        }
-    }
-
-    recenterVertexBuffer(rec.vertexBuffer, rec.originX, rec.originY, rec.originZ);
-    rec.eikonalGrid = createEikonalGridForVertices(rec.vertexBuffer);
+    computeMeshNormals(rec.vertexBuffer, rec.indexBuffer);
+    recenterVertexBuffer(rec);
+    buildObjectScalarFields(rec);
 
     info.object_id = rec.id;
     info.origin_x = rec.originX;
@@ -511,6 +596,268 @@ std::vector<std::uint32_t> SlicerBackend::objectIndices(std::uint64_t objectId) 
         return {};
     }
     return it->second.indexBuffer;
+}
+
+std::vector<std::string> SlicerBackend::listObjectFields(std::uint64_t objectId) const {
+    std::vector<std::string> names;
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return names;
+    }
+    for (const auto& [name, grid] : it->second.scalarFields) {
+        if (grid) {
+            names.push_back(name);
+        }
+    }
+    return names;
+}
+
+FieldStats SlicerBackend::getObjectFieldStats(std::uint64_t objectId, const std::string& fieldName) const {
+    FieldStats stats{};
+    stats.valid = false;
+    stats.field_name = rust::String(fieldName);
+    stats.active_voxel_count = 0;
+    stats.min_value = 0.0f;
+    stats.max_value = 0.0f;
+    stats.background_value = 0.0f;
+    stats.voxel_size = 0.0f;
+
+    const auto objIt = impl_->objects.find(objectId);
+    if (objIt == impl_->objects.end()) {
+        return stats;
+    }
+    const auto fieldIt = objIt->second.scalarFields.find(fieldName);
+    if (fieldIt == objIt->second.scalarFields.end() || !fieldIt->second) {
+        return stats;
+    }
+
+    const openvdb::FloatGrid::Ptr& grid = fieldIt->second;
+    stats.valid = true;
+    stats.active_voxel_count = grid->activeVoxelCount();
+    stats.background_value = grid->background();
+    stats.voxel_size = static_cast<float>(grid->transform().voxelSize()[0]);
+
+    float minVal = std::numeric_limits<float>::max();
+    float maxVal = std::numeric_limits<float>::lowest();
+    for (auto iter = grid->cbeginValueOn(); iter; ++iter) {
+        const float v = *iter;
+        minVal = std::min(minVal, v);
+        maxVal = std::max(maxVal, v);
+    }
+
+    if (minVal <= maxVal) {
+        stats.min_value = minVal;
+        stats.max_value = maxVal;
+    }
+    return stats;
+}
+
+bool SlicerBackend::recomputeObjectFields(
+    std::uint64_t objectId,
+    float voxelSize,
+    float narrowBandVoxels)
+{
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return false;
+    }
+    buildObjectScalarFields(it->second, voxelSize, narrowBandVoxels);
+    return true;
+}
+
+IsoSurfaceMesh SlicerBackend::extractFieldIsosurface(
+    std::uint64_t objectId,
+    const std::string& fieldName,
+    float isovalue,
+    float adaptivity) const
+{
+    IsoSurfaceMesh out{};
+    const auto objIt = impl_->objects.find(objectId);
+    if (objIt == impl_->objects.end()) {
+        return out;
+    }
+    const auto fieldIt = objIt->second.scalarFields.find(fieldName);
+    if (fieldIt == objIt->second.scalarFields.end() || !fieldIt->second) {
+        return out;
+    }
+
+    const openvdb::FloatGrid& grid = *fieldIt->second;
+    std::vector<openvdb::Vec3s> points;
+    std::vector<openvdb::Vec3I> triangles;
+    std::vector<openvdb::Vec4I> quads;
+
+    openvdb::tools::volumeToMesh(
+        grid,
+        points,
+        triangles,
+        quads,
+        static_cast<double>(isovalue),
+        static_cast<double>( std::clamp(adaptivity, 0.0f, 1.0f)),
+        true);
+
+    if (points.empty() || (triangles.empty() && quads.empty())) {
+        return out;
+    }
+
+    std::vector<RenderVertex> verts(points.size());
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        verts[i].x = points[i].x();
+        verts[i].y = points[i].y();
+        verts[i].z = points[i].z();
+        verts[i].nx = 0.0f;
+        verts[i].ny = 0.0f;
+        verts[i].nz = 0.0f;
+    }
+
+    std::vector<std::uint32_t> inds;
+    inds.reserve(triangles.size() * 3 + quads.size() * 6);
+
+    // Note: OpenVDB volumeToMesh orders polygon vertices clockwise when viewed from
+    // the higher-valued side of the isosurface; reversing to (0, 2, 1) produces
+    // standard CCW outward normals.
+    for (const auto& tri : triangles) {
+        inds.push_back(tri[0]);
+        inds.push_back(tri[2]);
+        inds.push_back(tri[1]);
+    }
+    for (const auto& q : quads) {
+        inds.push_back(q[0]);
+        inds.push_back(q[2]);
+        inds.push_back(q[1]);
+
+        inds.push_back(q[0]);
+        inds.push_back(q[3]);
+        inds.push_back(q[2]);
+    }
+
+    computeMeshNormals(verts, inds);
+
+    out.vertices.reserve(verts.size());
+    for (const auto& v : verts) {
+        out.vertices.push_back(v);
+    }
+    out.indices.reserve(inds.size());
+    for (const auto idx : inds) {
+        out.indices.push_back(idx);
+    }
+    return out;
+}
+
+FieldSlice2D SlicerBackend::sampleFieldSlice(
+    std::uint64_t objectId,
+    const std::string& fieldName,
+    std::uint8_t axis,
+    float normalizedPos,
+    std::uint32_t resolution) const
+{
+    FieldSlice2D slice{};
+    slice.valid = false;
+    slice.width = 0;
+    slice.height = 0;
+    slice.origin = {0.0f, 0.0f, 0.0f};
+    slice.u_vec = {1.0f, 0.0f, 0.0f};
+    slice.v_vec = {0.0f, 1.0f, 0.0f};
+    slice.normal = {0.0f, 0.0f, 1.0f};
+    slice.plane_coord = 0.0f;
+    slice.min_value = 0.0f;
+    slice.max_value = 0.0f;
+    slice.background_value = 0.0f;
+
+    const auto objIt = impl_->objects.find(objectId);
+    if (objIt == impl_->objects.end()) {
+        return slice;
+    }
+    const ObjectRecord& rec = objIt->second;
+    const auto fieldIt = rec.scalarFields.find(fieldName);
+    if (fieldIt == rec.scalarFields.end() || !fieldIt->second) {
+        return slice;
+    }
+
+    const openvdb::FloatGrid& grid = *fieldIt->second;
+    const float bg = grid.background();
+    const float voxel = static_cast<float>(grid.transform().voxelSize()[0]);
+    const float maxSpan = std::max({
+        rec.maxX - rec.minX,
+        rec.maxY - rec.minY,
+        rec.maxZ - rec.minZ,
+        1.0f});
+    const float pad = std::max(0.18f * maxSpan, voxel * 3.0f);
+
+    const float bMinX = rec.minX - pad;
+    const float bMinY = rec.minY - pad;
+    const float bMinZ = rec.minZ - pad;
+    const float bMaxX = rec.maxX + pad;
+    const float bMaxY = rec.maxY + pad;
+    const float bMaxZ = rec.maxZ + pad;
+
+    const float t = std::clamp(normalizedPos, 0.0f, 1.0f);
+    const std::uint32_t res = std::clamp<std::uint32_t>(resolution, 16, 512);
+
+    if (axis == 0) {
+        // YZ slice at X = const
+        const float xCoord = bMinX + t * (bMaxX - bMinX);
+        slice.origin = {xCoord, bMinY, bMinZ};
+        slice.u_vec = {0.0f, bMaxY - bMinY, 0.0f};
+        slice.v_vec = {0.0f, 0.0f, bMaxZ - bMinZ};
+        slice.normal = {1.0f, 0.0f, 0.0f};
+        slice.plane_coord = xCoord;
+    } else if (axis == 1) {
+        // XZ slice at Y = const
+        const float yCoord = bMinY + t * (bMaxY - bMinY);
+        slice.origin = {bMinX, yCoord, bMinZ};
+        slice.u_vec = {bMaxX - bMinX, 0.0f, 0.0f};
+        slice.v_vec = {0.0f, 0.0f, bMaxZ - bMinZ};
+        slice.normal = {0.0f, 1.0f, 0.0f};
+        slice.plane_coord = yCoord;
+    } else {
+        // XY slice at Z = const (default)
+        const float zCoord = bMinZ + t * (bMaxZ - bMinZ);
+        slice.origin = {bMinX, bMinY, zCoord};
+        slice.u_vec = {bMaxX - bMinX, 0.0f, 0.0f};
+        slice.v_vec = {0.0f, bMaxY - bMinY, 0.0f};
+        slice.normal = {0.0f, 0.0f, 1.0f};
+        slice.plane_coord = zCoord;
+    }
+
+    slice.valid = true;
+    slice.width = res;
+    slice.height = res;
+    slice.background_value = bg;
+
+    // Query global active min/max of the field so color normalization stays consistent across slices
+    float minVal = std::numeric_limits<float>::max();
+    float maxVal = std::numeric_limits<float>::lowest();
+    for (auto iter = grid.cbeginValueOn(); iter; ++iter) {
+        const float v = *iter;
+        minVal = std::min(minVal, v);
+        maxVal = std::max(maxVal, v);
+    }
+    if (minVal > maxVal) {
+        minVal = -1.0f;
+        maxVal = 1.0f;
+    }
+    slice.min_value = minVal;
+    slice.max_value = maxVal;
+
+    auto accessor = grid.getConstAccessor();
+    openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+        sampler(accessor, grid.transform());
+
+    slice.values.reserve(static_cast<std::size_t>(res) * res);
+    for (std::uint32_t iv = 0; iv < res; ++iv) {
+        const float fv = (static_cast<float>(iv) + 0.5f) / static_cast<float>(res);
+        for (std::uint32_t iu = 0; iu < res; ++iu) {
+            const float fu = (static_cast<float>(iu) + 0.5f) / static_cast<float>(res);
+            const openvdb::Vec3d wp(
+                slice.origin[0] + fu * slice.u_vec[0] + fv * slice.v_vec[0],
+                slice.origin[1] + fu * slice.u_vec[1] + fv * slice.v_vec[1],
+                slice.origin[2] + fu * slice.u_vec[2] + fv * slice.v_vec[2]);
+            const float sampled = sampler.wsSample(wp);
+            slice.values.push_back(sampled);
+        }
+    }
+
+    return slice;
 }
 
 const std::vector<RenderVertex>& SlicerBackend::vertices() const noexcept {
@@ -627,6 +974,51 @@ bool export_object_step_to_path(std::uint64_t object_id, rust::Str path) {
     std::lock_guard<std::mutex> lock(g_backendMutex);
     const std::string filePath(path.data(), path.size());
     return globalBackend().exportObjectStep(object_id, filePath);
+}
+
+rust::Vec<rust::String> list_object_fields(std::uint64_t object_id) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const auto names = globalBackend().listObjectFields(object_id);
+    rust::Vec<rust::String> out;
+    out.reserve(names.size());
+    for (const auto& n : names) {
+        out.push_back(rust::String(n));
+    }
+    return out;
+}
+
+FieldStats get_object_field_stats(std::uint64_t object_id, rust::Str field_name) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const std::string name(field_name.data(), field_name.size());
+    return globalBackend().getObjectFieldStats(object_id, name);
+}
+
+bool recompute_object_fields(std::uint64_t object_id, float voxel_size, float narrow_band_voxels) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().recomputeObjectFields(object_id, voxel_size, narrow_band_voxels);
+}
+
+IsoSurfaceMesh extract_field_isosurface(
+    std::uint64_t object_id,
+    rust::Str field_name,
+    float isovalue,
+    float adaptivity)
+{
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const std::string name(field_name.data(), field_name.size());
+    return globalBackend().extractFieldIsosurface(object_id, name, isovalue, adaptivity);
+}
+
+FieldSlice2D sample_field_slice(
+    std::uint64_t object_id,
+    rust::Str field_name,
+    std::uint8_t axis,
+    float normalized_pos,
+    std::uint32_t resolution)
+{
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const std::string name(field_name.data(), field_name.size());
+    return globalBackend().sampleFieldSlice(object_id, name, axis, normalized_pos, resolution);
 }
 
 } // namespace manifold
