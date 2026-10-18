@@ -15,18 +15,52 @@ pub mod ffi {
         pub nz: f32,
     }
 
+    /// Metadata returned by the C++ backend for each decomposed solid/part
+    /// in a STEP assembly or registered STL/3MF triangle mesh.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct DecomposedPartInfo {
+        pub object_id: u64,
+        pub name: String,
+        pub origin_x: f32,
+        pub origin_y: f32,
+        pub origin_z: f32,
+        pub has_brep: bool,
+    }
+
     unsafe extern "C++" {
         include!("slicer_backend.h");
 
-        /// Loads a STEP CAD model on the C++ backend, tessellates it via
-        /// `BRepMesh_IncrementalMesh`, and initializes its OpenVDB Eikonal grid.
+        /// Legacy single-model STEP loader.
         pub fn load_cad_model(path: &str) -> bool;
 
-        /// Retrieves the tessellated vertex array (`x, y, z, nx, ny, nz`) from C++.
+        /// Retrieves the tessellated vertex array (`x, y, z, nx, ny, nz`) of the last loaded object.
         pub fn get_tessellated_vertices() -> Vec<RenderVertex>;
 
-        /// Retrieves the tessellated triangle index buffer (`u32`) from C++.
+        /// Retrieves the tessellated triangle index buffer (`u32`) of the last loaded object.
         pub fn get_tessellated_indices() -> Vec<u32>;
+
+        /// Loads a STEP file and decomposes assemblies into independent solid/shell objects.
+        pub fn load_step_assembly(path: &str) -> Vec<DecomposedPartInfo>;
+
+        /// Registers an indexed triangle mesh (from STL or 3MF) in the C++ backend,
+        /// computing vertex normals and initializing an OpenVDB Eikonal grid.
+        pub fn register_triangle_mesh(
+            name: &str,
+            positions: &[f32],
+            indices: &[u32],
+        ) -> DecomposedPartInfo;
+
+        /// Retrieves the centered local-space vertex buffer for `object_id`.
+        pub fn get_object_vertices(object_id: u64) -> Vec<RenderVertex>;
+
+        /// Retrieves the triangle index buffer for `object_id`.
+        pub fn get_object_indices(object_id: u64) -> Vec<u32>;
+
+        /// Removes `object_id` from the C++ backend without disturbing other objects.
+        pub fn remove_cad_object(object_id: u64) -> bool;
+
+        /// Exports the original OCCT B-Rep `TopoDS_Shape` for `object_id` to a STEP file.
+        pub fn export_object_step_to_path(object_id: u64, path: &str) -> bool;
     }
 }
 
@@ -57,8 +91,14 @@ mod tests {
 
     #[test]
     fn verify_render_vertex_abi_layout() {
-        assert_eq!(std::mem::size_of::<RenderVertex>(), 6 * std::mem::size_of::<f32>());
-        assert_eq!(std::mem::align_of::<RenderVertex>(), std::mem::align_of::<f32>());
+        assert_eq!(
+            std::mem::size_of::<RenderVertex>(),
+            6 * std::mem::size_of::<f32>()
+        );
+        assert_eq!(
+            std::mem::align_of::<RenderVertex>(),
+            std::mem::align_of::<f32>()
+        );
 
         let sample = [RenderVertex {
             x: 1.0,
