@@ -40,10 +40,17 @@ pub mod ffi {
     }
 
     /// Triangle mesh extracted from any scalar `openvdb::FloatGrid` via `openvdb::tools::volumeToMesh`.
+    /// For non-SDF fields, triangles straddling the object surface ($\phi_{\text{sdf}} = 0$) are
+    /// split along the exact intersection contour so the interior ($\phi_{\text{sdf}} \le 0$)
+    /// and exterior ($\phi_{\text{sdf}} > 0$) portions can be independently styled or clipped.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct IsoSurfaceMesh {
         pub vertices: Vec<RenderVertex>,
+        pub vertex_sdf: Vec<f32>,
         pub indices: Vec<u32>,
+        pub interior_indices: Vec<u32>,
+        pub exterior_indices: Vec<u32>,
+        pub intersection_contour: Vec<f32>,
     }
 
     /// 2D uniform grid sample of any scalar `openvdb::FloatGrid` across an axis-aligned
@@ -62,6 +69,7 @@ pub mod ffi {
         pub max_value: f32,
         pub background_value: f32,
         pub values: Vec<f32>,
+        pub sdf_values: Vec<f32>,
     }
 
     unsafe extern "C++" {

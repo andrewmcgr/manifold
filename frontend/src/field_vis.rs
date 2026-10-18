@@ -33,6 +33,30 @@ impl SliceAxis {
     }
 }
 
+/// Controls how a non-SDF isosurface visualizes the region where it intersects the solid object ($\phi_{\text{sdf}} \le 0$).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IsoIntersectionMode {
+    /// Highlights the object-intersecting region ($\phi_{\text{sdf}} \le 0$) in vivid colors
+    /// and dims the exterior region ($\phi_{\text{sdf}} > 0$) in muted dark slate.
+    #[default]
+    HighlightInsideDimOutside,
+    /// Clips away all exterior triangles ($\phi_{\text{sdf}} > 0$), rendering only the exact
+    /// portion of the isosurface that intersects the solid object ($\phi_{\text{sdf}} \le 0$).
+    ClipToObjectInterior,
+    /// Renders the entire unclipped isosurface uniformly.
+    FullUnclipped,
+}
+
+impl IsoIntersectionMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HighlightInsideDimOutside => "Highlight Inside (φ <= 0) & Dim Exterior",
+            Self::ClipToObjectInterior => "Clip to Object Interior Only (φ <= 0)",
+            Self::FullUnclipped => "Full Unclipped Isosurface",
+        }
+    }
+}
+
 /// Colormap palettes for 2D scalar field slice visualization.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FieldColormap {
@@ -75,14 +99,19 @@ pub struct FieldVisualizationState {
     /// Opacity of the selected CAD solid mesh (`0.0..=1.0`) so interior slices/isosurfaces are visible.
     pub solid_opacity: f32,
 
-    // --- 3D Isosurface Controls & Persistent Handles ---
+    // --- 3D Isosurface & Object Intersection Controls ---
     pub show_isosurface: bool,
     pub isovalue: f32,
     pub adaptivity: f32,
+    pub intersection_mode: IsoIntersectionMode,
+    pub show_intersection_contour: bool,
     pub isosurface_entity: Option<Entity>,
     pub isosurface_mesh_handle: Option<Handle<Mesh>>,
     pub isosurface_mat_handle: Option<Handle<StandardMaterial>>,
     pub isosurface_triangles: usize,
+    pub interior_triangles: usize,
+    pub exterior_triangles: usize,
+    pub contour_segments_local: Vec<[Vec3; 2]>,
     pub dirty_isosurface: bool,
 
     // --- 2D Cross-Section Slice Controls & Persistent Handles ---
@@ -111,10 +140,15 @@ impl Default for FieldVisualizationState {
             show_isosurface: false,
             isovalue: 0.0,
             adaptivity: 0.0,
+            intersection_mode: IsoIntersectionMode::HighlightInsideDimOutside,
+            show_intersection_contour: true,
             isosurface_entity: None,
             isosurface_mesh_handle: None,
             isosurface_mat_handle: None,
             isosurface_triangles: 0,
+            interior_triangles: 0,
+            exterior_triangles: 0,
+            contour_segments_local: Vec::new(),
             dirty_isosurface: true,
             show_slice_plane: false,
             slice_axis: SliceAxis::Z,
@@ -158,8 +192,9 @@ impl FieldVisualizationState {
 }
 
 /// Synchronizes available OpenVDB scalar fields, updates 3D isosurfaces (`volumeToMesh`)
-/// and 2D cross-section slices (`GridSampler`) in-place without entity despawn/spawn flicker,
-/// and keeps visualization entities aligned with the selected object's world `Transform`.
+/// with exact object-intersection clipping/highlighting ($\phi_{\text{sdf}} \le 0$) and 3D
+/// intersection contour curves ($\tau = c \cap \phi_{\text{sdf}} = 0$), and updates 2D
+/// cross-section slices (`GridSampler`) in-place without entity despawn/spawn flicker.
 #[allow(clippy::too_many_arguments)]
 pub fn sync_field_visualization_system(
     mut commands: Commands,
@@ -168,6 +203,7 @@ pub fn sync_field_visualization_system(
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gizmos: Gizmos,
     object_transforms: Query<
         &Transform,
         (
@@ -200,6 +236,7 @@ pub fn sync_field_visualization_system(
         vis_state.last_object_id = selected_id;
         vis_state.available_fields.clear();
         vis_state.cached_stats = None;
+        vis_state.contour_segments_local.clear();
         vis_state.dirty_isosurface = true;
         vis_state.dirty_slice = true;
 
@@ -243,7 +280,7 @@ pub fn sync_field_visualization_system(
         vis_state.refresh_stats_for(obj_id);
     }
 
-    // 2. Update 3D Isosurface Mesh in-place (opaque depth-tested mesh to eliminate sorting flicker)
+    // 2. Update 3D Isosurface Mesh in-place (opaque depth-tested mesh with per-vertex colors)
     if !vis_state.show_isosurface {
         if let Some(ent) = vis_state.isosurface_entity {
             if let Ok((_, mut vis)) = iso_query.get_mut(ent) {
@@ -251,6 +288,9 @@ pub fn sync_field_visualization_system(
             }
         }
         vis_state.isosurface_triangles = 0;
+        vis_state.interior_triangles = 0;
+        vis_state.exterior_triangles = 0;
+        vis_state.contour_segments_local.clear();
     } else if vis_state.dirty_isosurface {
         vis_state.dirty_isosurface = false;
 
@@ -261,18 +301,60 @@ pub fn sync_field_visualization_system(
             vis_state.adaptivity,
         );
 
-        vis_state.isosurface_triangles = iso_mesh.indices.len() / 3;
-        if !iso_mesh.vertices.is_empty() && !iso_mesh.indices.is_empty() {
+        vis_state.interior_triangles = iso_mesh.interior_indices.len() / 3;
+        vis_state.exterior_triangles = iso_mesh.exterior_indices.len() / 3;
+
+        // Cache 3D intersection boundary contour segments (\tau(x) = c \cap \phi_sdf(x) = 0)
+        vis_state.contour_segments_local.clear();
+        for seg in iso_mesh.intersection_contour.chunks_exact(6) {
+            let p0 = Vec3::new(seg[0], seg[1], seg[2]);
+            let p1 = Vec3::new(seg[3], seg[4], seg[5]);
+            if p0.distance_squared(p1) > 1.0e-8 {
+                vis_state.contour_segments_local.push([p0, p1]);
+            }
+        }
+
+        let is_non_sdf = vis_state.active_field_name != "sdf";
+        let active_indices: Vec<u32> = if is_non_sdf
+            && vis_state.intersection_mode == IsoIntersectionMode::ClipToObjectInterior
+        {
+            iso_mesh.interior_indices.clone()
+        } else {
+            iso_mesh.indices.clone()
+        };
+
+        vis_state.isosurface_triangles = active_indices.len() / 3;
+
+        if !iso_mesh.vertices.is_empty() && !active_indices.is_empty() {
             let mut positions = Vec::with_capacity(iso_mesh.vertices.len());
             let mut normals = Vec::with_capacity(iso_mesh.vertices.len());
-            // Apply a tiny 0.015 mm normal bias so the phi=0 isosurface does not Z-fight with the CAD mesh
-            for v in &iso_mesh.vertices {
+            let mut colors = Vec::with_capacity(iso_mesh.vertices.len());
+
+            // Determine interior SDF depth scale for rich shading inside the object
+            let min_sdf = iso_mesh
+                .vertex_sdf
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::min)
+                .min(-1.0);
+
+            for (i, v) in iso_mesh.vertices.iter().enumerate() {
+                // Apply a tiny 0.015 mm normal bias so the phi=0 isosurface does not Z-fight with the CAD mesh
                 positions.push([
                     v.x + v.nx * 0.015,
                     v.y + v.ny * 0.015,
                     v.z + v.nz * 0.015,
                 ]);
                 normals.push([v.nx, v.ny, v.nz]);
+
+                let sdf_val = iso_mesh.vertex_sdf.get(i).copied().unwrap_or(0.0);
+                let rgba = compute_isosurface_vertex_color(
+                    &vis_state.active_field_name,
+                    vis_state.intersection_mode,
+                    sdf_val,
+                    min_sdf,
+                );
+                colors.push(rgba);
             }
 
             let bevy_mesh = Mesh::new(
@@ -281,13 +363,8 @@ pub fn sync_field_visualization_system(
             )
             .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
             .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-            .with_inserted_indices(Indices::U32(iso_mesh.indices));
-
-            let iso_color = match vis_state.active_field_name.as_str() {
-                "sdf" => Color::srgb(0.16, 0.88, 0.58),
-                "eikonal" => Color::srgb(0.95, 0.62, 0.16),
-                _ => Color::srgb(0.75, 0.38, 0.94),
-            };
+            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+            .with_inserted_indices(Indices::U32(active_indices));
 
             if let (Some(ent), Some(ref mesh_h), Some(ref mat_h)) = (
                 vis_state.isosurface_entity,
@@ -296,7 +373,7 @@ pub fn sync_field_visualization_system(
             ) {
                 meshes.insert(mesh_h, bevy_mesh);
                 if let Some(mat) = materials.get_mut(mat_h) {
-                    mat.base_color = iso_color;
+                    mat.base_color = Color::WHITE;
                 }
                 if let Ok((mut tf, mut vis)) = iso_query.get_mut(ent) {
                     *tf = obj_world_tf;
@@ -305,9 +382,10 @@ pub fn sync_field_visualization_system(
             } else {
                 let mesh_h = meshes.add(bevy_mesh);
                 let mat_h = materials.add(StandardMaterial {
-                    base_color: iso_color,
-                    metallic: 0.15,
-                    perceptual_roughness: 0.38,
+                    // Base color is WHITE so per-vertex ATTRIBUTE_COLOR directly drives surface appearance
+                    base_color: Color::WHITE,
+                    metallic: 0.12,
+                    perceptual_roughness: 0.36,
                     alpha_mode: AlphaMode::Opaque,
                     depth_bias: 8.0,
                     double_sided: true,
@@ -336,6 +414,20 @@ pub fn sync_field_visualization_system(
         }
     }
 
+    // 2b. Render 3D Object Intersection Boundary Contour (\tau(x) = c \cap \phi_sdf(x) = 0)
+    if vis_state.show_isosurface
+        && vis_state.show_intersection_contour
+        && vis_state.active_field_name != "sdf"
+        && !vis_state.contour_segments_local.is_empty()
+    {
+        let contour_color = Color::srgb(0.15, 1.0, 0.92);
+        for &[p0, p1] in &vis_state.contour_segments_local {
+            let w0 = obj_world_tf.transform_point(p0);
+            let w1 = obj_world_tf.transform_point(p1);
+            gizmos.line(w0, w1, contour_color);
+        }
+    }
+
     // 3. Update 2D Cross-Section Slice Plane in-place using AlphaMode::Mask(0.5)
     //    so hardware depth testing is active and there is zero transparency sort flicker!
     if !vis_state.show_slice_plane {
@@ -359,6 +451,8 @@ pub fn sync_field_visualization_system(
             vis_state.slice_plane_coord = slice.plane_coord;
             let rgba_bytes = rasterize_slice_to_rgba(
                 &slice,
+                &vis_state.active_field_name,
+                vis_state.isovalue,
                 vis_state.colormap,
                 vis_state.show_iso_contours,
                 vis_state.fade_exterior_background,
@@ -462,10 +556,51 @@ pub fn sync_field_visualization_system(
     }
 }
 
+/// Computes per-vertex RGBA color for an extracted isosurface mesh so that for non-SDF fields,
+/// the region intersecting the solid object ($\phi_{\text{sdf}} \le 0$) is sharply distinguished
+/// from the exterior extension ($\phi_{\text{sdf}} > 0$).
+fn compute_isosurface_vertex_color(
+    field_name: &str,
+    mode: IsoIntersectionMode,
+    sdf_val: f32,
+    min_sdf: f32,
+) -> [f32; 4] {
+    if field_name == "sdf" {
+        return [0.16, 0.88, 0.58, 1.0];
+    }
+
+    let base_inside = match field_name {
+        "eikonal" => [1.0, 0.68, 0.14],
+        "overhang" => [0.22, 0.92, 0.72],
+        _ => [0.85, 0.44, 0.98],
+    };
+
+    if mode == IsoIntersectionMode::FullUnclipped {
+        return [base_inside[0], base_inside[1], base_inside[2], 1.0];
+    }
+
+    if sdf_val <= 0.0 {
+        // Inside the object (\phi_sdf <= 0): shade smoothly from bright warm gold at the
+        // perimeter (\phi_sdf = 0) to vivid field color toward the interior medial core.
+        let depth_t = (sdf_val / min_sdf.min(-0.5)).clamp(0.0, 1.0);
+        let r = (1.0 * (1.0 - 0.35 * depth_t) * base_inside[0] + 0.18 * (1.0 - depth_t)).clamp(0.0, 1.0);
+        let g = (base_inside[1] * (0.85 + 0.15 * (1.0 - depth_t)) + 0.15 * depth_t).clamp(0.0, 1.0);
+        let b = (base_inside[2] + 0.45 * depth_t).clamp(0.0, 1.0);
+        [r, g, b, 1.0]
+    } else {
+        // Outside the object (\phi_sdf > 0): dim, cool dark slate-blue so the intersecting
+        // interior patch stands out unmistakably.
+        [0.18, 0.21, 0.29, 1.0]
+    }
+}
+
 /// Converts a 2D grid of scalar values (`FieldSlice2D`) into an RGBA8 pixel buffer
-/// using the selected `FieldColormap` and optional iso-contour lines.
+/// using the selected `FieldColormap`, highlighting the object boundary ($\phi_{\text{sdf}} = 0$)
+/// and the active isosurface intersection contour ($v = \text{isovalue}$ inside $\phi_{\text{sdf}} \le 0$).
 fn rasterize_slice_to_rgba(
     slice: &FieldSlice2D,
+    field_name: &str,
+    active_isovalue: f32,
     colormap: FieldColormap,
     show_contours: bool,
     fade_background: bool,
@@ -478,14 +613,16 @@ fn rasterize_slice_to_rgba(
     let span = (max_v - min_v).max(1e-5);
     let bg = slice.background_value;
     let bg_tol = span * 0.025;
+    let is_non_sdf = field_name != "sdf";
 
-    for &val in &slice.values {
+    for (idx, &val) in slice.values.iter().enumerate() {
         if !val.is_finite() {
             out.extend_from_slice(&[0, 0, 0, 0]);
             continue;
         }
 
-        let is_bg = (val - bg).abs() <= bg_tol && val > 0.0;
+        let sdf_v = slice.sdf_values.get(idx).copied().unwrap_or(val);
+        let is_bg = (val - bg).abs() <= bg_tol && sdf_v > 0.0;
         if fade_background && is_bg {
             // Alpha = 0 so AlphaMode::Mask(0.5) discards exterior background cleanly
             out.extend_from_slice(&[0, 0, 0, 0]);
@@ -525,9 +662,26 @@ fn rasterize_slice_to_rgba(
             }
         };
 
+        // Dim exterior region (\phi_sdf > 0) slightly on non-SDF slices so the object interior pops
+        if is_non_sdf && sdf_v > 0.0 {
+            r *= 0.45;
+            g *= 0.45;
+            b *= 0.50;
+        }
+
         if show_contours {
-            let zero_band = span * 0.012;
-            if min_v < 0.0 && max_v > 0.0 && val.abs() < zero_band {
+            let iso_band = span * 0.014;
+            if is_non_sdf && sdf_v.abs() < 0.22 {
+                // Crisp white outline along the object boundary (\phi_sdf = 0)
+                r = 0.96;
+                g = 0.98;
+                b = 1.0;
+            } else if is_non_sdf && (val - active_isovalue).abs() < iso_band && sdf_v <= 0.0 {
+                // Bright cyan highlight where the active non-SDF isosurface intersects the object!
+                r = 0.15;
+                g = 1.0;
+                b = 0.92;
+            } else if !is_non_sdf && min_v < 0.0 && max_v > 0.0 && val.abs() < iso_band {
                 r = 1.0;
                 g = 1.0;
                 b = 1.0;
@@ -605,17 +759,48 @@ mod tests {
             sdf_stats.max_value
         );
 
-        let iso = ffi::extract_field_isosurface(part.object_id, "sdf", 0.0, 0.0);
-        assert!(!iso.vertices.is_empty());
-        assert!(!iso.indices.is_empty());
+        // Verify non-SDF ("eikonal") isosurface extraction splits interior (\phi <= 0)
+        // vs exterior (\phi > 0) triangles and extracts the 3D object intersection contour!
+        let eik_iso = ffi::extract_field_isosurface(part.object_id, "eikonal", 10.0, 0.0);
+        assert!(!eik_iso.vertices.is_empty());
+        assert_eq!(eik_iso.vertices.len(), eik_iso.vertex_sdf.len());
+        assert!(
+            !eik_iso.interior_indices.is_empty(),
+            "Expected non-empty interior_indices where eikonal=10 intersects the cube"
+        );
+        assert!(
+            !eik_iso.exterior_indices.is_empty(),
+            "Expected non-empty exterior_indices in the narrow band outside the cube"
+        );
+        assert!(
+            eik_iso.intersection_contour.len() >= 6,
+            "Expected 3D intersection boundary contour segments where eikonal=10 crosses phi_sdf=0"
+        );
+        // Verify every interior triangle vertex has phi_sdf <= 0
+        for &idx in &eik_iso.interior_indices {
+            let sdf_v = eik_iso.vertex_sdf[idx as usize];
+            assert!(
+                sdf_v <= 0.0,
+                "Interior triangle vertex had positive SDF {}",
+                sdf_v
+            );
+        }
 
-        let slice = ffi::sample_field_slice(part.object_id, "sdf", 2, 0.5, 32);
+        let slice = ffi::sample_field_slice(part.object_id, "eikonal", 2, 0.5, 32);
         assert!(slice.valid);
         assert_eq!(slice.width, 32);
         assert_eq!(slice.height, 32);
         assert_eq!(slice.values.len(), 32 * 32);
+        assert_eq!(slice.sdf_values.len(), 32 * 32);
 
-        let rgba = rasterize_slice_to_rgba(&slice, FieldColormap::CoolWarmSigned, true, true);
+        let rgba = rasterize_slice_to_rgba(
+            &slice,
+            "eikonal",
+            10.0,
+            FieldColormap::CoolWarmSigned,
+            true,
+            true,
+        );
         assert_eq!(rgba.len(), 32 * 32 * 4);
 
         let _ = ffi::remove_cad_object(part.object_id);

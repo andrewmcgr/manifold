@@ -6,7 +6,9 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::bridge::ffi;
 use crate::config::{BedShape, SlicerConfig};
-use crate::field_vis::{FieldColormap, FieldVisualizationState, SliceAxis};
+use crate::field_vis::{
+    FieldColormap, FieldVisualizationState, IsoIntersectionMode, SliceAxis,
+};
 use crate::hull::rotation_to_place_face_on_bed;
 use crate::io::threemf::{save_project_to_3mf, ExportableObject};
 use crate::io::load_files_into_backend;
@@ -388,6 +390,9 @@ pub fn ui_workspace_system(
                                     .changed()
                                 {
                                     vis_state.dirty_isosurface = true;
+                                    if vis_state.active_field_name != "sdf" {
+                                        vis_state.dirty_slice = true;
+                                    }
                                 }
                                 if ui
                                     .add(
@@ -398,10 +403,46 @@ pub fn ui_workspace_system(
                                 {
                                     vis_state.dirty_isosurface = true;
                                 }
-                                ui.small(format!(
-                                    "Isosurface Mesh: {} triangles",
-                                    vis_state.isosurface_triangles
-                                ));
+
+                                if vis_state.active_field_name != "sdf" {
+                                    egui::ComboBox::from_label("Object Intersection")
+                                        .selected_text(vis_state.intersection_mode.label())
+                                        .show_ui(ui, |ui| {
+                                            for mode in [
+                                                IsoIntersectionMode::HighlightInsideDimOutside,
+                                                IsoIntersectionMode::ClipToObjectInterior,
+                                                IsoIntersectionMode::FullUnclipped,
+                                            ] {
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut vis_state.intersection_mode,
+                                                        mode,
+                                                        mode.label(),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    vis_state.dirty_isosurface = true;
+                                                }
+                                            }
+                                        });
+
+                                    ui.checkbox(
+                                        &mut vis_state.show_intersection_contour,
+                                        "Show 3D Object Intersection Contour (φ_sdf = 0)",
+                                    );
+
+                                    ui.small(format!(
+                                        "Inside Object (φ <= 0): {} tris | Exterior (φ > 0): {} tris | Contour: {} segs",
+                                        vis_state.interior_triangles,
+                                        vis_state.exterior_triangles,
+                                        vis_state.contour_segments_local.len()
+                                    ));
+                                } else {
+                                    ui.small(format!(
+                                        "Isosurface Mesh: {} triangles",
+                                        vis_state.isosurface_triangles
+                                    ));
+                                }
                             }
 
                             ui.separator();
