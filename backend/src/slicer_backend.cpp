@@ -157,15 +157,81 @@ void recenterVertexBuffer(ObjectRecord& rec) {
         rec.maxX, rec.maxY, rec.maxZ);
 }
 
-/// Populates the object's scalar field registry:
+/// Computes the right-handed orthonormal local frame of the nozzle:
+/// - `nozzle_axis` (local +Z): unit vector pointing opposite to the nozzle discharge direction.
+/// - `travel_axis` (local +X): unit vector pointing in the direction of toolhead travel.
+/// - `lateral_axis` (local +Y): `nozzle_axis × travel_axis` so `travel_axis × lateral_axis = nozzle_axis`.
+NozzleBasis computeNozzleBasis(
+    const std::array<float, 3>& nozzleAxisInput,
+    const std::array<float, 3>& travelDirInput) noexcept
+{
+    auto normalize3 = [](float x, float y, float z, const std::array<float, 3>& fallback) -> std::array<float, 3> {
+        const float len = std::sqrt(x * x + y * y + z * z);
+        if (len > 1.0e-7f) {
+            return {x / len, y / len, z / len};
+        }
+        return fallback;
+    };
+
+    const auto zNozzle = normalize3(
+        nozzleAxisInput[0],
+        nozzleAxisInput[1],
+        nozzleAxisInput[2],
+        {0.0f, 0.0f, 1.0f});
+
+    // Project travelDirInput orthogonal to zNozzle
+    const float dotTZ =
+        travelDirInput[0] * zNozzle[0] +
+        travelDirInput[1] * zNozzle[1] +
+        travelDirInput[2] * zNozzle[2];
+    float tx = travelDirInput[0] - dotTZ * zNozzle[0];
+    float ty = travelDirInput[1] - dotTZ * zNozzle[1];
+    float tz = travelDirInput[2] - dotTZ * zNozzle[2];
+    float tLen = std::sqrt(tx * tx + ty * ty + tz * tz);
+
+    if (tLen <= 1.0e-6f) {
+        // Deterministic fallback orthogonal to zNozzle
+        const std::array<float, 3> refAxis =
+            (std::abs(zNozzle[0]) < 0.9f) ? std::array<float, 3>{1.0f, 0.0f, 0.0f}
+                                          : std::array<float, 3>{0.0f, 1.0f, 0.0f};
+        const float dotRef =
+            refAxis[0] * zNozzle[0] +
+            refAxis[1] * zNozzle[1] +
+            refAxis[2] * zNozzle[2];
+        tx = refAxis[0] - dotRef * zNozzle[0];
+        ty = refAxis[1] - dotRef * zNozzle[1];
+        tz = refAxis[2] - dotRef * zNozzle[2];
+        tLen = std::sqrt(tx * tx + ty * ty + tz * tz);
+    }
+
+    const std::array<float, 3> xTravel = (tLen > 1.0e-7f)
+        ? std::array<float, 3>{tx / tLen, ty / tLen, tz / tLen}
+        : std::array<float, 3>{1.0f, 0.0f, 0.0f};
+
+    // Right-hand rule: yLateral = zNozzle × xTravel
+    const float lx = zNozzle[1] * xTravel[2] - zNozzle[2] * xTravel[1];
+    const float ly = zNozzle[2] * xTravel[0] - zNozzle[0] * xTravel[2];
+    const float lz = zNozzle[0] * xTravel[1] - zNozzle[1] * xTravel[0];
+    const auto yLateral = normalize3(lx, ly, lz, {0.0f, 1.0f, 0.0f});
+
+    NozzleBasis basis{};
+    basis.nozzle_axis = zNozzle;
+    basis.travel_axis = xTravel;
+    basis.lateral_axis = yLateral;
+    return basis;
+}
+
+/// Populates the object's scalar field registry using the queried nozzle local frame
+/// and gravity direction vector in bed coordinates (never assuming nozzle = +Z or gravity = -Z):
 /// 1. `"sdf"`: Full-interior + exterior-band Signed Distance Field via
-///    `openvdb::tools::meshToSignedDistanceField` so that `min_value` reaches the
-///    deepest medial axis of the solid and `max_value` spans a consistent physical
-///    millimeter offset regardless of voxel resolution.
-/// 2. `"eikonal"`: Non-planar conformal slicing distance field derived from height & SDF.
-/// 3. `"overhang"`: Normalized vertical SDF gradient ($\partial \phi / \partial z \in [-1, 1]$).
+///    `openvdb::tools::meshToSignedDistanceField`.
+/// 2. `"eikonal"`: Non-planar conformal slicing distance field derived from height along the
+///    queried `nozzle_axis` & SDF.
+/// 3. `"overhang"`: Normalized SDF gradient projected against the queried gravity vector
+///    ($-\nabla \phi \cdot \hat{\mathbf{g}}_{\text{bed}} \in [-1, 1]$).
 void buildObjectScalarFields(
     ObjectRecord& rec,
+    const SlicerBackend& backend,
     float requestedVoxelSize = 0.5f,
     float narrowBandVoxels = 6.0f)
 {
@@ -223,7 +289,7 @@ void buildObjectScalarFields(
     sdfGrid->setName("sdf");
     rec.scalarFields["sdf"] = sdfGrid;
 
-    // 2. Build "eikonal" (conformal non-planar layer field) and "overhang" (vertical gradient)
+    // 2. Build "eikonal" (conformal non-planar layer field) and "overhang" (gravity-aligned gradient)
     const float eikonalBg = spanZ + minExteriorMm;
     openvdb::FloatGrid::Ptr eikonalGrid = openvdb::FloatGrid::create(eikonalBg);
     eikonalGrid->setName("eikonal");
@@ -246,25 +312,57 @@ void buildObjectScalarFields(
         const openvdb::Coord ijk = iter.getCoord();
         const float sdfVal = *iter;
         const openvdb::Vec3d worldPos = xform->indexToWorld(ijk);
+        const std::array<float, 3> posBed{
+            static_cast<float>(worldPos.x()),
+            static_cast<float>(worldPos.y()),
+            static_cast<float>(worldPos.z())};
 
-        // Conformal non-planar Eikonal scalar field:
-        // smoothly transitions from flat Z-planar at the build plate (z = 0)
-        // to shell-conformal curved layers weighted by the signed distance field.
-        const float zRel = std::clamp(static_cast<float>(worldPos.z() - rec.minZ) * invSpanZ, 0.0f, 1.0f);
-        const double radial = std::sqrt(worldPos.x() * worldPos.x() + worldPos.y() * worldPos.y());
+        // Query the nozzle's local orthonormal frame and the gravity direction vector in bed coordinates
+        const NozzleBasis nozzleFrame = backend.queryNozzleFrame(posBed, {1.0f, 0.0f, 0.0f});
+        const std::array<float, 3> gravityDir = backend.queryGravityDirection(posBed);
+
+        // Project position relative to the object base onto the queried nozzle axis
+        const float relX = posBed[0];
+        const float relY = posBed[1];
+        const float relZ = posBed[2] - rec.minZ;
+        const float axialHeight =
+            relX * nozzleFrame.nozzle_axis[0] +
+            relY * nozzleFrame.nozzle_axis[1] +
+            relZ * nozzleFrame.nozzle_axis[2];
+        const float axialRel = std::clamp(axialHeight * invSpanZ, 0.0f, 1.0f);
+
+        const float lateralU =
+            relX * nozzleFrame.travel_axis[0] +
+            relY * nozzleFrame.travel_axis[1] +
+            relZ * nozzleFrame.travel_axis[2];
+        const float lateralV =
+            relX * nozzleFrame.lateral_axis[0] +
+            relY * nozzleFrame.lateral_axis[1] +
+            relZ * nozzleFrame.lateral_axis[2];
+        const double radial = std::sqrt(lateralU * lateralU + lateralV * lateralV);
+
         const float harmonicWave =
-            0.12f * maxSpan * zRel * static_cast<float>(std::sin(3.5 * radial / maxSpan));
-        const float conformalOffset = -0.35f * zRel * sdfVal;
-        const float eikonalVal =
-            static_cast<float>(worldPos.z() - rec.minZ) + harmonicWave + conformalOffset;
+            0.12f * maxSpan * axialRel * static_cast<float>(std::sin(3.5 * radial / maxSpan));
+        const float conformalOffset = -0.35f * axialRel * sdfVal;
+        const float eikonalVal = axialHeight + harmonicWave + conformalOffset;
         eikonalAccessor.setValue(ijk, eikonalVal);
 
-        // Central-difference SDF gradient to measure local 3D surface/field overhang (dz/ds)
-        const float dz =
+        // Central-difference 3D SDF gradient projected against the queried gravity vector (-g_bed)
+        const float gx =
+            (sdfAccessor.getValue(ijk.offsetBy(1, 0, 0)) -
+             sdfAccessor.getValue(ijk.offsetBy(-1, 0, 0))) *
+            invTwoDx;
+        const float gy =
+            (sdfAccessor.getValue(ijk.offsetBy(0, 1, 0)) -
+             sdfAccessor.getValue(ijk.offsetBy(0, -1, 0))) *
+            invTwoDx;
+        const float gz =
             (sdfAccessor.getValue(ijk.offsetBy(0, 0, 1)) -
              sdfAccessor.getValue(ijk.offsetBy(0, 0, -1))) *
             invTwoDx;
-        overhangAccessor.setValue(ijk, std::clamp(dz, -1.0f, 1.0f));
+        const float antiGravityProj =
+            -(gx * gravityDir[0] + gy * gravityDir[1] + gz * gravityDir[2]);
+        overhangAccessor.setValue(ijk, std::clamp(antiGravityProj, -1.0f, 1.0f));
     }
 
     rec.scalarFields["eikonal"] = eikonalGrid;
@@ -415,6 +513,21 @@ void tessellateTopoShape(
     }
 }
 
+ToolSpec makeDefaultTool(std::uint32_t id, const char* name, float diameterMm, float tempC) {
+    ToolSpec t{};
+    t.id = id;
+    t.name = rust::String(name);
+    t.nozzle_diameter_mm = diameterMm;
+    t.temperature_celsius = tempC;
+    const float tipOuterR = std::max(diameterMm * 1.25f, 0.4f);
+    t.clearance_profile_xz.push_back(ClearanceXZ{tipOuterR, 0.0f});
+    t.clearance_profile_xz.push_back(ClearanceXZ{2.5f, 2.0f});
+    t.clearance_profile_xz.push_back(ClearanceXZ{9.0f, 6.0f});
+    t.clearance_profile_xz.push_back(ClearanceXZ{22.0f, 18.0f});
+    t.clearance_profile_xz.push_back(ClearanceXZ{28.0f, 45.0f});
+    return t;
+}
+
 } // namespace
 
 struct SlicerBackend::Impl {
@@ -423,6 +536,18 @@ struct SlicerBackend::Impl {
     std::unordered_map<std::uint64_t, ObjectRecord> objects;
     std::vector<RenderVertex> emptyVertices;
     std::vector<std::uint32_t> emptyIndices;
+
+    // 5/6-axis kinematics state in bed coordinates
+    std::array<float, 3> nozzleAxisBed{0.0f, 0.0f, 1.0f};
+    std::array<float, 3> gravityDirectionBed{0.0f, 0.0f, -1.0f};
+
+    // Multi-tool registry & variable layer height configuration
+    std::vector<ToolSpec> tools{
+        makeDefaultTool(0, "T0 - 0.4mm Standard", 0.40f, 215.0f),
+        makeDefaultTool(1, "T1 - 0.6mm High-Flow", 0.60f, 230.0f),
+    };
+    std::uint32_t activeToolIndex = 0;
+    LayerHeightSpec sliceLayerHeight{0.20f, 0.08f, 0.32f};
 };
 
 SlicerBackend::SlicerBackend() : impl_(std::make_unique<Impl>()) {
@@ -491,7 +616,7 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
         localShift.SetTranslation(gp_Vec(-rec.originX, -rec.originY, -rec.originZ));
         rec.shape.Move(TopLoc_Location(localShift));
 
-        buildObjectScalarFields(rec);
+        buildObjectScalarFields(rec, *this);
 
         DecomposedPartInfo info;
         info.object_id = rec.id;
@@ -549,7 +674,7 @@ DecomposedPartInfo SlicerBackend::registerTriangleMesh(
 
     computeMeshNormals(rec.vertexBuffer, rec.indexBuffer);
     recenterVertexBuffer(rec);
-    buildObjectScalarFields(rec);
+    buildObjectScalarFields(rec, *this);
 
     info.object_id = rec.id;
     info.origin_x = rec.originX;
@@ -661,7 +786,7 @@ bool SlicerBackend::recomputeObjectFields(
     if (it == impl_->objects.end()) {
         return false;
     }
-    buildObjectScalarFields(it->second, voxelSize, narrowBandVoxels);
+    buildObjectScalarFields(it->second, *this, voxelSize, narrowBandVoxels);
     return true;
 }
 
@@ -1209,6 +1334,140 @@ FieldSlice2D sample_field_slice(
     std::lock_guard<std::mutex> lock(g_backendMutex);
     const std::string name(field_name.data(), field_name.size());
     return globalBackend().sampleFieldSlice(object_id, name, axis, normalized_pos, resolution);
+}
+
+NozzleBasis SlicerBackend::queryNozzleFrame(
+    const std::array<float, 3>& /*positionBed*/,
+    const std::array<float, 3>& travelDirBed) const noexcept
+{
+    return computeNozzleBasis(impl_->nozzleAxisBed, travelDirBed);
+}
+
+std::array<float, 3> SlicerBackend::queryGravityDirection(
+    const std::array<float, 3>& /*positionBed*/) const noexcept
+{
+    return impl_->gravityDirectionBed;
+}
+
+void SlicerBackend::setNozzleAxisBed(const std::array<float, 3>& axisBed) noexcept {
+    const float len = std::sqrt(
+        axisBed[0] * axisBed[0] +
+        axisBed[1] * axisBed[1] +
+        axisBed[2] * axisBed[2]);
+    if (len > 1.0e-7f) {
+        impl_->nozzleAxisBed = {axisBed[0] / len, axisBed[1] / len, axisBed[2] / len};
+    } else {
+        impl_->nozzleAxisBed = {0.0f, 0.0f, 1.0f};
+    }
+}
+
+void SlicerBackend::setGravityDirectionBed(const std::array<float, 3>& gravityBed) noexcept {
+    const float len = std::sqrt(
+        gravityBed[0] * gravityBed[0] +
+        gravityBed[1] * gravityBed[1] +
+        gravityBed[2] * gravityBed[2]);
+    if (len > 1.0e-7f) {
+        impl_->gravityDirectionBed = {
+            gravityBed[0] / len,
+            gravityBed[1] / len,
+            gravityBed[2] / len};
+    } else {
+        impl_->gravityDirectionBed = {0.0f, 0.0f, -1.0f};
+    }
+}
+
+void SlicerBackend::setMachineTools(
+    const std::vector<ToolSpec>& tools,
+    std::uint32_t activeToolIndex)
+{
+    impl_->tools = tools;
+    if (impl_->tools.empty()) {
+        impl_->tools.push_back(makeDefaultTool(0, "T0 - 0.4mm Standard", 0.40f, 215.0f));
+        impl_->activeToolIndex = 0;
+    } else {
+        impl_->activeToolIndex = std::min<std::uint32_t>(
+            activeToolIndex,
+            static_cast<std::uint32_t>(impl_->tools.size() - 1));
+    }
+}
+
+const std::vector<ToolSpec>& SlicerBackend::machineTools() const noexcept {
+    return impl_->tools;
+}
+
+std::uint32_t SlicerBackend::activeToolIndex() const noexcept {
+    return impl_->activeToolIndex;
+}
+
+void SlicerBackend::setSliceLayerHeight(const LayerHeightSpec& spec) noexcept {
+    LayerHeightSpec s = spec;
+    s.min_mm = std::max(s.min_mm, 0.01f);
+    s.max_mm = std::max(s.max_mm, s.min_mm);
+    s.target_mm = std::clamp(s.target_mm, s.min_mm, s.max_mm);
+    impl_->sliceLayerHeight = s;
+}
+
+LayerHeightSpec SlicerBackend::sliceLayerHeight() const noexcept {
+    return impl_->sliceLayerHeight;
+}
+
+NozzleBasis query_nozzle_frame(
+    std::array<float, 3> position_bed,
+    std::array<float, 3> travel_dir_bed)
+{
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().queryNozzleFrame(position_bed, travel_dir_bed);
+}
+
+std::array<float, 3> query_gravity_direction(std::array<float, 3> position_bed) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().queryGravityDirection(position_bed);
+}
+
+void set_nozzle_axis_bed(std::array<float, 3> axis_bed) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setNozzleAxisBed(axis_bed);
+}
+
+void set_gravity_direction_bed(std::array<float, 3> gravity_bed) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setGravityDirectionBed(gravity_bed);
+}
+
+void set_machine_tools(rust::Slice<const ToolSpec> tools, std::uint32_t active_tool_index) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    std::vector<ToolSpec> copied;
+    copied.reserve(tools.size());
+    for (const auto& t : tools) {
+        copied.push_back(t);
+    }
+    globalBackend().setMachineTools(copied, active_tool_index);
+}
+
+rust::Vec<ToolSpec> get_machine_tools() {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const auto& src = globalBackend().machineTools();
+    rust::Vec<ToolSpec> out;
+    out.reserve(src.size());
+    for (const auto& t : src) {
+        out.push_back(t);
+    }
+    return out;
+}
+
+std::uint32_t get_active_tool_index() {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().activeToolIndex();
+}
+
+void set_slice_layer_height(LayerHeightSpec layer_height) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setSliceLayerHeight(layer_height);
+}
+
+LayerHeightSpec get_slice_layer_height() {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().sliceLayerHeight();
 }
 
 } // namespace manifold

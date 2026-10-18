@@ -5,7 +5,7 @@ use bevy::tasks::{block_on, IoTaskPool};
 use bevy_egui::{egui, EguiContexts};
 
 use crate::bridge::ffi;
-use crate::config::{BedShape, SlicerConfig};
+use crate::config::{BedShape, ClearancePointXZ, SlicerConfig, ToolConfig};
 use crate::field_vis::{
     FieldColormap, FieldVisualizationState, IsoIntersectionMode, SliceAxis,
 };
@@ -329,6 +329,7 @@ pub fn ui_workspace_system(
                                         .text("Voxel (mm)"),
                                 );
                                 if ui.small_button("Recompute Fields").clicked() {
+                                    sync_config_to_backend(&config);
                                     if ffi::recompute_object_fields(
                                         sel_id,
                                         config.eikonal.voxel_size_mm,
@@ -540,10 +541,263 @@ pub fn ui_workspace_system(
                     }
                 }
 
-                // --- Print Bed & Extensible Slicer Configuration ---
+                // --- Machine Tools, Clearance Profiles & Multi-Axis Kinematics ---
                 ui.add_space(8.0);
                 ui.separator();
-                ui.collapsing("Print Bed & Slicer Configuration", |ui| {
+                ui.collapsing("Machine Tools & Multi-Axis Kinematics", |ui| {
+                    let mut dirty_backend_sync = false;
+
+                    // 1. Multi-Tool Registry (Nozzle Diameter, Temperature, XZ Clearance Profile)
+                    ui.label(egui::RichText::new("Extrusion Tools").strong());
+                    if config.tools.is_empty() {
+                        config.tools.push(ToolConfig::default());
+                        config.active_tool_index = 0;
+                        dirty_backend_sync = true;
+                    }
+                    if config.active_tool_index >= config.tools.len() {
+                        config.active_tool_index = config.tools.len() - 1;
+                    }
+
+                    ui.horizontal_wrapped(|ui| {
+                        let current_active = config.active_tool_index;
+                        let mut clicked_idx = None;
+                        for (idx, tool) in config.tools.iter().enumerate() {
+                            let selected = current_active == idx;
+                            if ui
+                                .selectable_label(selected, format!("T{} ({:.2}mm)", tool.id, tool.nozzle_diameter_mm))
+                                .clicked()
+                            {
+                                clicked_idx = Some(idx);
+                            }
+                        }
+                        if let Some(idx) = clicked_idx {
+                            config.active_tool_index = idx;
+                            dirty_backend_sync = true;
+                        }
+                        if ui.small_button("+ Add Tool").clicked() {
+                            let next_id = config
+                                .tools
+                                .iter()
+                                .map(|t| t.id)
+                                .max()
+                                .unwrap_or(0)
+                                + 1;
+                            config.tools.push(ToolConfig::standard_tool(
+                                next_id,
+                                format!("T{next_id} - 0.4mm"),
+                                0.40,
+                                215.0,
+                            ));
+                            config.active_tool_index = config.tools.len() - 1;
+                            dirty_backend_sync = true;
+                        }
+                        if config.tools.len() > 1 && ui.small_button("Remove Tool").clicked() {
+                            let rm_idx = config.active_tool_index;
+                            config.tools.remove(rm_idx);
+                            if config.active_tool_index >= config.tools.len() {
+                                config.active_tool_index = config.tools.len() - 1;
+                            }
+                            dirty_backend_sync = true;
+                        }
+                    });
+
+                    let active_idx = config.active_tool_index;
+                    if let Some(tool) = config.tools.get_mut(active_idx) {
+                        ui.horizontal(|ui| {
+                            ui.label("Name:");
+                            if ui.text_edit_singleline(&mut tool.name).changed() {
+                                dirty_backend_sync = true;
+                            }
+                        });
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut tool.nozzle_diameter_mm, 0.15..=2.0)
+                                    .text("Nozzle Diameter (mm)"),
+                            )
+                            .changed()
+                        {
+                            dirty_backend_sync = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut tool.temperature_celsius, 170.0..=350.0)
+                                    .text("Temperature (°C)"),
+                            )
+                            .changed()
+                        {
+                            dirty_backend_sync = true;
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Clearance Profile (XZ in Nozzle Frame)").strong(),
+                        );
+                        ui.small("Radius X (mm) from nozzle center vs. height Z (mm) above tip:");
+
+                        let mut remove_pt_idx: Option<usize> = None;
+                        let profile_len = tool.clearance_profile_xz.len();
+                        for (p_idx, pt) in tool.clearance_profile_xz.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("#{p_idx}"));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut pt.x_radius_mm)
+                                            .speed(0.1)
+                                            .range(0.0..=200.0)
+                                            .prefix("X (r): ")
+                                            .suffix(" mm"),
+                                    )
+                                    .changed()
+                                {
+                                    dirty_backend_sync = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut pt.z_height_mm)
+                                            .speed(0.1)
+                                            .range(0.0..=300.0)
+                                            .prefix("Z: ")
+                                            .suffix(" mm"),
+                                    )
+                                    .changed()
+                                {
+                                    dirty_backend_sync = true;
+                                }
+                                if profile_len > 2 && ui.small_button("✕").clicked() {
+                                    remove_pt_idx = Some(p_idx);
+                                }
+                            });
+                        }
+                        if let Some(rm_idx) = remove_pt_idx {
+                            tool.clearance_profile_xz.remove(rm_idx);
+                            dirty_backend_sync = true;
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.small_button("+ Add XZ Point").clicked() {
+                                let (next_x, next_z) = tool
+                                    .clearance_profile_xz
+                                    .last()
+                                    .map(|p| (p.x_radius_mm + 4.0, p.z_height_mm + 10.0))
+                                    .unwrap_or((1.0, 0.0));
+                                tool.clearance_profile_xz
+                                    .push(ClearancePointXZ::new(next_x, next_z));
+                                dirty_backend_sync = true;
+                            }
+                            if ui.small_button("Sort by Z").clicked() {
+                                tool.clearance_profile_xz.sort_by(|a, b| {
+                                    a.z_height_mm
+                                        .partial_cmp(&b.z_height_mm)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                dirty_backend_sync = true;
+                            }
+                        });
+                    }
+
+                    ui.separator();
+
+                    // 2. Nozzle Local Frame & Bed-Coordinate Gravity Vector
+                    ui.label(
+                        egui::RichText::new("Nozzle Frame & Gravity (Bed Coordinates)").strong(),
+                    );
+                    let queried_frame = config.query_nozzle_frame(Vec3::ZERO, Vec3::X);
+                    let queried_gravity = config.query_gravity_bed(Vec3::ZERO);
+
+                    ui.small(format!(
+                        "Nozzle +Z (opp. nozzle): [{:.2}, {:.2}, {:.2}]",
+                        queried_frame.nozzle_axis.x,
+                        queried_frame.nozzle_axis.y,
+                        queried_frame.nozzle_axis.z
+                    ));
+                    ui.small(format!(
+                        "Travel +X: [{:.2}, {:.2}, {:.2}] | Lateral +Y: [{:.2}, {:.2}, {:.2}]",
+                        queried_frame.travel_axis.x,
+                        queried_frame.travel_axis.y,
+                        queried_frame.travel_axis.z,
+                        queried_frame.lateral_axis.x,
+                        queried_frame.lateral_axis.y,
+                        queried_frame.lateral_axis.z
+                    ));
+                    ui.small(format!(
+                        "Gravity Vector (Bed Coords): [{:.2}, {:.2}, {:.2}]",
+                        queried_gravity.x, queried_gravity.y, queried_gravity.z
+                    ));
+
+                    let mut tilt_changed = false;
+                    tilt_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut config.machine.bed_tilt_rx_deg, -60.0..=60.0)
+                                .text("5-Axis Bed Tilt Rx (°)"),
+                        )
+                        .changed();
+                    tilt_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut config.machine.bed_tilt_ry_deg, -60.0..=60.0)
+                                .text("5-Axis Bed Tilt Ry (°)"),
+                        )
+                        .changed();
+                    if ui.small_button("Reset Level Bed (0°, 0°)").clicked() {
+                        config.machine.bed_tilt_rx_deg = 0.0;
+                        config.machine.bed_tilt_ry_deg = 0.0;
+                        tilt_changed = true;
+                    }
+                    if tilt_changed {
+                        config.machine.update_gravity_from_bed_tilt();
+                        dirty_backend_sync = true;
+                    }
+
+                    ui.checkbox(
+                        &mut config.machine.show_nozzle_clearance_gizmo,
+                        "Show 3D Nozzle Frame, Clearance & Gravity Gizmo",
+                    );
+
+                    if dirty_backend_sync {
+                        sync_config_to_backend(&config);
+                    }
+                });
+
+                // --- Print Bed & Slice Configuration ---
+                ui.add_space(8.0);
+                ui.separator();
+                ui.collapsing("Print Bed & Slice Configuration", |ui| {
+                    ui.label(egui::RichText::new("Variable Slice Layer Height (mm)").strong());
+                    let mut lh_changed = false;
+                    lh_changed |= ui
+                        .add(
+                            egui::Slider::new(
+                                &mut config.slicing.layer_height.target_mm,
+                                0.04..=1.20,
+                            )
+                            .text("Target Layer Height (mm)"),
+                        )
+                        .changed();
+                    lh_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut config.slicing.layer_height.min_mm, 0.02..=0.80)
+                                .text("Min Layer Height (mm)"),
+                        )
+                        .changed();
+                    lh_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut config.slicing.layer_height.max_mm, 0.05..=1.50)
+                                .text("Max Layer Height (mm)"),
+                        )
+                        .changed();
+                    if lh_changed {
+                        config.slicing.layer_height.sanitize();
+                        sync_config_to_backend(&config);
+                    }
+
+                    ui.add(
+                        egui::Slider::new(&mut config.slicing.max_nonplanar_slope_deg, 0.0..=65.0)
+                            .text("Max Slope (°)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut config.eikonal.voxel_size_mm, 0.10..=2.0)
+                            .text("OpenVDB Voxel (mm)"),
+                    );
+
+                    ui.separator();
                     ui.label(egui::RichText::new("Print Bed Geometry").strong());
                     ui.horizontal(|ui| {
                         ui.selectable_value(
@@ -603,21 +857,6 @@ pub fn ui_workspace_system(
                         egui::Slider::new(&mut config.arrangement.bed_edge_margin_mm, 0.0..=25.0)
                             .text("Bed Margin (mm)"),
                     );
-
-                    ui.separator();
-                    ui.label(egui::RichText::new("Non-Planar & Eikonal Slicing (Preview)").strong());
-                    ui.add(
-                        egui::Slider::new(&mut config.slicing.base_layer_height_mm, 0.05..=0.40)
-                            .text("Base Layer (mm)"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut config.slicing.max_nonplanar_slope_deg, 0.0..=65.0)
-                            .text("Max Slope (°)"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut config.eikonal.voxel_size_mm, 0.10..=2.0)
-                            .text("OpenVDB Voxel (mm)"),
-                    );
                 });
 
                 // --- Telemetry & 3MF Import Notices ---
@@ -656,6 +895,40 @@ pub fn ui_workspace_system(
         });
 }
 
+/// Synchronizes the Rust `SlicerConfig` (nozzle axis, bed-coordinate gravity vector,
+/// multi-tool specifications & XZ clearance profiles, and variable layer height)
+/// into the C++ compute backend.
+pub fn sync_config_to_backend(config: &SlicerConfig) {
+    ffi::set_nozzle_axis_bed(config.machine.nozzle_axis_bed);
+    ffi::set_gravity_direction_bed(config.machine.gravity_direction_bed);
+
+    let ffi_tools: Vec<ffi::ToolSpec> = config
+        .tools
+        .iter()
+        .map(|t| ffi::ToolSpec {
+            id: t.id,
+            name: t.name.clone(),
+            nozzle_diameter_mm: t.nozzle_diameter_mm,
+            temperature_celsius: t.temperature_celsius,
+            clearance_profile_xz: t
+                .clearance_profile_xz
+                .iter()
+                .map(|p| ffi::ClearanceXZ {
+                    x_radius_mm: p.x_radius_mm,
+                    z_height_mm: p.z_height_mm,
+                })
+                .collect(),
+        })
+        .collect();
+    ffi::set_machine_tools(&ffi_tools, config.active_tool_index as u32);
+
+    ffi::set_slice_layer_height(ffi::LayerHeightSpec {
+        target_mm: config.slicing.layer_height.target_mm,
+        min_mm: config.slicing.layer_height.min_mm,
+        max_mm: config.slicing.layer_height.max_mm,
+    });
+}
+
 /// Polls background import/export tasks on each frame without blocking the macOS main thread.
 #[allow(clippy::too_many_arguments)]
 pub fn poll_io_tasks_system(
@@ -679,6 +952,7 @@ pub fn poll_io_tasks_system(
 
             if let Some(restored_cfg) = report.restored_config {
                 *config = restored_cfg;
+                sync_config_to_backend(&config);
             }
 
             plate.import_notices = report.notices;

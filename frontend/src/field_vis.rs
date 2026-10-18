@@ -124,6 +124,7 @@ pub struct FieldVisualizationState {
     pub fade_exterior_background: bool,
     pub slice_entity: Option<Entity>,
     pub slice_mesh_handle: Option<Handle<Mesh>>,
+    pub slice_mat_handle: Option<Handle<StandardMaterial>>,
     pub slice_image_handle: Option<Handle<Image>>,
     pub slice_plane_coord: f32,
     pub dirty_slice: bool,
@@ -159,6 +160,7 @@ impl Default for FieldVisualizationState {
             fade_exterior_background: true,
             slice_entity: None,
             slice_mesh_handle: None,
+            slice_mat_handle: None,
             slice_image_handle: None,
             slice_plane_coord: 0.0,
             dirty_slice: true,
@@ -494,34 +496,43 @@ pub fn sync_field_visualization_system(
             .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, quad_uvs)
             .with_inserted_indices(Indices::U32(quad_indices));
 
-            if let (Some(ent), Some(ref mesh_h), Some(ref img_h)) = (
+            let new_img_h = images.add(texture);
+
+            if let (Some(ent), Some(mesh_h), Some(mat_h)) = (
                 vis_state.slice_entity,
-                &vis_state.slice_mesh_handle,
-                &vis_state.slice_image_handle,
+                vis_state.slice_mesh_handle.clone(),
+                vis_state.slice_mat_handle.clone(),
             ) {
-                meshes.insert(mesh_h, quad_mesh);
-                images.insert(img_h, texture);
+                meshes.insert(&mesh_h, quad_mesh);
+                if let Some(old_img_h) = vis_state.slice_image_handle.replace(new_img_h.clone()) {
+                    images.remove(&old_img_h);
+                }
+                // Mutate StandardMaterial so Bevy's MaterialPlugin rebuilds the GPU bind group
+                // with the newly uploaded texture on this frame.
+                if let Some(mat) = materials.get_mut(&mat_h) {
+                    mat.base_color_texture = Some(new_img_h);
+                }
                 if let Ok((mut tf, mut vis)) = slice_query.get_mut(ent) {
                     *tf = obj_world_tf;
                     *vis = Visibility::Inherited;
                 }
             } else {
                 let mesh_h = meshes.add(quad_mesh);
-                let img_h = images.add(texture);
+                let mat_h = materials.add(StandardMaterial {
+                    base_color: Color::WHITE,
+                    base_color_texture: Some(new_img_h.clone()),
+                    unlit: true,
+                    alpha_mode: AlphaMode::Mask(0.5),
+                    depth_bias: 16.0,
+                    double_sided: true,
+                    cull_mode: None,
+                    ..default()
+                });
                 let ent = commands
                     .spawn((
                         PbrBundle {
                             mesh: mesh_h.clone(),
-                            material: materials.add(StandardMaterial {
-                                base_color: Color::WHITE,
-                                base_color_texture: Some(img_h.clone()),
-                                unlit: true,
-                                alpha_mode: AlphaMode::Mask(0.5),
-                                depth_bias: 16.0,
-                                double_sided: true,
-                                cull_mode: None,
-                                ..default()
-                            }),
+                            material: mat_h.clone(),
                             transform: obj_world_tf,
                             ..default()
                         },
@@ -530,7 +541,8 @@ pub fn sync_field_visualization_system(
                     .id();
                 vis_state.slice_entity = Some(ent);
                 vis_state.slice_mesh_handle = Some(mesh_h);
-                vis_state.slice_image_handle = Some(img_h);
+                vis_state.slice_mat_handle = Some(mat_h);
+                vis_state.slice_image_handle = Some(new_img_h);
             }
         }
     }
@@ -615,6 +627,14 @@ fn rasterize_slice_to_rgba(
     let bg_tol = span * 0.025;
     let is_non_sdf = field_name != "sdf";
 
+    let max_sdf = slice
+        .sdf_values
+        .iter()
+        .copied()
+        .fold(1.0f32, f32::max)
+        .max(1.0);
+    let exterior_halo_limit = 0.45 * max_sdf;
+
     for (idx, &val) in slice.values.iter().enumerate() {
         if !val.is_finite() {
             out.extend_from_slice(&[0, 0, 0, 0]);
@@ -622,7 +642,7 @@ fn rasterize_slice_to_rgba(
         }
 
         let sdf_v = slice.sdf_values.get(idx).copied().unwrap_or(val);
-        let is_bg = (val - bg).abs() <= bg_tol && sdf_v > 0.0;
+        let is_bg = ((val - bg).abs() <= bg_tol && sdf_v > 0.0) || (sdf_v > exterior_halo_limit);
         if fade_background && is_bg {
             // Alpha = 0 so AlphaMode::Mask(0.5) discards exterior background cleanly
             out.extend_from_slice(&[0, 0, 0, 0]);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -14,10 +15,15 @@ struct DecomposedPartInfo;
 struct FieldStats;
 struct IsoSurfaceMesh;
 struct FieldSlice2D;
+struct NozzleBasis;
+struct ClearanceXZ;
+struct ToolSpec;
+struct LayerHeightSpec;
 
 /// Core C++20 compute engine handling CAD B-Rep ingestion (OCCT), assembly
 /// decomposition, surface tessellation, STL/3MF triangle mesh registration,
-/// OpenVDB Signed Distance Fields (SDF), and generic scalar field visualization.
+/// OpenVDB Signed Distance Fields (SDF), generic scalar field visualization,
+/// and 5/6-axis nozzle & gravity kinematics.
 class SlicerBackend {
 public:
     SlicerBackend();
@@ -67,7 +73,7 @@ public:
     /// Queries statistics (active voxel count, min/max value, voxel size) for a named field.
     FieldStats getObjectFieldStats(std::uint64_t objectId, const std::string& fieldName) const;
 
-    /// Rebuilds the OpenVDB SDF (`meshToLevelSet`) and derived scalar fields (`eikonal`, `overhang`)
+    /// Rebuilds the OpenVDB SDF and derived scalar fields (`eikonal`, `overhang`)
     /// for `objectId` at the requested `voxelSize` and `narrowBandVoxels`.
     bool recomputeObjectFields(std::uint64_t objectId, float voxelSize, float narrowBandVoxels);
 
@@ -87,6 +93,37 @@ public:
         std::uint8_t axis,
         float normalizedPos,
         std::uint32_t resolution) const;
+
+    /// Queries the nozzle's local orthonormal right-handed basis at `positionBed`
+    /// for a toolhead moving in direction `travelDirBed` (in bed coordinates).
+    NozzleBasis queryNozzleFrame(
+        const std::array<float, 3>& positionBed,
+        const std::array<float, 3>& travelDirBed) const noexcept;
+
+    /// Queries the unit gravity direction vector in bed coordinates at `positionBed`.
+    std::array<float, 3> queryGravityDirection(
+        const std::array<float, 3>& positionBed) const noexcept;
+
+    /// Updates the nozzle axis orientation (pointing opposite to nozzle discharge) in bed coordinates.
+    void setNozzleAxisBed(const std::array<float, 3>& axisBed) noexcept;
+
+    /// Updates the gravity direction vector in bed coordinates.
+    void setGravityDirectionBed(const std::array<float, 3>& gravityBed) noexcept;
+
+    /// Replaces the machine's tool list and sets the active tool index.
+    void setMachineTools(const std::vector<ToolSpec>& tools, std::uint32_t activeToolIndex);
+
+    /// Returns the configured list of machine tools.
+    const std::vector<ToolSpec>& machineTools() const noexcept;
+
+    /// Returns the active tool index.
+    std::uint32_t activeToolIndex() const noexcept;
+
+    /// Sets the variable layer height (`target_mm`, `min_mm`, `max_mm`) for slicing.
+    void setSliceLayerHeight(const LayerHeightSpec& spec) noexcept;
+
+    /// Returns the current variable layer height specification.
+    LayerHeightSpec sliceLayerHeight() const noexcept;
 
     /// Returns a reference to the most recently loaded object's vertices.
     const std::vector<RenderVertex>& vertices() const noexcept;
@@ -131,5 +168,17 @@ FieldSlice2D sample_field_slice(
     std::uint8_t axis,
     float normalized_pos,
     std::uint32_t resolution);
+
+NozzleBasis query_nozzle_frame(
+    std::array<float, 3> position_bed,
+    std::array<float, 3> travel_dir_bed);
+std::array<float, 3> query_gravity_direction(std::array<float, 3> position_bed);
+void set_nozzle_axis_bed(std::array<float, 3> axis_bed);
+void set_gravity_direction_bed(std::array<float, 3> gravity_bed);
+void set_machine_tools(rust::Slice<const ToolSpec> tools, std::uint32_t active_tool_index);
+rust::Vec<ToolSpec> get_machine_tools();
+std::uint32_t get_active_tool_index();
+void set_slice_layer_height(LayerHeightSpec layer_height);
+LayerHeightSpec get_slice_layer_height();
 
 } // namespace manifold

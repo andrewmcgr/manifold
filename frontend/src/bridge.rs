@@ -72,6 +72,44 @@ pub mod ffi {
         pub sdf_values: Vec<f32>,
     }
 
+    /// Orthonormal right-handed basis of the nozzle's local coordinate frame in bed coordinates:
+    /// - `nozzle_axis`: unit vector pointing opposite to the nozzle discharge axis (local +Z).
+    /// - `travel_axis`: unit vector pointing in the direction of travel (local +X).
+    /// - `lateral_axis`: unit vector from the right-hand rule (`nozzle_axis × travel_axis`, local +Y).
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct NozzleBasis {
+        pub nozzle_axis: [f32; 3],
+        pub travel_axis: [f32; 3],
+        pub lateral_axis: [f32; 3],
+    }
+
+    /// A single `(X, Z)` pair in a tool's revolved clearance profile in the nozzle's local frame:
+    /// `x_radius_mm` is the radial distance from the nozzle center and `z_height_mm` is the Z
+    /// distance above the nozzle tip along `nozzle_axis`.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct ClearanceXZ {
+        pub x_radius_mm: f32,
+        pub z_height_mm: f32,
+    }
+
+    /// Machine extrusion tool definition shared across the C++/Rust boundary.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct ToolSpec {
+        pub id: u32,
+        pub name: String,
+        pub nozzle_diameter_mm: f32,
+        pub temperature_celsius: f32,
+        pub clearance_profile_xz: Vec<ClearanceXZ>,
+    }
+
+    /// Variable layer height specification (`target_mm`, `min_mm`, `max_mm`) for non-planar slicing.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct LayerHeightSpec {
+        pub target_mm: f32,
+        pub min_mm: f32,
+        pub max_mm: f32,
+    }
+
     unsafe extern "C++" {
         include!("slicer_backend.h");
 
@@ -140,6 +178,37 @@ pub mod ffi {
             normalized_pos: f32,
             resolution: u32,
         ) -> FieldSlice2D;
+
+        /// Queries the right-handed orthonormal local frame of the nozzle at `position_bed`
+        /// moving along `travel_dir_bed` in bed coordinates.
+        pub fn query_nozzle_frame(
+            position_bed: [f32; 3],
+            travel_dir_bed: [f32; 3],
+        ) -> NozzleBasis;
+
+        /// Queries the unit gravity direction vector in bed coordinates at `position_bed`.
+        pub fn query_gravity_direction(position_bed: [f32; 3]) -> [f32; 3];
+
+        /// Sets the active nozzle axis orientation (pointing opposite to nozzle discharge) in bed coordinates.
+        pub fn set_nozzle_axis_bed(axis_bed: [f32; 3]);
+
+        /// Sets the active gravity direction vector in bed coordinates (e.g. when a 5-axis machine tilts the bed).
+        pub fn set_gravity_direction_bed(gravity_bed: [f32; 3]);
+
+        /// Synchronizes the machine's tool list and active tool index into the C++ backend.
+        pub fn set_machine_tools(tools: &[ToolSpec], active_tool_index: u32);
+
+        /// Retrieves the machine's configured tool list from the C++ backend.
+        pub fn get_machine_tools() -> Vec<ToolSpec>;
+
+        /// Retrieves the currently active tool index in the C++ backend.
+        pub fn get_active_tool_index() -> u32;
+
+        /// Sets the variable slice layer height (`target_mm`, `min_mm`, `max_mm`) in the C++ backend.
+        pub fn set_slice_layer_height(layer_height: LayerHeightSpec);
+
+        /// Retrieves the current variable slice layer height (`target_mm`, `min_mm`, `max_mm`) from the C++ backend.
+        pub fn get_slice_layer_height() -> LayerHeightSpec;
     }
 }
 
@@ -166,7 +235,7 @@ impl ffi::RenderVertex {
 
 #[cfg(test)]
 mod tests {
-    use super::ffi::RenderVertex;
+    use super::ffi::{self, ClearanceXZ, LayerHeightSpec, RenderVertex, ToolSpec};
 
     #[test]
     fn verify_render_vertex_abi_layout() {
@@ -189,5 +258,71 @@ mod tests {
         }];
         let bytes: &[u8] = bytemuck::cast_slice(&sample);
         assert_eq!(bytes.len(), 24);
+    }
+
+    #[test]
+    fn verify_kinematics_tools_and_layer_height_ffi() {
+        ffi::set_nozzle_axis_bed([0.0, 0.0, 1.0]);
+        let basis = ffi::query_nozzle_frame([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        assert_eq!(basis.nozzle_axis, [0.0, 0.0, 1.0]);
+        assert_eq!(basis.travel_axis, [1.0, 0.0, 0.0]);
+        assert_eq!(basis.lateral_axis, [0.0, 1.0, 0.0]);
+
+        ffi::set_gravity_direction_bed([0.0, -0.5, -0.8660254]);
+        let g = ffi::query_gravity_direction([0.0, 0.0, 0.0]);
+        assert!((g[1] + 0.5).abs() < 1e-5 && (g[2] + 0.8660254).abs() < 1e-5);
+        ffi::set_gravity_direction_bed([0.0, 0.0, -1.0]);
+
+        let tools = [
+            ToolSpec {
+                id: 0,
+                name: "T0 - 0.4mm".to_string(),
+                nozzle_diameter_mm: 0.40,
+                temperature_celsius: 215.0,
+                clearance_profile_xz: vec![
+                    ClearanceXZ {
+                        x_radius_mm: 0.5,
+                        z_height_mm: 0.0,
+                    },
+                    ClearanceXZ {
+                        x_radius_mm: 12.0,
+                        z_height_mm: 15.0,
+                    },
+                ],
+            },
+            ToolSpec {
+                id: 1,
+                name: "T1 - 0.8mm".to_string(),
+                nozzle_diameter_mm: 0.80,
+                temperature_celsius: 245.0,
+                clearance_profile_xz: vec![
+                    ClearanceXZ {
+                        x_radius_mm: 1.0,
+                        z_height_mm: 0.0,
+                    },
+                    ClearanceXZ {
+                        x_radius_mm: 16.0,
+                        z_height_mm: 20.0,
+                    },
+                ],
+            },
+        ];
+        ffi::set_machine_tools(&tools, 1);
+        assert_eq!(ffi::get_active_tool_index(), 1);
+        let read_tools = ffi::get_machine_tools();
+        assert_eq!(read_tools.len(), 2);
+        assert_eq!(read_tools[1].nozzle_diameter_mm, 0.80);
+        assert_eq!(read_tools[1].temperature_celsius, 245.0);
+        assert_eq!(read_tools[1].clearance_profile_xz.len(), 2);
+
+        ffi::set_slice_layer_height(LayerHeightSpec {
+            target_mm: 0.22,
+            min_mm: 0.08,
+            max_mm: 0.36,
+        });
+        let lh = ffi::get_slice_layer_height();
+        assert!((lh.target_mm - 0.22).abs() < 1e-6);
+        assert!((lh.min_mm - 0.08).abs() < 1e-6);
+        assert!((lh.max_mm - 0.36).abs() < 1e-6);
     }
 }

@@ -746,6 +746,96 @@ pub fn draw_viewport_gizmos_system(
     gizmos.line(Vec3::ZERO, Vec3::new(0.0, 25.0, 0.0), Color::srgb(0.25, 0.90, 0.35));
     gizmos.line(Vec3::ZERO, Vec3::new(0.0, 0.0, 25.0), Color::srgb(0.30, 0.55, 0.98));
 
+    // Optional 3D visualization of the queried Nozzle Local Frame, active tool XZ clearance
+    // profile, and Gravity direction vector in bed coordinates
+    if config.machine.show_nozzle_clearance_gizmo {
+        let tip_bed = if let Some(sel_id) = plate.selected_object_id {
+            if let Some(obj) = plate.objects.iter().find(|o| o.object_id == sel_id) {
+                if let Ok(obj_tf) = object_transforms.get(obj.entity) {
+                    let (min_p, max_p) = obj.compute_world_aabb(obj_tf);
+                    Vec3::new(0.5 * (min_p.x + max_p.x), 0.5 * (min_p.y + max_p.y), max_p.z + 2.0)
+                } else {
+                    Vec3::new(0.0, 0.0, 35.0)
+                }
+            } else {
+                Vec3::new(0.0, 0.0, 35.0)
+            }
+        } else {
+            Vec3::new(0.0, 0.0, 35.0)
+        };
+
+        let frame = config.query_nozzle_frame(tip_bed, Vec3::X);
+        let gravity = config.query_gravity_bed(tip_bed);
+
+        // Draw Nozzle Local Orthonormal Basis (X_travel = Red, Y_lateral = Green, Z_nozzle = Cyan)
+        gizmos.arrow(
+            tip_bed,
+            tip_bed + frame.travel_axis * 24.0,
+            Color::srgb(1.0, 0.30, 0.25),
+        );
+        gizmos.arrow(
+            tip_bed,
+            tip_bed + frame.lateral_axis * 24.0,
+            Color::srgb(0.25, 0.95, 0.40),
+        );
+        gizmos.arrow(
+            tip_bed,
+            tip_bed + frame.nozzle_axis * 32.0,
+            Color::srgb(0.20, 0.85, 1.0),
+        );
+
+        // Draw Gravity Vector in Bed Coordinates (Magenta arrow)
+        gizmos.arrow(
+            tip_bed,
+            tip_bed + gravity * 28.0,
+            Color::srgb(0.98, 0.32, 0.88),
+        );
+
+        // Draw the active tool's revolved XZ clearance profile in the nozzle's local frame
+        if let Some(tool) = config.active_tool() {
+            let profile_color = Color::srgba(1.0, 0.72, 0.18, 0.85);
+            let ring_segments = 24usize;
+            for pt in &tool.clearance_profile_xz {
+                let mut ring = Vec::with_capacity(ring_segments + 1);
+                for k in 0..=ring_segments {
+                    let theta = (k as f32 / ring_segments as f32) * std::f32::consts::TAU;
+                    let local_p = Vec3::new(
+                        pt.x_radius_mm * theta.cos(),
+                        pt.x_radius_mm * theta.sin(),
+                        pt.z_height_mm,
+                    );
+                    ring.push(frame.nozzle_local_to_bed(tip_bed, local_p));
+                }
+                gizmos.linestrip(ring, profile_color);
+            }
+            // Draw 4 meridional generator lines (+/- X_travel and +/- Y_lateral) in the nozzle frame
+            for dir_2d in [
+                Vec2::new(1.0, 0.0),
+                Vec2::new(-1.0, 0.0),
+                Vec2::new(0.0, 1.0),
+                Vec2::new(0.0, -1.0),
+            ] {
+                let meridian: Vec<Vec3> = tool
+                    .clearance_profile_xz
+                    .iter()
+                    .map(|pt| {
+                        frame.nozzle_local_to_bed(
+                            tip_bed,
+                            Vec3::new(
+                                dir_2d.x * pt.x_radius_mm,
+                                dir_2d.y * pt.x_radius_mm,
+                                pt.z_height_mm,
+                            ),
+                        )
+                    })
+                    .collect();
+                if meridian.len() >= 2 {
+                    gizmos.linestrip(meridian, profile_color);
+                }
+            }
+        }
+    }
+
     // Selected object gizmos & <=27-face simplified convex hull overlay
     let Some(sel_id) = plate.selected_object_id else {
         return;
