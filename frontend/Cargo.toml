@@ -1,0 +1,20 @@
+[package]
+name = "manifold-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[dependencies]
+cxx.workspace = true
+bytemuck.workspace = true
+wgpu.workspace = true
+bevy.workspace = true
+bevy_egui.workspace = true
+egui.workspace = true
+rfd.workspace = true
+
+[build-dependencies]
+cxx-build.workspace = true
+cmake.workspace = true

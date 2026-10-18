@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "frontend",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Manifold Slicer Contributors"]
+
+[workspace.dependencies]
+cxx = "1.0"
+cxx-build = "1.0"
+cmake = "0.1"
+bytemuck = { version = "1.18", features = ["derive", "extern_crate_alloc"] }
+wgpu = "22.1"
+bevy = "0.14"
+bevy_egui = "0.29"
+egui = "0.28"
+rfd = "0.15"
