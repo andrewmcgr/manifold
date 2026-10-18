@@ -50,6 +50,7 @@ add_library(slicer_backend STATIC
 target_include_directories(slicer_backend
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../target/cxxbridge>
         $<INSTALL_INTERFACE:include>
         ${OpenCASCADE_INCLUDE_DIR}
 )
