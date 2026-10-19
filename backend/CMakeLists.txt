@@ -46,6 +46,7 @@ set(OCCT_LIBS
 add_library(slicer_backend STATIC
     src/slicer_backend.cpp
     src/eikonal_solver.cpp
+    src/path_generator.cpp
 )
 
 target_include_directories(slicer_backend

@@ -6,11 +6,12 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::bridge::ffi;
 use crate::config::{
-    BedShape, ClearancePointXZ, PointNormalHint, SlicerConfig, SurfaceHintMode, ToolConfig,
+    BedShape, ClearancePointXZ, PointNormalHint, SlicerConfig, SolidInfillPattern, SurfaceHintMode,
+    ToolConfig,
 };
 use crate::field_vis::{
     FieldColormap, FieldVisualizationState, IsoIntersectionMode, SelectedLayersColorMode,
-    SliceAxis,
+    SliceAxis, ToolpathColorMode,
 };
 use crate::hull::rotation_to_place_face_on_bed;
 use crate::io::threemf::{save_project_to_3mf, ExportableObject};
@@ -1181,6 +1182,7 @@ pub fn ui_workspace_system(
                                         .changed();
                                     if range_changed {
                                         vis_state.dirty_selected_layers_mesh = true;
+                                        vis_state.dirty_toolpaths_mesh = true;
                                         vis_state.dirty_slice = true;
                                     }
 
@@ -1262,6 +1264,308 @@ pub fn ui_workspace_system(
                                 ui.small(
                                     "Click 'Select Isosurfaces' to compute the Eikonal field and select non-planar layers.",
                                 );
+                            }
+                        });
+
+                        // --- Non-Planar Shell & Toolpath Generation ---
+                        ui.add_space(8.0);
+                        ui.separator();
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new("Shell & Toolpath Generation").strong(),
+                        )
+                        .id_source("shell_and_toolpath_generation_section")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            let is_computing = vis_state.pending_field_task.is_some();
+                            let has_eikonal = vis_state
+                                .available_fields
+                                .iter()
+                                .any(|f| f == "eikonal");
+                            let active_nozzle_mm = config
+                                .active_tool()
+                                .map(|t| t.nozzle_diameter_mm)
+                                .unwrap_or(0.40);
+
+                            let mut tp_cfg_changed = false;
+                            tp_cfg_changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut config.slicing.shell_thickness_mm,
+                                        0.20..=8.00,
+                                    )
+                                    .text("Shell Thickness (-φ_sdf <= T_shell mm)"),
+                                )
+                                .changed();
+
+                            ui.horizontal(|ui| {
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut config.slicing.inner_wall_count)
+                                            .speed(0.1)
+                                            .range(0..=12)
+                                            .prefix("Inner Walls: "),
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.min_extrusion_length_mm,
+                                        )
+                                        .speed(0.02)
+                                        .range(0.0..=10.0)
+                                        .prefix("Min Len: ")
+                                        .suffix(" mm"),
+                                    )
+                                    .changed();
+                                if ui.small_button("2× Nozzle").clicked() {
+                                    config.slicing.min_extrusion_length_mm =
+                                        2.0 * active_nozzle_mm;
+                                    tp_cfg_changed = true;
+                                }
+                            });
+
+                            egui::ComboBox::from_label("Solid Infill Pattern")
+                                .selected_text(config.slicing.solid_infill_pattern.label())
+                                .show_ui(ui, |ui| {
+                                    for pat in [
+                                        SolidInfillPattern::Monotonic,
+                                        SolidInfillPattern::Concentric,
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut config.slicing.solid_infill_pattern,
+                                                pat,
+                                                pat.label(),
+                                            )
+                                            .changed()
+                                        {
+                                            tp_cfg_changed = true;
+                                        }
+                                    }
+                                });
+
+                            // Line Widths: Outer Wall, Inner Wall, Solid Infill (Target, Min, Max)
+                            ui.small(egui::RichText::new("Line Widths (Target / Min / Max mm):").strong());
+                            ui.horizontal(|ui| {
+                                ui.label("Outer Wall:");
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.outer_wall_width.target_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.10..=2.50)
+                                        .prefix("T: "),
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.outer_wall_width.min_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.08..=2.00)
+                                        .prefix("Min: "),
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.outer_wall_width.max_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.12..=3.00)
+                                        .prefix("Max: "),
+                                    )
+                                    .changed();
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Inner Wall:");
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.inner_wall_width.target_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.10..=2.50)
+                                        .prefix("T: "),
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.inner_wall_width.min_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.08..=2.00)
+                                        .prefix("Min: "),
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.inner_wall_width.max_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.12..=3.00)
+                                        .prefix("Max: "),
+                                    )
+                                    .changed();
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Solid Infill:");
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.solid_infill_width.target_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.10..=2.50)
+                                        .prefix("T: "),
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.solid_infill_width.min_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.08..=2.00)
+                                        .prefix("Min: "),
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.solid_infill_width.max_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.12..=3.00)
+                                        .prefix("Max: "),
+                                    )
+                                    .changed();
+                            });
+
+                            if tp_cfg_changed {
+                                config.slicing.sanitize();
+                                sync_config_to_backend(&config);
+                                vis_state.dirty_toolpaths = true;
+                            }
+
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .checkbox(
+                                        &mut vis_state.show_toolpaths,
+                                        "Show 3D Shell Toolpaths",
+                                    )
+                                    .changed()
+                                {
+                                    vis_state.dirty_toolpaths_mesh = true;
+                                    if vis_state.show_toolpaths && vis_state.solid_opacity > 0.35 {
+                                        vis_state.solid_opacity = 0.18;
+                                    }
+                                    if vis_state.show_toolpaths && !has_eikonal && !is_computing {
+                                        spawn_field_compute_task(
+                                            &mut vis_state,
+                                            &mut plate,
+                                            &config,
+                                            sel_id,
+                                            &obj_name,
+                                            obj_rotation,
+                                        );
+                                    }
+                                }
+
+                                if ui
+                                    .add_enabled(
+                                        !is_computing,
+                                        egui::Button::new("Generate Shell Toolpaths").small(),
+                                    )
+                                    .clicked()
+                                {
+                                    vis_state.show_toolpaths = true;
+                                    if vis_state.solid_opacity > 0.35 {
+                                        vis_state.solid_opacity = 0.18;
+                                    }
+                                    if has_eikonal {
+                                        vis_state.recompute_toolpaths(sel_id, &config);
+                                    } else {
+                                        spawn_field_compute_task(
+                                            &mut vis_state,
+                                            &mut plate,
+                                            &config,
+                                            sel_id,
+                                            &obj_name,
+                                            obj_rotation,
+                                        );
+                                    }
+                                }
+                            });
+
+                            if vis_state.show_toolpaths {
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .checkbox(
+                                            &mut vis_state.show_outer_walls,
+                                            "Outer Walls",
+                                        )
+                                        .changed()
+                                    {
+                                        vis_state.dirty_toolpaths_mesh = true;
+                                    }
+                                    if ui
+                                        .checkbox(
+                                            &mut vis_state.show_inner_walls,
+                                            "Inner Walls",
+                                        )
+                                        .changed()
+                                    {
+                                        vis_state.dirty_toolpaths_mesh = true;
+                                    }
+                                    if ui
+                                        .checkbox(
+                                            &mut vis_state.show_solid_infill,
+                                            "Solid Infill & Gap Fill",
+                                        )
+                                        .changed()
+                                    {
+                                        vis_state.dirty_toolpaths_mesh = true;
+                                    }
+                                    ui.checkbox(
+                                        &mut vis_state.show_toolpath_centerlines,
+                                        "Centerlines",
+                                    );
+                                });
+
+                                egui::ComboBox::from_id_source("toolpath_color_mode_combo")
+                                    .selected_text(vis_state.toolpath_color_mode.label())
+                                    .show_ui(ui, |ui| {
+                                        for mode in [
+                                            ToolpathColorMode::ByFeatureType,
+                                            ToolpathColorMode::ByLineWidth,
+                                        ] {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut vis_state.toolpath_color_mode,
+                                                    mode,
+                                                    mode.label(),
+                                                )
+                                                .changed()
+                                            {
+                                                vis_state.dirty_toolpaths_mesh = true;
+                                            }
+                                        }
+                                    });
+                            }
+
+                            if let Some(ref tp_res) = vis_state.cached_toolpaths {
+                                ui.small(format!(
+                                    "Paths: {} total ({} outer walls, {} inner walls, {} solid infill/gap fill)",
+                                    tp_res.total_path_count,
+                                    tp_res.outer_wall_count,
+                                    tp_res.inner_wall_count,
+                                    tp_res.solid_infill_count
+                                ));
                             }
                         });
                     }
@@ -1697,6 +2001,28 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         max_mm: config.slicing.layer_height.max_mm,
         first_layer_mm: config.slicing.layer_height.first_layer_mm,
         top_layer_mm: config.slicing.layer_height.top_layer_mm,
+    });
+
+    ffi::set_shell_path_spec(ffi::ShellPathSpec {
+        shell_thickness_mm: config.slicing.shell_thickness_mm,
+        inner_wall_count: config.slicing.inner_wall_count,
+        outer_wall_width: ffi::LineWidthSpec {
+            target_mm: config.slicing.outer_wall_width.target_mm,
+            min_mm: config.slicing.outer_wall_width.min_mm,
+            max_mm: config.slicing.outer_wall_width.max_mm,
+        },
+        inner_wall_width: ffi::LineWidthSpec {
+            target_mm: config.slicing.inner_wall_width.target_mm,
+            min_mm: config.slicing.inner_wall_width.min_mm,
+            max_mm: config.slicing.inner_wall_width.max_mm,
+        },
+        solid_infill_width: ffi::LineWidthSpec {
+            target_mm: config.slicing.solid_infill_width.target_mm,
+            min_mm: config.slicing.solid_infill_width.min_mm,
+            max_mm: config.slicing.solid_infill_width.max_mm,
+        },
+        solid_infill_pattern: config.slicing.solid_infill_pattern.as_u8(),
+        min_extrusion_length_mm: config.slicing.min_extrusion_length_mm,
     });
 
     ffi::set_eikonal_solver_iterations(config.eikonal.solver_iterations);

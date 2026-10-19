@@ -1,5 +1,6 @@
 #include "slicer_backend.h"
 #include "eikonal_solver.h"
+#include "path_generator.h"
 #include "manifold-frontend/src/bridge.rs.h"
 
 #include <algorithm>
@@ -576,6 +577,15 @@ struct SlicerBackend::Impl {
     LayerHeightSpec sliceLayerHeight{0.20f, 0.08f, 0.32f, 0.20f, 0.20f};
     std::uint32_t eikonalSolverIterations = 4;
     std::vector<SpatialOrientationHint> spatialOrientationHints;
+    ShellPathSpec shellPathSpec{
+        1.60f,
+        2,
+        LineWidthSpec{0.40f, 0.28f, 0.56f},
+        LineWidthSpec{0.42f, 0.28f, 0.58f},
+        LineWidthSpec{0.42f, 0.26f, 0.60f},
+        0,
+        0.80f,
+    };
 };
 
 SlicerBackend::SlicerBackend() : impl_(std::make_unique<Impl>()) {
@@ -2848,6 +2858,63 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     return result;
 }
 
+void SlicerBackend::setShellPathSpec(const ShellPathSpec& spec) noexcept {
+    ShellPathSpec s = spec;
+    s.shell_thickness_mm = std::max(0.05f, s.shell_thickness_mm);
+    auto sanitizeW = [](LineWidthSpec& w) {
+        w.min_mm = std::max(0.05f, w.min_mm);
+        if (w.max_mm < w.min_mm) {
+            w.max_mm = w.min_mm;
+        }
+        w.target_mm = std::clamp(w.target_mm, w.min_mm, w.max_mm);
+    };
+    sanitizeW(s.outer_wall_width);
+    sanitizeW(s.inner_wall_width);
+    sanitizeW(s.solid_infill_width);
+    s.min_extrusion_length_mm = std::max(0.0f, s.min_extrusion_length_mm);
+    impl_->shellPathSpec = s;
+}
+
+ShellPathSpec SlicerBackend::shellPathSpec() const noexcept {
+    return impl_->shellPathSpec;
+}
+
+ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
+    std::uint64_t objectId,
+    float adaptivity) const
+{
+    ObjectToolpathsResult empty{};
+    empty.valid = false;
+
+    const auto objIt = impl_->objects.find(objectId);
+    if (objIt == impl_->objects.end()) {
+        return empty;
+    }
+    const ObjectRecord& rec = objIt->second;
+
+    const auto eikIt = rec.scalarFields.find("eikonal");
+    const auto sdfIt = rec.scalarFields.find("sdf");
+    if (eikIt == rec.scalarFields.end() || !eikIt->second ||
+        sdfIt == rec.scalarFields.end() || !sdfIt->second) {
+        return empty;
+    }
+
+    const SelectedIsosurfacesResult selectedLayers =
+        selectSlicingIsosurfaces(objectId, adaptivity);
+    if (!selectedLayers.valid || selectedLayers.layers.empty()) {
+        return empty;
+    }
+
+    return generateShellToolpathsForLayers(
+        selectedLayers,
+        *sdfIt->second,
+        *eikIt->second,
+        rec.toolAxisGrid.get(),
+        impl_->nozzleAxisBed,
+        impl_->sliceLayerHeight,
+        impl_->shellPathSpec);
+}
+
 NozzleBasis query_nozzle_frame(
     std::array<float, 3> position_bed,
     std::array<float, 3> travel_dir_bed)
@@ -2930,6 +2997,21 @@ void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hin
 SelectedIsosurfacesResult select_slicing_isosurfaces(std::uint64_t object_id, float adaptivity) {
     std::lock_guard<std::mutex> lock(g_backendMutex);
     return globalBackend().selectSlicingIsosurfaces(object_id, adaptivity);
+}
+
+void set_shell_path_spec(ShellPathSpec spec) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setShellPathSpec(spec);
+}
+
+ShellPathSpec get_shell_path_spec() {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().shellPathSpec();
+}
+
+ObjectToolpathsResult generate_object_shell_toolpaths(std::uint64_t object_id, float adaptivity) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().generateObjectShellToolpaths(object_id, adaptivity);
 }
 
 } // namespace manifold

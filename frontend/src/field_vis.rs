@@ -3,8 +3,11 @@ use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
-use crate::bridge::ffi::{self, FieldSlice2D, FieldStats, LayerHeightSpec, SelectedIsosurfacesResult};
-use crate::config::SlicerConfig;
+use crate::bridge::ffi::{
+    self, ExtrusionPath, FieldSlice2D, FieldStats, LayerHeightSpec, LineWidthSpec,
+    ObjectToolpathsResult, SelectedIsosurfacesResult, ShellPathSpec,
+};
+use crate::config::{NozzleFrame, SlicerConfig};
 use crate::scene::{BuildPlateState, CadObjectEntity};
 
 /// Cross-section cutting plane orientation in the object's coordinate frame.
@@ -103,6 +106,30 @@ impl SelectedLayersColorMode {
     }
 }
 
+/// Color mode for 3D visualization of generated non-planar shell toolpaths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolpathColorMode {
+    /// Colors paths by feature type:
+    /// - Outer Wall: Coral/Orange
+    /// - Inner Wall: Emerald/Lime Green
+    /// - Solid Infill: Sky Blue/Cyan
+    /// - Gap Fill: Vivid Magenta/Gold
+    #[default]
+    ByFeatureType,
+    /// Colors each vertex by its local line width relative to `[min_mm, target_mm, max_mm]`
+    /// (Blue = `min_mm`, Emerald Green = `target_mm`, Amber/Red = `max_mm`).
+    ByLineWidth,
+}
+
+impl ToolpathColorMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ByFeatureType => "Feature Type (Outer / Inner / Solid Infill / Gap)",
+            Self::ByLineWidth => "Local Line Width (Min=Blue / Target=Green / Max=Amber)",
+        }
+    }
+}
+
 /// Marker component for the 3D isosurface mesh entity extracted via `openvdb::tools::volumeToMesh`.
 #[derive(Component)]
 pub struct FieldIsosurfaceEntity;
@@ -115,9 +142,13 @@ pub struct FieldSliceEntity;
 #[derive(Component)]
 pub struct SelectedLayersMeshEntity;
 
+/// Marker component for the 3D variable-width extruded bead mesh entity of generated toolpaths.
+#[derive(Component)]
+pub struct ToolpathsMeshEntity;
+
 /// Generic scalar field visualization state resource supporting any named `openvdb::FloatGrid`
 /// on the currently selected object (`"sdf"`, `"eikonal"`, `"overhang"`, and future fields),
-/// plus 3D/2D visualization of the selected non-planar slicing isosurfaces.
+/// plus 3D/2D visualization of the selected non-planar slicing isosurfaces and shell toolpaths.
 #[derive(Resource)]
 pub struct FieldVisualizationState {
     pub active_field_name: String,
@@ -159,6 +190,20 @@ pub struct FieldVisualizationState {
     pub selected_layers_mat_handle: Option<Handle<StandardMaterial>>,
     pub dirty_selected_layers: bool,
     pub dirty_selected_layers_mesh: bool,
+
+    // --- Non-Planar Shell Toolpaths Visualization Controls ---
+    pub show_toolpaths: bool,
+    pub show_outer_walls: bool,
+    pub show_inner_walls: bool,
+    pub show_solid_infill: bool,
+    pub show_toolpath_centerlines: bool,
+    pub toolpath_color_mode: ToolpathColorMode,
+    pub cached_toolpaths: Option<ObjectToolpathsResult>,
+    pub toolpaths_entity: Option<Entity>,
+    pub toolpaths_mesh_handle: Option<Handle<Mesh>>,
+    pub toolpaths_mat_handle: Option<Handle<StandardMaterial>>,
+    pub dirty_toolpaths: bool,
+    pub dirty_toolpaths_mesh: bool,
 
     // --- 2D Cross-Section Slice Controls & Persistent Handles ---
     pub show_slice_plane: bool,
@@ -215,6 +260,18 @@ impl Default for FieldVisualizationState {
             selected_layers_mat_handle: None,
             dirty_selected_layers: true,
             dirty_selected_layers_mesh: true,
+            show_toolpaths: false,
+            show_outer_walls: true,
+            show_inner_walls: true,
+            show_solid_infill: true,
+            show_toolpath_centerlines: false,
+            toolpath_color_mode: ToolpathColorMode::ByFeatureType,
+            cached_toolpaths: None,
+            toolpaths_entity: None,
+            toolpaths_mesh_handle: None,
+            toolpaths_mat_handle: None,
+            dirty_toolpaths: true,
+            dirty_toolpaths_mesh: true,
             show_slice_plane: false,
             slice_axis: SliceAxis::Z,
             slice_normalized_pos: 0.5,
@@ -237,9 +294,12 @@ impl FieldVisualizationState {
     pub fn mark_all_dirty(&mut self) {
         self.cached_stats = None;
         self.cached_selected_layers = None;
+        self.cached_toolpaths = None;
         self.dirty_isosurface = true;
         self.dirty_selected_layers = true;
         self.dirty_selected_layers_mesh = true;
+        self.dirty_toolpaths = true;
+        self.dirty_toolpaths_mesh = true;
         self.dirty_slice = true;
     }
 
@@ -266,6 +326,55 @@ impl FieldVisualizationState {
         self.dirty_selected_layers = false;
         self.dirty_selected_layers_mesh = true;
         self.dirty_slice = true;
+    }
+
+    pub fn recompute_toolpaths(&mut self, object_id: u64, config: &SlicerConfig) {
+        let lh = config.slicing.layer_height;
+        ffi::set_slice_layer_height(LayerHeightSpec {
+            target_mm: lh.target_mm,
+            min_mm: lh.min_mm,
+            max_mm: lh.max_mm,
+            first_layer_mm: lh.first_layer_mm,
+            top_layer_mm: lh.top_layer_mm,
+        });
+        let s = &config.slicing;
+        ffi::set_shell_path_spec(ShellPathSpec {
+            shell_thickness_mm: s.shell_thickness_mm,
+            inner_wall_count: s.inner_wall_count,
+            outer_wall_width: LineWidthSpec {
+                target_mm: s.outer_wall_width.target_mm,
+                min_mm: s.outer_wall_width.min_mm,
+                max_mm: s.outer_wall_width.max_mm,
+            },
+            inner_wall_width: LineWidthSpec {
+                target_mm: s.inner_wall_width.target_mm,
+                min_mm: s.inner_wall_width.min_mm,
+                max_mm: s.inner_wall_width.max_mm,
+            },
+            solid_infill_width: LineWidthSpec {
+                target_mm: s.solid_infill_width.target_mm,
+                min_mm: s.solid_infill_width.min_mm,
+                max_mm: s.solid_infill_width.max_mm,
+            },
+            solid_infill_pattern: s.solid_infill_pattern.as_u8(),
+            min_extrusion_length_mm: s.min_extrusion_length_mm,
+        });
+
+        if self.cached_selected_layers.is_none() || self.dirty_selected_layers {
+            self.recompute_selected_layers(object_id, config);
+        }
+
+        let res = ffi::generate_object_shell_toolpaths(object_id, self.adaptivity);
+        if res.valid && !res.layers.is_empty() {
+            if self.selected_layer_max_idx == 0 && res.layers.len() > 1 {
+                self.selected_layer_max_idx = res.layers.len() - 1;
+            }
+            self.cached_toolpaths = Some(res);
+        } else {
+            self.cached_toolpaths = None;
+        }
+        self.dirty_toolpaths = false;
+        self.dirty_toolpaths_mesh = true;
     }
 
     pub fn refresh_stats_for(&mut self, object_id: u64) {
@@ -307,6 +416,7 @@ pub fn sync_field_visualization_system(
             Without<FieldIsosurfaceEntity>,
             Without<FieldSliceEntity>,
             Without<SelectedLayersMeshEntity>,
+            Without<ToolpathsMeshEntity>,
         ),
     >,
     mut iso_query: Query<
@@ -316,6 +426,7 @@ pub fn sync_field_visualization_system(
             Without<CadObjectEntity>,
             Without<FieldSliceEntity>,
             Without<SelectedLayersMeshEntity>,
+            Without<ToolpathsMeshEntity>,
         ),
     >,
     mut slice_query: Query<
@@ -325,6 +436,7 @@ pub fn sync_field_visualization_system(
             Without<CadObjectEntity>,
             Without<FieldIsosurfaceEntity>,
             Without<SelectedLayersMeshEntity>,
+            Without<ToolpathsMeshEntity>,
         ),
     >,
     mut selected_layers_query: Query<
@@ -334,6 +446,17 @@ pub fn sync_field_visualization_system(
             Without<CadObjectEntity>,
             Without<FieldIsosurfaceEntity>,
             Without<FieldSliceEntity>,
+            Without<ToolpathsMeshEntity>,
+        ),
+    >,
+    mut toolpaths_query: Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<ToolpathsMeshEntity>,
+            Without<CadObjectEntity>,
+            Without<FieldIsosurfaceEntity>,
+            Without<FieldSliceEntity>,
+            Without<SelectedLayersMeshEntity>,
         ),
     >,
 ) {
@@ -345,10 +468,13 @@ pub fn sync_field_visualization_system(
         vis_state.available_fields.clear();
         vis_state.cached_stats = None;
         vis_state.cached_selected_layers = None;
+        vis_state.cached_toolpaths = None;
         vis_state.contour_segments_local.clear();
         vis_state.dirty_isosurface = true;
         vis_state.dirty_selected_layers = true;
         vis_state.dirty_selected_layers_mesh = true;
+        vis_state.dirty_toolpaths = true;
+        vis_state.dirty_toolpaths_mesh = true;
         vis_state.dirty_slice = true;
 
         if let Some(id) = selected_id {
@@ -380,6 +506,11 @@ pub fn sync_field_visualization_system(
                 *vis = Visibility::Hidden;
             }
         }
+        if let Some(ent) = vis_state.toolpaths_entity {
+            if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
+                *vis = Visibility::Hidden;
+            }
+        }
         return;
     };
 
@@ -400,6 +531,7 @@ pub fn sync_field_visualization_system(
     if vis_state.last_highlighted_selected_layer != vis_state.highlighted_selected_layer {
         vis_state.last_highlighted_selected_layer = vis_state.highlighted_selected_layer;
         vis_state.dirty_selected_layers_mesh = true;
+        vis_state.dirty_toolpaths_mesh = true;
         if vis_state.show_slice_plane && vis_state.show_selected_layers {
             vis_state.dirty_slice = true;
         }
@@ -731,6 +863,198 @@ pub fn sync_field_visualization_system(
         }
     }
 
+    // 2d. Update & Render Non-Planar Shell Toolpaths (3D Variable-Width Extruded Bead Mesh)
+    if vis_state.show_toolpaths
+        && vis_state.dirty_toolpaths
+        && vis_state.available_fields.iter().any(|f| f == "eikonal")
+    {
+        vis_state.recompute_toolpaths(obj_id, &config);
+    }
+
+    if !vis_state.show_toolpaths {
+        if let Some(ent) = vis_state.toolpaths_entity {
+            if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
+                *vis = Visibility::Hidden;
+            }
+        }
+    } else if vis_state.dirty_toolpaths_mesh {
+        vis_state.dirty_toolpaths_mesh = false;
+
+        let stride = vis_state.selected_layer_stride.max(1);
+        let min_idx = vis_state.selected_layer_min_idx;
+        let max_idx = vis_state.selected_layer_max_idx;
+        let highlighted = vis_state.highlighted_selected_layer;
+        let color_mode = vis_state.toolpath_color_mode;
+        let show_outer = vis_state.show_outer_walls;
+        let show_inner = vis_state.show_inner_walls;
+        let show_infill = vis_state.show_solid_infill;
+
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut normals: Vec<[f32; 3]> = Vec::new();
+        let mut colors: Vec<[f32; 4]> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+
+        if let Some(ref tp_res) = vis_state.cached_toolpaths {
+            let total = tp_res.layers.len();
+            if total > 0 {
+                let lo = min_idx.min(total - 1);
+                let hi = max_idx.min(total - 1).max(lo);
+
+                for (idx, layer_tp) in tp_res.layers.iter().enumerate() {
+                    let is_hovered = highlighted == Some(idx);
+                    let in_range = idx >= lo && idx <= hi;
+                    let matches_stride =
+                        ((idx - lo) % stride == 0) || idx == 0 || idx + 1 == total;
+                    if !is_hovered && (!in_range || !matches_stride) {
+                        continue;
+                    }
+
+                    let dim_factor = if is_hovered {
+                        1.15
+                    } else if highlighted.is_some() {
+                        0.55
+                    } else {
+                        1.0
+                    };
+
+                    for path in &layer_tp.paths {
+                        let visible = match path.feature_kind {
+                            0 => show_outer,
+                            1 => show_inner,
+                            _ => show_infill,
+                        };
+                        if !visible || path.points.len() < 2 {
+                            continue;
+                        }
+                        append_extrusion_path_bead_mesh(
+                            path,
+                            color_mode,
+                            &config,
+                            dim_factor,
+                            &mut positions,
+                            &mut normals,
+                            &mut colors,
+                            &mut indices,
+                        );
+                    }
+                }
+            }
+        }
+
+        if !positions.is_empty() && !indices.is_empty() {
+            let bevy_mesh = Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::default(),
+            )
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+            .with_inserted_indices(Indices::U32(indices));
+
+            if let (Some(ent), Some(ref mesh_h), Some(ref mat_h)) = (
+                vis_state.toolpaths_entity,
+                &vis_state.toolpaths_mesh_handle,
+                &vis_state.toolpaths_mat_handle,
+            ) {
+                meshes.insert(mesh_h, bevy_mesh);
+                if let Some(mat) = materials.get_mut(mat_h) {
+                    mat.base_color = Color::WHITE;
+                }
+                if let Ok((mut tf, mut vis)) = toolpaths_query.get_mut(ent) {
+                    *tf = obj_world_tf;
+                    *vis = Visibility::Inherited;
+                }
+            } else {
+                let mesh_h = meshes.add(bevy_mesh);
+                let mat_h = materials.add(StandardMaterial {
+                    base_color: Color::WHITE,
+                    metallic: 0.08,
+                    perceptual_roughness: 0.34,
+                    alpha_mode: AlphaMode::Opaque,
+                    depth_bias: 14.0,
+                    double_sided: true,
+                    cull_mode: None,
+                    ..default()
+                });
+                let ent = commands
+                    .spawn((
+                        PbrBundle {
+                            mesh: mesh_h.clone(),
+                            material: mat_h.clone(),
+                            transform: obj_world_tf,
+                            ..default()
+                        },
+                        ToolpathsMeshEntity,
+                    ))
+                    .id();
+                vis_state.toolpaths_entity = Some(ent);
+                vis_state.toolpaths_mesh_handle = Some(mesh_h);
+                vis_state.toolpaths_mat_handle = Some(mat_h);
+            }
+        } else if let Some(ent) = vis_state.toolpaths_entity {
+            if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
+                *vis = Visibility::Hidden;
+            }
+        }
+    }
+
+    // Optional crisp gizmo centerlines on top of toolpath beads
+    if vis_state.show_toolpaths && vis_state.show_toolpath_centerlines {
+        if let Some(ref tp_res) = vis_state.cached_toolpaths {
+            let total = tp_res.layers.len();
+            if total > 0 {
+                let stride = vis_state.selected_layer_stride.max(1);
+                let lo = vis_state.selected_layer_min_idx.min(total - 1);
+                let hi = vis_state.selected_layer_max_idx.min(total - 1).max(lo);
+                let highlighted = vis_state.highlighted_selected_layer;
+
+                for (idx, layer_tp) in tp_res.layers.iter().enumerate() {
+                    let is_hovered = highlighted == Some(idx);
+                    let in_range = idx >= lo && idx <= hi;
+                    let matches_stride =
+                        ((idx - lo) % stride == 0) || idx == 0 || idx + 1 == total;
+                    if !is_hovered && (!in_range || !matches_stride) {
+                        continue;
+                    }
+                    for path in &layer_tp.paths {
+                        let visible = match path.feature_kind {
+                            0 => vis_state.show_outer_walls,
+                            1 => vis_state.show_inner_walls,
+                            _ => vis_state.show_solid_infill,
+                        };
+                        if !visible || path.points.len() < 2 {
+                            continue;
+                        }
+                        let rgba = compute_toolpath_point_color(
+                            path.feature_kind,
+                            path.wall_index,
+                            path.mean_width_mm,
+                            vis_state.toolpath_color_mode,
+                            &config,
+                        );
+                        let line_col = Color::srgb(
+                            (rgba[0] * 1.15).min(1.0),
+                            (rgba[1] * 1.15).min(1.0),
+                            (rgba[2] * 1.15).min(1.0),
+                        );
+                        for w in path.points.windows(2) {
+                            let p0 = obj_world_tf.transform_point(Vec3::new(w[0].x, w[0].y, w[0].z));
+                            let p1 = obj_world_tf.transform_point(Vec3::new(w[1].x, w[1].y, w[1].z));
+                            gizmos.line(p0, p1, line_col);
+                        }
+                        if path.is_closed && path.points.len() >= 3 {
+                            let last = path.points.last().unwrap();
+                            let first = &path.points[0];
+                            let p0 = obj_world_tf.transform_point(Vec3::new(last.x, last.y, last.z));
+                            let p1 = obj_world_tf.transform_point(Vec3::new(first.x, first.y, first.z));
+                            gizmos.line(p0, p1, line_col);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 3. Update 2D Cross-Section Slice Plane in-place using AlphaMode::Mask(0.5)
     //    so hardware depth testing is active and there is zero transparency sort flicker!
     if !vis_state.show_slice_plane {
@@ -875,7 +1199,7 @@ pub fn sync_field_visualization_system(
         }
     }
 
-    // 4. Keep active isosurface, selected layers, & slice entities locked to the selected object's Transform
+    // 4. Keep active isosurface, selected layers, toolpaths, & slice entities locked to the selected object's Transform
     if vis_state.show_isosurface {
         if let Some(ent) = vis_state.isosurface_entity {
             if let Ok((mut tf, _)) = iso_query.get_mut(ent) {
@@ -894,12 +1218,178 @@ pub fn sync_field_visualization_system(
             }
         }
     }
+    if vis_state.show_toolpaths {
+        if let Some(ent) = vis_state.toolpaths_entity {
+            if let Ok((mut tf, _)) = toolpaths_query.get_mut(ent) {
+                if *tf != obj_world_tf {
+                    *tf = obj_world_tf;
+                }
+            }
+        }
+    }
     if vis_state.show_slice_plane {
         if let Some(ent) = vis_state.slice_entity {
             if let Ok((mut tf, _)) = slice_query.get_mut(ent) {
                 if *tf != obj_world_tf {
                     *tf = obj_world_tf;
                 }
+            }
+        }
+    }
+}
+
+/// Expands a continuous `ExtrusionPath` into a 3D variable-width bead tube mesh oriented
+/// in each point's local `NozzleFrame` $(\hat{\mathbf{x}}_{\text{nozzle}}, \hat{\mathbf{y}}_{\text{nozzle}}, \hat{\mathbf{z}}_{\text{nozzle}})$.
+#[allow(clippy::too_many_arguments)]
+fn append_extrusion_path_bead_mesh(
+    path: &ExtrusionPath,
+    color_mode: ToolpathColorMode,
+    config: &SlicerConfig,
+    brightness_scale: f32,
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+) {
+    let n = path.points.len();
+    if n < 2 {
+        return;
+    }
+
+    let base_ring_start = positions.len() as u32;
+
+    for i in 0..n {
+        let pt = &path.points[i];
+        let p_curr = Vec3::new(pt.x, pt.y, pt.z);
+        let p_prev = if i > 0 {
+            let pv = &path.points[i - 1];
+            Vec3::new(pv.x, pv.y, pv.z)
+        } else if path.is_closed {
+            let pv = &path.points[n - 1];
+            Vec3::new(pv.x, pv.y, pv.z)
+        } else {
+            p_curr
+        };
+        let p_next = if i + 1 < n {
+            let nv = &path.points[i + 1];
+            Vec3::new(nv.x, nv.y, nv.z)
+        } else if path.is_closed {
+            let nv = &path.points[0];
+            Vec3::new(nv.x, nv.y, nv.z)
+        } else {
+            p_curr
+        };
+
+        let raw_travel = (p_next - p_prev)
+            .try_normalize()
+            .unwrap_or(Vec3::X);
+        let nozzle_axis = Vec3::new(pt.nx, pt.ny, pt.nz)
+            .try_normalize()
+            .unwrap_or_else(|| Vec3::from_array(config.machine.nozzle_axis_bed));
+        let frame = NozzleFrame::from_nozzle_and_travel(nozzle_axis, raw_travel);
+
+        let half_w = (0.48 * pt.width_mm).max(0.03);
+        let half_h = (0.42 * pt.height_mm).max(0.02);
+
+        // 4-sided cross-section ring in local (lateral_axis, nozzle_axis):
+        // 0: top (+z_nozzle), 1: right (+y_nozzle), 2: bottom (-z_nozzle), 3: left (-y_nozzle)
+        let v_top = p_curr + frame.nozzle_axis * half_h;
+        let v_right = p_curr + frame.lateral_axis * half_w;
+        let v_bottom = p_curr - frame.nozzle_axis * half_h;
+        let v_left = p_curr - frame.lateral_axis * half_w;
+
+        let mut rgba = compute_toolpath_point_color(
+            path.feature_kind,
+            path.wall_index,
+            pt.width_mm,
+            color_mode,
+            config,
+        );
+        rgba[0] = (rgba[0] * brightness_scale).clamp(0.0, 1.0);
+        rgba[1] = (rgba[1] * brightness_scale).clamp(0.0, 1.0);
+        rgba[2] = (rgba[2] * brightness_scale).clamp(0.0, 1.0);
+
+        positions.push(v_top.to_array());
+        normals.push(frame.nozzle_axis.to_array());
+        colors.push(rgba);
+
+        positions.push(v_right.to_array());
+        normals.push(frame.lateral_axis.to_array());
+        colors.push(rgba);
+
+        positions.push(v_bottom.to_array());
+        normals.push((-frame.nozzle_axis).to_array());
+        colors.push(rgba);
+
+        positions.push(v_left.to_array());
+        normals.push((-frame.lateral_axis).to_array());
+        colors.push(rgba);
+    }
+
+    let seg_count = if path.is_closed && n >= 3 { n } else { n - 1 };
+    for s in 0..seg_count {
+        let r0 = base_ring_start + (s as u32) * 4;
+        let r1 = base_ring_start + (((s + 1) % n) as u32) * 4;
+        for k in 0..4u32 {
+            let k_next = (k + 1) % 4;
+            let a0 = r0 + k;
+            let a1 = r0 + k_next;
+            let b0 = r1 + k;
+            let b1 = r1 + k_next;
+            indices.extend_from_slice(&[a0, b0, b1, a0, b1, a1]);
+        }
+    }
+
+    // End caps for open extrusion polylines
+    if !path.is_closed {
+        let r_start = base_ring_start;
+        indices.extend_from_slice(&[r_start, r_start + 2, r_start + 1, r_start, r_start + 3, r_start + 2]);
+        let r_end = base_ring_start + ((n - 1) as u32) * 4;
+        indices.extend_from_slice(&[r_end, r_end + 1, r_end + 2, r_end, r_end + 2, r_end + 3]);
+    }
+}
+
+/// Computes the RGBA color for a toolpath point according to `ToolpathColorMode`.
+fn compute_toolpath_point_color(
+    feature_kind: u8,
+    wall_index: u32,
+    width_mm: f32,
+    mode: ToolpathColorMode,
+    config: &SlicerConfig,
+) -> [f32; 4] {
+    match mode {
+        ToolpathColorMode::ByFeatureType => match feature_kind {
+            0 => [0.98, 0.44, 0.16, 1.0], // Outer Wall: vivid coral-orange
+            1 => {
+                // Inner Wall: emerald/lime green (with slight shade variation per wall index)
+                let shade = (1.0 - 0.10 * ((wall_index.saturating_sub(1) % 4) as f32)).clamp(0.65, 1.0);
+                [0.24 * shade, 0.90 * shade, 0.42 * shade, 1.0]
+            }
+            2 => [0.22, 0.76, 0.98, 1.0], // Solid Infill: bright sky-blue/cyan
+            _ => [0.98, 0.32, 0.88, 1.0], // Gap Fill: vivid magenta
+        },
+        ToolpathColorMode::ByLineWidth => {
+            let spec = match feature_kind {
+                0 => config.slicing.outer_wall_width,
+                1 => config.slicing.inner_wall_width,
+                _ => config.slicing.solid_infill_width,
+            };
+            if width_mm <= spec.target_mm {
+                let denom = (spec.target_mm - spec.min_mm).max(1.0e-4);
+                let t = ((width_mm - spec.min_mm) / denom).clamp(0.0, 1.0);
+                // Cool Blue (min_mm) -> Emerald Green (target_mm)
+                let r = 0.16 * (1.0 - t) + 0.18 * t;
+                let g = 0.52 * (1.0 - t) + 0.88 * t;
+                let b = 0.96 * (1.0 - t) + 0.42 * t;
+                [r, g, b, 1.0]
+            } else {
+                let denom = (spec.max_mm - spec.target_mm).max(1.0e-4);
+                let t = ((width_mm - spec.target_mm) / denom).clamp(0.0, 1.0);
+                // Emerald Green (target_mm) -> Warm Amber/Red (max_mm)
+                let r = 0.18 * (1.0 - t) + 0.98 * t;
+                let g = 0.88 * (1.0 - t) + 0.46 * t;
+                let b = 0.42 * (1.0 - t) + 0.16 * t;
+                [r, g, b, 1.0]
             }
         }
     }
@@ -1595,5 +2085,258 @@ mod tests {
         ffi::set_spatial_orientation_hints(&[]);
         let _ = ffi::remove_cad_object(part.object_id);
     }
+
+    #[test]
+    fn test_shell_path_generation_monotonic_and_concentric() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ffi::set_spatial_orientation_hints(&[]);
+
+        // Register a 16x16x8 mm block on the bed
+        let positions: [f32; 24] = [
+            -8.0, -8.0, 0.0,
+             8.0, -8.0, 0.0,
+             8.0,  8.0, 0.0,
+            -8.0,  8.0, 0.0,
+            -8.0, -8.0, 8.0,
+             8.0, -8.0, 8.0,
+             8.0,  8.0, 8.0,
+            -8.0,  8.0, 8.0,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2,
+            4, 5, 6, 4, 6, 7,
+            0, 1, 5, 0, 5, 4,
+            1, 2, 6, 1, 6, 5,
+            2, 3, 7, 2, 7, 6,
+            3, 0, 4, 3, 4, 7,
+        ];
+
+        let part = ffi::register_triangle_mesh("test_shell_paths_block", &positions, &indices);
+        assert!(part.object_id > 0);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.6, 4.0));
+
+        ffi::set_slice_layer_height(ffi::LayerHeightSpec {
+            target_mm: 1.0,
+            min_mm: 0.6,
+            max_mm: 1.4,
+            first_layer_mm: 0.5,
+            top_layer_mm: 0.4,
+        });
+
+        let min_len = 0.80f32; // 2x 0.4mm nozzle
+        let base_spec = ffi::ShellPathSpec {
+            shell_thickness_mm: 2.0,
+            inner_wall_count: 2,
+            outer_wall_width: ffi::LineWidthSpec {
+                target_mm: 0.42,
+                min_mm: 0.28,
+                max_mm: 0.58,
+            },
+            inner_wall_width: ffi::LineWidthSpec {
+                target_mm: 0.45,
+                min_mm: 0.30,
+                max_mm: 0.60,
+            },
+            solid_infill_width: ffi::LineWidthSpec {
+                target_mm: 0.45,
+                min_mm: 0.30,
+                max_mm: 0.62,
+            },
+            solid_infill_pattern: 0, // Monotonic
+            min_extrusion_length_mm: min_len,
+        };
+        ffi::set_shell_path_spec(base_spec.clone());
+
+        let mono_res = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(mono_res.valid);
+        assert!(mono_res.outer_wall_count > 0, "Expected outer walls to be generated");
+        assert!(mono_res.inner_wall_count > 0, "Expected inner walls to be generated");
+        assert!(
+            mono_res.solid_infill_count > 0,
+            "Expected Monotonic solid infill to be generated in the remaining shell"
+        );
+
+        // Verify min extrusion length and line width bounds on every generated path,
+        // and verify that individual segments within a path are shorter than min_extrusion_length_mm
+        let mut found_sub_min_segment = false;
+        for layer in &mono_res.layers {
+            for path in &layer.paths {
+                assert!(
+                    path.total_length_mm >= min_len - 1.0e-4,
+                    "Continuous extrusion path length {} was shorter than min_extrusion_length_mm {}",
+                    path.total_length_mm,
+                    min_len
+                );
+                assert!(path.points.len() >= 2);
+                for w in path.points.windows(2) {
+                    let dx = w[1].x - w[0].x;
+                    let dy = w[1].y - w[0].y;
+                    let dz = w[1].z - w[0].z;
+                    let seg_len = (dx * dx + dy * dy + dz * dz).sqrt();
+                    if seg_len < min_len {
+                        found_sub_min_segment = true;
+                    }
+                }
+                for pt in &path.points {
+                    match path.feature_kind {
+                        0 => assert!(
+                            pt.width_mm >= 0.28 - 1.0e-3 && pt.width_mm <= 0.58 + 1.0e-3,
+                            "Outer wall width {} outside [0.28, 0.58]",
+                            pt.width_mm
+                        ),
+                        1 => assert!(
+                            pt.width_mm >= 0.30 - 1.0e-3 && pt.width_mm <= 0.60 + 1.0e-3,
+                            "Inner wall width {} outside [0.30, 0.60]",
+                            pt.width_mm
+                        ),
+                        _ => assert!(
+                            pt.width_mm >= 0.30 - 1.0e-3 && pt.width_mm <= 0.62 + 1.0e-3,
+                            "Solid infill width {} outside [0.30, 0.62]",
+                            pt.width_mm
+                        ),
+                    }
+                }
+            }
+        }
+        assert!(
+            found_sub_min_segment,
+            "Expected individual polyline segments shorter than min_extrusion_length_mm inside continuous paths"
+        );
+
+        // Verify mid-height horizontal layer restricts paths to the 2.0 mm outer shell
+        // (leaving the central core [-6, 6] x [-6, 6] empty for future sparse infill)
+        let mid_layer = mono_res
+            .layers
+            .iter()
+            .find(|l| (l.isovalue - 4.0).abs() < 1.2)
+            .expect("Expected a mid-height layer near Z=4.0");
+        assert!(!mid_layer.paths.is_empty());
+        for path in &mid_layer.paths {
+            for pt in &path.points {
+                let dist_from_outer_xy = (8.0 - pt.x.abs()).min(8.0 - pt.y.abs());
+                assert!(
+                    dist_from_outer_xy <= 2.65,
+                    "Mid-height path point ({}, {}, {}) penetrated into sparse core beyond shell thickness (dist={})",
+                    pt.x,
+                    pt.y,
+                    pt.z,
+                    dist_from_outer_xy
+                );
+            }
+        }
+
+        // Now test Concentric solid infill pattern (pattern = 1)
+        let mut conc_spec = base_spec;
+        conc_spec.solid_infill_pattern = 1;
+        ffi::set_shell_path_spec(conc_spec);
+
+        let conc_res = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(conc_res.valid);
+        assert!(conc_res.outer_wall_count > 0);
+        assert!(conc_res.inner_wall_count > 0);
+        assert!(
+            conc_res.solid_infill_count > 0,
+            "Expected Concentric solid infill to be generated in the remaining shell"
+        );
+
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_tilted_isosurface_open_and_closed_walls() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Build a wedge/tapered block with a tilted orientation hint so non-planar isosurfaces
+        // slice obliquely across the outer shell and produce both open and closed wall paths.
+        let positions: [f32; 24] = [
+            -8.0, -5.0, 0.0,
+             8.0, -5.0, 0.0,
+             8.0,  5.0, 0.0,
+            -8.0,  5.0, 0.0,
+            -8.0, -1.2, 10.0,
+             8.0, -1.2, 10.0,
+             8.0,  1.2, 10.0,
+            -8.0,  1.2, 10.0,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2,
+            4, 5, 6, 4, 6, 7,
+            0, 1, 5, 0, 5, 4,
+            1, 2, 6, 1, 6, 5,
+            2, 3, 7, 2, 7, 6,
+            3, 0, 4, 3, 4, 7,
+        ];
+
+        let part = ffi::register_triangle_mesh("test_tapered_wedge_paths", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        let hints = vec![ffi::SpatialOrientationHint {
+            kind: 1,
+            position_bed: [0.0, 0.0, 5.0],
+            direction_bed: [0.55, 0.0, 0.835],
+            influence_radius_mm: 20.0,
+            weight: 1.0,
+            apply_on_surface_only: false,
+        }];
+        ffi::set_spatial_orientation_hints(&hints);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.5, 4.0));
+
+        ffi::set_slice_layer_height(ffi::LayerHeightSpec {
+            target_mm: 0.8,
+            min_mm: 0.5,
+            max_mm: 1.1,
+            first_layer_mm: 0.4,
+            top_layer_mm: 0.3,
+        });
+
+        ffi::set_shell_path_spec(ffi::ShellPathSpec {
+            shell_thickness_mm: 1.8,
+            inner_wall_count: 2,
+            outer_wall_width: ffi::LineWidthSpec {
+                target_mm: 0.42,
+                min_mm: 0.26,
+                max_mm: 0.58,
+            },
+            inner_wall_width: ffi::LineWidthSpec {
+                target_mm: 0.42,
+                min_mm: 0.26,
+                max_mm: 0.58,
+            },
+            solid_infill_width: ffi::LineWidthSpec {
+                target_mm: 0.42,
+                min_mm: 0.26,
+                max_mm: 0.58,
+            },
+            solid_infill_pattern: 0,
+            min_extrusion_length_mm: 0.8,
+        });
+
+        let res = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(res.valid);
+        assert!(res.total_path_count > 0);
+
+        let any_open_wall = res
+            .layers
+            .iter()
+            .flat_map(|l| l.paths.iter())
+            .any(|p| (p.feature_kind == 0 || p.feature_kind == 1) && !p.is_closed);
+        let any_closed_wall = res
+            .layers
+            .iter()
+            .flat_map(|l| l.paths.iter())
+            .any(|p| (p.feature_kind == 0 || p.feature_kind == 1) && p.is_closed);
+        assert!(
+            any_open_wall,
+            "Expected non-planar tilted/tapered isosurfaces to produce open wall paths where walls terminate at the shell or clearance boundary"
+        );
+        assert!(
+            any_closed_wall,
+            "Expected closed wall loops on full-perimeter cross-sections"
+        );
+
+        ffi::set_spatial_orientation_hints(&[]);
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
 }
+
 

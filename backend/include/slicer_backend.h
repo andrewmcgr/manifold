@@ -23,6 +23,12 @@ struct SelectedLayerInfo;
 struct SelectedIsosurfacesResult;
 struct SpatialOrientationHint;
 struct FieldComputeProgress;
+struct LineWidthSpec;
+struct ShellPathSpec;
+struct ToolpathPoint;
+struct ExtrusionPath;
+struct LayerToolpaths;
+struct ObjectToolpathsResult;
 
 /// Core C++20 compute engine handling CAD B-Rep ingestion (OCCT), assembly
 /// decomposition, surface tessellation, STL/3MF triangle mesh registration,
@@ -152,6 +158,19 @@ public:
         std::uint64_t objectId,
         float adaptivity) const;
 
+    /// Sets the shell & toolpath generation parameters (`ShellPathSpec`).
+    void setShellPathSpec(const ShellPathSpec& spec) noexcept;
+
+    /// Returns the current shell & toolpath generation parameters (`ShellPathSpec`).
+    ShellPathSpec shellPathSpec() const noexcept;
+
+    /// Generates outer walls, inner walls, solid infill (`Monotonic` or `Concentric`),
+    /// and shell gap fill across all selected non-planar slicing isosurfaces of `objectId`
+    /// within the outer shell ($-T_{\text{shell}} \le \phi_{\text{sdf}}(\mathbf{x}) \le 0$).
+    ObjectToolpathsResult generateObjectShellToolpaths(
+        std::uint64_t objectId,
+        float adaptivity) const;
+
     /// Returns a reference to the most recently loaded object's vertices.
     const std::vector<RenderVertex>& vertices() const noexcept;
 
@@ -213,5 +232,8 @@ void set_eikonal_solver_iterations(std::uint32_t iterations);
 std::uint32_t get_eikonal_solver_iterations();
 void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hints);
 SelectedIsosurfacesResult select_slicing_isosurfaces(std::uint64_t object_id, float adaptivity);
+void set_shell_path_spec(ShellPathSpec spec);
+ShellPathSpec get_shell_path_spec();
+ObjectToolpathsResult generate_object_shell_toolpaths(std::uint64_t object_id, float adaptivity);
 
 } // namespace manifold

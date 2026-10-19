@@ -271,15 +271,104 @@ impl Default for ArrangementConfig {
     }
 }
 
-/// Non-planar slicing process configuration, starting with variable layer height `(target, min, max)`.
+/// Configurable variable extrusion line width `(target_mm, min_mm, max_mm)`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LineWidthConfig {
+    /// Nominal target extrusion line width (mm).
+    pub target_mm: f32,
+    /// Minimum allowable line width when compressing to fit narrow spaces (mm).
+    pub min_mm: f32,
+    /// Maximum allowable line width when expanding to fill residual gaps (mm).
+    pub max_mm: f32,
+}
+
+impl Default for LineWidthConfig {
+    fn default() -> Self {
+        Self {
+            target_mm: 0.40,
+            min_mm: 0.28,
+            max_mm: 0.56,
+        }
+    }
+}
+
+impl LineWidthConfig {
+    pub const fn new(target_mm: f32, min_mm: f32, max_mm: f32) -> Self {
+        Self {
+            target_mm,
+            min_mm,
+            max_mm,
+        }
+    }
+
+    /// Ensures `0.05 <= min_mm <= target_mm <= max_mm`.
+    pub fn sanitize(&mut self) {
+        self.min_mm = self.min_mm.max(0.05);
+        if self.max_mm < self.min_mm {
+            self.max_mm = self.min_mm;
+        }
+        self.target_mm = self.target_mm.clamp(self.min_mm, self.max_mm);
+    }
+}
+
+/// Pattern used to generate solid infill inside the outer shell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SolidInfillPattern {
+    /// Monotonic directional flood fill across the remaining shell region.
+    #[default]
+    Monotonic,
+    /// Continued inward SDF/geodesic insetting across the remaining shell region.
+    Concentric,
+}
+
+impl SolidInfillPattern {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Monotonic => 0,
+            Self::Concentric => 1,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Concentric,
+            _ => Self::Monotonic,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Monotonic => "Monotonic (Flood Fill)",
+            Self::Concentric => "Concentric (Continued Insetting)",
+        }
+    }
+}
+
+/// Non-planar slicing process & shell toolpath generation configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SlicingProcessConfig {
-    /// Variable non-planar layer height (`target_mm`, `min_mm`, `max_mm`).
+    /// Variable non-planar layer height (`target_mm`, `min_mm`, `max_mm`, `first_layer_mm`, `top_layer_mm`).
     pub layer_height: LayerHeightConfig,
     pub max_nonplanar_slope_deg: f32,
     pub perimeter_count: u32,
     pub infill_density_percent: f32,
+    /// Thickness of the outer shell (mm), defining the shell region $-T_{\text{shell}} \le \phi_{\text{sdf}}(\mathbf{x}) \le 0$.
+    pub shell_thickness_mm: f32,
+    /// Number of inner walls immediately inside the outer wall (in addition to the 1 outer wall).
+    pub inner_wall_count: u32,
+    /// Variable line width `(target_mm, min_mm, max_mm)` for outer walls contacting $\phi_{\text{sdf}} = 0$.
+    pub outer_wall_width: LineWidthConfig,
+    /// Variable line width `(target_mm, min_mm, max_mm)` for inner walls.
+    pub inner_wall_width: LineWidthConfig,
+    /// Variable line width `(target_mm, min_mm, max_mm)` for solid infill and shell gap fill.
+    pub solid_infill_width: LineWidthConfig,
+    /// Solid infill pattern within the shell (`Monotonic` or `Concentric`).
+    pub solid_infill_pattern: SolidInfillPattern,
+    /// Minimum continuous extrusion length (mm); defaults to $2 \times d_{\text{nozzle}}$.
+    /// Individual segments of a continuous extrusion may be shorter than this.
+    pub min_extrusion_length_mm: f32,
 }
 
 impl Default for SlicingProcessConfig {
@@ -289,7 +378,25 @@ impl Default for SlicingProcessConfig {
             max_nonplanar_slope_deg: 35.0,
             perimeter_count: 3,
             infill_density_percent: 20.0,
+            shell_thickness_mm: 1.60,
+            inner_wall_count: 2,
+            outer_wall_width: LineWidthConfig::new(0.40, 0.28, 0.56),
+            inner_wall_width: LineWidthConfig::new(0.42, 0.28, 0.58),
+            solid_infill_width: LineWidthConfig::new(0.42, 0.26, 0.60),
+            solid_infill_pattern: SolidInfillPattern::Monotonic,
+            min_extrusion_length_mm: 0.80,
         }
+    }
+}
+
+impl SlicingProcessConfig {
+    pub fn sanitize(&mut self) {
+        self.layer_height.sanitize();
+        self.shell_thickness_mm = self.shell_thickness_mm.max(0.05);
+        self.outer_wall_width.sanitize();
+        self.inner_wall_width.sanitize();
+        self.solid_infill_width.sanitize();
+        self.min_extrusion_length_mm = self.min_extrusion_length_mm.max(0.0);
     }
 }
 

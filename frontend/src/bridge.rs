@@ -162,6 +162,76 @@ pub mod ffi {
         pub stage: String,
     }
 
+    /// Configurable variable extrusion line width `(target_mm, min_mm, max_mm)` shared across FFI.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct LineWidthSpec {
+        pub target_mm: f32,
+        pub min_mm: f32,
+        pub max_mm: f32,
+    }
+
+    /// Shell & path generation parameters shared across FFI.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct ShellPathSpec {
+        pub shell_thickness_mm: f32,
+        pub inner_wall_count: u32,
+        pub outer_wall_width: LineWidthSpec,
+        pub inner_wall_width: LineWidthSpec,
+        pub solid_infill_width: LineWidthSpec,
+        /// `0 = Monotonic`, `1 = Concentric`
+        pub solid_infill_pattern: u8,
+        pub min_extrusion_length_mm: f32,
+    }
+
+    /// A single 3D vertex along a continuous non-planar extrusion toolpath.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct ToolpathPoint {
+        pub x: f32,
+        pub y: f32,
+        pub z: f32,
+        /// Local unit `nozzle_axis` $\hat{\mathbf{z}}_{\text{nozzle}}$ pointing opposite to nozzle discharge.
+        pub nx: f32,
+        pub ny: f32,
+        pub nz: f32,
+        /// Local extruded line width (mm) along $\hat{\mathbf{y}}_{\text{nozzle}}$.
+        pub width_mm: f32,
+        /// Local layer thickness (mm) along $\hat{\mathbf{z}}_{\text{nozzle}}$.
+        pub height_mm: f32,
+    }
+
+    /// A continuous open or closed extrusion path on a non-planar slicing isosurface.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct ExtrusionPath {
+        /// `0 = OuterWall`, `1 = InnerWall`, `2 = SolidInfill`, `3 = GapFill`
+        pub feature_kind: u8,
+        /// `0` for outer wall, `1..=inner_wall_count` for inner walls, pass index for infill/gap fill.
+        pub wall_index: u32,
+        pub is_closed: bool,
+        pub total_length_mm: f32,
+        pub mean_width_mm: f32,
+        pub points: Vec<ToolpathPoint>,
+    }
+
+    /// All shell toolpaths generated on a single selected slicing isosurface layer.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct LayerToolpaths {
+        pub layer_index: u32,
+        pub branch_id: u32,
+        pub isovalue: f32,
+        pub paths: Vec<ExtrusionPath>,
+    }
+
+    /// Complete shell toolpath generation result for an object across all selected slicing isosurfaces.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct ObjectToolpathsResult {
+        pub valid: bool,
+        pub total_path_count: u32,
+        pub outer_wall_count: u32,
+        pub inner_wall_count: u32,
+        pub solid_infill_count: u32,
+        pub layers: Vec<LayerToolpaths>,
+    }
+
     unsafe extern "C++" {
         include!("slicer_backend.h");
 
@@ -287,6 +357,20 @@ pub mod ffi {
             object_id: u64,
             adaptivity: f32,
         ) -> SelectedIsosurfacesResult;
+
+        /// Sets the shell & toolpath generation parameters (`ShellPathSpec`) in the C++ backend.
+        pub fn set_shell_path_spec(spec: ShellPathSpec);
+
+        /// Retrieves the current shell & toolpath generation parameters (`ShellPathSpec`) from the C++ backend.
+        pub fn get_shell_path_spec() -> ShellPathSpec;
+
+        /// Generates outer walls, inner walls, solid infill (`Monotonic` or `Concentric`), and
+        /// shell gap fill across all selected non-planar slicing isosurfaces of `object_id`
+        /// within the outer shell ($-T_{\text{shell}} \le \phi_{\text{sdf}}(\mathbf{x}) \le 0$).
+        pub fn generate_object_shell_toolpaths(
+            object_id: u64,
+            adaptivity: f32,
+        ) -> ObjectToolpathsResult;
     }
 }
 
