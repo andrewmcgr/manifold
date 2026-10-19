@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::tasks::IoTaskPool;
 
 use crate::bridge::ffi::{
     self, ExtrusionPath, FieldSlice2D, FieldStats, LayerHeightSpec, LineWidthSpec,
@@ -222,6 +223,16 @@ pub struct FieldVisualizationState {
 
     /// Background task computing OpenVDB scalar fields for `(object_id, object_name)`.
     pub pending_field_task: Option<(u64, String, bevy::tasks::Task<bool>)>,
+    /// Background task computing selected slicing isosurfaces and/or non-planar shell toolpaths.
+    pub pending_slicing_task: Option<(
+        u64,
+        bevy::tasks::Task<(
+            Option<SelectedIsosurfacesResult>,
+            Option<ObjectToolpathsResult>,
+        )>,
+    )>,
+    /// True while the user is actively holding down the pointer on a UI slider/drag widget.
+    pub ui_pointer_down: bool,
 }
 
 impl Default for FieldVisualizationState {
@@ -286,11 +297,17 @@ impl Default for FieldVisualizationState {
             slice_plane_coord: 0.0,
             dirty_slice: true,
             pending_field_task: None,
+            pending_slicing_task: None,
+            ui_pointer_down: false,
         }
     }
 }
 
 impl FieldVisualizationState {
+    pub fn is_busy(&self) -> bool {
+        self.pending_field_task.is_some() || self.pending_slicing_task.is_some()
+    }
+
     pub fn mark_all_dirty(&mut self) {
         self.cached_stats = None;
         self.cached_selected_layers = None;
@@ -303,42 +320,36 @@ impl FieldVisualizationState {
         self.dirty_slice = true;
     }
 
-    pub fn recompute_selected_layers(&mut self, object_id: u64, config: &SlicerConfig) {
-        let lh = config.slicing.layer_height;
-        ffi::set_slice_layer_height(LayerHeightSpec {
-            target_mm: lh.target_mm,
-            min_mm: lh.min_mm,
-            max_mm: lh.max_mm,
-            first_layer_mm: lh.first_layer_mm,
-            top_layer_mm: lh.top_layer_mm,
-        });
-        let res = ffi::select_slicing_isosurfaces(object_id, self.adaptivity);
-        if res.valid && !res.layers.is_empty() {
-            let max_idx = res.layers.len() - 1;
-            self.selected_layer_min_idx = 0;
-            self.selected_layer_max_idx = max_idx;
-            self.cached_selected_layers = Some(res);
-        } else {
-            self.selected_layer_min_idx = 0;
-            self.selected_layer_max_idx = 0;
-            self.cached_selected_layers = None;
+    /// Spawns an asynchronous background task on `IoTaskPool` to compute selected slicing
+    /// isosurfaces and/or non-planar shell toolpaths without blocking the UI thread.
+    pub fn spawn_slicing_task(
+        &mut self,
+        object_id: u64,
+        config: &SlicerConfig,
+        need_layers: bool,
+        need_toolpaths: bool,
+    ) {
+        if self.is_busy() || (!need_layers && !need_toolpaths) {
+            return;
         }
-        self.dirty_selected_layers = false;
-        self.dirty_selected_layers_mesh = true;
-        self.dirty_slice = true;
-    }
 
-    pub fn recompute_toolpaths(&mut self, object_id: u64, config: &SlicerConfig) {
+        if need_layers {
+            self.dirty_selected_layers = false;
+        }
+        if need_toolpaths {
+            self.dirty_toolpaths = false;
+        }
+
         let lh = config.slicing.layer_height;
-        ffi::set_slice_layer_height(LayerHeightSpec {
+        let lh_spec = LayerHeightSpec {
             target_mm: lh.target_mm,
             min_mm: lh.min_mm,
             max_mm: lh.max_mm,
             first_layer_mm: lh.first_layer_mm,
             top_layer_mm: lh.top_layer_mm,
-        });
+        };
         let s = &config.slicing;
-        ffi::set_shell_path_spec(ShellPathSpec {
+        let shell_spec = ShellPathSpec {
             shell_thickness_mm: s.shell_thickness_mm,
             inner_wall_count: s.inner_wall_count,
             outer_wall_width: LineWidthSpec {
@@ -358,23 +369,60 @@ impl FieldVisualizationState {
             },
             solid_infill_pattern: s.solid_infill_pattern.as_u8(),
             min_extrusion_length_mm: s.min_extrusion_length_mm,
+        };
+        let adaptivity = self.adaptivity;
+
+        let task = IoTaskPool::get().spawn(async move {
+            ffi::set_slice_layer_height(lh_spec);
+            ffi::set_shell_path_spec(shell_spec);
+
+            let layers_res = if need_layers {
+                Some(ffi::select_slicing_isosurfaces(object_id, adaptivity))
+            } else {
+                None
+            };
+            let tp_res = if need_toolpaths {
+                Some(ffi::generate_object_shell_toolpaths(object_id, adaptivity))
+            } else {
+                None
+            };
+            (layers_res, tp_res)
         });
 
-        if self.cached_selected_layers.is_none() || self.dirty_selected_layers {
-            self.recompute_selected_layers(object_id, config);
+        self.pending_slicing_task = Some((object_id, task));
+    }
+
+    pub fn apply_slicing_task_result(
+        &mut self,
+        layers_opt: Option<SelectedIsosurfacesResult>,
+        toolpaths_opt: Option<ObjectToolpathsResult>,
+    ) {
+        if let Some(res) = layers_opt {
+            if res.valid && !res.layers.is_empty() {
+                let max_idx = res.layers.len() - 1;
+                self.selected_layer_min_idx = 0;
+                self.selected_layer_max_idx = max_idx;
+                self.cached_selected_layers = Some(res);
+            } else {
+                self.selected_layer_min_idx = 0;
+                self.selected_layer_max_idx = 0;
+                self.cached_selected_layers = None;
+            }
+            self.dirty_selected_layers_mesh = true;
+            self.dirty_slice = true;
         }
 
-        let res = ffi::generate_object_shell_toolpaths(object_id, self.adaptivity);
-        if res.valid && !res.layers.is_empty() {
-            if self.selected_layer_max_idx == 0 && res.layers.len() > 1 {
-                self.selected_layer_max_idx = res.layers.len() - 1;
+        if let Some(res) = toolpaths_opt {
+            if res.valid && !res.layers.is_empty() {
+                if self.selected_layer_max_idx == 0 && res.layers.len() > 1 {
+                    self.selected_layer_max_idx = res.layers.len() - 1;
+                }
+                self.cached_toolpaths = Some(res);
+            } else {
+                self.cached_toolpaths = None;
             }
-            self.cached_toolpaths = Some(res);
-        } else {
-            self.cached_toolpaths = None;
+            self.dirty_toolpaths_mesh = true;
         }
-        self.dirty_toolpaths = false;
-        self.dirty_toolpaths_mesh = true;
     }
 
     pub fn refresh_stats_for(&mut self, object_id: u64) {
@@ -478,13 +526,15 @@ pub fn sync_field_visualization_system(
         vis_state.dirty_slice = true;
 
         if let Some(id) = selected_id {
-            vis_state.available_fields = ffi::list_object_fields(id);
-            if !vis_state.available_fields.is_empty()
-                && !vis_state
-                    .available_fields
-                    .contains(&vis_state.active_field_name)
-            {
-                vis_state.active_field_name = vis_state.available_fields[0].clone();
+            if !vis_state.is_busy() {
+                vis_state.available_fields = ffi::list_object_fields(id);
+                if !vis_state.available_fields.is_empty()
+                    && !vis_state
+                        .available_fields
+                        .contains(&vis_state.active_field_name)
+                {
+                    vis_state.active_field_name = vis_state.available_fields[0].clone();
+                }
             }
         }
     }
@@ -523,7 +573,7 @@ pub fn sync_field_visualization_system(
         .copied()
         .unwrap_or(Transform::IDENTITY);
 
-    if vis_state.cached_stats.is_none() {
+    if vis_state.cached_stats.is_none() && !vis_state.is_busy() {
         vis_state.refresh_stats_for(obj_id);
     }
 
@@ -537,6 +587,19 @@ pub fn sync_field_visualization_system(
         }
     }
 
+    // Spawn background task for selected slicing isosurfaces and/or shell toolpaths when needed
+    let want_layers = vis_state.show_selected_layers && vis_state.dirty_selected_layers;
+    let want_toolpaths = vis_state.show_toolpaths && vis_state.dirty_toolpaths;
+    if (want_layers || want_toolpaths)
+        && !vis_state.is_busy()
+        && !vis_state.ui_pointer_down
+        && vis_state.available_fields.iter().any(|f| f == "eikonal")
+    {
+        let need_layers =
+            want_layers || (want_toolpaths && vis_state.cached_selected_layers.is_none());
+        vis_state.spawn_slicing_task(obj_id, &config, need_layers, want_toolpaths);
+    }
+
     // 2. Update 3D Isosurface Mesh in-place (opaque depth-tested mesh with per-vertex colors)
     if !vis_state.show_isosurface {
         if let Some(ent) = vis_state.isosurface_entity {
@@ -548,7 +611,7 @@ pub fn sync_field_visualization_system(
         vis_state.interior_triangles = 0;
         vis_state.exterior_triangles = 0;
         vis_state.contour_segments_local.clear();
-    } else if vis_state.dirty_isosurface {
+    } else if vis_state.dirty_isosurface && !vis_state.is_busy() {
         vis_state.dirty_isosurface = false;
 
         let iso_mesh = ffi::extract_field_isosurface(
@@ -685,14 +748,7 @@ pub fn sync_field_visualization_system(
         }
     }
 
-    // 2c. Update & Render Selected Slicing Isosurfaces Stack (3D Clipped Surfaces + Contours)
-    if vis_state.show_selected_layers
-        && vis_state.dirty_selected_layers
-        && vis_state.available_fields.iter().any(|f| f == "eikonal")
-    {
-        vis_state.recompute_selected_layers(obj_id, &config);
-    }
-
+    // 2c. Render Selected Slicing Isosurfaces Stack (3D Clipped Surfaces + Contours)
     if !vis_state.show_selected_layers || !vis_state.show_selected_layer_surfaces {
         if let Some(ent) = vis_state.selected_layers_entity {
             if let Ok((_, mut vis)) = selected_layers_query.get_mut(ent) {
@@ -863,14 +919,7 @@ pub fn sync_field_visualization_system(
         }
     }
 
-    // 2d. Update & Render Non-Planar Shell Toolpaths (3D Variable-Width Extruded Bead Mesh)
-    if vis_state.show_toolpaths
-        && vis_state.dirty_toolpaths
-        && vis_state.available_fields.iter().any(|f| f == "eikonal")
-    {
-        vis_state.recompute_toolpaths(obj_id, &config);
-    }
-
+    // 2d. Render Non-Planar Shell Toolpaths (3D Variable-Width Extruded Bead Mesh)
     if !vis_state.show_toolpaths {
         if let Some(ent) = vis_state.toolpaths_entity {
             if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
@@ -899,6 +948,31 @@ pub fn sync_field_visualization_system(
             if total > 0 {
                 let lo = min_idx.min(total - 1);
                 let hi = max_idx.min(total - 1).max(lo);
+
+                let mut est_pts = 0usize;
+                for (idx, layer_tp) in tp_res.layers.iter().enumerate() {
+                    let is_hovered = highlighted == Some(idx);
+                    let in_range = idx >= lo && idx <= hi;
+                    let matches_stride =
+                        ((idx - lo) % stride == 0) || idx == 0 || idx + 1 == total;
+                    if !is_hovered && (!in_range || !matches_stride) {
+                        continue;
+                    }
+                    for path in &layer_tp.paths {
+                        let visible = match path.feature_kind {
+                            0 => show_outer,
+                            1 => show_inner,
+                            _ => show_infill,
+                        };
+                        if visible && path.points.len() >= 2 {
+                            est_pts += path.points.len();
+                        }
+                    }
+                }
+                positions.reserve(est_pts * 4);
+                normals.reserve(est_pts * 4);
+                colors.reserve(est_pts * 4);
+                indices.reserve(est_pts * 24);
 
                 for (idx, layer_tp) in tp_res.layers.iter().enumerate() {
                     let is_hovered = highlighted == Some(idx);
@@ -1063,7 +1137,7 @@ pub fn sync_field_visualization_system(
                 *vis = Visibility::Hidden;
             }
         }
-    } else if vis_state.dirty_slice {
+    } else if vis_state.dirty_slice && !vis_state.is_busy() {
         vis_state.dirty_slice = false;
 
         let slice = ffi::sample_field_slice(
@@ -2336,6 +2410,114 @@ mod tests {
 
         ffi::set_spatial_orientation_hints(&[]);
         let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_testobj1_top_layers_have_unbroken_isosurfaces_and_toolpaths() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let stl_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Test Objects/TestObj1.stl");
+        let obj = crate::io::stl::load_stl_file(&stl_path).expect("Failed to load TestObj1.stl");
+
+        let cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        let layers = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(layers.valid);
+        assert!(tp.valid);
+        assert_eq!(layers.layers.len(), tp.layers.len());
+
+        // 1. Every selected isosurface layer must have non-empty mesh triangles AND non-empty toolpaths
+        for (i, (l, t)) in layers.layers.iter().zip(tp.layers.iter()).enumerate() {
+            assert!(
+                !l.indices.is_empty(),
+                "Layer #{i} (branch {}, iso={}) has empty mesh!",
+                l.branch_id,
+                l.isovalue
+            );
+            assert!(
+                !t.paths.is_empty(),
+                "Layer #{i} (branch {}, iso={}, top={}) produced 0 toolpaths!",
+                l.branch_id,
+                l.isovalue,
+                l.is_top_layer
+            );
+        }
+
+        // 2. Verify that the top layers on the single-span upper arch branches
+        // (Y in [-6.5, -3.5] and Y in [17.5, 22.5]) have unbroken mesh coverage across all
+        // 10 Y-bins (no missing middle sections) and toolpaths spanning their full Y extent.
+        let mut checked_top_arch_layers = 0usize;
+        for (i, (l, t)) in layers.layers.iter().zip(tp.layers.iter()).enumerate() {
+            let mut min_y = f32::MAX;
+            let mut max_y = f32::MIN;
+            let mut max_z = f32::MIN;
+            for v in &l.vertices {
+                min_y = min_y.min(v.y);
+                max_y = max_y.max(v.y);
+                max_z = max_z.max(v.z);
+            }
+
+            let is_b6_arch = min_y >= -6.7 && max_y <= -3.3 && max_z >= 13.5;
+            let is_b7_arch = min_y >= 17.3 && max_y <= 22.7 && max_z >= 13.5;
+            if is_b6_arch || is_b7_arch {
+                checked_top_arch_layers += 1;
+                let y_span = (max_y - min_y).max(0.1);
+                let mut bin_counts = [0usize; 10];
+                for tri in l.indices.chunks_exact(3) {
+                    let v0 = &l.vertices[tri[0] as usize];
+                    let v1 = &l.vertices[tri[1] as usize];
+                    let v2 = &l.vertices[tri[2] as usize];
+                    let cy = (v0.y + v1.y + v2.y) / 3.0;
+                    let b = (((cy - min_y) / y_span) * 10.0).floor().clamp(0.0, 9.0) as usize;
+                    bin_counts[b] += 1;
+                }
+                for (b, &cnt) in bin_counts.iter().enumerate() {
+                    assert!(
+                        cnt > 0,
+                        "Layer #{i} (branch {}, iso={:.3}, Y=[{:.2}..{:.2}]) is missing triangles in interior Y-bin {b}: {:?}",
+                        l.branch_id,
+                        l.isovalue,
+                        min_y,
+                        max_y,
+                        bin_counts
+                    );
+                }
+
+                let mut tp_min_y = f32::MAX;
+                let mut tp_max_y = f32::MIN;
+                for p in &t.paths {
+                    for pt in &p.points {
+                        tp_min_y = tp_min_y.min(pt.y);
+                        tp_max_y = tp_max_y.max(pt.y);
+                    }
+                }
+                assert!(
+                    (tp_max_y - tp_min_y) >= 0.75 * y_span,
+                    "Layer #{i} (branch {}, iso={:.3}) toolpath Y-span [{:.2}..{:.2}] does not cover mesh Y-span [{:.2}..{:.2}]",
+                    l.branch_id,
+                    l.isovalue,
+                    tp_min_y,
+                    tp_max_y,
+                    min_y,
+                    max_y
+                );
+            }
+        }
+        assert!(
+            checked_top_arch_layers >= 10,
+            "Expected at least 10 top arch layers on B6/B7 above Z=13.5, checked {checked_top_arch_layers}"
+        );
+
+        let _ = ffi::remove_cad_object(obj.object_id);
     }
 }
 

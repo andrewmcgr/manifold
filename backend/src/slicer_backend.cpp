@@ -72,6 +72,11 @@ struct ObjectRecord {
     std::map<std::string, openvdb::FloatGrid::Ptr> scalarFields;
     /// Solved 3D unit tool axis field \hat{a}(x) in bed coordinates.
     openvdb::Vec3SGrid::Ptr toolAxisGrid;
+    /// Cached selected slicing isosurfaces for this object's current Eikonal field & LayerHeightSpec.
+    mutable bool hasCachedSelectedLayers = false;
+    mutable float cachedSelectedLayersAdaptivity = -1.0f;
+    mutable LayerHeightSpec cachedSelectedLayersSpec{};
+    mutable SelectedIsosurfacesResult cachedSelectedLayers{};
 };
 
 void computeVertexBounds(
@@ -278,6 +283,7 @@ void buildObjectScalarFields(
 {
     rec.scalarFields.clear();
     rec.toolAxisGrid.reset();
+    rec.hasCachedSelectedLayers = false;
     if (rec.vertexBuffer.empty() || rec.indexBuffer.size() < 3) {
         return;
     }
@@ -864,6 +870,7 @@ bool SlicerBackend::recomputeObjectFields(
         if (it != impl_->objects.end()) {
             it->second.scalarFields = std::move(workingRec.scalarFields);
             it->second.toolAxisGrid = std::move(workingRec.toolAxisGrid);
+            it->second.hasCachedSelectedLayers = false;
             committed = true;
         }
     }
@@ -1556,6 +1563,17 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     const float hTarget = std::clamp(lh.target_mm, hMin, hMax);
     const float hFirst = (lh.first_layer_mm > 0.0f) ? std::max(lh.first_layer_mm, 0.01f) : hTarget;
     const float hTop = (lh.top_layer_mm > 0.0f) ? std::max(lh.top_layer_mm, 0.01f) : hTarget;
+
+    if (rec.hasCachedSelectedLayers &&
+        std::abs(rec.cachedSelectedLayersSpec.target_mm - lh.target_mm) < 1.0e-5f &&
+        std::abs(rec.cachedSelectedLayersSpec.min_mm - lh.min_mm) < 1.0e-5f &&
+        std::abs(rec.cachedSelectedLayersSpec.max_mm - lh.max_mm) < 1.0e-5f &&
+        std::abs(rec.cachedSelectedLayersSpec.first_layer_mm - lh.first_layer_mm) < 1.0e-5f &&
+        std::abs(rec.cachedSelectedLayersSpec.top_layer_mm - lh.top_layer_mm) < 1.0e-5f) {
+        return rec.cachedSelectedLayers;
+    }
+
+    setFieldProgress(true, 0.05f, "Selecting non-planar slicing isosurfaces...");
 
     // ------------------------------------------------------------------------
     // 1. Collect Active Interior Voxels, Compute |\nabla \tau|, & Exact \phi_sdf = 0 Bounds
@@ -2592,7 +2610,10 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     std::vector<SelectedLayerInfo> extractedLayers(numLayers);
     const bool multiBranch = (branches.size() > 1);
     const float outerFringeLimit = sdfBg - 1.75f * voxelSize;
-    const float clampedAdaptivity = std::clamp(adaptivity, 0.0f, 1.0f);
+    // Always extract slicing layers at full voxel resolution (adaptivity = 0.0) so
+    // OpenVDB never merges adaptive quads across the \phi_sdf = 0 boundary or introduces
+    // interior T-junction cracks on top-surface layers.
+    (void)adaptivity;
 
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, numLayers),
@@ -2621,7 +2642,19 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         }
                     }
                 }
-                return (b0 < 0);
+                if (b0 >= 0) {
+                    return false;
+                }
+                for (int dz = -2; dz <= 2; ++dz) {
+                    for (int dy = -2; dy <= 2; ++dy) {
+                        for (int dx = -2; dx <= 2; ++dx) {
+                            if (bAcc.getValue(c + openvdb::Coord(dx, dy, dz)) == targetBranch) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
             };
 
             auto lerpVertex = [](const RenderVertex& a, const RenderVertex& b, float t) -> RenderVertex {
@@ -2668,7 +2701,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     triangles,
                     quads,
                     static_cast<double>(pl.isovalue),
-                    static_cast<double>(clampedAdaptivity),
+                    0.0,
                     true);
 
                 if (!points.empty() && (!triangles.empty() || !quads.empty())) {
@@ -2855,6 +2888,12 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     for (auto& layer : extractedLayers) {
         result.layers.push_back(std::move(layer));
     }
+
+    rec.cachedSelectedLayers = result;
+    rec.cachedSelectedLayersAdaptivity = adaptivity;
+    rec.cachedSelectedLayersSpec = lh;
+    rec.hasCachedSelectedLayers = true;
+    setFieldProgress(false, 1.0f, "Selected slicing isosurfaces ready.");
     return result;
 }
 
@@ -2905,14 +2944,24 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         return empty;
     }
 
-    return generateShellToolpathsForLayers(
+    setFieldProgress(true, 0.08f, "Generating non-planar shell toolpaths...");
+    auto progressCb = [](std::size_t done, std::size_t total) {
+        const float frac = 0.08f + 0.90f * (static_cast<float>(done) / static_cast<float>(std::max<std::size_t>(1, total)));
+        const std::string msg = "Generating shell toolpaths (" + std::to_string(done) + "/" + std::to_string(total) + " layers)...";
+        setFieldProgress(true, frac, msg.c_str());
+    };
+
+    ObjectToolpathsResult res = generateShellToolpathsForLayers(
         selectedLayers,
         *sdfIt->second,
         *eikIt->second,
         rec.toolAxisGrid.get(),
         impl_->nozzleAxisBed,
         impl_->sliceLayerHeight,
-        impl_->shellPathSpec);
+        impl_->shellPathSpec,
+        progressCb);
+    setFieldProgress(false, 1.0f, "Shell toolpaths ready.");
+    return res;
 }
 
 NozzleBasis query_nozzle_frame(

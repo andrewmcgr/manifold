@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <queue>
 #include <unordered_map>
 #include <utility>
@@ -111,6 +113,14 @@ struct GridKey3DHash {
     }
 };
 
+inline GridKey3D toGridKey(const Vec3f& p, float invCell) noexcept {
+    return GridKey3D{
+        static_cast<std::int64_t>(std::llround(p.x * invCell)),
+        static_cast<std::int64_t>(std::llround(p.y * invCell)),
+        static_cast<std::int64_t>(std::llround(p.z * invCell)),
+    };
+}
+
 struct EdgeKey {
     std::uint32_t a = 0;
     std::uint32_t b = 0;
@@ -155,7 +165,7 @@ SurfaceVertex lerpSurfaceVertex(const SurfaceVertex& a, const SurfaceVertex& b, 
     out.layerHeightMm = a.layerHeightMm + t * (b.layerHeightMm - a.layerHeightMm);
     out.dRem = a.dRem + t * (b.dRem - a.dRem);
     out.remSpan = a.remSpan + t * (b.remSpan - a.remSpan);
-    out.onOuterBoundary = a.onOuterBoundary && b.onOuterBoundary;
+    out.onOuterBoundary = false;
     out.onInnerShellBoundary = a.onInnerShellBoundary && b.onInnerShellBoundary;
     return out;
 }
@@ -176,11 +186,7 @@ SurfaceMesh weldSurfaceMesh(const SurfaceMesh& inMesh, float weldEps = 1.0e-4f) 
 
     for (std::size_t i = 0; i < inMesh.verts.size(); ++i) {
         const auto& v = inMesh.verts[i];
-        const GridKey3D key{
-            static_cast<std::int64_t>(std::llround(v.pos.x * invCell)),
-            static_cast<std::int64_t>(std::llround(v.pos.y * invCell)),
-            static_cast<std::int64_t>(std::llround(v.pos.z * invCell)),
-        };
+        const GridKey3D key = toGridKey(v.pos, invCell);
         auto it = cellToVert.find(key);
         if (it != cellToVert.end()) {
             const std::uint32_t idx = it->second;
@@ -214,14 +220,14 @@ SurfaceMesh weldSurfaceMesh(const SurfaceMesh& inMesh, float weldEps = 1.0e-4f) 
     return out;
 }
 
-/// Subdivides triangles in the shell band once (4-to-1 midpoint split on triangles with edges
-/// longer than `maxEdgeLen`) so that contour extraction and medial-axis detection have
-/// fine resolution relative to the extrusion line width.
+/// Conformingly subdivides edges in the already-clipped shell mesh (both edges longer than
+/// `maxEdgeLen` and interior cross-strip edges connecting two outer-boundary vertices) so
+/// contour extraction and medial-axis detection have interior vertices even on 1-triangle-wide
+/// top-layer strips without introducing T-junctions.
 template <typename SdfSamplerFn>
 SurfaceMesh subdivideShellMesh(
     const SurfaceMesh& inMesh,
     float maxEdgeLen,
-    float shellSdfFloor,
     SdfSamplerFn&& sampleSdfAt)
 {
     if (inMesh.tris.empty() || inMesh.verts.empty()) {
@@ -232,12 +238,36 @@ SurfaceMesh subdivideShellMesh(
     const float maxEdgeSq = maxEdgeLen * maxEdgeLen;
 
     for (int pass = 0; pass < 2; ++pass) {
-        if (current.tris.size() > 35000) {
+        if (current.tris.size() > 6000) {
             break;
         }
-        bool anySplit = false;
+
+        std::unordered_map<EdgeKey, std::uint32_t, EdgeKeyHash> edgeTriCounts;
+        edgeTriCounts.reserve(current.tris.size() * 3);
+        for (const auto& tri : current.tris) {
+            edgeTriCounts[EdgeKey(tri[0], tri[1])] += 1;
+            edgeTriCounts[EdgeKey(tri[1], tri[2])] += 1;
+            edgeTriCounts[EdgeKey(tri[2], tri[0])] += 1;
+        }
+
         std::unordered_map<EdgeKey, std::uint32_t, EdgeKeyHash> edgeMidpoints;
         edgeMidpoints.reserve(current.tris.size() * 2);
+
+        auto shouldSplitEdge = [&](std::uint32_t u, std::uint32_t v) -> bool {
+            const float lenSq = lengthSq3(current.verts[v].pos - current.verts[u].pos);
+            if (lenSq > maxEdgeSq) {
+                return true;
+            }
+            // Always split interior edges whose endpoints both lie on the outer boundary
+            // (1-triangle-wide thin strips) so a centerline vertex is created inside the strip.
+            if (current.verts[u].onOuterBoundary && current.verts[v].onOuterBoundary) {
+                auto it = edgeTriCounts.find(EdgeKey(u, v));
+                if (it != edgeTriCounts.end() && it->second >= 2 && lenSq > 1.0e-5f) {
+                    return true;
+                }
+            }
+            return false;
+        };
 
         auto getMidpoint = [&](std::uint32_t u, std::uint32_t v) -> std::uint32_t {
             const EdgeKey key(u, v);
@@ -246,6 +276,12 @@ SurfaceMesh subdivideShellMesh(
                 return it->second;
             }
             SurfaceVertex mid = lerpSurfaceVertex(current.verts[u], current.verts[v], 0.5f);
+            auto cntIt = edgeTriCounts.find(key);
+            const bool isTrueOuterBoundaryEdge =
+                (cntIt != edgeTriCounts.end() && cntIt->second == 1) &&
+                current.verts[u].onOuterBoundary &&
+                current.verts[v].onOuterBoundary;
+            mid.onOuterBoundary = isTrueOuterBoundaryEdge;
             if (!mid.onOuterBoundary) {
                 const float wsSdf = sampleSdfAt(mid.pos);
                 mid.sdf = 0.5f * (mid.sdf + wsSdf);
@@ -260,23 +296,21 @@ SurfaceMesh subdivideShellMesh(
 
         std::vector<std::array<std::uint32_t, 3>> nextTris;
         nextTris.reserve(current.tris.size() * 2);
+        bool anySplit = false;
 
         for (const auto& tri : current.tris) {
             const std::uint32_t i0 = tri[0];
             const std::uint32_t i1 = tri[1];
             const std::uint32_t i2 = tri[2];
 
-            const float maxTriSdf = std::max({
-                current.verts[i0].sdf,
-                current.verts[i1].sdf,
-                current.verts[i2].sdf,
-            });
-            const float l01 = lengthSq3(current.verts[i1].pos - current.verts[i0].pos);
-            const float l12 = lengthSq3(current.verts[i2].pos - current.verts[i1].pos);
-            const float l20 = lengthSq3(current.verts[i0].pos - current.verts[i2].pos);
-            const float longestSq = std::max({l01, l12, l20});
+            const bool s01 = shouldSplitEdge(i0, i1);
+            const bool s12 = shouldSplitEdge(i1, i2);
+            const bool s20 = shouldSplitEdge(i2, i0);
+            const int splitCount = static_cast<int>(s01) + static_cast<int>(s12) + static_cast<int>(s20);
 
-            if (maxTriSdf >= shellSdfFloor && longestSq > maxEdgeSq) {
+            if (splitCount == 0) {
+                nextTris.push_back(tri);
+            } else if (splitCount == 3) {
                 anySplit = true;
                 const std::uint32_t m01 = getMidpoint(i0, i1);
                 const std::uint32_t m12 = getMidpoint(i1, i2);
@@ -285,8 +319,38 @@ SurfaceMesh subdivideShellMesh(
                 nextTris.push_back({m01, i1, m12});
                 nextTris.push_back({m20, m12, i2});
                 nextTris.push_back({m01, m12, m20});
+            } else if (splitCount == 2) {
+                anySplit = true;
+                // Rotate indices so edges (a, b) and (b, c) are the two split edges
+                std::uint32_t a = i0, b = i1, c = i2;
+                if (!s01) {
+                    a = i1; b = i2; c = i0;
+                } else if (!s12) {
+                    a = i2; b = i0; c = i1;
+                }
+                const std::uint32_t mab = getMidpoint(a, b);
+                const std::uint32_t mbc = getMidpoint(b, c);
+                nextTris.push_back({mab, b, mbc});
+                if (lengthSq3(current.verts[a].pos - current.verts[mbc].pos) <=
+                    lengthSq3(current.verts[c].pos - current.verts[mab].pos)) {
+                    nextTris.push_back({a, mab, mbc});
+                    nextTris.push_back({a, mbc, c});
+                } else {
+                    nextTris.push_back({a, mab, c});
+                    nextTris.push_back({mab, mbc, c});
+                }
             } else {
-                nextTris.push_back(tri);
+                // splitCount == 1: rotate indices so edge (a, b) is the single split edge
+                anySplit = true;
+                std::uint32_t a = i0, b = i1, c = i2;
+                if (s12) {
+                    a = i1; b = i2; c = i0;
+                } else if (s20) {
+                    a = i2; b = i0; c = i1;
+                }
+                const std::uint32_t mab = getMidpoint(a, b);
+                nextTris.push_back({a, mab, c});
+                nextTris.push_back({mab, b, c});
             }
         }
 
@@ -407,10 +471,122 @@ struct Segment3D {
     float widthB = 0.40f;
 };
 
+/// Intersects a single triangle `tri` with the iso-level `isoValue` of `fieldAtVert`,
+/// clipping against `validityAtVert >= minValidity`. Returns true and populates `outSeg` if valid.
+inline bool intersectTriangleWithIsoLevel(
+    const SurfaceMesh& mesh,
+    const std::array<std::uint32_t, 3>& tri,
+    const std::vector<float>& fieldAtVert,
+    float isoValue,
+    const std::vector<float>& validityAtVert,
+    float minValidity,
+    const std::vector<float>& widthAtVert,
+    Segment3D& outSeg)
+{
+    const std::uint32_t idx[3] = {tri[0], tri[1], tri[2]};
+    float fp[3] = {
+        fieldAtVert[idx[0]] - isoValue,
+        fieldAtVert[idx[1]] - isoValue,
+        fieldAtVert[idx[2]] - isoValue,
+    };
+
+    for (int k = 0; k < 3; ++k) {
+        if (std::abs(fp[k]) < 1.0e-7f) {
+            fp[k] = 1.0e-7f;
+        }
+    }
+
+    if ((fp[0] > 0.0f && fp[1] > 0.0f && fp[2] > 0.0f) ||
+        (fp[0] < 0.0f && fp[1] < 0.0f && fp[2] < 0.0f)) {
+        return false;
+    }
+
+    struct Crossing {
+        SurfaceVertex v{};
+        float validity = 0.0f;
+        float width = 0.40f;
+    };
+    Crossing crossings[3];
+    int numCrossings = 0;
+
+    for (int e = 0; e < 3; ++e) {
+        const int eNext = (e + 1) % 3;
+        if ((fp[e] < 0.0f && fp[eNext] > 0.0f) || (fp[e] > 0.0f && fp[eNext] < 0.0f)) {
+            const std::uint32_t u = idx[e];
+            const std::uint32_t v = idx[eNext];
+            const float denom = fp[eNext] - fp[e];
+            const float t = (std::abs(denom) > 1.0e-9f)
+                ? std::clamp(-fp[e] / denom, 0.0f, 1.0f)
+                : 0.5f;
+
+            Crossing c{};
+            c.v = lerpSurfaceVertex(mesh.verts[u], mesh.verts[v], t);
+            c.validity = validityAtVert[u] + t * (validityAtVert[v] - validityAtVert[u]);
+            c.width = widthAtVert[u] + t * (widthAtVert[v] - widthAtVert[u]);
+            crossings[numCrossings++] = c;
+            if (numCrossings == 2) {
+                break;
+            }
+        }
+    }
+
+    if (numCrossings != 2) {
+        return false;
+    }
+
+    Crossing c0 = crossings[0];
+    Crossing c1 = crossings[1];
+
+    // Orient segment consistently so that higher `field` is to the left (normal × tangent)
+    const Vec3f triNormal = normalize3(
+        cross3(
+            mesh.verts[idx[1]].pos - mesh.verts[idx[0]].pos,
+            mesh.verts[idx[2]].pos - mesh.verts[idx[0]].pos),
+        c0.v.normal);
+    const Vec3f gradDir =
+        (mesh.verts[idx[0]].pos * fp[0]) +
+        (mesh.verts[idx[1]].pos * fp[1]) +
+        (mesh.verts[idx[2]].pos * fp[2]);
+    const Vec3f segDir = c1.v.pos - c0.v.pos;
+    if (dot3(cross3(triNormal, segDir), gradDir) < 0.0f) {
+        std::swap(c0, c1);
+    }
+
+    // Clip segment against `validity >= minValidity`
+    const float val0 = c0.validity - minValidity;
+    const float val1 = c1.validity - minValidity;
+    if (val0 < 0.0f && val1 < 0.0f) {
+        return false;
+    }
+    if (val0 < 0.0f || val1 < 0.0f) {
+        const float denom = val1 - val0;
+        const float tClip = (std::abs(denom) > 1.0e-8f)
+            ? std::clamp(-val0 / denom, 0.0f, 1.0f)
+            : 0.5f;
+        Crossing cMid{};
+        cMid.v = lerpSurfaceVertex(c0.v, c1.v, tClip);
+        cMid.validity = minValidity;
+        cMid.width = c0.width + tClip * (c1.width - c0.width);
+        if (val0 < 0.0f) {
+            c0 = cMid;
+        } else {
+            c1 = cMid;
+        }
+    }
+
+    if (dist3(c0.v.pos, c1.v.pos) <= 1.0e-5f) {
+        return false;
+    }
+
+    outSeg.a = c0.v;
+    outSeg.b = c1.v;
+    outSeg.widthA = c0.width;
+    outSeg.widthB = c1.width;
+    return true;
+}
+
 /// Extracts iso-contour segments `field(x) = isoValue` across triangles of `mesh`,
 /// restricted to points where `validityField(x) >= minValidity`.
-/// If a contour segment within a triangle straddles `validityField(x) = minValidity`,
-/// it is clipped to the valid sub-segment so open walls terminate cleanly at the exact clearance boundary.
 std::vector<Segment3D> extractIsoContourSegments(
     const SurfaceMesh& mesh,
     const std::vector<float>& fieldAtVert,
@@ -424,110 +600,19 @@ std::vector<Segment3D> extractIsoContourSegments(
         return segments;
     }
 
+    Segment3D seg{};
     for (const auto& tri : mesh.tris) {
-        const std::uint32_t idx[3] = {tri[0], tri[1], tri[2]};
-        const float f[3] = {
-            fieldAtVert[idx[0]] - isoValue,
-            fieldAtVert[idx[1]] - isoValue,
-            fieldAtVert[idx[2]] - isoValue,
-        };
-
-        // Perturb exact zeros slightly to avoid degenerate vertex-on-contour double crossings
-        float fp[3] = {f[0], f[1], f[2]};
-        for (int k = 0; k < 3; ++k) {
-            if (std::abs(fp[k]) < 1.0e-7f) {
-                fp[k] = 1.0e-7f;
-            }
+        if (intersectTriangleWithIsoLevel(
+                mesh,
+                tri,
+                fieldAtVert,
+                isoValue,
+                validityAtVert,
+                minValidity,
+                widthAtVert,
+                seg)) {
+            segments.push_back(seg);
         }
-
-        if ((fp[0] > 0.0f && fp[1] > 0.0f && fp[2] > 0.0f) ||
-            (fp[0] < 0.0f && fp[1] < 0.0f && fp[2] < 0.0f)) {
-            continue;
-        }
-
-        struct Crossing {
-            SurfaceVertex v{};
-            float validity = 0.0f;
-            float width = 0.40f;
-        };
-        Crossing crossings[3];
-        int numCrossings = 0;
-
-        for (int e = 0; e < 3; ++e) {
-            const int eNext = (e + 1) % 3;
-            if ((fp[e] < 0.0f && fp[eNext] > 0.0f) || (fp[e] > 0.0f && fp[eNext] < 0.0f)) {
-                const std::uint32_t u = idx[e];
-                const std::uint32_t v = idx[eNext];
-                const float denom = fp[eNext] - fp[e];
-                const float t = (std::abs(denom) > 1.0e-9f)
-                    ? std::clamp(-fp[e] / denom, 0.0f, 1.0f)
-                    : 0.5f;
-
-                Crossing c{};
-                c.v = lerpSurfaceVertex(mesh.verts[u], mesh.verts[v], t);
-                c.validity = validityAtVert[u] + t * (validityAtVert[v] - validityAtVert[u]);
-                c.width = widthAtVert[u] + t * (widthAtVert[v] - widthAtVert[u]);
-                crossings[numCrossings++] = c;
-                if (numCrossings == 2) {
-                    break;
-                }
-            }
-        }
-
-        if (numCrossings != 2) {
-            continue;
-        }
-
-        Crossing c0 = crossings[0];
-        Crossing c1 = crossings[1];
-
-        // Orient segment consistently so that higher `field` is to the left (normal × tangent)
-        const Vec3f triNormal = normalize3(
-            cross3(
-                mesh.verts[idx[1]].pos - mesh.verts[idx[0]].pos,
-                mesh.verts[idx[2]].pos - mesh.verts[idx[0]].pos),
-            c0.v.normal);
-        const Vec3f gradDir =
-            (mesh.verts[idx[0]].pos * fp[0]) +
-            (mesh.verts[idx[1]].pos * fp[1]) +
-            (mesh.verts[idx[2]].pos * fp[2]);
-        const Vec3f segDir = c1.v.pos - c0.v.pos;
-        if (dot3(cross3(triNormal, segDir), gradDir) < 0.0f) {
-            std::swap(c0, c1);
-        }
-
-        // Clip segment against `validity >= minValidity`
-        const float val0 = c0.validity - minValidity;
-        const float val1 = c1.validity - minValidity;
-        if (val0 < 0.0f && val1 < 0.0f) {
-            continue;
-        }
-        if (val0 < 0.0f || val1 < 0.0f) {
-            const float denom = val1 - val0;
-            const float tClip = (std::abs(denom) > 1.0e-8f)
-                ? std::clamp(-val0 / denom, 0.0f, 1.0f)
-                : 0.5f;
-            Crossing cMid{};
-            cMid.v = lerpSurfaceVertex(c0.v, c1.v, tClip);
-            cMid.validity = minValidity;
-            cMid.width = c0.width + tClip * (c1.width - c0.width);
-            if (val0 < 0.0f) {
-                c0 = cMid;
-            } else {
-                c1 = cMid;
-            }
-        }
-
-        if (dist3(c0.v.pos, c1.v.pos) <= 1.0e-5f) {
-            continue;
-        }
-
-        Segment3D seg{};
-        seg.a = c0.v;
-        seg.b = c1.v;
-        seg.widthA = c0.width;
-        seg.widthB = c1.width;
-        segments.push_back(seg);
     }
 
     return segments;
@@ -545,7 +630,8 @@ struct RawChain {
     bool isClosed = false;
 };
 
-/// Stitches unordered 3D segments into maximal continuous open polylines or closed loops.
+/// Stitches unordered 3D segments into maximal continuous open polylines or closed loops
+/// in $O(N)$ time using a 3D spatial hash table over segment endpoints.
 std::vector<RawChain> stitchSegmentsIntoChains(
     const std::vector<Segment3D>& segments,
     float snapToleranceMm,
@@ -566,7 +652,62 @@ std::vector<RawChain> stitchSegmentsIntoChains(
         return {s.b.pos, s.b.nozzleAxis, s.widthB, s.b.layerHeightMm};
     };
 
+    const float cellSize = std::max(snapToleranceMm * 1.05f, 1.0e-3f);
+    const float invCell = 1.0f / cellSize;
     const float snapSq = snapToleranceMm * snapToleranceMm;
+
+    struct EndpointRef {
+        std::uint32_t segIdx = 0;
+        bool isEndB = false;
+    };
+
+    std::unordered_map<GridKey3D, std::vector<EndpointRef>, GridKey3DHash> endpointGrid;
+    endpointGrid.reserve(nSegs * 2);
+
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(nSegs); ++i) {
+        endpointGrid[toGridKey(segments[i].a.pos, invCell)].push_back({i, false});
+        endpointGrid[toGridKey(segments[i].b.pos, invCell)].push_back({i, true});
+    }
+
+    auto findClosestUnusedEndpoint = [&](const Vec3f& queryPos,
+                                         bool preferStartA,
+                                         std::size_t& outSegIdx,
+                                         bool& outReverseSeg) -> bool {
+        const GridKey3D baseKey = toGridKey(queryPos, invCell);
+        float bestDistSq = snapSq;
+        outSegIdx = nSegs;
+        outReverseSeg = false;
+
+        for (std::int64_t dz = -1; dz <= 1; ++dz) {
+            for (std::int64_t dy = -1; dy <= 1; ++dy) {
+                for (std::int64_t dx = -1; dx <= 1; ++dx) {
+                    const GridKey3D nbKey{baseKey.ix + dx, baseKey.iy + dy, baseKey.iz + dz};
+                    auto it = endpointGrid.find(nbKey);
+                    if (it == endpointGrid.end()) {
+                        continue;
+                    }
+                    for (const EndpointRef& ref : it->second) {
+                        if (used[ref.segIdx]) {
+                            continue;
+                        }
+                        const Vec3f& epPos =
+                            ref.isEndB ? segments[ref.segIdx].b.pos : segments[ref.segIdx].a.pos;
+                        const float dSq = lengthSq3(epPos - queryPos);
+                        if (dSq < bestDistSq) {
+                            bestDistSq = dSq;
+                            outSegIdx = ref.segIdx;
+                            // If `preferStartA` (extending forward from tail), matching `a` (`!isEndB`)
+                            // means `reverseSeg = false`; matching `b` (`isEndB`) means `reverseSeg = true`.
+                            // If `!preferStartA` (extending backward from head), matching `b` (`isEndB`)
+                            // means `reverseSeg = false`; matching `a` (`!isEndB`) means `reverseSeg = true`.
+                            outReverseSeg = preferStartA ? ref.isEndB : (!ref.isEndB);
+                        }
+                    }
+                }
+            }
+        }
+        return outSegIdx < nSegs;
+    };
 
     for (std::size_t seed = 0; seed < nSegs; ++seed) {
         if (used[seed]) {
@@ -581,30 +722,9 @@ std::vector<RawChain> stitchSegmentsIntoChains(
 
         // Extend forward from chain.back()
         while (true) {
-            const Vec3f tail = chain.back().pos;
             std::size_t bestIdx = nSegs;
             bool reverseSeg = false;
-            float bestDistSq = snapSq;
-
-            for (std::size_t i = 0; i < nSegs; ++i) {
-                if (used[i]) {
-                    continue;
-                }
-                const float dA = lengthSq3(segments[i].a.pos - tail);
-                if (dA < bestDistSq) {
-                    bestDistSq = dA;
-                    bestIdx = i;
-                    reverseSeg = false;
-                }
-                const float dB = lengthSq3(segments[i].b.pos - tail);
-                if (dB < bestDistSq) {
-                    bestDistSq = dB;
-                    bestIdx = i;
-                    reverseSeg = true;
-                }
-            }
-
-            if (bestIdx == nSegs) {
+            if (!findClosestUnusedEndpoint(chain.back().pos, true, bestIdx, reverseSeg)) {
                 break;
             }
             used[bestIdx] = true;
@@ -612,7 +732,6 @@ std::vector<RawChain> stitchSegmentsIntoChains(
             const RawChainPoint nextStart = reverseSeg ? makePtB(seg) : makePtA(seg);
             const RawChainPoint nextEnd = reverseSeg ? makePtA(seg) : makePtB(seg);
 
-            // Average shared endpoint attributes
             chain.back().pos = lerp3(chain.back().pos, nextStart.pos, 0.5f);
             chain.back().widthMm = 0.5f * (chain.back().widthMm + nextStart.widthMm);
             chain.back().heightMm = 0.5f * (chain.back().heightMm + nextStart.heightMm);
@@ -626,32 +745,12 @@ std::vector<RawChain> stitchSegmentsIntoChains(
         }
 
         // Extend backward from chain.front()
+        std::vector<RawChainPoint> revPrefix;
         while (true) {
-            const Vec3f head = chain.front().pos;
+            const Vec3f head = revPrefix.empty() ? chain.front().pos : revPrefix.back().pos;
             std::size_t bestIdx = nSegs;
             bool reverseSeg = false;
-            float bestDistSq = snapSq;
-
-            for (std::size_t i = 0; i < nSegs; ++i) {
-                if (used[i]) {
-                    continue;
-                }
-                // To prepend to `head`, we want the segment's end (`b`) to match `head`
-                const float dB = lengthSq3(segments[i].b.pos - head);
-                if (dB < bestDistSq) {
-                    bestDistSq = dB;
-                    bestIdx = i;
-                    reverseSeg = false;
-                }
-                const float dA = lengthSq3(segments[i].a.pos - head);
-                if (dA < bestDistSq) {
-                    bestDistSq = dA;
-                    bestIdx = i;
-                    reverseSeg = true;
-                }
-            }
-
-            if (bestIdx == nSegs) {
+            if (!findClosestUnusedEndpoint(head, false, bestIdx, reverseSeg)) {
                 break;
             }
             used[bestIdx] = true;
@@ -659,16 +758,23 @@ std::vector<RawChain> stitchSegmentsIntoChains(
             const RawChainPoint prevStart = reverseSeg ? makePtB(seg) : makePtA(seg);
             const RawChainPoint prevEnd = reverseSeg ? makePtA(seg) : makePtB(seg);
 
-            chain.front().pos = lerp3(chain.front().pos, prevEnd.pos, 0.5f);
-            chain.front().widthMm = 0.5f * (chain.front().widthMm + prevEnd.widthMm);
-            chain.front().heightMm = 0.5f * (chain.front().heightMm + prevEnd.heightMm);
-            chain.front().nozzleAxis = normalize3(
-                chain.front().nozzleAxis + prevEnd.nozzleAxis,
-                chain.front().nozzleAxis);
+            RawChainPoint& attachPt = revPrefix.empty() ? chain.front() : revPrefix.back();
+            attachPt.pos = lerp3(attachPt.pos, prevEnd.pos, 0.5f);
+            attachPt.widthMm = 0.5f * (attachPt.widthMm + prevEnd.widthMm);
+            attachPt.heightMm = 0.5f * (attachPt.heightMm + prevEnd.heightMm);
+            attachPt.nozzleAxis = normalize3(
+                attachPt.nozzleAxis + prevEnd.nozzleAxis,
+                attachPt.nozzleAxis);
 
-            if (dist3(prevStart.pos, chain.front().pos) > 1.0e-5f) {
-                chain.insert(chain.begin(), prevStart);
+            if (dist3(prevStart.pos, attachPt.pos) > 1.0e-5f) {
+                revPrefix.push_back(prevStart);
             }
+        }
+
+        if (!revPrefix.empty()) {
+            std::reverse(revPrefix.begin(), revPrefix.end());
+            revPrefix.insert(revPrefix.end(), chain.begin(), chain.end());
+            chain = std::move(revPrefix);
         }
 
         if (chain.size() < 2) {
@@ -679,7 +785,6 @@ std::vector<RawChain> stitchSegmentsIntoChains(
         const float endDist = dist3(chain.front().pos, chain.back().pos);
         if (chain.size() >= 3 && endDist <= closeLoopToleranceMm) {
             rc.isClosed = true;
-            // Weld first and last points if they are nearly identical
             if (endDist <= 0.05f * closeLoopToleranceMm && chain.size() >= 4) {
                 chain.front().pos = lerp3(chain.front().pos, chain.back().pos, 0.5f);
                 chain.front().widthMm = 0.5f * (chain.front().widthMm + chain.back().widthMm);
@@ -696,7 +801,8 @@ std::vector<RawChain> stitchSegmentsIntoChains(
 }
 
 /// Converts a `RawChain` into an `ExtrusionPath` if its continuous 3D arc length is at least
-/// `minExtrusionLengthMm`. Also smooths/orthogonalizes local nozzle frames along the path.
+/// `minExtrusionLengthMm`. Also simplifies redundant collinear micro-vertices while preserving
+/// conformal 3D surface geometry and variable line widths.
 bool finalizeExtrusionPath(
     const RawChain& raw,
     std::uint8_t featureKind,
@@ -733,10 +839,8 @@ bool finalizeExtrusionPath(
     outPath.points.clear();
     outPath.points.reserve(raw.pts.size());
 
-    for (std::size_t i = 0; i < raw.pts.size(); ++i) {
-        const auto& pt = raw.pts[i];
+    auto toToolpathPoint = [](const RawChainPoint& pt) -> ToolpathPoint {
         const Vec3f zNozzle = normalize3(pt.nozzleAxis, {0.0f, 0.0f, 1.0f});
-
         ToolpathPoint tp{};
         tp.x = pt.pos.x;
         tp.y = pt.pos.y;
@@ -746,13 +850,43 @@ bool finalizeExtrusionPath(
         tp.nz = zNozzle.z;
         tp.width_mm = pt.widthMm;
         tp.height_mm = pt.heightMm;
-        outPath.points.push_back(tp);
+        return tp;
+    };
+
+    const float maxMergedSegLen = 0.55f;
+    outPath.points.push_back(toToolpathPoint(raw.pts.front()));
+    RawChainPoint lastKept = raw.pts.front();
+
+    for (std::size_t i = 1; i + 1 < raw.pts.size(); ++i) {
+        const RawChainPoint& curr = raw.pts[i];
+        const RawChainPoint& next = raw.pts[i + 1];
+
+        const float spanLen = dist3(lastKept.pos, next.pos);
+        bool keep = (spanLen > maxMergedSegLen) ||
+            (std::abs(curr.widthMm - lastKept.widthMm) > 0.015f) ||
+            (dot3(curr.nozzleAxis, lastKept.nozzleAxis) < 0.9994f);
+
+        if (!keep && spanLen > 1.0e-5f) {
+            const Vec3f chordDir = (next.pos - lastKept.pos) * (1.0f / spanLen);
+            const Vec3f rel = curr.pos - lastKept.pos;
+            const Vec3f perp = rel - (chordDir * dot3(rel, chordDir));
+            if (lengthSq3(perp) > (0.010f * 0.010f)) {
+                keep = true;
+            }
+        }
+
+        if (keep) {
+            outPath.points.push_back(toToolpathPoint(curr));
+            lastKept = curr;
+        }
     }
 
+    outPath.points.push_back(toToolpathPoint(raw.pts.back()));
     return true;
 }
 
-/// Generates `Monotonic` flood-fill paths on the remaining 3D shell submesh `infillMesh`.
+/// Generates `Monotonic` flood-fill paths on the remaining 3D shell submesh `infillMesh`
+/// using single-pass triangle-to-scanline bucketing.
 void generateMonotonicInfillOnSubmesh(
     const SurfaceMesh& infillMesh,
     std::uint32_t layerIndex,
@@ -898,7 +1032,42 @@ void generateMonotonicInfillOnSubmesh(
         const std::vector<float> allValid(islandMesh.verts.size(), 1.0f);
         const std::vector<float> constWidth(islandMesh.verts.size(), lineWidthMm);
 
-        // Extract ordered scanlines for each monotonic step m = 0 .. numLines - 1
+        // Single-pass triangle-to-scanline bucketing: each triangle only tests the scanlines
+        // `m` that fall within its `[triUMin, triUMax]` interval!
+        std::vector<std::vector<Segment3D>> rawScanSegs(static_cast<std::size_t>(numLines));
+        Segment3D seg{};
+
+        for (const auto& tri : islandMesh.tris) {
+            const float u0 = uCoord[tri[0]];
+            const float u1 = uCoord[tri[1]];
+            const float u2 = uCoord[tri[2]];
+            const float triUMin = std::min({u0, u1, u2});
+            const float triUMax = std::max({u0, u1, u2});
+
+            const int mLo = std::max(
+                0,
+                static_cast<int>(std::ceil((triUMin - startU) / lineWidthMm - 1.0e-5f)));
+            const int mHi = std::min(
+                numLines - 1,
+                static_cast<int>(std::floor((triUMax - startU) / lineWidthMm + 1.0e-5f)));
+
+            for (int m = mLo; m <= mHi; ++m) {
+                const float uIso = startU + static_cast<float>(m) * lineWidthMm;
+                if (intersectTriangleWithIsoLevel(
+                        islandMesh,
+                        tri,
+                        uCoord,
+                        uIso,
+                        allValid,
+                        0.0f,
+                        constWidth,
+                        seg)) {
+                    rawScanSegs[static_cast<std::size_t>(m)].push_back(seg);
+                }
+            }
+        }
+
+        // Stitch each scanline's segments into ordered 3D scanline chains
         struct ScanSegment {
             RawChain chain;
             float vStart = 0.0f;
@@ -908,15 +1077,11 @@ void generateMonotonicInfillOnSubmesh(
         std::vector<std::vector<ScanSegment>> scanlines(static_cast<std::size_t>(numLines));
 
         for (int m = 0; m < numLines; ++m) {
-            const float uIso = startU + static_cast<float>(m) * lineWidthMm;
-            const auto segs = extractIsoContourSegments(
-                islandMesh,
-                uCoord,
-                uIso,
-                allValid,
-                0.0f,
-                constWidth);
-            auto chains = stitchSegmentsIntoChains(segs, 0.05f * lineWidthMm, 0.0f);
+            const auto& segs = rawScanSegs[static_cast<std::size_t>(m)];
+            if (segs.empty()) {
+                continue;
+            }
+            auto chains = stitchSegmentsIntoChains(segs, 0.06f * lineWidthMm, 0.0f);
             for (auto& ch : chains) {
                 if (ch.pts.size() < 2) {
                     continue;
@@ -973,7 +1138,6 @@ void generateMonotonicInfillOnSubmesh(
                         if (nextLineSegs[k].consumed) {
                             continue;
                         }
-                        // Connect at the corresponding side (+v if `forwardAlongV`, -v otherwise)
                         const Vec3f candidateAttach = forwardAlongV
                             ? nextLineSegs[k].chain.pts.back().pos
                             : nextLineSegs[k].chain.pts.front().pos;
@@ -1023,7 +1187,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const openvdb::Vec3SGrid* toolAxisGrid,
     const std::array<float, 3>& defaultNozzleAxisBed,
     const LayerHeightSpec& layerHeightSpec,
-    const ShellPathSpec& spec)
+    const ShellPathSpec& spec,
+    const std::function<void(std::size_t, std::size_t)>& progressCb)
 {
     ObjectToolpathsResult result{};
     result.valid = false;
@@ -1053,6 +1218,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
     const std::size_t numLayers = selectedLayers.layers.size();
     std::vector<LayerToolpaths> perLayerResults(numLayers);
+    std::atomic<std::size_t> completedLayers{0};
 
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, numLayers),
@@ -1065,12 +1231,18 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
             openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
                 eikSampler(eikAcc, eikGrid.transform());
 
+            using ToolAcc = openvdb::Vec3SGrid::ConstAccessor;
+            using ToolSampler = openvdb::tools::GridSampler<ToolAcc, openvdb::tools::BoxSampler>;
+            std::unique_ptr<ToolAcc> tAccPtr;
+            std::unique_ptr<ToolSampler> tSamplerPtr;
+            if (toolAxisGrid != nullptr) {
+                tAccPtr = std::make_unique<ToolAcc>(toolAxisGrid->getConstAccessor());
+                tSamplerPtr = std::make_unique<ToolSampler>(*tAccPtr, toolAxisGrid->transform());
+            }
+
             auto sampleNozzleAxis = [&](const Vec3f& p) -> Vec3f {
-                if (toolAxisGrid != nullptr) {
-                    auto tAcc = toolAxisGrid->getConstAccessor();
-                    openvdb::tools::GridSampler<openvdb::Vec3SGrid::ConstAccessor, openvdb::tools::BoxSampler>
-                        tSampler(tAcc, toolAxisGrid->transform());
-                    const openvdb::Vec3s v = tSampler.wsSample(openvdb::Vec3d(p.x, p.y, p.z));
+                if (tSamplerPtr != nullptr) {
+                    const openvdb::Vec3s v = tSamplerPtr->wsSample(openvdb::Vec3d(p.x, p.y, p.z));
                     const Vec3f raw{v.x(), v.y(), v.z()};
                     if (lengthSq3(raw) > 1.0e-4f) {
                         return normalize3(raw, fallbackNozzle);
@@ -1103,6 +1275,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
                 if (layerInfo.vertices.empty() || layerInfo.indices.size() < 3) {
                     perLayerResults[layerIdx] = std::move(layerOut);
+                    const std::size_t done = completedLayers.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (progressCb && (done % 4 == 0 || done == numLayers)) {
+                        progressCb(done, numLayers);
+                    }
                     continue;
                 }
 
@@ -1113,16 +1289,15 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 baseMesh.verts.reserve(layerInfo.vertices.size());
                 const float meanLayerH = std::max(0.02f, layerInfo.mean_thickness_mm);
 
+                // First sample only SDF on baseMesh so we can clip out the sparse interior core
+                // before sampling toolAxis / eikGradNorm or subdividing triangles!
                 for (const auto& rv : layerInfo.vertices) {
                     SurfaceVertex sv{};
                     sv.pos = {rv.x, rv.y, rv.z};
                     sv.normal = normalize3({rv.nx, rv.ny, rv.nz}, fallbackNozzle);
-                    sv.nozzleAxis = sampleNozzleAxis(sv.pos);
+                    sv.nozzleAxis = fallbackNozzle;
                     sv.sdf = sampleSdf(sv.pos);
-                    const float gradNorm = sampleEikGradNorm(sv.pos);
-                    sv.layerHeightMm = (gradNorm > 0.25f)
-                        ? std::clamp(meanLayerH / gradNorm, hMin, hMax)
-                        : meanLayerH;
+                    sv.layerHeightMm = meanLayerH;
                     sv.onOuterBoundary = false;
                     sv.onInnerShellBoundary = false;
                     baseMesh.verts.push_back(sv);
@@ -1140,6 +1315,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 baseMesh = weldSurfaceMesh(baseMesh, 1.0e-4f);
                 if (baseMesh.tris.empty()) {
                     perLayerResults[layerIdx] = std::move(layerOut);
+                    const std::size_t done = completedLayers.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (progressCb && (done % 4 == 0 || done == numLayers)) {
+                        progressCb(done, numLayers);
+                    }
                     continue;
                 }
 
@@ -1170,8 +1349,6 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                 }
 
-                // If the entire layer is a small corner cap where boundary edges had slightly lower SDF,
-                // mark all boundary edges as outer boundary so the cap still generates its outer perimeter.
                 if (!anyOuterBoundary) {
                     for (const auto& [ek, count] : edgeTriCounts) {
                         if (count == 1) {
@@ -1198,21 +1375,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                 }
 
-                // Refine triangles within the shell band so line-width offsets have sub-bead resolution
-                const float targetRefEdge = std::clamp(
-                    0.55f * std::min({outerW.target_mm, innerW.target_mm, shellThicknessMm}),
-                    0.18f,
-                    0.45f);
-                baseMesh = subdivideShellMesh(
-                    baseMesh,
-                    targetRefEdge,
-                    -shellThicknessMm - 1.5f * voxelSize,
-                    [&](const Vec3f& p) {
-                        return std::min(-1.0e-4f, sampleSdf(p) - sdfZeroShift);
-                    });
-
                 // ------------------------------------------------------------
                 // 2. Clip S_k to the Outer Shell Domain (-T_shell <= \phi_sdf <= 0)
+                //    BEFORE subdividing or sampling nozzleAxis / eikGradNorm!
                 // ------------------------------------------------------------
                 std::vector<float> sdfDepth(baseMesh.verts.size(), 0.0f);
                 for (std::size_t i = 0; i < baseMesh.verts.size(); ++i) {
@@ -1227,7 +1392,32 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
                 if (shellMesh.tris.empty() || shellMesh.verts.empty()) {
                     perLayerResults[layerIdx] = std::move(layerOut);
+                    const std::size_t done = completedLayers.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (progressCb && (done % 4 == 0 || done == numLayers)) {
+                        progressCb(done, numLayers);
+                    }
                     continue;
+                }
+
+                // Subdivide the already-clipped shell strip so narrow top-layer strips have interior vertices
+                const float targetRefEdge = std::clamp(
+                    0.55f * std::min({outerW.target_mm, innerW.target_mm, shellThicknessMm}),
+                    0.18f,
+                    0.35f);
+                shellMesh = subdivideShellMesh(
+                    shellMesh,
+                    targetRefEdge,
+                    [&](const Vec3f& p) {
+                        return std::min(-1.0e-4f, sampleSdf(p) - sdfZeroShift);
+                    });
+
+                // Sample 5/6-axis nozzle orientation and local layer height only on the surviving shell vertices
+                for (auto& sv : shellMesh.verts) {
+                    sv.nozzleAxis = sampleNozzleAxis(sv.pos);
+                    const float gradNorm = sampleEikGradNorm(sv.pos);
+                    sv.layerHeightMm = (gradNorm > 0.25f)
+                        ? std::clamp(meanLayerH / gradNorm, hMin, hMax)
+                        : meanLayerH;
                 }
 
                 // ------------------------------------------------------------
@@ -1235,7 +1425,12 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // ------------------------------------------------------------
                 const std::size_t nV = shellMesh.verts.size();
                 std::vector<std::vector<std::uint32_t>> adj(nV);
+                std::unordered_map<EdgeKey, std::uint32_t, EdgeKeyHash> shellEdgeTriCounts;
+                shellEdgeTriCounts.reserve(shellMesh.tris.size() * 3);
                 for (const auto& tri : shellMesh.tris) {
+                    shellEdgeTriCounts[EdgeKey(tri[0], tri[1])] += 1;
+                    shellEdgeTriCounts[EdgeKey(tri[1], tri[2])] += 1;
+                    shellEdgeTriCounts[EdgeKey(tri[2], tri[0])] += 1;
                     for (int k = 0; k < 3; ++k) {
                         const std::uint32_t u = tri[k];
                         const std::uint32_t v = tri[(k + 1) % 3];
@@ -1244,7 +1439,19 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                 }
 
-                // Compute inward tangent normal at each outer boundary vertex
+                // Ensure only vertices belonging to true outer boundary edges (incident to 1 triangle)
+                // are marked as `onOuterBoundary`, and collect exact outer boundary segments.
+                struct OuterSegment {
+                    Vec3f a;
+                    Vec3f b;
+                    Vec3f ab;
+                    Vec3f inwardNormal;
+                    float abLenSq;
+                };
+                std::vector<OuterSegment> outerSegments;
+                outerSegments.reserve(nV / 2 + 8);
+
+                std::vector<bool> trueOuterVert(nV, false);
                 std::vector<Vec3f> outerInwardNormal(nV, {0.0f, 0.0f, 0.0f});
                 for (const auto& tri : shellMesh.tris) {
                     for (int k = 0; k < 3; ++k) {
@@ -1252,47 +1459,158 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         const std::uint32_t v = tri[(k + 1) % 3];
                         const std::uint32_t w = tri[(k + 2) % 3];
                         if (shellMesh.verts[u].onOuterBoundary && shellMesh.verts[v].onOuterBoundary) {
-                            const Vec3f edgeDir = normalize3(shellMesh.verts[v].pos - shellMesh.verts[u].pos);
-                            const Vec3f toInterior = shellMesh.verts[w].pos - shellMesh.verts[u].pos;
-                            const Vec3f inward = normalize3(
-                                toInterior - (edgeDir * dot3(toInterior, edgeDir)),
-                                {0.0f, 0.0f, 0.0f});
-                            outerInwardNormal[u] = outerInwardNormal[u] + inward;
-                            outerInwardNormal[v] = outerInwardNormal[v] + inward;
+                            auto cntIt = shellEdgeTriCounts.find(EdgeKey(u, v));
+                            if (cntIt != shellEdgeTriCounts.end() && cntIt->second == 1) {
+                                trueOuterVert[u] = true;
+                                trueOuterVert[v] = true;
+                                const Vec3f a = shellMesh.verts[u].pos;
+                                const Vec3f b = shellMesh.verts[v].pos;
+                                const Vec3f ab = b - a;
+                                const Vec3f edgeDir = normalize3(ab);
+                                const Vec3f toInterior = shellMesh.verts[w].pos - a;
+                                const Vec3f inward = normalize3(
+                                    toInterior - (edgeDir * dot3(toInterior, edgeDir)),
+                                    {1.0f, 0.0f, 0.0f});
+                                outerInwardNormal[u] = outerInwardNormal[u] + inward;
+                                outerInwardNormal[v] = outerInwardNormal[v] + inward;
+                                outerSegments.push_back(OuterSegment{
+                                    a,
+                                    b,
+                                    ab,
+                                    inward,
+                                    lengthSq3(ab),
+                                });
+                            }
                         }
                     }
                 }
                 for (std::size_t i = 0; i < nV; ++i) {
-                    if (shellMesh.verts[i].onOuterBoundary) {
+                    shellMesh.verts[i].onOuterBoundary = trueOuterVert[i];
+                    if (trueOuterVert[i]) {
                         outerInwardNormal[i] = normalize3(outerInwardNormal[i], {1.0f, 0.0f, 0.0f});
                     }
                 }
 
-                // Multi-source Dijkstra from \Gamma_outer (\phi_sdf = 0) across \mathcal{M}_{shell, k}
+                if (outerSegments.empty()) {
+                    perLayerResults[layerIdx] = std::move(layerOut);
+                    const std::size_t done = completedLayers.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (progressCb && (done % 4 == 0 || done == numLayers)) {
+                        progressCb(done, numLayers);
+                    }
+                    continue;
+                }
+
+                // Build a 3D spatial hash grid of outer boundary segments so every vertex can
+                // query exact point-to-segment distance `dOuter` and opposing-wall clearance `rMedial`.
+                const float medialCellSize = std::max(0.6f, 1.5f * shellThicknessMm);
+                const float invMedialCell = 1.0f / medialCellSize;
+                std::unordered_map<GridKey3D, std::vector<std::uint32_t>, GridKey3DHash> edgeGrid;
+                edgeGrid.reserve(outerSegments.size() * 2 + 8);
+                for (std::size_t sIdx = 0; sIdx < outerSegments.size(); ++sIdx) {
+                    const auto& seg = outerSegments[sIdx];
+                    const Vec3f minPt{
+                        std::min(seg.a.x, seg.b.x),
+                        std::min(seg.a.y, seg.b.y),
+                        std::min(seg.a.z, seg.b.z)};
+                    const Vec3f maxPt{
+                        std::max(seg.a.x, seg.b.x),
+                        std::max(seg.a.y, seg.b.y),
+                        std::max(seg.a.z, seg.b.z)};
+                    const GridKey3D kMin = toGridKey(minPt, invMedialCell);
+                    const GridKey3D kMax = toGridKey(maxPt, invMedialCell);
+                    for (std::int64_t iz = kMin.iz; iz <= kMax.iz; ++iz) {
+                        for (std::int64_t iy = kMin.iy; iy <= kMax.iy; ++iy) {
+                            for (std::int64_t ix = kMin.ix; ix <= kMax.ix; ++ix) {
+                                edgeGrid[GridKey3D{ix, iy, iz}].push_back(static_cast<std::uint32_t>(sIdx));
+                            }
+                        }
+                    }
+                }
+
                 const float kInf = 1.0e9f;
                 std::vector<float> dOuter(nV, kInf);
-                std::vector<std::uint32_t> closestOuterSrc(nV, 0);
+                std::vector<Vec3f> closestOuterNormal(nV, {1.0f, 0.0f, 0.0f});
+                std::vector<float> rMedial(nV, shellThicknessMm * 4.0f);
 
                 using QueueItem = std::pair<float, std::uint32_t>;
                 std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> pq;
 
-                std::vector<std::uint32_t> outerBoundaryVerts;
-                outerBoundaryVerts.reserve(nV / 4 + 8);
+                struct CandSeg {
+                    std::uint32_t segIdx;
+                    float dist;
+                    Vec3f foot;
+                };
+                std::vector<CandSeg> cands;
+                cands.reserve(64);
 
                 for (std::size_t i = 0; i < nV; ++i) {
-                    if (shellMesh.verts[i].onOuterBoundary) {
-                        dOuter[i] = 0.0f;
-                        closestOuterSrc[i] = static_cast<std::uint32_t>(i);
-                        pq.push({0.0f, static_cast<std::uint32_t>(i)});
-                        outerBoundaryVerts.push_back(static_cast<std::uint32_t>(i));
+                    const Vec3f p = shellMesh.verts[i].pos;
+                    const GridKey3D baseKey = toGridKey(p, invMedialCell);
+                    cands.clear();
+
+                    float bestDist = shellMesh.verts[i].onOuterBoundary ? 0.0f : kInf;
+                    Vec3f bestFoot = p;
+                    Vec3f bestNormal = shellMesh.verts[i].onOuterBoundary
+                        ? outerInwardNormal[i]
+                        : Vec3f{1.0f, 0.0f, 0.0f};
+
+                    for (std::int64_t dz = -1; dz <= 1; ++dz) {
+                        for (std::int64_t dy = -1; dy <= 1; ++dy) {
+                            for (std::int64_t dx = -1; dx <= 1; ++dx) {
+                                const GridKey3D nbKey{baseKey.ix + dx, baseKey.iy + dy, baseKey.iz + dz};
+                                auto it = edgeGrid.find(nbKey);
+                                if (it == edgeGrid.end()) {
+                                    continue;
+                                }
+                                for (const std::uint32_t sIdx : it->second) {
+                                    const auto& seg = outerSegments[sIdx];
+                                    const float tProj = (seg.abLenSq > 1.0e-12f)
+                                        ? std::clamp(dot3(p - seg.a, seg.ab) / seg.abLenSq, 0.0f, 1.0f)
+                                        : 0.5f;
+                                    const Vec3f foot = seg.a + seg.ab * tProj;
+                                    const float d = dist3(p, foot);
+                                    cands.push_back(CandSeg{sIdx, d, foot});
+                                    if (!shellMesh.verts[i].onOuterBoundary && d < bestDist) {
+                                        bestDist = d;
+                                        bestFoot = foot;
+                                        bestNormal = seg.inwardNormal;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (bestDist < kInf * 0.5f) {
+                        dOuter[i] = bestDist;
+                        closestOuterNormal[i] = bestNormal;
+                        pq.push({bestDist, static_cast<std::uint32_t>(i)});
+
+                        const Vec3f v1 = p - bestFoot;
+                        float minOppDist = kInf;
+                        for (const auto& c : cands) {
+                            if (c.dist >= minOppDist) {
+                                continue;
+                            }
+                            const auto& seg = outerSegments[c.segIdx];
+                            const float nDot = dot3(bestNormal, seg.inwardNormal);
+                            const Vec3f v2 = p - c.foot;
+                            const bool opposingRay =
+                                (bestDist > 1.0e-4f && c.dist > 1.0e-4f) &&
+                                (dot3(v1, v2) < -0.20f * bestDist * c.dist);
+                            const bool opposingBoundary =
+                                (nDot < -0.15f) &&
+                                (c.dist > 1.0e-3f || !shellMesh.verts[i].onOuterBoundary);
+                            if (opposingBoundary || opposingRay) {
+                                minOppDist = c.dist;
+                            }
+                        }
+                        if (minOppDist < kInf * 0.5f) {
+                            rMedial[i] = 0.5f * (bestDist + minOppDist);
+                        }
                     }
                 }
 
-                if (outerBoundaryVerts.empty()) {
-                    perLayerResults[layerIdx] = std::move(layerOut);
-                    continue;
-                }
-
+                // Dijkstra fallback for any vertices beyond the 3x3x3 spatial grid neighborhood
                 while (!pq.empty()) {
                     const auto [dCurr, u] = pq.top();
                     pq.pop();
@@ -1303,31 +1621,23 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         const float wEdge = dist3(shellMesh.verts[u].pos, shellMesh.verts[v].pos);
                         if (dCurr + wEdge < dOuter[v]) {
                             dOuter[v] = dCurr + wEdge;
-                            closestOuterSrc[v] = closestOuterSrc[u];
+                            closestOuterNormal[v] = closestOuterNormal[u];
                             pq.push({dOuter[v], v});
                         }
                     }
                 }
 
-                // Smooth `dOuter` slightly with the continuous 3D SDF depth (scaled by surface gradient)
-                // so iso-contours of `dOuter` are smooth sub-voxel curves without piecewise graph jaggedness
-                std::vector<float> dOuterSmooth = dOuter;
-                for (int iter = 0; iter < 2; ++iter) {
-                    std::vector<float> nextD = dOuterSmooth;
-                    for (std::size_t i = 0; i < nV; ++i) {
-                        if (shellMesh.verts[i].onOuterBoundary || adj[i].empty()) {
-                            continue;
+                // Also detect medial shock edges directly on the mesh where adjacent vertices
+                // originate from opposing outer boundary normals
+                for (std::size_t i = 0; i < nV; ++i) {
+                    for (std::uint32_t nb : adj[i]) {
+                        if (dot3(closestOuterNormal[i], closestOuterNormal[nb]) < -0.15f) {
+                            const float edgeLen = dist3(shellMesh.verts[i].pos, shellMesh.verts[nb].pos);
+                            const float shockHalfSpan = 0.5f * (dOuter[i] + dOuter[nb] + edgeLen);
+                            rMedial[i] = std::min(rMedial[i], shockHalfSpan);
                         }
-                        float sumNb = 0.0f;
-                        for (std::uint32_t nb : adj[i]) {
-                            sumNb += dOuterSmooth[nb];
-                        }
-                        const float avgNb = sumNb / static_cast<float>(adj[i].size());
-                        nextD[i] = 0.70f * dOuterSmooth[i] + 0.30f * avgNb;
                     }
-                    dOuterSmooth = std::move(nextD);
                 }
-                dOuter = std::move(dOuterSmooth);
 
                 // Multi-source Dijkstra from \Gamma_inner (\phi_sdf = -T_shell) to measure remaining shell distance
                 std::vector<float> dInner(nV, kInf);
@@ -1356,52 +1666,6 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                 }
 
-                // Compute medial-axis half-span R_medial(v) from opposing outer boundary segments
-                std::vector<float> rMedial(nV, shellThicknessMm * 4.0f);
-                const std::size_t bStride = std::max<std::size_t>(1, outerBoundaryVerts.size() / 160);
-
-                for (std::size_t i = 0; i < nV; ++i) {
-                    const std::uint32_t srcIdx = closestOuterSrc[i];
-                    const Vec3f srcPos = shellMesh.verts[srcIdx].pos;
-                    const Vec3f srcNormal = outerInwardNormal[srcIdx];
-                    const float d0 = dOuter[i];
-
-                    float minOppDist = kInf;
-                    for (std::size_t b = 0; b < outerBoundaryVerts.size(); b += bStride) {
-                        const std::uint32_t bIdx = outerBoundaryVerts[b];
-                        const Vec3f bPos = shellMesh.verts[bIdx].pos;
-                        const Vec3f bNormal = outerInwardNormal[bIdx];
-
-                        // Opposing wall criterion: either inward normals oppose (`dot < -0.15`)
-                        // or boundary chord distance is significantly larger than direct distance
-                        const float nDot = dot3(srcNormal, bNormal);
-                        const float chordDist = dist3(srcPos, bPos);
-                        const float dToB = dist3(shellMesh.verts[i].pos, bPos);
-
-                        if (nDot < -0.15f || chordDist > 1.65f * (d0 + dToB)) {
-                            minOppDist = std::min(minOppDist, dToB);
-                        }
-                    }
-
-                    if (minOppDist < kInf * 0.5f) {
-                        rMedial[i] = 0.5f * (d0 + minOppDist);
-                    }
-                }
-
-                // Also detect medial shock edges directly on the mesh where adjacent vertices
-                // originate from opposing outer boundary normals
-                for (std::size_t i = 0; i < nV; ++i) {
-                    const std::uint32_t sI = closestOuterSrc[i];
-                    for (std::uint32_t nb : adj[i]) {
-                        const std::uint32_t sN = closestOuterSrc[nb];
-                        if (dot3(outerInwardNormal[sI], outerInwardNormal[sN]) < -0.15f) {
-                            const float edgeLen = dist3(shellMesh.verts[i].pos, shellMesh.verts[nb].pos);
-                            const float shockHalfSpan = 0.5f * (dOuter[i] + dOuter[nb] + edgeLen);
-                            rMedial[i] = std::min(rMedial[i], shockHalfSpan);
-                        }
-                    }
-                }
-
                 // Smooth `rMedial` across 1-ring neighborhoods so line widths vary smoothly
                 {
                     std::vector<float> rSmooth = rMedial;
@@ -1416,6 +1680,19 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         rSmooth[i] = sum / static_cast<float>(adj[i].size() + 1);
                     }
                     rMedial = std::move(rSmooth);
+                }
+
+                // Compute local peak `dOuter` across a 2-ring neighborhood so outer-wall
+                // offsets on narrow top strips never exceed the actual mesh peak `dOuter`.
+                std::vector<float> localPeakDOuter = dOuter;
+                for (int ring = 0; ring < 2; ++ring) {
+                    std::vector<float> nextPeak = localPeakDOuter;
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        for (std::uint32_t nb : adj[i]) {
+                            nextPeak[i] = std::max(nextPeak[i], localPeakDOuter[nb]);
+                        }
+                    }
+                    localPeakDOuter = std::move(nextPeak);
                 }
 
                 // Total available one-sided shell span B(v) at each vertex
@@ -1440,7 +1717,6 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 for (std::size_t i = 0; i < nV; ++i) {
                     const float B = availableSpan[i];
                     if (B < outerW.min_mm) {
-                        // Even a minimum-width outer wall barely fits: clamp to min_mm
                         localOuterWidth[i] = outerW.min_mm;
                         localInnerWidth[i] = innerW.min_mm;
                         activeInnerCount[i] = 0;
@@ -1448,7 +1724,6 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         continue;
                     }
 
-                    // Determine maximum number of inner walls m in [0..numInnerWalls] that fit in B
                     std::uint32_t mFit = 0;
                     for (std::uint32_t m = 1; m <= numInnerWalls; ++m) {
                         const float wMinSum = outerW.min_mm + static_cast<float>(m) * innerW.min_mm;
@@ -1466,7 +1741,6 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     const float wMaxSum = outerW.max_mm + static_cast<float>(mFit) * innerW.max_mm;
 
                     if (B < wTargetSum) {
-                        // Compress outer & inner walls smoothly between [min_mm, target_mm] to fit B
                         const float denom = std::max(1.0e-5f, wTargetSum - wMinSum);
                         const float t = std::clamp((B - wMinSum) / denom, 0.0f, 1.0f);
                         localOuterWidth[i] =
@@ -1474,12 +1748,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         localInnerWidth[i] =
                             innerW.min_mm + t * (innerW.target_mm - innerW.min_mm);
                     } else {
-                        // B >= wTargetSum: check if there is a narrow unfillable medial residual gap
                         const float remGap = (rMedial[i] <= spanShell[i])
                             ? 2.0f * (rMedial[i] - wTargetSum)
                             : (B - wTargetSum);
                         if (remGap > 0.0f && remGap < infillW.min_mm && B <= wMaxSum) {
-                            // Expand walls up toward max_mm so no sub-minimum gap is left behind
                             const float denom = std::max(1.0e-5f, wMaxSum - wTargetSum);
                             const float t = std::clamp((B - wTargetSum) / denom, 0.0f, 1.0f);
                             localOuterWidth[i] =
@@ -1499,21 +1771,27 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // ------------------------------------------------------------
                 // 5. Extract Outer Wall (Contacts \phi_sdf = 0) & Inner Walls
                 // ------------------------------------------------------------
-                const float stitchSnap = std::max(0.04f, 0.25f * targetRefEdge);
+                const float stitchSnap = std::max(0.05f, 0.25f * targetRefEdge);
                 const float closeLoopTol = std::max(0.15f, 0.65f * outerW.target_mm);
 
-                // 5a. Outer wall: centerline at d_outer(x) = 0.5 * w_outer(x)
+                // 5a. Outer wall: centerline at d_outer(x) = 0.5 * w_outer(x) (clamped on thin top crests)
                 {
                     std::vector<float> outerLevel(nV, 0.0f);
                     for (std::size_t i = 0; i < nV; ++i) {
-                        outerLevel[i] = dOuter[i] - 0.5f * localOuterWidth[i];
+                        const float stripHalfSpan = std::min(
+                            availableSpan[i],
+                            std::max(dOuter[i], localPeakDOuter[i]));
+                        const float effOffset = std::min(
+                            0.5f * localOuterWidth[i],
+                            0.65f * stripHalfSpan);
+                        outerLevel[i] = dOuter[i] - effOffset;
                     }
                     const auto outerSegs = extractIsoContourSegments(
                         shellMesh,
                         outerLevel,
                         0.0f,
                         availableSpan,
-                        0.5f * outerW.min_mm,
+                        0.02f,
                         localOuterWidth);
                     const auto outerChains =
                         stitchSegmentsIntoChains(outerSegs, stitchSnap, closeLoopTol);
@@ -1568,13 +1846,11 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // ------------------------------------------------------------
                 // 6. Shell Gap Fill & Solid Infill (`Monotonic` or `Concentric`)
                 // ------------------------------------------------------------
-                // Signed distance inward from the inner edge of the wall stack:
-                // dRem(v) = dOuter(v) - totalWallSpan(v) >= 0 inside the remaining shell region
                 std::vector<float> negDRem(nV, 0.0f);
                 std::vector<float> remOneSidedSpan(nV, 0.0f);
                 for (std::size_t i = 0; i < nV; ++i) {
                     const float dRem = dOuter[i] - totalWallSpan[i];
-                    negDRem[i] = -dRem; // <= 0 where dRem >= 0
+                    negDRem[i] = -dRem;
                     remOneSidedSpan[i] = std::max(0.0f, availableSpan[i] - totalWallSpan[i]);
                     shellMesh.verts[i].dRem = std::max(0.0f, dRem);
                     shellMesh.verts[i].remSpan = remOneSidedSpan[i];
@@ -1631,14 +1907,12 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                 }
 
-                // 6b. Solid Infill in the remaining shell region where `dRem >= 0` and
-                //     remaining span exceeds single-bead gap fill (or fills the shell interior)
+                // 6b. Solid Infill in the remaining shell region where `dRem >= 0`
                 for (std::size_t i = 0; i < nV; ++i) {
                     const bool isMedialLimited = (rMedial[i] < spanShell[i] - 0.05f);
                     const float fullRemWidth = isMedialLimited
                         ? 2.0f * remOneSidedSpan[i]
                         : remOneSidedSpan[i];
-                    // Exclude regions already handled by a single gap-fill bead
                     if (isMedialLimited && fullRemWidth <= infillW.max_mm) {
                         negDRem[i] = 1.0f;
                     }
@@ -1652,7 +1926,6 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
                 if (!infillSubmesh.tris.empty() && !infillSubmesh.verts.empty()) {
                     if (infillPattern == kPatternConcentric) {
-                        // Concentric solid infill: continued inward offsetting from the innermost wall
                         const std::size_t nInfV = infillSubmesh.verts.size();
                         std::vector<float> infDepth(nInfV, 0.0f);
                         std::vector<float> infSpan(nInfV, 0.0f);
@@ -1675,9 +1948,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 infillW.max_mm);
                         }
 
-                        const int maxPasses = std::max(
+                        const int maxPasses = std::clamp(
+                            static_cast<int>(std::ceil(maxRemSpan / infillW.min_mm)),
                             1,
-                            static_cast<int>(std::ceil(maxRemSpan / infillW.min_mm)));
+                            64);
                         std::uint32_t passIdx = 0;
 
                         for (int p = 0; p < maxPasses; ++p) {
@@ -1713,7 +1987,6 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             }
                         }
                     } else {
-                        // Monotonic flood fill across the 3D curved remaining shell submesh
                         generateMonotonicInfillOnSubmesh(
                             infillSubmesh,
                             layerInfo.layer_index,
@@ -1724,6 +1997,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 }
 
                 perLayerResults[layerIdx] = std::move(layerOut);
+                const std::size_t done = completedLayers.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (progressCb && (done % 4 == 0 || done == numLayers)) {
+                    progressCb(done, numLayers);
+                }
             }
         });
 

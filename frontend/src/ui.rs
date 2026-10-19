@@ -36,6 +36,7 @@ pub fn ui_workspace_system(
     plate.ui_hovered_point_hint_id = None;
     vis_state.highlighted_selected_layer = None;
     let ctx = contexts.ctx_mut();
+    vis_state.ui_pointer_down = ctx.is_using_pointer();
 
     // ========================================================================
     // 1. Top Editing Mode & Action Toolbar
@@ -688,7 +689,7 @@ pub fn ui_workspace_system(
                         )
                         .default_open(true)
                         .show(ui, |ui| {
-                            let is_computing = vis_state.pending_field_task.is_some();
+                            let is_computing = vis_state.is_busy();
 
                             // Field Selector
                             ui.horizontal(|ui| {
@@ -702,7 +703,9 @@ pub fn ui_workspace_system(
                                         if ui.selectable_label(selected, fname).clicked() && !selected {
                                             vis_state.active_field_name = fname.clone();
                                             vis_state.mark_all_dirty();
-                                            vis_state.refresh_stats_for(sel_id);
+                                            if !is_computing {
+                                                vis_state.refresh_stats_for(sel_id);
+                                            }
                                         }
                                     }
                                 }
@@ -980,7 +983,7 @@ pub fn ui_workspace_system(
                         .id_source("selected_slicing_isosurfaces_section")
                         .default_open(true)
                         .show(ui, |ui| {
-                            let is_computing = vis_state.pending_field_task.is_some();
+                            let is_computing = vis_state.is_busy();
                             let has_eikonal = vis_state
                                 .available_fields
                                 .iter()
@@ -1043,8 +1046,11 @@ pub fn ui_workspace_system(
 
                             if lh_changed {
                                 config.slicing.layer_height.sanitize();
-                                sync_config_to_backend(&config);
+                                if !is_computing {
+                                    sync_config_to_backend(&config);
+                                }
                                 vis_state.dirty_selected_layers = true;
+                                vis_state.dirty_toolpaths = true;
                             }
 
                             ui.horizontal(|ui| {
@@ -1087,7 +1093,16 @@ pub fn ui_workspace_system(
                                         vis_state.solid_opacity = 0.22;
                                     }
                                     if has_eikonal {
-                                        vis_state.recompute_selected_layers(sel_id, &config);
+                                        let need_toolpaths = vis_state.show_toolpaths;
+                                        vis_state.spawn_slicing_task(
+                                            sel_id,
+                                            &config,
+                                            true,
+                                            need_toolpaths,
+                                        );
+                                        plate.status_message = format!(
+                                            "Selecting non-planar isosurfaces for '{obj_name}' in background..."
+                                        );
                                     } else {
                                         spawn_field_compute_task(
                                             &mut vis_state,
@@ -1276,7 +1291,7 @@ pub fn ui_workspace_system(
                         .id_source("shell_and_toolpath_generation_section")
                         .default_open(true)
                         .show(ui, |ui| {
-                            let is_computing = vis_state.pending_field_task.is_some();
+                            let is_computing = vis_state.is_busy();
                             let has_eikonal = vis_state
                                 .available_fields
                                 .iter()
@@ -1448,7 +1463,9 @@ pub fn ui_workspace_system(
 
                             if tp_cfg_changed {
                                 config.slicing.sanitize();
-                                sync_config_to_backend(&config);
+                                if !is_computing {
+                                    sync_config_to_backend(&config);
+                                }
                                 vis_state.dirty_toolpaths = true;
                             }
 
@@ -1488,7 +1505,17 @@ pub fn ui_workspace_system(
                                         vis_state.solid_opacity = 0.18;
                                     }
                                     if has_eikonal {
-                                        vis_state.recompute_toolpaths(sel_id, &config);
+                                        let need_layers = vis_state.cached_selected_layers.is_none()
+                                            || vis_state.dirty_selected_layers;
+                                        vis_state.spawn_slicing_task(
+                                            sel_id,
+                                            &config,
+                                            need_layers,
+                                            true,
+                                        );
+                                        plate.status_message = format!(
+                                            "Generating non-planar shell toolpaths for '{obj_name}' in background..."
+                                        );
                                     } else {
                                         spawn_field_compute_task(
                                             &mut vis_state,
@@ -1803,7 +1830,7 @@ pub fn ui_workspace_system(
                         "Show 3D Nozzle Frame, Clearance & Gravity Gizmo",
                     );
 
-                    if dirty_backend_sync {
+                    if dirty_backend_sync && !vis_state.is_busy() {
                         sync_config_to_backend(&config);
                     }
                 });
@@ -1855,8 +1882,11 @@ pub fn ui_workspace_system(
                         .changed();
                     if lh_changed {
                         config.slicing.layer_height.sanitize();
-                        sync_config_to_backend(&config);
+                        if !vis_state.is_busy() {
+                            sync_config_to_backend(&config);
+                        }
                         vis_state.dirty_selected_layers = true;
+                        vis_state.dirty_toolpaths = true;
                     }
 
                     ui.add(
@@ -2209,6 +2239,15 @@ pub fn poll_io_tasks_system(
                     }
                     vis_state.mark_all_dirty();
                     vis_state.refresh_stats_for(obj_id);
+                    if vis_state.show_selected_layers || vis_state.show_toolpaths {
+                        let need_toolpaths = vis_state.show_toolpaths;
+                        vis_state.spawn_slicing_task(
+                            obj_id,
+                            &config,
+                            true,
+                            need_toolpaths,
+                        );
+                    }
                 }
                 plate.status_message = format!(
                     "Computed OpenVDB SDF & constrained Eikonal fields for '{finished_name}' (voxel {:.2} mm, {} iters).",
@@ -2219,6 +2258,31 @@ pub fn poll_io_tasks_system(
                 plate.status_message = format!(
                     "Failed to compute OpenVDB scalar fields for '{finished_name}'."
                 );
+            }
+        }
+    }
+
+    // 4. Poll pending background layer selection & shell toolpath generation task
+    if let Some((obj_id, ref mut task)) = vis_state.pending_slicing_task {
+        if let Some((layers_opt, toolpaths_opt)) = block_on(future::poll_once(task)) {
+            vis_state.pending_slicing_task = None;
+            if plate.selected_object_id == Some(obj_id) {
+                let num_layers = layers_opt
+                    .as_ref()
+                    .map(|l| l.layers.len())
+                    .or_else(|| vis_state.cached_selected_layers.as_ref().map(|l| l.layers.len()))
+                    .unwrap_or(0);
+                let num_paths = toolpaths_opt.as_ref().map(|t| t.total_path_count);
+                vis_state.apply_slicing_task_result(layers_opt, toolpaths_opt);
+                if let Some(paths) = num_paths {
+                    plate.status_message = format!(
+                        "Generated {paths} non-planar shell toolpaths across {num_layers} layers."
+                    );
+                } else {
+                    plate.status_message = format!(
+                        "Selected {num_layers} non-planar slicing isosurfaces."
+                    );
+                }
             }
         }
     }

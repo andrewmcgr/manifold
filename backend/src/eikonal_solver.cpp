@@ -27,16 +27,6 @@ inline float dot3(const std::array<float, 3>& a, const std::array<float, 3>& b) 
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
-inline std::array<float, 3> cross3(
-    const std::array<float, 3>& a,
-    const std::array<float, 3>& b) noexcept
-{
-    return {
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0]};
-}
-
 inline float length3(const std::array<float, 3>& v) noexcept {
     return std::sqrt(dot3(v, v));
 }
@@ -344,7 +334,6 @@ void extendEikonalToExteriorBand(
     for (std::size_t i = 0; i < n; ++i) {
         if (!domain.isInterior[i]) {
             extIndices.push_back(i);
-            domain.tau[i] = kInfinityTau;
         } else {
             // Store the final interior gradient in targetDir so exterior extension continues the exact slope
             const auto g = computeVoxelTauGradient(domain, i);
@@ -354,6 +343,9 @@ void extendEikonalToExteriorBand(
                 domain.slowness[i] = std::clamp(gLen, 0.25f, 2.5f);
             }
         }
+    }
+    for (const std::size_t extIdx : extIndices) {
+        domain.tau[extIdx] = kInfinityTau;
     }
 
     const std::size_t extCount = extIndices.size();
@@ -888,7 +880,6 @@ void ToolClearanceConstraint::enforceOnField(
 
     const float alphaMaxRad = computeMaxClearanceSlopeRad(ctx.activeTool);
     const float cosAlphaMax = std::cos(alphaMaxRad);
-    const float dx = static_cast<float>(domain.voxelSize);
 
     // 1. Check whether the discrete gradient \nabla \tau at any interior voxel violates
     // the clearance cone of half-angle `alphaMaxRad` around the ACTUAL tool axis `domain.toolAxis[i]`.
@@ -931,91 +922,6 @@ void ToolClearanceConstraint::enforceOnField(
     if (anyViolation.load(std::memory_order_relaxed)) {
         runInteriorFastSweeping(domain, 1, /*useDirectionalGuidance=*/true);
     }
-
-    // 2. Parallel Gather-based XZ clearance profile ring verification in the local nozzle frame
-    // of the ACTUAL tool axis `domain.toolAxis[u]`:
-    // When the nozzle tip is at `pos[u]` with tool axis `zNozzle = domain.toolAxis[u]`, any point
-    // `upperWorld = pos[u] + z_m * zNozzle + r_m * radial` on the tool's physical clearance envelope
-    // that lies inside the object must NOT have been printed earlier than `u` (\tau(upperWorld) >= \tau(u)).
-    // Equivalently, looking from `u` down to `lowerWorld = pos[u] - z_m * zNozzle - r_m * radial`,
-    // we require \tau(u) >= \tau(lowerWorld).
-    if (!ctx.activeTool.clearance_profile_xz.empty() && domain.indexGrid) {
-        const std::vector<float> oldTau = domain.tau;
-        const std::array<std::array<float, 2>, 8> ringDirs{{
-            {1.0f, 0.0f},
-            {-1.0f, 0.0f},
-            {0.0f, 1.0f},
-            {0.0f, -1.0f},
-            {0.70710678f, 0.70710678f},
-            {-0.70710678f, 0.70710678f},
-            {0.70710678f, -0.70710678f},
-            {-0.70710678f, -0.70710678f},
-        }};
-
-        const auto& zWf = domain.zParityWavefront;
-        tbb::parallel_for(
-            tbb::blocked_range<std::size_t>(0, zWf.indices.size(), 256),
-            [&](const tbb::blocked_range<std::size_t>& r) {
-                auto localIdxAcc = domain.indexGrid->getConstAccessor();
-
-                for (std::size_t posIdx = r.begin(); posIdx != r.end(); ++posIdx) {
-                    const std::size_t u = zWf.indices[posIdx];
-                    const auto& pos = domain.posBed[u];
-                    const auto& zNozzle = domain.toolAxis[u];
-
-                    const std::array<float, 3> refDir =
-                        (std::abs(zNozzle[0]) < 0.9f) ? std::array<float, 3>{1.0f, 0.0f, 0.0f}
-                                                      : std::array<float, 3>{0.0f, 1.0f, 0.0f};
-                    const float dotRef = dot3(refDir, zNozzle);
-                    const std::array<float, 3> xNozzle = normalize3({
-                        refDir[0] - dotRef * zNozzle[0],
-                        refDir[1] - dotRef * zNozzle[1],
-                        refDir[2] - dotRef * zNozzle[2]});
-                    const std::array<float, 3> yNozzle = normalize3(cross3(zNozzle, xNozzle));
-
-                    float reqTau = oldTau[u];
-                    for (const auto& stage : ctx.activeTool.clearance_profile_xz) {
-                        const float rMm = stage.x_radius_mm;
-                        const float zMm = stage.z_height_mm;
-                        if (zMm < 1.25f * dx) {
-                            continue;
-                        }
-
-                        for (const auto& cs : ringDirs) {
-                            const std::array<float, 3> offsetVec{
-                                -zMm * zNozzle[0] - rMm * (cs[0] * xNozzle[0] + cs[1] * yNozzle[0]),
-                                -zMm * zNozzle[1] - rMm * (cs[0] * xNozzle[1] + cs[1] * yNozzle[1]),
-                                -zMm * zNozzle[2] - rMm * (cs[0] * xNozzle[2] + cs[1] * yNozzle[2])};
-                            const openvdb::Vec3d lowerWorld(
-                                pos[0] + offsetVec[0],
-                                pos[1] + offsetVec[1],
-                                pos[2] + offsetVec[2]);
-                            const openvdb::Coord lowerCoord =
-                                domain.transform->worldToIndexCellCentered(lowerWorld);
-                            const std::int32_t lowerIdx = localIdxAcc.getValue(lowerCoord);
-                            if (lowerIdx >= 0) {
-                                const std::size_t idx = static_cast<std::size_t>(lowerIdx);
-                                if (idx != u && domain.isInterior[idx] &&
-                                    oldTau[idx] < 0.5f * kInfinityTau) {
-                                    // Compensate for cell-center rounding between `lowerWorld` and `posBed[idx]`
-                                    // along `targetDir[idx]` so nearest-voxel lookup never creates stair-stepping.
-                                    const std::array<float, 3> roundDiff{
-                                        static_cast<float>(lowerWorld.x()) - domain.posBed[idx][0],
-                                        static_cast<float>(lowerWorld.y()) - domain.posBed[idx][1],
-                                        static_cast<float>(lowerWorld.z()) - domain.posBed[idx][2]};
-                                    const float interpLowerTau =
-                                        oldTau[idx] + dot3(roundDiff, domain.targetDir[idx]);
-                                    if (interpLowerTau > reqTau) {
-                                        reqTau = interpLowerTau;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    domain.tau[u] = reqTau;
-                }
-            });
-    }
 }
 
 // ============================================================================
@@ -1024,7 +930,7 @@ void ToolClearanceConstraint::enforceOnField(
 
 void OverhangIslandConstraint::applyPreSweepModifiers(
     ActiveVolumeDomain& domain,
-    const EikonalSolverContext& /*ctx*/) const
+    const EikonalSolverContext& ctx) const
 {
     const std::size_t n = domain.coords.size();
     const float dx = static_cast<float>(domain.voxelSize);
@@ -1035,8 +941,8 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
         tbb::blocked_range<std::size_t>(0, n, 512),
         [&](const tbb::blocked_range<std::size_t>& r) {
             for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                domain.slowness[i] = 1.0f;
                 if (!domain.isInterior[i]) {
-                    domain.slowness[i] = 1.0f;
                     continue;
                 }
 
@@ -1052,25 +958,33 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
                 }
                 domain.targetDir[i] = baseDir;
 
-                const float ov = domain.overhang[i];
+                // `domain.overhang[i]` is -\nabla\phi_sdf \cdot \hat{g}_{bed}, which is negative
+                // on downward-facing overhangs (\nabla\phi_sdf aligned with gravity \hat{g}_{bed}).
+                const float downwardOverhang = -domain.overhang[i];
                 const float distFromSurface = std::abs(domain.sdf[i]);
 
-                if (ov > kOverhangThreshold && distFromSurface < surfaceShellMm) {
+                if (downwardOverhang > kOverhangThreshold && distFromSurface < surfaceShellMm) {
                     const float shellFactor = 1.0f - (distFromSurface / surfaceShellMm);
-                    const float ovSeverity =
-                        std::clamp((ov - kOverhangThreshold) / (1.0f - kOverhangThreshold), 0.0f, 1.0f);
-                    domain.slowness[i] =
-                        std::clamp(1.0f - 0.42f * shellFactor * ovSeverity, 0.48f, 1.0f);
+                    const float ovSeverity = std::clamp(
+                        (downwardOverhang - kOverhangThreshold) / (1.0f - kOverhangThreshold),
+                        0.0f,
+                        1.0f);
 
+                    const std::array<float, 3> gravityDir =
+                        ctx.backend.queryGravityDirection(domain.posBed[i]);
                     const auto& nOut = domain.sdfGrad[i];
-                    const float wBias = 0.35f * shellFactor * ovSeverity;
-                    domain.targetDir[i] = normalize3(
-                        {(1.0f - wBias) * domain.targetDir[i][0] + wBias * nOut[0],
-                         (1.0f - wBias) * domain.targetDir[i][1] + wBias * nOut[1],
-                         (1.0f - wBias) * domain.targetDir[i][2] + wBias * nOut[2]},
+                    const float gProj = dot3(nOut, gravityDir);
+                    const std::array<float, 3> lateralOut = normalize3(
+                        {nOut[0] - gProj * gravityDir[0],
+                         nOut[1] - gProj * gravityDir[1],
+                         nOut[2] - gProj * gravityDir[2]},
                         aAxis);
-                } else {
-                    domain.slowness[i] = 1.0f;
+                    const float wBias = 0.25f * shellFactor * ovSeverity;
+                    domain.targetDir[i] = normalize3(
+                        {(1.0f - wBias) * domain.targetDir[i][0] + wBias * lateralOut[0],
+                         (1.0f - wBias) * domain.targetDir[i][1] + wBias * lateralOut[1],
+                         (1.0f - wBias) * domain.targetDir[i][2] + wBias * lateralOut[2]},
+                        aAxis);
                 }
             }
         });

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <functional>
 #include <openvdb/openvdb.h>
 
 #include "slicer_backend.h"
@@ -28,6 +30,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const openvdb::Vec3SGrid* toolAxisGrid,
     const std::array<float, 3>& defaultNozzleAxisBed,
     const LayerHeightSpec& layerHeightSpec,
-    const ShellPathSpec& spec);
+    const ShellPathSpec& spec,
+    const std::function<void(std::size_t, std::size_t)>& progressCb = nullptr);
 
 } // namespace manifold
