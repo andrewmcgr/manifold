@@ -9,7 +9,8 @@ use crate::config::{
     BedShape, ClearancePointXZ, PointNormalHint, SlicerConfig, SurfaceHintMode, ToolConfig,
 };
 use crate::field_vis::{
-    FieldColormap, FieldVisualizationState, IsoIntersectionMode, SliceAxis,
+    FieldColormap, FieldVisualizationState, IsoIntersectionMode, SelectedLayersColorMode,
+    SliceAxis,
 };
 use crate::hull::rotation_to_place_face_on_bed;
 use crate::io::threemf::{save_project_to_3mf, ExportableObject};
@@ -32,6 +33,7 @@ pub fn ui_workspace_system(
 ) {
     plate.ui_hovered_surface_hint_patch = None;
     plate.ui_hovered_point_hint_id = None;
+    vis_state.highlighted_selected_layer = None;
     let ctx = contexts.ctx_mut();
 
     // ========================================================================
@@ -967,6 +969,301 @@ pub fn ui_workspace_system(
                                 });
                             }
                         });
+
+                        // --- Selected Slicing Isosurfaces (Bidirectional Branch-Aware) ---
+                        ui.add_space(8.0);
+                        ui.separator();
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new("Selected Slicing Isosurfaces").strong(),
+                        )
+                        .id_source("selected_slicing_isosurfaces_section")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            let is_computing = vis_state.pending_field_task.is_some();
+                            let has_eikonal = vis_state
+                                .available_fields
+                                .iter()
+                                .any(|f| f == "eikonal");
+
+                            let mut lh_changed = false;
+                            lh_changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut config.slicing.layer_height.target_mm,
+                                        0.04..=1.20,
+                                    )
+                                    .text("Target Thickness (mm)"),
+                                )
+                                .changed();
+                            ui.horizontal(|ui| {
+                                lh_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut config.slicing.layer_height.min_mm)
+                                            .speed(0.01)
+                                            .range(0.02..=1.00)
+                                            .prefix("Min: ")
+                                            .suffix(" mm"),
+                                    )
+                                    .changed();
+                                lh_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut config.slicing.layer_height.max_mm)
+                                            .speed(0.01)
+                                            .range(0.05..=1.50)
+                                            .prefix("Max: ")
+                                            .suffix(" mm"),
+                                    )
+                                    .changed();
+                            });
+                            ui.horizontal(|ui| {
+                                lh_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.layer_height.first_layer_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.02..=1.50)
+                                        .prefix("First Layer: ")
+                                        .suffix(" mm"),
+                                    )
+                                    .changed();
+                                lh_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.layer_height.top_layer_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.02..=1.50)
+                                        .prefix("Top Layer: ")
+                                        .suffix(" mm"),
+                                    )
+                                    .changed();
+                            });
+
+                            if lh_changed {
+                                config.slicing.layer_height.sanitize();
+                                sync_config_to_backend(&config);
+                                vis_state.dirty_selected_layers = true;
+                            }
+
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .checkbox(
+                                        &mut vis_state.show_selected_layers,
+                                        "Show Selected Isosurfaces",
+                                    )
+                                    .changed()
+                                {
+                                    vis_state.dirty_selected_layers_mesh = true;
+                                    vis_state.dirty_slice = true;
+                                    if vis_state.show_selected_layers && vis_state.solid_opacity > 0.45 {
+                                        vis_state.solid_opacity = 0.22;
+                                    }
+                                    if vis_state.show_selected_layers
+                                        && !has_eikonal
+                                        && !is_computing
+                                    {
+                                        spawn_field_compute_task(
+                                            &mut vis_state,
+                                            &mut plate,
+                                            &config,
+                                            sel_id,
+                                            &obj_name,
+                                            obj_rotation,
+                                        );
+                                    }
+                                }
+
+                                if ui
+                                    .add_enabled(
+                                        !is_computing,
+                                        egui::Button::new("Select Isosurfaces").small(),
+                                    )
+                                    .clicked()
+                                {
+                                    vis_state.show_selected_layers = true;
+                                    if vis_state.solid_opacity > 0.45 {
+                                        vis_state.solid_opacity = 0.22;
+                                    }
+                                    if has_eikonal {
+                                        vis_state.recompute_selected_layers(sel_id, &config);
+                                    } else {
+                                        spawn_field_compute_task(
+                                            &mut vis_state,
+                                            &mut plate,
+                                            &config,
+                                            sel_id,
+                                            &obj_name,
+                                            obj_rotation,
+                                        );
+                                    }
+                                }
+                            });
+
+                            if vis_state.show_selected_layers {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .checkbox(
+                                            &mut vis_state.show_selected_layer_surfaces,
+                                            "3D Surfaces",
+                                        )
+                                        .changed()
+                                    {
+                                        vis_state.dirty_selected_layers_mesh = true;
+                                    }
+                                    ui.checkbox(
+                                        &mut vis_state.show_selected_layer_contours,
+                                        "3D Perimeter Contours",
+                                    );
+                                });
+
+                                egui::ComboBox::from_id_source("selected_layers_color_mode")
+                                    .selected_text(vis_state.selected_layers_color_mode.label())
+                                    .show_ui(ui, |ui| {
+                                        for mode in [
+                                            SelectedLayersColorMode::ByLayerThickness,
+                                            SelectedLayersColorMode::ByBranch,
+                                            SelectedLayersColorMode::AlternatingBands,
+                                        ] {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut vis_state.selected_layers_color_mode,
+                                                    mode,
+                                                    mode.label(),
+                                                )
+                                                .changed()
+                                            {
+                                                vis_state.dirty_selected_layers_mesh = true;
+                                            }
+                                        }
+                                    });
+                            }
+
+                            if let Some(ref res) = vis_state.cached_selected_layers.clone() {
+                                let total_layers = res.layers.len();
+                                if total_layers > 0 {
+                                    let max_idx = total_layers - 1;
+                                    let mut range_changed = false;
+                                    ui.horizontal(|ui| {
+                                        range_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut vis_state.selected_layer_min_idx,
+                                                    0..=max_idx,
+                                                )
+                                                .text("Start Layer"),
+                                            )
+                                            .changed();
+                                        range_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut vis_state.selected_layer_max_idx,
+                                                    0..=max_idx,
+                                                )
+                                                .text("End Layer"),
+                                            )
+                                            .changed();
+                                    });
+                                    if vis_state.selected_layer_min_idx
+                                        > vis_state.selected_layer_max_idx
+                                    {
+                                        vis_state.selected_layer_max_idx =
+                                            vis_state.selected_layer_min_idx;
+                                    }
+                                    range_changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut vis_state.selected_layer_stride,
+                                                1..=10,
+                                            )
+                                            .text("Display Stride"),
+                                        )
+                                        .changed();
+                                    if range_changed {
+                                        vis_state.dirty_selected_layers_mesh = true;
+                                        vis_state.dirty_slice = true;
+                                    }
+
+                                    let mut global_min_h = f32::MAX;
+                                    let mut global_max_h = 0.0f32;
+                                    let mut sum_h = 0.0f32;
+                                    for l in &res.layers {
+                                        global_min_h = global_min_h.min(l.mean_thickness_mm);
+                                        global_max_h = global_max_h.max(l.mean_thickness_mm);
+                                        sum_h += l.mean_thickness_mm;
+                                    }
+                                    let avg_h = sum_h / (total_layers as f32);
+
+                                    ui.small(format!(
+                                        "Selected: {} layers across {} branch(es) | Avg Δh: {:.3} mm (range [{:.3}, {:.3}] mm)",
+                                        total_layers,
+                                        res.branch_count,
+                                        avg_h,
+                                        global_min_h,
+                                        global_max_h
+                                    ));
+
+                                    egui::CollapsingHeader::new(format!(
+                                        "Selected Isosurface List ({total_layers})"
+                                    ))
+                                    .id_source("selected_isosurface_layer_list")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        ui.small(
+                                            "Hover a layer to highlight it in 3D; click to inspect in the single-isosurface viewer.",
+                                        );
+                                        egui::ScrollArea::vertical()
+                                            .max_height(180.0)
+                                            .show(ui, |ui| {
+                                                for (idx, layer) in res.layers.iter().enumerate() {
+                                                    let tag = match (
+                                                        layer.is_first_layer,
+                                                        layer.is_top_layer,
+                                                    ) {
+                                                        (true, true) => " [FIRST+TOP]",
+                                                        (true, false) => " [FIRST]",
+                                                        (false, true) => " [TOP]",
+                                                        (false, false) => "",
+                                                    };
+                                                    let label = format!(
+                                                        "#{} (B{} {}/{})  τ={:.2} mm | Δh={:.3} mm [{:.2}..{:.2}]{}",
+                                                        layer.layer_index,
+                                                        layer.branch_id,
+                                                        layer.branch_layer_index + 1,
+                                                        layer.branch_layer_count,
+                                                        layer.isovalue,
+                                                        layer.mean_thickness_mm,
+                                                        layer.min_thickness_mm,
+                                                        layer.max_thickness_mm,
+                                                        tag
+                                                    );
+                                                    let resp = ui.selectable_label(
+                                                        vis_state.highlighted_selected_layer
+                                                            == Some(idx),
+                                                        label,
+                                                    );
+                                                    if resp.hovered() {
+                                                        vis_state.highlighted_selected_layer =
+                                                            Some(idx);
+                                                    }
+                                                    if resp.clicked() {
+                                                        vis_state.active_field_name =
+                                                            "eikonal".to_string();
+                                                        vis_state.isovalue = layer.isovalue;
+                                                        vis_state.show_isosurface = true;
+                                                        vis_state.dirty_isosurface = true;
+                                                        vis_state.dirty_slice = true;
+                                                    }
+                                                }
+                                            });
+                                    });
+                                }
+                            } else if !has_eikonal {
+                                ui.small(
+                                    "Click 'Select Isosurfaces' to compute the Eikonal field and select non-planar layers.",
+                                );
+                            }
+                        });
                     }
                 }
 
@@ -1234,9 +1531,28 @@ pub fn ui_workspace_system(
                                 .text("Max Layer Height (mm)"),
                         )
                         .changed();
+                    lh_changed |= ui
+                        .add(
+                            egui::Slider::new(
+                                &mut config.slicing.layer_height.first_layer_mm,
+                                0.02..=1.20,
+                            )
+                            .text("First Layer Height (mm)"),
+                        )
+                        .changed();
+                    lh_changed |= ui
+                        .add(
+                            egui::Slider::new(
+                                &mut config.slicing.layer_height.top_layer_mm,
+                                0.02..=1.20,
+                            )
+                            .text("Top Layer Height (mm)"),
+                        )
+                        .changed();
                     if lh_changed {
                         config.slicing.layer_height.sanitize();
                         sync_config_to_backend(&config);
+                        vis_state.dirty_selected_layers = true;
                     }
 
                     ui.add(
@@ -1379,6 +1695,8 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         target_mm: config.slicing.layer_height.target_mm,
         min_mm: config.slicing.layer_height.min_mm,
         max_mm: config.slicing.layer_height.max_mm,
+        first_layer_mm: config.slicing.layer_height.first_layer_mm,
+        top_layer_mm: config.slicing.layer_height.top_layer_mm,
     });
 
     ffi::set_eikonal_solver_iterations(config.eikonal.solver_iterations);

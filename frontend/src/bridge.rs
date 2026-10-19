@@ -104,12 +104,42 @@ pub mod ffi {
         pub clearance_profile_xz: Vec<ClearanceXZ>,
     }
 
-    /// Variable layer height specification (`target_mm`, `min_mm`, `max_mm`) for non-planar slicing.
+    /// Variable layer height specification (`target_mm`, `min_mm`, `max_mm`, `first_layer_mm`, `top_layer_mm`)
+    /// for non-planar slicing.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct LayerHeightSpec {
         pub target_mm: f32,
         pub min_mm: f32,
         pub max_mm: f32,
+        pub first_layer_mm: f32,
+        pub top_layer_mm: f32,
+    }
+
+    /// Metadata and extracted geometry for a single selected slicing isosurface layer.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct SelectedLayerInfo {
+        pub layer_index: u32,
+        pub branch_id: u32,
+        pub parent_branch_id: i32,
+        pub branch_layer_index: u32,
+        pub branch_layer_count: u32,
+        pub isovalue: f32,
+        pub mean_thickness_mm: f32,
+        pub min_thickness_mm: f32,
+        pub max_thickness_mm: f32,
+        pub is_first_layer: bool,
+        pub is_top_layer: bool,
+        pub vertices: Vec<RenderVertex>,
+        pub indices: Vec<u32>,
+        pub contour_segments: Vec<f32>,
+    }
+
+    /// Result of bidirectional branch-aware slicing isosurface selection on an object's Eikonal field.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct SelectedIsosurfacesResult {
+        pub valid: bool,
+        pub branch_count: u32,
+        pub layers: Vec<SelectedLayerInfo>,
     }
 
     /// Spatial/surface orientation hint (`kind`: 0 = Tangency, 1 = Orthogonality)
@@ -234,10 +264,10 @@ pub mod ffi {
         /// Retrieves the currently active tool index in the C++ backend.
         pub fn get_active_tool_index() -> u32;
 
-        /// Sets the variable slice layer height (`target_mm`, `min_mm`, `max_mm`) in the C++ backend.
+        /// Sets the variable slice layer height (`target_mm`, `min_mm`, `max_mm`, `first_layer_mm`, `top_layer_mm`) in the C++ backend.
         pub fn set_slice_layer_height(layer_height: LayerHeightSpec);
 
-        /// Retrieves the current variable slice layer height (`target_mm`, `min_mm`, `max_mm`) from the C++ backend.
+        /// Retrieves the current variable slice layer height from the C++ backend.
         pub fn get_slice_layer_height() -> LayerHeightSpec;
 
         /// Sets the number of outer constraint & tool-orientation relaxation iterations for the Eikonal solver.
@@ -248,6 +278,15 @@ pub mod ffi {
 
         /// Sets spatial/surface tangency and orthogonality hints for the Eikonal solver.
         pub fn set_spatial_orientation_hints(hints: &[SpatialOrientationHint]);
+
+        /// Selects the non-planar slicing isosurfaces for `object_id` using a bidirectional
+        /// branch-aware relaxation algorithm honoring `min_mm`, `max_mm`, `target_mm`,
+        /// `first_layer_mm`, and `top_layer_mm`, and extracts their interior-clipped 3D
+        /// meshes and boundary contours.
+        pub fn select_slicing_isosurfaces(
+            object_id: u64,
+            adaptivity: f32,
+        ) -> SelectedIsosurfacesResult;
     }
 }
 
@@ -371,11 +410,15 @@ mod tests {
             target_mm: 0.22,
             min_mm: 0.08,
             max_mm: 0.36,
+            first_layer_mm: 0.25,
+            top_layer_mm: 0.15,
         });
         let lh = ffi::get_slice_layer_height();
         assert!((lh.target_mm - 0.22).abs() < 1e-6);
         assert!((lh.min_mm - 0.08).abs() < 1e-6);
         assert!((lh.max_mm - 0.36).abs() < 1e-6);
+        assert!((lh.first_layer_mm - 0.25).abs() < 1e-6);
+        assert!((lh.top_layer_mm - 0.15).abs() < 1e-6);
 
         ffi::set_eikonal_solver_iterations(4);
         assert_eq!(ffi::get_eikonal_solver_iterations(), 4);

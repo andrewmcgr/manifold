@@ -170,8 +170,9 @@ impl ToolConfig {
 }
 
 /// Non-constant layer thickness specification for conformal / non-planar slicing,
-/// represented as `(target_mm, min_mm, max_mm)`.
+/// represented as `(target_mm, min_mm, max_mm, first_layer_mm, top_layer_mm)`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LayerHeightConfig {
     /// Nominal target layer thickness (mm).
     pub target_mm: f32,
@@ -179,6 +180,10 @@ pub struct LayerHeightConfig {
     pub min_mm: f32,
     /// Maximum allowable layer thickness in expanded conformal zones (mm).
     pub max_mm: f32,
+    /// Dedicated first-layer thickness for the initial isosurface off the bed (mm).
+    pub first_layer_mm: f32,
+    /// Dedicated top-layer thickness setting the final isosurface in each branch (mm).
+    pub top_layer_mm: f32,
 }
 
 impl Default for LayerHeightConfig {
@@ -187,18 +192,22 @@ impl Default for LayerHeightConfig {
             target_mm: 0.20,
             min_mm: 0.08,
             max_mm: 0.32,
+            first_layer_mm: 0.20,
+            top_layer_mm: 0.20,
         }
     }
 }
 
 impl LayerHeightConfig {
-    /// Ensures `0.01 <= min_mm <= target_mm <= max_mm`.
+    /// Ensures `0.01 <= min_mm <= target_mm <= max_mm` and positive `first_layer_mm`/`top_layer_mm`.
     pub fn sanitize(&mut self) {
         self.min_mm = self.min_mm.max(0.01);
         if self.max_mm < self.min_mm {
             self.max_mm = self.min_mm;
         }
         self.target_mm = self.target_mm.clamp(self.min_mm, self.max_mm);
+        self.first_layer_mm = self.first_layer_mm.clamp(0.01, self.max_mm.max(1.0));
+        self.top_layer_mm = self.top_layer_mm.clamp(0.01, self.max_mm.max(1.0));
     }
 }
 
@@ -557,6 +566,8 @@ mod tests {
             target_mm: 0.20,
             min_mm: 0.08,
             max_mm: 0.32,
+            first_layer_mm: 0.24,
+            top_layer_mm: 0.16,
         };
         let toml_str = config.to_toml_string().unwrap();
         let decoded = SlicerConfig::from_toml_str(&toml_str).unwrap();

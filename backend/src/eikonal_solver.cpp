@@ -1558,7 +1558,13 @@ EikonalSolveResult solveConstrainedEikonal(
     // 5. Pack solved fields into OpenVDB grids
     notifyProgress(0.96f, "Packing OpenVDB scalar & vector grids...");
     const float spanZ = std::max(objectMaxZ - objectMinZ, 1.0f);
-    const float eikonalBg = spanZ + exteriorBandMm;
+    float maxSolvedTau = spanZ;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (domain.tau[i] < 0.5f * kInfinityTau) {
+            maxSolvedTau = std::max(maxSolvedTau, domain.tau[i]);
+        }
+    }
+    const float eikonalBg = maxSolvedTau + 2.0f * exteriorBandMm + 10.0f;
 
     openvdb::FloatGrid::Ptr eikonalGrid = openvdb::FloatGrid::create(eikonalBg);
     eikonalGrid->setName("eikonal");

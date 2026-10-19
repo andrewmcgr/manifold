@@ -9,7 +9,13 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <numeric>
+#include <queue>
+#include <set>
 #include <unordered_map>
+
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 
 // Open CASCADE (OCCT) headers
 #include <BRepBndLib.hxx>
@@ -567,7 +573,7 @@ struct SlicerBackend::Impl {
         makeDefaultTool(1, "T1 - 0.6mm High-Flow", 0.60f, 230.0f),
     };
     std::uint32_t activeToolIndex = 0;
-    LayerHeightSpec sliceLayerHeight{0.20f, 0.08f, 0.32f};
+    LayerHeightSpec sliceLayerHeight{0.20f, 0.08f, 0.32f, 0.20f, 0.20f};
     std::uint32_t eikonalSolverIterations = 4;
     std::vector<SpatialOrientationHint> spatialOrientationHints;
 };
@@ -1482,6 +1488,8 @@ void SlicerBackend::setSliceLayerHeight(const LayerHeightSpec& spec) noexcept {
     s.min_mm = std::max(s.min_mm, 0.01f);
     s.max_mm = std::max(s.max_mm, s.min_mm);
     s.target_mm = std::clamp(s.target_mm, s.min_mm, s.max_mm);
+    s.first_layer_mm = (s.first_layer_mm > 0.0f) ? std::max(s.first_layer_mm, 0.01f) : s.target_mm;
+    s.top_layer_mm = (s.top_layer_mm > 0.0f) ? std::max(s.top_layer_mm, 0.01f) : s.target_mm;
     impl_->sliceLayerHeight = s;
 }
 
@@ -1503,6 +1511,1341 @@ void SlicerBackend::setSpatialOrientationHints(const std::vector<SpatialOrientat
 
 const std::vector<SpatialOrientationHint>& SlicerBackend::spatialOrientationHints() const noexcept {
     return impl_->spatialOrientationHints;
+}
+
+SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
+    std::uint64_t objectId,
+    float adaptivity) const
+{
+    SelectedIsosurfacesResult result{};
+    result.valid = false;
+    result.branch_count = 0;
+
+    const auto objIt = impl_->objects.find(objectId);
+    if (objIt == impl_->objects.end()) {
+        return result;
+    }
+    const ObjectRecord& rec = objIt->second;
+
+    const auto eikIt = rec.scalarFields.find("eikonal");
+    const auto sdfIt = rec.scalarFields.find("sdf");
+    if (eikIt == rec.scalarFields.end() || !eikIt->second ||
+        sdfIt == rec.scalarFields.end() || !sdfIt->second) {
+        return result;
+    }
+
+    const openvdb::FloatGrid& eikGrid = *eikIt->second;
+    const openvdb::FloatGrid& sdfGrid = *sdfIt->second;
+    const float voxelSize = static_cast<float>(eikGrid.transform().voxelSize()[0]);
+    const float eikBg = eikGrid.background();
+    const float sdfBg = sdfGrid.background();
+
+    LayerHeightSpec lh = impl_->sliceLayerHeight;
+    const float hMin = std::max(lh.min_mm, 0.01f);
+    const float hMax = std::max(lh.max_mm, hMin);
+    const float hTarget = std::clamp(lh.target_mm, hMin, hMax);
+    const float hFirst = (lh.first_layer_mm > 0.0f) ? std::max(lh.first_layer_mm, 0.01f) : hTarget;
+    const float hTop = (lh.top_layer_mm > 0.0f) ? std::max(lh.top_layer_mm, 0.01f) : hTarget;
+
+    // ------------------------------------------------------------------------
+    // 1. Collect Active Interior Voxels, Compute |\nabla \tau|, & Exact \phi_sdf = 0 Bounds
+    // ------------------------------------------------------------------------
+    struct InteriorVoxel {
+        openvdb::Coord ijk;
+        float tau = 0.0f;
+        float sdf = 0.0f;
+        float gradMag = 1.0f;
+        float surfTauMin = 0.0f;
+        float surfTauMax = 0.0f;
+        float cornerSdfAllowance = 0.0f;
+        int branchId = 0;
+    };
+
+    std::vector<InteriorVoxel> voxels;
+    voxels.reserve(eikGrid.activeVoxelCount() / 2 + 64);
+
+    auto sdfAccMain = sdfGrid.getConstAccessor();
+    auto eikAccMain = eikGrid.getConstAccessor();
+
+    // Distinguish valid solved voxels from the background value `eikBg`
+    const float validTauLimit = eikBg - std::max(0.5f * voxelSize, 0.5f);
+    // Include voxels up to +0.50 * voxelSize for 26-connectivity across thin features/corners,
+    // while tracking exact \phi_sdf = 0 surface-clamped [surfTauMin, surfTauMax] per voxel.
+    const float interiorSdfCutoff = 0.50f * voxelSize;
+
+    openvdb::Int32Grid voxelIdxGrid(-1);
+    voxelIdxGrid.setTransform(eikGrid.transform().copy());
+    auto idxAcc = voxelIdxGrid.getAccessor();
+
+    for (auto iter = eikGrid.cbeginValueOn(); iter; ++iter) {
+        const float tau = *iter;
+        if (!std::isfinite(tau) || tau >= validTauLimit) {
+            continue;
+        }
+        const openvdb::Coord ijk = iter.getCoord();
+        const float sdf = sdfAccMain.getValue(ijk);
+        if (sdf > interiorSdfCutoff) {
+            continue;
+        }
+
+        const int vIdx = static_cast<int>(voxels.size());
+        idxAcc.setValue(ijk, vIdx);
+        voxels.push_back(InteriorVoxel{ijk, tau, sdf, 1.0f, tau, tau, 0.0f, 0});
+    }
+
+    if (voxels.empty()) {
+        return result;
+    }
+
+    // Compute finite-difference |\nabla \tau| and exact \phi_sdf = 0 surface crossings per voxel
+    const float invVoxel = 1.0f / std::max(voxelSize, 1.0e-5f);
+    float globalTauMin = std::numeric_limits<float>::max();
+    float globalTauMax = std::numeric_limits<float>::lowest();
+
+    const std::array<openvdb::Coord, 3> axes = {
+        openvdb::Coord(1, 0, 0),
+        openvdb::Coord(0, 1, 0),
+        openvdb::Coord(0, 0, 1),
+    };
+
+    for (std::size_t i = 0; i < voxels.size(); ++i) {
+        const openvdb::Coord& c = voxels[i].ijk;
+        const float t0 = voxels[i].tau;
+        const float s0 = voxels[i].sdf;
+
+        std::array<float, 3> gradTau{0.0f, 0.0f, 0.0f};
+        std::array<float, 3> gradSdf{0.0f, 0.0f, 0.0f};
+
+        for (int a = 0; a < 3; ++a) {
+            const openvdb::Coord& d = axes[static_cast<std::size_t>(a)];
+            const float tP = eikAccMain.getValue(c + d);
+            const float tM = eikAccMain.getValue(c - d);
+            const bool okP = std::isfinite(tP) && (tP < validTauLimit);
+            const bool okM = std::isfinite(tM) && (tM < validTauLimit);
+            if (okP && okM) {
+                gradTau[static_cast<std::size_t>(a)] = 0.5f * (tP - tM) * invVoxel;
+            } else if (okP) {
+                gradTau[static_cast<std::size_t>(a)] = (tP - t0) * invVoxel;
+            } else if (okM) {
+                gradTau[static_cast<std::size_t>(a)] = (t0 - tM) * invVoxel;
+            }
+
+            const float sP = sdfAccMain.getValue(c + d);
+            const float sM = sdfAccMain.getValue(c - d);
+            gradSdf[static_cast<std::size_t>(a)] = 0.5f * (sP - sM) * invVoxel;
+        }
+
+        const float g = std::sqrt(
+            gradTau[0] * gradTau[0] + gradTau[1] * gradTau[1] + gradTau[2] * gradTau[2]);
+        voxels[i].gradMag = (g > 1.0e-3f) ? std::clamp(g, 0.20f, 4.0f) : 1.0f;
+
+        if (s0 <= 0.0f) {
+            float tMin = t0;
+            float tMax = t0;
+            // Expand to exact \phi_sdf = 0 crossings along 26-neighbor edges exiting the object
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        const openvdb::Coord nb = c + openvdb::Coord(dx, dy, dz);
+                        const float sNb = sdfAccMain.getValue(nb);
+                        if (sNb <= 0.0f) {
+                            continue;
+                        }
+                        const float tNb = eikAccMain.getValue(nb);
+                        if (!std::isfinite(tNb) || tNb >= validTauLimit) {
+                            continue;
+                        }
+                        const float denom = sNb - s0;
+                        if (denom > 1.0e-6f) {
+                            const float alpha = std::clamp(-s0 / denom, 0.0f, 1.0f);
+                            const float tZero = (1.0f - alpha) * t0 + alpha * tNb;
+                            tMin = std::min(tMin, tZero);
+                            tMax = std::max(tMax, tZero);
+                        }
+                    }
+                }
+            }
+            voxels[i].surfTauMin = tMin;
+            voxels[i].surfTauMax = tMax;
+        } else {
+            // Voxel center is in the thin boundary shell (0 < sdf <= 0.50 * voxelSize):
+            // compute its \tau values Strictly on the \phi_sdf = 0 surface so exterior voxel
+            // centers never overestimate tauEnd into thin air outside the object.
+            float tMin = std::numeric_limits<float>::max();
+            float tMax = std::numeric_limits<float>::lowest();
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        const int nbIdx = idxAcc.getValue(c + openvdb::Coord(dx, dy, dz));
+                        if (nbIdx < 0) {
+                            continue;
+                        }
+                        const float sNb = voxels[static_cast<std::size_t>(nbIdx)].sdf;
+                        if (sNb > 0.0f) {
+                            continue;
+                        }
+                        const float tNb = voxels[static_cast<std::size_t>(nbIdx)].tau;
+                        const float denom = s0 - sNb;
+                        const float alpha = (denom > 1.0e-6f)
+                            ? std::clamp(-sNb / denom, 0.0f, 1.0f)
+                            : 0.0f;
+                        const float tZero = (1.0f - alpha) * tNb + alpha * t0;
+                        tMin = std::min(tMin, tZero);
+                        tMax = std::max(tMax, tZero);
+                    }
+                }
+            }
+            if (tMin <= tMax) {
+                voxels[i].surfTauMin = tMin;
+                voxels[i].surfTauMax = tMax;
+            } else {
+                // Sub-voxel corner tip with no strictly negative neighbor center: project onto \phi_sdf = 0
+                const float gSdfLen = std::sqrt(
+                    gradSdf[0] * gradSdf[0] + gradSdf[1] * gradSdf[1] + gradSdf[2] * gradSdf[2]);
+                float dTauToSurf = 0.0f;
+                if (gSdfLen > 1.0e-5f) {
+                    dTauToSurf = s0 * (
+                        gradTau[0] * gradSdf[0] +
+                        gradTau[1] * gradSdf[1] +
+                        gradTau[2] * gradSdf[2]) / gSdfLen;
+                }
+                const float tProj = std::max(0.0f, t0 - dTauToSurf);
+                voxels[i].surfTauMin = tProj;
+                voxels[i].surfTauMax = tProj;
+                voxels[i].cornerSdfAllowance = std::clamp(s0, 0.0f, 0.75f * voxelSize);
+            }
+        }
+
+        globalTauMin = std::min(globalTauMin, voxels[i].surfTauMin);
+        globalTauMax = std::max(globalTauMax, voxels[i].surfTauMax);
+    }
+
+    // Project exact CAD mesh vertices and triangle centroids onto their containing/nearest
+    // interior voxel so sharp 3D corners of the CAD mesh are captured to sub-voxel accuracy.
+    openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+        eikSurfaceSampler(eikAccMain, eikGrid.transform());
+    openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+        sdfSurfaceSampler(sdfAccMain, sdfGrid.transform());
+
+    auto registerSurfacePoint = [&](double wx, double wy, double wz) {
+        const openvdb::Vec3d wp(wx, wy, wz);
+        const float tauSurf = eikSurfaceSampler.wsSample(wp);
+        if (!std::isfinite(tauSurf) || tauSurf >= validTauLimit) {
+            return;
+        }
+        const openvdb::Coord ijk = eikGrid.transform().worldToIndexCellCentered(wp);
+        int vIdx = idxAcc.getValue(ijk);
+        if (vIdx < 0) {
+            int bestDistSq = 100;
+            for (int dz = -2; dz <= 2; ++dz) {
+                for (int dy = -2; dy <= 2; ++dy) {
+                    for (int dx = -2; dx <= 2; ++dx) {
+                        const int dSq = dx * dx + dy * dy + dz * dz;
+                        if (dSq >= bestDistSq) {
+                            continue;
+                        }
+                        const int cand = idxAcc.getValue(ijk + openvdb::Coord(dx, dy, dz));
+                        if (cand >= 0) {
+                            bestDistSq = dSq;
+                            vIdx = cand;
+                        }
+                    }
+                }
+            }
+        }
+        if (vIdx >= 0) {
+            auto& vx = voxels[static_cast<std::size_t>(vIdx)];
+            vx.surfTauMin = std::min(vx.surfTauMin, tauSurf);
+            vx.surfTauMax = std::max(vx.surfTauMax, tauSurf);
+            const float sdfAtPt = sdfSurfaceSampler.wsSample(wp);
+            if (std::isfinite(sdfAtPt) && sdfAtPt > 0.0f) {
+                vx.cornerSdfAllowance = std::max(
+                    vx.cornerSdfAllowance,
+                    std::clamp(sdfAtPt, 0.0f, 0.75f * voxelSize));
+            }
+            globalTauMin = std::min(globalTauMin, tauSurf);
+            globalTauMax = std::max(globalTauMax, tauSurf);
+        }
+    };
+
+    for (const auto& v : rec.vertexBuffer) {
+        registerSurfacePoint(v.x, v.y, v.z);
+    }
+
+    if (globalTauMax <= globalTauMin + 1.0e-4f) {
+        return result;
+    }
+
+    // ------------------------------------------------------------------------
+    // 2. Construct Topological Branch Tree via Descending Superlevel-Set Split Tree
+    // ------------------------------------------------------------------------
+    // Unlike thin \Delta\tau slabs (which fragment into disconnected 1D strips whenever
+    // isosurfaces are tilted across the grid), the superlevel sets U(t) = {x : \tau(x) >= t}
+    // are solid 3D volumes that remain 26-connected at arbitrary tilt angles right up to the
+    // sharpest 3D corners. Sweeping t downward from \tau_max to \tau_min via Union-Find
+    // detects genuine multi-tower saddle splits while preserving exact branch peak isovalues.
+    struct MacroBranch {
+        int id = 0;
+        int primaryParentId = -1;
+        std::vector<int> parentBranches;
+        std::vector<int> childBranches;
+        std::vector<int> voxelIndices;
+        float tauStart = 0.0f;
+        float tauEnd = 0.0f;
+        float startCornerSdfAllowance = 0.0f;
+        float peakCornerSdfAllowance = 0.0f;
+        bool isRoot = true;
+        bool isLeaf = true;
+
+        // 1D profile across [tauStart, tauEnd]
+        enum : int { kNumBins = 64 };
+        std::array<float, kNumBins> gMean{};
+        std::array<float, kNumBins> gMin{};
+        std::array<float, kNumBins> gMax{};
+        std::array<float, kNumBins + 1> cumArcS{};
+        float totalArcLengthMm = 0.0f;
+
+        // Selected layer isovalues and thicknesses on this branch
+        std::vector<float> layerIsovalues;
+        std::vector<float> layerMeanThickness;
+        std::vector<float> layerMinThickness;
+        std::vector<float> layerMaxThickness;
+        std::vector<bool> layerIsFirst;
+        std::vector<bool> layerIsTop;
+
+        float tauToArcS(float tau) const noexcept {
+            if (tauEnd <= tauStart + 1.0e-6f) {
+                return 0.0f;
+            }
+            const float u = std::clamp((tau - tauStart) / (tauEnd - tauStart), 0.0f, 1.0f);
+            const float fBin = u * static_cast<float>(kNumBins);
+            const int b0 = std::clamp(static_cast<int>(std::floor(fBin)), 0, kNumBins - 1);
+            const float frac = fBin - static_cast<float>(b0);
+            return cumArcS[b0] + frac * (cumArcS[b0 + 1] - cumArcS[b0]);
+        }
+
+        float arcSToTau(float s) const noexcept {
+            if (totalArcLengthMm <= 1.0e-6f || tauEnd <= tauStart + 1.0e-6f) {
+                return tauStart;
+            }
+            const float clampedS = std::clamp(s, 0.0f, totalArcLengthMm);
+            auto it = std::lower_bound(cumArcS.begin(), cumArcS.end(), clampedS);
+            int idx = static_cast<int>(std::distance(cumArcS.begin(), it));
+            if (idx <= 0) {
+                return tauStart;
+            }
+            if (idx > kNumBins) {
+                return tauEnd;
+            }
+            const int b0 = idx - 1;
+            const float ds = cumArcS[b0 + 1] - cumArcS[b0];
+            const float frac = (ds > 1.0e-7f) ? (clampedS - cumArcS[b0]) / ds : 0.0f;
+            const float u = (static_cast<float>(b0) + std::clamp(frac, 0.0f, 1.0f)) /
+                            static_cast<float>(kNumBins);
+            return tauStart + u * (tauEnd - tauStart);
+        }
+
+        void queryGradRange(float tauA, float tauB, float& outGMin, float& outGMean, float& outGMax) const noexcept {
+            if (tauEnd <= tauStart + 1.0e-6f) {
+                outGMin = outGMean = outGMax = 1.0f;
+                return;
+            }
+            const float u0 = std::clamp((std::min(tauA, tauB) - tauStart) / (tauEnd - tauStart), 0.0f, 1.0f);
+            const float u1 = std::clamp((std::max(tauA, tauB) - tauStart) / (tauEnd - tauStart), 0.0f, 1.0f);
+            const int bStart = std::clamp(
+                static_cast<int>(std::floor(u0 * static_cast<float>(kNumBins))),
+                0,
+                kNumBins - 1);
+            const int bEnd = std::clamp(
+                static_cast<int>(std::floor(u1 * static_cast<float>(kNumBins))),
+                bStart,
+                kNumBins - 1);
+            outGMin = std::numeric_limits<float>::max();
+            outGMax = 0.0f;
+            float sumMean = 0.0f;
+            int cnt = 0;
+            for (int b = bStart; b <= bEnd; ++b) {
+                outGMin = std::min(outGMin, gMin[b]);
+                outGMax = std::max(outGMax, gMax[b]);
+                sumMean += gMean[b];
+                ++cnt;
+            }
+            outGMean = (cnt > 0) ? (sumMean / static_cast<float>(cnt)) : 1.0f;
+            if (outGMin > outGMax) {
+                outGMin = outGMax = outGMean;
+            }
+        }
+    };
+
+    struct SuperComponent {
+        float peakTau = std::numeric_limits<float>::lowest();
+        float minTau = std::numeric_limits<float>::max();
+        float startCornerSdfAllowance = 0.0f;
+        float peakCornerSdfAllowance = 0.0f;
+        std::vector<int> voxelIndices;
+        std::vector<int> childBranches;
+        bool active = true;
+    };
+
+    const std::size_t numVoxels = voxels.size();
+    std::vector<int> descOrder(numVoxels);
+    std::iota(descOrder.begin(), descOrder.end(), 0);
+    std::sort(descOrder.begin(), descOrder.end(), [&](int a, int b) {
+        if (std::abs(voxels[a].tau - voxels[b].tau) > 1.0e-6f) {
+            return voxels[a].tau > voxels[b].tau;
+        }
+        return voxels[a].surfTauMax > voxels[b].surfTauMax;
+    });
+
+    std::vector<int> ufParent(numVoxels, -1);
+    std::vector<int> rootToComp(numVoxels, -1);
+    std::vector<std::uint8_t> swept(numVoxels, 0);
+    std::vector<SuperComponent> superComps;
+    superComps.reserve(64);
+
+    auto ufFind = [&](int x) -> int {
+        int r = x;
+        while (ufParent[r] != r) {
+            r = ufParent[r];
+        }
+        int curr = x;
+        while (curr != r) {
+            const int nxt = ufParent[curr];
+            ufParent[curr] = r;
+            curr = nxt;
+        }
+        return r;
+    };
+
+    auto mergeSuperComps = [&](int dstCompId, int srcCompId) {
+        if (dstCompId == srcCompId) {
+            return;
+        }
+        auto& dst = superComps[static_cast<std::size_t>(dstCompId)];
+        auto& src = superComps[static_cast<std::size_t>(srcCompId)];
+        if (!src.active) {
+            return;
+        }
+        if (src.peakTau >= dst.peakTau - 0.5f * voxelSize) {
+            dst.peakCornerSdfAllowance = std::max(dst.peakCornerSdfAllowance, src.peakCornerSdfAllowance);
+        }
+        if (src.minTau <= dst.minTau + 0.5f * voxelSize) {
+            dst.startCornerSdfAllowance = std::max(dst.startCornerSdfAllowance, src.startCornerSdfAllowance);
+        }
+        dst.peakTau = std::max(dst.peakTau, src.peakTau);
+        dst.minTau = std::min(dst.minTau, src.minTau);
+        dst.voxelIndices.insert(dst.voxelIndices.end(), src.voxelIndices.begin(), src.voxelIndices.end());
+        dst.childBranches.insert(dst.childBranches.end(), src.childBranches.begin(), src.childBranches.end());
+        src.voxelIndices.clear();
+        src.childBranches.clear();
+        src.active = false;
+    };
+
+    const float minBranchPersistenceMm = std::max({2.5f * voxelSize, 3.0f * hMax, 1.5f});
+    const std::size_t minBranchVoxels = 12;
+
+    std::vector<MacroBranch> rawBranches;
+
+    for (const int v : descOrder) {
+        swept[v] = 1;
+        ufParent[v] = v;
+
+        const openvdb::Coord& c = voxels[v].ijk;
+        std::vector<int> nbRoots;
+        std::vector<int> nbComps;
+
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0 && dz == 0) {
+                        continue;
+                    }
+                    const int nb = idxAcc.getValue(c + openvdb::Coord(dx, dy, dz));
+                    if (nb >= 0 && swept[nb]) {
+                        const int r = ufFind(nb);
+                        const int cId = rootToComp[r];
+                        if (cId >= 0 && superComps[static_cast<std::size_t>(cId)].active) {
+                            if (std::find(nbComps.begin(), nbComps.end(), cId) == nbComps.end()) {
+                                nbRoots.push_back(r);
+                                nbComps.push_back(cId);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (nbComps.empty()) {
+            // New local maximum peak in the superlevel set
+            const int cId = static_cast<int>(superComps.size());
+            SuperComponent sc{};
+            sc.peakTau = voxels[v].surfTauMax;
+            sc.minTau = voxels[v].surfTauMin;
+            sc.peakCornerSdfAllowance = voxels[v].cornerSdfAllowance;
+            sc.startCornerSdfAllowance = voxels[v].cornerSdfAllowance;
+            sc.voxelIndices.push_back(v);
+            sc.active = true;
+            superComps.push_back(std::move(sc));
+            rootToComp[v] = cId;
+        } else if (nbComps.size() == 1) {
+            // Single continuing superlevel component
+            const int r0 = nbRoots[0];
+            const int cId = nbComps[0];
+            ufParent[v] = r0;
+            auto& sc = superComps[static_cast<std::size_t>(cId)];
+            if (voxels[v].surfTauMax >= sc.peakTau - 1.5f * voxelSize) {
+                sc.peakCornerSdfAllowance = std::max(sc.peakCornerSdfAllowance, voxels[v].cornerSdfAllowance);
+            }
+            if (voxels[v].surfTauMin <= sc.minTau + 1.5f * voxelSize) {
+                sc.startCornerSdfAllowance = std::max(sc.startCornerSdfAllowance, voxels[v].cornerSdfAllowance);
+            }
+            sc.peakTau = std::max(sc.peakTau, voxels[v].surfTauMax);
+            sc.minTau = std::min(sc.minTau, voxels[v].surfTauMin);
+            sc.voxelIndices.push_back(v);
+        } else {
+            // Saddle point where >= 2 upper superlevel components meet at tauSplit
+            const float tauSplit = voxels[v].tau;
+            std::vector<int> sigComps;
+            std::vector<int> minorComps;
+
+            for (const int cId : nbComps) {
+                const auto& sc = superComps[static_cast<std::size_t>(cId)];
+                const float persistence = sc.peakTau - tauSplit;
+                const bool isSignificant = !sc.childBranches.empty() ||
+                    (persistence >= minBranchPersistenceMm && sc.voxelIndices.size() >= minBranchVoxels);
+                if (isSignificant) {
+                    sigComps.push_back(cId);
+                } else {
+                    minorComps.push_back(cId);
+                }
+            }
+
+            // Union all neighbor roots with v
+            const int masterRoot = nbRoots[0];
+            for (std::size_t j = 1; j < nbRoots.size(); ++j) {
+                const int rj = ufFind(nbRoots[j]);
+                if (rj != masterRoot) {
+                    ufParent[rj] = masterRoot;
+                }
+            }
+            ufParent[v] = masterRoot;
+
+            if (sigComps.size() <= 1) {
+                // Not a genuine topological branch split: merge minor discretization bumps
+                // into the main component while preserving the exact global peakTau!
+                int mainComp = !sigComps.empty() ? sigComps[0] : nbComps[0];
+                if (sigComps.empty()) {
+                    for (const int cId : nbComps) {
+                        if (superComps[static_cast<std::size_t>(cId)].peakTau >
+                            superComps[static_cast<std::size_t>(mainComp)].peakTau) {
+                            mainComp = cId;
+                        }
+                    }
+                }
+                for (const int cId : nbComps) {
+                    if (cId != mainComp) {
+                        mergeSuperComps(mainComp, cId);
+                    }
+                }
+                auto& sc = superComps[static_cast<std::size_t>(mainComp)];
+                if (voxels[v].surfTauMax >= sc.peakTau - 1.5f * voxelSize) {
+                    sc.peakCornerSdfAllowance = std::max(sc.peakCornerSdfAllowance, voxels[v].cornerSdfAllowance);
+                }
+                if (voxels[v].surfTauMin <= sc.minTau + 1.5f * voxelSize) {
+                    sc.startCornerSdfAllowance = std::max(sc.startCornerSdfAllowance, voxels[v].cornerSdfAllowance);
+                }
+                sc.peakTau = std::max(sc.peakTau, voxels[v].surfTauMax);
+                sc.minTau = std::min(sc.minTau, voxels[v].surfTauMin);
+                sc.voxelIndices.push_back(v);
+                rootToComp[masterRoot] = mainComp;
+            } else {
+                // Genuine topological split at tauSplit into >= 2 significant upper branches!
+                int bestSig = sigComps[0];
+                for (const int cId : sigComps) {
+                    if (superComps[static_cast<std::size_t>(cId)].peakTau >
+                        superComps[static_cast<std::size_t>(bestSig)].peakTau) {
+                        bestSig = cId;
+                    }
+                }
+                for (const int mId : minorComps) {
+                    mergeSuperComps(bestSig, mId);
+                }
+
+                std::vector<int> finalizedChildIds;
+                finalizedChildIds.reserve(sigComps.size());
+                for (const int cId : sigComps) {
+                    auto& sc = superComps[static_cast<std::size_t>(cId)];
+                    const int bId = static_cast<int>(rawBranches.size());
+                    MacroBranch mb{};
+                    mb.id = bId;
+                    mb.tauStart = tauSplit;
+                    mb.tauEnd = std::max(sc.peakTau, tauSplit + 1.0e-3f);
+                    mb.startCornerSdfAllowance = sc.startCornerSdfAllowance;
+                    mb.peakCornerSdfAllowance = sc.peakCornerSdfAllowance;
+                    mb.isRoot = false;
+                    mb.isLeaf = sc.childBranches.empty();
+                    mb.childBranches = std::move(sc.childBranches);
+                    mb.voxelIndices = std::move(sc.voxelIndices);
+                    sc.active = false;
+
+                    rawBranches.push_back(std::move(mb));
+                    finalizedChildIds.push_back(bId);
+                }
+
+                // Start a new parent trunk SuperComponent below tauSplit
+                const int trunkCompId = static_cast<int>(superComps.size());
+                SuperComponent trunk{};
+                trunk.peakTau = tauSplit;
+                trunk.minTau = voxels[v].surfTauMin;
+                trunk.peakCornerSdfAllowance = voxels[v].cornerSdfAllowance;
+                trunk.startCornerSdfAllowance = voxels[v].cornerSdfAllowance;
+                trunk.voxelIndices.push_back(v);
+                trunk.childBranches = std::move(finalizedChildIds);
+                trunk.active = true;
+                superComps.push_back(std::move(trunk));
+                rootToComp[masterRoot] = trunkCompId;
+            }
+        }
+    }
+
+    // Finalize remaining active root SuperComponents at the bottom of the sweep
+    std::vector<int> activeRootComps;
+    for (std::size_t cId = 0; cId < superComps.size(); ++cId) {
+        if (superComps[cId].active && !superComps[cId].voxelIndices.empty()) {
+            activeRootComps.push_back(static_cast<int>(cId));
+        }
+    }
+
+    if (activeRootComps.size() > 1) {
+        int largestRoot = activeRootComps[0];
+        for (const int cId : activeRootComps) {
+            if (superComps[static_cast<std::size_t>(cId)].voxelIndices.size() >
+                superComps[static_cast<std::size_t>(largestRoot)].voxelIndices.size()) {
+                largestRoot = cId;
+            }
+        }
+        std::vector<int> keptRoots;
+        for (const int cId : activeRootComps) {
+            const auto& sc = superComps[static_cast<std::size_t>(cId)];
+            const bool isSig = (cId == largestRoot) || !sc.childBranches.empty() ||
+                ((sc.peakTau - sc.minTau) >= minBranchPersistenceMm &&
+                 sc.voxelIndices.size() >= minBranchVoxels);
+            if (isSig) {
+                keptRoots.push_back(cId);
+            } else {
+                mergeSuperComps(largestRoot, cId);
+            }
+        }
+        activeRootComps = std::move(keptRoots);
+    }
+
+    for (const int cId : activeRootComps) {
+        auto& sc = superComps[static_cast<std::size_t>(cId)];
+        if (!sc.active || sc.voxelIndices.empty()) {
+            continue;
+        }
+        const int bId = static_cast<int>(rawBranches.size());
+        MacroBranch mb{};
+        mb.id = bId;
+        mb.tauStart = std::min(sc.minTau, std::max(0.0f, globalTauMin));
+        mb.tauEnd = std::max(sc.peakTau, mb.tauStart + 1.0e-3f);
+        mb.startCornerSdfAllowance = sc.startCornerSdfAllowance;
+        mb.peakCornerSdfAllowance = sc.peakCornerSdfAllowance;
+        mb.isRoot = true;
+        mb.isLeaf = sc.childBranches.empty();
+        mb.childBranches = std::move(sc.childBranches);
+        mb.voxelIndices = std::move(sc.voxelIndices);
+        sc.active = false;
+        rawBranches.push_back(std::move(mb));
+    }
+
+    if (rawBranches.empty()) {
+        MacroBranch mb{};
+        mb.id = 0;
+        mb.tauStart = std::max(0.0f, globalTauMin);
+        mb.tauEnd = globalTauMax;
+        mb.isRoot = true;
+        mb.isLeaf = true;
+        for (std::size_t i = 0; i < numVoxels; ++i) {
+            mb.voxelIndices.push_back(static_cast<int>(i));
+        }
+        rawBranches.push_back(std::move(mb));
+    }
+
+    // Order branches ascending by tauStart (so root trunk is B0, child branches follow)
+    std::vector<int> branchOrder(rawBranches.size());
+    std::iota(branchOrder.begin(), branchOrder.end(), 0);
+    std::sort(branchOrder.begin(), branchOrder.end(), [&](int a, int b) {
+        if (rawBranches[a].isRoot != rawBranches[b].isRoot) {
+            return rawBranches[a].isRoot > rawBranches[b].isRoot;
+        }
+        if (std::abs(rawBranches[a].tauStart - rawBranches[b].tauStart) > 1.0e-4f) {
+            return rawBranches[a].tauStart < rawBranches[b].tauStart;
+        }
+        return rawBranches[a].tauEnd < rawBranches[b].tauEnd;
+    });
+
+    std::vector<int> oldToNewBranch(rawBranches.size(), 0);
+    for (std::size_t newIdx = 0; newIdx < branchOrder.size(); ++newIdx) {
+        oldToNewBranch[static_cast<std::size_t>(branchOrder[newIdx])] = static_cast<int>(newIdx);
+    }
+
+    std::vector<MacroBranch> branches(rawBranches.size());
+    for (std::size_t newIdx = 0; newIdx < branchOrder.size(); ++newIdx) {
+        MacroBranch mb = std::move(rawBranches[static_cast<std::size_t>(branchOrder[newIdx])]);
+        mb.id = static_cast<int>(newIdx);
+        for (int& ch : mb.childBranches) {
+            ch = oldToNewBranch[static_cast<std::size_t>(ch)];
+        }
+        branches[newIdx] = std::move(mb);
+    }
+
+    for (std::size_t b = 0; b < branches.size(); ++b) {
+        for (const int ch : branches[b].childBranches) {
+            branches[static_cast<std::size_t>(ch)].parentBranches.push_back(static_cast<int>(b));
+            branches[static_cast<std::size_t>(ch)].primaryParentId = static_cast<int>(b);
+            branches[static_cast<std::size_t>(ch)].isRoot = false;
+        }
+        branches[b].isLeaf = branches[b].childBranches.empty();
+    }
+
+    // Populate 3D branchGrid and dilate by 3 voxels into the exterior narrow band
+    // so boundary triangles cut by volumeToMesh always match their branch cleanly.
+    openvdb::Int32Grid branchGrid(-1);
+    branchGrid.setTransform(eikGrid.transform().copy());
+    auto branchAcc = branchGrid.getAccessor();
+
+    for (std::size_t b = 0; b < branches.size(); ++b) {
+        for (const int vIdx : branches[b].voxelIndices) {
+            voxels[static_cast<std::size_t>(vIdx)].branchId = static_cast<int>(b);
+            branchAcc.setValue(voxels[static_cast<std::size_t>(vIdx)].ijk, static_cast<int>(b));
+        }
+    }
+
+    if (branches.size() > 1) {
+        for (int pass = 0; pass < 3; ++pass) {
+            std::vector<std::pair<openvdb::Coord, int>> dilationUpdates;
+            for (auto iter = branchGrid.cbeginValueOn(); iter; ++iter) {
+                const int bId = *iter;
+                if (bId < 0) {
+                    continue;
+                }
+                const openvdb::Coord c = iter.getCoord();
+                for (int dz = -1; dz <= 1; ++dz) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            if (dx == 0 && dy == 0 && dz == 0) {
+                                continue;
+                            }
+                            const openvdb::Coord nb = c + openvdb::Coord(dx, dy, dz);
+                            if (branchAcc.getValue(nb) < 0) {
+                                dilationUpdates.emplace_back(nb, bId);
+                            }
+                        }
+                    }
+                }
+            }
+            for (const auto& [coord, bId] : dilationUpdates) {
+                if (branchAcc.getValue(coord) < 0) {
+                    branchAcc.setValue(coord, bId);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 3. Build 1D Gradient & Cumulative Arc-Length Profiles S_b(\tau) per Branch
+    // ------------------------------------------------------------------------
+    auto rebuildBranchArcLengthProfile = [&](MacroBranch& mb) {
+        constexpr int M = MacroBranch::kNumBins;
+        const float t0 = mb.tauStart;
+        const float t1 = std::max(mb.tauEnd, t0 + 1.0e-4f);
+        const float span = t1 - t0;
+
+        std::array<double, M> sumG{};
+        std::array<int, M> countG{};
+        for (int m = 0; m < M; ++m) {
+            mb.gMin[m] = std::numeric_limits<float>::max();
+            mb.gMax[m] = 0.0f;
+            mb.gMean[m] = 1.0f;
+        }
+
+        for (const int vIdx : mb.voxelIndices) {
+            const float t = voxels[static_cast<std::size_t>(vIdx)].tau;
+            const float g = voxels[static_cast<std::size_t>(vIdx)].gradMag;
+            const int m = std::clamp(
+                static_cast<int>(std::floor(((t - t0) / span) * static_cast<float>(M))),
+                0,
+                M - 1);
+            sumG[m] += static_cast<double>(g);
+            countG[m] += 1;
+            mb.gMin[m] = std::min(mb.gMin[m], g);
+            mb.gMax[m] = std::max(mb.gMax[m], g);
+        }
+
+        float fallbackMean = 1.0f;
+        double totalSum = 0.0;
+        int totalCnt = 0;
+        for (int m = 0; m < M; ++m) {
+            totalSum += sumG[m];
+            totalCnt += countG[m];
+        }
+        if (totalCnt > 0) {
+            fallbackMean = static_cast<float>(totalSum / static_cast<double>(totalCnt));
+        }
+
+        for (int m = 0; m < M; ++m) {
+            if (countG[m] > 0) {
+                mb.gMean[m] = static_cast<float>(sumG[m] / static_cast<double>(countG[m]));
+            } else {
+                mb.gMean[m] = fallbackMean;
+            }
+        }
+
+        for (int m = 1; m < M; ++m) {
+            if (countG[m] == 0) {
+                mb.gMean[m] = mb.gMean[m - 1];
+                mb.gMin[m] = mb.gMin[m - 1];
+                mb.gMax[m] = mb.gMax[m - 1];
+            }
+        }
+        for (int m = M - 2; m >= 0; --m) {
+            if (countG[m] == 0 || mb.gMin[m] > mb.gMax[m]) {
+                mb.gMean[m] = mb.gMean[m + 1];
+                mb.gMin[m] = mb.gMin[m + 1];
+                mb.gMax[m] = mb.gMax[m + 1];
+            }
+        }
+        for (int m = 0; m < M; ++m) {
+            if (mb.gMin[m] > mb.gMax[m]) {
+                mb.gMin[m] = mb.gMax[m] = mb.gMean[m];
+            }
+        }
+
+        std::array<float, M> smoothed = mb.gMean;
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int m = 1; m + 1 < M; ++m) {
+                smoothed[m] = 0.25f * mb.gMean[m - 1] + 0.50f * mb.gMean[m] + 0.25f * mb.gMean[m + 1];
+            }
+            mb.gMean = smoothed;
+        }
+
+        const float dTau = span / static_cast<float>(M);
+        mb.cumArcS[0] = 0.0f;
+        for (int m = 0; m < M; ++m) {
+            const float g = std::clamp(mb.gMean[m], 0.20f, 4.0f);
+            mb.cumArcS[m + 1] = mb.cumArcS[m] + dTau / g;
+        }
+        mb.totalArcLengthMm = mb.cumArcS[M];
+    };
+
+    for (auto& mb : branches) {
+        rebuildBranchArcLengthProfile(mb);
+    }
+
+    // ------------------------------------------------------------------------
+    // 4. Bidirectional Junction & Layer Relaxation Solver
+    // ------------------------------------------------------------------------
+    // First, optimize internal split junction isovalues bidirectionally so that
+    // both parent and child branches achieve near-target layer spacing without quantization jumps.
+    if (branches.size() > 1) {
+        for (int pass = 0; pass < 4; ++pass) {
+            for (std::size_t b = 0; b < branches.size(); ++b) {
+                if (branches[b].childBranches.empty()) {
+                    continue;
+                }
+                const float baseJuncTau = branches[b].tauEnd;
+                const float searchRadiusTau = 0.45f * hTarget;
+                float bestJuncTau = baseJuncTau;
+                float bestCost = std::numeric_limits<float>::max();
+
+                for (int step = -10; step <= 10; ++step) {
+                    const float candTau = baseJuncTau +
+                        (static_cast<float>(step) / 10.0f) * searchRadiusTau;
+                    if (candTau <= branches[b].tauStart + hFirst + hMin) {
+                        continue;
+                    }
+
+                    const float parentSpanMm = branches[b].totalArcLengthMm +
+                        (candTau - baseJuncTau) / std::max(branches[b].gMean.back(), 0.25f) -
+                        (branches[b].isRoot ? hFirst : 0.0f);
+                    if (parentSpanMm <= hMin) {
+                        continue;
+                    }
+                    const int nParent = std::max(1, static_cast<int>(std::round(parentSpanMm / hTarget)));
+                    const float hParent = parentSpanMm / static_cast<float>(nParent);
+                    const float penParent = (hParent < hMin)
+                        ? 50.0f * (hMin - hParent) * (hMin - hParent)
+                        : ((hParent > hMax) ? 50.0f * (hParent - hMax) * (hParent - hMax) : 0.0f);
+                    float cost = static_cast<float>(nParent) * (hParent - hTarget) * (hParent - hTarget) + penParent;
+
+                    bool validChildren = true;
+                    for (const int ch : branches[b].childBranches) {
+                        const float childSpanMm = branches[ch].totalArcLengthMm -
+                            (candTau - baseJuncTau) / std::max(branches[ch].gMean.front(), 0.25f) -
+                            (branches[ch].isLeaf ? hTop : 0.0f);
+                        if (childSpanMm <= hMin) {
+                            validChildren = false;
+                            break;
+                        }
+                        const int nChild = std::max(1, static_cast<int>(std::round(childSpanMm / hTarget)));
+                        const float hChild = childSpanMm / static_cast<float>(nChild);
+                        const float penChild = (hChild < hMin)
+                            ? 50.0f * (hMin - hChild) * (hMin - hChild)
+                            : ((hChild > hMax) ? 50.0f * (hChild - hMax) * (hChild - hMax) : 0.0f);
+                        cost += static_cast<float>(nChild) * (hChild - hTarget) * (hChild - hTarget) + penChild;
+                    }
+
+                    if (validChildren && cost < bestCost) {
+                        bestCost = cost;
+                        bestJuncTau = candTau;
+                    }
+                }
+
+                if (std::abs(bestJuncTau - baseJuncTau) > 1.0e-5f) {
+                    branches[b].tauEnd = bestJuncTau;
+                    rebuildBranchArcLengthProfile(branches[b]);
+                    for (const int ch : branches[b].childBranches) {
+                        branches[ch].tauStart = bestJuncTau;
+                        rebuildBranchArcLengthProfile(branches[ch]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Solve the bidirectional layer sequence on each branch b:
+    // - Root branches emit their first layer at s_0 = hFirst (is_first_layer = true).
+    // - Non-root branches start their interval at s_0 = 0 (which is the parent's junction layer,
+    //   already emitted by the parent branch) and emit layers k = 1 .. N_b.
+    // - Leaf branches anchor their final layer at s_{N_b} = L_b - hTop (is_top_layer = true).
+    // - Internal branches anchor their final layer at the junction s_{N_b} = L_b.
+    for (auto& mb : branches) {
+        const float L = mb.totalArcLengthMm;
+        if (L <= 1.0e-4f) {
+            continue;
+        }
+
+        const float sStart = mb.isRoot ? std::min(hFirst, 0.50f * L) : 0.0f;
+        const float sEnd = mb.isLeaf
+            ? std::max(sStart, L - std::min(hTop, 0.50f * L))
+            : L;
+        const float spanS = std::max(0.0f, sEnd - sStart);
+
+        // Very thin branch case: always emit the first/top anchor layer so no root or leaf peak is dropped
+        if (spanS < 0.5f * hMin) {
+            if (mb.isRoot || mb.isLeaf) {
+                const float sAnchor = mb.isLeaf ? sEnd : sStart;
+                const float tauAnchor = mb.arcSToTau(sAnchor);
+                const float thick = std::max(0.01f, sAnchor);
+                mb.layerIsovalues.push_back(tauAnchor);
+                mb.layerMeanThickness.push_back(thick);
+                mb.layerMinThickness.push_back(thick);
+                mb.layerMaxThickness.push_back(thick);
+                mb.layerIsFirst.push_back(mb.isRoot);
+                mb.layerIsTop.push_back(mb.isLeaf);
+            }
+            continue;
+        }
+
+        const int nMin = std::max(1, static_cast<int>(std::ceil(spanS / hMax - 1.0e-5f)));
+        const int nMax = std::max(1, static_cast<int>(std::floor(spanS / hMin + 1.0e-5f)));
+        const int nIdeal = std::max(1, static_cast<int>(std::round(spanS / hTarget)));
+        const int N = (nMin <= nMax) ? std::clamp(nIdeal, nMin, nMax) : nIdeal;
+
+        std::vector<float> sNodes(static_cast<std::size_t>(N) + 1, 0.0f);
+        for (int k = 0; k <= N; ++k) {
+            const float u = static_cast<float>(k) / static_cast<float>(N);
+            sNodes[k] = sStart + u * spanS;
+        }
+
+        // Bidirectional (forward bottom-up + backward top-down) Gauss-Seidel relaxation
+        // accounting for local gradient variations so physical thickness errors are evenly
+        // distributed across the entire branch while strictly respecting [hMin, hMax].
+        if (N >= 2) {
+            for (int iter = 0; iter < 40; ++iter) {
+                // Forward pass: k = 1 .. N - 1 (bottom-up from bed/junction toward peak)
+                for (int k = 1; k < N; ++k) {
+                    const float sMid = 0.5f * (sNodes[k - 1] + sNodes[k + 1]);
+                    const float lo = std::max(sNodes[k - 1] + hMin, sNodes[k + 1] - hMax);
+                    const float hi = std::min(sNodes[k - 1] + hMax, sNodes[k + 1] - hMin);
+                    sNodes[k] = (lo <= hi) ? std::clamp(sMid, lo, hi) : sMid;
+                }
+
+                // Backward pass: k = N - 1 .. 1 (top-down from peak/junction toward bed)
+                for (int k = N - 1; k >= 1; --k) {
+                    const float sMid = 0.5f * (sNodes[k - 1] + sNodes[k + 1]);
+                    const float lo = std::max(sNodes[k - 1] + hMin, sNodes[k + 1] - hMax);
+                    const float hi = std::min(sNodes[k - 1] + hMax, sNodes[k + 1] - hMin);
+                    sNodes[k] = (lo <= hi) ? std::clamp(sMid, lo, hi) : sMid;
+                }
+            }
+        }
+
+        const int kFirstEmit = mb.isRoot ? 0 : 1;
+        for (int k = kFirstEmit; k <= N; ++k) {
+            const float sCurr = sNodes[k];
+            const float sPrev = (k == 0) ? 0.0f : sNodes[k - 1];
+            const float tauCurr = mb.arcSToTau(sCurr);
+            const float tauPrev = (k == 0) ? mb.tauStart : mb.arcSToTau(sPrev);
+            const float dTau = std::max(0.0f, tauCurr - tauPrev);
+
+            float gMinLocal = 1.0f, gMeanLocal = 1.0f, gMaxLocal = 1.0f;
+            mb.queryGradRange(tauPrev, tauCurr, gMinLocal, gMeanLocal, gMaxLocal);
+
+            const float meanH = std::max(0.01f, sCurr - sPrev);
+            const float rawMinH = (gMaxLocal > 1.0e-4f) ? (dTau / gMaxLocal) : meanH;
+            const float rawMaxH = (gMinLocal > 1.0e-4f) ? (dTau / gMinLocal) : meanH;
+            const bool isFirst = (mb.isRoot && k == 0);
+            const bool isTop = (mb.isLeaf && k == N);
+
+            const float minH = isFirst ? meanH : std::clamp(std::min(rawMinH, meanH), hMin, meanH);
+            const float maxH = isFirst ? meanH : std::clamp(std::max(rawMaxH, meanH), meanH, hMax);
+
+            mb.layerIsovalues.push_back(tauCurr);
+            mb.layerMeanThickness.push_back(meanH);
+            mb.layerMinThickness.push_back(minH);
+            mb.layerMaxThickness.push_back(maxH);
+            mb.layerIsFirst.push_back(isFirst);
+            mb.layerIsTop.push_back(isTop);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 5. Flatten, Sort, and Parallel-Extract 3D Clipped Layer Meshes & Contours
+    // ------------------------------------------------------------------------
+    struct PendingLayer {
+        std::uint32_t branchId = 0;
+        std::int32_t parentBranchId = -1;
+        std::uint32_t branchLayerIndex = 0;
+        std::uint32_t branchLayerCount = 0;
+        float isovalue = 0.0f;
+        float meanThicknessMm = 0.0f;
+        float minThicknessMm = 0.0f;
+        float maxThicknessMm = 0.0f;
+        float sdfClipAllowance = 0.0f;
+        bool isFirstLayer = false;
+        bool isTopLayer = false;
+    };
+
+    std::vector<PendingLayer> pending;
+    const float cornerRampTauSpan = std::max(2.0f * voxelSize, 1.5f * hMax);
+
+    for (const auto& mb : branches) {
+        const auto count = static_cast<std::uint32_t>(mb.layerIsovalues.size());
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const float iso = mb.layerIsovalues[i];
+            float allowance = 0.0f;
+            if (mb.isRoot && mb.startCornerSdfAllowance > 0.0f) {
+                const float u = std::clamp(1.0f - (iso - mb.tauStart) / cornerRampTauSpan, 0.0f, 1.0f);
+                allowance = std::max(allowance, u * mb.startCornerSdfAllowance);
+            }
+            if (mb.isLeaf && mb.peakCornerSdfAllowance > 0.0f) {
+                const float u = std::clamp(1.0f - (mb.tauEnd - iso) / cornerRampTauSpan, 0.0f, 1.0f);
+                allowance = std::max(allowance, u * mb.peakCornerSdfAllowance);
+            }
+
+            PendingLayer pl{};
+            pl.branchId = static_cast<std::uint32_t>(mb.id);
+            pl.parentBranchId = static_cast<std::int32_t>(mb.primaryParentId);
+            pl.branchLayerIndex = i;
+            pl.branchLayerCount = count;
+            pl.isovalue = iso;
+            pl.meanThicknessMm = mb.layerMeanThickness[i];
+            pl.minThicknessMm = mb.layerMinThickness[i];
+            pl.maxThicknessMm = mb.layerMaxThickness[i];
+            pl.sdfClipAllowance = allowance;
+            pl.isFirstLayer = mb.layerIsFirst[i];
+            pl.isTopLayer = mb.layerIsTop[i];
+            pending.push_back(pl);
+        }
+    }
+
+    if (pending.empty()) {
+        return result;
+    }
+
+    std::sort(pending.begin(), pending.end(), [](const PendingLayer& a, const PendingLayer& b) {
+        if (std::abs(a.isovalue - b.isovalue) > 1.0e-5f) {
+            return a.isovalue < b.isovalue;
+        }
+        return a.branchId < b.branchId;
+    });
+
+    const std::size_t numLayers = pending.size();
+    std::vector<SelectedLayerInfo> extractedLayers(numLayers);
+    const bool multiBranch = (branches.size() > 1);
+    const float outerFringeLimit = sdfBg - 1.75f * voxelSize;
+    const float clampedAdaptivity = std::clamp(adaptivity, 0.0f, 1.0f);
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, numLayers),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            auto sdfAcc = sdfGrid.getConstAccessor();
+            openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+                sdfSampler(sdfAcc, sdfGrid.transform());
+            auto bAcc = branchGrid.getConstAccessor();
+
+            auto belongsToBranch = [&](float x, float y, float z, int targetBranch) -> bool {
+                if (!multiBranch) {
+                    return true;
+                }
+                const openvdb::Coord c =
+                    branchGrid.transform().worldToIndexCellCentered(openvdb::Vec3d(x, y, z));
+                const int b0 = bAcc.getValue(c);
+                if (b0 == targetBranch) {
+                    return true;
+                }
+                for (int dz = -1; dz <= 1; ++dz) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            if (bAcc.getValue(c + openvdb::Coord(dx, dy, dz)) == targetBranch) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return (b0 < 0);
+            };
+
+            auto lerpVertex = [](const RenderVertex& a, const RenderVertex& b, float t) -> RenderVertex {
+                RenderVertex rv{};
+                rv.x = a.x + t * (b.x - a.x);
+                rv.y = a.y + t * (b.y - a.y);
+                rv.z = a.z + t * (b.z - a.z);
+                rv.nx = a.nx + t * (b.nx - a.nx);
+                rv.ny = a.ny + t * (b.ny - a.ny);
+                rv.nz = a.nz + t * (b.nz - a.nz);
+                const float len = std::sqrt(rv.nx * rv.nx + rv.ny * rv.ny + rv.nz * rv.nz);
+                if (len > 1.0e-7f) {
+                    rv.nx /= len;
+                    rv.ny /= len;
+                    rv.nz /= len;
+                } else {
+                    rv.nz = 1.0f;
+                }
+                return rv;
+            };
+
+            for (std::size_t idx = r.begin(); idx != r.end(); ++idx) {
+                const PendingLayer& pl = pending[idx];
+                SelectedLayerInfo info{};
+                info.layer_index = static_cast<std::uint32_t>(idx);
+                info.branch_id = pl.branchId;
+                info.parent_branch_id = pl.parentBranchId;
+                info.branch_layer_index = pl.branchLayerIndex;
+                info.branch_layer_count = pl.branchLayerCount;
+                info.isovalue = pl.isovalue;
+                info.mean_thickness_mm = pl.meanThicknessMm;
+                info.min_thickness_mm = pl.minThicknessMm;
+                info.max_thickness_mm = pl.maxThicknessMm;
+                info.is_first_layer = pl.isFirstLayer;
+                info.is_top_layer = pl.isTopLayer;
+
+                std::vector<openvdb::Vec3s> points;
+                std::vector<openvdb::Vec3I> triangles;
+                std::vector<openvdb::Vec4I> quads;
+
+                openvdb::tools::volumeToMesh(
+                    eikGrid,
+                    points,
+                    triangles,
+                    quads,
+                    static_cast<double>(pl.isovalue),
+                    static_cast<double>(clampedAdaptivity),
+                    true);
+
+                if (!points.empty() && (!triangles.empty() || !quads.empty())) {
+                    std::vector<RenderVertex> verts(points.size());
+                    for (std::size_t i = 0; i < points.size(); ++i) {
+                        verts[i].x = points[i].x();
+                        verts[i].y = points[i].y();
+                        verts[i].z = points[i].z();
+                        verts[i].nx = 0.0f;
+                        verts[i].ny = 0.0f;
+                        verts[i].nz = 0.0f;
+                    }
+
+                    std::vector<std::uint32_t> inds;
+                    inds.reserve(triangles.size() * 3 + quads.size() * 6);
+                    for (const auto& tri : triangles) {
+                        inds.push_back(tri[0]);
+                        inds.push_back(tri[2]);
+                        inds.push_back(tri[1]);
+                    }
+                    for (const auto& q : quads) {
+                        inds.push_back(q[0]);
+                        inds.push_back(q[2]);
+                        inds.push_back(q[1]);
+                        inds.push_back(q[0]);
+                        inds.push_back(q[3]);
+                        inds.push_back(q[2]);
+                    }
+
+                    computeMeshNormals(verts, inds);
+
+                    std::vector<float> vertSdf(verts.size(), 0.0f);
+                    for (std::size_t i = 0; i < verts.size(); ++i) {
+                        vertSdf[i] = sdfSampler.wsSample(
+                            openvdb::Vec3d(verts[i].x, verts[i].y, verts[i].z));
+                    }
+
+                    auto clipAgainstSdfThreshold = [&](float sdfLimit) {
+                        info.vertices.clear();
+                        info.indices.clear();
+                        info.contour_segments.clear();
+
+                        std::vector<std::int32_t> vertexRemap(verts.size(), -1);
+                        auto emitVertex = [&](std::uint32_t oldIdx) -> std::uint32_t {
+                            if (vertexRemap[oldIdx] >= 0) {
+                                return static_cast<std::uint32_t>(vertexRemap[oldIdx]);
+                            }
+                            const auto newIdx = static_cast<std::uint32_t>(info.vertices.size());
+                            info.vertices.push_back(verts[oldIdx]);
+                            vertexRemap[oldIdx] = static_cast<std::int32_t>(newIdx);
+                            return newIdx;
+                        };
+                        auto emitCutVertex = [&](const RenderVertex& cv) -> std::uint32_t {
+                            const auto newIdx = static_cast<std::uint32_t>(info.vertices.size());
+                            info.vertices.push_back(cv);
+                            return newIdx;
+                        };
+
+                        for (std::size_t t = 0; t + 2 < inds.size(); t += 3) {
+                            const std::uint32_t i0 = inds[t + 0];
+                            const std::uint32_t i1 = inds[t + 1];
+                            const std::uint32_t i2 = inds[t + 2];
+
+                            const float d0 = vertSdf[i0] - sdfLimit;
+                            const float d1 = vertSdf[i1] - sdfLimit;
+                            const float d2 = vertSdf[i2] - sdfLimit;
+
+                            if (std::max({vertSdf[i0], vertSdf[i1], vertSdf[i2]}) >= outerFringeLimit &&
+                                std::min({vertSdf[i0], vertSdf[i1], vertSdf[i2]}) > 0.25f * voxelSize) {
+                                continue;
+                            }
+
+                            const bool in0 = (d0 <= 0.0f);
+                            const bool in1 = (d1 <= 0.0f);
+                            const bool in2 = (d2 <= 0.0f);
+                            if (!in0 && !in1 && !in2) {
+                                continue;
+                            }
+
+                            const float cx = (verts[i0].x + verts[i1].x + verts[i2].x) / 3.0f;
+                            const float cy = (verts[i0].y + verts[i1].y + verts[i2].y) / 3.0f;
+                            const float cz = (verts[i0].z + verts[i1].z + verts[i2].z) / 3.0f;
+                            if (!belongsToBranch(cx, cy, cz, static_cast<int>(pl.branchId))) {
+                                continue;
+                            }
+
+                            if (in0 && in1 && in2) {
+                                const std::uint32_t n0 = emitVertex(i0);
+                                const std::uint32_t n1 = emitVertex(i1);
+                                const std::uint32_t n2 = emitVertex(i2);
+                                info.indices.push_back(n0);
+                                info.indices.push_back(n1);
+                                info.indices.push_back(n2);
+                                continue;
+                            }
+
+                            std::uint32_t idxA = i0, idxB = i1, idxC = i2;
+                            float dA = d0, dB = d1, dC = d2;
+                            bool soloInside = in0;
+
+                            if (in0 == in1) {
+                                idxA = i2; idxB = i0; idxC = i1;
+                                dA = d2;   dB = d0;   dC = d1;
+                                soloInside = in2;
+                            } else if (in0 == in2) {
+                                idxA = i1; idxB = i2; idxC = i0;
+                                dA = d1;   dB = d2;   dC = d0;
+                                soloInside = in1;
+                            }
+
+                            const float denomAB = dB - dA;
+                            const float denomAC = dC - dA;
+                            const float tAB = (std::abs(denomAB) > 1.0e-8f)
+                                ? std::clamp(-dA / denomAB, 0.0f, 1.0f)
+                                : 0.5f;
+                            const float tAC = (std::abs(denomAC) > 1.0e-8f)
+                                ? std::clamp(-dA / denomAC, 0.0f, 1.0f)
+                                : 0.5f;
+
+                            const RenderVertex vAB = lerpVertex(verts[idxA], verts[idxB], tAB);
+                            const RenderVertex vAC = lerpVertex(verts[idxA], verts[idxC], tAC);
+
+                            info.contour_segments.push_back(vAB.x);
+                            info.contour_segments.push_back(vAB.y);
+                            info.contour_segments.push_back(vAB.z);
+                            info.contour_segments.push_back(vAC.x);
+                            info.contour_segments.push_back(vAC.y);
+                            info.contour_segments.push_back(vAC.z);
+
+                            const std::uint32_t vAB_in = emitCutVertex(vAB);
+                            const std::uint32_t vAC_in = emitCutVertex(vAC);
+
+                            if (soloInside) {
+                                const std::uint32_t nA = emitVertex(idxA);
+                                info.indices.push_back(nA);
+                                info.indices.push_back(vAB_in);
+                                info.indices.push_back(vAC_in);
+                            } else {
+                                const std::uint32_t nB = emitVertex(idxB);
+                                const std::uint32_t nC = emitVertex(idxC);
+                                info.indices.push_back(vAB_in);
+                                info.indices.push_back(nB);
+                                info.indices.push_back(nC);
+                                info.indices.push_back(vAB_in);
+                                info.indices.push_back(nC);
+                                info.indices.push_back(vAC_in);
+                            }
+                        }
+                    };
+
+                    clipAgainstSdfThreshold(pl.sdfClipAllowance);
+
+                    // If trilinear SDF rounding at a sharp 3D corner still left this layer empty,
+                    // find the minimum SDF on the branch's isosurface sheet and clip with a small margin.
+                    if (info.indices.empty()) {
+                        float minBranchSdf = std::numeric_limits<float>::max();
+                        for (std::size_t t = 0; t + 2 < inds.size(); t += 3) {
+                            const std::uint32_t i0 = inds[t + 0];
+                            const std::uint32_t i1 = inds[t + 1];
+                            const std::uint32_t i2 = inds[t + 2];
+                            if (std::max({vertSdf[i0], vertSdf[i1], vertSdf[i2]}) >= outerFringeLimit) {
+                                continue;
+                            }
+                            const float cx = (verts[i0].x + verts[i1].x + verts[i2].x) / 3.0f;
+                            const float cy = (verts[i0].y + verts[i1].y + verts[i2].y) / 3.0f;
+                            const float cz = (verts[i0].z + verts[i1].z + verts[i2].z) / 3.0f;
+                            if (belongsToBranch(cx, cy, cz, static_cast<int>(pl.branchId))) {
+                                minBranchSdf = std::min({minBranchSdf, vertSdf[i0], vertSdf[i1], vertSdf[i2]});
+                            }
+                        }
+                        if (minBranchSdf <= 0.85f * voxelSize) {
+                            clipAgainstSdfThreshold(minBranchSdf + std::min(0.20f * voxelSize, 0.25f * hTop));
+                        }
+                    }
+                }
+
+                extractedLayers[idx] = std::move(info);
+            }
+        });
+
+    result.valid = true;
+    result.branch_count = static_cast<std::uint32_t>(branches.size());
+    result.layers.reserve(extractedLayers.size());
+    for (auto& layer : extractedLayers) {
+        result.layers.push_back(std::move(layer));
+    }
+    return result;
 }
 
 NozzleBasis query_nozzle_frame(
@@ -1582,6 +2925,11 @@ void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hin
         copied.push_back(h);
     }
     globalBackend().setSpatialOrientationHints(copied);
+}
+
+SelectedIsosurfacesResult select_slicing_isosurfaces(std::uint64_t object_id, float adaptivity) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().selectSlicingIsosurfaces(object_id, adaptivity);
 }
 
 } // namespace manifold

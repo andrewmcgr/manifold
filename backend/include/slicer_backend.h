@@ -19,6 +19,8 @@ struct NozzleBasis;
 struct ClearanceXZ;
 struct ToolSpec;
 struct LayerHeightSpec;
+struct SelectedLayerInfo;
+struct SelectedIsosurfacesResult;
 struct SpatialOrientationHint;
 struct FieldComputeProgress;
 
@@ -124,7 +126,7 @@ public:
     /// Returns the active tool index.
     std::uint32_t activeToolIndex() const noexcept;
 
-    /// Sets the variable layer height (`target_mm`, `min_mm`, `max_mm`) for slicing.
+    /// Sets the variable layer height (`target_mm`, `min_mm`, `max_mm`, `first_layer_mm`, `top_layer_mm`) for slicing.
     void setSliceLayerHeight(const LayerHeightSpec& spec) noexcept;
 
     /// Returns the current variable layer height specification.
@@ -141,6 +143,14 @@ public:
 
     /// Returns the configured spatial/surface orientation hints.
     const std::vector<SpatialOrientationHint>& spatialOrientationHints() const noexcept;
+
+    /// Selects the non-planar slicing isosurfaces for `objectId` using a bidirectional
+    /// branch-aware relaxation algorithm honoring `min_mm`, `max_mm`, `target_mm`,
+    /// `first_layer_mm`, and `top_layer_mm`, and extracts their interior-clipped 3D
+    /// meshes and boundary contours.
+    SelectedIsosurfacesResult selectSlicingIsosurfaces(
+        std::uint64_t objectId,
+        float adaptivity) const;
 
     /// Returns a reference to the most recently loaded object's vertices.
     const std::vector<RenderVertex>& vertices() const noexcept;
@@ -202,5 +212,6 @@ LayerHeightSpec get_slice_layer_height();
 void set_eikonal_solver_iterations(std::uint32_t iterations);
 std::uint32_t get_eikonal_solver_iterations();
 void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hints);
+SelectedIsosurfacesResult select_slicing_isosurfaces(std::uint64_t object_id, float adaptivity);
 
 } // namespace manifold
