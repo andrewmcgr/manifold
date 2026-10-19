@@ -309,16 +309,22 @@ pub fn ui_workspace_system(
                         )
                         .default_open(true)
                         .show(ui, |ui| {
+                            let is_computing = vis_state.pending_field_task.is_some();
+
                             // Field Selector
                             ui.horizontal(|ui| {
                                 ui.label("Scalar Field:");
                                 let avail = vis_state.available_fields.clone();
-                                for fname in &avail {
-                                    let selected = &vis_state.active_field_name == fname;
-                                    if ui.selectable_label(selected, fname).clicked() && !selected {
-                                        vis_state.active_field_name = fname.clone();
-                                        vis_state.mark_all_dirty();
-                                        vis_state.refresh_stats_for(sel_id);
+                                if avail.is_empty() {
+                                    ui.small("(not computed yet)");
+                                } else {
+                                    for fname in &avail {
+                                        let selected = &vis_state.active_field_name == fname;
+                                        if ui.selectable_label(selected, fname).clicked() && !selected {
+                                            vis_state.active_field_name = fname.clone();
+                                            vis_state.mark_all_dirty();
+                                            vis_state.refresh_stats_for(sel_id);
+                                        }
                                     }
                                 }
                             });
@@ -335,24 +341,35 @@ pub fn ui_workspace_system(
                                     )
                                     .text("Iters"),
                                 );
-                                if ui.small_button("Recompute Fields").clicked() {
-                                    sync_config_to_backend(&config);
-                                    if ffi::recompute_object_fields(
+                                let btn_label = if vis_state.available_fields.is_empty() {
+                                    "Compute Fields"
+                                } else {
+                                    "Recompute Fields"
+                                };
+                                if ui
+                                    .add_enabled(!is_computing, egui::Button::new(btn_label).small())
+                                    .clicked()
+                                {
+                                    spawn_field_compute_task(
+                                        &mut vis_state,
+                                        &mut plate,
+                                        &config,
                                         sel_id,
-                                        config.eikonal.voxel_size_mm,
-                                        config.eikonal.narrow_band_width_voxels as f32,
-                                    ) {
-                                        vis_state.mark_all_dirty();
-                                        vis_state.refresh_stats_for(sel_id);
-                                        plate.status_message = format!(
-                                            "Recomputed OpenVDB SDF & constrained Eikonal fields for '{}' (voxel {:.2} mm, {} iters).",
-                                            obj_name,
-                                            config.eikonal.voxel_size_mm,
-                                            config.eikonal.solver_iterations
-                                        );
-                                    }
+                                        &obj_name,
+                                    );
                                 }
                             });
+
+                            if is_computing {
+                                let prog = ffi::get_field_compute_progress();
+                                ui.ctx().request_repaint();
+                                ui.add(
+                                    egui::ProgressBar::new(prog.fraction.clamp(0.0, 1.0))
+                                        .show_percentage()
+                                        .animate(true)
+                                        .text(prog.stage),
+                                );
+                            }
 
                             let (min_val, max_val) = if let Some(ref stats) = vis_state.cached_stats
                             {
@@ -386,6 +403,18 @@ pub fn ui_workspace_system(
                                 vis_state.dirty_isosurface = true;
                                 if vis_state.show_isosurface && vis_state.solid_opacity > 0.5 {
                                     vis_state.solid_opacity = 0.25;
+                                }
+                                if vis_state.show_isosurface
+                                    && vis_state.available_fields.is_empty()
+                                    && vis_state.pending_field_task.is_none()
+                                {
+                                    spawn_field_compute_task(
+                                        &mut vis_state,
+                                        &mut plate,
+                                        &config,
+                                        sel_id,
+                                        &obj_name,
+                                    );
                                 }
                             }
 
@@ -468,6 +497,18 @@ pub fn ui_workspace_system(
                                 vis_state.dirty_slice = true;
                                 if vis_state.show_slice_plane && vis_state.solid_opacity > 0.5 {
                                     vis_state.solid_opacity = 0.25;
+                                }
+                                if vis_state.show_slice_plane
+                                    && vis_state.available_fields.is_empty()
+                                    && vis_state.pending_field_task.is_none()
+                                {
+                                    spawn_field_compute_task(
+                                        &mut vis_state,
+                                        &mut plate,
+                                        &config,
+                                        sel_id,
+                                        &obj_name,
+                                    );
                                 }
                             }
 
@@ -964,13 +1005,35 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
     ffi::set_eikonal_solver_iterations(config.eikonal.solver_iterations);
 }
 
-/// Polls background import/export tasks on each frame without blocking the macOS main thread.
+/// Spawns an asynchronous background task to compute OpenVDB SDF, constrained Eikonal,
+/// overhang, and 5/6-axis tool orientation fields without blocking the UI thread.
+fn spawn_field_compute_task(
+    vis_state: &mut FieldVisualizationState,
+    plate: &mut BuildPlateState,
+    config: &SlicerConfig,
+    object_id: u64,
+    object_name: &str,
+) {
+    sync_config_to_backend(config);
+    let voxel_size = config.eikonal.voxel_size_mm;
+    let narrow_band = config.eikonal.narrow_band_width_voxels as f32;
+    let task = IoTaskPool::get().spawn(async move {
+        ffi::recompute_object_fields(object_id, voxel_size, narrow_band)
+    });
+    vis_state.pending_field_task = Some((object_id, object_name.to_string(), task));
+    plate.status_message = format!(
+        "Computing OpenVDB scalar fields for '{object_name}' in background (voxel {voxel_size:.2} mm)..."
+    );
+}
+
+/// Polls background import/export/field-computation tasks on each frame without blocking the macOS main thread.
 #[allow(clippy::too_many_arguments)]
 pub fn poll_io_tasks_system(
     mut commands: Commands,
     render_device: Option<Res<RenderDevice>>,
     mut plate: ResMut<BuildPlateState>,
     mut config: ResMut<SlicerConfig>,
+    mut vis_state: ResMut<FieldVisualizationState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut camera_query: Query<(&mut OrbitCamera, &mut Transform), Without<CadObjectEntity>>,
@@ -1030,6 +1093,37 @@ pub fn poll_io_tasks_system(
                 None => {
                     plate.status_message = "3MF save cancelled.".to_string();
                 }
+            }
+        }
+    }
+
+    // 3. Poll pending background OpenVDB scalar field computation task
+    if let Some((obj_id, ref obj_name, ref mut task)) = vis_state.pending_field_task {
+        if let Some(succeeded) = block_on(future::poll_once(task)) {
+            let finished_name = obj_name.clone();
+            vis_state.pending_field_task = None;
+            if succeeded {
+                if plate.selected_object_id == Some(obj_id) {
+                    vis_state.available_fields = ffi::list_object_fields(obj_id);
+                    if !vis_state.available_fields.is_empty()
+                        && !vis_state
+                            .available_fields
+                            .contains(&vis_state.active_field_name)
+                    {
+                        vis_state.active_field_name = vis_state.available_fields[0].clone();
+                    }
+                    vis_state.mark_all_dirty();
+                    vis_state.refresh_stats_for(obj_id);
+                }
+                plate.status_message = format!(
+                    "Computed OpenVDB SDF & constrained Eikonal fields for '{finished_name}' (voxel {:.2} mm, {} iters).",
+                    config.eikonal.voxel_size_mm,
+                    config.eikonal.solver_iterations
+                );
+            } else {
+                plate.status_message = format!(
+                    "Failed to compute OpenVDB scalar fields for '{finished_name}'."
+                );
             }
         }
     }

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,9 +41,20 @@ enum class ToolOrientationMode : std::uint8_t {
     MostlyParallelToSurface = 2,
 };
 
+/// Compressed Sparse Row (CSR) wavefront schedule grouping mutually non-adjacent
+/// active voxels into parallelizable level sets.
+struct WavefrontSchedule {
+    std::vector<std::size_t> indices;
+    std::vector<std::size_t> levelOffsets;
+
+    std::size_t numLevels() const noexcept {
+        return levelOffsets.empty() ? 0 : (levelOffsets.size() - 1);
+    }
+};
+
 /// Flattened representation of all active voxels in the object's OpenVDB domain,
-/// providing O(1) 6-neighbor and 26-neighbor indexing for fast sweeping,
-/// constraint projection, and causal island removal.
+/// providing O(1) 6-neighbor indexing and parallel hyperplane wavefront schedules
+/// for multi-threaded TBB fast sweeping, constraint projection, and causal island removal.
 struct ActiveVolumeDomain {
     double voxelSize = 0.5;
     float minZBed = 0.0f;
@@ -82,15 +94,23 @@ struct ActiveVolumeDomain {
     /// OpenVDB Int32Grid mapping active (i, j, k) coordinates to [0, N-1] (-1 if inactive).
     openvdb::Int32Grid::Ptr indexGrid;
 
+    /// 4 diagonal hyperplane schedules (L = +-i +- j + k) for lock-free TBB 8-octant fast sweeping.
+    std::array<WavefrontSchedule, 4> octantWavefronts;
+    /// Z-slice Red-Black schedule for parallel upward clearance cone enforcement.
+    WavefrontSchedule zParityWavefront;
+
     /// Look up active voxel index by OpenVDB Coord (-1 if not in active domain).
     std::int32_t findVoxelIndex(const openvdb::Coord& ijk) const;
 
-    /// Builds the flattened index and 6-neighbor connectivity table from `sdfGrid`.
+    /// Builds the flattened index and 6-neighbor connectivity table from `sdfGrid` in parallel.
     void initializeFromSdfGrid(
         const openvdb::FloatGrid& sdfGrid,
         float objectMinZ,
         float objectMaxZ,
         float objectMaxSpan);
+
+    /// Builds O(N) counting-sort hyperplane wavefront schedules for all non-seed interior voxels.
+    void buildWavefrontSchedules();
 };
 
 /// Context passed to tool orientation strategies and Eikonal constraints.
@@ -102,6 +122,7 @@ struct EikonalSolverContext {
     std::uint32_t totalIterations = 4;
     ToolOrientationMode orientationMode = ToolOrientationMode::FollowEikonalGradient;
     std::vector<OrientationHint> hints;
+    std::function<void(float, const char*)> reportProgress;
 };
 
 /// Pluggable strategy for computing and clamping the local 5/6-axis tool orientation

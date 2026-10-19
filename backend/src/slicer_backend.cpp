@@ -3,6 +3,7 @@
 #include "manifold-frontend/src/bridge.rs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <filesystem>
 #include <limits>
@@ -224,6 +225,32 @@ NozzleBasis computeNozzleBasis(
     return basis;
 }
 
+std::mutex g_backendMutex;
+std::atomic<bool> g_fieldComputeRunning{false};
+std::atomic<float> g_fieldComputeFraction{0.0f};
+std::mutex g_fieldProgressStageMutex;
+std::string g_fieldComputeStage{"Idle"};
+
+void setFieldProgress(bool running, float fraction, const char* stageMsg) {
+    g_fieldComputeRunning.store(running, std::memory_order_relaxed);
+    g_fieldComputeFraction.store(std::clamp(fraction, 0.0f, 1.0f), std::memory_order_relaxed);
+    if (stageMsg != nullptr) {
+        std::lock_guard<std::mutex> lock(g_fieldProgressStageMutex);
+        g_fieldComputeStage = stageMsg;
+    }
+}
+
+FieldComputeProgress getFieldProgressSnapshot() {
+    FieldComputeProgress out{};
+    out.running = g_fieldComputeRunning.load(std::memory_order_relaxed);
+    out.fraction = g_fieldComputeFraction.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(g_fieldProgressStageMutex);
+        out.stage = rust::String(g_fieldComputeStage);
+    }
+    return out;
+}
+
 /// Populates the object's scalar and vector field registry using the iterative
 /// constrained 3D Eikonal + tool-orientation solver:
 /// 1. `"sdf"`: Full-interior + exterior-band Signed Distance Field via
@@ -245,6 +272,8 @@ void buildObjectScalarFields(
     if (rec.vertexBuffer.empty() || rec.indexBuffer.size() < 3) {
         return;
     }
+
+    setFieldProgress(true, 0.04f, "Voxelizing mesh & building OpenVDB Signed Distance Field...");
 
     const float spanX = rec.maxX - rec.minX;
     const float spanY = rec.maxY - rec.minY;
@@ -319,6 +348,9 @@ void buildObjectScalarFields(
         backend.eikonalSolverIterations(),
         ToolOrientationMode::FollowEikonalGradient,
         {},
+        [](float frac, const char* msg) {
+            setFieldProgress(true, frac, msg);
+        },
     };
 
     for (const auto& ffiHint : backend.spatialOrientationHints()) {
@@ -598,8 +630,6 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
         localShift.SetTranslation(gp_Vec(-rec.originX, -rec.originY, -rec.originZ));
         rec.shape.Move(TopLoc_Location(localShift));
 
-        buildObjectScalarFields(rec, *this);
-
         DecomposedPartInfo info;
         info.object_id = rec.id;
         info.name = rust::String(rec.name);
@@ -656,7 +686,6 @@ DecomposedPartInfo SlicerBackend::registerTriangleMesh(
 
     computeMeshNormals(rec.vertexBuffer, rec.indexBuffer);
     recenterVertexBuffer(rec);
-    buildObjectScalarFields(rec, *this);
 
     info.object_id = rec.id;
     info.origin_x = rec.originX;
@@ -764,12 +793,49 @@ bool SlicerBackend::recomputeObjectFields(
     float voxelSize,
     float narrowBandVoxels)
 {
-    const auto it = impl_->objects.find(objectId);
-    if (it == impl_->objects.end()) {
-        return false;
+    ObjectRecord workingRec;
+    SlicerBackend snapshotBackend;
+    {
+        std::lock_guard<std::mutex> lock(g_backendMutex);
+        const auto it = impl_->objects.find(objectId);
+        if (it == impl_->objects.end()) {
+            return false;
+        }
+        workingRec.id = it->second.id;
+        workingRec.name = it->second.name;
+        workingRec.minX = it->second.minX;
+        workingRec.minY = it->second.minY;
+        workingRec.minZ = it->second.minZ;
+        workingRec.maxX = it->second.maxX;
+        workingRec.maxY = it->second.maxY;
+        workingRec.maxZ = it->second.maxZ;
+        workingRec.vertexBuffer = it->second.vertexBuffer;
+        workingRec.indexBuffer = it->second.indexBuffer;
+
+        snapshotBackend.impl_->nozzleAxisBed = impl_->nozzleAxisBed;
+        snapshotBackend.impl_->gravityDirectionBed = impl_->gravityDirectionBed;
+        snapshotBackend.impl_->tools = impl_->tools;
+        snapshotBackend.impl_->activeToolIndex = impl_->activeToolIndex;
+        snapshotBackend.impl_->sliceLayerHeight = impl_->sliceLayerHeight;
+        snapshotBackend.impl_->eikonalSolverIterations = impl_->eikonalSolverIterations;
+        snapshotBackend.impl_->spatialOrientationHints = impl_->spatialOrientationHints;
     }
-    buildObjectScalarFields(it->second, *this, voxelSize, narrowBandVoxels);
-    return true;
+
+    setFieldProgress(true, 0.01f, "Preparing mesh & OpenVDB grid...");
+    buildObjectScalarFields(workingRec, snapshotBackend, voxelSize, narrowBandVoxels);
+
+    bool committed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_backendMutex);
+        const auto it = impl_->objects.find(objectId);
+        if (it != impl_->objects.end()) {
+            it->second.scalarFields = std::move(workingRec.scalarFields);
+            it->second.toolAxisGrid = std::move(workingRec.toolAxisGrid);
+            committed = true;
+        }
+    }
+    setFieldProgress(false, 1.0f, "Field computation complete.");
+    return committed;
 }
 
 IsoSurfaceMesh SlicerBackend::extractFieldIsosurface(
@@ -1178,7 +1244,6 @@ const std::vector<std::uint32_t>& SlicerBackend::indices() const noexcept {
 // ============================================================================
 
 namespace {
-std::mutex g_backendMutex;
 SlicerBackend& globalBackend() {
     static SlicerBackend instance;
     return instance;
@@ -1291,8 +1356,11 @@ FieldStats get_object_field_stats(std::uint64_t object_id, rust::Str field_name)
 }
 
 bool recompute_object_fields(std::uint64_t object_id, float voxel_size, float narrow_band_voxels) {
-    std::lock_guard<std::mutex> lock(g_backendMutex);
     return globalBackend().recomputeObjectFields(object_id, voxel_size, narrow_band_voxels);
+}
+
+FieldComputeProgress get_field_compute_progress() {
+    return getFieldProgressSnapshot();
 }
 
 IsoSurfaceMesh extract_field_isosurface(

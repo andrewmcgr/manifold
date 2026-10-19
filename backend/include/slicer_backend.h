@@ -20,6 +20,7 @@ struct ClearanceXZ;
 struct ToolSpec;
 struct LayerHeightSpec;
 struct SpatialOrientationHint;
+struct FieldComputeProgress;
 
 /// Core C++20 compute engine handling CAD B-Rep ingestion (OCCT), assembly
 /// decomposition, surface tessellation, STL/3MF triangle mesh registration,
@@ -170,6 +171,7 @@ bool export_object_step_to_path(std::uint64_t object_id, rust::Str path);
 rust::Vec<rust::String> list_object_fields(std::uint64_t object_id);
 FieldStats get_object_field_stats(std::uint64_t object_id, rust::Str field_name);
 bool recompute_object_fields(std::uint64_t object_id, float voxel_size, float narrow_band_voxels);
+FieldComputeProgress get_field_compute_progress();
 IsoSurfaceMesh extract_field_isosurface(
     std::uint64_t object_id,
     rust::Str field_name,

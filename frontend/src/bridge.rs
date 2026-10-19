@@ -124,6 +124,14 @@ pub mod ffi {
         pub apply_on_surface_only: bool,
     }
 
+    /// Lock-free progress snapshot for background OpenVDB & Eikonal field computation.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct FieldComputeProgress {
+        pub running: bool,
+        pub fraction: f32,
+        pub stage: String,
+    }
+
     unsafe extern "C++" {
         include!("slicer_backend.h");
 
@@ -140,7 +148,8 @@ pub mod ffi {
         pub fn load_step_assembly(path: &str) -> Vec<DecomposedPartInfo>;
 
         /// Registers an indexed triangle mesh (from STL or 3MF) in the C++ backend,
-        /// computing vertex normals and initializing OpenVDB SDF & Eikonal grids.
+        /// computing vertex normals and centering local coordinates (without computing
+        /// volumetric scalar fields on initial load).
         pub fn register_triangle_mesh(
             name: &str,
             positions: &[f32],
@@ -173,6 +182,9 @@ pub mod ffi {
             voxel_size: f32,
             narrow_band_voxels: f32,
         ) -> bool;
+
+        /// Queries the current lock-free progress of background field computation.
+        pub fn get_field_compute_progress() -> FieldComputeProgress;
 
         /// Extracts a 3D polygonal isosurface mesh at `isovalue` from any named scalar field
         /// on `object_id` using `openvdb::tools::volumeToMesh`.
@@ -382,9 +394,15 @@ mod tests {
 
         let info = ffi::register_triangle_mesh("TestBox", &positions, &indices);
         assert!(info.object_id > 0);
+        // Fields must not be computed on initial object load
+        assert!(ffi::list_object_fields(info.object_id).is_empty());
 
         // 1. With T1 active (has_rotational_axes = false), tool_tilt_deg must be 0 everywhere
         assert!(ffi::recompute_object_fields(info.object_id, 1.5, 4.0));
+        let prog = ffi::get_field_compute_progress();
+        assert!(!prog.running);
+        assert!((prog.fraction - 1.0).abs() < 1e-4);
+
         let fields = ffi::list_object_fields(info.object_id);
         assert!(fields.contains(&"sdf".to_string()));
         assert!(fields.contains(&"eikonal".to_string()));

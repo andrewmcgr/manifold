@@ -128,6 +128,9 @@ pub struct FieldVisualizationState {
     pub slice_image_handle: Option<Handle<Image>>,
     pub slice_plane_coord: f32,
     pub dirty_slice: bool,
+
+    /// Background task computing OpenVDB scalar fields for `(object_id, object_name)`.
+    pub pending_field_task: Option<(u64, String, bevy::tasks::Task<bool>)>,
 }
 
 impl Default for FieldVisualizationState {
@@ -164,6 +167,7 @@ impl Default for FieldVisualizationState {
             slice_image_handle: None,
             slice_plane_coord: 0.0,
             dirty_slice: true,
+            pending_field_task: None,
         }
     }
 }
@@ -762,13 +766,15 @@ mod tests {
         let part = ffi::register_triangle_mesh("test_sdf_cube", &positions, &indices);
         assert!(part.object_id > 0);
 
+        // Fields are not computed on initial object load
+        assert!(ffi::list_object_fields(part.object_id).is_empty());
+
+        // Compute fields on demand and verify that voxel resolution preserves full interior & exterior millimeter range
+        assert!(ffi::recompute_object_fields(part.object_id, 0.25, 6.0));
         let fields = ffi::list_object_fields(part.object_id);
         assert!(fields.contains(&"sdf".to_string()));
         assert!(fields.contains(&"eikonal".to_string()));
         assert!(fields.contains(&"overhang".to_string()));
-
-        // Verify that changing voxel resolution preserves full interior & exterior millimeter range
-        assert!(ffi::recompute_object_fields(part.object_id, 0.25, 6.0));
         let sdf_stats = ffi::get_object_field_stats(part.object_id, "sdf");
         assert!(sdf_stats.valid);
         assert!(sdf_stats.active_voxel_count > 0);
