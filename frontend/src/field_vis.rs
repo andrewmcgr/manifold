@@ -740,10 +740,11 @@ fn viridis_approx(t: f32) -> (f32, f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::ffi;
+    use crate::bridge::{ffi, TEST_BACKEND_LOCK};
 
     #[test]
     fn test_openvdb_sdf_and_generic_field_visualization_pipeline() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let positions: [f32; 24] = [
             -10.0, -10.0, 0.0,
              10.0, -10.0, 0.0,
@@ -831,4 +832,144 @@ mod tests {
 
         let _ = ffi::remove_cad_object(part.object_id);
     }
+
+    #[test]
+    fn test_soft_orientation_hints_respect_hard_tool_limits() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let positions: [f32; 24] = [
+            -8.0, -8.0, 0.0,
+             8.0, -8.0, 0.0,
+             8.0,  8.0, 0.0,
+            -8.0,  8.0, 0.0,
+            -8.0, -8.0, 16.0,
+             8.0, -8.0, 16.0,
+             8.0,  8.0, 16.0,
+            -8.0,  8.0, 16.0,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2,
+            4, 5, 6, 4, 6, 7,
+            0, 1, 5, 0, 5, 4,
+            1, 2, 6, 1, 6, 5,
+            2, 3, 7, 2, 7, 6,
+            3, 0, 4, 3, 4, 7,
+        ];
+
+        let part = ffi::register_triangle_mesh("test_hint_cube", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        // Configure a 5/6-axis tool with a strict 25 deg max tilt limit
+        let tools = vec![ffi::ToolSpec {
+            id: 0,
+            name: "5AxisTest".to_string(),
+            nozzle_diameter_mm: 0.4,
+            temperature_celsius: 215.0,
+            has_rotational_axes: true,
+            max_angle_from_bed_normal_deg: 25.0,
+            clearance_profile_xz: vec![
+                ffi::ClearanceXZ { x_radius_mm: 0.6, z_height_mm: 0.0 },
+                ffi::ClearanceXZ { x_radius_mm: 4.0, z_height_mm: 5.0 },
+            ],
+        }];
+        ffi::set_machine_tools(&tools, 0);
+        ffi::set_eikonal_solver_iterations(3);
+
+        // 1. Baseline without hints
+        ffi::set_spatial_orientation_hints(&[]);
+        assert!(ffi::recompute_object_fields(part.object_id, 1.0, 3.0));
+        let baseline_slice = ffi::sample_field_slice(part.object_id, "eikonal", 1, 0.5, 16);
+        assert!(baseline_slice.valid);
+
+        // 2. Apply strong soft hints (both surface tangency and an extreme 80-deg point hint)
+        let hints = vec![
+            ffi::SpatialOrientationHint {
+                kind: 1, // Orthogonality point hint requesting ~80 deg tilt (exceeds 25 deg tool limit!)
+                position_bed: [0.0, 0.0, 10.0],
+                direction_bed: [0.9848, 0.0, 0.1736],
+                influence_radius_mm: 14.0,
+                weight: 1.0,
+                apply_on_surface_only: false,
+            },
+            ffi::SpatialOrientationHint {
+                kind: 0, // Surface tangency hint on +X wall
+                position_bed: [8.0, 0.0, 8.0],
+                direction_bed: [1.0, 0.0, 0.0],
+                influence_radius_mm: 8.0,
+                weight: 0.9,
+                apply_on_surface_only: true,
+            },
+        ];
+        ffi::set_spatial_orientation_hints(&hints);
+        assert!(ffi::recompute_object_fields(part.object_id, 1.0, 3.0));
+
+        let hinted_slice = ffi::sample_field_slice(part.object_id, "eikonal", 1, 0.5, 16);
+        assert!(hinted_slice.valid);
+
+        // Verify the soft hint genuinely tilted the Eikonal isosurfaces across the object (> 1.5 mm change across 16 mm span)
+        let max_diff = baseline_slice
+            .values
+            .iter()
+            .zip(hinted_slice.values.iter())
+            .zip(hinted_slice.sdf_values.iter())
+            .filter(|((_, _), &sdf)| sdf <= 0.0)
+            .map(|((&a, &b), _)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1.5,
+            "Expected soft orientation hints to strongly tilt interior Eikonal isosurfaces, max_diff={max_diff}"
+        );
+
+        // Verify hard tool angle limit (25 deg) was never exceeded despite 80-deg hint
+        let tilt_stats = ffi::get_object_field_stats(part.object_id, "tool_tilt_deg");
+        assert!(tilt_stats.valid);
+        assert!(
+            tilt_stats.max_value > 15.0 && tilt_stats.max_value <= 25.05,
+            "Soft hint must tilt tool axis up to limit without exceeding max_angle_from_bed_normal_deg (25 deg), got max tilt {}",
+            tilt_stats.max_value
+        );
+
+        // 3. Verify that the clearance constraint explicitly tracks the actual tool axis:
+        // With a very narrow clearance cone (r = 5.0 at z = 1.0 -> alpha_max ≈ 11.3 deg):
+        // - If has_rotational_axes = false (fixed vertical tool axis +Z), isosurface tilt is clamped near 11.3 deg.
+        // - If has_rotational_axes = true (tilted tool axis up to 25 deg), the clearance cone tilts with the tool axis,
+        //   allowing significantly steeper isosurfaces!
+        let narrow_fixed_tool = vec![ffi::ToolSpec {
+            id: 0,
+            name: "FixedNarrowCone".to_string(),
+            nozzle_diameter_mm: 0.4,
+            temperature_celsius: 215.0,
+            has_rotational_axes: false,
+            max_angle_from_bed_normal_deg: 25.0,
+            clearance_profile_xz: vec![
+                ffi::ClearanceXZ { x_radius_mm: 0.6, z_height_mm: 0.0 },
+                ffi::ClearanceXZ { x_radius_mm: 5.0, z_height_mm: 1.0 },
+            ],
+        }];
+        ffi::set_machine_tools(&narrow_fixed_tool, 0);
+        assert!(ffi::recompute_object_fields(part.object_id, 1.0, 3.0));
+        let fixed_tool_slice = ffi::sample_field_slice(part.object_id, "eikonal", 1, 0.5, 16);
+
+        let mut narrow_rot_tool = narrow_fixed_tool.clone();
+        narrow_rot_tool[0].has_rotational_axes = true;
+        ffi::set_machine_tools(&narrow_rot_tool, 0);
+        assert!(ffi::recompute_object_fields(part.object_id, 1.0, 3.0));
+        let rot_tool_slice = ffi::sample_field_slice(part.object_id, "eikonal", 1, 0.5, 16);
+
+        let tool_axis_clearance_diff = fixed_tool_slice
+            .values
+            .iter()
+            .zip(rot_tool_slice.values.iter())
+            .zip(rot_tool_slice.sdf_values.iter())
+            .filter(|((_, _), &sdf)| sdf <= 0.0)
+            .map(|((&a, &b), _)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            tool_axis_clearance_diff > 0.5,
+            "Expected clearance constraint to follow the actual tilted tool axis vs fixed vertical axis, diff={tool_axis_clearance_diff}"
+        );
+
+        ffi::set_spatial_orientation_hints(&[]);
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
 }
+

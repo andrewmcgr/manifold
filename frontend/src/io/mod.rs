@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use bevy::prelude::*;
 use crate::bridge::ffi::{self, DecomposedPartInfo, RenderVertex};
 use crate::config::SlicerConfig;
-use crate::hull::{SimplifiedConvexHull, MAX_SIMPLIFIED_HULL_FACES};
+use crate::hull::{
+    build_surface_patches, SimplifiedConvexHull, SurfacePatch, MAX_SIMPLIFIED_HULL_FACES,
+};
 
 /// Complete CPU-side payload for a single object loaded and processed by the C++ backend.
 #[derive(Clone, Debug)]
@@ -21,6 +23,8 @@ pub struct LoadedObjectData {
     pub local_min: Vec3,
     pub local_max: Vec3,
     pub hull: SimplifiedConvexHull,
+    pub surface_patches: Vec<SurfacePatch>,
+    pub triangle_to_patch: Vec<u32>,
 }
 
 /// Summary of an asynchronous multi-file import operation.
@@ -106,7 +110,9 @@ pub fn load_step_file_parts(
 }
 
 /// Fetches the centered vertices and indices from the C++ backend for `part.object_id`,
-/// computes local AABB bounds, and builds its $\le 27$-face `SimplifiedConvexHull`.
+/// computes local AABB bounds, builds its $\le 27$-face `SimplifiedConvexHull`, and segments
+/// its surface into selectable `SurfacePatch` regions (exact STEP `TopoDS_Face`s or contiguous
+/// near-planar mesh regions).
 pub fn build_loaded_object_from_part(
     part: DecomposedPartInfo,
     source_file: &str,
@@ -121,8 +127,16 @@ pub fn build_loaded_object_from_part(
         return None;
     }
 
+    let brep_face_ids = if part.has_brep {
+        ffi::get_object_triangle_face_ids(part.object_id)
+    } else {
+        Vec::new()
+    };
+
     let (local_min, local_max) = compute_vertex_bounds(&vertices);
     let hull = SimplifiedConvexHull::from_vertices(&vertices, MAX_SIMPLIFIED_HULL_FACES);
+    let (surface_patches, triangle_to_patch) =
+        build_surface_patches(&vertices, &indices, &brep_face_ids);
 
     Some(LoadedObjectData {
         object_id: part.object_id,
@@ -137,6 +151,8 @@ pub fn build_loaded_object_from_part(
         local_min,
         local_max,
         hull,
+        surface_patches,
+        triangle_to_patch,
     })
 }
 

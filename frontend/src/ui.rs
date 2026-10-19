@@ -5,7 +5,9 @@ use bevy::tasks::{block_on, IoTaskPool};
 use bevy_egui::{egui, EguiContexts};
 
 use crate::bridge::ffi;
-use crate::config::{BedShape, ClearancePointXZ, SlicerConfig, ToolConfig};
+use crate::config::{
+    BedShape, ClearancePointXZ, PointNormalHint, SlicerConfig, SurfaceHintMode, ToolConfig,
+};
 use crate::field_vis::{
     FieldColormap, FieldVisualizationState, IsoIntersectionMode, SliceAxis,
 };
@@ -28,6 +30,8 @@ pub fn ui_workspace_system(
     mut object_transforms: Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
     mut camera_query: Query<(&mut OrbitCamera, &mut Transform), Without<CadObjectEntity>>,
 ) {
+    plate.ui_hovered_surface_hint_patch = None;
+    plate.ui_hovered_point_hint_id = None;
     let ctx = contexts.ctx_mut();
 
     // ========================================================================
@@ -41,6 +45,9 @@ pub fn ui_workspace_system(
                 ToolMode::MoveOnBed,
                 ToolMode::Rotate,
                 ToolMode::PlaceOnFace,
+                ToolMode::SurfaceHintOrthogonal,
+                ToolMode::SurfaceHintTangent,
+                ToolMode::PointHint,
             ] {
                 let selected = plate.tool_mode == mode;
                 if ui.selectable_label(selected, mode.label()).clicked() {
@@ -210,6 +217,7 @@ pub fn ui_workspace_system(
 
                         ui.heading(format!("Selected: {obj_name}"));
 
+                        let mut obj_rotation = Quat::IDENTITY;
                         if let Ok((mut tf, _)) = object_transforms.get_mut(obj_entity) {
                             let (w_min, w_max) =
                                 plate.objects[obj_idx].compute_world_aabb(&tf);
@@ -299,7 +307,375 @@ pub fn ui_workspace_system(
                             if changed {
                                 snap_object_to_bed(&plate.objects[obj_idx], &mut tf);
                             }
+                            obj_rotation = tf.rotation;
                         }
+
+                        // --- Tangency & Orthogonality Hints (Soft Constraints) ---
+                        ui.add_space(8.0);
+                        ui.separator();
+                        let patch_count = plate.objects[obj_idx].surface_patches.len();
+                        let obj_has_brep = plate.objects[obj_idx].has_brep;
+                        let obj_local_center =
+                            0.5 * (plate.objects[obj_idx].local_min + plate.objects[obj_idx].local_max);
+                        let surface_hint_count = config
+                            .eikonal
+                            .surface_hints
+                            .iter()
+                            .filter(|h| h.object_id == sel_id)
+                            .count();
+                        let point_hint_count = config
+                            .eikonal
+                            .point_hints
+                            .iter()
+                            .filter(|h| h.object_id == sel_id)
+                            .count();
+
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new(format!(
+                                "Tangency & Orthogonality Hints ({} surface, {} point)",
+                                surface_hint_count, point_hint_count
+                            ))
+                            .strong(),
+                        )
+                        .id_source("tangency_orthogonality_hints_section")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.small(if obj_has_brep {
+                                format!(
+                                    "Soft constraints for Eikonal isosurface normal (∇τ). Selectable STEP B-Rep faces: {patch_count}. Never overrides tool clearance or angle limits."
+                                )
+                            } else {
+                                format!(
+                                    "Soft constraints for Eikonal isosurface normal (∇τ). Contiguous near-planar mesh patches: {patch_count}. Never overrides tool clearance or angle limits."
+                                )
+                            });
+
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Placement Tool:");
+                                for mode in [
+                                    ToolMode::SurfaceHintOrthogonal,
+                                    ToolMode::SurfaceHintTangent,
+                                    ToolMode::PointHint,
+                                ] {
+                                    let active = plate.tool_mode == mode;
+                                    if ui.selectable_label(active, mode.label()).clicked() {
+                                        plate.tool_mode =
+                                            if active { ToolMode::Select } else { mode };
+                                    }
+                                }
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut config.eikonal.default_surface_hint_depth_mm,
+                                        1.0..=30.0,
+                                    )
+                                    .text("Face Depth (mm)"),
+                                );
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut config.eikonal.default_point_hint_radius_mm,
+                                        1.5..=40.0,
+                                    )
+                                    .text("Point Radius (mm)"),
+                                );
+                            });
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut config.eikonal.default_hint_weight,
+                                    0.05..=1.0,
+                                )
+                                .text("Default Soft Weight"),
+                            );
+
+                            // 1. Surface Face Hints List (Collapsible)
+                            ui.separator();
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new(format!(
+                                    "Surface Face Hints ({surface_hint_count})"
+                                ))
+                                .strong(),
+                            )
+                            .id_source("surface_face_hints_list")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                if surface_hint_count > 0
+                                    && ui.small_button("Clear Surface Hints").clicked()
+                                {
+                                    config
+                                        .eikonal
+                                        .surface_hints
+                                        .retain(|h| h.object_id != sel_id);
+                                    plate.selected_surface_hint_patch = None;
+                                }
+
+                                if surface_hint_count == 0 {
+                                    ui.small(
+                                        "Click faces in the viewport using 'Surface Hint: Normal ⊥ Surface' (gold) or 'Normal ∥ Surface' (cyan).",
+                                    );
+                                } else {
+                                    let mut remove_surf_idx: Option<usize> = None;
+                                    for (idx, sh) in
+                                        config.eikonal.surface_hints.iter_mut().enumerate()
+                                    {
+                                        if sh.object_id != sel_id {
+                                            continue;
+                                        }
+                                        let is_sel =
+                                            plate.selected_surface_hint_patch == Some(sh.patch_id);
+                                        let row_resp = ui.horizontal(|ui| {
+                                            let kind_str =
+                                                if obj_has_brep { "STEP Face" } else { "Patch" };
+                                            if ui
+                                                .selectable_label(
+                                                    is_sel,
+                                                    format!("{kind_str} #{}", sh.patch_id + 1),
+                                                )
+                                                .on_hover_text(
+                                                    "Click to select/deselect this surface hint and toggle its 3D arrows",
+                                                )
+                                                .clicked()
+                                            {
+                                                plate.selected_surface_hint_patch = if is_sel {
+                                                    None
+                                                } else {
+                                                    Some(sh.patch_id)
+                                                };
+                                            }
+                                            if ui
+                                                .small_button(sh.mode.short_label())
+                                                .on_hover_text("Click to toggle between Normal ⊥ Surface and Normal ∥ Surface")
+                                                .clicked()
+                                            {
+                                                sh.mode = match sh.mode {
+                                                    SurfaceHintMode::NormalOrthogonalToSurface => {
+                                                        SurfaceHintMode::NormalTangentToSurface
+                                                    }
+                                                    SurfaceHintMode::NormalTangentToSurface => {
+                                                        SurfaceHintMode::NormalOrthogonalToSurface
+                                                    }
+                                                };
+                                            }
+                                            ui.add(
+                                                egui::DragValue::new(&mut sh.influence_depth_mm)
+                                                    .speed(0.2)
+                                                    .range(0.5..=50.0)
+                                                    .prefix("d="),
+                                            );
+                                            ui.add(
+                                                egui::DragValue::new(&mut sh.weight)
+                                                    .speed(0.02)
+                                                    .range(0.05..=1.0)
+                                                    .prefix("w="),
+                                            );
+                                            if ui.small_button("✕").clicked() {
+                                                remove_surf_idx = Some(idx);
+                                            }
+                                        });
+                                        if row_resp.response.hovered()
+                                            || ui.rect_contains_pointer(row_resp.response.rect)
+                                        {
+                                            plate.ui_hovered_surface_hint_patch = Some(sh.patch_id);
+                                        }
+                                    }
+                                    if let Some(idx) = remove_surf_idx {
+                                        let removed_patch =
+                                            config.eikonal.surface_hints[idx].patch_id;
+                                        config.eikonal.surface_hints.remove(idx);
+                                        if plate.selected_surface_hint_patch == Some(removed_patch)
+                                        {
+                                            plate.selected_surface_hint_patch = None;
+                                        }
+                                    }
+                                }
+                            });
+
+                            // 2. 3D Point Hints in Space (Collapsible)
+                            ui.separator();
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new(format!(
+                                    "3D Point Hints in Space ({point_hint_count})"
+                                ))
+                                .strong(),
+                            )
+                            .id_source("point_hints_in_space_list")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("+ Add at Center").clicked() {
+                                        let next_id = config
+                                            .eikonal
+                                            .point_hints
+                                            .iter()
+                                            .map(|h| h.id)
+                                            .max()
+                                            .unwrap_or(0)
+                                            + 1;
+                                        let def_radius =
+                                            config.eikonal.default_point_hint_radius_mm;
+                                        let def_weight = config.eikonal.default_hint_weight;
+                                        config.eikonal.point_hints.push(PointNormalHint {
+                                            id: next_id,
+                                            object_id: sel_id,
+                                            local_position: [
+                                                obj_local_center.x,
+                                                obj_local_center.y,
+                                                obj_local_center.z,
+                                            ],
+                                            local_direction: [0.0, 0.0, 1.0],
+                                            influence_radius_mm: def_radius,
+                                            weight: def_weight,
+                                        });
+                                        plate.selected_point_hint_id = Some(next_id);
+                                    }
+                                    if point_hint_count > 0
+                                        && ui.small_button("Clear Point Hints").clicked()
+                                    {
+                                        config
+                                            .eikonal
+                                            .point_hints
+                                            .retain(|h| h.object_id != sel_id);
+                                        plate.selected_point_hint_id = None;
+                                    }
+                                });
+
+                                if point_hint_count == 0 {
+                                    ui.small(
+                                        "Select '3D Point Hint' and click on the 2D slice plane (or object surface) in the viewport, then drag the arrow tip to aim.",
+                                    );
+                                } else {
+                                    let mut remove_pt_idx: Option<usize> = None;
+                                    for (idx, ph) in
+                                        config.eikonal.point_hints.iter_mut().enumerate()
+                                    {
+                                        if ph.object_id != sel_id {
+                                            continue;
+                                        }
+                                        let is_sel = plate.selected_point_hint_id == Some(ph.id);
+                                        let group_resp = ui.group(|ui| {
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        is_sel,
+                                                        format!("Point Hint #{}", ph.id),
+                                                    )
+                                                    .on_hover_text(
+                                                        "Click to select/deselect this point hint and toggle its 3D arrow",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    plate.selected_point_hint_id = if is_sel {
+                                                        None
+                                                    } else {
+                                                        Some(ph.id)
+                                                    };
+                                                }
+                                                ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut ph.influence_radius_mm,
+                                                    )
+                                                    .speed(0.25)
+                                                    .range(1.0..=60.0)
+                                                    .prefix("r=")
+                                                    .suffix("mm"),
+                                                );
+                                                ui.add(
+                                                    egui::DragValue::new(&mut ph.weight)
+                                                        .speed(0.02)
+                                                        .range(0.05..=1.0)
+                                                        .prefix("w="),
+                                                );
+                                                if ui.small_button("✕").clicked() {
+                                                    remove_pt_idx = Some(idx);
+                                                }
+                                            });
+
+                                            ui.horizontal(|ui| {
+                                                ui.small("Local Pos:");
+                                                ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut ph.local_position[0],
+                                                    )
+                                                    .speed(0.5)
+                                                    .prefix("X:"),
+                                                );
+                                                ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut ph.local_position[1],
+                                                    )
+                                                    .speed(0.5)
+                                                    .prefix("Y:"),
+                                                );
+                                                ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut ph.local_position[2],
+                                                    )
+                                                    .speed(0.5)
+                                                    .prefix("Z:"),
+                                                );
+                                            });
+
+                                            // Spherical Azimuth / Elevation controls for normal direction
+                                            let dir = Vec3::from_array(ph.local_direction)
+                                                .try_normalize()
+                                                .unwrap_or(Vec3::Z);
+                                            let mut elev_deg =
+                                                dir.z.clamp(-1.0, 1.0).asin().to_degrees();
+                                            let mut azim_deg =
+                                                dir.y.atan2(dir.x).to_degrees();
+                                            let mut dir_changed = false;
+                                            ui.horizontal(|ui| {
+                                                ui.small("Normal Dir:");
+                                                dir_changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut elev_deg,
+                                                            -90.0..=90.0,
+                                                        )
+                                                        .text("Elev°"),
+                                                    )
+                                                    .changed();
+                                                dir_changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut azim_deg,
+                                                            -180.0..=180.0,
+                                                        )
+                                                        .text("Azim°"),
+                                                    )
+                                                    .changed();
+                                            });
+                                            if dir_changed {
+                                                let el = elev_deg.to_radians();
+                                                let az = azim_deg.to_radians();
+                                                let new_dir = Vec3::new(
+                                                    el.cos() * az.cos(),
+                                                    el.cos() * az.sin(),
+                                                    el.sin(),
+                                                )
+                                                .normalize_or_zero();
+                                                if new_dir.length_squared() > 0.5 {
+                                                    ph.local_direction = new_dir.to_array();
+                                                }
+                                            }
+                                        });
+                                        if group_resp.response.hovered()
+                                            || ui.rect_contains_pointer(group_resp.response.rect)
+                                        {
+                                            plate.ui_hovered_point_hint_id = Some(ph.id);
+                                        }
+                                    }
+                                    if let Some(idx) = remove_pt_idx {
+                                        let removed_id = config.eikonal.point_hints[idx].id;
+                                        config.eikonal.point_hints.remove(idx);
+                                        if plate.selected_point_hint_id == Some(removed_id) {
+                                            plate.selected_point_hint_id = None;
+                                        }
+                                    }
+                                }
+                            });
+                        });
 
                         // --- Generic Volumetric Field Visualization (OpenVDB) ---
                         ui.add_space(8.0);
@@ -356,6 +732,7 @@ pub fn ui_workspace_system(
                                         &config,
                                         sel_id,
                                         &obj_name,
+                                        obj_rotation,
                                     );
                                 }
                             });
@@ -414,6 +791,7 @@ pub fn ui_workspace_system(
                                         &config,
                                         sel_id,
                                         &obj_name,
+                                        obj_rotation,
                                     );
                                 }
                             }
@@ -508,6 +886,7 @@ pub fn ui_workspace_system(
                                         &config,
                                         sel_id,
                                         &obj_name,
+                                        obj_rotation,
                                     );
                                 }
                             }
@@ -1005,6 +1384,65 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
     ffi::set_eikonal_solver_iterations(config.eikonal.solver_iterations);
 }
 
+/// Compiles all active surface-face hints and 3D point hints for `object_id` into
+/// backend `ffi::SpatialOrientationHint` records (in object-local OpenVDB coordinates)
+/// and pushes them to the C++ Eikonal solver.
+pub fn sync_object_hints_to_backend(
+    config: &SlicerConfig,
+    plate: &BuildPlateState,
+    object_id: u64,
+) {
+    let mut ffi_hints = Vec::new();
+
+    if let Some(obj) = plate.objects.iter().find(|o| o.object_id == object_id) {
+        for sh in config
+            .eikonal
+            .surface_hints
+            .iter()
+            .filter(|h| h.object_id == object_id)
+        {
+            if let Some(patch) = obj.surface_patches.get(sh.patch_id as usize) {
+                let kind = match sh.mode {
+                    SurfaceHintMode::NormalOrthogonalToSurface => 1u8, // HintKind::Orthogonality
+                    SurfaceHintMode::NormalTangentToSurface => 0u8,    // HintKind::Tangency
+                };
+                let sample_count = patch.sample_points.len().max(1) as f32;
+                let sample_spacing = (patch.area / sample_count).sqrt();
+                let effective_radius = sh.influence_depth_mm.max(sample_spacing * 1.35);
+
+                for &(pos, normal) in &patch.sample_points {
+                    ffi_hints.push(ffi::SpatialOrientationHint {
+                        kind,
+                        position_bed: [pos.x, pos.y, pos.z],
+                        direction_bed: [normal.x, normal.y, normal.z],
+                        influence_radius_mm: effective_radius,
+                        weight: sh.weight,
+                        apply_on_surface_only: true,
+                    });
+                }
+            }
+        }
+    }
+
+    for ph in config
+        .eikonal
+        .point_hints
+        .iter()
+        .filter(|h| h.object_id == object_id)
+    {
+        ffi_hints.push(ffi::SpatialOrientationHint {
+            kind: 1u8, // HintKind::Orthogonality (aligns \nabla \tau with ph.local_direction)
+            position_bed: ph.local_position,
+            direction_bed: ph.local_direction,
+            influence_radius_mm: ph.influence_radius_mm,
+            weight: ph.weight,
+            apply_on_surface_only: false,
+        });
+    }
+
+    ffi::set_spatial_orientation_hints(&ffi_hints);
+}
+
 /// Spawns an asynchronous background task to compute OpenVDB SDF, constrained Eikonal,
 /// overhang, and 5/6-axis tool orientation fields without blocking the UI thread.
 fn spawn_field_compute_task(
@@ -1013,8 +1451,21 @@ fn spawn_field_compute_task(
     config: &SlicerConfig,
     object_id: u64,
     object_name: &str,
+    obj_rotation: Quat,
 ) {
     sync_config_to_backend(config);
+    let inv_rot = obj_rotation.inverse();
+    let local_nozzle = (inv_rot * Vec3::from_array(config.machine.nozzle_axis_bed))
+        .normalize_or_zero();
+    if local_nozzle.length_squared() > 1.0e-6 {
+        ffi::set_nozzle_axis_bed(local_nozzle.to_array());
+    }
+    let local_gravity = (inv_rot * Vec3::from_array(config.machine.gravity_direction_bed))
+        .normalize_or_zero();
+    if local_gravity.length_squared() > 1.0e-6 {
+        ffi::set_gravity_direction_bed(local_gravity.to_array());
+    }
+    sync_object_hints_to_backend(config, plate, object_id);
     let voxel_size = config.eikonal.voxel_size_mm;
     let narrow_band = config.eikonal.narrow_band_width_voxels as f32;
     let task = IoTaskPool::get().spawn(async move {

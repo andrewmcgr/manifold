@@ -3,6 +3,7 @@
 #include "eikonal_solver.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -102,7 +103,9 @@ float computeBedSafeTiltRad(
     for (const auto& pt : tool.clearance_profile_xz) {
         const float r = std::max(0.0f, pt.x_radius_mm);
         const float z = std::max(0.0f, pt.z_height_mm);
-        if (r <= 1.0e-4f) {
+        // Skip the z=0 nozzle tip orifice flat so the tip itself can tilt on lower layers;
+        // upper clearance profile stages (z > 0) constrain bed collision as a function of hBedMm.
+        if (r <= 1.0e-4f || z <= 1.0e-3f) {
             continue;
         }
         const float hypotRZ = std::hypot(r, z);
@@ -147,13 +150,15 @@ std::array<float, 3> computeVoxelTauGradient(
         axisDeriv(n6[4], n6[5])};
 }
 
-/// Solves the 3D Godunov upwind quadratic update at voxel `idx` for |\nabla \tau| = s(x),
-/// optionally blending a directional upwind step along `-domain.targetDir[idx]`.
-float godunovUpwindUpdate(
+/// Solves the 3D Godunov upwind quadratic update at voxel `idx` for the initial
+/// unconstrained isotropic Eikonal equation |\nabla \tau| = s(x).
+float godunovIsotropicUpdate(
     const ActiveVolumeDomain& domain,
-    std::size_t idx,
-    bool useDirectionalGuidance) noexcept
+    std::size_t idx) noexcept
 {
+    if (domain.isSeed[idx]) {
+        return domain.tau[idx];
+    }
     const float dx = static_cast<float>(domain.voxelSize);
     const float stepCost = std::max(0.15f, domain.slowness[idx]) * dx;
     const auto& n6 = domain.neighbors6[idx];
@@ -200,54 +205,77 @@ float godunovUpwindUpdate(
         }
     }
 
-    if (!useDirectionalGuidance) {
-        return u;
-    }
-
-    // Directional upwind estimate along -targetDir[idx]
-    const auto& d = domain.targetDir[idx];
-    float weightSum = 0.0f;
-    float upwindTauSum = 0.0f;
-
-    const std::int32_t xUp = (d[0] >= 0.0f) ? n6[0] : n6[1];
-    const std::int32_t yUp = (d[1] >= 0.0f) ? n6[2] : n6[3];
-    const std::int32_t zUp = (d[2] >= 0.0f) ? n6[4] : n6[5];
-
-    const float wx = std::abs(d[0]);
-    const float wy = std::abs(d[1]);
-    const float wz = std::abs(d[2]);
-
-    const float tx = neighborTau(xUp);
-    const float ty = neighborTau(yUp);
-    const float tz = neighborTau(zUp);
-
-    if (wx > 1.0e-4f && tx < 0.5f * kInfinityTau) {
-        weightSum += wx;
-        upwindTauSum += wx * tx;
-    }
-    if (wy > 1.0e-4f && ty < 0.5f * kInfinityTau) {
-        weightSum += wy;
-        upwindTauSum += wy * ty;
-    }
-    if (wz > 1.0e-4f && tz < 0.5f * kInfinityTau) {
-        weightSum += wz;
-        upwindTauSum += wz * tz;
-    }
-
-    if (weightSum > 1.0e-4f) {
-        const float l1Norm = wx + wy + wz;
-        const float dirStep = stepCost / std::max(l1Norm, 1.0f);
-        const float uDir = (upwindTauSum / weightSum) + dirStep;
-        return 0.70f * u + 0.30f * uDir;
-    }
-
     return u;
+}
+
+/// Evaluates an upwind-biased directional gradient-integration update at voxel `idx`
+/// that aligns \nabla \tau(x) with `domain.slowness[idx] * domain.targetDir[idx]`.
+/// Because upwind neighbors ((x_i - x_u) \cdot g_{iu} > 0) receive higher weight than
+/// downwind neighbors, opposite neighbors (+dx and -dx) never cancel out `targetDir`,
+/// while any plane wave \tau(x) = g \cdot x + c is an exact fixed point.
+float directionalGradientIntegrationUpdate(
+    const ActiveVolumeDomain& domain,
+    std::size_t idx) noexcept
+{
+    const float dx = static_cast<float>(domain.voxelSize);
+    const auto& n6 = domain.neighbors6[idx];
+    const float sIdx = std::max(0.15f, domain.slowness[idx]);
+    const auto& dIdx = domain.targetDir[idx];
+
+    // Step vectors x_idx - x_u for the 6 face neighbors:
+    // k=0: u at -X => x_idx - x_u = (+dx, 0, 0)
+    // k=1: u at +X => x_idx - x_u = (-dx, 0, 0), etc.
+    const std::array<std::array<float, 3>, 6> stepFromU{{
+        {dx, 0.0f, 0.0f},
+        {-dx, 0.0f, 0.0f},
+        {0.0f, dx, 0.0f},
+        {0.0f, -dx, 0.0f},
+        {0.0f, 0.0f, dx},
+        {0.0f, 0.0f, -dx},
+    }};
+
+    float weightedTauSum = 0.0f;
+    float weightSum = 0.0f;
+
+    for (int k = 0; k < 6; ++k) {
+        const std::int32_t nb = n6[static_cast<std::size_t>(k)];
+        if (nb < 0) {
+            continue;
+        }
+        const std::size_t u = static_cast<std::size_t>(nb);
+        if (!domain.isInterior[u] || domain.tau[u] >= 0.5f * kInfinityTau) {
+            continue;
+        }
+
+        const float sU = std::max(0.15f, domain.slowness[u]);
+        const auto& dU = domain.targetDir[u];
+        const std::array<float, 3> gEdge{
+            0.5f * (sIdx * dIdx[0] + sU * dU[0]),
+            0.5f * (sIdx * dIdx[1] + sU * dU[1]),
+            0.5f * (sIdx * dIdx[2] + sU * dU[2])};
+
+        const float deltaTau = dot3(gEdge, stepFromU[static_cast<std::size_t>(k)]);
+        // Strong upwind bias: upstream neighbors (deltaTau > 0) carry weight up to 6.0,
+        // whereas downstream neighbors carry weight 0.15 so boundary conditions still couple
+        // smoothly without cancelling out the interior directional slope.
+        const float w = (deltaTau >= 0.0f)
+            ? (1.0f + 5.0f * (deltaTau / dx))
+            : 0.15f;
+
+        weightedTauSum += w * (domain.tau[u] + deltaTau);
+        weightSum += w;
+    }
+
+    if (weightSum > 1.0e-5f) {
+        return weightedTauSum / weightSum;
+    }
+    return domain.tau[idx];
 }
 
 /// Runs multi-threaded 8-octant Gauss-Seidel Fast Sweeping passes over all interior voxels
 /// using the precomputed diagonal hyperplane wavefront schedules (Detrixhe et al. 2013).
-/// Within each hyperplane level L = s_x i + s_y j + s_z k, no two voxels are 6-neighbors,
-/// so every hyperplane slice executes in parallel via `tbb::parallel_for` with zero data races.
+/// When `useDirectionalGuidance` is false, solves the initial unconstrained isotropic Eikonal
+/// equation; when true, integrates the constrained directional field `domain.targetDir`.
 void runInteriorFastSweeping(
     ActiveVolumeDomain& domain,
     std::uint32_t numSweepRounds,
@@ -258,25 +286,28 @@ void runInteriorFastSweeping(
         const std::size_t endOff = wf.levelOffsets[lvl + 1];
         const std::size_t count = endOff - beginOff;
 
+        auto updateVoxel = [&](std::size_t idx) {
+            if (!useDirectionalGuidance) {
+                const float cand = godunovIsotropicUpdate(domain, idx);
+                if (cand < domain.tau[idx]) {
+                    domain.tau[idx] = cand;
+                }
+            } else {
+                domain.tau[idx] = directionalGradientIntegrationUpdate(domain, idx);
+            }
+        };
+
         if (count >= kMinParallelWavefrontSize) {
             tbb::parallel_for(
                 tbb::blocked_range<std::size_t>(beginOff, endOff, kMinParallelWavefrontSize),
                 [&](const tbb::blocked_range<std::size_t>& r) {
                     for (std::size_t pos = r.begin(); pos != r.end(); ++pos) {
-                        const std::size_t idx = wf.indices[pos];
-                        const float cand = godunovUpwindUpdate(domain, idx, useDirectionalGuidance);
-                        if (cand < domain.tau[idx]) {
-                            domain.tau[idx] = cand;
-                        }
+                        updateVoxel(wf.indices[pos]);
                     }
                 });
         } else {
             for (std::size_t pos = beginOff; pos < endOff; ++pos) {
-                const std::size_t idx = wf.indices[pos];
-                const float cand = godunovUpwindUpdate(domain, idx, useDirectionalGuidance);
-                if (cand < domain.tau[idx]) {
-                    domain.tau[idx] = cand;
-                }
+                updateVoxel(wf.indices[pos]);
             }
         }
     };
@@ -300,8 +331,9 @@ void runInteriorFastSweeping(
 }
 
 /// Extends the solved interior Eikonal field smoothly into the exterior narrow-band voxels
-/// (\phi_sdf > 0.75 * dx) in parallel via `tbb::parallel_for` so that `openvdb::tools::volumeToMesh`
-/// extracts clean, continuous isosurface sheets across the object boundary (\phi_sdf = 0).
+/// (\phi_sdf > 0.75 * dx) in parallel via an outward shell-by-shell march so that
+/// `openvdb::tools::volumeToMesh` extracts clean, continuous isosurface sheets across
+/// the object boundary (\phi_sdf = 0) without flattening the interior gradient.
 void extendEikonalToExteriorBand(
     ActiveVolumeDomain& domain,
     const SlicerBackend& backend)
@@ -312,6 +344,15 @@ void extendEikonalToExteriorBand(
     for (std::size_t i = 0; i < n; ++i) {
         if (!domain.isInterior[i]) {
             extIndices.push_back(i);
+            domain.tau[i] = kInfinityTau;
+        } else {
+            // Store the final interior gradient in targetDir so exterior extension continues the exact slope
+            const auto g = computeVoxelTauGradient(domain, i);
+            const float gLen = length3(g);
+            if (gLen > 1.0e-4f) {
+                domain.targetDir[i] = {g[0] / gLen, g[1] / gLen, g[2] / gLen};
+                domain.slowness[i] = std::clamp(gLen, 0.25f, 2.5f);
+            }
         }
     }
 
@@ -331,8 +372,10 @@ void extendEikonalToExteriorBand(
     }};
 
     std::vector<float> nextTau = domain.tau;
+    std::vector<std::array<float, 3>> nextDir = domain.targetDir;
+    std::vector<float> nextSlowness = domain.slowness;
 
-    for (int pass = 0; pass < 10; ++pass) {
+    for (int pass = 0; pass < 16; ++pass) {
         tbb::parallel_for(
             tbb::blocked_range<std::size_t>(0, extCount, 256),
             [&](const tbb::blocked_range<std::size_t>& r) {
@@ -341,6 +384,8 @@ void extendEikonalToExteriorBand(
                     const auto& n6 = domain.neighbors6[idx];
                     float sumWeightedTau = 0.0f;
                     float sumWeight = 0.0f;
+                    std::array<float, 3> sumDir{0.0f, 0.0f, 0.0f};
+                    float sumSlowness = 0.0f;
 
                     for (int k = 0; k < 6; ++k) {
                         const std::int32_t nb = n6[static_cast<std::size_t>(k)];
@@ -352,24 +397,27 @@ void extendEikonalToExteriorBand(
                         if (nbTau >= 0.5f * kInfinityTau) {
                             continue;
                         }
-                        const float w = (domain.sdf[u] < domain.sdf[idx]) ? 2.5f : 1.0f;
-                        const float deltaTau = dot3(domain.toolAxis[u], stepVecs[static_cast<std::size_t>(k)]);
+                        // Prioritize neighbors closer to the object surface (\phi_sdf smaller)
+                        const float w = (domain.sdf[u] < domain.sdf[idx]) ? 4.0f : 0.6f;
+                        const float sU = domain.slowness[u];
+                        const float deltaTau =
+                            sU * dot3(domain.targetDir[u], stepVecs[static_cast<std::size_t>(k)]);
                         sumWeightedTau += w * std::max(0.0f, nbTau + deltaTau);
+                        sumDir[0] += w * domain.targetDir[u][0];
+                        sumDir[1] += w * domain.targetDir[u][1];
+                        sumDir[2] += w * domain.targetDir[u][2];
+                        sumSlowness += w * sU;
                         sumWeight += w;
                     }
 
                     if (sumWeight > 0.0f) {
                         nextTau[idx] = sumWeightedTau / sumWeight;
-                    } else if (pass == 0) {
-                        const NozzleBasis basis =
-                            backend.queryNozzleFrame(domain.posBed[idx], {1.0f, 0.0f, 0.0f});
-                        const std::array<float, 3> rel{
-                            domain.posBed[idx][0],
-                            domain.posBed[idx][1],
-                            domain.posBed[idx][2] - domain.minZBed};
-                        nextTau[idx] = std::max(0.0f, dot3(rel, basis.nozzle_axis));
+                        nextDir[idx] = normalize3(sumDir, domain.targetDir[idx]);
+                        nextSlowness[idx] = sumSlowness / sumWeight;
                     } else {
                         nextTau[idx] = domain.tau[idx];
+                        nextDir[idx] = domain.targetDir[idx];
+                        nextSlowness[idx] = domain.slowness[idx];
                     }
                 }
             });
@@ -380,9 +428,26 @@ void extendEikonalToExteriorBand(
                 for (std::size_t e = r.begin(); e != r.end(); ++e) {
                     const std::size_t idx = extIndices[e];
                     domain.tau[idx] = nextTau[idx];
+                    domain.targetDir[idx] = nextDir[idx];
+                    domain.slowness[idx] = nextSlowness[idx];
                 }
             });
     }
+
+    // Fallback for any disconnected exterior narrow-band voxels beyond 16 shells
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, extCount, 512),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            for (std::size_t e = r.begin(); e != r.end(); ++e) {
+                const std::size_t idx = extIndices[e];
+                if (domain.tau[idx] >= 0.5f * kInfinityTau) {
+                    const NozzleBasis basis =
+                        backend.queryNozzleFrame(domain.posBed[idx], {1.0f, 0.0f, 0.0f});
+                    const float h = dot3(domain.posBed[idx], basis.nozzle_axis) - domain.minZBed;
+                    domain.tau[idx] = std::max(0.0f, h);
+                }
+            }
+        });
 }
 
 } // namespace
@@ -503,8 +568,12 @@ void ActiveVolumeDomain::buildWavefrontSchedules() {
     std::int32_t minK = std::numeric_limits<std::int32_t>::max();
     std::int32_t maxK = std::numeric_limits<std::int32_t>::lowest();
 
+    // Include all interior voxels in the wavefront schedules so directional integration
+    // and harmonic hint diffusion can sweep smoothly across the entire interior domain.
+    // (During the initial unconstrained isotropic Eikonal sweep, `godunovIsotropicUpdate`
+    // keeps `isSeed` voxels fixed at their initial seed values.)
     for (std::size_t i = 0; i < n; ++i) {
-        if (isInterior[i] && !isSeed[i]) {
+        if (isInterior[i]) {
             activeInterior.push_back(i);
             minK = std::min(minK, coords[i].z());
             maxK = std::max(maxK, coords[i].z());
@@ -633,26 +702,33 @@ void ToolOrientationStrategy::updateToolOrientations(
                     ctx.backend.queryNozzleFrame(domain.posBed[i], {1.0f, 0.0f, 0.0f});
                 const std::array<float, 3> bedNormal = baseFrame.nozzle_axis;
 
-                const std::array<float, 3> rel{
-                    domain.posBed[i][0],
-                    domain.posBed[i][1],
-                    domain.posBed[i][2] - domain.minZBed};
-                const float hBedMm = std::max(0.0f, dot3(rel, bedNormal));
+                const float hBedMm =
+                    std::max(0.0f, dot3(domain.posBed[i], bedNormal) - domain.minZBed);
                 const float gammaMaxRad =
                     computeBedSafeTiltRad(ctx.activeTool, hBedMm, maxAngleRad);
                 localMaxTiltRad[i] = gammaMaxRad;
 
                 std::array<float, 3> desiredAxis = bedNormal;
                 if (domain.isInterior[i]) {
-                    const auto gradTau = computeVoxelTauGradient(domain, i);
-                    const float gradLen = length3(gradTau);
-                    if (gradLen > 1.0e-5f) {
-                        desiredAxis = {
-                            gradTau[0] / gradLen,
-                            gradTau[1] / gradLen,
-                            gradTau[2] / gradLen};
-                        if (dot3(desiredAxis, bedNormal) < 0.0f) {
-                            desiredAxis = {-desiredAxis[0], -desiredAxis[1], -desiredAxis[2]};
+                    // `domain.targetDir[i]` already combines the current Eikonal gradient,
+                    // overhang guidance, and diffused soft orientation hints.
+                    desiredAxis = domain.targetDir[i];
+                    if (ctx.hints.empty()) {
+                        const auto gradTau = computeVoxelTauGradient(domain, i);
+                        const float gradLen = length3(gradTau);
+                        if (gradLen > 1.0e-5f) {
+                            std::array<float, 3> gUnit{
+                                gradTau[0] / gradLen,
+                                gradTau[1] / gradLen,
+                                gradTau[2] / gradLen};
+                            if (dot3(gUnit, bedNormal) < 0.0f) {
+                                gUnit = {-gUnit[0], -gUnit[1], -gUnit[2]};
+                            }
+                            desiredAxis = normalize3(
+                                {0.5f * desiredAxis[0] + 0.5f * gUnit[0],
+                                 0.5f * desiredAxis[1] + 0.5f * gUnit[1],
+                                 0.5f * desiredAxis[2] + 0.5f * gUnit[2]},
+                                bedNormal);
                         }
                     }
 
@@ -790,17 +866,12 @@ void ToolClearanceConstraint::applyPreSweepModifiers(
                     continue;
                 }
                 const auto& aAxis = domain.toolAxis[i];
-                const auto gradTau = computeVoxelTauGradient(domain, i);
-                const float gradLen = length3(gradTau);
+                const auto& rawDir = domain.targetDir[i];
 
-                std::array<float, 3> rawDir = aAxis;
-                if (gradLen > 1.0e-5f) {
-                    rawDir = {gradTau[0] / gradLen, gradTau[1] / gradLen, gradTau[2] / gradLen};
-                    if (dot3(rawDir, aAxis) < 0.0f) {
-                        rawDir = {-rawDir[0], -rawDir[1], -rawDir[2]};
-                    }
-                }
-
+                // Strictly clamp the target isosurface normal (including any soft orientation hints)
+                // to the tool's clearance cone centered on the ACTUAL solved tool axis `aAxis`.
+                // Note: Do not negate `rawDir` when `dot(rawDir, aAxis) < 0` as that would flip
+                // its radial azimuth by 180 degrees; `clampUnitVectorToCone` preserves radial azimuth.
                 domain.targetDir[i] = clampUnitVectorToCone(rawDir, aAxis, alphaMaxRad);
             }
         });
@@ -816,93 +887,72 @@ void ToolClearanceConstraint::enforceOnField(
     }
 
     const float alphaMaxRad = computeMaxClearanceSlopeRad(ctx.activeTool);
-    const float tanAlphaMax = std::max(std::tan(alphaMaxRad), 0.14f);
+    const float cosAlphaMax = std::cos(alphaMaxRad);
     const float dx = static_cast<float>(domain.voxelSize);
 
-    const std::array<std::array<float, 3>, 6> neighborOffsets{{
-        {-dx, 0.0f, 0.0f},
-        {dx, 0.0f, 0.0f},
-        {0.0f, -dx, 0.0f},
-        {0.0f, dx, 0.0f},
-        {0.0f, 0.0f, -dx},
-        {0.0f, 0.0f, dx},
-    }};
+    // 1. Check whether the discrete gradient \nabla \tau at any interior voxel violates
+    // the clearance cone of half-angle `alphaMaxRad` around the ACTUAL tool axis `domain.toolAxis[i]`.
+    // Voxels whose gradient already satisfies \angle(\nabla \tau, toolAxis) <= alphaMaxRad are untouched.
+    std::vector<std::uint8_t> violatesCone(n, 0);
+    std::atomic<bool> anyViolation{false};
 
-    // 1. Parallel Z-slice Red-Black clearance cone enforcement
-    const auto& zWf = domain.zParityWavefront;
-    const std::size_t numZLevels = zWf.numLevels();
-
-    auto enforceOnVoxel = [&](std::size_t idx) {
-        const auto& aAxis = domain.toolAxis[idx];
-        const auto& n6 = domain.neighbors6[idx];
-
-        for (int k = 0; k < 6; ++k) {
-            const std::int32_t nb = n6[static_cast<std::size_t>(k)];
-            if (nb < 0) {
-                continue;
-            }
-            const std::size_t u = static_cast<std::size_t>(nb);
-            if (!domain.isInterior[u] || domain.tau[u] >= 0.5f * kInfinityTau) {
-                continue;
-            }
-
-            const std::array<float, 3> stepFromU{
-                -neighborOffsets[static_cast<std::size_t>(k)][0],
-                -neighborOffsets[static_cast<std::size_t>(k)][1],
-                -neighborOffsets[static_cast<std::size_t>(k)][2]};
-            const float dzAxial = dot3(stepFromU, aAxis);
-            const std::array<float, 3> radialVec{
-                stepFromU[0] - dzAxial * aAxis[0],
-                stepFromU[1] - dzAxial * aAxis[1],
-                stepFromU[2] - dzAxial * aAxis[2]};
-            const float drRadial = length3(radialVec);
-
-            if (dzAxial > 0.1f * dx) {
-                const float minProgress = std::max(0.15f * dx, dzAxial - drRadial * tanAlphaMax);
-                domain.tau[idx] = std::max(domain.tau[idx], domain.tau[u] + 0.5f * minProgress);
-            } else if (std::abs(dzAxial) <= 0.25f * dx && drRadial > 0.1f * dx) {
-                const float maxLateralJump = drRadial * std::sin(alphaMaxRad);
-                if (domain.tau[idx] > domain.tau[u] + maxLateralJump) {
-                    domain.tau[idx] = domain.tau[u] + maxLateralJump;
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, n, 512),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            bool localViol = false;
+            for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                if (!domain.isInterior[i]) {
+                    continue;
+                }
+                const auto& aAxis = domain.toolAxis[i];
+                const auto g = computeVoxelTauGradient(domain, i);
+                const float gLen = length3(g);
+                if (gLen > 1.0e-4f) {
+                    const std::array<float, 3> gUnit{g[0] / gLen, g[1] / gLen, g[2] / gLen};
+                    const float cosTheta = dot3(gUnit, aAxis);
+                    if (cosTheta < cosAlphaMax - 1.0e-3f) {
+                        domain.targetDir[i] = clampUnitVectorToCone(gUnit, aAxis, alphaMaxRad);
+                        violatesCone[i] = 1;
+                        localViol = true;
+                    } else {
+                        domain.targetDir[i] = clampUnitVectorToCone(domain.targetDir[i], aAxis, alphaMaxRad);
+                    }
+                } else {
+                    domain.targetDir[i] = clampUnitVectorToCone(domain.targetDir[i], aAxis, alphaMaxRad);
                 }
             }
-        }
-    };
-
-    for (int pass = 0; pass < 2; ++pass) {
-        for (std::size_t lvl = 0; lvl < numZLevels; ++lvl) {
-            const std::size_t beginOff = zWf.levelOffsets[lvl];
-            const std::size_t endOff = zWf.levelOffsets[lvl + 1];
-            const std::size_t count = endOff - beginOff;
-
-            if (count >= kMinParallelWavefrontSize) {
-                tbb::parallel_for(
-                    tbb::blocked_range<std::size_t>(beginOff, endOff, kMinParallelWavefrontSize),
-                    [&](const tbb::blocked_range<std::size_t>& r) {
-                        for (std::size_t pos = r.begin(); pos != r.end(); ++pos) {
-                            enforceOnVoxel(zWf.indices[pos]);
-                        }
-                    });
-            } else {
-                for (std::size_t pos = beginOff; pos < endOff; ++pos) {
-                    enforceOnVoxel(zWf.indices[pos]);
-                }
+            if (localViol) {
+                anyViolation.store(true, std::memory_order_relaxed);
             }
-        }
+        });
+
+    // If any voxel violated the tool's clearance cone around its actual tool axis,
+    // re-integrate the clamped gradient across the octant wavefronts.
+    if (anyViolation.load(std::memory_order_relaxed)) {
+        runInteriorFastSweeping(domain, 1, /*useDirectionalGuidance=*/true);
     }
 
-    // 2. Parallel Gather-based XZ clearance profile ring verification in the local nozzle frame:
-    // Each interior voxel `u` queries points `idx` below it (`pos[u] - z_m * zNozzle - r_m * radial`)
-    // and enforces `newTau[u] >= oldTau[idx] + 0.15 * z_m` without write contention.
+    // 2. Parallel Gather-based XZ clearance profile ring verification in the local nozzle frame
+    // of the ACTUAL tool axis `domain.toolAxis[u]`:
+    // When the nozzle tip is at `pos[u]` with tool axis `zNozzle = domain.toolAxis[u]`, any point
+    // `upperWorld = pos[u] + z_m * zNozzle + r_m * radial` on the tool's physical clearance envelope
+    // that lies inside the object must NOT have been printed earlier than `u` (\tau(upperWorld) >= \tau(u)).
+    // Equivalently, looking from `u` down to `lowerWorld = pos[u] - z_m * zNozzle - r_m * radial`,
+    // we require \tau(u) >= \tau(lowerWorld).
     if (!ctx.activeTool.clearance_profile_xz.empty() && domain.indexGrid) {
         const std::vector<float> oldTau = domain.tau;
-        const std::array<std::array<float, 2>, 4> ringDirs{{
+        const std::array<std::array<float, 2>, 8> ringDirs{{
             {1.0f, 0.0f},
             {-1.0f, 0.0f},
             {0.0f, 1.0f},
             {0.0f, -1.0f},
+            {0.70710678f, 0.70710678f},
+            {-0.70710678f, 0.70710678f},
+            {0.70710678f, -0.70710678f},
+            {-0.70710678f, -0.70710678f},
         }};
 
+        const auto& zWf = domain.zParityWavefront;
         tbb::parallel_for(
             tbb::blocked_range<std::size_t>(0, zWf.indices.size(), 256),
             [&](const tbb::blocked_range<std::size_t>& r) {
@@ -927,22 +977,37 @@ void ToolClearanceConstraint::enforceOnField(
                     for (const auto& stage : ctx.activeTool.clearance_profile_xz) {
                         const float rMm = stage.x_radius_mm;
                         const float zMm = stage.z_height_mm;
-                        if (zMm < 0.75f * dx || zMm > 3.5f * dx) {
+                        if (zMm < 1.25f * dx) {
                             continue;
                         }
 
                         for (const auto& cs : ringDirs) {
+                            const std::array<float, 3> offsetVec{
+                                -zMm * zNozzle[0] - rMm * (cs[0] * xNozzle[0] + cs[1] * yNozzle[0]),
+                                -zMm * zNozzle[1] - rMm * (cs[0] * xNozzle[1] + cs[1] * yNozzle[1]),
+                                -zMm * zNozzle[2] - rMm * (cs[0] * xNozzle[2] + cs[1] * yNozzle[2])};
                             const openvdb::Vec3d lowerWorld(
-                                pos[0] - zMm * zNozzle[0] - rMm * (cs[0] * xNozzle[0] + cs[1] * yNozzle[0]),
-                                pos[1] - zMm * zNozzle[1] - rMm * (cs[0] * xNozzle[1] + cs[1] * yNozzle[1]),
-                                pos[2] - zMm * zNozzle[2] - rMm * (cs[0] * xNozzle[2] + cs[1] * yNozzle[2]));
+                                pos[0] + offsetVec[0],
+                                pos[1] + offsetVec[1],
+                                pos[2] + offsetVec[2]);
                             const openvdb::Coord lowerCoord =
                                 domain.transform->worldToIndexCellCentered(lowerWorld);
                             const std::int32_t lowerIdx = localIdxAcc.getValue(lowerCoord);
                             if (lowerIdx >= 0) {
                                 const std::size_t idx = static_cast<std::size_t>(lowerIdx);
-                                if (domain.isInterior[idx] && oldTau[idx] < 0.5f * kInfinityTau) {
-                                    reqTau = std::max(reqTau, oldTau[idx] + 0.15f * zMm);
+                                if (idx != u && domain.isInterior[idx] &&
+                                    oldTau[idx] < 0.5f * kInfinityTau) {
+                                    // Compensate for cell-center rounding between `lowerWorld` and `posBed[idx]`
+                                    // along `targetDir[idx]` so nearest-voxel lookup never creates stair-stepping.
+                                    const std::array<float, 3> roundDiff{
+                                        static_cast<float>(lowerWorld.x()) - domain.posBed[idx][0],
+                                        static_cast<float>(lowerWorld.y()) - domain.posBed[idx][1],
+                                        static_cast<float>(lowerWorld.z()) - domain.posBed[idx][2]};
+                                    const float interpLowerTau =
+                                        oldTau[idx] + dot3(roundDiff, domain.targetDir[idx]);
+                                    if (interpLowerTau > reqTau) {
+                                        reqTau = interpLowerTau;
+                                    }
                                 }
                             }
                         }
@@ -975,6 +1040,18 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
                     continue;
                 }
 
+                const auto& aAxis = domain.toolAxis[i];
+                const auto gradTau = computeVoxelTauGradient(domain, i);
+                const float gradLen = length3(gradTau);
+                std::array<float, 3> baseDir = aAxis;
+                if (gradLen > 1.0e-5f) {
+                    baseDir = {gradTau[0] / gradLen, gradTau[1] / gradLen, gradTau[2] / gradLen};
+                    if (dot3(baseDir, aAxis) < 0.0f) {
+                        baseDir = {-baseDir[0], -baseDir[1], -baseDir[2]};
+                    }
+                }
+                domain.targetDir[i] = baseDir;
+
                 const float ov = domain.overhang[i];
                 const float distFromSurface = std::abs(domain.sdf[i]);
 
@@ -991,7 +1068,7 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
                         {(1.0f - wBias) * domain.targetDir[i][0] + wBias * nOut[0],
                          (1.0f - wBias) * domain.targetDir[i][1] + wBias * nOut[1],
                          (1.0f - wBias) * domain.targetDir[i][2] + wBias * nOut[2]},
-                        domain.toolAxis[i]);
+                        aAxis);
                 } else {
                     domain.slowness[i] = 1.0f;
                 }
@@ -1008,8 +1085,28 @@ void OverhangIslandConstraint::enforceOnField(
         return;
     }
 
+    // Shift interior \tau so that the earliest bed seed voxel starts at \tau = 0
+    // while allowing tilted layers across the bed to have \tau >= 0.
+    float minSeedTau = std::numeric_limits<float>::max();
+    for (std::size_t i = 0; i < n; ++i) {
+        if (domain.isSeed[i] && domain.tau[i] < 0.5f * kInfinityTau) {
+            minSeedTau = std::min(minSeedTau, domain.tau[i]);
+        }
+    }
+    if (minSeedTau < 0.5f * kInfinityTau && std::abs(minSeedTau) > 1.0e-6f) {
+        tbb::parallel_for(
+            tbb::blocked_range<std::size_t>(0, n, 512),
+            [&](const tbb::blocked_range<std::size_t>& r) {
+                for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                    if (domain.isInterior[i] && domain.tau[i] < 0.5f * kInfinityTau) {
+                        domain.tau[i] = std::max(0.0f, domain.tau[i] - minSeedTau);
+                    }
+                }
+            });
+    }
+
     const float dx = static_cast<float>(domain.voxelSize);
-    const float epsStep = 0.04f * dx;
+    const float epsStep = 0.02f * dx;
 
     struct HeapEntry {
         float tau;
@@ -1026,7 +1123,7 @@ void OverhangIslandConstraint::enforceOnField(
     std::size_t seedCount = 0;
     for (std::size_t i = 0; i < n; ++i) {
         if (domain.isSeed[i]) {
-            causalTau[i] = domain.tau[i];
+            causalTau[i] = std::max(0.0f, domain.tau[i]);
             pq.push(HeapEntry{causalTau[i], i});
             ++seedCount;
         }
@@ -1080,6 +1177,131 @@ void OverhangIslandConstraint::enforceOnField(
 // 3. OrientationHintConstraint Implementation (Parallelized via TBB)
 // ============================================================================
 
+namespace {
+
+/// Evaluates the direct soft orientation hint weight `wMax \in [0, 1]` and desired unit
+/// isosurface normal `outTargetDir` at voxel `i`.
+float evaluateSoftHintAtVoxel(
+    const ActiveVolumeDomain& domain,
+    const EikonalSolverContext& ctx,
+    std::size_t i,
+    std::array<float, 3>& outTargetDir) noexcept
+{
+    const auto& pos = domain.posBed[i];
+    const auto& baseDir = domain.targetDir[i];
+    const NozzleBasis baseFrame =
+        ctx.backend.queryNozzleFrame(pos, {1.0f, 0.0f, 0.0f});
+    const std::array<float, 3> bedNormal = baseFrame.nozzle_axis;
+    const float sdfDepth = std::abs(domain.sdf[i]);
+
+    std::array<float, 3> accumVec{0.0f, 0.0f, 0.0f};
+    float maxFalloff = 0.0f;
+
+    for (const auto& hint : ctx.hints) {
+        // Use a generous effective influence radius so surface and point hints penetrate well
+        // into the volume before harmonic diffusion spreads them smoothly across the object.
+        const float radius = std::max(hint.influenceRadiusMm, 3.0f * static_cast<float>(domain.voxelSize));
+        const float maxDepth = std::max(2.0f * radius, 0.35f * domain.maxSpanMm);
+        if (hint.applyOnSurfaceOnly && sdfDepth > maxDepth) {
+            continue;
+        }
+
+        const std::array<float, 3> diff{
+            pos[0] - hint.positionBed[0],
+            pos[1] - hint.positionBed[1],
+            pos[2] - hint.positionBed[2]};
+        const float dist = length3(diff);
+        const float reach = hint.applyOnSurfaceOnly ? (1.5f * radius) : (2.0f * radius);
+        if (dist >= reach) {
+            continue;
+        }
+
+        const float uDist = std::clamp(1.0f - dist / reach, 0.0f, 1.0f);
+        // Smooth cubic falloff that stays strong (near 1.0) close to the hint
+        float falloff = uDist * uDist * (3.0f - 2.0f * uDist) * std::clamp(hint.weight, 0.0f, 1.0f);
+        if (hint.applyOnSurfaceOnly) {
+            const float uDepth = std::clamp(1.0f - sdfDepth / maxDepth, 0.0f, 1.0f);
+            falloff *= std::sqrt(uDepth);
+        }
+        if (falloff <= 1.0e-4f) {
+            continue;
+        }
+
+        const auto hintVec = normalize3(hint.directionBed, bedNormal);
+        std::array<float, 3> targetFromHint = baseDir;
+        if (hint.kind == HintKind::Orthogonality) {
+            // Isosurface normal \nabla \tau aligned with \pm hintVec:
+            // - For a 3D point hint (`!applyOnSurfaceOnly`), preserve the user's chosen arrow
+            //   direction (only flipping if it points steeply downward into the bed).
+            // - For a surface orthogonality hint (`applyOnSurfaceOnly`), `hintVec` is the outward
+            //   face normal; if the face points downward (overhang), flip to `-hintVec` so \nabla \tau
+            //   points upward while remaining orthogonal to the surface; if the face is a vertical
+            //   side wall, bias slightly upward so clamping tilts cleanly toward `+hintVec`.
+            targetFromHint = hintVec;
+            const float dotBed = dot3(targetFromHint, bedNormal);
+            if (hint.applyOnSurfaceOnly) {
+                if (dotBed < -0.15f) {
+                    targetFromHint = {-targetFromHint[0], -targetFromHint[1], -targetFromHint[2]};
+                } else if (std::abs(dotBed) <= 0.15f) {
+                    targetFromHint = normalize3(
+                        {targetFromHint[0] + 0.25f * bedNormal[0],
+                         targetFromHint[1] + 0.25f * bedNormal[1],
+                         targetFromHint[2] + 0.25f * bedNormal[2]},
+                        bedNormal);
+                }
+            } else if (dotBed < -0.25f) {
+                targetFromHint = {-targetFromHint[0], -targetFromHint[1], -targetFromHint[2]};
+            }
+        } else {
+            // HintKind::Tangency: Isosurface normal \nabla \tau tangent to surface (\nabla \tau \perp hintVec)
+            float proj = dot3(baseDir, hintVec);
+            std::array<float, 3> tang{
+                baseDir[0] - proj * hintVec[0],
+                baseDir[1] - proj * hintVec[1],
+                baseDir[2] - proj * hintVec[2]};
+            if (length3(tang) < 0.10f) {
+                // When the selected face normal `hintVec` is nearly parallel to `baseDir`
+                // (e.g. a horizontal top or bottom face!), project a horizontal/radial reference
+                // direction onto the face's tangent plane so layers tilt to meet the face at 90 degrees.
+                std::array<float, 3> radialRef{pos[0], pos[1], 0.0f};
+                if (length3(radialRef) < 1.0e-3f) {
+                    radialRef = baseFrame.travel_axis;
+                } else {
+                    radialRef = normalize3(radialRef, baseFrame.travel_axis);
+                }
+                const float projRad = dot3(radialRef, hintVec);
+                tang = {
+                    radialRef[0] - projRad * hintVec[0],
+                    radialRef[1] - projRad * hintVec[1],
+                    radialRef[2] - projRad * hintVec[2]};
+            }
+            targetFromHint = normalize3(tang, bedNormal);
+            if (dot3(targetFromHint, bedNormal) < -0.1f) {
+                targetFromHint = {-targetFromHint[0], -targetFromHint[1], -targetFromHint[2]};
+            }
+        }
+
+        accumVec[0] += falloff * targetFromHint[0];
+        accumVec[1] += falloff * targetFromHint[1];
+        accumVec[2] += falloff * targetFromHint[2];
+        maxFalloff = std::max(maxFalloff, falloff);
+    }
+
+    if (maxFalloff > 1.0e-4f) {
+        const auto unitHint = normalize3(accumVec, baseDir);
+        outTargetDir = normalize3(
+            {(1.0f - maxFalloff) * baseDir[0] + maxFalloff * unitHint[0],
+             (1.0f - maxFalloff) * baseDir[1] + maxFalloff * unitHint[1],
+             (1.0f - maxFalloff) * baseDir[2] + maxFalloff * unitHint[2]},
+            bedNormal);
+    } else {
+        outTargetDir = baseDir;
+    }
+    return maxFalloff;
+}
+
+} // namespace
+
 void OrientationHintConstraint::applyPreSweepModifiers(
     ActiveVolumeDomain& domain,
     const EikonalSolverContext& ctx) const
@@ -1089,7 +1311,9 @@ void OrientationHintConstraint::applyPreSweepModifiers(
     }
 
     const std::size_t n = domain.coords.size();
-    const float surfaceBandMm = 2.5f * static_cast<float>(domain.voxelSize);
+    std::vector<std::array<float, 3>> directHintDir(n, {0.0f, 0.0f, 1.0f});
+    std::vector<std::array<float, 3>> baseDirs = domain.targetDir;
+    std::vector<float> directWeight(n, 0.0f);
 
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, n, 512),
@@ -1098,63 +1322,92 @@ void OrientationHintConstraint::applyPreSweepModifiers(
                 if (!domain.isInterior[i]) {
                     continue;
                 }
-
-                const auto& pos = domain.posBed[i];
-                std::array<float, 3> blendedDir = domain.targetDir[i];
-
-                for (const auto& hint : ctx.hints) {
-                    if (hint.applyOnSurfaceOnly && std::abs(domain.sdf[i]) > surfaceBandMm) {
-                        continue;
-                    }
-
-                    const std::array<float, 3> diff{
-                        pos[0] - hint.positionBed[0],
-                        pos[1] - hint.positionBed[1],
-                        pos[2] - hint.positionBed[2]};
-                    const float dist = length3(diff);
-                    const float radius = std::max(hint.influenceRadiusMm, 1.0e-3f);
-                    if (dist >= radius) {
-                        continue;
-                    }
-
-                    const float falloff =
-                        (1.0f - dist / radius) * std::clamp(hint.weight, 0.0f, 1.0f);
-                    const auto hintVec = normalize3(hint.directionBed, domain.toolAxis[i]);
-
-                    std::array<float, 3> targetFromHint = blendedDir;
-                    if (hint.kind == HintKind::Orthogonality) {
-                        targetFromHint = hintVec;
-                        if (dot3(targetFromHint, domain.toolAxis[i]) < 0.0f) {
-                            targetFromHint = {
-                                -targetFromHint[0],
-                                -targetFromHint[1],
-                                -targetFromHint[2]};
-                        }
-                    } else {
-                        const float proj = dot3(blendedDir, hintVec);
-                        targetFromHint = normalize3(
-                            {blendedDir[0] - proj * hintVec[0],
-                             blendedDir[1] - proj * hintVec[1],
-                             blendedDir[2] - proj * hintVec[2]},
-                            domain.toolAxis[i]);
-                    }
-
-                    blendedDir = normalize3(
-                        {(1.0f - falloff) * blendedDir[0] + falloff * targetFromHint[0],
-                         (1.0f - falloff) * blendedDir[1] + falloff * targetFromHint[1],
-                         (1.0f - falloff) * blendedDir[2] + falloff * targetFromHint[2]},
-                        domain.toolAxis[i]);
+                std::array<float, 3> hDir = domain.targetDir[i];
+                const float w = evaluateSoftHintAtVoxel(domain, ctx, i, hDir);
+                directHintDir[i] = hDir;
+                directWeight[i] = w;
+                if (w > 1.0e-4f) {
+                    domain.targetDir[i] = hDir;
                 }
-
-                domain.targetDir[i] = blendedDir;
             }
         });
+
+    // Harmonically diffuse the hinted target normal field across the interior volume using
+    // the parallel octant wavefront schedules so surface-face and 3D point hints smoothly
+    // steer the entire surrounding layer field rather than only a thin skin.
+    auto diffuseWavefrontSlice = [&](const WavefrontSchedule& wf, std::size_t lvl) {
+        const std::size_t beginOff = wf.levelOffsets[lvl];
+        const std::size_t endOff = wf.levelOffsets[lvl + 1];
+        const std::size_t count = endOff - beginOff;
+
+        auto diffuseVoxel = [&](std::size_t idx) {
+            const float wDirect = directWeight[idx];
+            if (wDirect >= 0.92f) {
+                domain.targetDir[idx] = directHintDir[idx];
+                return;
+            }
+
+            const auto& n6 = domain.neighbors6[idx];
+            // Weak background tether (0.04) toward `baseDirs[idx]` so hints propagate far into
+            // the interior while un-hinted regions far away still relax smoothly.
+            std::array<float, 3> acc{
+                0.04f * baseDirs[idx][0] + 2.5f * wDirect * directHintDir[idx][0],
+                0.04f * baseDirs[idx][1] + 2.5f * wDirect * directHintDir[idx][1],
+                0.04f * baseDirs[idx][2] + 2.5f * wDirect * directHintDir[idx][2]};
+
+            for (const std::int32_t nb : n6) {
+                if (nb >= 0) {
+                    const std::size_t u = static_cast<std::size_t>(nb);
+                    if (domain.isInterior[u]) {
+                        acc[0] += domain.targetDir[u][0];
+                        acc[1] += domain.targetDir[u][1];
+                        acc[2] += domain.targetDir[u][2];
+                    }
+                }
+            }
+
+            domain.targetDir[idx] = normalize3(acc, baseDirs[idx]);
+        };
+
+        if (count >= kMinParallelWavefrontSize) {
+            tbb::parallel_for(
+                tbb::blocked_range<std::size_t>(beginOff, endOff, kMinParallelWavefrontSize),
+                [&](const tbb::blocked_range<std::size_t>& r) {
+                    for (std::size_t pos = r.begin(); pos != r.end(); ++pos) {
+                        diffuseVoxel(wf.indices[pos]);
+                    }
+                });
+        } else {
+            for (std::size_t pos = beginOff; pos < endOff; ++pos) {
+                diffuseVoxel(wf.indices[pos]);
+            }
+        }
+    };
+
+    for (int round = 0; round < 2; ++round) {
+        for (const auto& wf : domain.octantWavefronts) {
+            const std::size_t numLvls = wf.numLevels();
+            for (std::size_t lvl = 0; lvl < numLvls; ++lvl) {
+                diffuseWavefrontSlice(wf, lvl);
+            }
+            for (std::size_t lvl = numLvls; lvl-- > 0;) {
+                diffuseWavefrontSlice(wf, lvl);
+            }
+        }
+    }
 }
 
 void OrientationHintConstraint::enforceOnField(
-    ActiveVolumeDomain& /*domain*/,
-    const EikonalSolverContext& /*ctx*/) const
+    ActiveVolumeDomain& domain,
+    const EikonalSolverContext& ctx) const
 {
+    if (ctx.hints.empty()) {
+        return;
+    }
+
+    // Perform an additional directional wavefront integration round along the clearance-clamped
+    // `domain.targetDir` when hints are active so `\tau` converges tightly to the hinted slope.
+    runInteriorFastSweeping(domain, 1, /*useDirectionalGuidance=*/true);
 }
 
 // ============================================================================
@@ -1183,11 +1436,14 @@ EikonalSolveResult solveConstrainedEikonal(
     const std::size_t n = domain.coords.size();
     const float dx = static_cast<float>(domain.voxelSize);
 
-    // 1. Evaluate the gravity-aware "overhang" field and initialize bed contact seeds (\tau = 0) in parallel
+    // 1. Evaluate the gravity-aware "overhang" field and determine bed contact height along
+    // the queried nozzle axis in parallel
     notifyProgress(0.26f, "Evaluating overhang field & bed contact seeds...");
 
     const float interiorCutoff = 0.75f * dx;
     const float seedHeightCutoff = 1.50f * dx;
+
+    std::vector<float> axialProjections(n, std::numeric_limits<float>::max());
 
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, n, 512),
@@ -1207,53 +1463,30 @@ EikonalSolveResult solveConstrainedEikonal(
 
                 const bool insideOrBoundary = (domain.sdf[i] <= interiorCutoff);
                 domain.isInterior[i] = insideOrBoundary ? 1 : 0;
-
                 if (insideOrBoundary) {
-                    const std::array<float, 3> rel{pos[0], pos[1], pos[2] - objectMinZ};
-                    const float hAxial = dot3(rel, nozzleFrame.nozzle_axis);
-                    if (hAxial <= seedHeightCutoff) {
-                        domain.isSeed[i] = 1;
-                        domain.tau[i] = std::max(0.0f, hAxial);
-                    }
+                    axialProjections[i] = dot3(pos, nozzleFrame.nozzle_axis);
                 }
             }
         });
 
-    std::size_t seedCount = 0;
-    float minInteriorAxialHeight = std::numeric_limits<float>::max();
+    float minInteriorAxialProj = std::numeric_limits<float>::max();
     for (std::size_t i = 0; i < n; ++i) {
-        if (domain.isSeed[i]) {
-            ++seedCount;
-        }
         if (domain.isInterior[i]) {
-            const NozzleBasis nozzleFrame =
-                baseContext.backend.queryNozzleFrame(domain.posBed[i], {1.0f, 0.0f, 0.0f});
-            const std::array<float, 3> rel{
-                domain.posBed[i][0],
-                domain.posBed[i][1],
-                domain.posBed[i][2] - objectMinZ};
-            minInteriorAxialHeight =
-                std::min(minInteriorAxialHeight, dot3(rel, nozzleFrame.nozzle_axis));
+            minInteriorAxialProj = std::min(minInteriorAxialProj, axialProjections[i]);
         }
     }
+    if (minInteriorAxialProj < 0.5f * kInfinityTau) {
+        domain.minZBed = minInteriorAxialProj;
+    }
 
-    if (seedCount == 0 && minInteriorAxialHeight < 0.5f * kInfinityTau) {
-        for (std::size_t i = 0; i < n; ++i) {
-            if (!domain.isInterior[i]) {
-                continue;
-            }
-            const NozzleBasis nozzleFrame =
-                baseContext.backend.queryNozzleFrame(domain.posBed[i], {1.0f, 0.0f, 0.0f});
-            const std::array<float, 3> rel{
-                domain.posBed[i][0],
-                domain.posBed[i][1],
-                domain.posBed[i][2] - objectMinZ};
-            const float hAxial = dot3(rel, nozzleFrame.nozzle_axis);
-            if (hAxial <= minInteriorAxialHeight + seedHeightCutoff) {
-                domain.isSeed[i] = 1;
-                domain.tau[i] = std::max(0.0f, hAxial - minInteriorAxialHeight);
-                ++seedCount;
-            }
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!domain.isInterior[i]) {
+            continue;
+        }
+        const float hAxial = axialProjections[i] - domain.minZBed;
+        if (hAxial <= seedHeightCutoff) {
+            domain.isSeed[i] = 1;
+            domain.tau[i] = std::max(0.0f, hAxial);
         }
     }
 
@@ -1265,14 +1498,13 @@ EikonalSolveResult solveConstrainedEikonal(
     runInteriorFastSweeping(domain, 2, /*useDirectionalGuidance=*/false);
 
     ToolOrientationStrategy orientationStrategy;
-    std::vector<std::unique_ptr<EikonalConstraint>> constraints;
-    constraints.push_back(std::make_unique<OverhangIslandConstraint>());
-    constraints.push_back(std::make_unique<OrientationHintConstraint>());
-    constraints.push_back(std::make_unique<ToolClearanceConstraint>());
+    OverhangIslandConstraint overhangConstraint;
+    OrientationHintConstraint hintConstraint;
+    ToolClearanceConstraint clearanceConstraint;
 
     EikonalSolverContext iterCtx = baseContext;
     iterCtx.outerIteration = 0;
-    constraints[0]->enforceOnField(domain, iterCtx);
+    overhangConstraint.enforceOnField(domain, iterCtx);
 
     // 3. Step B: Outer Iterative Tool-Orientation & Constraint Relaxation Loop
     const std::uint32_t totalIters = std::clamp<std::uint32_t>(baseContext.totalIterations, 1, 16);
@@ -1286,30 +1518,38 @@ EikonalSolveResult solveConstrainedEikonal(
 
         const std::string msgOrient =
             "Iteration " + std::to_string(iter + 1) + "/" + std::to_string(totalIters) +
-            ": Updating 5/6-axis tool orientations...";
+            ": Evaluating orientation hints & 5/6-axis tool axes...";
         notifyProgress(iterBaseFrac, msgOrient.c_str());
 
+        // 3a. Initialize targetDir from \nabla \tau + overhang bias, then diffuse soft orientation hints
+        overhangConstraint.applyPreSweepModifiers(domain, iterCtx);
+        hintConstraint.applyPreSweepModifiers(domain, iterCtx);
+
+        // 3b. Update 5/6-axis tool orientation (clamped strictly to tool rotational angle limits)
         orientationStrategy.updateToolOrientations(domain, iterCtx);
 
-        for (const auto& c : constraints) {
-            c->applyPreSweepModifiers(domain, iterCtx);
-        }
+        // 3c. Strictly clamp targetDir (including any hints) to the tool's clearance cone
+        //     centered on the ACTUAL solved tool axis `domain.toolAxis[i]`
+        clearanceConstraint.applyPreSweepModifiers(domain, iterCtx);
 
         const std::string msgSweep =
             "Iteration " + std::to_string(iter + 1) + "/" + std::to_string(totalIters) +
-            ": Parallel Eikonal sweeping & clearance constraints...";
+            ": Parallel Eikonal sweeping & hard clearance enforcement...";
         notifyProgress(iterBaseFrac + 0.5f * iterSpan, msgSweep.c_str());
 
-        runInteriorFastSweeping(domain, 1, /*useDirectionalGuidance=*/true);
+        // 3d. Directional wavefront integration + soft hint refinement on \tau
+        runInteriorFastSweeping(domain, 2, /*useDirectionalGuidance=*/true);
+        hintConstraint.enforceOnField(domain, iterCtx);
 
-        for (const auto& c : constraints) {
-            c->enforceOnField(domain, iterCtx);
-        }
+        // 3e. Hard constraints always run last so soft hints can never violate clearance or causality
+        clearanceConstraint.enforceOnField(domain, iterCtx);
+        overhangConstraint.enforceOnField(domain, iterCtx);
     }
 
     notifyProgress(0.88f, "Finalizing tool orientations & anti-island causality...");
     orientationStrategy.updateToolOrientations(domain, iterCtx);
-    constraints[0]->enforceOnField(domain, iterCtx);
+    clearanceConstraint.enforceOnField(domain, iterCtx);
+    overhangConstraint.enforceOnField(domain, iterCtx);
 
     // 4. Smoothly extend \tau(x) into the exterior narrow band in parallel
     notifyProgress(0.92f, "Extending Eikonal field into exterior narrow band...");

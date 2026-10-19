@@ -351,6 +351,258 @@ pub fn ray_intersect_triangle(
     }
 }
 
+/// A selectable surface patch on a 3D object used for placing surface tangency/orthogonality hints:
+/// - For STEP B-Rep geometry (`has_brep == true`), corresponds to an exact `TopoDS_Face`.
+/// - For triangle meshes (`has_brep == false`), corresponds to a contiguous near-planar
+///   region of triangles segmented across shared edges by dihedral angle ($\le 15^\circ$).
+#[derive(Clone, Debug)]
+pub struct SurfacePatch {
+    pub patch_id: u32,
+    pub area: f32,
+    pub centroid: Vec3,
+    pub normal: Vec3,
+    /// Exterior boundary line segments `[v0, v1]` in local object coordinates for viewport highlighting.
+    pub boundary_edges: Vec<[Vec3; 2]>,
+    /// Distributed `(local_position, local_normal)` samples across the patch (up to 24 samples)
+    /// used to emit `SpatialOrientationHint` records into the C++ Eikonal solver.
+    pub sample_points: Vec<(Vec3, Vec3)>,
+}
+
+fn quantize_pos(p: Vec3) -> (i64, i64, i64) {
+    (
+        (p.x * 10_000.0).round() as i64,
+        (p.y * 10_000.0).round() as i64,
+        (p.z * 10_000.0).round() as i64,
+    )
+}
+
+fn canonical_edge_key(a: (i64, i64, i64), b: (i64, i64, i64)) -> ((i64, i64, i64), (i64, i64, i64)) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Builds selectable `SurfacePatch` regions and a per-triangle `triangle_to_patch` lookup table:
+/// - If `brep_face_ids` has one entry per triangle (`indices.len() / 3`), groups triangles by
+///   their exact STEP `TopoDS_Face` index.
+/// - Otherwise, segments the triangle mesh into contiguous near-planar regions via flood-fill
+///   across shared geometric edges (merging adjacent triangles within $15^\circ$).
+pub fn build_surface_patches(
+    vertices: &[RenderVertex],
+    indices: &[u32],
+    brep_face_ids: &[u32],
+) -> (Vec<SurfacePatch>, Vec<u32>) {
+    use std::collections::{HashMap, VecDeque};
+
+    let num_tris = indices.len() / 3;
+    if num_tris == 0 || vertices.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut tri_verts: Vec<[Vec3; 3]> = Vec::with_capacity(num_tris);
+    let mut tri_normals: Vec<Vec3> = Vec::with_capacity(num_tris);
+    let mut tri_areas: Vec<f32> = Vec::with_capacity(num_tris);
+    let mut tri_centroids: Vec<Vec3> = Vec::with_capacity(num_tris);
+
+    for t in 0..num_tris {
+        let i0 = indices[3 * t] as usize;
+        let i1 = indices[3 * t + 1] as usize;
+        let i2 = indices[3 * t + 2] as usize;
+        if i0 >= vertices.len() || i1 >= vertices.len() || i2 >= vertices.len() {
+            tri_verts.push([Vec3::ZERO; 3]);
+            tri_normals.push(Vec3::Z);
+            tri_areas.push(0.0);
+            tri_centroids.push(Vec3::ZERO);
+            continue;
+        }
+        let v0 = Vec3::new(vertices[i0].x, vertices[i0].y, vertices[i0].z);
+        let v1 = Vec3::new(vertices[i1].x, vertices[i1].y, vertices[i1].z);
+        let v2 = Vec3::new(vertices[i2].x, vertices[i2].y, vertices[i2].z);
+        let cross = (v1 - v0).cross(v2 - v0);
+        let area = 0.5 * cross.length();
+        let n = if area > 1e-8 {
+            (cross / (2.0 * area)).normalize_or_zero()
+        } else {
+            Vec3::new(vertices[i0].nx, vertices[i0].ny, vertices[i0].nz).normalize_or_zero()
+        };
+        tri_verts.push([v0, v1, v2]);
+        tri_normals.push(if n.length_squared() > 0.5 { n } else { Vec3::Z });
+        tri_areas.push(area);
+        tri_centroids.push((v0 + v1 + v2) / 3.0);
+    }
+
+    let mut triangle_to_patch = vec![u32::MAX; num_tris];
+    let mut num_patches = 0u32;
+
+    if brep_face_ids.len() == num_tris {
+        let mut raw_to_compact: HashMap<u32, u32> = HashMap::new();
+        for (t, &raw_fid) in brep_face_ids.iter().enumerate() {
+            let pid = *raw_to_compact.entry(raw_fid).or_insert_with(|| {
+                let id = num_patches;
+                num_patches += 1;
+                id
+            });
+            triangle_to_patch[t] = pid;
+        }
+    } else {
+        // Build edge-to-triangle adjacency using quantized 3D positions so both indexed
+        // and unindexed/STL triangle soups share topological edges.
+        type QuantEdge = ((i64, i64, i64), (i64, i64, i64));
+        let mut edge_to_tris: HashMap<QuantEdge, Vec<usize>> =
+            HashMap::with_capacity(num_tris * 2);
+
+        for (t, tv) in tri_verts.iter().enumerate() {
+            let q0 = quantize_pos(tv[0]);
+            let q1 = quantize_pos(tv[1]);
+            let q2 = quantize_pos(tv[2]);
+            for &(qa, qb) in &[(q0, q1), (q1, q2), (q2, q0)] {
+                if qa != qb {
+                    edge_to_tris
+                        .entry(canonical_edge_key(qa, qb))
+                        .or_default()
+                        .push(t);
+                }
+            }
+        }
+
+        let cos_edge_tol = 15.0_f32.to_radians().cos(); // ~0.9659
+        let cos_patch_tol = 20.0_f32.to_radians().cos(); // ~0.9397
+        let mut queue = VecDeque::new();
+
+        for seed_t in 0..num_tris {
+            if triangle_to_patch[seed_t] != u32::MAX {
+                continue;
+            }
+            let pid = num_patches;
+            num_patches += 1;
+            triangle_to_patch[seed_t] = pid;
+            queue.push_back(seed_t);
+
+            let mut running_normal_sum = tri_normals[seed_t] * tri_areas[seed_t].max(1e-6);
+
+            while let Some(curr_t) = queue.pop_front() {
+                let curr_n = tri_normals[curr_t];
+                let avg_n = running_normal_sum.normalize_or_zero();
+                let tv = &tri_verts[curr_t];
+                let q0 = quantize_pos(tv[0]);
+                let q1 = quantize_pos(tv[1]);
+                let q2 = quantize_pos(tv[2]);
+
+                for &(qa, qb) in &[(q0, q1), (q1, q2), (q2, q0)] {
+                    if qa == qb {
+                        continue;
+                    }
+                    if let Some(neighbors) = edge_to_tris.get(&canonical_edge_key(qa, qb)) {
+                        for &nb_t in neighbors {
+                            if triangle_to_patch[nb_t] != u32::MAX {
+                                continue;
+                            }
+                            let nb_n = tri_normals[nb_t];
+                            if nb_n.dot(curr_n) >= cos_edge_tol && nb_n.dot(avg_n) >= cos_patch_tol
+                            {
+                                triangle_to_patch[nb_t] = pid;
+                                running_normal_sum += nb_n * tri_areas[nb_t].max(1e-6);
+                                queue.push_back(nb_t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let patch_count = num_patches as usize;
+    let mut patch_tris: Vec<Vec<usize>> = vec![Vec::new(); patch_count];
+    for (t, &pid) in triangle_to_patch.iter().enumerate() {
+        if (pid as usize) < patch_count {
+            patch_tris[pid as usize].push(t);
+        }
+    }
+
+    let mut patches = Vec::with_capacity(patch_count);
+    for (pid, tris) in patch_tris.iter().enumerate() {
+        let mut total_area = 0.0_f32;
+        let mut weighted_centroid = Vec3::ZERO;
+        let mut weighted_normal = Vec3::ZERO;
+
+        type QuantEdge = ((i64, i64, i64), (i64, i64, i64));
+        let mut edge_counts: HashMap<QuantEdge, (u32, [Vec3; 2])> =
+            HashMap::with_capacity(tris.len() * 2);
+
+        for &t in tris {
+            let a = tri_areas[t].max(1e-7);
+            total_area += tri_areas[t];
+            weighted_centroid += a * tri_centroids[t];
+            weighted_normal += a * tri_normals[t];
+
+            let tv = &tri_verts[t];
+            for &(va, vb) in &[(tv[0], tv[1]), (tv[1], tv[2]), (tv[2], tv[0])] {
+                let qa = quantize_pos(va);
+                let qb = quantize_pos(vb);
+                if qa != qb {
+                    let key = canonical_edge_key(qa, qb);
+                    let entry = edge_counts.entry(key).or_insert((0, [va, vb]));
+                    entry.0 += 1;
+                }
+            }
+        }
+
+        let centroid = if total_area > 1e-6 {
+            weighted_centroid / total_area
+        } else if let Some(&first_t) = tris.first() {
+            tri_centroids[first_t]
+        } else {
+            Vec3::ZERO
+        };
+
+        let normal = weighted_normal.normalize_or_zero();
+        let normal = if normal.length_squared() > 0.5 {
+            normal
+        } else {
+            Vec3::Z
+        };
+
+        let mut boundary_edges: Vec<[Vec3; 2]> = edge_counts
+            .values()
+            .filter_map(|&(cnt, seg)| if cnt == 1 { Some(seg) } else { None })
+            .take(512)
+            .collect();
+
+        // If a closed surface (e.g. full cylinder B-Rep face) has no open boundary edges,
+        // include a sparse sample of triangle edges so hovering/selecting still highlights it.
+        if boundary_edges.is_empty() && !tris.is_empty() {
+            let step = (tris.len() / 48).max(1);
+            for &t in tris.iter().step_by(step).take(64) {
+                let tv = &tri_verts[t];
+                boundary_edges.push([tv[0], tv[1]]);
+            }
+        }
+
+        // Build up to 24 distributed (position, normal) samples across the patch
+        let mut sample_points = Vec::with_capacity(24);
+        sample_points.push((centroid, normal));
+        if !tris.is_empty() {
+            let step = (tris.len() / 23).max(1);
+            for &t in tris.iter().step_by(step).take(23) {
+                sample_points.push((tri_centroids[t], tri_normals[t]));
+            }
+        }
+
+        patches.push(SurfacePatch {
+            patch_id: pid as u32,
+            area: total_area,
+            centroid,
+            normal,
+            boundary_edges,
+            sample_points,
+        });
+    }
+
+    (patches, triangle_to_patch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +641,34 @@ mod tests {
             let aligned_normal = rot * face.normal;
             assert!((aligned_normal - Vec3::NEG_Z).length() < 1e-3);
         }
+    }
+
+    #[test]
+    fn test_surface_patch_segmentation_for_mesh_and_brep() {
+        // Create two orthogonal quads (each 2 triangles): one on Z=0 (normal -Z), one on X=0 (normal -X)
+        let verts = vec![
+            RenderVertex { x: 0.0, y: 0.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+            RenderVertex { x: 10.0, y: 0.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+            RenderVertex { x: 10.0, y: 10.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+            RenderVertex { x: 0.0, y: 10.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+            RenderVertex { x: 0.0, y: 0.0, z: 10.0, nx: -1.0, ny: 0.0, nz: 0.0 },
+            RenderVertex { x: 0.0, y: 10.0, z: 10.0, nx: -1.0, ny: 0.0, nz: 0.0 },
+        ];
+        let indices = vec![
+            0, 2, 1, 0, 3, 2, // Quad 1 (Z=0 plane, 2 triangles)
+            0, 4, 5, 0, 5, 3, // Quad 2 (X=0 plane, 2 triangles)
+        ];
+
+        // 1. Mesh mode (empty brep_face_ids) should segment into 2 near-planar contiguous patches
+        let (mesh_patches, tri_map) = build_surface_patches(&verts, &indices, &[]);
+        assert_eq!(mesh_patches.len(), 2);
+        assert_eq!(tri_map[0], tri_map[1]);
+        assert_eq!(tri_map[2], tri_map[3]);
+        assert_ne!(tri_map[0], tri_map[2]);
+
+        // 2. B-Rep mode with explicit STEP face IDs
+        let (brep_patches, brep_map) = build_surface_patches(&verts, &indices, &[10, 10, 20, 20]);
+        assert_eq!(brep_patches.len(), 2);
+        assert_eq!(brep_map, vec![0, 0, 1, 1]);
     }
 }

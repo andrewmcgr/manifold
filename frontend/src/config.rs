@@ -131,7 +131,7 @@ impl ToolConfig {
             name: name.into(),
             nozzle_diameter_mm,
             temperature_celsius,
-            has_rotational_axes: id > 0,
+            has_rotational_axes: true,
             max_angle_from_bed_normal_deg: 45.0,
             clearance_profile_xz: vec![
                 ClearancePointXZ::new(tip_outer_r, 0.0),
@@ -284,7 +284,59 @@ impl Default for SlicingProcessConfig {
     }
 }
 
-/// OpenVDB volumetric Eikonal and SDF field parameters.
+/// Mode for a surface-face orientation hint selected on a STEP B-Rep face or near-planar mesh patch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SurfaceHintMode {
+    /// Suggests isosurface normal $\nabla \tau$ orthogonal to the selected face
+    /// ($\nabla \tau \parallel \pm \hat{\mathbf{n}}_{\text{face}}$), making layers tangent/conformal to the surface.
+    #[default]
+    NormalOrthogonalToSurface,
+    /// Suggests isosurface normal $\nabla \tau$ tangent to the selected face
+    /// ($\nabla \tau \perp \hat{\mathbf{n}}_{\text{face}}$), making layers meet the surface orthogonally ($90^\circ$).
+    NormalTangentToSurface,
+}
+
+impl SurfaceHintMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NormalOrthogonalToSurface => "Normal ⊥ Surface (Conformal Layers)",
+            Self::NormalTangentToSurface => "Normal ∥ Surface (⊥ Layers)",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::NormalOrthogonalToSurface => "⊥ Normal",
+            Self::NormalTangentToSurface => "∥ Normal",
+        }
+    }
+}
+
+/// A soft orientation hint assigned to a selectable `SurfacePatch` on an object.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceFaceHint {
+    pub object_id: u64,
+    pub patch_id: u32,
+    pub mode: SurfaceHintMode,
+    pub influence_depth_mm: f32,
+    pub weight: f32,
+}
+
+/// A soft orientation hint placed at a 3D point in space (stored in object-local coordinates
+/// so it follows the object if moved/rotated on the build plate).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PointNormalHint {
+    pub id: u32,
+    pub object_id: u64,
+    /// Position in the object's local coordinate frame (mm).
+    pub local_position: [f32; 3],
+    /// Desired unit normal direction $\hat{\mathbf{d}}$ for $\nabla \tau$ in the object's local coordinate frame.
+    pub local_direction: [f32; 3],
+    pub influence_radius_mm: f32,
+    pub weight: f32,
+}
+
+/// OpenVDB volumetric Eikonal and SDF field parameters and soft orientation hints.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EikonalFieldConfig {
@@ -293,6 +345,16 @@ pub struct EikonalFieldConfig {
     pub curvature_regularization: f32,
     /// Number of outer constraint & tool-orientation relaxation iterations (`>= 1`).
     pub solver_iterations: u32,
+    /// Default interior influence depth (mm) for newly placed surface-face hints.
+    pub default_surface_hint_depth_mm: f32,
+    /// Default spherical influence radius (mm) for newly placed 3D point hints.
+    pub default_point_hint_radius_mm: f32,
+    /// Default soft blend weight (`0.0..=1.0`) for newly placed hints.
+    pub default_hint_weight: f32,
+    /// Active surface-face hints placed on STEP B-Rep faces or contiguous planar mesh patches.
+    pub surface_hints: Vec<SurfaceFaceHint>,
+    /// Active 3D point normal hints placed in space.
+    pub point_hints: Vec<PointNormalHint>,
 }
 
 impl Default for EikonalFieldConfig {
@@ -302,6 +364,11 @@ impl Default for EikonalFieldConfig {
             narrow_band_width_voxels: 6,
             curvature_regularization: 0.05,
             solver_iterations: 4,
+            default_surface_hint_depth_mm: 12.0,
+            default_point_hint_radius_mm: 18.0,
+            default_hint_weight: 0.85,
+            surface_hints: Vec::new(),
+            point_hints: Vec::new(),
         }
     }
 }

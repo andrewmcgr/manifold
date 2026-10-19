@@ -10,9 +10,12 @@ use wgpu::util::DeviceExt;
 
 use crate::arrange::{auto_arrange_spiral, ArrangeItem};
 use crate::bridge::ffi::{self, RenderVertex};
-use crate::config::{BedShape, SlicerConfig};
+use crate::config::{
+    BedShape, PointNormalHint, SlicerConfig, SurfaceFaceHint, SurfaceHintMode,
+};
+use crate::field_vis::SliceAxis;
 use crate::hull::{
-    ray_intersect_triangle, rotation_to_place_face_on_bed, SimplifiedConvexHull,
+    ray_intersect_triangle, rotation_to_place_face_on_bed, SimplifiedConvexHull, SurfacePatch,
 };
 use crate::io::{LoadedBatchReport, LoadedObjectData};
 
@@ -24,6 +27,12 @@ pub enum ToolMode {
     MoveOnBed,
     Rotate,
     PlaceOnFace,
+    /// Select STEP B-Rep faces or contiguous planar mesh patches to suggest $\nabla \tau \parallel \pm \hat{\mathbf{n}}_{\text{face}}$ (isosurfaces conformal/tangent to the face).
+    SurfaceHintOrthogonal,
+    /// Select STEP B-Rep faces or contiguous planar mesh patches to suggest $\nabla \tau \perp \hat{\mathbf{n}}_{\text{face}}$ (isosurfaces orthogonal to the face).
+    SurfaceHintTangent,
+    /// Place & orient 3D point normal hints in space (on the active 2D slice plane or object surface).
+    PointHint,
 }
 
 impl ToolMode {
@@ -33,6 +42,9 @@ impl ToolMode {
             Self::MoveOnBed => "Move on Bed (XY)",
             Self::Rotate => "Rotate / Orient",
             Self::PlaceOnFace => "Place on Face (Hull)",
+            Self::SurfaceHintOrthogonal => "Hint: Face ⊥ Normal (Conformal)",
+            Self::SurfaceHintTangent => "Hint: Face ∥ Normal (⊥ Layers)",
+            Self::PointHint => "Hint: 3D Point Normal",
         }
     }
 }
@@ -76,6 +88,8 @@ pub struct SceneObject {
     pub local_min: Vec3,
     pub local_max: Vec3,
     pub hull: SimplifiedConvexHull,
+    pub surface_patches: Vec<SurfacePatch>,
+    pub triangle_to_patch: Vec<u32>,
     pub vertex_buffer: Option<wgpu::Buffer>,
     pub index_buffer: Option<wgpu::Buffer>,
     pub visible: bool,
@@ -115,6 +129,17 @@ impl SceneObject {
 
     /// Raycasts a world-space ray against this object's triangle mesh.
     pub fn raycast_mesh(&self, transform: &Transform, ray: Ray3d) -> Option<f32> {
+        self.raycast_surface_patch(transform, ray)
+            .map(|(_, _, _, world_dist)| world_dist)
+    }
+
+    /// Raycasts a world-space ray against this object's triangle mesh, returning
+    /// `(patch_id, local_hit_point, local_hit_normal, world_distance)`.
+    pub fn raycast_surface_patch(
+        &self,
+        transform: &Transform,
+        ray: Ray3d,
+    ) -> Option<(u32, Vec3, Vec3, f32)> {
         let (aabb_min, aabb_max) = self.compute_world_aabb(transform);
         if !ray_intersects_aabb(ray, aabb_min, aabb_max) {
             return None;
@@ -128,8 +153,8 @@ impl SceneObject {
             return None;
         }
 
-        let mut best_local_t: Option<f32> = None;
-        for tri in self.indices.chunks_exact(3) {
+        let mut best_hit: Option<(usize, f32, Vec3)> = None;
+        for (tri_idx, tri) in self.indices.chunks_exact(3).enumerate() {
             let i0 = tri[0] as usize;
             let i1 = tri[1] as usize;
             let i2 = tri[2] as usize;
@@ -139,23 +164,32 @@ impl SceneObject {
             let v0 = &self.vertices[i0];
             let v1 = &self.vertices[i1];
             let v2 = &self.vertices[i2];
-            if let Some(t) = ray_intersect_triangle(
-                local_origin,
-                local_dir,
-                Vec3::new(v0.x, v0.y, v0.z),
-                Vec3::new(v1.x, v1.y, v1.z),
-                Vec3::new(v2.x, v2.y, v2.z),
-            ) {
-                if best_local_t.map_or(true, |best| t < best) {
-                    best_local_t = Some(t);
+            let p0 = Vec3::new(v0.x, v0.y, v0.z);
+            let p1 = Vec3::new(v1.x, v1.y, v1.z);
+            let p2 = Vec3::new(v2.x, v2.y, v2.z);
+            if let Some(t) = ray_intersect_triangle(local_origin, local_dir, p0, p1, p2) {
+                if best_hit.map_or(true, |(_, best_t, _)| t < best_t) {
+                    let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+                    best_hit = Some((tri_idx, t, n));
                 }
             }
         }
 
-        best_local_t.map(|t| {
+        best_hit.map(|(tri_idx, t, tri_normal)| {
+            let patch_id = self
+                .triangle_to_patch
+                .get(tri_idx)
+                .copied()
+                .unwrap_or(0);
+            let patch_normal = self
+                .surface_patches
+                .get(patch_id as usize)
+                .map(|p| p.normal)
+                .unwrap_or(tri_normal);
             let local_hit = local_origin + local_dir * t;
             let world_hit = transform.transform_point(local_hit);
-            ray.origin.distance(world_hit)
+            let world_dist = ray.origin.distance(world_hit);
+            (patch_id, local_hit, patch_normal, world_dist)
         })
     }
 }
@@ -175,6 +209,13 @@ pub struct BuildPlateState {
     pub selected_object_id: Option<u64>,
     pub tool_mode: ToolMode,
     pub hovered_hull_face: Option<usize>,
+    pub hovered_surface_patch: Option<u32>,
+    pub hovered_point_preview: Option<(Vec3, Vec3)>,
+    pub selected_surface_hint_patch: Option<u32>,
+    pub selected_point_hint_id: Option<u32>,
+    pub ui_hovered_surface_hint_patch: Option<u32>,
+    pub ui_hovered_point_hint_id: Option<u32>,
+    pub is_dragging_point_hint_dir: bool,
     pub is_dragging_object: bool,
     pub drag_offset_xy: Vec2,
     pub status_message: String,
@@ -293,6 +334,8 @@ pub fn spawn_loaded_objects(
             local_min: data.local_min,
             local_max: data.local_max,
             hull: data.hull,
+            surface_patches: data.surface_patches,
+            triangle_to_patch: data.triangle_to_patch,
             vertex_buffer,
             index_buffer,
             visible: true,
@@ -323,6 +366,8 @@ pub fn remove_object_from_plate(
             plate.selected_object_id = plate.objects.last().map(|o| o.object_id);
         }
         plate.hovered_hull_face = None;
+        plate.hovered_surface_patch = None;
+        plate.hovered_point_preview = None;
         plate.status_message = format!("Removed object '{}' (ID {object_id}).", removed.name);
     }
 }
@@ -443,7 +488,9 @@ pub fn update_selection_materials_system(
 /// - Dragging selected object on the XY bed (`ToolMode::MoveOnBed`)
 /// - Interactive object rotation (`ToolMode::Rotate`)
 /// - Hovering and clicking a $\le 27$-face convex hull facet (`ToolMode::PlaceOnFace`)
-/// - Camera orbit / pan / zoom when not dragging an object
+/// - Hovering and toggling surface-face hints (`ToolMode::SurfaceHintOrthogonal`, `ToolMode::SurfaceHintTangent`)
+/// - Placing and interactively aiming 3D point normal hints (`ToolMode::PointHint`)
+/// - Camera orbit / pan / zoom when not dragging an object or gizmo
 #[allow(clippy::too_many_arguments)]
 pub fn viewport_interaction_system(
     mut contexts: EguiContexts,
@@ -452,6 +499,8 @@ pub fn viewport_interaction_system(
     mut mouse_motion: EventReader<MouseMotion>,
     mut mouse_wheel: EventReader<MouseWheel>,
     mut plate: ResMut<BuildPlateState>,
+    mut config: ResMut<SlicerConfig>,
+    vis_state: Res<crate::field_vis::FieldVisualizationState>,
     mut camera_query: Query<(&Camera, &GlobalTransform, &mut OrbitCamera, &mut Transform), Without<CadObjectEntity>>,
     mut object_transforms: Query<&mut Transform, With<CadObjectEntity>>,
 ) {
@@ -460,8 +509,11 @@ pub fn viewport_interaction_system(
         mouse_motion.clear();
         mouse_wheel.clear();
         plate.hovered_hull_face = None;
+        plate.hovered_surface_patch = None;
+        plate.hovered_point_preview = None;
         if mouse_buttons.just_released(MouseButton::Left) {
             plate.is_dragging_object = false;
+            plate.is_dragging_point_hint_dir = false;
         }
         return;
     }
@@ -477,47 +529,202 @@ pub fn viewport_interaction_system(
         .cursor_position()
         .and_then(|pos| camera.viewport_to_world(cam_global, pos));
 
-    // 1. Update hovered convex hull face when in `PlaceOnFace` mode
+    // 1. Update hover states for `PlaceOnFace`, `SurfaceHint*`, and `PointHint`
     plate.hovered_hull_face = None;
-    if plate.tool_mode == ToolMode::PlaceOnFace {
-        if let (Some(ray), Some(sel_id)) = (cursor_ray, plate.selected_object_id) {
-            if let Some(obj) = plate.objects.iter().find(|o| o.object_id == sel_id) {
-                if let Ok(obj_tf) = object_transforms.get(obj.entity) {
-                    if let Some((face_idx, _)) = obj.hull.raycast(obj_tf, ray) {
-                        plate.hovered_hull_face = Some(face_idx);
+    plate.hovered_surface_patch = None;
+    plate.hovered_point_preview = None;
+
+    if let (Some(ray), Some(sel_id)) = (cursor_ray, plate.selected_object_id) {
+        if let Some(obj) = plate.objects.iter().find(|o| o.object_id == sel_id) {
+            if let Ok(obj_tf) = object_transforms.get(obj.entity) {
+                match plate.tool_mode {
+                    ToolMode::PlaceOnFace => {
+                        if let Some((face_idx, _)) = obj.hull.raycast(obj_tf, ray) {
+                            plate.hovered_hull_face = Some(face_idx);
+                        }
                     }
+                    ToolMode::SurfaceHintOrthogonal | ToolMode::SurfaceHintTangent => {
+                        if let Some((patch_id, _, _, _)) = obj.raycast_surface_patch(obj_tf, ray) {
+                            plate.hovered_surface_patch = Some(patch_id);
+                        }
+                    }
+                    ToolMode::PointHint => {
+                        if !plate.is_dragging_point_hint_dir {
+                            if let Some((local_pt, local_dir)) =
+                                compute_point_hint_placement(obj, obj_tf, &vis_state, ray)
+                            {
+                                let world_pt = obj_tf.transform_point(local_pt);
+                                let world_dir =
+                                    (obj_tf.rotation * local_dir).normalize_or_zero();
+                                plate.hovered_point_preview = Some((world_pt, world_dir));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     }
 
-    // 2. Handle Left Mouse Button press: hull face placement, object picking, or starting bed drag
+    // 2. Handle Left Mouse Button press
     if mouse_buttons.just_pressed(MouseButton::Left) {
-        if plate.tool_mode == ToolMode::PlaceOnFace {
-            if let (Some(face_idx), Some(sel_id)) =
-                (plate.hovered_hull_face, plate.selected_object_id)
-            {
-                if let Some(obj) = plate.objects.iter().find(|o| o.object_id == sel_id) {
-                    if let Some(face) = obj.hull.faces.get(face_idx) {
-                        let face_normal = face.normal;
-                        let face_area = face.area;
-                        let obj_name = obj.name.clone();
-                        if let Ok(mut obj_tf) = object_transforms.get_mut(obj.entity) {
-                            obj_tf.rotation =
-                                rotation_to_place_face_on_bed(obj_tf.rotation, face_normal);
-                            snap_object_to_bed(obj, &mut obj_tf);
-                            plate.status_message = format!(
-                                "Placed '{}' on hull face #{} (area {:.1} mm²).",
-                                obj_name,
-                                face_idx + 1,
-                                face_area
-                            );
-                            mouse_motion.clear();
-                            return;
+        match plate.tool_mode {
+            ToolMode::PlaceOnFace => {
+                if let (Some(face_idx), Some(sel_id)) =
+                    (plate.hovered_hull_face, plate.selected_object_id)
+                {
+                    if let Some(obj) = plate.objects.iter().find(|o| o.object_id == sel_id) {
+                        if let Some(face) = obj.hull.faces.get(face_idx) {
+                            let face_normal = face.normal;
+                            let face_area = face.area;
+                            let obj_name = obj.name.clone();
+                            if let Ok(mut obj_tf) = object_transforms.get_mut(obj.entity) {
+                                obj_tf.rotation =
+                                    rotation_to_place_face_on_bed(obj_tf.rotation, face_normal);
+                                snap_object_to_bed(obj, &mut obj_tf);
+                                plate.status_message = format!(
+                                    "Placed '{}' on hull face #{} (area {:.1} mm²).",
+                                    obj_name,
+                                    face_idx + 1,
+                                    face_area
+                                );
+                                mouse_motion.clear();
+                                return;
+                            }
                         }
                     }
                 }
             }
+            ToolMode::SurfaceHintOrthogonal | ToolMode::SurfaceHintTangent => {
+                if let (Some(patch_id), Some(sel_id)) =
+                    (plate.hovered_surface_patch, plate.selected_object_id)
+                {
+                    let target_mode = if plate.tool_mode == ToolMode::SurfaceHintOrthogonal {
+                        SurfaceHintMode::NormalOrthogonalToSurface
+                    } else {
+                        SurfaceHintMode::NormalTangentToSurface
+                    };
+                    let depth_mm = config.eikonal.default_surface_hint_depth_mm;
+                    let weight = config.eikonal.default_hint_weight;
+
+                    if let Some(existing_pos) = config
+                        .eikonal
+                        .surface_hints
+                        .iter()
+                        .position(|h| h.object_id == sel_id && h.patch_id == patch_id)
+                    {
+                        if config.eikonal.surface_hints[existing_pos].mode == target_mode {
+                            config.eikonal.surface_hints.remove(existing_pos);
+                            if plate.selected_surface_hint_patch == Some(patch_id) {
+                                plate.selected_surface_hint_patch = None;
+                            }
+                            plate.status_message = format!(
+                                "Removed surface orientation hint on patch #{patch_id}."
+                            );
+                        } else {
+                            config.eikonal.surface_hints[existing_pos].mode = target_mode;
+                            plate.selected_surface_hint_patch = Some(patch_id);
+                            plate.status_message = format!(
+                                "Switched patch #{patch_id} hint to '{}'.",
+                                target_mode.label()
+                            );
+                        }
+                    } else {
+                        config.eikonal.surface_hints.push(SurfaceFaceHint {
+                            object_id: sel_id,
+                            patch_id,
+                            mode: target_mode,
+                            influence_depth_mm: depth_mm,
+                            weight,
+                        });
+                        plate.selected_surface_hint_patch = Some(patch_id);
+                        plate.status_message = format!(
+                            "Added '{}' hint on patch #{patch_id} (depth {:.1} mm).",
+                            target_mode.label(),
+                            depth_mm
+                        );
+                    }
+                    mouse_motion.clear();
+                    return;
+                }
+            }
+            ToolMode::PointHint => {
+                if let (Some(ray), Some(sel_id)) = (cursor_ray, plate.selected_object_id) {
+                    if let Some(obj) = plate.objects.iter().find(|o| o.object_id == sel_id) {
+                        if let Ok(obj_tf) = object_transforms.get(obj.entity) {
+                            // 2a. First check if the user clicked near an existing 3D point hint's base sphere
+                            // (or arrow tip if that point hint is currently selected and its arrow is visible)
+                            const ARROW_LEN_MM: f32 = 16.0;
+                            let mut hit_existing_id: Option<u32> = None;
+                            let mut best_ray_dist = 4.5_f32;
+                            for h in config
+                                .eikonal
+                                .point_hints
+                                .iter()
+                                .filter(|h| h.object_id == sel_id)
+                            {
+                                let w_base = obj_tf.transform_point(Vec3::from(h.local_position));
+                                let d_base = ray_point_distance(ray, w_base);
+                                let d = if plate.selected_point_hint_id == Some(h.id) {
+                                    let w_dir = (obj_tf.rotation * Vec3::from(h.local_direction))
+                                        .normalize_or_zero();
+                                    let w_tip = w_base + w_dir * ARROW_LEN_MM;
+                                    d_base.min(ray_point_distance(ray, w_tip))
+                                } else {
+                                    d_base
+                                };
+                                if d < best_ray_dist {
+                                    best_ray_dist = d;
+                                    hit_existing_id = Some(h.id);
+                                }
+                            }
+
+                            if let Some(hid) = hit_existing_id {
+                                plate.selected_point_hint_id = Some(hid);
+                                plate.is_dragging_point_hint_dir = true;
+                                plate.status_message = format!(
+                                    "Selected 3D point hint #{hid} — drag in viewport to aim normal direction."
+                                );
+                                mouse_motion.clear();
+                                return;
+                            }
+
+                            // 2b. Otherwise, place a new 3D point hint on the active 2D slice plane or object surface
+                            if let Some((local_pt, local_dir)) =
+                                compute_point_hint_placement(obj, obj_tf, &vis_state, ray)
+                            {
+                                let next_id = config
+                                    .eikonal
+                                    .point_hints
+                                    .iter()
+                                    .map(|h| h.id)
+                                    .max()
+                                    .unwrap_or(0)
+                                    + 1;
+                                let radius = config.eikonal.default_point_hint_radius_mm;
+                                let weight = config.eikonal.default_hint_weight;
+                                config.eikonal.point_hints.push(PointNormalHint {
+                                    id: next_id,
+                                    object_id: sel_id,
+                                    local_position: local_pt.to_array(),
+                                    local_direction: local_dir.to_array(),
+                                    influence_radius_mm: radius,
+                                    weight,
+                                });
+                                plate.selected_point_hint_id = Some(next_id);
+                                plate.is_dragging_point_hint_dir = true;
+                                plate.status_message = format!(
+                                    "Placed 3D point hint #{next_id} at ({:.1}, {:.1}, {:.1}) — drag to aim normal vector.",
+                                    local_pt.x, local_pt.y, local_pt.z
+                                );
+                                mouse_motion.clear();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
 
         // Raycast against all visible objects to select the closest hit
@@ -556,6 +763,7 @@ pub fn viewport_interaction_system(
 
     if mouse_buttons.just_released(MouseButton::Left) {
         plate.is_dragging_object = false;
+        plate.is_dragging_point_hint_dir = false;
     }
 
     let mut delta_drag = Vec2::ZERO;
@@ -568,7 +776,65 @@ pub fn viewport_interaction_system(
         scroll += ev.y;
     }
 
-    // 3. Active object manipulation when dragging in MoveOnBed or Rotate mode
+    // 3a. Interactive aiming of the selected 3D point hint's normal direction vector
+    if plate.is_dragging_point_hint_dir && mouse_buttons.pressed(MouseButton::Left) {
+        if delta_drag != Vec2::ZERO {
+            if let (Some(sel_id), Some(hid)) =
+                (plate.selected_object_id, plate.selected_point_hint_id)
+            {
+                if let Some(obj) = plate.objects.iter().find(|o| o.object_id == sel_id) {
+                    if let Ok(obj_tf) = object_transforms.get(obj.entity) {
+                        if let Some(hint) = config
+                            .eikonal
+                            .point_hints
+                            .iter_mut()
+                            .find(|h| h.object_id == sel_id && h.id == hid)
+                        {
+                            // First try aiming the 3D arrow directly toward the cursor ray's projection
+                            // on the camera-parallel plane passing through the hint's world position
+                            let w_base = obj_tf.transform_point(Vec3::from(hint.local_position));
+                            let cam_fwd = *cam_transform.forward();
+                            let mut updated = false;
+                            if let Some(ray) = cursor_ray {
+                                if let Some(plane_hit) =
+                                    intersect_ray_plane(ray, w_base, cam_fwd)
+                                {
+                                    let offset = plane_hit - w_base;
+                                    if offset.length() > 1.5 {
+                                        let new_world_dir = offset.normalize();
+                                        let new_local_dir = (obj_tf.rotation.inverse()
+                                            * new_world_dir)
+                                            .normalize_or_zero();
+                                        if new_local_dir.length_squared() > 0.5 {
+                                            hint.local_direction = new_local_dir.to_array();
+                                            updated = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if !updated {
+                                let right = *cam_transform.right();
+                                let up = *cam_transform.up();
+                                let w_dir = (obj_tf.rotation * Vec3::from(hint.local_direction))
+                                    .normalize_or_zero();
+                                let rot_yaw = Quat::from_axis_angle(up, delta_drag.x * 0.012);
+                                let rot_pitch = Quat::from_axis_angle(right, -delta_drag.y * 0.012);
+                                let new_world_dir = (rot_yaw * rot_pitch * w_dir).normalize_or_zero();
+                                let new_local_dir =
+                                    (obj_tf.rotation.inverse() * new_world_dir).normalize_or_zero();
+                                if new_local_dir.length_squared() > 0.5 {
+                                    hint.local_direction = new_local_dir.to_array();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // 3b. Active object manipulation when dragging in MoveOnBed or Rotate mode
     if plate.is_dragging_object && mouse_buttons.pressed(MouseButton::Left) {
         if let Some(sel_id) = plate.selected_object_id {
             match plate.tool_mode {
@@ -632,6 +898,72 @@ pub fn viewport_interaction_system(
     *cam_transform = Transform::from_translation(eye).looking_at(orbit.focus, Vec3::Z);
 }
 
+/// Computes the local-space `(position, initial_normal)` for placing a 3D point hint:
+/// 1. If the 2D cross-section slice plane is active and the cursor ray intersects it inside
+///    the object's local bounding box, places the point directly on the 2D slice plane.
+/// 2. Otherwise, raycasts the object's surface mesh and places the point slightly inside
+///    the surface (`1.5 mm` inward along `-normal`).
+fn compute_point_hint_placement(
+    obj: &SceneObject,
+    obj_tf: &Transform,
+    vis_state: &crate::field_vis::FieldVisualizationState,
+    ray: Ray3d,
+) -> Option<(Vec3, Vec3)> {
+    let inv_mat = obj_tf.compute_matrix().inverse();
+    let local_origin = inv_mat.transform_point3(ray.origin);
+    let local_dir = inv_mat.transform_vector3(*ray.direction).normalize_or_zero();
+    if local_dir.length_squared() < 1e-6 {
+        return None;
+    }
+
+    // Priority 1: Active 2D Cross-Section Slice Plane
+    if vis_state.show_slice_plane {
+        let t = vis_state.slice_normalized_pos.clamp(0.0, 1.0);
+        let (plane_normal, plane_coord) = match vis_state.slice_axis {
+            SliceAxis::X => (Vec3::X, obj.local_min.x + t * (obj.local_max.x - obj.local_min.x)),
+            SliceAxis::Y => (Vec3::Y, obj.local_min.y + t * (obj.local_max.y - obj.local_min.y)),
+            SliceAxis::Z => (Vec3::Z, obj.local_min.z + t * (obj.local_max.z - obj.local_min.z)),
+        };
+        let denom = local_dir.dot(plane_normal);
+        if denom.abs() > 1e-5 {
+            let dist = (plane_coord - local_origin.dot(plane_normal)) / denom;
+            if dist > 0.0 {
+                let hit = local_origin + local_dir * dist;
+                let margin = 2.0_f32;
+                if hit.x >= obj.local_min.x - margin
+                    && hit.x <= obj.local_max.x + margin
+                    && hit.y >= obj.local_min.y - margin
+                    && hit.y <= obj.local_max.y + margin
+                    && hit.z >= obj.local_min.z - margin
+                    && hit.z <= obj.local_max.z + margin
+                {
+                    let up_local = (obj_tf.rotation.inverse() * Vec3::Z).normalize_or_zero();
+                    let default_dir = if up_local.length_squared() > 0.5 {
+                        up_local
+                    } else {
+                        Vec3::Z
+                    };
+                    return Some((hit, default_dir));
+                }
+            }
+        }
+    }
+
+    // Priority 2: Object surface mesh hit (inset slightly into the interior)
+    if let Some((_, local_hit, local_normal, _)) = obj.raycast_surface_patch(obj_tf, ray) {
+        let inset_pt = local_hit - local_normal * 1.5;
+        let up_local = (obj_tf.rotation.inverse() * Vec3::Z).normalize_or_zero();
+        let dir = if local_normal.dot(up_local) >= -0.1 {
+            local_normal
+        } else {
+            -local_normal
+        };
+        return Some((inset_pt, dir.normalize_or_zero()));
+    }
+
+    None
+}
+
 pub fn compute_orbit_eye(orbit: &OrbitCamera) -> Vec3 {
     let cos_pitch = orbit.pitch.cos();
     let offset = Vec3::new(
@@ -643,7 +975,8 @@ pub fn compute_orbit_eye(orbit: &OrbitCamera) -> Vec3 {
 }
 
 /// Draws the configured print bed grid, build volume box, selection bounding box,
-/// and (when in `PlaceOnFace` mode) the $\le 27$-face simplified convex hull overlay.
+/// $\le 27$-face simplified convex hull overlay (`PlaceOnFace`), selectable B-Rep / planar
+/// mesh surface patches (`SurfaceHint*`), and 3D point normal hint gizmos (`PointHint`).
 pub fn draw_viewport_gizmos_system(
     mut gizmos: Gizmos,
     config: Res<SlicerConfig>,
@@ -808,7 +1141,6 @@ pub fn draw_viewport_gizmos_system(
                 }
                 gizmos.linestrip(ring, profile_color);
             }
-            // Draw 4 meridional generator lines (+/- X_travel and +/- Y_lateral) in the nozzle frame
             for dir_2d in [
                 Vec2::new(1.0, 0.0),
                 Vec2::new(-1.0, 0.0),
@@ -836,7 +1168,7 @@ pub fn draw_viewport_gizmos_system(
         }
     }
 
-    // Selected object gizmos & <=27-face simplified convex hull overlay
+    // Selected object gizmos & overlays
     let Some(sel_id) = plate.selected_object_id else {
         return;
     };
@@ -884,6 +1216,168 @@ pub fn draw_viewport_gizmos_system(
         let sel_color = Color::srgba(0.98, 0.78, 0.22, 0.75);
         draw_aabb_wireframe(&mut gizmos, min_p, max_p, sel_color);
     }
+
+    // --- Render Active & Hovered Surface-Face Orientation Hints ---
+    for sh in config
+        .eikonal
+        .surface_hints
+        .iter()
+        .filter(|h| h.object_id == sel_id)
+    {
+        if let Some(patch) = obj.surface_patches.get(sh.patch_id as usize) {
+            let is_selected = plate.selected_surface_hint_patch == Some(sh.patch_id);
+            let is_ui_hovered = plate.ui_hovered_surface_hint_patch == Some(sh.patch_id);
+            let is_vp_hovered = matches!(
+                plate.tool_mode,
+                ToolMode::SurfaceHintOrthogonal | ToolMode::SurfaceHintTangent
+            ) && plate.hovered_surface_patch == Some(sh.patch_id);
+            let show_arrows = is_selected || is_ui_hovered || is_vp_hovered;
+
+            let color = if is_ui_hovered {
+                Color::srgb(1.0, 0.92, 0.20)
+            } else if is_selected {
+                match sh.mode {
+                    SurfaceHintMode::NormalOrthogonalToSurface => Color::srgb(0.15, 0.95, 0.98),
+                    SurfaceHintMode::NormalTangentToSurface => Color::srgb(1.0, 0.42, 0.85),
+                }
+            } else {
+                match sh.mode {
+                    SurfaceHintMode::NormalOrthogonalToSurface => {
+                        Color::srgba(0.15, 0.95, 0.98, 0.55)
+                    }
+                    SurfaceHintMode::NormalTangentToSurface => Color::srgba(1.0, 0.42, 0.85, 0.55),
+                }
+            };
+
+            draw_surface_patch_gizmo(
+                &mut gizmos,
+                patch,
+                obj_tf,
+                color,
+                if show_arrows { Some(sh.mode) } else { None },
+            );
+            if is_ui_hovered {
+                let w_center = obj_tf.transform_point(patch.centroid);
+                gizmos.sphere(w_center, Quat::IDENTITY, 1.8, color);
+            }
+        }
+    }
+
+    if matches!(
+        plate.tool_mode,
+        ToolMode::SurfaceHintOrthogonal | ToolMode::SurfaceHintTangent
+    ) {
+        if let Some(hovered_pid) = plate.hovered_surface_patch {
+            if let Some(patch) = obj.surface_patches.get(hovered_pid as usize) {
+                let preview_mode = if plate.tool_mode == ToolMode::SurfaceHintOrthogonal {
+                    SurfaceHintMode::NormalOrthogonalToSurface
+                } else {
+                    SurfaceHintMode::NormalTangentToSurface
+                };
+                draw_surface_patch_gizmo(
+                    &mut gizmos,
+                    patch,
+                    obj_tf,
+                    Color::srgb(1.0, 0.88, 0.18),
+                    Some(preview_mode),
+                );
+            }
+        }
+    }
+
+    // --- Render Active & Preview 3D Point Normal Hints ---
+    const ARROW_LEN_MM: f32 = 16.0;
+    for ph in config
+        .eikonal
+        .point_hints
+        .iter()
+        .filter(|h| h.object_id == sel_id)
+    {
+        let is_selected = plate.selected_point_hint_id == Some(ph.id);
+        let is_ui_hovered = plate.ui_hovered_point_hint_id == Some(ph.id);
+        let show_arrow = is_selected || is_ui_hovered;
+
+        let w_base = obj_tf.transform_point(Vec3::from(ph.local_position));
+        if !show_arrow {
+            // Suppress arrow and tip handle for non-selected/non-hovered point hints to prevent clutter
+            gizmos.sphere(
+                w_base,
+                Quat::IDENTITY,
+                1.3,
+                Color::srgba(0.25, 0.98, 0.55, 0.65),
+            );
+            continue;
+        }
+
+        let w_dir = (obj_tf.rotation * Vec3::from(ph.local_direction)).normalize_or_zero();
+        let w_tip = w_base + w_dir * ARROW_LEN_MM;
+
+        let arrow_color = if is_ui_hovered {
+            Color::srgb(1.0, 0.95, 0.25)
+        } else {
+            Color::srgb(1.0, 0.86, 0.15)
+        };
+        let base_radius = if is_ui_hovered { 2.0 } else { 1.6 };
+        gizmos.sphere(w_base, Quat::IDENTITY, base_radius, arrow_color);
+        gizmos.arrow(w_base, w_tip, arrow_color);
+        gizmos.sphere(w_tip, Quat::IDENTITY, 1.3, Color::srgb(1.0, 0.48, 0.15));
+
+        // Draw influence radius wireframe circle around the selected or hovered point hint
+        let ring_color = if is_ui_hovered {
+            Color::srgba(1.0, 0.95, 0.25, 0.70)
+        } else {
+            Color::srgba(0.25, 0.98, 0.55, 0.45)
+        };
+        let r = ph.influence_radius_mm.max(1.0);
+        let up_ref = if w_dir.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
+        let t1 = w_dir.cross(up_ref).normalize_or_zero();
+        let t2 = w_dir.cross(t1).normalize_or_zero();
+        let segs = 24usize;
+        let mut ring = Vec::with_capacity(segs + 1);
+        for k in 0..=segs {
+            let a = (k as f32 / segs as f32) * std::f32::consts::TAU;
+            ring.push(w_base + r * (a.cos() * t1 + a.sin() * t2));
+        }
+        gizmos.linestrip(ring, ring_color);
+    }
+
+    if plate.tool_mode == ToolMode::PointHint {
+        if let Some((w_pos, w_dir)) = plate.hovered_point_preview {
+            let preview_color = Color::srgba(1.0, 0.90, 0.25, 0.75);
+            gizmos.sphere(w_pos, Quat::IDENTITY, 1.4, preview_color);
+            gizmos.arrow(w_pos, w_pos + w_dir * ARROW_LEN_MM, preview_color);
+        }
+    }
+}
+
+fn draw_surface_patch_gizmo(
+    gizmos: &mut Gizmos,
+    patch: &SurfacePatch,
+    obj_tf: &Transform,
+    color: Color,
+    mode: Option<SurfaceHintMode>,
+) {
+    for &[a, b] in &patch.boundary_edges {
+        gizmos.line(obj_tf.transform_point(a), obj_tf.transform_point(b), color);
+    }
+
+    let w_center = obj_tf.transform_point(patch.centroid);
+    let w_normal = (obj_tf.rotation * patch.normal).normalize_or_zero();
+    match mode {
+        Some(SurfaceHintMode::NormalOrthogonalToSurface) => {
+            // Arrow along surface normal (\nabla \tau \parallel \pm n_face -> conformal layers)
+            gizmos.arrow(w_center, w_center + w_normal * 14.0, color);
+        }
+        Some(SurfaceHintMode::NormalTangentToSurface) => {
+            // Tangent cross-vectors on the surface (\nabla \tau \perp n_face -> layers meet face at 90°)
+            let up = if w_normal.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
+            let t1 = w_normal.cross(up).normalize_or_zero();
+            let t2 = w_normal.cross(t1).normalize_or_zero();
+            gizmos.arrow(w_center - t1 * 8.0, w_center + t1 * 8.0, color);
+            gizmos.arrow(w_center - t2 * 8.0, w_center + t2 * 8.0, color);
+        }
+        None => {}
+    }
 }
 
 fn draw_aabb_wireframe(gizmos: &mut Gizmos, min: Vec3, max: Vec3, color: Color) {
@@ -916,6 +1410,26 @@ fn intersect_ray_z_plane(ray: Ray3d, z_plane: f32) -> Option<Vec3> {
     } else {
         None
     }
+}
+
+fn intersect_ray_plane(ray: Ray3d, plane_origin: Vec3, plane_normal: Vec3) -> Option<Vec3> {
+    let denom = ray.direction.dot(plane_normal);
+    if denom.abs() < 1e-6 {
+        return None;
+    }
+    let t = (plane_origin - ray.origin).dot(plane_normal) / denom;
+    if t > 0.0 {
+        Some(ray.origin + *ray.direction * t)
+    } else {
+        None
+    }
+}
+
+fn ray_point_distance(ray: Ray3d, pt: Vec3) -> f32 {
+    let v = pt - ray.origin;
+    let proj = v.dot(*ray.direction).max(0.0);
+    let closest = ray.origin + *ray.direction * proj;
+    closest.distance(pt)
 }
 
 fn ray_intersects_aabb(ray: Ray3d, min: Vec3, max: Vec3) -> bool {

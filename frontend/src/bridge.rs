@@ -162,6 +162,10 @@ pub mod ffi {
         /// Retrieves the triangle index buffer for `object_id`.
         pub fn get_object_indices(object_id: u64) -> Vec<u32>;
 
+        /// Retrieves the per-triangle STEP B-Rep `TopoDS_Face` index for `object_id`
+        /// (empty for pure triangle meshes).
+        pub fn get_object_triangle_face_ids(object_id: u64) -> Vec<u32>;
+
         /// Removes `object_id` from the C++ backend without disturbing other objects.
         pub fn remove_cad_object(object_id: u64) -> bool;
 
@@ -269,6 +273,9 @@ impl ffi::RenderVertex {
 }
 
 #[cfg(test)]
+pub static TEST_BACKEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::ffi::{self, ClearanceXZ, LayerHeightSpec, RenderVertex, ToolSpec};
 
@@ -297,6 +304,9 @@ mod tests {
 
     #[test]
     fn verify_kinematics_tools_and_layer_height_ffi() {
+        let _guard = super::TEST_BACKEND_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         ffi::set_nozzle_axis_bed([0.0, 0.0, 1.0]);
         let basis = ffi::query_nozzle_frame([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
         assert_eq!(basis.nozzle_axis, [0.0, 0.0, 1.0]);

@@ -69,6 +69,9 @@ public:
     /// Returns the tessellated triangle indices for a specific object ID.
     std::vector<std::uint32_t> objectIndices(std::uint64_t objectId) const;
 
+    /// Returns the per-triangle STEP B-Rep TopoDS_Face index for `objectId` (empty for pure triangle meshes).
+    std::vector<std::uint32_t> objectTriangleFaceIds(std::uint64_t objectId) const;
+
     /// Lists all named OpenVDB scalar fields stored on `objectId`.
     std::vector<std::string> listObjectFields(std::uint64_t objectId) const;
 
@@ -165,6 +168,7 @@ DecomposedPartInfo register_triangle_mesh(
     rust::Slice<const std::uint32_t> indices);
 rust::Vec<RenderVertex> get_object_vertices(std::uint64_t object_id);
 rust::Vec<std::uint32_t> get_object_indices(std::uint64_t object_id);
+rust::Vec<std::uint32_t> get_object_triangle_face_ids(std::uint64_t object_id);
 bool remove_cad_object(std::uint64_t object_id);
 bool export_object_step_to_path(std::uint64_t object_id, rust::Str path);
 

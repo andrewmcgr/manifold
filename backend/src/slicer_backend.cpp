@@ -59,6 +59,8 @@ struct ObjectRecord {
     float maxX = 0.0f, maxY = 0.0f, maxZ = 0.0f;
     std::vector<RenderVertex> vertexBuffer;
     std::vector<std::uint32_t> indexBuffer;
+    /// Per-triangle STEP B-Rep TopoDS_Face index (1 entry per triangle when `hasBrep == true`).
+    std::vector<std::uint32_t> triangleFaceIds;
     /// Generic dictionary of named scalar fields (e.g., "sdf", "eikonal", "overhang", "tool_tilt_deg").
     std::map<std::string, openvdb::FloatGrid::Ptr> scalarFields;
     /// Solved 3D unit tool axis field \hat{a}(x) in bed coordinates.
@@ -437,10 +439,12 @@ void tessellateTopoShape(
     double linearDeflection,
     double angularDeflection,
     std::vector<RenderVertex>& vertexBuffer,
-    std::vector<std::uint32_t>& indexBuffer)
+    std::vector<std::uint32_t>& indexBuffer,
+    std::vector<std::uint32_t>& triangleFaceIds)
 {
     vertexBuffer.clear();
     indexBuffer.clear();
+    triangleFaceIds.clear();
 
     if (shape.IsNull()) {
         return;
@@ -449,6 +453,7 @@ void tessellateTopoShape(
     BRepMesh_IncrementalMesh mesher(shape, linearDeflection, Standard_False, angularDeflection, Standard_True);
     mesher.Perform();
 
+    std::uint32_t currentFaceId = 0;
     for (TopExp_Explorer explorer(shape, TopAbs_FACE); explorer.More(); explorer.Next()) {
         const TopoDS_Face& face = TopoDS::Face(explorer.Current());
         TopLoc_Location location;
@@ -478,6 +483,7 @@ void tessellateTopoShape(
         }
 
         indexBuffer.reserve(indexBuffer.size() + static_cast<std::size_t>(numTriangles) * 3);
+        triangleFaceIds.reserve(triangleFaceIds.size() + static_cast<std::size_t>(numTriangles));
         for (Standard_Integer t = 1; t <= numTriangles; ++t) {
             Standard_Integer n1 = 0, n2 = 0, n3 = 0;
             triangulation->Triangle(t).Get(n1, n2, n3);
@@ -493,6 +499,7 @@ void tessellateTopoShape(
             indexBuffer.push_back(idx0);
             indexBuffer.push_back(idx1);
             indexBuffer.push_back(idx2);
+            triangleFaceIds.push_back(currentFaceId);
 
             const auto& v0 = vertexBuffer[idx0];
             const auto& v1 = vertexBuffer[idx1];
@@ -520,6 +527,7 @@ void tessellateTopoShape(
                 v.nz = 1.0f;
             }
         }
+        ++currentFaceId;
     }
 }
 
@@ -618,7 +626,8 @@ std::vector<DecomposedPartInfo> SlicerBackend::loadStepAssembly(
             linearDeflection,
             angularDeflection,
             rec.vertexBuffer,
-            rec.indexBuffer);
+            rec.indexBuffer,
+            rec.triangleFaceIds);
 
         if (rec.vertexBuffer.empty() || rec.indexBuffer.empty()) {
             continue;
@@ -732,6 +741,14 @@ std::vector<std::uint32_t> SlicerBackend::objectIndices(std::uint64_t objectId) 
         return {};
     }
     return it->second.indexBuffer;
+}
+
+std::vector<std::uint32_t> SlicerBackend::objectTriangleFaceIds(std::uint64_t objectId) const {
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return {};
+    }
+    return it->second.triangleFaceIds;
 }
 
 std::vector<std::string> SlicerBackend::listObjectFields(std::uint64_t objectId) const {
@@ -1323,6 +1340,17 @@ rust::Vec<std::uint32_t> get_object_indices(std::uint64_t object_id) {
     out.reserve(src.size());
     for (const std::uint32_t idx : src) {
         out.push_back(idx);
+    }
+    return out;
+}
+
+rust::Vec<std::uint32_t> get_object_triangle_face_ids(std::uint64_t object_id) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const auto src = globalBackend().objectTriangleFaceIds(object_id);
+    rust::Vec<std::uint32_t> out;
+    out.reserve(src.size());
+    for (const std::uint32_t fid : src) {
+        out.push_back(fid);
     }
     return out;
 }
