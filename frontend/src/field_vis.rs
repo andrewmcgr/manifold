@@ -43,10 +43,10 @@ impl SliceAxis {
 pub enum IsoIntersectionMode {
     /// Highlights the object-intersecting region ($\phi_{\text{sdf}} \le 0$) in vivid colors
     /// and dims the exterior region ($\phi_{\text{sdf}} > 0$) in muted dark slate.
-    #[default]
     HighlightInsideDimOutside,
     /// Clips away all exterior triangles ($\phi_{\text{sdf}} > 0$), rendering only the exact
     /// portion of the isosurface that intersects the solid object ($\phi_{\text{sdf}} \le 0$).
+    #[default]
     ClipToObjectInterior,
     /// Renders the entire unclipped isosurface uniformly.
     FullUnclipped,
@@ -282,11 +282,11 @@ impl Default for FieldVisualizationState {
             available_fields: Vec::new(),
             cached_stats: None,
             last_object_id: None,
-            solid_opacity: 1.0,
+            solid_opacity: 0.25,
             show_isosurface: false,
             isovalue: 0.0,
             adaptivity: 0.0,
-            intersection_mode: IsoIntersectionMode::HighlightInsideDimOutside,
+            intersection_mode: IsoIntersectionMode::ClipToObjectInterior,
             show_intersection_contour: true,
             isosurface_entity: None,
             isosurface_mesh_handle: None,
@@ -844,8 +844,9 @@ pub fn sync_field_visualization_system(
             for (idx, layer) in res.layers.iter().enumerate() {
                 let is_hovered = highlighted == Some(idx);
                 let in_range = idx >= lo && idx <= hi;
-                let matches_stride =
-                    ((idx - lo) % stride == 0) || layer.is_first_layer || layer.is_top_layer;
+                let matches_stride = (idx.saturating_sub(lo) % stride == 0)
+                    || layer.is_first_layer
+                    || layer.is_top_layer;
                 if !is_hovered && (!in_range || !matches_stride) {
                     continue;
                 }
@@ -952,8 +953,9 @@ pub fn sync_field_visualization_system(
                 for (idx, layer) in res.layers.iter().enumerate() {
                     let is_hovered = highlighted == Some(idx);
                     let in_range = idx >= lo && idx <= hi;
-                    let matches_stride =
-                        ((idx - lo) % stride == 0) || layer.is_first_layer || layer.is_top_layer;
+                    let matches_stride = (idx.saturating_sub(lo) % stride == 0)
+                        || layer.is_first_layer
+                        || layer.is_top_layer;
                     if !is_hovered && (!in_range || !matches_stride) {
                         continue;
                     }
@@ -1035,7 +1037,7 @@ pub fn sync_field_visualization_system(
                     let is_hovered = highlighted == Some(idx);
                     let in_range = idx >= lo && idx <= hi;
                     let matches_stride =
-                        ((idx - lo) % stride == 0) || idx == 0 || idx + 1 == total;
+                        (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
                     if !is_hovered && (!in_range || !matches_stride) {
                         continue;
                     }
@@ -1062,7 +1064,7 @@ pub fn sync_field_visualization_system(
                     let is_hovered = highlighted == Some(idx);
                     let in_range = idx >= lo && idx <= hi;
                     let matches_stride =
-                        ((idx - lo) % stride == 0) || idx == 0 || idx + 1 == total;
+                        (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
                     if !is_hovered && (!in_range || !matches_stride) {
                         continue;
                     }
@@ -1111,7 +1113,7 @@ pub fn sync_field_visualization_system(
                     let is_hovered = highlighted == Some(idx);
                     let in_range = idx >= lo && idx <= hi;
                     let matches_stride =
-                        ((idx - lo) % stride == 0) || idx == 0 || idx + 1 == total;
+                        (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
                     if !is_hovered && (!in_range || !matches_stride) {
                         continue;
                     }
@@ -1222,7 +1224,7 @@ pub fn sync_field_visualization_system(
                     let is_hovered = highlighted == Some(idx);
                     let in_range = idx >= lo && idx <= hi;
                     let matches_stride =
-                        ((idx - lo) % stride == 0) || idx == 0 || idx + 1 == total;
+                        (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
                     if !is_hovered && (!in_range || !matches_stride) {
                         continue;
                     }
@@ -1306,7 +1308,9 @@ pub fn sync_field_visualization_system(
                             }
                             if idx >= lo
                                 && idx <= hi
-                                && (((idx - lo) % stride == 0) || l.is_first_layer || l.is_top_layer)
+                                && ((idx.saturating_sub(lo) % stride == 0)
+                                    || l.is_first_layer
+                                    || l.is_top_layer)
                             {
                                 selected_iso_list.push(l.isovalue);
                             }

@@ -832,8 +832,8 @@ pub fn ui_workspace_system(
                                         .selected_text(vis_state.intersection_mode.label())
                                         .show_ui(ui, |ui| {
                                             for mode in [
-                                                IsoIntersectionMode::HighlightInsideDimOutside,
                                                 IsoIntersectionMode::ClipToObjectInterior,
+                                                IsoIntersectionMode::HighlightInsideDimOutside,
                                                 IsoIntersectionMode::FullUnclipped,
                                             ] {
                                                 if ui
@@ -1161,7 +1161,7 @@ pub fn ui_workspace_system(
                                     let max_idx = total_layers - 1;
                                     let mut range_changed = false;
                                     ui.horizontal(|ui| {
-                                        range_changed |= ui
+                                        let min_changed = ui
                                             .add(
                                                 egui::Slider::new(
                                                     &mut vis_state.selected_layer_min_idx,
@@ -1170,7 +1170,7 @@ pub fn ui_workspace_system(
                                                 .text("Start Layer"),
                                             )
                                             .changed();
-                                        range_changed |= ui
+                                        let max_changed = ui
                                             .add(
                                                 egui::Slider::new(
                                                     &mut vis_state.selected_layer_max_idx,
@@ -1179,13 +1179,21 @@ pub fn ui_workspace_system(
                                                 .text("End Layer"),
                                             )
                                             .changed();
+                                        if min_changed
+                                            && vis_state.selected_layer_min_idx
+                                                > vis_state.selected_layer_max_idx
+                                        {
+                                            vis_state.selected_layer_max_idx =
+                                                vis_state.selected_layer_min_idx;
+                                        } else if max_changed
+                                            && vis_state.selected_layer_max_idx
+                                                < vis_state.selected_layer_min_idx
+                                        {
+                                            vis_state.selected_layer_min_idx =
+                                                vis_state.selected_layer_max_idx;
+                                        }
+                                        range_changed |= min_changed || max_changed;
                                     });
-                                    if vis_state.selected_layer_min_idx
-                                        > vis_state.selected_layer_max_idx
-                                    {
-                                        vis_state.selected_layer_max_idx =
-                                            vis_state.selected_layer_min_idx;
-                                    }
                                     range_changed |= ui
                                         .add(
                                             egui::Slider::new(
@@ -1268,6 +1276,9 @@ pub fn ui_workspace_system(
                                                             "eikonal".to_string();
                                                         vis_state.isovalue = layer.isovalue;
                                                         vis_state.show_isosurface = true;
+                                                        if vis_state.solid_opacity > 0.5 {
+                                                            vis_state.solid_opacity = 0.25;
+                                                        }
                                                         vis_state.dirty_isosurface = true;
                                                         vis_state.dirty_slice = true;
                                                     }
@@ -1805,6 +1816,9 @@ pub fn ui_workspace_system(
                                             .clicked()
                                         {
                                             vis_state.show_toolpaths = true;
+                                            if vis_state.solid_opacity > 0.35 {
+                                                vis_state.solid_opacity = 0.18;
+                                            }
                                             if has_eikonal {
                                                 let need_layers =
                                                     vis_state.cached_selected_layers.is_none()
@@ -1879,12 +1893,6 @@ pub fn ui_workspace_system(
                                             }
                                         });
                                 });
-                                gc_changed |= ui
-                                    .checkbox(
-                                        &mut gc.gcode_origin_at_bed_center,
-                                        "G-code Origin at Bed Center (0, 0) instead of Front-Left",
-                                    )
-                                    .changed();
 
                                 ui.collapsing("Speeds, Accelerations & Klipper Kinematics", |ui| {
                                     ui.horizontal(|ui| {
@@ -2528,6 +2536,12 @@ pub fn ui_workspace_system(
                         .add(
                             egui::Slider::new(&mut config.bed.height_z, 50.0..=600.0)
                                 .text("Max Z (mm)"),
+                        )
+                        .changed();
+                    bed_changed |= ui
+                        .checkbox(
+                            &mut config.gcode.gcode_origin_at_bed_center,
+                            "G-code Origin at Bed Center (0, 0) instead of Front-Left",
                         )
                         .changed();
                     if bed_changed {

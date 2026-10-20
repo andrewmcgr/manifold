@@ -10,7 +10,7 @@ pub mod ui;
 
 use bevy::prelude::*;
 use bevy::render::renderer::RenderDevice;
-use bevy_egui::EguiPlugin;
+use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bridge::ffi::RenderVertex;
 use config::SlicerConfig;
 use field_vis::{sync_field_visualization_system, FieldVisualizationState};
@@ -85,13 +85,49 @@ fn main() {
         .run();
 }
 
+/// Registers system mathematical and technical symbol fallback fonts into `egui`
+/// so glyphs such as `⊥`, `∥`, `✕`, `∇`, `φ`, `τ`, and `Δ` render cleanly instead of placeholder boxes.
+fn configure_egui_symbol_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let candidate_paths = [
+        ("apple_symbols", "/System/Library/Fonts/Apple Symbols.ttf"),
+        (
+            "arial_unicode",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ),
+    ];
+
+    let mut loaded_any = false;
+    for (name, path) in candidate_paths {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert(name.to_string(), egui::FontData::from_owned(bytes));
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                family.push(name.to_string());
+            }
+            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                family.push(name.to_string());
+            }
+            loaded_any = true;
+        }
+    }
+
+    if loaded_any {
+        ctx.set_fonts(fonts);
+    }
+}
+
 /// Initializes the 3D viewport camera/lighting and constructs the raw `wgpu::RenderPipeline`
 /// configured with `RenderVertex::desc()` (24-byte stride via `bytemuck`).
 fn setup_viewport_scene_and_pipeline(
     mut commands: Commands,
+    mut egui_contexts: EguiContexts,
     render_device: Option<Res<RenderDevice>>,
     mut plate: ResMut<BuildPlateState>,
 ) {
+    configure_egui_symbol_fonts(egui_contexts.ctx_mut());
+
     let orbit = OrbitCamera::default();
     let eye = compute_orbit_eye(&orbit);
 

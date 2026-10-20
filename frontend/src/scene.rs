@@ -439,7 +439,7 @@ pub fn run_auto_arrange_on_plate(
 }
 
 /// Updates object material highlights so the selected object is visually distinct,
-/// while preserving translucency (with backface culling) when volumetric field visualization is active.
+/// while preserving translucency (with backface culling) when any visualization is active.
 pub fn update_selection_materials_system(
     plate: Res<BuildPlateState>,
     vis_state: Res<crate::field_vis::FieldVisualizationState>,
@@ -453,8 +453,11 @@ pub fn update_selection_materials_system(
         if let Some(mat) = materials.get_mut(&obj.material_handle) {
             let is_selected = plate.selected_object_id == Some(obj.object_id);
             if is_selected {
-                let field_active = vis_state.show_isosurface || vis_state.show_slice_plane;
-                let alpha = if field_active {
+                let any_vis_active = vis_state.show_isosurface
+                    || vis_state.show_slice_plane
+                    || vis_state.show_selected_layers
+                    || vis_state.show_toolpaths;
+                let alpha = if any_vis_active {
                     vis_state.solid_opacity.clamp(0.0, 1.0)
                 } else {
                     1.0
