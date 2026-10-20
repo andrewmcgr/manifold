@@ -2817,6 +2817,109 @@ mod tests {
         assert!(tp.valid);
         assert_eq!(layers.layers.len(), tp.layers.len());
 
+        let q_pt = |v: &ffi::RenderVertex| -> (i32, i32, i32) {
+            (
+                (v.x * 1000.0).round() as i32,
+                (v.y * 1000.0).round() as i32,
+                (v.z * 1000.0).round() as i32,
+            )
+        };
+        for (i, l) in layers.layers.iter().enumerate() {
+            let mut edge_counts: std::collections::HashMap<((i32, i32, i32), (i32, i32, i32)), usize> =
+                std::collections::HashMap::new();
+            for tri in l.indices.chunks_exact(3) {
+                let p0 = q_pt(&l.vertices[tri[0] as usize]);
+                let p1 = q_pt(&l.vertices[tri[1] as usize]);
+                let p2 = q_pt(&l.vertices[tri[2] as usize]);
+                for &(a, b) in &[(p0, p1), (p1, p2), (p2, p0)] {
+                    if a == b {
+                        continue;
+                    }
+                    let key = if a < b { (a, b) } else { (b, a) };
+                    *edge_counts.entry(key).or_insert(0) += 1;
+                }
+            }
+            let boundary_edges = edge_counts.values().filter(|&&c| c == 1).count();
+            let contour_segs = l.contour_segments.len() / 6;
+            let hole_edges = boundary_edges.saturating_sub(contour_segs);
+            assert!(
+                !l.indices.is_empty(),
+                "Layer #{i} (branch B{}, {}/{}) at iso={:.3} must not have an empty mesh",
+                l.branch_id,
+                l.branch_layer_index + 1,
+                l.branch_layer_count,
+                l.isovalue
+            );
+            assert_eq!(
+                hole_edges,
+                0,
+                "Layer #{i} (branch B{}, {}/{}) at iso={:.3} has {hole_edges} spurious interior hole edges (bnd_edges={boundary_edges}, contour_segs={contour_segs})",
+                l.branch_id,
+                l.branch_layer_index + 1,
+                l.branch_layer_count,
+                l.isovalue
+            );
+        }
+
+        // Also test with a tilted orientation hint on TestObj1.stl
+        let hints = vec![ffi::SpatialOrientationHint {
+            kind: 1,
+            position_bed: [0.0, 0.0, 5.0],
+            direction_bed: [0.35, 0.35, 0.87],
+            influence_radius_mm: 40.0,
+            weight: 0.9,
+            apply_on_surface_only: false,
+        }];
+        ffi::set_spatial_orientation_hints(&hints);
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+        let tilted_layers = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        for (i, l) in tilted_layers.layers.iter().enumerate() {
+            let mut edge_counts: std::collections::HashMap<((i32, i32, i32), (i32, i32, i32)), usize> =
+                std::collections::HashMap::new();
+            for tri in l.indices.chunks_exact(3) {
+                let p0 = q_pt(&l.vertices[tri[0] as usize]);
+                let p1 = q_pt(&l.vertices[tri[1] as usize]);
+                let p2 = q_pt(&l.vertices[tri[2] as usize]);
+                for &(a, b) in &[(p0, p1), (p1, p2), (p2, p0)] {
+                    if a == b {
+                        continue;
+                    }
+                    let key = if a < b { (a, b) } else { (b, a) };
+                    *edge_counts.entry(key).or_insert(0) += 1;
+                }
+            }
+            let boundary_edges = edge_counts.values().filter(|&&c| c == 1).count();
+            let contour_segs = l.contour_segments.len() / 6;
+            let hole_edges = boundary_edges.saturating_sub(contour_segs);
+            assert!(
+                !l.indices.is_empty(),
+                "Tilted layer #{i} (branch B{}, {}/{}) at iso={:.3} must not have an empty mesh",
+                l.branch_id,
+                l.branch_layer_index + 1,
+                l.branch_layer_count,
+                l.isovalue
+            );
+            assert_eq!(
+                hole_edges,
+                0,
+                "Tilted layer #{i} (branch B{}, {}/{}) at iso={:.3} has {hole_edges} spurious interior hole edges (bnd_edges={boundary_edges}, contour_segs={contour_segs})",
+                l.branch_id,
+                l.branch_layer_index + 1,
+                l.branch_layer_count,
+                l.isovalue
+            );
+        }
+        ffi::set_spatial_orientation_hints(&[]);
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
         // 1. Every selected isosurface layer must have non-empty mesh triangles AND non-empty toolpaths
         for (i, (l, t)) in layers.layers.iter().zip(tp.layers.iter()).enumerate() {
             assert!(
