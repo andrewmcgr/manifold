@@ -1313,6 +1313,386 @@ pub fn format_exclude_object_define(name: &str, center: [f32; 2], polygon: &[[f3
     )
 }
 
+/// Standard RFC 4648 Base64 encoder for embedding PNG thumbnails in G-code comments.
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Encodes an RGBA8 image buffer (`width * height * 4` bytes) into PNG format in memory.
+fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut png_bytes = Vec::with_capacity((width * height) as usize + 256);
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        if let Ok(mut writer) = encoder.write_header() {
+            let _ = writer.write_image_data(rgba);
+        }
+    }
+    png_bytes
+}
+
+/// Formats a single PNG thumbnail block (`; thumbnail begin WxH B64_LEN` ... `; thumbnail end`)
+/// adhering to Moonraker's `BaseSlicer.parse_thumbnails` specification in `metadata.py`.
+fn format_thumbnail_gcode_block(width: u32, height: u32, rgba: &[u8]) -> String {
+    let png_bytes = encode_rgba_to_png(width, height, rgba);
+    let b64 = encode_base64(&png_bytes);
+    let mut out = String::with_capacity(b64.len() + (b64.len() / 78 + 4) * 4 + 64);
+    out.push_str(";\n");
+    out.push_str(&format!(
+        "; thumbnail begin {}x{} {}\n",
+        width,
+        height,
+        b64.len()
+    ));
+    for chunk in b64.as_bytes().chunks(78) {
+        out.push_str("; ");
+        if let Ok(s) = std::str::from_utf8(chunk) {
+            out.push_str(s);
+        }
+        out.push('\n');
+    }
+    out.push_str("; thumbnail end\n");
+    out.push_str(";\n");
+    out
+}
+
+/// Renders an isometric 3D Z-buffered shaded preview of the planned non-planar toolpaths into
+/// `300x300` and downsampled `32x32` RGBA buffers, and returns the formatted Moonraker thumbnail blocks.
+pub fn render_toolpath_preview_thumbnails(
+    layers: &[PlannedLayerGcode],
+    bbox_min: Vec3,
+    bbox_max: Vec3,
+    up_bed: Vec3,
+) -> String {
+    const HI_W: usize = 300;
+    const HI_H: usize = 300;
+    const LO_W: usize = 32;
+    const LO_H: usize = 32;
+
+    let mut rgba_hi = vec![0u8; HI_W * HI_H * 4];
+    let mut z_buf = vec![f32::INFINITY; HI_W * HI_H];
+
+    // Orthonormal isometric camera basis aligned with `up_bed` (respecting AGENTS.md Rule 2)
+    let world_up = up_bed.try_normalize().unwrap_or(Vec3::Z);
+    let ref_x = if world_up.dot(Vec3::X).abs() < 0.9 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let bed_tangent_x = (ref_x - world_up * ref_x.dot(world_up))
+        .try_normalize()
+        .unwrap_or(Vec3::X);
+    let bed_tangent_y = world_up.cross(bed_tangent_x).try_normalize().unwrap_or(Vec3::Y);
+
+    // Isometric 3/4 view direction looking toward object center
+    let yaw = -38.0f32.to_radians();
+    let pitch = -28.0f32.to_radians();
+    let horiz_dir = bed_tangent_x * yaw.cos() + bed_tangent_y * yaw.sin();
+    let view_forward = (horiz_dir * pitch.cos() + world_up * pitch.sin())
+        .try_normalize()
+        .unwrap_or(Vec3::ONE.normalize());
+    let cam_right = view_forward
+        .cross(world_up)
+        .try_normalize()
+        .unwrap_or(bed_tangent_x);
+    let cam_up = cam_right
+        .cross(view_forward)
+        .try_normalize()
+        .unwrap_or(world_up);
+
+    let center = 0.5 * (bbox_min + bbox_max);
+    let ext = (bbox_max - bbox_min).max(Vec3::splat(1.0));
+    let half_ext = 0.5 * ext;
+
+    // Project all 8 AABB corners onto `(cam_right, cam_up)` to auto-frame the object
+    let mut proj_min_x = f32::INFINITY;
+    let mut proj_max_x = f32::NEG_INFINITY;
+    let mut proj_min_y = f32::INFINITY;
+    let mut proj_max_y = f32::NEG_INFINITY;
+
+    for sx in [-1.0f32, 1.0] {
+        for sy in [-1.0f32, 1.0] {
+            for sz in [-1.0f32, 1.0] {
+                let offset = Vec3::new(sx * half_ext.x, sy * half_ext.y, sz * half_ext.z);
+                let px = offset.dot(cam_right);
+                let py = offset.dot(cam_up);
+                proj_min_x = proj_min_x.min(px);
+                proj_max_x = proj_max_x.max(px);
+                proj_min_y = proj_min_y.min(py);
+                proj_max_y = proj_max_y.max(py);
+            }
+        }
+    }
+
+    let span_x = (proj_max_x - proj_min_x).max(1.0);
+    let span_y = (proj_max_y - proj_min_y).max(1.0);
+    let scale = (0.84 * (HI_W as f32)) / span_x.max(span_y);
+    let proj_cx = 0.5 * (proj_min_x + proj_max_x);
+    let proj_cy = 0.5 * (proj_min_y + proj_max_y);
+
+    let project_pt = |p: Vec3| -> (f32, f32, f32) {
+        let rel = p - center;
+        let x_cam = rel.dot(cam_right) - proj_cx;
+        let y_cam = rel.dot(cam_up) - proj_cy;
+        let z_cam = rel.dot(view_forward);
+        let sx = 0.5 * (HI_W as f32) + x_cam * scale;
+        let sy = 0.5 * (HI_H as f32) - y_cam * scale;
+        (sx, sy, z_cam)
+    };
+
+    let light_dir = (-0.45 * view_forward + 0.50 * cam_right + 0.74 * cam_up)
+        .try_normalize()
+        .unwrap_or(world_up);
+    let z_span = (bbox_max.dot(world_up) - bbox_min.dot(world_up)).max(1.0);
+    let z_base = bbox_min.dot(world_up);
+
+    // Count total extruding segments and stride if very dense so thumbnail rendering stays < 3 ms
+    let total_ext: usize = layers
+        .iter()
+        .map(|l| {
+            l.segments
+                .iter()
+                .filter(|s| s.kind.is_extruding() && s.delta_e_mm > 1.0e-6)
+                .count()
+        })
+        .sum();
+    let seg_stride = (total_ext / 25_000).max(1);
+
+    let mut seg_counter = 0usize;
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        let is_boundary_layer = layer_idx == 0 || layer_idx + 1 == layers.len();
+        for seg in &layer.segments {
+            if !seg.kind.is_extruding() || seg.delta_e_mm <= 1.0e-6 {
+                continue;
+            }
+            seg_counter += 1;
+            if seg_stride > 1
+                && !is_boundary_layer
+                && seg.kind != PlannedMoveKind::OuterWall
+                && (seg_counter % seg_stride != 0)
+            {
+                continue;
+            }
+
+            let (x0, y0, z0) = project_pt(seg.p0_bed);
+            let (x1, y1, z1) = project_pt(seg.p1_bed);
+            let r_px = (0.55 * seg.width_mm * scale).clamp(1.25, 4.2);
+
+            let min_px = ((x0.min(x1) - r_px - 0.5).floor() as i32).max(0) as usize;
+            let max_px = ((x0.max(x1) + r_px + 0.5).ceil() as i32).min(HI_W as i32 - 1) as usize;
+            let min_py = ((y0.min(y1) - r_px - 0.5).floor() as i32).max(0) as usize;
+            let max_py = ((y0.max(y1) + r_px + 0.5).ceil() as i32).min(HI_H as i32 - 1) as usize;
+            if min_px > max_px || min_py > max_py {
+                continue;
+            }
+
+            let base_rgb: [f32; 3] = match seg.kind {
+                PlannedMoveKind::OuterWall => [0.98, 0.52, 0.16],
+                PlannedMoveKind::ScarfSeam => [0.92, 0.42, 0.24],
+                PlannedMoveKind::InnerWall => [0.32, 0.78, 0.44],
+                PlannedMoveKind::SolidInfill | PlannedMoveKind::GapFill => [0.24, 0.76, 0.88],
+                PlannedMoveKind::SparseInfill => [0.92, 0.74, 0.22],
+                _ => [0.85, 0.50, 0.18],
+            };
+
+            let n3d = (seg.nozzle_bed_0 + seg.nozzle_bed_1)
+                .try_normalize()
+                .unwrap_or(world_up);
+            let h_u = (((0.5 * (seg.p0_bed + seg.p1_bed)).dot(world_up) - z_base) / z_span)
+                .clamp(0.0, 1.0);
+            let height_boost = 0.82 + 0.24 * h_u;
+            let surf_diffuse = n3d.dot(light_dir).max(0.0);
+
+            let dx = x1 - x0;
+            let dy = y1 - y0;
+            let len_sq = dx * dx + dy * dy;
+
+            for py in min_py..=max_py {
+                let fy = py as f32 + 0.5;
+                for px in min_px..=max_px {
+                    let fx = px as f32 + 0.5;
+                    let t = if len_sq > 1.0e-6 {
+                        (((fx - x0) * dx + (fy - y0) * dy) / len_sq).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let cx = x0 + t * dx;
+                    let cy = y0 + t * dy;
+                    let dist_sq = (fx - cx) * (fx - cx) + (fy - cy) * (fy - cy);
+                    let max_r = r_px + 0.45;
+                    if dist_sq > max_r * max_r {
+                        continue;
+                    }
+                    let dist = dist_sq.sqrt();
+                    let u_rad = (dist / r_px).clamp(0.0, 1.0);
+                    let cyl_z = (1.0 - u_rad * u_rad).max(0.0).sqrt();
+                    let z_depth = z0 + t * (z1 - z0) - cyl_z * (0.5 * seg.height_mm);
+
+                    let idx = py * HI_W + px;
+                    if z_depth <= z_buf[idx] + 0.08 {
+                        let shade = (0.36 + 0.44 * cyl_z + 0.26 * surf_diffuse) * height_boost;
+                        let spec = cyl_z.powi(6) * 0.14;
+                        let r = ((base_rgb[0] * shade + spec).clamp(0.0, 1.0) * 255.0) as u8;
+                        let g = ((base_rgb[1] * shade + spec).clamp(0.0, 1.0) * 255.0) as u8;
+                        let b = ((base_rgb[2] * shade + spec).clamp(0.0, 1.0) * 255.0) as u8;
+                        let alpha = if dist <= r_px - 0.35 {
+                            255u8
+                        } else {
+                            (((max_r - dist) / 0.80).clamp(0.0, 1.0) * 255.0) as u8
+                        };
+
+                        if alpha >= 200 || rgba_hi[idx * 4 + 3] == 0 {
+                            if alpha >= 200 {
+                                z_buf[idx] = z_depth;
+                            }
+                            rgba_hi[idx * 4] = r;
+                            rgba_hi[idx * 4 + 1] = g;
+                            rgba_hi[idx * 4 + 2] = b;
+                            rgba_hi[idx * 4 + 3] = rgba_hi[idx * 4 + 3].max(alpha);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Box-filter downsample 300x300 -> 32x32 with premultiplied alpha weighting
+    let mut rgba_lo = vec![0u8; LO_W * LO_H * 4];
+    for ly in 0..LO_H {
+        let y_start = (ly * HI_H) / LO_H;
+        let y_end = (((ly + 1) * HI_H) / LO_H).max(y_start + 1);
+        for lx in 0..LO_W {
+            let x_start = (lx * HI_W) / LO_W;
+            let x_end = (((lx + 1) * HI_W) / LO_W).max(x_start + 1);
+
+            let mut sum_r = 0u32;
+            let mut sum_g = 0u32;
+            let mut sum_b = 0u32;
+            let mut sum_a = 0u32;
+            let mut count = 0u32;
+
+            for hy in y_start..y_end {
+                for hx in x_start..x_end {
+                    let p = (hy * HI_W + hx) * 4;
+                    let a = rgba_hi[p + 3] as u32;
+                    sum_r += (rgba_hi[p] as u32) * a;
+                    sum_g += (rgba_hi[p + 1] as u32) * a;
+                    sum_b += (rgba_hi[p + 2] as u32) * a;
+                    sum_a += a;
+                    count += 1;
+                }
+            }
+
+            let dst = (ly * LO_W + lx) * 4;
+            if sum_a > 0 && count > 0 {
+                rgba_lo[dst] = (sum_r / sum_a).min(255) as u8;
+                rgba_lo[dst + 1] = (sum_g / sum_a).min(255) as u8;
+                rgba_lo[dst + 2] = (sum_b / sum_a).min(255) as u8;
+                rgba_lo[dst + 3] = (sum_a / count).min(255) as u8;
+            }
+        }
+    }
+
+    let mut blocks = format_thumbnail_gcode_block(LO_W as u32, LO_H as u32, &rgba_lo);
+    blocks.push_str(&format_thumbnail_gcode_block(HI_W as u32, HI_H as u32, &rgba_hi));
+    blocks
+}
+
+/// Formats `total_time_s` into the human-readable duration string expected by Moonraker's
+/// `PrusaSlicer._parse_time_to_seconds` (`r"(\d+)d"`, `r"(\d+)h"`, `r"(\d+)m"`, `r"(\d+)s"`).
+pub fn format_moonraker_estimated_time(total_time_s: f32) -> String {
+    let total_secs = total_time_s.max(1.0).round() as u64;
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let mins = (total_secs % 3_600) / 60;
+    let secs = total_secs % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {mins}m {secs}s")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m {secs}s")
+    } else if mins > 0 {
+        format!("{mins}m {secs}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Formats the Moonraker-compatible `PrusaSlicer` metadata footer block (`metadata.py`).
+fn format_moonraker_metadata_footer(
+    total_time_s: f32,
+    total_filament_mm: f32,
+    total_filament_volume_mm3: f32,
+    total_filament_grams: f32,
+    first_layer_height_mm: f32,
+    target_layer_height_mm: f32,
+    max_print_height_mm: f32,
+    layer_count: usize,
+    nozzle_diam_mm: f32,
+    filament_diam_mm: f32,
+    bed_temp_c: f32,
+    nozzle_temp_c: f32,
+) -> String {
+    let total_filament_cm3 = total_filament_volume_mm3 / 1000.0;
+    let time_str = format_moonraker_estimated_time(total_time_s);
+    format!(
+        concat!(
+            "\n; --- Moonraker / PrusaSlicer Metadata Footer ---\n",
+            "; filament used [mm] = {:.2}\n",
+            "; filament used [cm3] = {:.2}\n",
+            "; filament used [g] = {:.2}\n",
+            "; total filament used [g] = {:.2}\n",
+            "; estimated printing time (normal mode) = {}\n",
+            "; first_layer_height = {:.3}\n",
+            "; layer_height = {:.3}\n",
+            "; max_print_height = {:.3}\n",
+            "; total layers count = {}\n",
+            "; nozzle_diameter = {:.2}\n",
+            "; filament_diameter = {:.2}\n",
+            "; filament_type = PLA\n",
+            "; filament_settings_id = \"Manifold2 Non-Planar\"\n",
+            "; first_layer_bed_temperature = {:.0}\n",
+            "; first_layer_temperature = {:.0}\n"
+        ),
+        total_filament_mm,
+        total_filament_cm3,
+        total_filament_grams,
+        total_filament_grams,
+        time_str,
+        first_layer_height_mm,
+        target_layer_height_mm,
+        max_print_height_mm.max(0.0),
+        layer_count,
+        nozzle_diam_mm,
+        filament_diam_mm,
+        bed_temp_c,
+        nozzle_temp_c,
+    )
+}
+
 /// Executes the complete Toolpath-to-Gcode planning & emission pipeline on `raw_toolpaths`.
 pub fn plan_and_emit_gcode(
     raw_toolpaths: &ObjectToolpathsResult,
@@ -2033,6 +2413,18 @@ pub fn plan_and_emit_gcode_for_object(
         compute_exclude_object_polygon_2d(&planned_layers, bbox_min, bbox_max);
 
     let mut gcode = String::with_capacity(64 * 1024);
+    // Moonraker's `metadata.py` (`PrusaSlicer.check_identity`) requires a header comment
+    // matching `r"PrusaSlicer\s(.*)\son"` (or `OrcaSlicer\s(.*)\son`) to enable full metadata
+    // and embedded PNG thumbnail extraction.
+    gcode.push_str("; generated by PrusaSlicer 2.8.0-Manifold2 on 2026-10-20 at 00:00:00 UTC\n");
+    if gcfg.emit_thumbnails && !planned_layers.is_empty() {
+        gcode.push_str(&render_toolpath_preview_thumbnails(
+            &planned_layers,
+            bbox_min,
+            bbox_max,
+            up_bed,
+        ));
+    }
     if gcfg.emit_exclude_object {
         gcode.push_str(&format_exclude_object_define(
             &exclude_object_name,
@@ -2071,9 +2463,25 @@ pub fn plan_and_emit_gcode_for_object(
         if layer.segments.is_empty() {
             continue;
         }
+        let mut layer_max_z = 0.0f32;
+        let mut layer_sum_h = 0.0f32;
+        let mut layer_ext_cnt = 0usize;
+        for s in &layer.segments {
+            if s.kind.is_extruding() && s.delta_e_mm > 1.0e-6 {
+                layer_max_z = layer_max_z.max(s.p0_bed.z).max(s.p1_bed.z);
+                layer_sum_h += s.height_mm;
+                layer_ext_cnt += 1;
+            }
+        }
+        let layer_mean_h = if layer_ext_cnt > 0 {
+            layer_sum_h / (layer_ext_cnt as f32)
+        } else {
+            config.slicing.layer_height.target_mm
+        };
+
         gcode.push_str(&format!(
-            "\n; --- LAYER {} (Branch {}, Iso {:.3}) ---\n",
-            layer.layer_index, layer.branch_id, layer.isovalue
+            "\n; --- LAYER {} (Branch {}, Iso {:.3}) ---\n;LAYER_CHANGE\n;Z:{:.3}\n;HEIGHT:{:.3}\n",
+            layer.layer_index, layer.branch_id, layer.isovalue, layer_max_z, layer_mean_h
         ));
         if gcfg.emit_exclude_object {
             gcode.push_str(&format!("EXCLUDE_OBJECT_START NAME={exclude_object_name}\n"));
@@ -2257,6 +2665,21 @@ pub fn plan_and_emit_gcode_for_object(
     // Standard PLA density ~1.24 g/cm³ = 0.00124 g/mm³
     let total_filament_grams = total_filament_volume_mm3 * 0.00124;
 
+    gcode.push_str(&format_moonraker_metadata_footer(
+        total_time_s,
+        total_filament_mm,
+        total_filament_volume_mm3,
+        total_filament_grams,
+        config.slicing.layer_height.first_layer_mm,
+        config.slicing.layer_height.target_mm,
+        bbox_max.z,
+        planned_layers.len(),
+        nozzle_diam_mm,
+        gcfg.filament_diameter_mm,
+        gcfg.bed_temperature_celsius,
+        nozzle_temp_c,
+    ));
+
     PlannedGcodeResult {
         layers: planned_layers,
         gcode_text: gcode,
@@ -2428,7 +2851,14 @@ mod tests {
         assert_eq!(res.exclude_object_name, "My_Part_v1");
         assert!(res
             .gcode_text
-            .starts_with("EXCLUDE_OBJECT_DEFINE NAME=My_Part_v1 CENTER="));
+            .starts_with("; generated by PrusaSlicer 2.8.0-Manifold2 on "));
+        assert!(res.gcode_text.contains("; thumbnail begin 32x32 "));
+        assert!(res.gcode_text.contains("; thumbnail begin 300x300 "));
+        assert!(res.gcode_text.contains("; iVBORw0KGgo")); // PNG magic header in Base64
+        assert!(res.gcode_text.contains("; thumbnail end"));
+        assert!(res
+            .gcode_text
+            .contains("EXCLUDE_OBJECT_DEFINE NAME=My_Part_v1 CENTER="));
         assert!(res.gcode_text.contains("POLYGON=[["));
         assert!(res
             .gcode_text
@@ -2436,6 +2866,13 @@ mod tests {
         assert!(res
             .gcode_text
             .contains("EXCLUDE_OBJECT_END NAME=My_Part_v1\n"));
+        assert!(res.gcode_text.contains("; filament used [mm] = "));
+        assert!(res.gcode_text.contains("; filament used [cm3] = "));
+        assert!(res.gcode_text.contains("; filament used [g] = "));
+        assert!(res.gcode_text.contains("; total filament used [g] = "));
+        assert!(res
+            .gcode_text
+            .contains("; estimated printing time (normal mode) = "));
         assert!(res.gcode_text.contains("T0"));
         assert!(res.gcode_text.contains("M140 S60"));
         assert!(res.gcode_text.contains("M104 S215 T0"));

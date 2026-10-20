@@ -1902,6 +1902,15 @@ pub fn ui_workspace_system(
                                         "Emit EXCLUDE_OBJECT_DEFINE (NAME, CENTER, POLYGON) before print start and EXCLUDE_OBJECT_START / EXCLUDE_OBJECT_END per layer",
                                     )
                                     .changed();
+                                gc_changed |= ui
+                                    .checkbox(
+                                        &mut gc.emit_thumbnails,
+                                        "Embed Moonraker PNG Thumbnails (32x32 & 300x300)",
+                                    )
+                                    .on_hover_text(
+                                        "Render 3D isometric toolpath preview thumbnails and embed them as base64 PNG blocks (; thumbnail begin WxH LEN ... ; thumbnail end) for Moonraker, Mainsail, and Fluidd",
+                                    )
+                                    .changed();
 
                                 ui.collapsing("Speeds, Accelerations & Klipper Kinematics", |ui| {
                                     ui.horizontal(|ui| {

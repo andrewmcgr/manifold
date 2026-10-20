@@ -19,6 +19,7 @@ zip.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
 toml.workspace = true
+png.workspace = true
 
 [build-dependencies]
 cxx-build.workspace = true

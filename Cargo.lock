@@ -3074,6 +3074,7 @@ dependencies = [
  "cxx",
  "cxx-build",
  "egui",
+ "png",
  "quick-xml 0.39.4",
  "rfd",
  "serde",

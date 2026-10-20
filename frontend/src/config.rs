@@ -676,6 +676,8 @@ pub struct GcodeProcessConfig {
     pub gcode_origin_at_bed_center: bool,
     /// Emit Klipper `[exclude_object]` commands (`EXCLUDE_OBJECT_DEFINE`, `EXCLUDE_OBJECT_START`, `EXCLUDE_OBJECT_END`).
     pub emit_exclude_object: bool,
+    /// Embed base64-encoded PNG preview thumbnails (`32x32` and `300x300`) in the G-code header for Moonraker/Mainsail/Fluidd.
+    pub emit_thumbnails: bool,
 
     // --- Linear Speeds (mm/s) ---
     pub first_layer_speed_mms: f32,
@@ -745,6 +747,7 @@ impl Default for GcodeProcessConfig {
             wall_print_order: WallPrintOrder::InnerOuterInner,
             gcode_origin_at_bed_center: false,
             emit_exclude_object: true,
+            emit_thumbnails: true,
             first_layer_speed_mms: 45.0,
             outer_wall_speed_mms: 65.0,
             inner_wall_speed_mms: 100.0,
