@@ -1642,6 +1642,7 @@ pub fn format_moonraker_estimated_time(total_time_s: f32) -> String {
 }
 
 /// Formats the Moonraker-compatible `PrusaSlicer` metadata footer block (`metadata.py`).
+#[allow(clippy::too_many_arguments)]
 fn format_moonraker_metadata_footer(
     total_time_s: f32,
     total_filament_mm: f32,
@@ -1653,11 +1654,17 @@ fn format_moonraker_metadata_footer(
     layer_count: usize,
     nozzle_diam_mm: f32,
     filament_diam_mm: f32,
+    filament_type: &str,
     bed_temp_c: f32,
     nozzle_temp_c: f32,
 ) -> String {
     let total_filament_cm3 = total_filament_volume_mm3 / 1000.0;
     let time_str = format_moonraker_estimated_time(total_time_s);
+    let clean_filament_type = if filament_type.trim().is_empty() {
+        "PLA"
+    } else {
+        filament_type.trim()
+    };
     format!(
         concat!(
             "\n; --- Moonraker / PrusaSlicer Metadata Footer ---\n",
@@ -1672,7 +1679,7 @@ fn format_moonraker_metadata_footer(
             "; total layers count = {}\n",
             "; nozzle_diameter = {:.2}\n",
             "; filament_diameter = {:.2}\n",
-            "; filament_type = PLA\n",
+            "; filament_type = {}\n",
             "; filament_settings_id = \"Manifold2 Non-Planar\"\n",
             "; first_layer_bed_temperature = {:.0}\n",
             "; first_layer_temperature = {:.0}\n"
@@ -1688,6 +1695,7 @@ fn format_moonraker_metadata_footer(
         layer_count,
         nozzle_diam_mm,
         filament_diam_mm,
+        clean_filament_type,
         bed_temp_c,
         nozzle_temp_c,
     )
@@ -2455,11 +2463,12 @@ pub fn plan_and_emit_gcode_for_object(
     let mut emitted_accel = -1.0f32;
     let mut emitted_feed_mm_min = -1.0f32;
     let mut emitted_pa = -1.0f32;
+    let mut emitted_fan_pwm: Option<u8> = None;
     let mut last_emitted_kind: Option<PlannedMoveKind> = None;
     let mut active_retract_mm = 0.0f32;
     let mut accum_travel_time_s = 0.0f32;
 
-    for layer in &planned_layers {
+    for (layer_ord, layer) in planned_layers.iter().enumerate() {
         if layer.segments.is_empty() {
             continue;
         }
@@ -2485,6 +2494,25 @@ pub fn plan_and_emit_gcode_for_object(
         ));
         if gcfg.emit_exclude_object {
             gcode.push_str(&format!("EXCLUDE_OBJECT_START NAME={exclude_object_name}\n"));
+        }
+
+        // Emit part cooling fan command (`M107` or `M106 S0..255`) when target PWM changes
+        let target_fan_pct = if (layer_ord as u32) < gcfg.disable_fan_first_layers {
+            gcfg.first_layer_fan_speed_percent.clamp(0.0, 100.0)
+        } else {
+            gcfg.fan_speed_percent.clamp(0.0, 100.0)
+        };
+        let target_fan_pwm = (target_fan_pct * 2.55).round().clamp(0.0, 255.0) as u8;
+        if emitted_fan_pwm != Some(target_fan_pwm) {
+            if target_fan_pwm == 0 {
+                gcode.push_str("M107 ; Part cooling fan off\n");
+            } else {
+                gcode.push_str(&format!(
+                    "M106 S{target_fan_pwm} ; Part cooling fan {:.0}%\n",
+                    target_fan_pct
+                ));
+            }
+            emitted_fan_pwm = Some(target_fan_pwm);
         }
 
         for seg in &layer.segments {
@@ -2662,8 +2690,8 @@ pub fn plan_and_emit_gcode_for_object(
     }
 
     let total_filament_volume_mm3 = total_filament_mm * filament_area_mm2;
-    // Standard PLA density ~1.24 g/cm³ = 0.00124 g/mm³
-    let total_filament_grams = total_filament_volume_mm3 * 0.00124;
+    let density_g_mm3 = (gcfg.filament_density_g_cm3 * 0.001).max(0.0001);
+    let total_filament_grams = total_filament_volume_mm3 * density_g_mm3;
 
     gcode.push_str(&format_moonraker_metadata_footer(
         total_time_s,
@@ -2676,6 +2704,7 @@ pub fn plan_and_emit_gcode_for_object(
         planned_layers.len(),
         nozzle_diam_mm,
         gcfg.filament_diameter_mm,
+        &gcfg.filament_type,
         gcfg.bed_temperature_celsius,
         nozzle_temp_c,
     ));

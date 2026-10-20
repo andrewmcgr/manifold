@@ -663,8 +663,12 @@ impl WallPrintOrder {
 pub struct GcodeProcessConfig {
     /// Heated bed target temperature (°C).
     pub bed_temperature_celsius: f32,
+    /// Filament material type identifier (e.g., `"PLA"`, `"PETG"`, `"ABS"`, `"ASA"`, `"TPU"`, `"PA-CF"`).
+    pub filament_type: String,
     /// Raw filament diameter (mm), typically `1.75` or `2.85`.
     pub filament_diameter_mm: f32,
+    /// Filament bulk density (g/cm³), e.g., `1.24` for PLA, `1.27` for PETG, `1.04` for ABS.
+    pub filament_density_g_cm3: f32,
     /// Global extrusion flow multiplier (`0.5..=1.5`).
     pub extrusion_multiplier: f32,
     /// First-layer extrusion multiplier (`0.7..=1.5`).
@@ -715,7 +719,7 @@ pub struct GcodeProcessConfig {
     pub ooze_relaxation_extra_prime_mm: f32,
     pub ooze_relaxation_tau_s: f32,
 
-    // --- Non-Newtonian Rheology, Pressure Advance & Corner/Transient Flow ---
+    // --- Non-Newtonian Rheology, Pressure Advance, Die Swell & Cooling ---
     pub enable_flat_nozzle_comp: bool,
     pub enable_corner_flow_comp: bool,
     pub corner_flow_comp_ratio: f32,
@@ -731,6 +735,8 @@ pub struct GcodeProcessConfig {
     pub swell_low: f32,
     pub swell_high: f32,
     pub fan_speed_percent: f32,
+    pub first_layer_fan_speed_percent: f32,
+    pub disable_fan_first_layers: u32,
 
     // --- Start & End G-code Templates ---
     pub start_gcode_template: String,
@@ -741,7 +747,9 @@ impl Default for GcodeProcessConfig {
     fn default() -> Self {
         Self {
             bed_temperature_celsius: 60.0,
+            filament_type: "PLA".to_string(),
             filament_diameter_mm: 1.75,
+            filament_density_g_cm3: 1.24,
             extrusion_multiplier: 1.0,
             first_layer_flow_multiplier: 1.02,
             wall_print_order: WallPrintOrder::InnerOuterInner,
@@ -793,6 +801,8 @@ impl Default for GcodeProcessConfig {
             swell_low: 1.03,
             swell_high: 1.10,
             fan_speed_percent: 100.0,
+            first_layer_fan_speed_percent: 0.0,
+            disable_fan_first_layers: 1,
             start_gcode_template: concat!(
                 "; --- Manifold2 Non-Planar Print Start ---\n",
                 "; Print Bounds: X[{bbox_min_x}..{bbox_max_x}] Y[{bbox_min_y}..{bbox_max_y}] Z[{bbox_min_z}..{bbox_max_z}]\n",
@@ -824,7 +834,11 @@ impl Default for GcodeProcessConfig {
 impl GcodeProcessConfig {
     pub fn sanitize(&mut self) {
         self.bed_temperature_celsius = self.bed_temperature_celsius.clamp(0.0, 150.0);
+        if self.filament_type.trim().is_empty() {
+            self.filament_type = "PLA".to_string();
+        }
         self.filament_diameter_mm = self.filament_diameter_mm.clamp(1.0, 3.5);
+        self.filament_density_g_cm3 = self.filament_density_g_cm3.clamp(0.5, 4.0);
         self.extrusion_multiplier = self.extrusion_multiplier.clamp(0.2, 2.0);
         self.first_layer_flow_multiplier = self.first_layer_flow_multiplier.clamp(0.5, 2.0);
         self.first_layer_speed_mms = self.first_layer_speed_mms.clamp(5.0, 500.0);
@@ -843,6 +857,7 @@ impl GcodeProcessConfig {
         self.minimum_cruise_ratio = self.minimum_cruise_ratio.clamp(0.0, 0.95);
         self.max_volumetric_flow_mm3s = self.max_volumetric_flow_mm3s.clamp(1.0, 100.0);
         self.max_stepper_speed_mms = self.max_stepper_speed_mms.clamp(50.0, 2000.0);
+        self.z_travel_penalty = self.z_travel_penalty.clamp(1.0, 20.0);
         self.scarf_length_mm = self.scarf_length_mm.clamp(1.0, 40.0);
         self.scarf_start_height_ratio = self.scarf_start_height_ratio.clamp(0.02, 0.50);
         self.seam_gap_mm = self.seam_gap_mm.clamp(0.0, 1.0);
@@ -852,11 +867,23 @@ impl GcodeProcessConfig {
         self.retract_speed_mms = self.retract_speed_mms.clamp(5.0, 150.0);
         self.min_travel_for_retract_mm = self.min_travel_for_retract_mm.clamp(0.1, 20.0);
         self.z_hop_mm = self.z_hop_mm.clamp(0.0, 5.0);
+        self.ooze_relaxation_extra_prime_mm =
+            self.ooze_relaxation_extra_prime_mm.clamp(-0.5, 0.5);
+        self.ooze_relaxation_tau_s = self.ooze_relaxation_tau_s.clamp(0.1, 30.0);
+        self.corner_flow_comp_ratio = self.corner_flow_comp_ratio.clamp(0.0, 1.0);
+        self.transient_pressure_exponent = self.transient_pressure_exponent.clamp(0.05, 1.0);
+        self.transient_min_flow_multiplier = self.transient_min_flow_multiplier.clamp(0.40, 1.0);
         self.pa_low_flow_s = self.pa_low_flow_s.clamp(0.0, 0.5);
         self.pa_high_flow_s = self.pa_high_flow_s.clamp(0.0, 0.5);
-        self.swell_low = self.swell_low.clamp(1.0, 1.8);
-        self.swell_high = self.swell_high.clamp(1.0, 1.8);
+        self.pa_ref_low_flow_mm3s = self.pa_ref_low_flow_mm3s.clamp(0.1, 30.0);
+        self.pa_ref_high_flow_mm3s = self
+            .pa_ref_high_flow_mm3s
+            .clamp(self.pa_ref_low_flow_mm3s + 0.5, 100.0);
+        self.swell_low = self.swell_low.clamp(1.0, 2.0);
+        self.swell_high = self.swell_high.clamp(self.swell_low, 2.0);
         self.fan_speed_percent = self.fan_speed_percent.clamp(0.0, 100.0);
+        self.first_layer_fan_speed_percent = self.first_layer_fan_speed_percent.clamp(0.0, 100.0);
+        self.disable_fan_first_layers = self.disable_fan_first_layers.min(20);
     }
 
     /// Effective minimum travel distance before triggering a retraction, accounting for scarf joint length.
@@ -932,6 +959,737 @@ impl SlicerConfig {
     }
 }
 
+/// Structured documentation entry for a single configuration parameter.
+/// Used both to render interactive `?` help popups in the UI and to generate
+/// complete Markdown reference documentation via [`generate_parameter_docs_markdown`].
+#[derive(Clone, Copy, Debug)]
+pub struct ParameterDoc {
+    /// Hierarchical dotted parameter key (e.g. `"gcode.extrusion_multiplier"`).
+    pub key: &'static str,
+    /// Human-readable category grouping.
+    pub category: &'static str,
+    /// Display title for popups and reference tables.
+    pub title: &'static str,
+    /// Physical units or value range description (empty if unitless/boolean).
+    pub units: &'static str,
+    /// Default value formatted as a string.
+    pub default_value: &'static str,
+    /// Concise 1-sentence summary shown at the top of the help popup.
+    pub summary: &'static str,
+    /// Detailed explanation of the physical/geometric behavior and tuning advice.
+    pub details: &'static str,
+}
+
+/// Complete structured parameter documentation catalog for Manifold2.
+pub const PARAMETER_DOCS: &[ParameterDoc] = &[
+    // --- Eikonal Field & Orientation Hints ---
+    ParameterDoc {
+        key: "eikonal.voxel_size_mm",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "OpenVDB Voxel Size",
+        units: "mm",
+        default_value: "0.50 mm",
+        summary: "Spatial resolution of the OpenVDB signed-distance and Eikonal time-of-arrival grids.",
+        details: "Smaller voxel sizes capture finer geometric detail and sharper non-planar curvature transitions at the cost of cubic memory and compute scaling. Typically set near 1x-1.5x the nozzle diameter.",
+    },
+    ParameterDoc {
+        key: "eikonal.narrow_band_width_voxels",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Narrow-Band Half-Width",
+        units: "voxels",
+        default_value: "6.0 voxels",
+        summary: "Half-width of the active OpenVDB level-set narrow band around the object boundary.",
+        details: "Controls how many voxel layers outside the surface are allocated in the sparse OpenVDB tree before flood-filling the interior.",
+    },
+    ParameterDoc {
+        key: "eikonal.solver_iterations",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Eikonal Solver Iterations",
+        units: "sweeps",
+        default_value: "4",
+        summary: "Number of Gauss-Seidel / Fast-Sweeping passes for the anisotropic Eikonal field.",
+        details: "More iterations improve convergence when strong surface/point orientation hints or complex multi-branch topologies bend the arrival-time field.",
+    },
+    ParameterDoc {
+        key: "eikonal.curvature_regularization",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Curvature Regularization",
+        units: "0.0 .. 1.0",
+        default_value: "0.15",
+        summary: "Laplacian smoothing weight applied to the target director field before Eikonal integration.",
+        details: "Prevents sharp creases or self-intersecting shocks in the conformal slicing isosurfaces when adjacent surface hints disagree.",
+    },
+    ParameterDoc {
+        key: "eikonal.default_surface_hint_depth_mm",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Default Surface Hint Depth",
+        units: "mm",
+        default_value: "8.0 mm",
+        summary: "Default inward influence distance for newly placed surface tangency/orthogonality hints.",
+        details: "Determines how deep into the part interior a B-Rep face or mesh patch hint steers the Eikonal gradient (∇τ).",
+    },
+    ParameterDoc {
+        key: "eikonal.default_point_hint_radius_mm",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Default 3D Point Hint Radius",
+        units: "mm",
+        default_value: "12.0 mm",
+        summary: "Default spherical influence radius for newly placed 3D point orientation hints.",
+        details: "Within this radius, the Eikonal layer normal is softly steered toward the 3D arrow direction using a smooth Wendland radial falloff.",
+    },
+    ParameterDoc {
+        key: "eikonal.default_hint_weight",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Default Hint Soft Weight",
+        units: "0.05 .. 1.0",
+        default_value: "0.85",
+        summary: "Relative blending strength of newly placed orientation hints against gravity/nozzle defaults.",
+        details: "Hints act as soft constraints: they steer the layer normal where feasible but never override hard toolhead clearance or maximum slope limits.",
+    },
+
+    // --- Non-Planar Slicing & Variable Layer Height ---
+    ParameterDoc {
+        key: "slicing.layer_height.target_mm",
+        category: "Non-Planar Layer Slicing",
+        title: "Target Layer Thickness",
+        units: "mm",
+        default_value: "0.20 mm",
+        summary: "Nominal layer thickness along the local surface normal between consecutive conformal isosurfaces.",
+        details: "Because non-planar isosurfaces expand and contract across curved geometry, the bidirectional branch selector chooses isovalues so the mean normal spacing matches this target while respecting [Min, Max] bounds.",
+    },
+    ParameterDoc {
+        key: "slicing.layer_height.min_mm",
+        category: "Non-Planar Layer Slicing",
+        title: "Minimum Layer Thickness",
+        units: "mm",
+        default_value: "0.08 mm",
+        summary: "Lower bound on local layer thickness where conformal layers pinch or converge.",
+        details: "Prevents nozzle scraping or starved extrusion when non-planar layers compress over high-curvature regions.",
+    },
+    ParameterDoc {
+        key: "slicing.layer_height.max_mm",
+        category: "Non-Planar Layer Slicing",
+        title: "Maximum Layer Thickness",
+        units: "mm",
+        default_value: "0.32 mm",
+        summary: "Upper bound on local layer thickness where conformal layers fan out.",
+        details: "Should not exceed ~75-80% of the nozzle diameter so extruded beads maintain adequate inter-layer squish and bond strength.",
+    },
+    ParameterDoc {
+        key: "slicing.layer_height.first_layer_mm",
+        category: "Non-Planar Layer Slicing",
+        title: "First Layer Thickness",
+        units: "mm",
+        default_value: "0.20 mm",
+        summary: "Target thickness of the initial build-plate adhesion layer.",
+        details: "A slightly thicker first layer (e.g. 0.20-0.25 mm for a 0.4 mm nozzle) tolerates minor bed unevenness and improves first-layer adhesion.",
+    },
+    ParameterDoc {
+        key: "slicing.layer_height.top_layer_mm",
+        category: "Non-Planar Layer Slicing",
+        title: "Top Layer Thickness",
+        units: "mm",
+        default_value: "0.20 mm",
+        summary: "Target thickness for terminal top surface layers of each branch.",
+        details: "Reducing top layer thickness produces smoother conformal top skins with finer step resolution.",
+    },
+    ParameterDoc {
+        key: "slicing.max_nonplanar_slope_deg",
+        category: "Non-Planar Layer Slicing",
+        title: "Maximum Non-Planar Slope Angle",
+        units: "deg (°)",
+        default_value: "35.0°",
+        summary: "Maximum allowed angle between the isosurface normal (∇τ) and the nozzle axis.",
+        details: "Clamps the Eikonal gradient cone so conformal layers never tilt steeper than your nozzle/fan shroud clearance allows.",
+    },
+
+    // --- Shell & Toolpath Generation ---
+    ParameterDoc {
+        key: "slicing.shell_thickness_mm",
+        category: "Shell & Toolpath Generation",
+        title: "Conformal 3D Shell Thickness",
+        units: "mm",
+        default_value: "0.80 mm",
+        summary: "True 3D Euclidean thickness of the dense outer skin measured via the object's signed distance field (-φ_sdf <= T_shell).",
+        details: "Unlike planar slicers that count top/bottom layers vertically, Manifold2 enforces a uniform 3D shell thickness everywhere (roofs, floors, and sloped walls) using the OpenVDB SDF.",
+    },
+    ParameterDoc {
+        key: "slicing.inner_wall_count",
+        category: "Shell & Toolpath Generation",
+        title: "Inner Wall Loop Count",
+        units: "loops",
+        default_value: "2",
+        summary: "Number of concentric inner perimeter loops printed inside the outer wall.",
+        details: "Inner walls back up the outer perimeter and provide structural stiffness before transitioning to solid or sparse infill.",
+    },
+    ParameterDoc {
+        key: "slicing.min_extrusion_length_mm",
+        category: "Shell & Toolpath Generation",
+        title: "Minimum Extrusion Path Length",
+        units: "mm",
+        default_value: "0.80 mm",
+        summary: "Shortest isolated gap-fill or infill segment that will be emitted instead of culled.",
+        details: "Filters out microscopic islands shorter than ~2x nozzle diameter that would otherwise cause blobs and unnecessary retractions.",
+    },
+    ParameterDoc {
+        key: "slicing.solid_infill_pattern",
+        category: "Shell & Toolpath Generation",
+        title: "Solid Shell Infill Pattern",
+        units: "",
+        default_value: "Monotonic",
+        summary: "Toolpath pattern used inside the dense 3D shell band (-φ_sdf <= T_shell).",
+        details: "Monotonic lines alternate direction by 90° each layer for flat, ridge-free skins; Concentric follows the 3D shell boundary inward.",
+    },
+    ParameterDoc {
+        key: "slicing.sparse_infill_pattern",
+        category: "Shell & Toolpath Generation",
+        title: "Sparse Core Infill Pattern",
+        units: "",
+        default_value: "Gyroid (3D TPMS)",
+        summary: "Volumetric infill pattern inside the core interior (-φ_sdf > T_shell).",
+        details: "Supports true 3D Triply Periodic Minimal Surfaces (Gyroid, Schwarz-P, Schwarz-D) intersected directly with curved non-planar isosurfaces, as well as Rectilinear, Grid, Triangles, Honeycomb, and Cubic.",
+    },
+    ParameterDoc {
+        key: "slicing.infill_density_percent",
+        category: "Shell & Toolpath Generation",
+        title: "Sparse Infill Density",
+        units: "%",
+        default_value: "20.0%",
+        summary: "Target volume fraction of sparse infill in the core interior.",
+        details: "Determines the spatial period/pitch of TPMS lattices or line spacing of 2D/3D infill patterns. Set to 0% for hollow parts or 100% for solid parts.",
+    },
+    ParameterDoc {
+        key: "slicing.infill_angle_deg",
+        category: "Shell & Toolpath Generation",
+        title: "Base Infill Orientation Angle",
+        units: "deg (°)",
+        default_value: "45.0°",
+        summary: "In-plane rotation angle of infill lattices and monotonic/rectilinear rasters in bed XY coordinates.",
+        details: "Rotates the infill coordinate frame around the bed Z axis to align structural ribs with primary load directions.",
+    },
+    ParameterDoc {
+        key: "slicing.line_widths",
+        category: "Shell & Toolpath Generation",
+        title: "Arachne-Style Variable Line Widths (Target / Min / Max)",
+        units: "mm",
+        default_value: "0.42 / 0.28 / 0.56 mm",
+        summary: "Target, minimum, and maximum extruded bead widths for Outer Walls, Inner Walls, Solid Infill, and Sparse Infill.",
+        details: "Medial-axis adaptive bead sizing dynamically widens or narrows walls within [Min, Max] to fill thin wedges without leaving voids or requiring tiny gap-fill fragments.",
+    },
+
+    // --- Filament, Multipliers & Cooling ---
+    ParameterDoc {
+        key: "gcode.wall_print_order",
+        category: "G-code General & Filament",
+        title: "Wall Printing Order",
+        units: "",
+        default_value: "Inner -> Outer -> Backing (In-Out-In)",
+        summary: "Sequence in which concentric perimeter loops are extruded on each layer.",
+        details: "In-Out-In prints deep inner walls [n..2], then the visible outer wall [0] unconfined for maximum dimensional accuracy, and finally backing wall [1] to lock the outer wall in place. Outside-In prints [0..n] sequentially.",
+    },
+    ParameterDoc {
+        key: "gcode.emit_exclude_object",
+        category: "G-code General & Filament",
+        title: "Emit Klipper EXCLUDE_OBJECT Commands",
+        units: "bool",
+        default_value: "true",
+        summary: "Emits Klipper EXCLUDE_OBJECT_DEFINE, EXCLUDE_OBJECT_START, and EXCLUDE_OBJECT_END macros.",
+        details: "Allows cancelling individual failed parts mid-print in Mainsail/Fluidd/KlipperScreen using the convex-hull footprint polygon.",
+    },
+    ParameterDoc {
+        key: "gcode.emit_thumbnails",
+        category: "G-code General & Filament",
+        title: "Embed Moonraker 3D Preview Thumbnails",
+        units: "bool",
+        default_value: "true",
+        summary: "Renders 32x32 and 300x300 isometric 3D toolpath PNG thumbnails into the G-code header.",
+        details: "Formatted as PrusaSlicer/Moonraker `; thumbnail begin WxH LEN` base64 blocks so Mainsail, Fluidd, and KlipperScreen display a 3D preview of the non-planar toolpaths.",
+    },
+    ParameterDoc {
+        key: "gcode.filament_type",
+        category: "Filament, Multipliers & Cooling",
+        title: "Filament Material Type",
+        units: "",
+        default_value: "PLA",
+        summary: "Material identifier written to Moonraker G-code metadata (e.g. PLA, PETG, ABS, ASA, TPU, PA-CF).",
+        details: "Used by Moonraker, Mainsail, Fluidd, and Spoolman to match filament spools and display material badges.",
+    },
+    ParameterDoc {
+        key: "gcode.filament_diameter_mm",
+        category: "Filament, Multipliers & Cooling",
+        title: "Filament Diameter",
+        units: "mm",
+        default_value: "1.75 mm",
+        summary: "Nominal diameter of the raw feedstock filament entering the extruder.",
+        details: "Determines the cross-sectional area A_fil = π*(D_fil/2)² used to convert volumetric extrusion into E-axis stepper distance.",
+    },
+    ParameterDoc {
+        key: "gcode.filament_density_g_cm3",
+        category: "Filament, Multipliers & Cooling",
+        title: "Filament Density",
+        units: "g/cm³",
+        default_value: "1.24 g/cm³",
+        summary: "Bulk mass density of the filament material in grams per cubic centimeter.",
+        details: "Used to compute total part weight in grams for the UI and Moonraker metadata (typical values: PLA 1.24, PETG 1.27, ABS 1.04, ASA 1.07, TPU 1.21).",
+    },
+    ParameterDoc {
+        key: "gcode.extrusion_multiplier",
+        category: "Filament, Multipliers & Cooling",
+        title: "Global Extrusion Multiplier",
+        units: "ratio (×)",
+        default_value: "1.00×",
+        summary: "Global volumetric flow scaling factor applied to all extruding moves.",
+        details: "Use to calibrate slight over- or under-extrusion for specific filament batches (e.g. 0.95-0.98 for moisture-sensitive or foaming filaments).",
+    },
+    ParameterDoc {
+        key: "gcode.first_layer_flow_multiplier",
+        category: "Filament, Multipliers & Cooling",
+        title: "First-Layer Flow Multiplier",
+        units: "ratio (×)",
+        default_value: "1.02×",
+        summary: "Additional flow multiplier applied on the first layer (layer_index == 0).",
+        details: "Slightly increasing first-layer flow (e.g. 1.02-1.05×) helps fill micro-texture on textured PEI plates for reliable bed adhesion.",
+    },
+    ParameterDoc {
+        key: "gcode.fan_speed_percent",
+        category: "Filament, Multipliers & Cooling",
+        title: "Part Cooling Fan Speed",
+        units: "%",
+        default_value: "100%",
+        summary: "Steady-state part cooling fan duty cycle (M106 S0..255) after the initial fan-disabled layers.",
+        details: "Crucial for non-planar overhangs and bridges. Typically 100% for PLA, 30-50% for PETG, and 0-20% for ABS/ASA inside an enclosure.",
+    },
+    ParameterDoc {
+        key: "gcode.first_layer_fan_speed_percent",
+        category: "Filament, Multipliers & Cooling",
+        title: "First-Layer Fan Speed",
+        units: "%",
+        default_value: "0%",
+        summary: "Part cooling fan speed applied during the initial `Disable Fan First Layers` count.",
+        details: "Usually kept at 0% (emits M107) on the first layer so the polymer bonds to the heated bed without thermal shock or warping.",
+    },
+    ParameterDoc {
+        key: "gcode.disable_fan_first_layers",
+        category: "Filament, Multipliers & Cooling",
+        title: "Use First-Layer Fan Speed for First N Layers",
+        units: "layers",
+        default_value: "1 layer",
+        summary: "Number of initial layers that use `First-Layer Fan Speed` before ramping to `Part Cooling Fan Speed`.",
+        details: "Setting to 1-3 layers prevents base-corner lifting before full cooling kicks in.",
+    },
+
+    // --- Speeds, Accelerations & Stepper Kinematics ---
+    ParameterDoc {
+        key: "gcode.wall_speeds_mms",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Outer & Inner Wall Speeds",
+        units: "mm/s",
+        default_value: "65 / 100 mm/s",
+        summary: "Target linear feedrates for visible outer perimeters and structural inner perimeters.",
+        details: "Moderate outer wall speeds minimize ringing and gloss variations; inner walls can run faster while remaining capped by Max Volumetric Flow.",
+    },
+    ParameterDoc {
+        key: "gcode.infill_speeds_mms",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Solid & Sparse Infill Speeds",
+        units: "mm/s",
+        default_value: "130 / 160 mm/s",
+        summary: "Target linear feedrates for dense 3D shell infill and interior sparse infill.",
+        details: "Automatically throttled if `width × height × speed` would exceed `Max Volumetric Flow (mm³/s)`.",
+    },
+    ParameterDoc {
+        key: "gcode.gap_fill_speed_mms",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Gap Fill Speed",
+        units: "mm/s",
+        default_value: "60 mm/s",
+        summary: "Target linear feedrate for narrow medial-axis gap-fill beads.",
+        details: "Kept conservative because gap-fill paths often have rapidly varying width and high curvature.",
+    },
+    ParameterDoc {
+        key: "gcode.first_layer_and_travel_speed_mms",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "First-Layer & Rapid Travel Speeds",
+        units: "mm/s",
+        default_value: "45 / 250 mm/s",
+        summary: "Feedrate for all extruding moves on the first layer and non-extruding rapid G0 moves.",
+        details: "Slower first-layer speeds ensure consistent melt wetting on the build plate; high travel speeds minimize ooze time during non-extruding hops.",
+    },
+    ParameterDoc {
+        key: "gcode.z_hop_speed_mms",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Nozzle Clearance Lift (Z-Hop) Speed",
+        units: "mm/s",
+        default_value: "25 mm/s",
+        summary: "Feedrate for clearance lifts along the local nozzle axis (`z_nozzle`) before/after travels.",
+        details: "In Manifold2, clearance hops lift along the local nozzle axis (Rule 1), not hardcoded +Z. Keep within leadscrew/z-belt torque limits.",
+    },
+    ParameterDoc {
+        key: "gcode.accelerations_mms2",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Feature Accelerations (Outer Wall / Inner Wall / Infill / Travel)",
+        units: "mm/s²",
+        default_value: "2500 / 4500 / 6500 / 9000 mm/s²",
+        summary: "Per-feature acceleration limits emitted via deadband-compacted `SET_VELOCITY_LIMIT ACCEL=...`.",
+        details: "Lower outer-wall acceleration preserves surface finish below input-shaper vibration thresholds, while higher inner-wall, infill, and travel accelerations reduce print time.",
+    },
+    ParameterDoc {
+        key: "gcode.square_corner_velocity_mms",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Square Corner Velocity (SCV)",
+        units: "mm/s",
+        default_value: "5.0 mm/s",
+        summary: "Klipper instantaneous junction velocity at a 90° corner.",
+        details: "Controls both the chained lookahead planner's junction speeds and the centripetal junction smoothing arc radius R_eff used for corner over-extrusion compensation.",
+    },
+    ParameterDoc {
+        key: "gcode.minimum_cruise_ratio",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Minimum Cruise Ratio",
+        units: "0.0 .. 0.90",
+        default_value: "0.50",
+        summary: "Klipper `minimum_cruise_ratio` enforcing a minimum constant-speed fraction on short back-to-back moves.",
+        details: "Prevents pure triangular velocity profiles on dense non-planar polylines that would otherwise excite high-frequency resonance.",
+    },
+    ParameterDoc {
+        key: "gcode.max_volumetric_flow_mm3s",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Maximum Hotend Volumetric Flow",
+        units: "mm³/s",
+        default_value: "18.0 mm³/s",
+        summary: "Hard ceiling on volumetric extrusion rate Q = width × height × speed.",
+        details: "Because non-planar layers vary continuously in both thickness (h) and Arachne width (w), the planner dynamically caps segment speed to `Q_max / (w × h)` so the hotend melt zone is never outrun.",
+    },
+    ParameterDoc {
+        key: "gcode.use_stepper_dynamics",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Stepper Back-EMF Torque Roll-off",
+        units: "bool",
+        default_value: "true",
+        summary: "Models high-speed stepper motor back-EMF torque drop (`a_eff(v) = a_0 * (1 - v / v_max_stepper)`).",
+        details: "Prevents skipped steps during fast travels and high-flow infills by replacing constant acceleration with exponential velocity-dependent acceleration envelopes.",
+    },
+    ParameterDoc {
+        key: "gcode.max_stepper_speed_mms",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Stepper Pull-Out Velocity (v_max_stepper)",
+        units: "mm/s",
+        default_value: "400 mm/s",
+        summary: "Asymptotic stepper velocity where back-EMF reduces available acceleration torque to zero.",
+        details: "Used when `Stepper Back-EMF Torque Roll-off` is enabled to bound reachable peak speeds on long segments.",
+    },
+    ParameterDoc {
+        key: "gcode.z_travel_penalty",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Z-Axis Travel Distance Penalty",
+        units: "weight",
+        default_value: "4.0×",
+        summary: "Penalty multiplier applied to vertical ΔZ displacements during nearest-neighbor path ordering and seam placement.",
+        details: "Discourages unnecessary up-and-down non-planar jumps across curved layers when ordering islands and infill lines.",
+    },
+
+    // --- Seams, 3D Scarf Joint, Wipe & Retraction ---
+    ParameterDoc {
+        key: "gcode.enable_scarf_joint",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "3D Conformal Scarf Joint",
+        units: "bool",
+        default_value: "true",
+        summary: "Replaces abrupt loop start/stop seams with a 3D helical ramp along the local nozzle axis (`z_nozzle`).",
+        details: "Ramps bead height and flow linearly over `Scarf Length (mm)` at the start and end of closed loops so the overlap blends seamlessly.",
+    },
+    ParameterDoc {
+        key: "gcode.scarf_length_mm",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Scarf Joint Ramp Length",
+        units: "mm",
+        default_value: "8.0 mm",
+        summary: "Arc length along the closed perimeter over which the 3D scarf joint ramps from `Scarf Start Height Ratio` to 100%.",
+        details: "Longer ramps (6-12 mm) make outer-wall seams virtually invisible on smooth non-planar surfaces.",
+    },
+    ParameterDoc {
+        key: "gcode.scarf_start_height_ratio",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Scarf Start Height Ratio",
+        units: "0.02 .. 0.50",
+        default_value: "0.12",
+        summary: "Initial fraction of full layer height at the leading tip of the scarf ramp.",
+        details: "Starts the scarf wedge at `h_start = ratio × h_layer` and finishes the loop at `(1 - ratio) × h_layer` so the two wedges sum to 100% height.",
+    },
+    ParameterDoc {
+        key: "gcode.seam_gap_mm",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Loop Seam Coast Gap",
+        units: "mm",
+        default_value: "0.06 mm",
+        summary: "Arc length trimmed from the end of a closed loop before the seam to prevent overlap bulges.",
+        details: "Compensates for residual nozzle pressure at loop closure.",
+    },
+    ParameterDoc {
+        key: "gcode.pre_retract_taper_mm",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Pre-Retract Flow Taper Length",
+        units: "mm",
+        default_value: "1.0 mm",
+        summary: "Distance before the end of an extrusion chain over which flow tapers slightly to bleed melt pressure.",
+        details: "Reduces stringing and end-of-path blobs before a retraction + wipe.",
+    },
+    ParameterDoc {
+        key: "gcode.wipe_length_mm",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Post-Extrusion Wipe Distance",
+        units: "mm",
+        default_value: "1.5 mm",
+        summary: "Non-extruding wipe travel distance along the path before lifting the nozzle.",
+        details: "On closed loops, wipes forward across the seam; on open paths, wipes backward along the just-printed trace so the nozzle never protrudes outside the part.",
+    },
+    ParameterDoc {
+        key: "gcode.retract_length_mm",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Nominal Retraction Length",
+        units: "mm",
+        default_value: "0.80 mm",
+        summary: "Baseline filament pullback distance before travel moves exceeding `Min Travel for Retract`.",
+        details: "Adapted dynamically based on residual melt-zone pressure (`K_pa × Q`). Typical values: 0.4-1.0 mm for direct-drive, 3.0-6.0 mm for Bowden.",
+    },
+    ParameterDoc {
+        key: "gcode.retract_speed_mms",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Retract & Unretract Speed",
+        units: "mm/s",
+        default_value: "45 mm/s",
+        summary: "Extruder feedrate used for G1 E-retract and E+unretract moves.",
+        details: "Fast enough to break filament strands cleanly without grinding the filament drive gear.",
+    },
+    ParameterDoc {
+        key: "gcode.min_travel_for_retract_mm",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Minimum Travel Distance for Retraction",
+        units: "mm",
+        default_value: "1.50 mm",
+        summary: "Shortest non-extruding travel move that triggers a retraction and nozzle clearance hop.",
+        details: "Suppresses redundant retractions between adjacent walls or tightly spaced infill lines.",
+    },
+    ParameterDoc {
+        key: "gcode.z_hop_mm",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Nozzle Clearance Hop Height",
+        units: "mm",
+        default_value: "0.40 mm",
+        summary: "Distance lifted along the local nozzle axis (`z_nozzle`) during retracted travel moves.",
+        details: "Essential for non-planar printing so the nozzle clears curved crests between islands.",
+    },
+    ParameterDoc {
+        key: "gcode.ooze_relaxation",
+        category: "Seams, Scarf Joint & Retraction",
+        title: "Thermal Ooze & Die-Swell Unretract Relaxation",
+        units: "mm / s",
+        default_value: "-0.02 mm / τ = 1.50 s",
+        summary: "Adjusts unretract prime length as an exponential function of travel duration (`1 - exp(-t / τ)`).",
+        details: "Short hops slightly under-prime to avoid viscoelastic swell blobs; long travels decay toward full prime as melt pressure relaxes.",
+    },
+
+    // --- Non-Newtonian Rheology, Die Swell & Transient Flow ---
+    ParameterDoc {
+        key: "gcode.enable_flat_nozzle_comp",
+        category: "Rheology, Die Swell & Dynamic PA",
+        title: "Flat-Nozzle Annular Slope Clearance",
+        units: "bool",
+        default_value: "true",
+        summary: "Elevates the nozzle tip along `z_nozzle` on sloped outer walls (`Δz = R_flat * sin(α) * (1 - cos(α))`).",
+        details: "Prevents the flat brass land surrounding the nozzle orifice from gouging the uphill side of a sloped conformal layer.",
+    },
+    ParameterDoc {
+        key: "gcode.pa_low_high_s",
+        category: "Rheology, Die Swell & Dynamic PA",
+        title: "Shear-Thinning Pressure Advance (k_low / k_high)",
+        units: "s",
+        default_value: "0.042 s / 0.024 s",
+        summary: "Pressure Advance time constants at low and high reference volumetric flow rates.",
+        details: "Polymer melts are shear-thinning (power-law index n < 1): effective PA decreases at higher volumetric flows. Manifold2 interpolates k(Q) via a power law between Q_low and Q_high.",
+    },
+    ParameterDoc {
+        key: "gcode.pa_ref_flows_mm3s",
+        category: "Rheology, Die Swell & Dynamic PA",
+        title: "PA Reference Flow Rates (Q_low / Q_high)",
+        units: "mm³/s",
+        default_value: "2.0 / 14.0 mm³/s",
+        summary: "Low and high volumetric flow calibration anchor points for power-law Pressure Advance and Die Swell.",
+        details: "Defines the flow range `[Q_low, Q_high]` over which `k_low..k_high` and the low/high-flow die-swell multipliers are calibrated.",
+    },
+    ParameterDoc {
+        key: "gcode.swell_multipliers",
+        category: "Rheology, Die Swell & Dynamic PA",
+        title: "Low-Flow & High-Flow Die-Swell Extrusion Multipliers",
+        units: "ratio (×)",
+        default_value: "0.971× (low) / 0.909× (high)",
+        summary: "Reciprocal viscoelastic die-swell extrusion multipliers (`1 / swell_low` and `1 / swell_high`) at `Q_low` and `Q_high`.",
+        details: "Viscoelastic polymer melts expand radially exiting the nozzle orifice (die swell increases with shear rate). Expressing die swell as reciprocal extrusion multipliers (< 1.0×) scales down flow and insets outer walls at high shear rates to prevent over-extrusion.",
+    },
+    ParameterDoc {
+        key: "gcode.enable_dynamic_pa",
+        category: "Rheology, Die Swell & Dynamic PA",
+        title: "Emit Dynamic SET_PRESSURE_ADVANCE Commands",
+        units: "bool",
+        default_value: "true",
+        summary: "Emits deadband-compacted `SET_PRESSURE_ADVANCE ADVANCE=...` updates as segment volumetric flow changes.",
+        details: "Automatically adapts Klipper's Pressure Advance across slow outer walls, variable-thickness non-planar layers, and high-flow infill.",
+    },
+    ParameterDoc {
+        key: "gcode.enable_slicer_pa_subdivision",
+        category: "Rheology, Die Swell & Dynamic PA",
+        title: "Slicer-Side Trapezoidal PA Subdivision",
+        units: "bool",
+        default_value: "false",
+        summary: "Subdivides each segment into entry-accel, cruise, and exit-decel sub-segments with pre-compensated E values (`ADVANCE=0`).",
+        details: "Useful for multi-axis controllers or firmwares without native nonlinear PA; disables firmware PA (`SET_PRESSURE_ADVANCE ADVANCE=0.0000`) when active.",
+    },
+    ParameterDoc {
+        key: "gcode.corner_flow_comp",
+        category: "Rheology, Die Swell & Dynamic PA",
+        title: "Klipper SCV Corner Flow Compensation",
+        units: "bool / ratio",
+        default_value: "true (ratio 0.85)",
+        summary: "Deducts both geometric inner-corner diamond overlap and Klipper SCV centripetal shortcut volume at corners.",
+        details: "Eliminates corner bulging on sharp perimeter turns by reducing extrusion on the segments immediately entering and exiting each corner.",
+    },
+    ParameterDoc {
+        key: "gcode.transient_pressure_comp",
+        category: "Rheology, Die Swell & Dynamic PA",
+        title: "Melt-Zone Transient Pressure Compensation",
+        units: "bool / exp / min×",
+        default_value: "true (exp 0.35, min 0.72×)",
+        summary: "First-order lag model of nozzle melt-chamber pressure across variable-width/height segments.",
+        details: "When stepping down from high-flow to low-flow segments, temporarily throttles extrusion (`>= Min Multiplier`) while stored melt-zone pressure discharges.",
+    },
+
+    // --- Start & End G-code Templates ---
+    ParameterDoc {
+        key: "gcode.bed_temperature_celsius",
+        category: "Start & End G-code Templates",
+        title: "Heated Bed Temperature",
+        units: "°C",
+        default_value: "60 °C",
+        summary: "Target build plate temperature substituted into `{bed_temp}` (`M140`/`M190`) and Moonraker metadata.",
+        details: "Typical values: 55-65 °C for PLA, 70-85 °C for PETG, 95-110 °C for ABS/ASA.",
+    },
+    ParameterDoc {
+        key: "gcode.templates",
+        category: "Start & End G-code Templates",
+        title: "Start & End G-code Templates",
+        units: "G-code",
+        default_value: "Standard Klipper M140/M104/G28/M190/M109",
+        summary: "Customizable start and end G-code blocks with `{bed_temp}`, `{nozzle_temp}`, `{tool_id}`, and bounding-box placeholders.",
+        details: "Supports `{tool_id}`, `{nozzle_temp}`, `{bed_temp}`, `{nozzle_diameter}`, `{bbox_min_x..z}`, `{bbox_max_x..z}`, `{bbox_center_x..y}`, and `{layer_count}`.",
+    },
+
+    // --- Machine Tools & Multi-Axis Kinematics ---
+    ParameterDoc {
+        key: "tools.nozzle_diameter_mm",
+        category: "Machine Tools & Multi-Axis Kinematics",
+        title: "Tool Nozzle Orifice Diameter",
+        units: "mm",
+        default_value: "0.40 mm",
+        summary: "Orifice diameter of the active extrusion tool.",
+        details: "Sets baseline extrusion widths, minimum path length presets, and flat-nozzle land radius (`R_flat = D_nozzle`).",
+    },
+    ParameterDoc {
+        key: "tools.temperature_celsius",
+        category: "Machine Tools & Multi-Axis Kinematics",
+        title: "Tool Hotend Temperature",
+        units: "°C",
+        default_value: "215 °C",
+        summary: "Target hotend temperature for the selected tool (`{nozzle_temp}`).",
+        details: "Emitted via `M104`/`M109` in the start G-code and recorded in Moonraker metadata.",
+    },
+    ParameterDoc {
+        key: "tools.rotational_axes",
+        category: "Machine Tools & Multi-Axis Kinematics",
+        title: "5/6-Axis Rotational Toolhead & Max Tilt Angle",
+        units: "bool / deg (°)",
+        default_value: "true / 45.0°",
+        summary: "Indicates whether the toolhead can tilt its nozzle axis (`z_nozzle`) away from the bed normal up to `Max Angle`.",
+        details: "Follows AGENTS.md Rule 1: all tool clearance profiles and non-planar offsets are evaluated in the local orthonormal nozzle frame `(x_nozzle, y_nozzle, z_nozzle)`.",
+    },
+    ParameterDoc {
+        key: "tools.clearance_profile_xz",
+        category: "Machine Tools & Multi-Axis Kinematics",
+        title: "Nozzle Clearance Profile (XZ in Nozzle Frame)",
+        units: "mm (X radius, Z height)",
+        default_value: "4-point cone profile",
+        summary: "Piecewise-linear radial envelope `(X_radius, Z_height)` of the nozzle tip, heater block, and fan shroud.",
+        details: "Defined in the local nozzle frame (`Z >= 0` up along `nozzle_axis`, `X >= 0` radial distance) to bound collision-free non-planar slopes.",
+    },
+    ParameterDoc {
+        key: "machine.bed_tilt_deg",
+        category: "Machine Tools & Multi-Axis Kinematics",
+        title: "5-Axis Build Plate Tilt (Rx / Ry)",
+        units: "deg (°)",
+        default_value: "0.0° / 0.0°",
+        summary: "Tilts the build plate relative to world gravity, updating the bed-coordinate gravity vector `g_bed`.",
+        details: "Follows AGENTS.md Rule 2: overhang fields and gravity-aware calculations always query `g_bed` rather than assuming gravity is `(0, 0, -1)`.",
+    },
+
+    // --- Print Bed & Auto-Arrangement ---
+    ParameterDoc {
+        key: "bed.geometry",
+        category: "Print Bed & Arrangement",
+        title: "Print Bed Shape & Dimensions (Width X / Depth Y / Max Z)",
+        units: "mm",
+        default_value: "Rectangular 256 × 256 × 256 mm",
+        summary: "Physical build volume dimensions and shape (Rectangular or Circular Delta).",
+        details: "Used for viewport grid rendering, spiral auto-arrangement bounds, and front-left vs. center G-code coordinate origin translation.",
+    },
+    ParameterDoc {
+        key: "gcode.gcode_origin_at_bed_center",
+        category: "Print Bed & Arrangement",
+        title: "G-code Origin at Bed Center (0, 0)",
+        units: "bool",
+        default_value: "false (Front-Left for Rectangular)",
+        summary: "Controls whether exported G-code places `(X0, Y0)` at the bed center or at the front-left corner.",
+        details: "Standard Cartesian/CoreXY printers (Voron, Bambu, Prusa) home `(0, 0)` at the front-left corner (`[0..W, 0..D]`), whereas Delta printers place `(0, 0)` at the bed center.",
+    },
+    ParameterDoc {
+        key: "arrangement.margins_mm",
+        category: "Print Bed & Arrangement",
+        title: "Auto-Arrangement Part Clearance & Bed Margin",
+        units: "mm",
+        default_value: "4.0 mm clearance / 5.0 mm margin",
+        summary: "Minimum XY gap between parts and safety margin from the build plate edge during spiral auto-arrangement.",
+        details: "Increase `Part Clearance` when printing tall non-planar parts sequentially or when using wide toolhead shrouds.",
+    },
+];
+
+/// Looks up the structured documentation entry for `key` in [`PARAMETER_DOCS`].
+pub fn lookup_parameter_doc(key: &str) -> Option<&'static ParameterDoc> {
+    PARAMETER_DOCS.iter().find(|doc| doc.key == key)
+}
+
+/// Generates a complete Markdown reference document from [`PARAMETER_DOCS`], grouped by category.
+pub fn generate_parameter_docs_markdown() -> String {
+    let mut out = String::with_capacity(16 * 1024);
+    out.push_str("# Manifold2 Parameter Reference\n\n");
+    let mut current_category = "";
+    for doc in PARAMETER_DOCS {
+        if doc.category != current_category {
+            current_category = doc.category;
+            out.push_str(&format!("## {current_category}\n\n"));
+        }
+        out.push_str(&format!("### {} (`{}`)\n", doc.title, doc.key));
+        if !doc.units.is_empty() {
+            out.push_str(&format!(
+                "- **Default**: `{}` ({})\n",
+                doc.default_value, doc.units
+            ));
+        } else {
+            out.push_str(&format!("- **Default**: `{}`\n", doc.default_value));
+        }
+        out.push_str(&format!("- **Summary**: {}\n", doc.summary));
+        out.push_str(&format!("- **Details**: {}\n\n", doc.details));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,5 +1757,28 @@ mod tests {
         let decoded = SlicerConfig::from_toml_str(&toml_str).unwrap();
         assert_eq!(decoded.tools.len(), 2);
         assert_eq!(decoded.slicing.layer_height, config.slicing.layer_height);
+    }
+
+    #[test]
+    fn test_parameter_docs_catalog_and_markdown_export() {
+        assert!(!PARAMETER_DOCS.is_empty());
+        for (i, doc) in PARAMETER_DOCS.iter().enumerate() {
+            assert!(!doc.key.is_empty());
+            assert!(!doc.title.is_empty());
+            assert!(!doc.summary.is_empty());
+            assert!(!doc.details.is_empty());
+            for other in &PARAMETER_DOCS[..i] {
+                assert_ne!(
+                    doc.key, other.key,
+                    "Duplicate ParameterDoc key: {}",
+                    doc.key
+                );
+            }
+        }
+        assert!(lookup_parameter_doc("gcode.swell_multipliers").is_some());
+        assert!(lookup_parameter_doc("gcode.fan_speed_percent").is_some());
+        let md = generate_parameter_docs_markdown();
+        assert!(md.starts_with("# Manifold2 Parameter Reference"));
+        assert!(md.contains("gcode.swell_multipliers"));
     }
 }
