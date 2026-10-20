@@ -994,7 +994,13 @@ pub fn sync_field_visualization_system(
     {
         vis_state.dirty_planned_gcode = false;
         if let Some(ref tp_res) = vis_state.cached_toolpaths {
-            let planned = crate::gcode::plan_and_emit_gcode(tp_res, obj_world_tf, &config);
+            let planned = crate::gcode::plan_and_emit_gcode_for_object(
+                &scene_obj.name,
+                scene_obj.object_id,
+                tp_res,
+                obj_world_tf,
+                &config,
+            );
             vis_state.cached_planned_gcode = Some(planned);
             vis_state.dirty_toolpaths_mesh = true;
         }

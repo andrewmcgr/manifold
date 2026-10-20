@@ -1893,6 +1893,15 @@ pub fn ui_workspace_system(
                                             }
                                         });
                                 });
+                                gc_changed |= ui
+                                    .checkbox(
+                                        &mut gc.emit_exclude_object,
+                                        "Emit Klipper EXCLUDE_OBJECT commands",
+                                    )
+                                    .on_hover_text(
+                                        "Emit EXCLUDE_OBJECT_DEFINE (NAME, CENTER, POLYGON) before print start and EXCLUDE_OBJECT_START / EXCLUDE_OBJECT_END per layer",
+                                    )
+                                    .changed();
 
                                 ui.collapsing("Speeds, Accelerations & Klipper Kinematics", |ui| {
                                     ui.horizontal(|ui| {

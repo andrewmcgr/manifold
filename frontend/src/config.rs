@@ -674,6 +674,8 @@ pub struct GcodeProcessConfig {
     /// When `false` (default for rectangular beds), G-code XY coordinates place `(0, 0)` at the
     /// front-left corner of the bed (`[0..width_x, 0..depth_y]`). When `true`, `(0, 0)` is at bed center.
     pub gcode_origin_at_bed_center: bool,
+    /// Emit Klipper `[exclude_object]` commands (`EXCLUDE_OBJECT_DEFINE`, `EXCLUDE_OBJECT_START`, `EXCLUDE_OBJECT_END`).
+    pub emit_exclude_object: bool,
 
     // --- Linear Speeds (mm/s) ---
     pub first_layer_speed_mms: f32,
@@ -742,6 +744,7 @@ impl Default for GcodeProcessConfig {
             first_layer_flow_multiplier: 1.02,
             wall_print_order: WallPrintOrder::InnerOuterInner,
             gcode_origin_at_bed_center: false,
+            emit_exclude_object: true,
             first_layer_speed_mms: 45.0,
             outer_wall_speed_mms: 65.0,
             inner_wall_speed_mms: 100.0,

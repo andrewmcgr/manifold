@@ -130,6 +130,9 @@ pub struct PlannedGcodeResult {
     pub total_filament_grams: f32,
     pub bbox_min_bed: Vec3,
     pub bbox_max_bed: Vec3,
+    pub exclude_object_name: String,
+    pub exclude_object_center_bed: [f32; 2],
+    pub exclude_object_polygon_bed: Vec<[f32; 2]>,
     pub extruding_move_count: usize,
     pub travel_move_count: usize,
     pub retract_count: usize,
@@ -1173,8 +1176,156 @@ pub fn expand_gcode_template(
         .replace("{layer_count}", &format!("{layer_count}"))
 }
 
+/// Sanitizes an object name into a valid Klipper `EXCLUDE_OBJECT` identifier (`[A-Za-z0-9_.-]`,
+/// no whitespace or special characters).
+pub fn sanitize_exclude_object_name(raw_name: &str, object_id: u64) -> String {
+    let stem = std::path::Path::new(raw_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(raw_name)
+        .trim();
+
+    let mut sanitized = String::with_capacity(stem.len() + 8);
+    let mut prev_underscore = false;
+    for ch in stem.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' {
+            sanitized.push(ch);
+            prev_underscore = false;
+        } else if !prev_underscore && !sanitized.is_empty() {
+            sanitized.push('_');
+            prev_underscore = true;
+        }
+    }
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        format!("Object_{object_id}")
+    } else if object_id > 1 && !trimmed.ends_with(&format!("_{object_id}")) {
+        format!("{trimmed}_{object_id}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Computes a compact 2D convex hull polygon `[[x0,y0],[x1,y1],...,[x0,y0]]` in G-code bed
+/// coordinates (`mm`) for Klipper's `EXCLUDE_OBJECT_DEFINE POLYGON=...` parameter.
+pub fn compute_exclude_object_polygon_2d(
+    layers: &[PlannedLayerGcode],
+    bbox_min: Vec3,
+    bbox_max: Vec3,
+) -> Vec<[f32; 2]> {
+    #[inline]
+    fn cross_2d(o: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    }
+
+    // Collect quantized 2D points (0.05 mm grid) from extruding moves to build the convex hull
+    let mut pts: Vec<[f32; 2]> = Vec::new();
+    for layer in layers {
+        for seg in &layer.segments {
+            if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
+                pts.push([seg.p0_bed.x, seg.p0_bed.y]);
+                pts.push([seg.p1_bed.x, seg.p1_bed.y]);
+            }
+        }
+    }
+
+    pts.sort_by(|a, b| {
+        a[0].partial_cmp(&b[0])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a[1].partial_cmp(&b[1]).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    pts.dedup_by(|a, b| (a[0] - b[0]).abs() < 0.05 && (a[1] - b[1]).abs() < 0.05);
+
+    let mut hull: Vec<[f32; 2]> = Vec::new();
+    if pts.len() >= 3 {
+        let mut lower: Vec<[f32; 2]> = Vec::with_capacity(pts.len());
+        for &p in &pts {
+            while lower.len() >= 2 && cross_2d(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 0.0 {
+                lower.pop();
+            }
+            lower.push(p);
+        }
+        let mut upper: Vec<[f32; 2]> = Vec::with_capacity(pts.len());
+        for &p in pts.iter().rev() {
+            while upper.len() >= 2 && cross_2d(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 0.0 {
+                upper.pop();
+            }
+            upper.push(p);
+        }
+        lower.pop();
+        upper.pop();
+        hull = lower;
+        hull.extend(upper);
+    }
+
+    // Fallback to the 2D bounding-box rectangle if hull is degenerate (< 3 vertices)
+    if hull.len() < 3 {
+        let x0 = bbox_min.x;
+        let y0 = bbox_min.y;
+        let x1 = bbox_max.x.max(x0 + 0.1);
+        let y1 = bbox_max.y.max(y0 + 0.1);
+        return vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]];
+    }
+
+    // Prune closely-spaced vertices (< 1.0 mm) and limit vertex count to <= 24 so the
+    // `EXCLUDE_OBJECT_DEFINE` line remains compact for Klipper & Moonraker
+    let mut simplified: Vec<[f32; 2]> = Vec::with_capacity(hull.len() + 1);
+    for p in hull {
+        if let Some(&last) = simplified.last() {
+            let dx = p[0] - last[0];
+            let dy = p[1] - last[1];
+            if dx * dx + dy * dy < 1.0 && simplified.len() >= 3 {
+                continue;
+            }
+        }
+        simplified.push(p);
+    }
+    if simplified.len() > 24 {
+        let n = simplified.len();
+        simplified = (0..24).map(|k| simplified[(k * n) / 24]).collect();
+    }
+    if let Some(&first) = simplified.first() {
+        if simplified
+            .last()
+            .is_none_or(|last| (last[0] - first[0]).abs() > 1.0e-4 || (last[1] - first[1]).abs() > 1.0e-4)
+        {
+            simplified.push(first);
+        }
+    }
+    simplified
+}
+
+/// Formats a Klipper `EXCLUDE_OBJECT_DEFINE` G-code line with zero internal spaces inside
+/// `CENTER=` and `POLYGON=` so Klipper's whitespace-splitting command parser handles it cleanly.
+pub fn format_exclude_object_define(name: &str, center: [f32; 2], polygon: &[[f32; 2]]) -> String {
+    let mut poly_json = String::with_capacity(polygon.len() * 18 + 4);
+    poly_json.push('[');
+    for (i, pt) in polygon.iter().enumerate() {
+        if i > 0 {
+            poly_json.push(',');
+        }
+        poly_json.push_str(&format!("[{:.3},{:.3}]", pt[0], pt[1]));
+    }
+    poly_json.push(']');
+    format!(
+        "EXCLUDE_OBJECT_DEFINE NAME={} CENTER={:.3},{:.3} POLYGON={}",
+        name, center[0], center[1], poly_json
+    )
+}
+
 /// Executes the complete Toolpath-to-Gcode planning & emission pipeline on `raw_toolpaths`.
 pub fn plan_and_emit_gcode(
+    raw_toolpaths: &ObjectToolpathsResult,
+    obj_world_tf: Transform,
+    config: &SlicerConfig,
+) -> PlannedGcodeResult {
+    plan_and_emit_gcode_for_object("Object_1", 1, raw_toolpaths, obj_world_tf, config)
+}
+
+/// Executes the complete Toolpath-to-Gcode planning & emission pipeline for a named object.
+pub fn plan_and_emit_gcode_for_object(
+    object_name: &str,
+    object_id: u64,
     raw_toolpaths: &ObjectToolpathsResult,
     obj_world_tf: Transform,
     config: &SlicerConfig,
@@ -1873,7 +2024,23 @@ pub fn plan_and_emit_gcode(
     let mut travel_move_count = 0usize;
     let mut retract_count = 0usize;
 
+    let exclude_object_name = sanitize_exclude_object_name(object_name, object_id);
+    let exclude_object_center_bed = [
+        0.5 * (bbox_min.x + bbox_max.x),
+        0.5 * (bbox_min.y + bbox_max.y),
+    ];
+    let exclude_object_polygon_bed =
+        compute_exclude_object_polygon_2d(&planned_layers, bbox_min, bbox_max);
+
     let mut gcode = String::with_capacity(64 * 1024);
+    if gcfg.emit_exclude_object {
+        gcode.push_str(&format_exclude_object_define(
+            &exclude_object_name,
+            exclude_object_center_bed,
+            &exclude_object_polygon_bed,
+        ));
+        gcode.push('\n');
+    }
     let start_expanded = expand_gcode_template(
         &gcfg.start_gcode_template,
         tool_id,
@@ -1908,6 +2075,9 @@ pub fn plan_and_emit_gcode(
             "\n; --- LAYER {} (Branch {}, Iso {:.3}) ---\n",
             layer.layer_index, layer.branch_id, layer.isovalue
         ));
+        if gcfg.emit_exclude_object {
+            gcode.push_str(&format!("EXCLUDE_OBJECT_START NAME={exclude_object_name}\n"));
+        }
 
         for seg in &layer.segments {
             total_time_s += seg.duration_s;
@@ -2028,6 +2198,10 @@ pub fn plan_and_emit_gcode(
 
             last_emitted_kind = Some(seg.kind);
         }
+
+        if gcfg.emit_exclude_object {
+            gcode.push_str(&format!("EXCLUDE_OBJECT_END NAME={exclude_object_name}\n"));
+        }
     }
 
     gcode.push('\n');
@@ -2092,6 +2266,9 @@ pub fn plan_and_emit_gcode(
         total_filament_grams,
         bbox_min_bed: bbox_min,
         bbox_max_bed: bbox_max,
+        exclude_object_name,
+        exclude_object_center_bed,
+        exclude_object_polygon_bed,
         extruding_move_count,
         travel_move_count,
         retract_count,
@@ -2237,11 +2414,28 @@ mod tests {
         };
 
         let cfg = SlicerConfig::default();
-        let res = plan_and_emit_gcode(&raw, Transform::IDENTITY, &cfg);
+        let res = plan_and_emit_gcode_for_object(
+            "My Part (v1).stl",
+            1,
+            &raw,
+            Transform::IDENTITY,
+            &cfg,
+        );
 
         assert!(res.extruding_move_count > 0);
         assert!(res.total_filament_mm > 0.0);
         assert!(res.total_time_s > 0.0);
+        assert_eq!(res.exclude_object_name, "My_Part_v1");
+        assert!(res
+            .gcode_text
+            .starts_with("EXCLUDE_OBJECT_DEFINE NAME=My_Part_v1 CENTER="));
+        assert!(res.gcode_text.contains("POLYGON=[["));
+        assert!(res
+            .gcode_text
+            .contains("EXCLUDE_OBJECT_START NAME=My_Part_v1\n"));
+        assert!(res
+            .gcode_text
+            .contains("EXCLUDE_OBJECT_END NAME=My_Part_v1\n"));
         assert!(res.gcode_text.contains("T0"));
         assert!(res.gcode_text.contains("M140 S60"));
         assert!(res.gcode_text.contains("M104 S215 T0"));
