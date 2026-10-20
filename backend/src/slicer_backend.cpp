@@ -590,6 +590,11 @@ struct SlicerBackend::Impl {
         LineWidthSpec{0.42f, 0.28f, 0.58f},
         LineWidthSpec{0.42f, 0.26f, 0.60f},
         0,
+        0.20f,
+        LineWidthSpec{0.45f, 0.30f, 0.65f},
+        2,
+        45.0f,
+        0.40f,
         0.80f,
     };
 };
@@ -2910,6 +2915,10 @@ void SlicerBackend::setShellPathSpec(const ShellPathSpec& spec) noexcept {
     sanitizeW(s.outer_wall_width);
     sanitizeW(s.inner_wall_width);
     sanitizeW(s.solid_infill_width);
+    sanitizeW(s.sparse_infill_width);
+    s.sparse_infill_density = std::clamp(s.sparse_infill_density, 0.0f, 1.0f);
+    s.infill_angle_deg = std::clamp(s.infill_angle_deg, 0.0f, 180.0f);
+    s.nozzle_diameter_mm = (s.nozzle_diameter_mm > 0.05f) ? s.nozzle_diameter_mm : 0.40f;
     s.min_extrusion_length_mm = std::max(0.0f, s.min_extrusion_length_mm);
     impl_->shellPathSpec = s;
 }

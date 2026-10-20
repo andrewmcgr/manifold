@@ -125,7 +125,7 @@ pub enum ToolpathColorMode {
 impl ToolpathColorMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::ByFeatureType => "Feature Type (Outer / Inner / Solid Infill / Gap)",
+            Self::ByFeatureType => "Feature Type (Outer / Inner / Solid / Sparse / Gap)",
             Self::ByLineWidth => "Local Line Width (Min=Blue / Target=Green / Max=Amber)",
         }
     }
@@ -192,11 +192,12 @@ pub struct FieldVisualizationState {
     pub dirty_selected_layers: bool,
     pub dirty_selected_layers_mesh: bool,
 
-    // --- Non-Planar Shell Toolpaths Visualization Controls ---
+    // --- Non-Planar Shell & Sparse Infill Toolpaths Visualization Controls ---
     pub show_toolpaths: bool,
     pub show_outer_walls: bool,
     pub show_inner_walls: bool,
     pub show_solid_infill: bool,
+    pub show_sparse_infill: bool,
     pub show_toolpath_centerlines: bool,
     pub toolpath_color_mode: ToolpathColorMode,
     pub cached_toolpaths: Option<ObjectToolpathsResult>,
@@ -275,6 +276,7 @@ impl Default for FieldVisualizationState {
             show_outer_walls: true,
             show_inner_walls: true,
             show_solid_infill: true,
+            show_sparse_infill: true,
             show_toolpath_centerlines: false,
             toolpath_color_mode: ToolpathColorMode::ByFeatureType,
             cached_toolpaths: None,
@@ -349,6 +351,12 @@ impl FieldVisualizationState {
             top_layer_mm: lh.top_layer_mm,
         };
         let s = &config.slicing;
+        let nozzle_diameter_mm = config
+            .tools
+            .get(config.active_tool_index)
+            .or_else(|| config.tools.first())
+            .map(|t| t.nozzle_diameter_mm)
+            .unwrap_or(0.4);
         let shell_spec = ShellPathSpec {
             shell_thickness_mm: s.shell_thickness_mm,
             inner_wall_count: s.inner_wall_count,
@@ -369,6 +377,15 @@ impl FieldVisualizationState {
             },
             solid_infill_pattern: s.solid_infill_pattern.as_u8(),
             min_extrusion_length_mm: s.min_extrusion_length_mm,
+            sparse_infill_density: (s.infill_density_percent / 100.0).clamp(0.0, 1.0),
+            sparse_infill_width: LineWidthSpec {
+                target_mm: s.sparse_infill_width.target_mm,
+                min_mm: s.sparse_infill_width.min_mm,
+                max_mm: s.sparse_infill_width.max_mm,
+            },
+            sparse_infill_pattern: s.sparse_infill_pattern.as_u8(),
+            infill_angle_deg: s.infill_angle_deg,
+            nozzle_diameter_mm,
         };
         let adaptivity = self.adaptivity;
 
@@ -937,6 +954,7 @@ pub fn sync_field_visualization_system(
         let show_outer = vis_state.show_outer_walls;
         let show_inner = vis_state.show_inner_walls;
         let show_infill = vis_state.show_solid_infill;
+        let show_sparse = vis_state.show_sparse_infill;
 
         let mut positions: Vec<[f32; 3]> = Vec::new();
         let mut normals: Vec<[f32; 3]> = Vec::new();
@@ -962,6 +980,7 @@ pub fn sync_field_visualization_system(
                         let visible = match path.feature_kind {
                             0 => show_outer,
                             1 => show_inner,
+                            4 => show_sparse,
                             _ => show_infill,
                         };
                         if visible && path.points.len() >= 2 {
@@ -995,6 +1014,7 @@ pub fn sync_field_visualization_system(
                         let visible = match path.feature_kind {
                             0 => show_outer,
                             1 => show_inner,
+                            4 => show_sparse,
                             _ => show_infill,
                         };
                         if !visible || path.points.len() < 2 {
@@ -1094,6 +1114,7 @@ pub fn sync_field_visualization_system(
                         let visible = match path.feature_kind {
                             0 => vis_state.show_outer_walls,
                             1 => vis_state.show_inner_walls,
+                            4 => vis_state.show_sparse_infill,
                             _ => vis_state.show_solid_infill,
                         };
                         if !visible || path.points.len() < 2 {
@@ -1440,12 +1461,14 @@ fn compute_toolpath_point_color(
                 [0.24 * shade, 0.90 * shade, 0.42 * shade, 1.0]
             }
             2 => [0.22, 0.76, 0.98, 1.0], // Solid Infill: bright sky-blue/cyan
+            4 => [0.98, 0.78, 0.18, 1.0], // Sparse Infill: warm gold/amber
             _ => [0.98, 0.32, 0.88, 1.0], // Gap Fill: vivid magenta
         },
         ToolpathColorMode::ByLineWidth => {
             let spec = match feature_kind {
                 0 => config.slicing.outer_wall_width,
                 1 => config.slicing.inner_wall_width,
+                4 => config.slicing.sparse_infill_width,
                 _ => config.slicing.solid_infill_width,
             };
             if width_mm <= spec.target_mm {
@@ -2218,6 +2241,15 @@ mod tests {
             },
             solid_infill_pattern: 0, // Monotonic
             min_extrusion_length_mm: min_len,
+            sparse_infill_density: 0.0, // Tested separately in sparse infill test
+            sparse_infill_width: ffi::LineWidthSpec {
+                target_mm: 0.42,
+                min_mm: 0.30,
+                max_mm: 0.60,
+            },
+            sparse_infill_pattern: 0,
+            infill_angle_deg: 45.0,
+            nozzle_diameter_mm: 0.4,
         };
         ffi::set_shell_path_spec(base_spec.clone());
 
@@ -2383,6 +2415,15 @@ mod tests {
             },
             solid_infill_pattern: 0,
             min_extrusion_length_mm: 0.8,
+            sparse_infill_density: 0.20,
+            sparse_infill_width: ffi::LineWidthSpec {
+                target_mm: 0.42,
+                min_mm: 0.28,
+                max_mm: 0.58,
+            },
+            sparse_infill_pattern: 0,
+            infill_angle_deg: 45.0,
+            nozzle_diameter_mm: 0.4,
         });
 
         let res = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -2518,6 +2559,164 @@ mod tests {
         );
 
         let _ = ffi::remove_cad_object(obj.object_id);
+    }
+
+    #[test]
+    fn test_non_planar_sparse_infill_patterns_and_endpoint_inset() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ffi::set_spatial_orientation_hints(&[]);
+
+        // Register a 20x20x10 mm block on the bed (`[-10, 10] x [-10, 10] x [0, 10]`)
+        // so the interior core (inside a 0.84 mm 2-wall shell) has diagonal > 25 mm (> 15 * 0.4 = 6.0 mm).
+        let positions: [f32; 24] = [
+            -10.0, -10.0,  0.0,
+             10.0, -10.0,  0.0,
+             10.0,  10.0,  0.0,
+            -10.0,  10.0,  0.0,
+            -10.0, -10.0, 10.0,
+             10.0, -10.0, 10.0,
+             10.0,  10.0, 10.0,
+            -10.0,  10.0, 10.0,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2,
+            4, 5, 6, 4, 6, 7,
+            0, 1, 5, 0, 5, 4,
+            1, 2, 6, 1, 6, 5,
+            2, 3, 7, 2, 7, 6,
+            3, 0, 4, 3, 4, 7,
+        ];
+
+        let part = ffi::register_triangle_mesh("test_sparse_infill_block", &positions, &indices);
+        assert!(part.object_id > 0);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.6, 4.0));
+
+        ffi::set_slice_layer_height(ffi::LayerHeightSpec {
+            target_mm: 1.0,
+            min_mm: 0.6,
+            max_mm: 1.4,
+            first_layer_mm: 0.5,
+            top_layer_mm: 0.4,
+        });
+
+        let shell_thickness = 0.84f32; // 1 outer wall (0.42) + 1 inner wall (0.42)
+        let sparse_w = 0.42f32;
+        let mut spec = ffi::ShellPathSpec {
+            shell_thickness_mm: shell_thickness,
+            inner_wall_count: 1,
+            outer_wall_width: ffi::LineWidthSpec {
+                target_mm: 0.42,
+                min_mm: 0.30,
+                max_mm: 0.56,
+            },
+            inner_wall_width: ffi::LineWidthSpec {
+                target_mm: 0.42,
+                min_mm: 0.30,
+                max_mm: 0.56,
+            },
+            solid_infill_width: ffi::LineWidthSpec {
+                target_mm: 0.42,
+                min_mm: 0.30,
+                max_mm: 0.56,
+            },
+            solid_infill_pattern: 0,
+            min_extrusion_length_mm: 0.80,
+            sparse_infill_density: 0.25,
+            sparse_infill_width: ffi::LineWidthSpec {
+                target_mm: sparse_w,
+                min_mm: 0.30,
+                max_mm: 0.60,
+            },
+            sparse_infill_pattern: 0,
+            infill_angle_deg: 45.0,
+            nozzle_diameter_mm: 0.40,
+        };
+
+        // Test all 7 sparse infill patterns (0..=6: Monotonic, Cubic, Gyroid, SchwarzD, SchwarzP, Concentric, AllWalls)
+        for pattern in crate::config::SparseInfillPattern::ALL {
+            spec.sparse_infill_pattern = pattern.as_u8();
+            ffi::set_shell_path_spec(spec.clone());
+
+            let res = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+            assert!(res.valid, "Toolpath generation failed for {:?}", pattern);
+            assert!(
+                res.sparse_infill_count > 0,
+                "Expected non-zero sparse_infill_count for pattern {:?}, got 0",
+                pattern
+            );
+
+            // Inspect a mid-height layer (Z ~ 5.0 mm) to verify sparse infill endpoints
+            // stay inside the shell + endpoint inset boundary and reach near the shell without off-by-one gaps
+            let mid_layer = res
+                .layers
+                .iter()
+                .find(|l| (l.isovalue - 5.0).abs() < 1.2)
+                .expect("Expected mid-height layer near Z=5.0");
+
+            let sparse_paths: Vec<_> = mid_layer
+                .paths
+                .iter()
+                .filter(|p| p.feature_kind == 4)
+                .collect();
+            assert!(
+                !sparse_paths.is_empty(),
+                "Expected sparse infill paths on mid-height layer for {:?}",
+                pattern
+            );
+
+            let mut min_dist_from_outer = f32::MAX;
+            for path in &sparse_paths {
+                for pt in &path.points {
+                    let dist_xy = (10.0 - pt.x.abs()).min(10.0 - pt.y.abs());
+                    min_dist_from_outer = min_dist_from_outer.min(dist_xy);
+                    // No sparse centerline point may cross outside `shell_thickness - 0.5 * sparse_w`
+                    assert!(
+                        dist_xy >= shell_thickness - 0.25,
+                        "Sparse infill point ({:.2}, {:.2}, {:.2}) for {:?} encroached into outer shell (dist_xy={:.3})",
+                        pt.x,
+                        pt.y,
+                        pt.z,
+                        pattern,
+                        dist_xy
+                    );
+                }
+            }
+
+            // For Monotonic (0) and Concentric/AllWalls (5, 6), verify there is no off-by-one wall gap:
+            // the closest sparse point to the shell must lie near `shell_thickness + 0.35 * sparse_w` (~0.99 mm),
+            // well below `shell_thickness + 1.5 * sparse_w` (~1.47 mm).
+            if matches!(
+                pattern,
+                crate::config::SparseInfillPattern::Monotonic
+                    | crate::config::SparseInfillPattern::Concentric
+                    | crate::config::SparseInfillPattern::AllWalls
+            ) {
+                assert!(
+                    min_dist_from_outer <= shell_thickness + 0.85,
+                    "Expected {:?} sparse infill to anchor adjacent to the shell without off-by-one gap, but min_dist_from_outer={:.3}",
+                    pattern,
+                    min_dist_from_outer
+                );
+            }
+        }
+
+        // Verify narrow-region promotion: increasing nozzle_diameter_mm so `15 * D_nozzle > island_diag`
+        // promotes the interior core to solid infill (`sparse_infill_count == 0`, `solid_infill_count > 0`).
+        spec.sparse_infill_pattern = 0;
+        spec.nozzle_diameter_mm = 2.5; // 15 * 2.5 = 37.5 mm > 28 mm island diagonal
+        ffi::set_shell_path_spec(spec);
+        let promoted_res = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(promoted_res.valid);
+        assert_eq!(
+            promoted_res.sparse_infill_count, 0,
+            "Expected narrow island (< 15 * D_nozzle) to be promoted from sparse to solid infill"
+        );
+        assert!(
+            promoted_res.solid_infill_count > 0,
+            "Expected promoted narrow island to generate solid infill paths"
+        );
+
+        let _ = ffi::remove_cad_object(part.object_id);
     }
 }
 

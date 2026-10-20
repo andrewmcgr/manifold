@@ -6,8 +6,8 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::bridge::ffi;
 use crate::config::{
-    BedShape, ClearancePointXZ, PointNormalHint, SlicerConfig, SolidInfillPattern, SurfaceHintMode,
-    ToolConfig,
+    BedShape, ClearancePointXZ, PointNormalHint, SlicerConfig, SolidInfillPattern,
+    SparseInfillPattern, SurfaceHintMode, ToolConfig,
 };
 use crate::field_vis::{
     FieldColormap, FieldVisualizationState, IsoIntersectionMode, SelectedLayersColorMode,
@@ -1359,7 +1359,46 @@ pub fn ui_workspace_system(
                                     }
                                 });
 
-                            // Line Widths: Outer Wall, Inner Wall, Solid Infill (Target, Min, Max)
+                            egui::ComboBox::from_id_source("sparse_infill_pattern_combo")
+                                .selected_text(format!(
+                                    "Sparse: {}",
+                                    config.slicing.sparse_infill_pattern.label()
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for pat in SparseInfillPattern::ALL {
+                                        if ui
+                                            .selectable_value(
+                                                &mut config.slicing.sparse_infill_pattern,
+                                                pat,
+                                                pat.label(),
+                                            )
+                                            .changed()
+                                        {
+                                            tp_cfg_changed = true;
+                                        }
+                                    }
+                                });
+
+                            tp_cfg_changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut config.slicing.infill_density_percent,
+                                        0.0..=100.0,
+                                    )
+                                    .suffix("%")
+                                    .text("Sparse Density"),
+                                )
+                                .changed();
+
+                            tp_cfg_changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut config.slicing.infill_angle_deg, -180.0..=180.0)
+                                        .suffix("°")
+                                        .text("Infill Angle"),
+                                )
+                                .changed();
+
+                            // Line Widths: Outer Wall, Inner Wall, Solid Infill, Sparse Infill (Target, Min, Max)
                             ui.small(egui::RichText::new("Line Widths (Target / Min / Max mm):").strong());
                             ui.horizontal(|ui| {
                                 ui.label("Outer Wall:");
@@ -1453,6 +1492,39 @@ pub fn ui_workspace_system(
                                     .add(
                                         egui::DragValue::new(
                                             &mut config.slicing.solid_infill_width.max_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.12..=3.00)
+                                        .prefix("Max: "),
+                                    )
+                                    .changed();
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Sparse Infill:");
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.sparse_infill_width.target_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.10..=2.50)
+                                        .prefix("T: "),
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.sparse_infill_width.min_mm,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.08..=2.00)
+                                        .prefix("Min: "),
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.sparse_infill_width.max_mm,
                                         )
                                         .speed(0.01)
                                         .range(0.12..=3.00)
@@ -1558,6 +1630,15 @@ pub fn ui_workspace_system(
                                     {
                                         vis_state.dirty_toolpaths_mesh = true;
                                     }
+                                    if ui
+                                        .checkbox(
+                                            &mut vis_state.show_sparse_infill,
+                                            "Sparse Infill",
+                                        )
+                                        .changed()
+                                    {
+                                        vis_state.dirty_toolpaths_mesh = true;
+                                    }
                                     ui.checkbox(
                                         &mut vis_state.show_toolpath_centerlines,
                                         "Centerlines",
@@ -1587,11 +1668,12 @@ pub fn ui_workspace_system(
 
                             if let Some(ref tp_res) = vis_state.cached_toolpaths {
                                 ui.small(format!(
-                                    "Paths: {} total ({} outer walls, {} inner walls, {} solid infill/gap fill)",
+                                    "Paths: {} total ({} outer, {} inner, {} solid/gap, {} sparse)",
                                     tp_res.total_path_count,
                                     tp_res.outer_wall_count,
                                     tp_res.inner_wall_count,
-                                    tp_res.solid_infill_count
+                                    tp_res.solid_infill_count,
+                                    tp_res.sparse_infill_count
                                 ));
                             }
                         });
@@ -2033,6 +2115,13 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         top_layer_mm: config.slicing.layer_height.top_layer_mm,
     });
 
+    let nozzle_diameter_mm = config
+        .tools
+        .get(config.active_tool_index)
+        .or_else(|| config.tools.first())
+        .map(|t| t.nozzle_diameter_mm)
+        .unwrap_or(0.4);
+
     ffi::set_shell_path_spec(ffi::ShellPathSpec {
         shell_thickness_mm: config.slicing.shell_thickness_mm,
         inner_wall_count: config.slicing.inner_wall_count,
@@ -2053,6 +2142,15 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         },
         solid_infill_pattern: config.slicing.solid_infill_pattern.as_u8(),
         min_extrusion_length_mm: config.slicing.min_extrusion_length_mm,
+        sparse_infill_density: (config.slicing.infill_density_percent / 100.0).clamp(0.0, 1.0),
+        sparse_infill_width: ffi::LineWidthSpec {
+            target_mm: config.slicing.sparse_infill_width.target_mm,
+            min_mm: config.slicing.sparse_infill_width.min_mm,
+            max_mm: config.slicing.sparse_infill_width.max_mm,
+        },
+        sparse_infill_pattern: config.slicing.sparse_infill_pattern.as_u8(),
+        infill_angle_deg: config.slicing.infill_angle_deg,
+        nozzle_diameter_mm,
     });
 
     ffi::set_eikonal_solver_iterations(config.eikonal.solver_iterations);

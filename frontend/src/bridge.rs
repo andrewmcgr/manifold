@@ -170,7 +170,7 @@ pub mod ffi {
         pub max_mm: f32,
     }
 
-    /// Shell & path generation parameters shared across FFI.
+    /// Shell & sparse infill path generation parameters shared across FFI.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct ShellPathSpec {
         pub shell_thickness_mm: f32,
@@ -180,6 +180,13 @@ pub mod ffi {
         pub solid_infill_width: LineWidthSpec,
         /// `0 = Monotonic`, `1 = Concentric`
         pub solid_infill_pattern: u8,
+        /// Fractional sparse infill density in `[0.0, 1.0]`.
+        pub sparse_infill_density: f32,
+        pub sparse_infill_width: LineWidthSpec,
+        /// `0 = Monotonic`, `1 = Cubic`, `2 = Gyroid`, `3 = SchwarzD`, `4 = SchwarzP`, `5 = Concentric`, `6 = AllWalls`
+        pub sparse_infill_pattern: u8,
+        pub infill_angle_deg: f32,
+        pub nozzle_diameter_mm: f32,
         pub min_extrusion_length_mm: f32,
     }
 
@@ -202,7 +209,7 @@ pub mod ffi {
     /// A continuous open or closed extrusion path on a non-planar slicing isosurface.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct ExtrusionPath {
-        /// `0 = OuterWall`, `1 = InnerWall`, `2 = SolidInfill`, `3 = GapFill`
+        /// `0 = OuterWall`, `1 = InnerWall`, `2 = SolidInfill`, `3 = GapFill`, `4 = SparseInfill`
         pub feature_kind: u8,
         /// `0` for outer wall, `1..=inner_wall_count` for inner walls, pass index for infill/gap fill.
         pub wall_index: u32,
@@ -212,7 +219,7 @@ pub mod ffi {
         pub points: Vec<ToolpathPoint>,
     }
 
-    /// All shell toolpaths generated on a single selected slicing isosurface layer.
+    /// All shell and sparse infill toolpaths generated on a single selected slicing isosurface layer.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct LayerToolpaths {
         pub layer_index: u32,
@@ -221,7 +228,7 @@ pub mod ffi {
         pub paths: Vec<ExtrusionPath>,
     }
 
-    /// Complete shell toolpath generation result for an object across all selected slicing isosurfaces.
+    /// Complete toolpath generation result for an object across all selected slicing isosurfaces.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct ObjectToolpathsResult {
         pub valid: bool,
@@ -229,6 +236,7 @@ pub mod ffi {
         pub outer_wall_count: u32,
         pub inner_wall_count: u32,
         pub solid_infill_count: u32,
+        pub sparse_infill_count: u32,
         pub layers: Vec<LayerToolpaths>,
     }
 

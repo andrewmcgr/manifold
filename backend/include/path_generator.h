@@ -10,8 +10,9 @@
 namespace manifold {
 
 /// Generates non-planar outer walls, inner walls, solid infill (`Monotonic` or `Concentric`),
-/// and shell gap fill across the selected slicing isosurfaces within the object's outer shell
-/// ($-T_{\text{shell}} \le \phi_{\text{sdf}}(\mathbf{x}) \le 0$).
+/// shell gap fill within the object's outer shell ($-T_{\text{shell}} \le \phi_{\text{sdf}}(\mathbf{x}) \le 0$),
+/// and non-planar sparse infill (`Monotonic`, `Cubic`, `Gyroid`, `SchwarzD`, `SchwarzP`,
+/// `Concentric`, `AllWalls`) within the interior core ($\phi_{\text{sdf}}(\mathbf{x}) < -T_{\text{shell}}$).
 ///
 /// Key invariants:
 /// - Walls are generated inwards on each 3D slicing isosurface by insetting from $\phi_{\text{sdf}} = 0$

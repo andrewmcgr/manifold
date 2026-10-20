@@ -345,7 +345,76 @@ impl SolidInfillPattern {
     }
 }
 
-/// Non-planar slicing process & shell toolpath generation configuration.
+/// Pattern used to generate sparse infill inside the interior core ($\phi_{\text{sdf}}(\mathbf{x}) < -T_{\text{shell}}$).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SparseInfillPattern {
+    /// Alternating-angle rectilinear scanlines with Union-Find island splitting & boustrophedon chaining.
+    Monotonic,
+    /// 3D isotropic space-diagonal truss (dual orthogonal ±45° scanlines with √2 phase drift).
+    Cubic,
+    /// Triply Periodic Minimal Surface (Gyroid: sin X cos Y + sin Y cos Z + sin Z cos X = 0).
+    #[default]
+    Gyroid,
+    /// Triply Periodic Minimal Surface (Schwarz D / Diamond lattice).
+    SchwarzD,
+    /// Triply Periodic Minimal Surface (Schwarz P / Primitive lattice).
+    SchwarzP,
+    /// Iterative inward geodesic/SDF offset rings at spacing w / ρ.
+    Concentric,
+    /// Iterative inward geodesic/SDF offset rings at 1× line width (100% concentric perimeters).
+    AllWalls,
+}
+
+impl SparseInfillPattern {
+    pub const ALL: [Self; 7] = [
+        Self::Monotonic,
+        Self::Cubic,
+        Self::Gyroid,
+        Self::SchwarzD,
+        Self::SchwarzP,
+        Self::Concentric,
+        Self::AllWalls,
+    ];
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Monotonic => 0,
+            Self::Cubic => 1,
+            Self::Gyroid => 2,
+            Self::SchwarzD => 3,
+            Self::SchwarzP => 4,
+            Self::Concentric => 5,
+            Self::AllWalls => 6,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Monotonic,
+            1 => Self::Cubic,
+            2 => Self::Gyroid,
+            3 => Self::SchwarzD,
+            4 => Self::SchwarzP,
+            5 => Self::Concentric,
+            6 => Self::AllWalls,
+            _ => Self::Gyroid,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Monotonic => "Monotonic (Rectilinear)",
+            Self::Cubic => "Cubic (3D Space-Diagonal Truss)",
+            Self::Gyroid => "Gyroid (TPMS)",
+            Self::SchwarzD => "Schwarz D (Diamond TPMS)",
+            Self::SchwarzP => "Schwarz P (Primitive TPMS)",
+            Self::Concentric => "Concentric (Inward Offset)",
+            Self::AllWalls => "All Walls (100% Concentric)",
+        }
+    }
+}
+
+/// Non-planar slicing process & shell/sparse toolpath generation configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SlicingProcessConfig {
@@ -353,7 +422,10 @@ pub struct SlicingProcessConfig {
     pub layer_height: LayerHeightConfig,
     pub max_nonplanar_slope_deg: f32,
     pub perimeter_count: u32,
+    /// Sparse infill density percentage (`0.0..=100.0`).
     pub infill_density_percent: f32,
+    /// Base in-plane rotation angle for scanline infill patterns (`0.0..=180.0` degrees).
+    pub infill_angle_deg: f32,
     /// Thickness of the outer shell (mm), defining the shell region $-T_{\text{shell}} \le \phi_{\text{sdf}}(\mathbf{x}) \le 0$.
     pub shell_thickness_mm: f32,
     /// Number of inner walls immediately inside the outer wall (in addition to the 1 outer wall).
@@ -366,6 +438,10 @@ pub struct SlicingProcessConfig {
     pub solid_infill_width: LineWidthConfig,
     /// Solid infill pattern within the shell (`Monotonic` or `Concentric`).
     pub solid_infill_pattern: SolidInfillPattern,
+    /// Variable line width `(target_mm, min_mm, max_mm)` for sparse infill inside the core ($\phi_{\text{sdf}} < -T_{\text{shell}}$).
+    pub sparse_infill_width: LineWidthConfig,
+    /// Sparse infill pattern inside the interior core (`Monotonic`, `Cubic`, `Gyroid`, `SchwarzD`, `SchwarzP`, `Concentric`, `AllWalls`).
+    pub sparse_infill_pattern: SparseInfillPattern,
     /// Minimum continuous extrusion length (mm); defaults to $2 \times d_{\text{nozzle}}$.
     /// Individual segments of a continuous extrusion may be shorter than this.
     pub min_extrusion_length_mm: f32,
@@ -378,12 +454,15 @@ impl Default for SlicingProcessConfig {
             max_nonplanar_slope_deg: 35.0,
             perimeter_count: 3,
             infill_density_percent: 20.0,
+            infill_angle_deg: 45.0,
             shell_thickness_mm: 1.60,
             inner_wall_count: 2,
             outer_wall_width: LineWidthConfig::new(0.40, 0.28, 0.56),
             inner_wall_width: LineWidthConfig::new(0.42, 0.28, 0.58),
             solid_infill_width: LineWidthConfig::new(0.42, 0.26, 0.60),
             solid_infill_pattern: SolidInfillPattern::Monotonic,
+            sparse_infill_width: LineWidthConfig::new(0.45, 0.30, 0.65),
+            sparse_infill_pattern: SparseInfillPattern::Gyroid,
             min_extrusion_length_mm: 0.80,
         }
     }
@@ -392,10 +471,13 @@ impl Default for SlicingProcessConfig {
 impl SlicingProcessConfig {
     pub fn sanitize(&mut self) {
         self.layer_height.sanitize();
+        self.infill_density_percent = self.infill_density_percent.clamp(0.0, 100.0);
+        self.infill_angle_deg = self.infill_angle_deg.clamp(0.0, 180.0);
         self.shell_thickness_mm = self.shell_thickness_mm.max(0.05);
         self.outer_wall_width.sanitize();
         self.inner_wall_width.sanitize();
         self.solid_infill_width.sanitize();
+        self.sparse_infill_width.sanitize();
         self.min_extrusion_length_mm = self.min_extrusion_length_mm.max(0.0);
     }
 }
