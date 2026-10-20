@@ -2,6 +2,7 @@ pub mod arrange;
 pub mod bridge;
 pub mod config;
 pub mod field_vis;
+pub mod gcode;
 pub mod hull;
 pub mod io;
 pub mod scene;

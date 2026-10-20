@@ -634,6 +634,235 @@ impl MachineKinematicsConfig {
     }
 }
 
+/// Ordering strategy for multiple walls within an island on a layer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WallPrintOrder {
+    /// Prints inner walls `[n-1 .. 2]`, then outer wall `0`, then backing inner wall `1`
+    /// so the outer wall sets before backing pressure is applied.
+    #[default]
+    InnerOuterInner,
+    /// Prints outer wall `0` first, followed by inner walls `1 .. n`.
+    OutsideIn,
+}
+
+impl WallPrintOrder {
+    pub const ALL: [Self; 2] = [Self::InnerOuterInner, Self::OutsideIn];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::InnerOuterInner => "Inner -> Outer -> Backing (In-Out-In)",
+            Self::OutsideIn => "Outside -> In",
+        }
+    }
+}
+
+/// Configuration for toolpath-to-Gcode kinematic planning, flow/rheology compensation,
+/// dynamic Pressure Advance, retractions, and start/end G-code templates.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GcodeProcessConfig {
+    /// Heated bed target temperature (°C).
+    pub bed_temperature_celsius: f32,
+    /// Raw filament diameter (mm), typically `1.75` or `2.85`.
+    pub filament_diameter_mm: f32,
+    /// Global extrusion flow multiplier (`0.5..=1.5`).
+    pub extrusion_multiplier: f32,
+    /// First-layer extrusion multiplier (`0.7..=1.5`).
+    pub first_layer_flow_multiplier: f32,
+    /// Wall printing order (`InnerOuterInner` or `OutsideIn`).
+    pub wall_print_order: WallPrintOrder,
+    /// When `false` (default for rectangular beds), G-code XY coordinates place `(0, 0)` at the
+    /// front-left corner of the bed (`[0..width_x, 0..depth_y]`). When `true`, `(0, 0)` is at bed center.
+    pub gcode_origin_at_bed_center: bool,
+
+    // --- Linear Speeds (mm/s) ---
+    pub first_layer_speed_mms: f32,
+    pub outer_wall_speed_mms: f32,
+    pub inner_wall_speed_mms: f32,
+    pub solid_infill_speed_mms: f32,
+    pub sparse_infill_speed_mms: f32,
+    pub gap_fill_speed_mms: f32,
+    pub travel_speed_mms: f32,
+    pub z_hop_speed_mms: f32,
+
+    // --- Accelerations (mm/s²) & Klipper Lookahead ---
+    pub outer_wall_accel_mms2: f32,
+    pub inner_wall_accel_mms2: f32,
+    pub infill_accel_mms2: f32,
+    pub travel_accel_mms2: f32,
+    pub square_corner_velocity_mms: f32,
+    pub minimum_cruise_ratio: f32,
+    pub max_volumetric_flow_mm3s: f32,
+    pub use_stepper_dynamics: bool,
+    pub max_stepper_speed_mms: f32,
+    pub z_travel_penalty: f32,
+
+    // --- Seam, Scarf Joint, Wipe & Retraction ---
+    pub enable_scarf_joint: bool,
+    pub scarf_length_mm: f32,
+    pub scarf_start_height_ratio: f32,
+    pub seam_gap_mm: f32,
+    pub pre_retract_taper_mm: f32,
+    pub wipe_length_mm: f32,
+    pub retract_length_mm: f32,
+    pub retract_speed_mms: f32,
+    pub min_travel_for_retract_mm: f32,
+    pub z_hop_mm: f32,
+    pub ooze_relaxation_extra_prime_mm: f32,
+    pub ooze_relaxation_tau_s: f32,
+
+    // --- Non-Newtonian Rheology, Pressure Advance & Corner/Transient Flow ---
+    pub enable_flat_nozzle_comp: bool,
+    pub enable_corner_flow_comp: bool,
+    pub corner_flow_comp_ratio: f32,
+    pub enable_transient_pressure_comp: bool,
+    pub transient_pressure_exponent: f32,
+    pub transient_min_flow_multiplier: f32,
+    pub enable_dynamic_pa: bool,
+    pub enable_slicer_pa_subdivision: bool,
+    pub pa_low_flow_s: f32,
+    pub pa_high_flow_s: f32,
+    pub pa_ref_low_flow_mm3s: f32,
+    pub pa_ref_high_flow_mm3s: f32,
+    pub swell_low: f32,
+    pub swell_high: f32,
+    pub fan_speed_percent: f32,
+
+    // --- Start & End G-code Templates ---
+    pub start_gcode_template: String,
+    pub end_gcode_template: String,
+}
+
+impl Default for GcodeProcessConfig {
+    fn default() -> Self {
+        Self {
+            bed_temperature_celsius: 60.0,
+            filament_diameter_mm: 1.75,
+            extrusion_multiplier: 1.0,
+            first_layer_flow_multiplier: 1.02,
+            wall_print_order: WallPrintOrder::InnerOuterInner,
+            gcode_origin_at_bed_center: false,
+            first_layer_speed_mms: 45.0,
+            outer_wall_speed_mms: 65.0,
+            inner_wall_speed_mms: 100.0,
+            solid_infill_speed_mms: 130.0,
+            sparse_infill_speed_mms: 160.0,
+            gap_fill_speed_mms: 60.0,
+            travel_speed_mms: 250.0,
+            z_hop_speed_mms: 25.0,
+            outer_wall_accel_mms2: 2500.0,
+            inner_wall_accel_mms2: 4500.0,
+            infill_accel_mms2: 6500.0,
+            travel_accel_mms2: 9000.0,
+            square_corner_velocity_mms: 5.0,
+            minimum_cruise_ratio: 0.50,
+            max_volumetric_flow_mm3s: 18.0,
+            use_stepper_dynamics: true,
+            max_stepper_speed_mms: 400.0,
+            z_travel_penalty: 4.0,
+            enable_scarf_joint: true,
+            scarf_length_mm: 8.0,
+            scarf_start_height_ratio: 0.12,
+            seam_gap_mm: 0.06,
+            pre_retract_taper_mm: 1.0,
+            wipe_length_mm: 1.5,
+            retract_length_mm: 0.80,
+            retract_speed_mms: 45.0,
+            min_travel_for_retract_mm: 1.50,
+            z_hop_mm: 0.40,
+            ooze_relaxation_extra_prime_mm: -0.02,
+            ooze_relaxation_tau_s: 1.50,
+            enable_flat_nozzle_comp: true,
+            enable_corner_flow_comp: true,
+            corner_flow_comp_ratio: 0.85,
+            enable_transient_pressure_comp: true,
+            transient_pressure_exponent: 0.35,
+            transient_min_flow_multiplier: 0.72,
+            enable_dynamic_pa: true,
+            enable_slicer_pa_subdivision: false,
+            pa_low_flow_s: 0.042,
+            pa_high_flow_s: 0.024,
+            pa_ref_low_flow_mm3s: 2.0,
+            pa_ref_high_flow_mm3s: 14.0,
+            swell_low: 1.03,
+            swell_high: 1.10,
+            fan_speed_percent: 100.0,
+            start_gcode_template: concat!(
+                "; --- Manifold2 Non-Planar Print Start ---\n",
+                "; Print Bounds: X[{bbox_min_x}..{bbox_max_x}] Y[{bbox_min_y}..{bbox_max_y}] Z[{bbox_min_z}..{bbox_max_z}]\n",
+                "G90 ; Absolute positioning\n",
+                "M83 ; Relative extrusion\n",
+                "M140 S{bed_temp} ; Set bed temperature\n",
+                "M104 S{nozzle_temp} T{tool_id} ; Set nozzle temperature\n",
+                "G28 ; Home all axes\n",
+                "T{tool_id} ; Select active tool\n",
+                "M190 S{bed_temp} ; Wait for bed temperature\n",
+                "M109 S{nozzle_temp} T{tool_id} ; Wait for nozzle temperature\n",
+                "G92 E0 ; Reset extruder"
+            )
+            .to_string(),
+            end_gcode_template: concat!(
+                "; --- Manifold2 Non-Planar Print End ---\n",
+                "M400 ; Wait for moves to finish\n",
+                "M104 S0 ; Turn off hotend\n",
+                "M140 S0 ; Turn off bed\n",
+                "M107 ; Turn off part cooling fan\n",
+                "G28 X Y ; Park toolhead\n",
+                "M84 ; Disable steppers"
+            )
+            .to_string(),
+        }
+    }
+}
+
+impl GcodeProcessConfig {
+    pub fn sanitize(&mut self) {
+        self.bed_temperature_celsius = self.bed_temperature_celsius.clamp(0.0, 150.0);
+        self.filament_diameter_mm = self.filament_diameter_mm.clamp(1.0, 3.5);
+        self.extrusion_multiplier = self.extrusion_multiplier.clamp(0.2, 2.0);
+        self.first_layer_flow_multiplier = self.first_layer_flow_multiplier.clamp(0.5, 2.0);
+        self.first_layer_speed_mms = self.first_layer_speed_mms.clamp(5.0, 500.0);
+        self.outer_wall_speed_mms = self.outer_wall_speed_mms.clamp(5.0, 600.0);
+        self.inner_wall_speed_mms = self.inner_wall_speed_mms.clamp(5.0, 600.0);
+        self.solid_infill_speed_mms = self.solid_infill_speed_mms.clamp(5.0, 800.0);
+        self.sparse_infill_speed_mms = self.sparse_infill_speed_mms.clamp(5.0, 800.0);
+        self.gap_fill_speed_mms = self.gap_fill_speed_mms.clamp(5.0, 500.0);
+        self.travel_speed_mms = self.travel_speed_mms.clamp(20.0, 1200.0);
+        self.z_hop_speed_mms = self.z_hop_speed_mms.clamp(2.0, 200.0);
+        self.outer_wall_accel_mms2 = self.outer_wall_accel_mms2.clamp(100.0, 50000.0);
+        self.inner_wall_accel_mms2 = self.inner_wall_accel_mms2.clamp(100.0, 50000.0);
+        self.infill_accel_mms2 = self.infill_accel_mms2.clamp(100.0, 50000.0);
+        self.travel_accel_mms2 = self.travel_accel_mms2.clamp(100.0, 80000.0);
+        self.square_corner_velocity_mms = self.square_corner_velocity_mms.clamp(0.5, 50.0);
+        self.minimum_cruise_ratio = self.minimum_cruise_ratio.clamp(0.0, 0.95);
+        self.max_volumetric_flow_mm3s = self.max_volumetric_flow_mm3s.clamp(1.0, 100.0);
+        self.max_stepper_speed_mms = self.max_stepper_speed_mms.clamp(50.0, 2000.0);
+        self.scarf_length_mm = self.scarf_length_mm.clamp(1.0, 40.0);
+        self.scarf_start_height_ratio = self.scarf_start_height_ratio.clamp(0.02, 0.50);
+        self.seam_gap_mm = self.seam_gap_mm.clamp(0.0, 1.0);
+        self.pre_retract_taper_mm = self.pre_retract_taper_mm.clamp(0.0, 10.0);
+        self.wipe_length_mm = self.wipe_length_mm.clamp(0.0, 10.0);
+        self.retract_length_mm = self.retract_length_mm.clamp(0.0, 10.0);
+        self.retract_speed_mms = self.retract_speed_mms.clamp(5.0, 150.0);
+        self.min_travel_for_retract_mm = self.min_travel_for_retract_mm.clamp(0.1, 20.0);
+        self.z_hop_mm = self.z_hop_mm.clamp(0.0, 5.0);
+        self.pa_low_flow_s = self.pa_low_flow_s.clamp(0.0, 0.5);
+        self.pa_high_flow_s = self.pa_high_flow_s.clamp(0.0, 0.5);
+        self.swell_low = self.swell_low.clamp(1.0, 1.8);
+        self.swell_high = self.swell_high.clamp(1.0, 1.8);
+        self.fan_speed_percent = self.fan_speed_percent.clamp(0.0, 100.0);
+    }
+
+    /// Effective minimum travel distance before triggering a retraction, accounting for scarf joint length.
+    pub fn effective_min_travel_for_retract(&self) -> f32 {
+        if self.enable_scarf_joint {
+            self.min_travel_for_retract_mm + 0.35 * self.scarf_length_mm
+        } else {
+            self.min_travel_for_retract_mm
+        }
+    }
+}
+
 /// Top-level extensible slicer configuration stored as a Bevy resource and
 /// persisted inside `.3mf` project files under `/Metadata/manifold2_config.toml`.
 #[derive(Resource, Clone, Debug, Serialize, Deserialize)]
@@ -642,6 +871,7 @@ pub struct SlicerConfig {
     pub bed: PrintBedConfig,
     pub arrangement: ArrangementConfig,
     pub slicing: SlicingProcessConfig,
+    pub gcode: GcodeProcessConfig,
     pub eikonal: EikonalFieldConfig,
     pub machine: MachineKinematicsConfig,
     pub tools: Vec<ToolConfig>,
@@ -654,6 +884,7 @@ impl Default for SlicerConfig {
             bed: PrintBedConfig::default(),
             arrangement: ArrangementConfig::default(),
             slicing: SlicingProcessConfig::default(),
+            gcode: GcodeProcessConfig::default(),
             eikonal: EikonalFieldConfig::default(),
             machine: MachineKinematicsConfig::default(),
             tools: vec![

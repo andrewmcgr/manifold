@@ -7,7 +7,7 @@ use bevy_egui::{egui, EguiContexts};
 use crate::bridge::ffi;
 use crate::config::{
     BedShape, ClearancePointXZ, PointNormalHint, SlicerConfig, SolidInfillPattern,
-    SparseInfillPattern, SurfaceHintMode, ToolConfig,
+    SparseInfillPattern, SurfaceHintMode, ToolConfig, WallPrintOrder,
 };
 use crate::field_vis::{
     FieldColormap, FieldVisualizationState, IsoIntersectionMode, SelectedLayersColorMode,
@@ -1639,6 +1639,24 @@ pub fn ui_workspace_system(
                                     {
                                         vis_state.dirty_toolpaths_mesh = true;
                                     }
+                                    if ui
+                                        .checkbox(
+                                            &mut vis_state.show_scarf_and_wipes,
+                                            "Scarf & Wipes",
+                                        )
+                                        .changed()
+                                    {
+                                        vis_state.dirty_toolpaths_mesh = true;
+                                    }
+                                    if ui
+                                        .checkbox(
+                                            &mut vis_state.show_travel_moves,
+                                            "Travel & Z-Hops",
+                                        )
+                                        .changed()
+                                    {
+                                        vis_state.dirty_toolpaths_mesh = true;
+                                    }
                                     ui.checkbox(
                                         &mut vis_state.show_toolpath_centerlines,
                                         "Centerlines",
@@ -1648,10 +1666,7 @@ pub fn ui_workspace_system(
                                 egui::ComboBox::from_id_source("toolpath_color_mode_combo")
                                     .selected_text(vis_state.toolpath_color_mode.label())
                                     .show_ui(ui, |ui| {
-                                        for mode in [
-                                            ToolpathColorMode::ByFeatureType,
-                                            ToolpathColorMode::ByLineWidth,
-                                        ] {
+                                        for mode in ToolpathColorMode::ALL {
                                             if ui
                                                 .selectable_value(
                                                     &mut vis_state.toolpath_color_mode,
@@ -1664,6 +1679,47 @@ pub fn ui_workspace_system(
                                             }
                                         }
                                     });
+
+                                if let Some(ref planned) = vis_state.cached_planned_gcode {
+                                    let legend_text = match vis_state.toolpath_color_mode {
+                                        ToolpathColorMode::ByFeatureType => {
+                                            "Legend: Outer=Orange | Inner=Green | Solid=Cyan | Sparse=Gold | Scarf=Violet | Wipe=Silver | Travel=Cyan/Yellow".to_string()
+                                        }
+                                        ToolpathColorMode::ByLineWidth => format!(
+                                            "Range (Blue -> Green -> Amber): {:.3} .. {:.3} mm",
+                                            planned.min_width_mm, planned.max_width_mm
+                                        ),
+                                        ToolpathColorMode::ByLayerHeight => format!(
+                                            "Range (Blue -> Green -> Amber): {:.3} .. {:.3} mm",
+                                            planned.min_height_mm, planned.max_height_mm
+                                        ),
+                                        ToolpathColorMode::BySpeed => format!(
+                                            "Range (Blue -> Green -> Amber): {:.1} .. {:.1} mm/s",
+                                            planned.min_speed_mms, planned.max_speed_mms
+                                        ),
+                                        ToolpathColorMode::ByAcceleration => format!(
+                                            "Range (Braking=Blue | Cruise=Green | Accel=Amber): {:.0} .. +{:.0} mm/s²",
+                                            planned.min_accel_mms2, planned.max_accel_mms2
+                                        ),
+                                        ToolpathColorMode::ByVolumetricFlow => format!(
+                                            "Range (Blue -> Green -> Amber): {:.2} .. {:.2} mm³/s",
+                                            planned.min_flow_mm3s, planned.max_flow_mm3s
+                                        ),
+                                        ToolpathColorMode::ByExtrusionMultiplier => format!(
+                                            "Range (Blue -> Green -> Amber): {:.3}× .. {:.3}×",
+                                            planned.min_flow_mult, planned.max_flow_mult
+                                        ),
+                                        ToolpathColorMode::ByPressureAdvance => format!(
+                                            "Range (Blue -> Green -> Amber): {:.4} .. {:.4} s",
+                                            planned.min_pa_s, planned.max_pa_s
+                                        ),
+                                        ToolpathColorMode::ByMeltZonePressure => format!(
+                                            "Range (Blue -> Green -> Amber): {:.2} .. {:.2} mm³/s eq",
+                                            planned.min_pressure_mm3s, planned.max_pressure_mm3s
+                                        ),
+                                    };
+                                    ui.small(egui::RichText::new(legend_text).italics());
+                                }
                             }
 
                             if let Some(ref tp_res) = vis_state.cached_toolpaths {
@@ -1676,6 +1732,438 @@ pub fn ui_workspace_system(
                                     tp_res.sparse_infill_count
                                 ));
                             }
+
+                            // --- G-code Generation, Kinematics, Rheology & Export ---
+                            ui.add_space(6.0);
+                            ui.separator();
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new("G-code Planning, Kinematics & Export")
+                                    .strong(),
+                            )
+                            .id_source("gcode_planning_kinematics_export_section")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                let has_planned = vis_state.cached_planned_gcode.is_some();
+
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            has_planned && !is_computing && !is_busy,
+                                            egui::Button::new(
+                                                egui::RichText::new("Export G-code (.gcode)...")
+                                                    .strong(),
+                                            ),
+                                        )
+                                        .on_hover_text(
+                                            "Export the planned non-planar G-code for the selected object",
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(ref planned) = vis_state.cached_planned_gcode {
+                                            let stem = std::path::Path::new(&obj_name)
+                                                .file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("manifold2_print");
+                                            let default_filename = format!("{stem}.gcode");
+                                            let gcode_bytes = planned.gcode_text.clone();
+                                            let total_moves = planned.extruding_move_count
+                                                + planned.travel_move_count;
+                                            plate.status_message =
+                                                "Choosing destination for G-code export..."
+                                                    .to_string();
+
+                                            let save_task = IoTaskPool::get().spawn(async move {
+                                                let file_handle = rfd::AsyncFileDialog::new()
+                                                    .add_filter(
+                                                        "G-code (.gcode, .nc)",
+                                                        &["gcode", "nc"],
+                                                    )
+                                                    .set_file_name(&default_filename)
+                                                    .save_file()
+                                                    .await?;
+                                                let out_path = file_handle.path().to_path_buf();
+                                                let kb = gcode_bytes.len() as f64 / 1024.0;
+                                                let res = std::fs::write(&out_path, gcode_bytes)
+                                                    .map(|()| {
+                                                        format!(
+                                                            "{} ({:.1} KB, {} moves)",
+                                                            out_path.display(),
+                                                            kb,
+                                                            total_moves
+                                                        )
+                                                    })
+                                                    .map_err(|e| e.to_string());
+                                                Some(res)
+                                            });
+                                            plate.pending_save_task = Some(save_task);
+                                        }
+                                    }
+
+                                    if !has_planned && !is_computing {
+                                        if ui
+                                            .small_button("Plan Toolpaths & G-code Now")
+                                            .clicked()
+                                        {
+                                            vis_state.show_toolpaths = true;
+                                            if has_eikonal {
+                                                let need_layers =
+                                                    vis_state.cached_selected_layers.is_none()
+                                                        || vis_state.dirty_selected_layers;
+                                                vis_state.spawn_slicing_task(
+                                                    sel_id,
+                                                    &config,
+                                                    need_layers,
+                                                    true,
+                                                );
+                                            } else {
+                                                spawn_field_compute_task(
+                                                    &mut vis_state,
+                                                    &mut plate,
+                                                    &config,
+                                                    sel_id,
+                                                    &obj_name,
+                                                    obj_rotation,
+                                                );
+                                            }
+                                        }
+                                    }
+                                });
+
+                                if let Some(ref planned) = vis_state.cached_planned_gcode {
+                                    let total_sec = planned.total_time_s.round() as u64;
+                                    let hrs = total_sec / 3600;
+                                    let mins = (total_sec % 3600) / 60;
+                                    let secs = total_sec % 60;
+                                    ui.small(format!(
+                                        "Est. Time: {:02}h {:02}m {:02}s | Filament: {:.2} m ({:.1} g, {:.0} mm³)",
+                                        hrs,
+                                        mins,
+                                        secs,
+                                        planned.total_filament_mm / 1000.0,
+                                        planned.total_filament_grams,
+                                        planned.total_filament_volume_mm3
+                                    ));
+                                    ui.small(format!(
+                                        "Moves: {} extruding, {} travels, {} retracts | BBox: [{:.1}, {:.1}, {:.1}]..[{:.1}, {:.1}, {:.1}] mm",
+                                        planned.extruding_move_count,
+                                        planned.travel_move_count,
+                                        planned.retract_count,
+                                        planned.bbox_min_bed.x,
+                                        planned.bbox_min_bed.y,
+                                        planned.bbox_min_bed.z,
+                                        planned.bbox_max_bed.x,
+                                        planned.bbox_max_bed.y,
+                                        planned.bbox_max_bed.z
+                                    ));
+                                }
+
+                                let mut gc_changed = false;
+                                let gc = &mut config.gcode;
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Wall Order:");
+                                    egui::ComboBox::from_id_source("gcode_wall_order_combo")
+                                        .selected_text(gc.wall_print_order.label())
+                                        .show_ui(ui, |ui| {
+                                            for order in [
+                                                WallPrintOrder::InnerOuterInner,
+                                                WallPrintOrder::OutsideIn,
+                                            ] {
+                                                gc_changed |= ui
+                                                    .selectable_value(
+                                                        &mut gc.wall_print_order,
+                                                        order,
+                                                        order.label(),
+                                                    )
+                                                    .changed();
+                                            }
+                                        });
+                                });
+                                gc_changed |= ui
+                                    .checkbox(
+                                        &mut gc.gcode_origin_at_bed_center,
+                                        "G-code Origin at Bed Center (0, 0) instead of Front-Left",
+                                    )
+                                    .changed();
+
+                                ui.collapsing("Speeds, Accelerations & Klipper Kinematics", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Outer / Inner Wall (mm/s):");
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut gc.outer_wall_speed_mms)
+                                                    .speed(1.0)
+                                                    .range(5.0..=500.0)
+                                                    .prefix("Out: "),
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut gc.inner_wall_speed_mms)
+                                                    .speed(1.0)
+                                                    .range(5.0..=500.0)
+                                                    .prefix("In: "),
+                                            )
+                                            .changed();
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Solid / Sparse Infill (mm/s):");
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut gc.solid_infill_speed_mms,
+                                                )
+                                                .speed(1.0)
+                                                .range(5.0..=600.0)
+                                                .prefix("Solid: "),
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut gc.sparse_infill_speed_mms,
+                                                )
+                                                .speed(1.0)
+                                                .range(5.0..=600.0)
+                                                .prefix("Sparse: "),
+                                            )
+                                            .changed();
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("1st Layer / Travel (mm/s):");
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut gc.first_layer_speed_mms,
+                                                )
+                                                .speed(1.0)
+                                                .range(5.0..=200.0)
+                                                .prefix("1st: "),
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut gc.travel_speed_mms)
+                                                    .speed(2.0)
+                                                    .range(20.0..=1000.0)
+                                                    .prefix("Trv: "),
+                                            )
+                                            .changed();
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Accel Infill / Wall / Travel (mm/s²):");
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut gc.infill_accel_mms2,
+                                                )
+                                                .speed(50.0)
+                                                .range(100.0..=30000.0)
+                                                .prefix("Inf: "),
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut gc.outer_wall_accel_mms2,
+                                                )
+                                                .speed(50.0)
+                                                .range(100.0..=30000.0)
+                                                .prefix("W: "),
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut gc.travel_accel_mms2,
+                                                )
+                                                .speed(50.0)
+                                                .range(100.0..=50000.0)
+                                                .prefix("T: "),
+                                            )
+                                            .changed();
+                                    });
+                                    ui.horizontal(|ui| {
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut gc.square_corner_velocity_mms,
+                                                    0.5..=25.0,
+                                                )
+                                                .text("SCV (mm/s)"),
+                                            )
+                                            .changed();
+                                    });
+                                    gc_changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut gc.minimum_cruise_ratio,
+                                                0.0..=0.90,
+                                            )
+                                            .text("Min Cruise Ratio"),
+                                        )
+                                        .changed();
+                                    gc_changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut gc.max_volumetric_flow_mm3s,
+                                                1.0..=50.0,
+                                            )
+                                            .text("Max Volumetric Flow (mm³/s)"),
+                                        )
+                                        .changed();
+                                    gc_changed |= ui
+                                        .checkbox(
+                                            &mut gc.use_stepper_dynamics,
+                                            "Stepper Back-EMF Torque Roll-off",
+                                        )
+                                        .changed();
+                                });
+
+                                ui.collapsing("Seams, 3D Scarf Joint, Wipe & Retraction", |ui| {
+                                    gc_changed |= ui
+                                        .checkbox(
+                                            &mut gc.enable_scarf_joint,
+                                            "3D Conformal Scarf Joint (Closed Loops)",
+                                        )
+                                        .changed();
+                                    if gc.enable_scarf_joint {
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut gc.scarf_length_mm,
+                                                    1.0..=25.0,
+                                                )
+                                                .text("Scarf Length (mm)"),
+                                            )
+                                            .changed();
+                                    }
+                                    ui.horizontal(|ui| {
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut gc.seam_gap_mm)
+                                                    .speed(0.01)
+                                                    .range(0.0..=1.0)
+                                                    .prefix("Seam Gap: ")
+                                                    .suffix(" mm"),
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut gc.wipe_length_mm)
+                                                    .speed(0.05)
+                                                    .range(0.0..=6.0)
+                                                    .prefix("Wipe: ")
+                                                    .suffix(" mm"),
+                                            )
+                                            .changed();
+                                    });
+                                    ui.horizontal(|ui| {
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut gc.retract_length_mm)
+                                                    .speed(0.05)
+                                                    .range(0.0..=8.0)
+                                                    .prefix("Retract: ")
+                                                    .suffix(" mm"),
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut gc.z_hop_mm)
+                                                    .speed(0.05)
+                                                    .range(0.0..=3.0)
+                                                    .prefix("Nozzle Hop: ")
+                                                    .suffix(" mm"),
+                                            )
+                                            .changed();
+                                    });
+                                });
+
+                                ui.collapsing(
+                                    "Rheology, Dynamic PA & Transient Pressure",
+                                    |ui| {
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut gc.pa_low_flow_s,
+                                                    0.0..=0.25,
+                                                )
+                                                .text("PA Low Flow k_low (s)"),
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut gc.pa_high_flow_s,
+                                                    0.0..=0.25,
+                                                )
+                                                .text("PA High Flow k_high (s)"),
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .checkbox(
+                                                &mut gc.enable_dynamic_pa,
+                                                "Emit Dynamic M572 / SET_PRESSURE_ADVANCE",
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .checkbox(
+                                                &mut gc.enable_slicer_pa_subdivision,
+                                                "Slicer-Side Trapezoidal PA Subdivision",
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .checkbox(
+                                                &mut gc.enable_corner_flow_comp,
+                                                "Klipper SCV Corner Flow Compensation",
+                                            )
+                                            .changed();
+                                        gc_changed |= ui
+                                            .checkbox(
+                                                &mut gc.enable_transient_pressure_comp,
+                                                "Melt-Zone Transient Pressure Compensation",
+                                            )
+                                            .changed();
+                                    },
+                                );
+
+                                ui.collapsing("Start & End G-code Templates", |ui| {
+                                    gc_changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut gc.bed_temperature_celsius,
+                                                0.0..=130.0,
+                                            )
+                                            .text("Bed Temperature (°C)"),
+                                        )
+                                        .changed();
+                                    ui.small(
+                                        "Placeholders: {tool_id}, {nozzle_temp}, {bed_temp}, {nozzle_diameter}, {bbox_min_x..z}, {bbox_max_x..z}, {bbox_center_x..y}, {layer_count}",
+                                    );
+                                    ui.label("Start G-code Template:");
+                                    gc_changed |= ui
+                                        .add(
+                                            egui::TextEdit::multiline(&mut gc.start_gcode_template)
+                                                .code_editor()
+                                                .desired_rows(5),
+                                        )
+                                        .changed();
+                                    ui.label("End G-code Template:");
+                                    gc_changed |= ui
+                                        .add(
+                                            egui::TextEdit::multiline(&mut gc.end_gcode_template)
+                                                .code_editor()
+                                                .desired_rows(4),
+                                        )
+                                        .changed();
+                                });
+
+                                if gc_changed {
+                                    config.gcode.sanitize();
+                                    vis_state.dirty_planned_gcode = true;
+                                }
+                            });
                         });
                     }
                 }
@@ -1982,17 +2470,22 @@ pub fn ui_workspace_system(
 
                     ui.separator();
                     ui.label(egui::RichText::new("Print Bed Geometry").strong());
+                    let mut bed_changed = false;
                     ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut config.bed.shape,
-                            BedShape::Rectangular,
-                            "Rectangular",
-                        );
-                        ui.selectable_value(
-                            &mut config.bed.shape,
-                            BedShape::Circular,
-                            "Circular (Delta)",
-                        );
+                        bed_changed |= ui
+                            .selectable_value(
+                                &mut config.bed.shape,
+                                BedShape::Rectangular,
+                                "Rectangular",
+                            )
+                            .changed();
+                        bed_changed |= ui
+                            .selectable_value(
+                                &mut config.bed.shape,
+                                BedShape::Circular,
+                                "Circular (Delta)",
+                            )
+                            .changed();
                     });
 
                     ui.horizontal(|ui| {
@@ -2001,33 +2494,45 @@ pub fn ui_workspace_system(
                             config.bed.width_x = 256.0;
                             config.bed.depth_y = 256.0;
                             config.bed.height_z = 256.0;
+                            bed_changed = true;
                         }
                         if ui.small_button("250×210 (Prusa)").clicked() {
                             config.bed.width_x = 250.0;
                             config.bed.depth_y = 210.0;
                             config.bed.height_z = 220.0;
+                            bed_changed = true;
                         }
                         if ui.small_button("350³ (Large)").clicked() {
                             config.bed.width_x = 350.0;
                             config.bed.depth_y = 350.0;
                             config.bed.height_z = 350.0;
+                            bed_changed = true;
                         }
                     });
 
-                    ui.add(
-                        egui::Slider::new(&mut config.bed.width_x, 50.0..=600.0)
-                            .text("Width X (mm)"),
-                    );
+                    bed_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut config.bed.width_x, 50.0..=600.0)
+                                .text("Width X (mm)"),
+                        )
+                        .changed();
                     if config.bed.shape == BedShape::Rectangular {
-                        ui.add(
-                            egui::Slider::new(&mut config.bed.depth_y, 50.0..=600.0)
-                                .text("Depth Y (mm)"),
-                        );
+                        bed_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut config.bed.depth_y, 50.0..=600.0)
+                                    .text("Depth Y (mm)"),
+                            )
+                            .changed();
                     }
-                    ui.add(
-                        egui::Slider::new(&mut config.bed.height_z, 50.0..=600.0)
-                            .text("Max Z (mm)"),
-                    );
+                    bed_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut config.bed.height_z, 50.0..=600.0)
+                                .text("Max Z (mm)"),
+                        )
+                        .changed();
+                    if bed_changed {
+                        vis_state.dirty_planned_gcode = true;
+                    }
                     ui.checkbox(&mut config.bed.show_volume_box, "Show Build Volume Box");
 
                     ui.separator();
@@ -2302,19 +2807,19 @@ pub fn poll_io_tasks_system(
         }
     }
 
-    // 2. Poll pending 3MF project save task
+    // 2. Poll pending 3MF project or G-code file save task
     if let Some(ref mut task) = plate.pending_save_task {
         if let Some(result) = block_on(future::poll_once(task)) {
             plate.pending_save_task = None;
             match result {
-                Some(Ok(saved_path)) => {
-                    plate.status_message = format!("Saved 3MF project & config to '{saved_path}'.");
+                Some(Ok(saved_info)) => {
+                    plate.status_message = format!("Exported to {saved_info}.");
                 }
                 Some(Err(err)) => {
-                    plate.status_message = format!("3MF save error: {err}");
+                    plate.status_message = format!("Export error: {err}");
                 }
                 None => {
-                    plate.status_message = "3MF save cancelled.".to_string();
+                    plate.status_message = "Export cancelled.".to_string();
                 }
             }
         }

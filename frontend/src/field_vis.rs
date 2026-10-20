@@ -107,26 +107,61 @@ impl SelectedLayersColorMode {
     }
 }
 
-/// Color mode for 3D visualization of generated non-planar shell toolpaths.
+/// Color mode for 3D visualization of generated non-planar toolpaths and G-code variables.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolpathColorMode {
     /// Colors paths by feature type:
     /// - Outer Wall: Coral/Orange
     /// - Inner Wall: Emerald/Lime Green
     /// - Solid Infill: Sky Blue/Cyan
-    /// - Gap Fill: Vivid Magenta/Gold
+    /// - Sparse Infill: Warm Gold/Amber
+    /// - Gap Fill: Vivid Magenta
+    /// - Scarf / Wipe: Violet / Slate
+    /// - Travel / Z-Hop: Cyan / Yellow
     #[default]
     ByFeatureType,
-    /// Colors each vertex by its local line width relative to `[min_mm, target_mm, max_mm]`
-    /// (Blue = `min_mm`, Emerald Green = `target_mm`, Amber/Red = `max_mm`).
+    /// Colors each segment by its local line width $W$ (`mm`).
     ByLineWidth,
+    /// Colors each segment by its local layer height $H$ (`mm`).
+    ByLayerHeight,
+    /// Colors each segment by its planned kinematic feedrate speed $v$ (`mm/s`).
+    BySpeed,
+    /// Colors each segment by its signed tangential acceleration $a$ (`mm/s²`).
+    ByAcceleration,
+    /// Colors each segment by its actual volumetric flow rate $Q_{\text{actual}}$ (`mm³/s`).
+    ByVolumetricFlow,
+    /// Colors each segment by its corner + transient pressure flow multiplier $M_{\text{total}}$.
+    ByExtrusionMultiplier,
+    /// Colors each segment by its dynamic non-Newtonian pressure advance $k_{\text{PA}}$ (`s`).
+    ByPressureAdvance,
+    /// Colors each segment by its modeled melt-zone pressure $P_{\text{melt}}$ (`MPa` proxy).
+    ByMeltZonePressure,
 }
 
 impl ToolpathColorMode {
+    pub const ALL: [Self; 9] = [
+        Self::ByFeatureType,
+        Self::ByLineWidth,
+        Self::ByLayerHeight,
+        Self::BySpeed,
+        Self::ByAcceleration,
+        Self::ByVolumetricFlow,
+        Self::ByExtrusionMultiplier,
+        Self::ByPressureAdvance,
+        Self::ByMeltZonePressure,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
-            Self::ByFeatureType => "Feature Type (Outer / Inner / Solid / Sparse / Gap)",
-            Self::ByLineWidth => "Local Line Width (Min=Blue / Target=Green / Max=Amber)",
+            Self::ByFeatureType => "Feature Type (Outer / Inner / Solid / Sparse / Scarf / Wipe)",
+            Self::ByLineWidth => "Line Width W (mm)",
+            Self::ByLayerHeight => "Layer Height H (mm)",
+            Self::BySpeed => "Planned Speed v (mm/s)",
+            Self::ByAcceleration => "Acceleration a (mm/s²)",
+            Self::ByVolumetricFlow => "Actual Volumetric Flow Q (mm³/s)",
+            Self::ByExtrusionMultiplier => "Flow Multiplier M (Corner + Transient)",
+            Self::ByPressureAdvance => "Dynamic Pressure Advance k_PA (s)",
+            Self::ByMeltZonePressure => "Melt-Zone Pressure P_melt (MPa)",
         }
     }
 }
@@ -192,19 +227,23 @@ pub struct FieldVisualizationState {
     pub dirty_selected_layers: bool,
     pub dirty_selected_layers_mesh: bool,
 
-    // --- Non-Planar Shell & Sparse Infill Toolpaths Visualization Controls ---
+    // --- Non-Planar Shell & Sparse Infill Toolpaths & Planned G-code Visualization Controls ---
     pub show_toolpaths: bool,
     pub show_outer_walls: bool,
     pub show_inner_walls: bool,
     pub show_solid_infill: bool,
     pub show_sparse_infill: bool,
+    pub show_travel_moves: bool,
+    pub show_scarf_and_wipes: bool,
     pub show_toolpath_centerlines: bool,
     pub toolpath_color_mode: ToolpathColorMode,
     pub cached_toolpaths: Option<ObjectToolpathsResult>,
+    pub cached_planned_gcode: Option<crate::gcode::PlannedGcodeResult>,
     pub toolpaths_entity: Option<Entity>,
     pub toolpaths_mesh_handle: Option<Handle<Mesh>>,
     pub toolpaths_mat_handle: Option<Handle<StandardMaterial>>,
     pub dirty_toolpaths: bool,
+    pub dirty_planned_gcode: bool,
     pub dirty_toolpaths_mesh: bool,
 
     // --- 2D Cross-Section Slice Controls & Persistent Handles ---
@@ -277,13 +316,17 @@ impl Default for FieldVisualizationState {
             show_inner_walls: true,
             show_solid_infill: true,
             show_sparse_infill: true,
+            show_travel_moves: false,
+            show_scarf_and_wipes: true,
             show_toolpath_centerlines: false,
             toolpath_color_mode: ToolpathColorMode::ByFeatureType,
             cached_toolpaths: None,
+            cached_planned_gcode: None,
             toolpaths_entity: None,
             toolpaths_mesh_handle: None,
             toolpaths_mat_handle: None,
             dirty_toolpaths: true,
+            dirty_planned_gcode: true,
             dirty_toolpaths_mesh: true,
             show_slice_plane: false,
             slice_axis: SliceAxis::Z,
@@ -314,10 +357,12 @@ impl FieldVisualizationState {
         self.cached_stats = None;
         self.cached_selected_layers = None;
         self.cached_toolpaths = None;
+        self.cached_planned_gcode = None;
         self.dirty_isosurface = true;
         self.dirty_selected_layers = true;
         self.dirty_selected_layers_mesh = true;
         self.dirty_toolpaths = true;
+        self.dirty_planned_gcode = true;
         self.dirty_toolpaths_mesh = true;
         self.dirty_slice = true;
     }
@@ -437,7 +482,9 @@ impl FieldVisualizationState {
                 self.cached_toolpaths = Some(res);
             } else {
                 self.cached_toolpaths = None;
+                self.cached_planned_gcode = None;
             }
+            self.dirty_planned_gcode = true;
             self.dirty_toolpaths_mesh = true;
         }
     }
@@ -534,11 +581,13 @@ pub fn sync_field_visualization_system(
         vis_state.cached_stats = None;
         vis_state.cached_selected_layers = None;
         vis_state.cached_toolpaths = None;
+        vis_state.cached_planned_gcode = None;
         vis_state.contour_segments_local.clear();
         vis_state.dirty_isosurface = true;
         vis_state.dirty_selected_layers = true;
         vis_state.dirty_selected_layers_mesh = true;
         vis_state.dirty_toolpaths = true;
+        vis_state.dirty_planned_gcode = true;
         vis_state.dirty_toolpaths_mesh = true;
         vis_state.dirty_slice = true;
 
@@ -936,7 +985,19 @@ pub fn sync_field_visualization_system(
         }
     }
 
-    // 2d. Render Non-Planar Shell Toolpaths (3D Variable-Width Extruded Bead Mesh)
+    // 2d. Plan G-code & Render Non-Planar Toolpaths (3D Variable-Width Extruded Bead Mesh)
+    if vis_state.cached_toolpaths.is_some()
+        && (vis_state.dirty_planned_gcode || vis_state.cached_planned_gcode.is_none())
+        && !vis_state.ui_pointer_down
+    {
+        vis_state.dirty_planned_gcode = false;
+        if let Some(ref tp_res) = vis_state.cached_toolpaths {
+            let planned = crate::gcode::plan_and_emit_gcode(tp_res, obj_world_tf, &config);
+            vis_state.cached_planned_gcode = Some(planned);
+            vis_state.dirty_toolpaths_mesh = true;
+        }
+    }
+
     if !vis_state.show_toolpaths {
         if let Some(ent) = vis_state.toolpaths_entity {
             if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
@@ -955,20 +1016,22 @@ pub fn sync_field_visualization_system(
         let show_inner = vis_state.show_inner_walls;
         let show_infill = vis_state.show_solid_infill;
         let show_sparse = vis_state.show_sparse_infill;
+        let show_scarf_wipes = vis_state.show_scarf_and_wipes;
+        let show_travels = vis_state.show_travel_moves;
 
         let mut positions: Vec<[f32; 3]> = Vec::new();
         let mut normals: Vec<[f32; 3]> = Vec::new();
         let mut colors: Vec<[f32; 4]> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
 
-        if let Some(ref tp_res) = vis_state.cached_toolpaths {
-            let total = tp_res.layers.len();
+        if let Some(ref planned) = vis_state.cached_planned_gcode {
+            let total = planned.layers.len();
             if total > 0 {
                 let lo = min_idx.min(total - 1);
                 let hi = max_idx.min(total - 1).max(lo);
 
-                let mut est_pts = 0usize;
-                for (idx, layer_tp) in tp_res.layers.iter().enumerate() {
+                let mut est_segs = 0usize;
+                for (idx, layer_p) in planned.layers.iter().enumerate() {
                     let is_hovered = highlighted == Some(idx);
                     let in_range = idx >= lo && idx <= hi;
                     let matches_stride =
@@ -976,22 +1039,73 @@ pub fn sync_field_visualization_system(
                     if !is_hovered && (!in_range || !matches_stride) {
                         continue;
                     }
-                    for path in &layer_tp.paths {
-                        let visible = match path.feature_kind {
-                            0 => show_outer,
-                            1 => show_inner,
-                            4 => show_sparse,
-                            _ => show_infill,
-                        };
-                        if visible && path.points.len() >= 2 {
-                            est_pts += path.points.len();
+                    for seg in &layer_p.segments {
+                        if is_planned_segment_visible(
+                            seg,
+                            show_outer,
+                            show_inner,
+                            show_infill,
+                            show_sparse,
+                            show_scarf_wipes,
+                            show_travels,
+                        ) {
+                            est_segs += 1;
                         }
                     }
                 }
-                positions.reserve(est_pts * 4);
-                normals.reserve(est_pts * 4);
-                colors.reserve(est_pts * 4);
-                indices.reserve(est_pts * 24);
+                positions.reserve(est_segs * 8);
+                normals.reserve(est_segs * 8);
+                colors.reserve(est_segs * 8);
+                indices.reserve(est_segs * 36);
+
+                for (idx, layer_p) in planned.layers.iter().enumerate() {
+                    let is_hovered = highlighted == Some(idx);
+                    let in_range = idx >= lo && idx <= hi;
+                    let matches_stride =
+                        ((idx - lo) % stride == 0) || idx == 0 || idx + 1 == total;
+                    if !is_hovered && (!in_range || !matches_stride) {
+                        continue;
+                    }
+
+                    let dim_factor = if is_hovered {
+                        1.15
+                    } else if highlighted.is_some() {
+                        0.55
+                    } else {
+                        1.0
+                    };
+
+                    for seg in &layer_p.segments {
+                        if !is_planned_segment_visible(
+                            seg,
+                            show_outer,
+                            show_inner,
+                            show_infill,
+                            show_sparse,
+                            show_scarf_wipes,
+                            show_travels,
+                        ) {
+                            continue;
+                        }
+                        append_planned_segment_bead_mesh(
+                            seg,
+                            planned,
+                            color_mode,
+                            &config,
+                            dim_factor,
+                            &mut positions,
+                            &mut normals,
+                            &mut colors,
+                            &mut indices,
+                        );
+                    }
+                }
+            }
+        } else if let Some(ref tp_res) = vis_state.cached_toolpaths {
+            let total = tp_res.layers.len();
+            if total > 0 {
+                let lo = min_idx.min(total - 1);
+                let hi = max_idx.min(total - 1).max(lo);
 
                 for (idx, layer_tp) in tp_res.layers.iter().enumerate() {
                     let is_hovered = highlighted == Some(idx);
@@ -1092,17 +1206,19 @@ pub fn sync_field_visualization_system(
         }
     }
 
-    // Optional crisp gizmo centerlines on top of toolpath beads
-    if vis_state.show_toolpaths && vis_state.show_toolpath_centerlines {
-        if let Some(ref tp_res) = vis_state.cached_toolpaths {
-            let total = tp_res.layers.len();
+    // Optional crisp gizmo centerlines and travel/Z-hop trajectories on top of toolpath beads
+    if vis_state.show_toolpaths
+        && (vis_state.show_toolpath_centerlines || vis_state.show_travel_moves)
+    {
+        if let Some(ref planned) = vis_state.cached_planned_gcode {
+            let total = planned.layers.len();
             if total > 0 {
                 let stride = vis_state.selected_layer_stride.max(1);
                 let lo = vis_state.selected_layer_min_idx.min(total - 1);
                 let hi = vis_state.selected_layer_max_idx.min(total - 1).max(lo);
                 let highlighted = vis_state.highlighted_selected_layer;
 
-                for (idx, layer_tp) in tp_res.layers.iter().enumerate() {
+                for (idx, layer_p) in planned.layers.iter().enumerate() {
                     let is_hovered = highlighted == Some(idx);
                     let in_range = idx >= lo && idx <= hi;
                     let matches_stride =
@@ -1110,20 +1226,32 @@ pub fn sync_field_visualization_system(
                     if !is_hovered && (!in_range || !matches_stride) {
                         continue;
                     }
-                    for path in &layer_tp.paths {
-                        let visible = match path.feature_kind {
-                            0 => vis_state.show_outer_walls,
-                            1 => vis_state.show_inner_walls,
-                            4 => vis_state.show_sparse_infill,
-                            _ => vis_state.show_solid_infill,
-                        };
-                        if !visible || path.points.len() < 2 {
+                    for seg in &layer_p.segments {
+                        let is_travel = matches!(
+                            seg.kind,
+                            crate::gcode::PlannedMoveKind::Travel
+                                | crate::gcode::PlannedMoveKind::ZHop
+                        );
+                        if is_travel && !vis_state.show_travel_moves {
                             continue;
                         }
-                        let rgba = compute_toolpath_point_color(
-                            path.feature_kind,
-                            path.wall_index,
-                            path.mean_width_mm,
+                        if !is_travel && !vis_state.show_toolpath_centerlines {
+                            continue;
+                        }
+                        if !is_planned_segment_visible(
+                            seg,
+                            vis_state.show_outer_walls,
+                            vis_state.show_inner_walls,
+                            vis_state.show_solid_infill,
+                            vis_state.show_sparse_infill,
+                            vis_state.show_scarf_and_wipes,
+                            vis_state.show_travel_moves,
+                        ) {
+                            continue;
+                        }
+                        let rgba = compute_planned_segment_color(
+                            seg,
+                            planned,
                             vis_state.toolpath_color_mode,
                             &config,
                         );
@@ -1132,18 +1260,9 @@ pub fn sync_field_visualization_system(
                             (rgba[1] * 1.15).min(1.0),
                             (rgba[2] * 1.15).min(1.0),
                         );
-                        for w in path.points.windows(2) {
-                            let p0 = obj_world_tf.transform_point(Vec3::new(w[0].x, w[0].y, w[0].z));
-                            let p1 = obj_world_tf.transform_point(Vec3::new(w[1].x, w[1].y, w[1].z));
-                            gizmos.line(p0, p1, line_col);
-                        }
-                        if path.is_closed && path.points.len() >= 3 {
-                            let last = path.points.last().unwrap();
-                            let first = &path.points[0];
-                            let p0 = obj_world_tf.transform_point(Vec3::new(last.x, last.y, last.z));
-                            let p1 = obj_world_tf.transform_point(Vec3::new(first.x, first.y, first.z));
-                            gizmos.line(p0, p1, line_col);
-                        }
+                        let p0 = obj_world_tf.transform_point(seg.p0_local);
+                        let p1 = obj_world_tf.transform_point(seg.p1_local);
+                        gizmos.line(p0, p1, line_col);
                     }
                 }
             }
@@ -1318,6 +1437,7 @@ pub fn sync_field_visualization_system(
             if let Ok((mut tf, _)) = toolpaths_query.get_mut(ent) {
                 if *tf != obj_world_tf {
                     *tf = obj_world_tf;
+                    vis_state.dirty_planned_gcode = true;
                 }
             }
         }
@@ -1329,6 +1449,223 @@ pub fn sync_field_visualization_system(
                     *tf = obj_world_tf;
                 }
             }
+        }
+    }
+}
+
+/// Returns whether a `PlannedSegment` should be rendered given the current UI visibility toggles.
+fn is_planned_segment_visible(
+    seg: &crate::gcode::PlannedSegment,
+    show_outer: bool,
+    show_inner: bool,
+    show_infill: bool,
+    show_sparse: bool,
+    show_scarf_wipes: bool,
+    show_travels: bool,
+) -> bool {
+    match seg.kind {
+        crate::gcode::PlannedMoveKind::Travel | crate::gcode::PlannedMoveKind::ZHop => show_travels,
+        crate::gcode::PlannedMoveKind::ScarfSeam | crate::gcode::PlannedMoveKind::Wipe => {
+            show_scarf_wipes && (show_outer || show_inner)
+        }
+        crate::gcode::PlannedMoveKind::OuterWall => show_outer,
+        crate::gcode::PlannedMoveKind::InnerWall => show_inner,
+        crate::gcode::PlannedMoveKind::SparseInfill => show_sparse,
+        crate::gcode::PlannedMoveKind::SolidInfill | crate::gcode::PlannedMoveKind::GapFill => {
+            show_infill
+        }
+    }
+}
+
+/// Appends a single planned segment (`PlannedSegment`) as a 3D oriented bead prism
+/// in its local `NozzleFrame` $(\hat{\mathbf{x}}_{\text{nozzle}}, \hat{\mathbf{y}}_{\text{nozzle}}, \hat{\mathbf{z}}_{\text{nozzle}})$.
+#[allow(clippy::too_many_arguments)]
+fn append_planned_segment_bead_mesh(
+    seg: &crate::gcode::PlannedSegment,
+    planned: &crate::gcode::PlannedGcodeResult,
+    color_mode: ToolpathColorMode,
+    config: &SlicerConfig,
+    brightness_scale: f32,
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+) {
+    let is_travel = matches!(
+        seg.kind,
+        crate::gcode::PlannedMoveKind::Travel | crate::gcode::PlannedMoveKind::ZHop
+    );
+    // Travel/Z-hop moves are drawn with gizmo lines
+    if is_travel {
+        return;
+    }
+
+    let delta = seg.p1_local - seg.p0_local;
+    let len_sq = delta.length_squared();
+    if len_sq < 1.0e-9 {
+        return;
+    }
+    let raw_travel = delta / len_sq.sqrt();
+
+    let n0 = seg
+        .nozzle_local_0
+        .try_normalize()
+        .unwrap_or_else(|| Vec3::from_array(config.machine.nozzle_axis_bed));
+    let n1 = seg.nozzle_local_1.try_normalize().unwrap_or(n0);
+
+    let frame0 = NozzleFrame::from_nozzle_and_travel(n0, raw_travel);
+    let frame1 = NozzleFrame::from_nozzle_and_travel(n1, raw_travel);
+
+    let w_eff = if matches!(seg.kind, crate::gcode::PlannedMoveKind::Wipe) {
+        (0.55 * seg.width_mm).max(0.10)
+    } else {
+        seg.width_mm
+    };
+    let h_eff = if matches!(seg.kind, crate::gcode::PlannedMoveKind::Wipe) {
+        (0.55 * seg.height_mm).max(0.06)
+    } else {
+        seg.height_mm
+    };
+
+    let half_w = (0.48 * w_eff).max(0.03);
+    let half_h = (0.42 * h_eff).max(0.02);
+
+    let mut rgba = compute_planned_segment_color(seg, planned, color_mode, config);
+    rgba[0] = (rgba[0] * brightness_scale).clamp(0.0, 1.0);
+    rgba[1] = (rgba[1] * brightness_scale).clamp(0.0, 1.0);
+    rgba[2] = (rgba[2] * brightness_scale).clamp(0.0, 1.0);
+
+    let base_ring_start = positions.len() as u32;
+
+    for (p, frame) in [(seg.p0_local, frame0), (seg.p1_local, frame1)] {
+        let v_top = p + frame.nozzle_axis * half_h;
+        let v_right = p + frame.lateral_axis * half_w;
+        let v_bottom = p - frame.nozzle_axis * half_h;
+        let v_left = p - frame.lateral_axis * half_w;
+
+        positions.push(v_top.to_array());
+        normals.push(frame.nozzle_axis.to_array());
+        colors.push(rgba);
+
+        positions.push(v_right.to_array());
+        normals.push(frame.lateral_axis.to_array());
+        colors.push(rgba);
+
+        positions.push(v_bottom.to_array());
+        normals.push((-frame.nozzle_axis).to_array());
+        colors.push(rgba);
+
+        positions.push(v_left.to_array());
+        normals.push((-frame.lateral_axis).to_array());
+        colors.push(rgba);
+    }
+
+    let r0 = base_ring_start;
+    let r1 = base_ring_start + 4;
+    for k in 0..4u32 {
+        let k_next = (k + 1) % 4;
+        let a0 = r0 + k;
+        let a1 = r0 + k_next;
+        let b0 = r1 + k;
+        let b1 = r1 + k_next;
+        indices.extend_from_slice(&[a0, b0, b1, a0, b1, a1]);
+    }
+    // End caps
+    indices.extend_from_slice(&[r0, r0 + 2, r0 + 1, r0, r0 + 3, r0 + 2]);
+    indices.extend_from_slice(&[r1, r1 + 1, r1 + 2, r1, r1 + 2, r1 + 3]);
+}
+
+/// Smooth perceptual Cool-Blue (0.0) -> Emerald-Green (0.5) -> Warm-Amber/Coral (1.0) ramp.
+fn perceptual_scalar_ramp(t: f32) -> [f32; 4] {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.5 {
+        let u = t * 2.0;
+        let r = 0.16 * (1.0 - u) + 0.18 * u;
+        let g = 0.52 * (1.0 - u) + 0.88 * u;
+        let b = 0.96 * (1.0 - u) + 0.42 * u;
+        [r, g, b, 1.0]
+    } else {
+        let u = (t - 0.5) * 2.0;
+        let r = 0.18 * (1.0 - u) + 0.98 * u;
+        let g = 0.88 * (1.0 - u) + 0.44 * u;
+        let b = 0.42 * (1.0 - u) + 0.16 * u;
+        [r, g, b, 1.0]
+    }
+}
+
+/// Computes the RGBA color for a `PlannedSegment` according to `ToolpathColorMode`.
+fn compute_planned_segment_color(
+    seg: &crate::gcode::PlannedSegment,
+    planned: &crate::gcode::PlannedGcodeResult,
+    mode: ToolpathColorMode,
+    config: &SlicerConfig,
+) -> [f32; 4] {
+    match seg.kind {
+        crate::gcode::PlannedMoveKind::Travel => {
+            if mode == ToolpathColorMode::BySpeed {
+                let denom = (planned.max_speed_mms - planned.min_speed_mms).max(1.0e-3);
+                let t = (seg.cruise_speed_mms - planned.min_speed_mms) / denom;
+                return perceptual_scalar_ramp(t);
+            }
+            return [0.28, 0.86, 0.98, 1.0]; // Cyan travel line
+        }
+        crate::gcode::PlannedMoveKind::ZHop => {
+            return [0.98, 0.92, 0.22, 1.0]; // Bright yellow nozzle-axis hop
+        }
+        _ => {}
+    }
+
+    match mode {
+        ToolpathColorMode::ByFeatureType => match seg.kind {
+            crate::gcode::PlannedMoveKind::ScarfSeam => [0.76, 0.44, 0.98, 1.0], // Violet scarf seam
+            crate::gcode::PlannedMoveKind::Wipe => [0.68, 0.76, 0.86, 1.0],      // Cool silver wipe
+            _ => compute_toolpath_point_color(
+                seg.kind as u8,
+                seg.wall_index,
+                seg.width_mm,
+                ToolpathColorMode::ByFeatureType,
+                config,
+            ),
+        },
+        ToolpathColorMode::ByLineWidth => {
+            let denom = (planned.max_width_mm - planned.min_width_mm).max(1.0e-4);
+            let t = (seg.width_mm - planned.min_width_mm) / denom;
+            perceptual_scalar_ramp(t)
+        }
+        ToolpathColorMode::ByLayerHeight => {
+            let denom = (planned.max_height_mm - planned.min_height_mm).max(1.0e-4);
+            let t = (seg.height_mm - planned.min_height_mm) / denom;
+            perceptual_scalar_ramp(t)
+        }
+        ToolpathColorMode::BySpeed => {
+            let denom = (planned.max_speed_mms - planned.min_speed_mms).max(1.0e-3);
+            let t = (seg.cruise_speed_mms - planned.min_speed_mms) / denom;
+            perceptual_scalar_ramp(t)
+        }
+        ToolpathColorMode::ByAcceleration => {
+            let denom = (planned.max_accel_mms2 - planned.min_accel_mms2).max(1.0);
+            let t = (seg.accel_mms2 - planned.min_accel_mms2) / denom;
+            perceptual_scalar_ramp(t)
+        }
+        ToolpathColorMode::ByVolumetricFlow => {
+            let denom = (planned.max_flow_mm3s - planned.min_flow_mm3s).max(1.0e-3);
+            let t = (seg.volumetric_flow_mm3s - planned.min_flow_mm3s) / denom;
+            perceptual_scalar_ramp(t)
+        }
+        ToolpathColorMode::ByExtrusionMultiplier => {
+            let denom = (planned.max_flow_mult - planned.min_flow_mult).max(1.0e-3);
+            let t = (seg.extrusion_multiplier - planned.min_flow_mult) / denom;
+            perceptual_scalar_ramp(t)
+        }
+        ToolpathColorMode::ByPressureAdvance => {
+            let denom = (planned.max_pa_s - planned.min_pa_s).max(1.0e-5);
+            let t = (seg.pressure_advance_s - planned.min_pa_s) / denom;
+            perceptual_scalar_ramp(t)
+        }
+        ToolpathColorMode::ByMeltZonePressure => {
+            let denom = (planned.max_pressure_mm3s - planned.min_pressure_mm3s).max(1.0e-4);
+            let t = (seg.melt_pressure_mm3s - planned.min_pressure_mm3s) / denom;
+            perceptual_scalar_ramp(t)
         }
     }
 }
@@ -1464,7 +1801,7 @@ fn compute_toolpath_point_color(
             4 => [0.98, 0.78, 0.18, 1.0], // Sparse Infill: warm gold/amber
             _ => [0.98, 0.32, 0.88, 1.0], // Gap Fill: vivid magenta
         },
-        ToolpathColorMode::ByLineWidth => {
+        ToolpathColorMode::ByLineWidth | _ => {
             let spec = match feature_kind {
                 0 => config.slicing.outer_wall_width,
                 1 => config.slicing.inner_wall_width,
