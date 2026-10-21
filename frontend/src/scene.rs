@@ -462,22 +462,35 @@ pub fn update_selection_materials_system(
                 } else {
                     1.0
                 };
-                mat.base_color = Color::srgba(0.32, 0.76, 0.98, alpha);
                 if alpha < 0.02 {
+                    mat.base_color = Color::srgba(0.55, 0.60, 0.68, 0.0);
                     mat.alpha_mode = AlphaMode::Mask(1.0);
                     mat.cull_mode = Some(wgpu::Face::Back);
                 } else if alpha < 0.99 {
+                    // Neutral, low-glare ghost shell so it does not cast a colored or specular
+                    // veil over internal toolpaths, isosurfaces, or scalar slices.
+                    mat.base_color = Color::srgba(0.52, 0.56, 0.64, alpha);
+                    mat.metallic = 0.0;
+                    mat.perceptual_roughness = 0.90;
+                    mat.reflectance = 0.06;
                     mat.alpha_mode = AlphaMode::Blend;
                     // Backface culling prevents the translucent CAD shell from self-interfering
                     mat.cull_mode = Some(wgpu::Face::Back);
                     mat.double_sided = false;
                 } else {
+                    mat.base_color = Color::srgba(0.32, 0.76, 0.98, 1.0);
+                    mat.metallic = 0.22;
+                    mat.perceptual_roughness = 0.45;
+                    mat.reflectance = 0.50;
                     mat.alpha_mode = AlphaMode::Opaque;
                     mat.cull_mode = None;
                     mat.double_sided = true;
                 }
             } else {
                 mat.base_color = Color::srgb(0.22, 0.52, 0.78);
+                mat.metallic = 0.22;
+                mat.perceptual_roughness = 0.45;
+                mat.reflectance = 0.50;
                 mat.alpha_mode = AlphaMode::Opaque;
                 mat.cull_mode = None;
                 mat.double_sided = true;

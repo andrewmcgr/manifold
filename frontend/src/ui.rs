@@ -10,8 +10,9 @@ use crate::config::{
     SolidInfillPattern, SparseInfillPattern, SurfaceHintMode, ToolConfig, WallPrintOrder,
 };
 use crate::field_vis::{
-    FieldColormap, FieldVisualizationState, IsoIntersectionMode, SelectedLayersColorMode,
-    SliceAxis, ToolpathColorMode,
+    high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
+    FieldVisualizationState, IsoIntersectionMode, SelectedLayersColorMode, SliceAxis,
+    ToolpathColorMode, BRANCH_PALETTE,
 };
 use crate::hull::rotation_to_place_face_on_bed;
 use crate::io::threemf::{save_project_to_3mf, ExportableObject};
@@ -20,6 +21,307 @@ use crate::scene::{
     compute_orbit_eye, remove_object_from_plate, run_auto_arrange_on_plate, snap_object_to_bed,
     spawn_loaded_objects, BuildPlateState, CadObjectEntity, OrbitCamera, ToolMode,
 };
+
+fn rgba_to_color32(rgba: [f32; 4]) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        (rgba[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (rgba[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (rgba[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (rgba[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
+}
+
+/// Renders a high-contrast horizontal color-bar legend with 5 specific numerical tick marks
+/// (`0%`, `25%`, `50%`, `75%`, `100%`) and individual color swatches for each tick value.
+fn draw_continuous_gradient_legend(
+    ui: &mut egui::Ui,
+    title: &str,
+    min_val: f32,
+    max_val: f32,
+    unit: &str,
+    decimals: usize,
+    color_fn: impl Fn(f32) -> [f32; 4],
+) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(6.0, 5.0))
+        .show(ui, |ui| {
+            let header = if unit.is_empty() {
+                title.to_string()
+            } else {
+                format!("{title} ({unit})")
+            };
+            ui.small(
+                egui::RichText::new(header)
+                    .strong()
+                    .color(egui::Color32::from_rgb(230, 238, 250)),
+            );
+
+            // 1. Multi-stop continuous gradient bar with 5 tick marks
+            let bar_width = ui.available_width().clamp(160.0, 340.0);
+            let bar_height = 14.0;
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(bar_width, bar_height + 5.0), egui::Sense::hover());
+            let bar_rect =
+                egui::Rect::from_min_size(rect.min, egui::vec2(bar_width, bar_height));
+
+            let steps = 48usize;
+            let painter = ui.painter();
+            for i in 0..steps {
+                let t0 = (i as f32) / (steps as f32);
+                let t1 = ((i + 1) as f32) / (steps as f32);
+                let tm = 0.5 * (t0 + t1);
+                let x0 = bar_rect.left() + bar_width * t0;
+                let x1 = bar_rect.left() + bar_width * t1;
+                let seg_rect = egui::Rect::from_min_max(
+                    egui::pos2(x0, bar_rect.top()),
+                    egui::pos2(x1 + 0.5, bar_rect.bottom()),
+                );
+                painter.rect_filled(seg_rect, 0.0, rgba_to_color32(color_fn(tm)));
+            }
+            painter.rect_stroke(
+                bar_rect,
+                2.0,
+                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(95)),
+            );
+
+            // Draw 5 crisp tick lines at 0%, 25%, 50%, 75%, 100%
+            for tick_idx in 0..=4 {
+                let frac = (tick_idx as f32) * 0.25;
+                let x = (bar_rect.left() + bar_width * frac)
+                    .clamp(bar_rect.left() + 0.5, bar_rect.right() - 0.5);
+                painter.line_segment(
+                    [
+                        egui::pos2(x, bar_rect.bottom() - 4.0),
+                        egui::pos2(x, rect.bottom()),
+                    ],
+                    egui::Stroke::new(1.25_f32, egui::Color32::from_gray(235)),
+                );
+            }
+
+            // 2. Specific numerical tick values with color swatches at 0%, 25%, 50%, 75%, 100%
+            ui.columns(5, |cols| {
+                for (i, col) in cols.iter_mut().enumerate() {
+                    let frac = (i as f32) * 0.25;
+                    let val = min_val + (max_val - min_val) * frac;
+                    let c32 = rgba_to_color32(color_fn(frac));
+                    col.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+                        ui.painter().rect_filled(dot_rect, 2.0, c32);
+                        let txt = format!("{val:.decimals$}");
+                        ui.label(
+                            egui::RichText::new(txt)
+                                .size(10.5)
+                                .monospace()
+                                .color(egui::Color32::from_gray(235)),
+                        );
+                    });
+                }
+            });
+        });
+}
+
+/// Renders a categorical color swatch legend for discrete modes (Feature Types, Branches, Special Layers).
+fn draw_categorical_swatch_legend(
+    ui: &mut egui::Ui,
+    title: &str,
+    items: &[(&str, [f32; 4])],
+) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(6.0, 5.0))
+        .show(ui, |ui| {
+            ui.small(
+                egui::RichText::new(title)
+                    .strong()
+                    .color(egui::Color32::from_rgb(230, 238, 250)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+                for &(label, rgba) in items {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let (swatch_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(swatch_rect, 2.0, rgba_to_color32(rgba));
+                        ui.painter().rect_stroke(
+                            swatch_rect,
+                            2.0,
+                            egui::Stroke::new(0.75_f32, egui::Color32::from_gray(80)),
+                        );
+                        ui.small(egui::RichText::new(label).color(egui::Color32::from_gray(230)));
+                    });
+                }
+            });
+        });
+}
+
+/// Renders the active toolpath legend (either continuous 5-tick gradient bar or categorical swatches).
+fn render_toolpath_color_legend(
+    ui: &mut egui::Ui,
+    vis_state: &FieldVisualizationState,
+    config: &SlicerConfig,
+) {
+    if vis_state.toolpath_color_mode == ToolpathColorMode::ByFeatureType {
+        draw_categorical_swatch_legend(
+            ui,
+            "Toolpath Feature Legend",
+            &[
+                ("Outer Wall", [0.98, 0.44, 0.16, 1.0]),
+                ("Inner Wall", [0.24, 0.90, 0.42, 1.0]),
+                ("Solid Infill", [0.22, 0.76, 0.98, 1.0]),
+                ("Sparse Infill", [0.98, 0.78, 0.18, 1.0]),
+                ("Gap Fill", [0.98, 0.32, 0.88, 1.0]),
+                ("Scarf Seam", [0.76, 0.44, 0.98, 1.0]),
+                ("Wipe", [0.68, 0.76, 0.86, 1.0]),
+                ("Travel", [0.28, 0.86, 0.98, 1.0]),
+                ("Z-Hop", [0.98, 0.92, 0.22, 1.0]),
+            ],
+        );
+        return;
+    }
+
+    if let Some(ref planned) = vis_state.cached_planned_gcode {
+        let (title, min_v, max_v, unit, decimals) = match vis_state.toolpath_color_mode {
+            ToolpathColorMode::ByLineWidth => (
+                "Line Width",
+                planned.min_width_mm,
+                planned.max_width_mm,
+                "mm",
+                3,
+            ),
+            ToolpathColorMode::ByLayerHeight => (
+                "Bead Height",
+                planned.min_height_mm,
+                planned.max_height_mm,
+                "mm",
+                3,
+            ),
+            ToolpathColorMode::BySpeed => (
+                "Feedrate Speed",
+                planned.min_speed_mms,
+                planned.max_speed_mms,
+                "mm/s",
+                1,
+            ),
+            ToolpathColorMode::ByAcceleration => (
+                "Segment Acceleration",
+                planned.min_accel_mms2,
+                planned.max_accel_mms2,
+                "mm/s²",
+                0,
+            ),
+            ToolpathColorMode::ByVolumetricFlow => (
+                "Volumetric Flow Rate",
+                planned.min_flow_mm3s,
+                planned.max_flow_mm3s,
+                "mm³/s",
+                2,
+            ),
+            ToolpathColorMode::ByExtrusionMultiplier => (
+                "Effective Flow Multiplier",
+                planned.min_flow_mult,
+                planned.max_flow_mult,
+                "×",
+                3,
+            ),
+            ToolpathColorMode::ByPressureAdvance => (
+                "Dynamic Pressure Advance",
+                planned.min_pa_s,
+                planned.max_pa_s,
+                "s",
+                4,
+            ),
+            ToolpathColorMode::ByMeltZonePressure => (
+                "Melt-Zone Pressure",
+                planned.min_pressure_mm3s,
+                planned.max_pressure_mm3s,
+                "mm³/s eq",
+                2,
+            ),
+            ToolpathColorMode::ByFeatureType => unreachable!(),
+        };
+        draw_continuous_gradient_legend(
+            ui,
+            title,
+            min_v,
+            max_v,
+            unit,
+            decimals,
+            high_contrast_parameter_ramp,
+        );
+    } else {
+        // Fallback when viewing un-planned raw shell toolpaths by line width
+        let spec = config.slicing.outer_wall_width;
+        draw_continuous_gradient_legend(
+            ui,
+            "Line Width",
+            spec.min_mm,
+            spec.max_mm,
+            "mm",
+            3,
+            high_contrast_parameter_ramp,
+        );
+    }
+}
+
+/// Renders the active selected-layer isosurface legend.
+fn render_selected_layers_color_legend(
+    ui: &mut egui::Ui,
+    vis_state: &FieldVisualizationState,
+    config: &SlicerConfig,
+) {
+    match vis_state.selected_layers_color_mode {
+        SelectedLayersColorMode::ByLayerThickness => {
+            let lh = config.slicing.layer_height;
+            draw_continuous_gradient_legend(
+                ui,
+                "Layer Thickness Δh",
+                lh.min_mm,
+                lh.max_mm,
+                "mm",
+                3,
+                high_contrast_parameter_ramp,
+            );
+            draw_categorical_swatch_legend(
+                ui,
+                "Boundary Layer Overrides",
+                &[
+                    ("First Layer (Bed)", [0.18, 0.92, 0.96, 1.0]),
+                    ("Top Layer (Branch Cap)", [0.96, 0.42, 0.92, 1.0]),
+                ],
+            );
+        }
+        SelectedLayersColorMode::ByBranch => {
+            let branch_count = vis_state
+                .cached_selected_layers
+                .as_ref()
+                .map(|r| (r.branch_count as usize).clamp(1, 8))
+                .unwrap_or(4);
+            let labels = [
+                "Branch 0", "Branch 1", "Branch 2", "Branch 3", "Branch 4", "Branch 5", "Branch 6",
+                "Branch 7",
+            ];
+            let mut items = Vec::with_capacity(branch_count);
+            for i in 0..branch_count {
+                let c = BRANCH_PALETTE[i % BRANCH_PALETTE.len()];
+                items.push((labels[i], [c[0], c[1], c[2], 1.0]));
+            }
+            draw_categorical_swatch_legend(ui, "Topological Branch ID", &items);
+        }
+        SelectedLayersColorMode::AlternatingBands => {
+            draw_categorical_swatch_legend(
+                ui,
+                "Alternating Layer Bands",
+                &[
+                    ("Even Layer (#2k)", [0.20, 0.84, 0.76, 1.0]),
+                    ("Odd Layer (#2k+1)", [0.96, 0.66, 0.22, 1.0]),
+                ],
+            );
+        }
+    }
+}
 
 /// Renders a compact `?` help button for a configuration parameter backed by [`crate::config::PARAMETER_DOCS`].
 /// Hovering or clicking the `?` button opens a rich structured popup with the parameter's
@@ -1060,6 +1362,26 @@ pub fn ui_workspace_system(
                                         vis_state.dirty_slice = true;
                                     }
                                 });
+
+                                let cmap = vis_state.colormap;
+                                let field_unit = match vis_state.active_field_name.as_str() {
+                                    "sdf" | "eikonal" => "mm",
+                                    "overhang" => "cos θ",
+                                    _ => "",
+                                };
+                                draw_continuous_gradient_legend(
+                                    ui,
+                                    &format!(
+                                        "Slice Colormap ({}) — {}",
+                                        cmap.label(),
+                                        vis_state.active_field_name
+                                    ),
+                                    min_val,
+                                    max_val,
+                                    field_unit,
+                                    2,
+                                    |t| sample_slice_colormap_rgba(cmap, t, min_val, max_val),
+                                );
                             }
                         });
 
@@ -1160,7 +1482,7 @@ pub fn ui_workspace_system(
                                     vis_state.dirty_selected_layers_mesh = true;
                                     vis_state.dirty_slice = true;
                                     if vis_state.show_selected_layers && vis_state.solid_opacity > 0.45 {
-                                        vis_state.solid_opacity = 0.22;
+                                        vis_state.solid_opacity = 0.12;
                                     }
                                     if vis_state.show_selected_layers
                                         && !has_eikonal
@@ -1186,7 +1508,7 @@ pub fn ui_workspace_system(
                                 {
                                     vis_state.show_selected_layers = true;
                                     if vis_state.solid_opacity > 0.45 {
-                                        vis_state.solid_opacity = 0.22;
+                                        vis_state.solid_opacity = 0.12;
                                     }
                                     if has_eikonal {
                                         let need_toolpaths = vis_state.show_toolpaths;
@@ -1249,6 +1571,8 @@ pub fn ui_workspace_system(
                                             }
                                         }
                                     });
+
+                                render_selected_layers_color_legend(ui, &vis_state, &config);
                             }
 
                             if let Some(ref res) = vis_state.cached_selected_layers.clone() {
@@ -1684,7 +2008,7 @@ pub fn ui_workspace_system(
                                 {
                                     vis_state.dirty_toolpaths_mesh = true;
                                     if vis_state.show_toolpaths && vis_state.solid_opacity > 0.35 {
-                                        vis_state.solid_opacity = 0.18;
+                                        vis_state.solid_opacity = 0.10;
                                     }
                                     if vis_state.show_toolpaths && !has_eikonal && !is_computing {
                                         spawn_field_compute_task(
@@ -1707,7 +2031,7 @@ pub fn ui_workspace_system(
                                 {
                                     vis_state.show_toolpaths = true;
                                     if vis_state.solid_opacity > 0.35 {
-                                        vis_state.solid_opacity = 0.18;
+                                        vis_state.solid_opacity = 0.10;
                                     }
                                     if has_eikonal {
                                         let need_layers = vis_state.cached_selected_layers.is_none()
@@ -1813,46 +2137,7 @@ pub fn ui_workspace_system(
                                         }
                                     });
 
-                                if let Some(ref planned) = vis_state.cached_planned_gcode {
-                                    let legend_text = match vis_state.toolpath_color_mode {
-                                        ToolpathColorMode::ByFeatureType => {
-                                            "Legend: Outer=Orange | Inner=Green | Solid=Cyan | Sparse=Gold | Scarf=Violet | Wipe=Silver | Travel=Cyan/Yellow".to_string()
-                                        }
-                                        ToolpathColorMode::ByLineWidth => format!(
-                                            "Range (Blue -> Green -> Amber): {:.3} .. {:.3} mm",
-                                            planned.min_width_mm, planned.max_width_mm
-                                        ),
-                                        ToolpathColorMode::ByLayerHeight => format!(
-                                            "Range (Blue -> Green -> Amber): {:.3} .. {:.3} mm",
-                                            planned.min_height_mm, planned.max_height_mm
-                                        ),
-                                        ToolpathColorMode::BySpeed => format!(
-                                            "Range (Blue -> Green -> Amber): {:.1} .. {:.1} mm/s",
-                                            planned.min_speed_mms, planned.max_speed_mms
-                                        ),
-                                        ToolpathColorMode::ByAcceleration => format!(
-                                            "Range (Braking=Blue | Cruise=Green | Accel=Amber): {:.0} .. +{:.0} mm/s²",
-                                            planned.min_accel_mms2, planned.max_accel_mms2
-                                        ),
-                                        ToolpathColorMode::ByVolumetricFlow => format!(
-                                            "Range (Blue -> Green -> Amber): {:.2} .. {:.2} mm³/s",
-                                            planned.min_flow_mm3s, planned.max_flow_mm3s
-                                        ),
-                                        ToolpathColorMode::ByExtrusionMultiplier => format!(
-                                            "Range (Blue -> Green -> Amber): {:.3}× .. {:.3}×",
-                                            planned.min_flow_mult, planned.max_flow_mult
-                                        ),
-                                        ToolpathColorMode::ByPressureAdvance => format!(
-                                            "Range (Blue -> Green -> Amber): {:.4} .. {:.4} s",
-                                            planned.min_pa_s, planned.max_pa_s
-                                        ),
-                                        ToolpathColorMode::ByMeltZonePressure => format!(
-                                            "Range (Blue -> Green -> Amber): {:.2} .. {:.2} mm³/s eq",
-                                            planned.min_pressure_mm3s, planned.max_pressure_mm3s
-                                        ),
-                                    };
-                                    ui.small(egui::RichText::new(legend_text).italics());
-                                }
+                                render_toolpath_color_legend(ui, &vis_state, &config);
                             }
 
                             if let Some(ref tp_res) = vis_state.cached_toolpaths {
@@ -3216,6 +3501,34 @@ pub fn ui_workspace_system(
                 }
             });
         });
+
+    // Top-right viewport HUD legend overlay when parameter visualization is active
+    let show_hud_toolpaths = vis_state.show_toolpaths
+        && (vis_state.cached_toolpaths.is_some() || vis_state.cached_planned_gcode.is_some());
+    let show_hud_layers =
+        vis_state.show_selected_layers && vis_state.cached_selected_layers.is_some();
+    if plate.selected_object().is_some() && (show_hud_toolpaths || show_hud_layers) {
+        egui::Window::new("Viewport Color Legend")
+            .id(egui::Id::new("viewport_parameter_color_legend_hud"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-14.0, 14.0))
+            .resizable(false)
+            .collapsible(true)
+            .default_width(310.0)
+            .show(ctx, |ui| {
+                ui.set_min_width(290.0);
+                ui.set_max_width(330.0);
+                if show_hud_toolpaths {
+                    render_toolpath_color_legend(ui, &vis_state, &config);
+                }
+                if show_hud_toolpaths && show_hud_layers {
+                    ui.add_space(4.0);
+                    ui.separator();
+                }
+                if show_hud_layers {
+                    render_selected_layers_color_legend(ui, &vis_state, &config);
+                }
+            });
+    }
 }
 
 /// Synchronizes the Rust `SlicerConfig` (nozzle axis, bed-coordinate gravity vector,

@@ -740,7 +740,7 @@ pub fn sync_field_visualization_system(
                     sdf_val,
                     min_sdf,
                 );
-                colors.push(rgba);
+                colors.push(srgba_to_linear_rgba(rgba));
             }
 
             let bevy_mesh = Mesh::new(
@@ -770,8 +770,9 @@ pub fn sync_field_visualization_system(
                 let mat_h = materials.add(StandardMaterial {
                     // Base color is WHITE so per-vertex ATTRIBUTE_COLOR directly drives surface appearance
                     base_color: Color::WHITE,
-                    metallic: 0.12,
-                    perceptual_roughness: 0.36,
+                    metallic: 0.0,
+                    perceptual_roughness: 0.58,
+                    reflectance: 0.16,
                     alpha_mode: AlphaMode::Opaque,
                     depth_bias: 8.0,
                     double_sided: true,
@@ -871,10 +872,11 @@ pub fn sync_field_visualization_system(
                     rgba[2] *= 0.65;
                 }
 
+                let linear_rgba = srgba_to_linear_rgba(rgba);
                 for v in &layer.vertices {
                     positions.push([v.x, v.y, v.z]);
                     normals.push([v.nx, v.ny, v.nz]);
-                    colors.push(rgba);
+                    colors.push(linear_rgba);
                 }
                 for &i in &layer.indices {
                     indices.push(base_v + i);
@@ -909,8 +911,9 @@ pub fn sync_field_visualization_system(
                 let mesh_h = meshes.add(bevy_mesh);
                 let mat_h = materials.add(StandardMaterial {
                     base_color: Color::WHITE,
-                    metallic: 0.10,
-                    perceptual_roughness: 0.38,
+                    metallic: 0.0,
+                    perceptual_roughness: 0.58,
+                    reflectance: 0.16,
                     alpha_mode: AlphaMode::Opaque,
                     depth_bias: 10.0,
                     double_sided: true,
@@ -1184,8 +1187,9 @@ pub fn sync_field_visualization_system(
                 let mesh_h = meshes.add(bevy_mesh);
                 let mat_h = materials.add(StandardMaterial {
                     base_color: Color::WHITE,
-                    metallic: 0.08,
-                    perceptual_roughness: 0.34,
+                    metallic: 0.0,
+                    perceptual_roughness: 0.56,
+                    reflectance: 0.16,
                     alpha_mode: AlphaMode::Opaque,
                     depth_bias: 14.0,
                     double_sided: true,
@@ -1544,6 +1548,7 @@ fn append_planned_segment_bead_mesh(
     rgba[0] = (rgba[0] * brightness_scale).clamp(0.0, 1.0);
     rgba[1] = (rgba[1] * brightness_scale).clamp(0.0, 1.0);
     rgba[2] = (rgba[2] * brightness_scale).clamp(0.0, 1.0);
+    let linear_rgba = srgba_to_linear_rgba(rgba);
 
     let base_ring_start = positions.len() as u32;
 
@@ -1555,19 +1560,19 @@ fn append_planned_segment_bead_mesh(
 
         positions.push(v_top.to_array());
         normals.push(frame.nozzle_axis.to_array());
-        colors.push(rgba);
+        colors.push(linear_rgba);
 
         positions.push(v_right.to_array());
         normals.push(frame.lateral_axis.to_array());
-        colors.push(rgba);
+        colors.push(linear_rgba);
 
         positions.push(v_bottom.to_array());
         normals.push((-frame.nozzle_axis).to_array());
-        colors.push(rgba);
+        colors.push(linear_rgba);
 
         positions.push(v_left.to_array());
         normals.push((-frame.lateral_axis).to_array());
-        colors.push(rgba);
+        colors.push(linear_rgba);
     }
 
     let r0 = base_ring_start;
@@ -1585,22 +1590,103 @@ fn append_planned_segment_bead_mesh(
     indices.extend_from_slice(&[r1, r1 + 1, r1 + 2, r1, r1 + 2, r1 + 3]);
 }
 
-/// Smooth perceptual Cool-Blue (0.0) -> Emerald-Green (0.5) -> Warm-Amber/Coral (1.0) ramp.
-fn perceptual_scalar_ramp(t: f32) -> [f32; 4] {
-    let t = t.clamp(0.0, 1.0);
-    if t <= 0.5 {
-        let u = t * 2.0;
-        let r = 0.16 * (1.0 - u) + 0.18 * u;
-        let g = 0.52 * (1.0 - u) + 0.88 * u;
-        let b = 0.96 * (1.0 - u) + 0.42 * u;
-        [r, g, b, 1.0]
+/// Converts a single sRGB channel ($[0, 1]$) into Linear RGB ($[0, 1]$) for `Mesh::ATTRIBUTE_COLOR`.
+#[inline]
+fn srgb_channel_to_linear(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.04045 {
+        c / 12.92
     } else {
-        let u = (t - 0.5) * 2.0;
-        let r = 0.18 * (1.0 - u) + 0.98 * u;
-        let g = 0.88 * (1.0 - u) + 0.44 * u;
-        let b = 0.42 * (1.0 - u) + 0.16 * u;
-        [r, g, b, 1.0]
+        ((c + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// Converts an sRGBA color (`[f32; 4]`, matching `egui` legend swatches) into Linear RGBA
+/// required by Bevy's 3D `Mesh::ATTRIBUTE_COLOR` PBR pipeline so 3D vertex colors are not
+/// double-gamma-encoded (which otherwise lifts secondary channels and washes out saturation).
+#[inline]
+pub fn srgba_to_linear_rgba(srgba: [f32; 4]) -> [f32; 4] {
+    [
+        srgb_channel_to_linear(srgba[0]),
+        srgb_channel_to_linear(srgba[1]),
+        srgb_channel_to_linear(srgba[2]),
+        srgba[3],
+    ]
+}
+
+/// High-contrast 6-stop perceptual color ramp for toolpath and layer scalar parameters:
+/// `0.00` Deep Indigo -> `0.20` Electric Cyan -> `0.40` Emerald Green ->
+/// `0.60` Solar Yellow -> `0.80` Blazing Orange-Red -> `1.00` Hot Crimson-Magenta.
+pub fn high_contrast_parameter_ramp(t: f32) -> [f32; 4] {
+    const STOPS: [(f32, [f32; 3]); 6] = [
+        (0.00, [0.16, 0.14, 0.88]), // Deep Indigo
+        (0.20, [0.02, 0.80, 0.98]), // Electric Cyan
+        (0.40, [0.10, 0.92, 0.34]), // Vivid Emerald Green
+        (0.60, [0.98, 0.90, 0.08]), // Bright Solar Yellow
+        (0.80, [0.98, 0.34, 0.06]), // Blazing Orange-Red
+        (1.00, [0.92, 0.06, 0.54]), // Hot Crimson-Magenta
+    ];
+    let t = t.clamp(0.0, 1.0);
+    for w in STOPS.windows(2) {
+        let (t0, c0) = w[0];
+        let (t1, c1) = w[1];
+        if t <= t1 {
+            let u = ((t - t0) / (t1 - t0).max(1.0e-5)).clamp(0.0, 1.0);
+            return [
+                c0[0] + (c1[0] - c0[0]) * u,
+                c0[1] + (c1[1] - c0[1]) * u,
+                c0[2] + (c1[2] - c0[2]) * u,
+                1.0,
+            ];
+        }
+    }
+    let last = STOPS[STOPS.len() - 1].1;
+    [last[0], last[1], last[2], 1.0]
+}
+
+/// Distinct 8-color categorical palette for branch-aware slicing visualization.
+pub const BRANCH_PALETTE: [[f32; 3]; 8] = [
+    [0.20, 0.86, 0.62],
+    [0.96, 0.62, 0.20],
+    [0.36, 0.68, 0.98],
+    [0.94, 0.38, 0.76],
+    [0.72, 0.90, 0.24],
+    [0.98, 0.42, 0.38],
+    [0.58, 0.48, 0.96],
+    [0.24, 0.90, 0.92],
+];
+
+/// Samples the 2D slice plane `FieldColormap` at normalized position `t` in `[0.0, 1.0]`
+/// given `[min_v, max_v]` (used by both the 2D slice rasterizer and the UI legend bar).
+pub fn sample_slice_colormap_rgba(
+    colormap: FieldColormap,
+    t: f32,
+    min_v: f32,
+    max_v: f32,
+) -> [f32; 4] {
+    let t = t.clamp(0.0, 1.0);
+    let val = min_v + (max_v - min_v) * t;
+    let (r, g, b) = match colormap {
+        FieldColormap::CoolWarmSigned => {
+            let abs_max = min_v.abs().max(max_v.abs()).max(1e-4);
+            let signed_t = (val / abs_max).clamp(-1.0, 1.0);
+            if signed_t < 0.0 {
+                let s = (-signed_t).clamp(0.0, 1.0);
+                (1.0 - 0.88 * s, 1.0 - 0.45 * s, 1.0 - 0.05 * s * s)
+            } else {
+                let s = signed_t.clamp(0.0, 1.0);
+                (1.0 - 0.08 * s * s, 1.0 - 0.72 * s, 1.0 - 0.88 * s)
+            }
+        }
+        FieldColormap::ViridisSequential => viridis_approx(t),
+        FieldColormap::ZebraIsoBands => {
+            let wave = (t * 16.0 * std::f32::consts::PI).sin();
+            let band = if wave >= 0.0 { 0.88 } else { 0.18 };
+            let (vr, vg, vb) = viridis_approx(t);
+            (vr * band, vg * band, vb * band)
+        }
+    };
+    [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0), 1.0]
 }
 
 /// Computes the RGBA color for a `PlannedSegment` according to `ToolpathColorMode`.
@@ -1615,7 +1701,7 @@ fn compute_planned_segment_color(
             if mode == ToolpathColorMode::BySpeed {
                 let denom = (planned.max_speed_mms - planned.min_speed_mms).max(1.0e-3);
                 let t = (seg.cruise_speed_mms - planned.min_speed_mms) / denom;
-                return perceptual_scalar_ramp(t);
+                return high_contrast_parameter_ramp(t);
             }
             return [0.28, 0.86, 0.98, 1.0]; // Cyan travel line
         }
@@ -1640,42 +1726,42 @@ fn compute_planned_segment_color(
         ToolpathColorMode::ByLineWidth => {
             let denom = (planned.max_width_mm - planned.min_width_mm).max(1.0e-4);
             let t = (seg.width_mm - planned.min_width_mm) / denom;
-            perceptual_scalar_ramp(t)
+            high_contrast_parameter_ramp(t)
         }
         ToolpathColorMode::ByLayerHeight => {
             let denom = (planned.max_height_mm - planned.min_height_mm).max(1.0e-4);
             let t = (seg.height_mm - planned.min_height_mm) / denom;
-            perceptual_scalar_ramp(t)
+            high_contrast_parameter_ramp(t)
         }
         ToolpathColorMode::BySpeed => {
             let denom = (planned.max_speed_mms - planned.min_speed_mms).max(1.0e-3);
             let t = (seg.cruise_speed_mms - planned.min_speed_mms) / denom;
-            perceptual_scalar_ramp(t)
+            high_contrast_parameter_ramp(t)
         }
         ToolpathColorMode::ByAcceleration => {
             let denom = (planned.max_accel_mms2 - planned.min_accel_mms2).max(1.0);
             let t = (seg.accel_mms2 - planned.min_accel_mms2) / denom;
-            perceptual_scalar_ramp(t)
+            high_contrast_parameter_ramp(t)
         }
         ToolpathColorMode::ByVolumetricFlow => {
             let denom = (planned.max_flow_mm3s - planned.min_flow_mm3s).max(1.0e-3);
             let t = (seg.volumetric_flow_mm3s - planned.min_flow_mm3s) / denom;
-            perceptual_scalar_ramp(t)
+            high_contrast_parameter_ramp(t)
         }
         ToolpathColorMode::ByExtrusionMultiplier => {
             let denom = (planned.max_flow_mult - planned.min_flow_mult).max(1.0e-3);
             let t = (seg.extrusion_multiplier - planned.min_flow_mult) / denom;
-            perceptual_scalar_ramp(t)
+            high_contrast_parameter_ramp(t)
         }
         ToolpathColorMode::ByPressureAdvance => {
             let denom = (planned.max_pa_s - planned.min_pa_s).max(1.0e-5);
             let t = (seg.pressure_advance_s - planned.min_pa_s) / denom;
-            perceptual_scalar_ramp(t)
+            high_contrast_parameter_ramp(t)
         }
         ToolpathColorMode::ByMeltZonePressure => {
             let denom = (planned.max_pressure_mm3s - planned.min_pressure_mm3s).max(1.0e-4);
             let t = (seg.melt_pressure_mm3s - planned.min_pressure_mm3s) / denom;
-            perceptual_scalar_ramp(t)
+            high_contrast_parameter_ramp(t)
         }
     }
 }
@@ -1750,22 +1836,23 @@ fn append_extrusion_path_bead_mesh(
         rgba[0] = (rgba[0] * brightness_scale).clamp(0.0, 1.0);
         rgba[1] = (rgba[1] * brightness_scale).clamp(0.0, 1.0);
         rgba[2] = (rgba[2] * brightness_scale).clamp(0.0, 1.0);
+        let linear_rgba = srgba_to_linear_rgba(rgba);
 
         positions.push(v_top.to_array());
         normals.push(frame.nozzle_axis.to_array());
-        colors.push(rgba);
+        colors.push(linear_rgba);
 
         positions.push(v_right.to_array());
         normals.push(frame.lateral_axis.to_array());
-        colors.push(rgba);
+        colors.push(linear_rgba);
 
         positions.push(v_bottom.to_array());
         normals.push((-frame.nozzle_axis).to_array());
-        colors.push(rgba);
+        colors.push(linear_rgba);
 
         positions.push(v_left.to_array());
         normals.push((-frame.lateral_axis).to_array());
-        colors.push(rgba);
+        colors.push(linear_rgba);
     }
 
     let seg_count = if path.is_closed && n >= 3 { n } else { n - 1 };
@@ -1818,23 +1905,9 @@ fn compute_toolpath_point_color(
                 4 => config.slicing.sparse_infill_width,
                 _ => config.slicing.solid_infill_width,
             };
-            if width_mm <= spec.target_mm {
-                let denom = (spec.target_mm - spec.min_mm).max(1.0e-4);
-                let t = ((width_mm - spec.min_mm) / denom).clamp(0.0, 1.0);
-                // Cool Blue (min_mm) -> Emerald Green (target_mm)
-                let r = 0.16 * (1.0 - t) + 0.18 * t;
-                let g = 0.52 * (1.0 - t) + 0.88 * t;
-                let b = 0.96 * (1.0 - t) + 0.42 * t;
-                [r, g, b, 1.0]
-            } else {
-                let denom = (spec.max_mm - spec.target_mm).max(1.0e-4);
-                let t = ((width_mm - spec.target_mm) / denom).clamp(0.0, 1.0);
-                // Emerald Green (target_mm) -> Warm Amber/Red (max_mm)
-                let r = 0.18 * (1.0 - t) + 0.98 * t;
-                let g = 0.88 * (1.0 - t) + 0.46 * t;
-                let b = 0.42 * (1.0 - t) + 0.16 * t;
-                [r, g, b, 1.0]
-            }
+            let denom = (spec.max_mm - spec.min_mm).max(1.0e-4);
+            let t = ((width_mm - spec.min_mm) / denom).clamp(0.0, 1.0);
+            high_contrast_parameter_ramp(t)
         }
     }
 }
@@ -1844,7 +1917,7 @@ fn compute_selected_layer_color(
     layer: &ffi::SelectedLayerInfo,
     mode: SelectedLayersColorMode,
     min_mm: f32,
-    target_mm: f32,
+    _target_mm: f32,
     max_mm: f32,
 ) -> [f32; 4] {
     match mode {
@@ -1856,36 +1929,12 @@ fn compute_selected_layer_color(
                 return [0.96, 0.42, 0.92, 1.0]; // Vivid magenta-violet for branch-top layer
             }
             let h = layer.mean_thickness_mm;
-            if h <= target_mm {
-                let denom = (target_mm - min_mm).max(1.0e-4);
-                let t = ((h - min_mm) / denom).clamp(0.0, 1.0);
-                // Cool Blue (min_mm) -> Emerald Green (target_mm)
-                let r = 0.16 * (1.0 - t) + 0.18 * t;
-                let g = 0.52 * (1.0 - t) + 0.88 * t;
-                let b = 0.96 * (1.0 - t) + 0.42 * t;
-                [r, g, b, 1.0]
-            } else {
-                let denom = (max_mm - target_mm).max(1.0e-4);
-                let t = ((h - target_mm) / denom).clamp(0.0, 1.0);
-                // Emerald Green (target_mm) -> Warm Amber/Coral (max_mm)
-                let r = 0.18 * (1.0 - t) + 0.98 * t;
-                let g = 0.88 * (1.0 - t) + 0.50 * t;
-                let b = 0.42 * (1.0 - t) + 0.16 * t;
-                [r, g, b, 1.0]
-            }
+            let denom = (max_mm - min_mm).max(1.0e-4);
+            let t = ((h - min_mm) / denom).clamp(0.0, 1.0);
+            high_contrast_parameter_ramp(t)
         }
         SelectedLayersColorMode::ByBranch => {
-            const PALETTE: [[f32; 3]; 8] = [
-                [0.20, 0.86, 0.62],
-                [0.96, 0.62, 0.20],
-                [0.36, 0.68, 0.98],
-                [0.94, 0.38, 0.76],
-                [0.72, 0.90, 0.24],
-                [0.98, 0.42, 0.38],
-                [0.58, 0.48, 0.96],
-                [0.24, 0.90, 0.92],
-            ];
-            let rgb = PALETTE[(layer.branch_id as usize) % PALETTE.len()];
+            let rgb = BRANCH_PALETTE[(layer.branch_id as usize) % BRANCH_PALETTE.len()];
             [rgb[0], rgb[1], rgb[2], 1.0]
         }
         SelectedLayersColorMode::AlternatingBands => {
@@ -3167,6 +3216,32 @@ mod tests {
         );
 
         let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_high_contrast_parameter_ramp_distinct_stops() {
+        let stops = [0.0_f32, 0.25, 0.50, 0.75, 1.0];
+        let colors: Vec<[f32; 4]> = stops
+            .iter()
+            .map(|&t| high_contrast_parameter_ramp(t))
+            .collect();
+        for c in &colors {
+            assert!((0.0..=1.0).contains(&c[0]));
+            assert!((0.0..=1.0).contains(&c[1]));
+            assert!((0.0..=1.0).contains(&c[2]));
+            assert!((c[3] - 1.0).abs() < 1.0e-5);
+        }
+        // Adjacent 25% stops must have strong Euclidean RGB separation (> 0.45)
+        for pair in colors.windows(2) {
+            let a = pair[0];
+            let b = pair[1];
+            let dist = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2))
+                .sqrt();
+            assert!(
+                dist > 0.45,
+                "Expected high RGB contrast between adjacent 25% stops ({a:?} vs {b:?}), got dist={dist:.3}"
+            );
+        }
     }
 }
 
