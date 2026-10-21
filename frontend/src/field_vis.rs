@@ -2872,6 +2872,58 @@ mod tests {
         assert!(tp.valid);
         assert_eq!(layers.layers.len(), tp.layers.len());
 
+        let planned = crate::gcode::plan_and_emit_gcode_for_object(
+            "TestObj1.stl",
+            obj.object_id,
+            &tp,
+            Transform::IDENTITY,
+            &cfg,
+        );
+        for (i, ((l, _t), pl)) in layers
+            .layers
+            .iter()
+            .zip(tp.layers.iter())
+            .zip(planned.layers.iter())
+            .enumerate()
+        {
+            let prev_iso = layers.layers[..i]
+                .iter()
+                .rev()
+                .find(|prev| prev.branch_id == l.branch_id || prev.branch_id as i32 == l.parent_branch_id)
+                .map(|prev| prev.isovalue)
+                .unwrap_or(0.0);
+            let d_iso = l.isovalue - prev_iso;
+            assert!(
+                d_iso >= 0.10,
+                "Layer #{i} (branch B{}, {}/{}) had overlapping/compressed dIso={d_iso:.3} (iso={:.3}, prev_iso={prev_iso:.3})",
+                l.branch_id,
+                l.branch_layer_index + 1,
+                l.branch_layer_count,
+                l.isovalue,
+            );
+
+            let ext_segs: Vec<_> = pl
+                .segments
+                .iter()
+                .filter(|s| s.kind.is_extruding() && s.delta_e_mm > 0.0)
+                .collect();
+            assert!(
+                !ext_segs.is_empty(),
+                "Layer #{i} (branch B{}) must have extruding G-code segments",
+                l.branch_id
+            );
+            let mean_seg_h =
+                ext_segs.iter().map(|s| s.height_mm).sum::<f32>() / (ext_segs.len() as f32);
+            assert!(
+                (mean_seg_h - l.mean_thickness_mm).abs() <= 0.03,
+                "Layer #{i} (branch B{}, {}/{}) mean planned segment height ({mean_seg_h:.3} mm) diverged from layer mean_thickness_mm ({:.3} mm)",
+                l.branch_id,
+                l.branch_layer_index + 1,
+                l.branch_layer_count,
+                l.mean_thickness_mm,
+            );
+        }
+
         let q_pt = |v: &ffi::RenderVertex| -> (i32, i32, i32) {
             (
                 (v.x * 1000.0).round() as i32,

@@ -388,12 +388,13 @@ fn rdp_simplify_open(pts: &[WorkingVertex], tol_sq: f32) -> Vec<WorkingVertex> {
             } else {
                 (p - a).length_squared()
             };
-            // Preserve vertices where width or nozzle orientation changes noticeably
+            // Preserve vertices where width, layer height, or nozzle orientation changes noticeably
             let width_diff = (pt.width_mm - 0.5 * (pts[i0].width_mm + pts[i1].width_mm)).abs();
-            if d_sq > max_d_sq && width_diff <= 0.025 {
+            let height_diff = (pt.height_mm - 0.5 * (pts[i0].height_mm + pts[i1].height_mm)).abs();
+            if d_sq > max_d_sq && width_diff <= 0.025 && height_diff <= 0.010 {
                 max_d_sq = d_sq;
                 split_idx = i;
-            } else if width_diff > 0.025 {
+            } else if width_diff > 0.025 || height_diff > 0.010 {
                 max_d_sq = tol_sq + 1.0;
                 split_idx = i;
                 break;
@@ -2946,5 +2947,112 @@ mod tests {
                 seg.exit_speed_mms
             );
         }
+    }
+
+    #[test]
+    fn test_thin_vs_thick_layer_height_scales_extrusion_volume_and_flow_rate() {
+        let make_square_layer = |layer_index: u32, z: f32, h: f32| -> LayerToolpaths {
+            LayerToolpaths {
+                layer_index,
+                branch_id: 0,
+                isovalue: z,
+                paths: vec![ExtrusionPath {
+                    feature_kind: 0,
+                    wall_index: 0,
+                    is_closed: false,
+                    total_length_mm: 40.0,
+                    mean_width_mm: 0.42,
+                    points: vec![
+                        ToolpathPoint {
+                            x: -20.0,
+                            y: 0.0,
+                            z,
+                            nx: 0.0,
+                            ny: 0.0,
+                            nz: 1.0,
+                            width_mm: 0.42,
+                            height_mm: h,
+                        },
+                        ToolpathPoint {
+                            x: 0.0,
+                            y: 0.0,
+                            z,
+                            nx: 0.0,
+                            ny: 0.0,
+                            nz: 1.0,
+                            width_mm: 0.42,
+                            height_mm: h,
+                        },
+                        ToolpathPoint {
+                            x: 20.0,
+                            y: 0.0,
+                            z,
+                            nx: 0.0,
+                            ny: 0.0,
+                            nz: 1.0,
+                            width_mm: 0.42,
+                            height_mm: h,
+                        },
+                    ],
+                }],
+            }
+        };
+
+        let raw = ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 3,
+            outer_wall_count: 3,
+            inner_wall_count: 0,
+            solid_infill_count: 0,
+            sparse_infill_count: 0,
+            layers: vec![
+                make_square_layer(0, 0.20, 0.20),
+                make_square_layer(1, 0.28, 0.08), // thin upper layer (0.08 mm)
+                make_square_layer(2, 0.56, 0.28), // thick upper layer (0.28 mm)
+            ],
+        };
+
+        let cfg = SlicerConfig::default();
+        let res = plan_and_emit_gcode_for_object("HeightScaleTest", 1, &raw, Transform::IDENTITY, &cfg);
+        assert_eq!(res.layers.len(), 3);
+
+        let thin_segs: Vec<_> = res.layers[1]
+            .segments
+            .iter()
+            .filter(|s| s.kind.is_extruding() && s.delta_e_mm > 0.0)
+            .collect();
+        let thick_segs: Vec<_> = res.layers[2]
+            .segments
+            .iter()
+            .filter(|s| s.kind.is_extruding() && s.delta_e_mm > 0.0)
+            .collect();
+        assert!(!thin_segs.is_empty() && !thick_segs.is_empty());
+
+        let thin_h = thin_segs.iter().map(|s| s.height_mm).sum::<f32>() / (thin_segs.len() as f32);
+        let thick_h = thick_segs.iter().map(|s| s.height_mm).sum::<f32>() / (thick_segs.len() as f32);
+        assert!((thin_h - 0.08).abs() < 1.0e-3);
+        assert!((thick_h - 0.28).abs() < 1.0e-3);
+
+        let thin_e_per_mm: f32 = thin_segs.iter().map(|s| s.delta_e_mm).sum::<f32>()
+            / thin_segs.iter().map(|s| s.length_mm).sum::<f32>();
+        let thick_e_per_mm: f32 = thick_segs.iter().map(|s| s.delta_e_mm).sum::<f32>()
+            / thick_segs.iter().map(|s| s.length_mm).sum::<f32>();
+        let thin_max_q = thin_segs
+            .iter()
+            .map(|s| s.volumetric_flow_mm3s)
+            .fold(0.0f32, f32::max);
+        let thick_max_q = thick_segs
+            .iter()
+            .map(|s| s.volumetric_flow_mm3s)
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            thick_e_per_mm > 2.5 * thin_e_per_mm,
+            "Expected thick layer E/mm ({thick_e_per_mm:.4}) > 2.5x thin layer E/mm ({thin_e_per_mm:.4})"
+        );
+        assert!(
+            thick_max_q > 2.5 * thin_max_q,
+            "Expected thick layer flow rate ({thick_max_q:.2} mm^3/s) > 2.5x thin layer flow rate ({thin_max_q:.2} mm^3/s)"
+        );
     }
 }

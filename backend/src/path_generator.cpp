@@ -803,6 +803,7 @@ std::vector<RawChain> stitchSegmentsIntoChains(
             if (endDist <= 0.05f * closeLoopToleranceMm && chain.size() >= 4) {
                 chain.front().pos = lerp3(chain.front().pos, chain.back().pos, 0.5f);
                 chain.front().widthMm = 0.5f * (chain.front().widthMm + chain.back().widthMm);
+                chain.front().heightMm = 0.5f * (chain.front().heightMm + chain.back().heightMm);
                 chain.pop_back();
             }
         } else {
@@ -879,6 +880,7 @@ bool finalizeExtrusionPath(
         const float spanLen = dist3(lastKept.pos, next.pos);
         bool keep = (spanLen > maxMergedSegLen) ||
             (std::abs(curr.widthMm - lastKept.widthMm) > 0.015f) ||
+            (std::abs(curr.heightMm - lastKept.heightMm) > 0.010f) ||
             (dot3(curr.nozzleAxis, lastKept.nozzleAxis) < 0.9994f);
 
         if (!keep && spanLen > 1.0e-5f) {
@@ -1825,7 +1827,7 @@ std::vector<RawChain> generateScanlineFamilyOnIsland(
 
 /// Generates non-planar sparse infill toolpaths (`feature_kind == kFeatureSparseInfill`, or
 /// `kFeatureSolidInfill` for narrow-region-promoted islands) on the interior core of `baseMesh`.
-template <typename SdfSamplerFn, typename NozzleSamplerFn, typename GradSamplerFn>
+template <typename SdfSamplerFn, typename NozzleSamplerFn, typename HeightSamplerFn>
 void generateSparseInfillForLayer(
     const SurfaceMesh& baseMesh,
     const std::vector<float>& sdfDepth,
@@ -1833,9 +1835,6 @@ void generateSparseInfillForLayer(
     float sdfZeroShift,
     std::uint32_t layerIndex,
     float layerIsovalue,
-    float meanLayerH,
-    float hMin,
-    float hMax,
     float sparseDensity,
     const SanitizedLineWidth& sparseW,
     std::uint8_t sparsePattern,
@@ -1848,7 +1847,7 @@ void generateSparseInfillForLayer(
     float closeLoopTol,
     SdfSamplerFn&& sampleSdf,
     NozzleSamplerFn&& sampleNozzleAxis,
-    GradSamplerFn&& sampleEikGradNorm,
+    HeightSamplerFn&& sampleLocalLayerHeight,
     ::rust::Vec<ExtrusionPath>& outPaths)
 {
     if (sparseDensity <= 1.0e-4f || baseMesh.tris.empty() || baseMesh.verts.empty()) {
@@ -1918,10 +1917,7 @@ void generateSparseInfillForLayer(
     for (auto& sv : sparseMesh.verts) {
         sv.nozzleAxis = sampleNozzleAxis(sv.pos);
         sv.sdf = sampleShiftedSdf(sv.pos);
-        const float gradNorm = sampleEikGradNorm(sv.pos);
-        sv.layerHeightMm = (gradNorm > 0.25f)
-            ? std::clamp(meanLayerH / gradNorm, hMin, hMax)
-            : meanLayerH;
+        sv.layerHeightMm = sampleLocalLayerHeight(sv.pos);
     }
 
     // 3. Decompose `sparseMesh` into connected 3D triangle islands
@@ -2124,6 +2120,7 @@ void generateSparseInfillForLayer(
                 if (lengthSq3(sv.nozzleAxis) <= 1.0e-4f) {
                     sv.nozzleAxis = sampleNozzleAxis(sv.pos);
                 }
+                sv.layerHeightMm = sampleLocalLayerHeight(sv.pos);
             }
 
             std::vector<float> psiField(tpmsMesh.verts.size(), 0.0f);
@@ -2340,12 +2337,27 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
             auto sampleEikGradNorm = [&](const Vec3f& p) -> float {
                 const float h = 0.5f * voxelSize;
-                const float gx = (eikSampler.wsSample(openvdb::Vec3d(p.x + h, p.y, p.z)) -
-                                  eikSampler.wsSample(openvdb::Vec3d(p.x - h, p.y, p.z))) / (2.0f * h);
-                const float gy = (eikSampler.wsSample(openvdb::Vec3d(p.x, p.y + h, p.z)) -
-                                  eikSampler.wsSample(openvdb::Vec3d(p.x, p.y - h, p.z))) / (2.0f * h);
-                const float gz = (eikSampler.wsSample(openvdb::Vec3d(p.x, p.y, p.z + h)) -
-                                  eikSampler.wsSample(openvdb::Vec3d(p.x, p.y, p.z - h))) / (2.0f * h);
+                const float sdfCut = 0.05f * voxelSize;
+                const float t0 = eikSampler.wsSample(openvdb::Vec3d(p.x, p.y, p.z));
+                auto axisDeriv = [&](float dx, float dy, float dz) -> float {
+                    const openvdb::Vec3d pP(p.x + dx, p.y + dy, p.z + dz);
+                    const openvdb::Vec3d pM(p.x - dx, p.y - dy, p.z - dz);
+                    const float tP = eikSampler.wsSample(pP);
+                    const float tM = eikSampler.wsSample(pM);
+                    const bool inP = sdfSampler.wsSample(pP) <= sdfCut;
+                    const bool inM = sdfSampler.wsSample(pM) <= sdfCut;
+                    if (inP && inM) {
+                        return (tP - tM) / (2.0f * h);
+                    } else if (inP) {
+                        return (tP - t0) / h;
+                    } else if (inM) {
+                        return (t0 - tM) / h;
+                    }
+                    return (tP - tM) / (2.0f * h);
+                };
+                const float gx = axisDeriv(h, 0.0f, 0.0f);
+                const float gy = axisDeriv(0.0f, h, 0.0f);
+                const float gz = axisDeriv(0.0f, 0.0f, h);
                 return std::sqrt(gx * gx + gy * gy + gz * gz);
             };
 
@@ -2403,6 +2415,45 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         progressCb(done, numLayers);
                     }
                     continue;
+                }
+
+                const float layerMinH = 0.02f;
+                const float layerMaxH = std::max({
+                    2.0f * hMax,
+                    meanLayerH,
+                    layerInfo.max_thickness_mm});
+
+                std::vector<float> baseVertGrads(baseMesh.verts.size(), 1.0f);
+                double sumLayerGrad = 0.0;
+                std::size_t cntLayerGrad = 0;
+                for (std::size_t i = 0; i < baseMesh.verts.size(); ++i) {
+                    const float g = sampleEikGradNorm(baseMesh.verts[i].pos);
+                    baseVertGrads[i] = g;
+                    if (g > 0.20f && g < 4.0f) {
+                        sumLayerGrad += static_cast<double>(g);
+                        cntLayerGrad += 1;
+                    }
+                }
+                const float layerMeanGrad = (cntLayerGrad > 0)
+                    ? static_cast<float>(sumLayerGrad / static_cast<double>(cntLayerGrad))
+                    : 1.0f;
+
+                auto sampleLocalLayerHeight = [&](const Vec3f& p) -> float {
+                    const float gradNorm = sampleEikGradNorm(p);
+                    if (gradNorm > 0.20f) {
+                        return std::clamp(
+                            meanLayerH * (layerMeanGrad / gradNorm),
+                            layerMinH,
+                            layerMaxH);
+                    }
+                    return meanLayerH;
+                };
+
+                for (std::size_t i = 0; i < baseMesh.verts.size(); ++i) {
+                    const float g = baseVertGrads[i];
+                    baseMesh.verts[i].layerHeightMm = (g > 0.20f)
+                        ? std::clamp(meanLayerH * (layerMeanGrad / g), layerMinH, layerMaxH)
+                        : meanLayerH;
                 }
 
                 // Identify outer boundary edges of S_k (where S_k intersects the outer surface \phi_sdf = 0)
@@ -2495,12 +2546,28 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     });
 
                 // Sample 5/6-axis nozzle orientation and local layer height only on the surviving shell vertices
-                for (auto& sv : shellMesh.verts) {
-                    sv.nozzleAxis = sampleNozzleAxis(sv.pos);
-                    const float gradNorm = sampleEikGradNorm(sv.pos);
-                    sv.layerHeightMm = (gradNorm > 0.25f)
-                        ? std::clamp(meanLayerH / gradNorm, hMin, hMax)
-                        : meanLayerH;
+                {
+                    std::vector<float> shellGrads(shellMesh.verts.size(), 1.0f);
+                    double sumShellGrad = 0.0;
+                    std::size_t cntShellGrad = 0;
+                    for (std::size_t i = 0; i < shellMesh.verts.size(); ++i) {
+                        shellMesh.verts[i].nozzleAxis = sampleNozzleAxis(shellMesh.verts[i].pos);
+                        const float g = sampleEikGradNorm(shellMesh.verts[i].pos);
+                        shellGrads[i] = g;
+                        if (g > 0.20f && g < 4.0f) {
+                            sumShellGrad += static_cast<double>(g);
+                            cntShellGrad += 1;
+                        }
+                    }
+                    const float shellMeanGrad = (cntShellGrad > 0)
+                        ? static_cast<float>(sumShellGrad / static_cast<double>(cntShellGrad))
+                        : layerMeanGrad;
+                    for (std::size_t i = 0; i < shellMesh.verts.size(); ++i) {
+                        const float g = shellGrads[i];
+                        shellMesh.verts[i].layerHeightMm = (g > 0.20f)
+                            ? std::clamp(meanLayerH * (shellMeanGrad / g), layerMinH, layerMaxH)
+                            : meanLayerH;
+                    }
                 }
 
                 // ------------------------------------------------------------
@@ -3104,9 +3171,6 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         sdfZeroShift,
                         layerInfo.layer_index,
                         layerInfo.isovalue,
-                        meanLayerH,
-                        hMin,
-                        hMax,
                         sparseDensity,
                         sparseW,
                         sparsePattern,
@@ -3119,7 +3183,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         closeLoopTol,
                         sampleSdf,
                         sampleNozzleAxis,
-                        sampleEikGradNorm,
+                        sampleLocalLayerHeight,
                         layerOut.paths);
                 }
 

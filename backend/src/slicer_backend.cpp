@@ -1653,9 +1653,19 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             const openvdb::Coord& d = axes[static_cast<std::size_t>(a)];
             const float tP = eikAccMain.getValue(c + d);
             const float tM = eikAccMain.getValue(c - d);
+            const float sP = sdfAccMain.getValue(c + d);
+            const float sM = sdfAccMain.getValue(c - d);
             const bool okP = std::isfinite(tP) && (tP < validTauLimit);
             const bool okM = std::isfinite(tM) && (tM < validTauLimit);
-            if (okP && okM) {
+            const bool inP = okP && (sP <= 0.05f * voxelSize);
+            const bool inM = okM && (sM <= 0.05f * voxelSize);
+            if (inP && inM) {
+                gradTau[static_cast<std::size_t>(a)] = 0.5f * (tP - tM) * invVoxel;
+            } else if (inP) {
+                gradTau[static_cast<std::size_t>(a)] = (tP - t0) * invVoxel;
+            } else if (inM) {
+                gradTau[static_cast<std::size_t>(a)] = (t0 - tM) * invVoxel;
+            } else if (okP && okM) {
                 gradTau[static_cast<std::size_t>(a)] = 0.5f * (tP - tM) * invVoxel;
             } else if (okP) {
                 gradTau[static_cast<std::size_t>(a)] = (tP - t0) * invVoxel;
@@ -1663,8 +1673,6 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 gradTau[static_cast<std::size_t>(a)] = (t0 - tM) * invVoxel;
             }
 
-            const float sP = sdfAccMain.getValue(c + d);
-            const float sM = sdfAccMain.getValue(c - d);
             gradSdf[static_cast<std::size_t>(a)] = 0.5f * (sP - sM) * invVoxel;
         }
 
@@ -1971,7 +1979,13 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         if (src.minTau <= dst.minTau + 0.5f * voxelSize) {
             dst.startCornerSdfAllowance = std::max(dst.startCornerSdfAllowance, src.startCornerSdfAllowance);
         }
-        dst.peakTau = std::max(dst.peakTau, src.peakTau);
+        if (dst.childBranches.empty() && src.childBranches.empty()) {
+            dst.peakTau = std::max(dst.peakTau, src.peakTau);
+        } else if (dst.childBranches.empty() && !src.childBranches.empty()) {
+            dst.peakTau = src.peakTau;
+        } else if (!dst.childBranches.empty() && !src.childBranches.empty()) {
+            dst.peakTau = std::min(dst.peakTau, src.peakTau);
+        }
         dst.minTau = std::min(dst.minTau, src.minTau);
         dst.voxelIndices.insert(dst.voxelIndices.end(), src.voxelIndices.begin(), src.voxelIndices.end());
         dst.childBranches.insert(dst.childBranches.end(), src.childBranches.begin(), src.childBranches.end());
@@ -2038,7 +2052,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             if (voxels[v].surfTauMin <= sc.minTau + 1.5f * voxelSize) {
                 sc.startCornerSdfAllowance = std::max(sc.startCornerSdfAllowance, voxels[v].cornerSdfAllowance);
             }
-            sc.peakTau = std::max(sc.peakTau, voxels[v].surfTauMax);
+            if (sc.childBranches.empty()) {
+                sc.peakTau = std::max(sc.peakTau, voxels[v].surfTauMax);
+            }
             sc.minTau = std::min(sc.minTau, voxels[v].surfTauMin);
             sc.voxelIndices.push_back(v);
         } else {
@@ -2093,7 +2109,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 if (voxels[v].surfTauMin <= sc.minTau + 1.5f * voxelSize) {
                     sc.startCornerSdfAllowance = std::max(sc.startCornerSdfAllowance, voxels[v].cornerSdfAllowance);
                 }
-                sc.peakTau = std::max(sc.peakTau, voxels[v].surfTauMax);
+                if (sc.childBranches.empty()) {
+                    sc.peakTau = std::max(sc.peakTau, voxels[v].surfTauMax);
+                }
                 sc.minTau = std::min(sc.minTau, voxels[v].surfTauMin);
                 sc.voxelIndices.push_back(v);
                 rootToComp[masterRoot] = mainComp;
@@ -2492,8 +2510,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             const bool isFirst = (mb.isRoot && k == 0);
             const bool isTop = (mb.isLeaf && k == N);
 
-            const float minH = isFirst ? meanH : std::clamp(std::min(rawMinH, meanH), hMin, meanH);
-            const float maxH = isFirst ? meanH : std::clamp(std::max(rawMaxH, meanH), meanH, hMax);
+            const float hiClamp = std::max(2.0f * hMax, meanH);
+            const float minH = isFirst ? meanH : std::clamp(std::min(rawMinH, meanH), 0.02f, meanH);
+            const float maxH = isFirst ? meanH : std::clamp(std::max(rawMaxH, meanH), meanH, hiClamp);
 
             mb.layerIsovalues.push_back(tauCurr);
             mb.layerMeanThickness.push_back(meanH);

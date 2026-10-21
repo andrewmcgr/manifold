@@ -379,6 +379,20 @@ void extendEikonalToExteriorBand(
                     std::array<float, 3> sumDir{0.0f, 0.0f, 0.0f};
                     float sumSlowness = 0.0f;
 
+                    bool hasStrictlyCloserNeighbor = false;
+                    for (int k = 0; k < 6; ++k) {
+                        const std::int32_t nb = n6[static_cast<std::size_t>(k)];
+                        if (nb < 0) {
+                            continue;
+                        }
+                        const std::size_t u = static_cast<std::size_t>(nb);
+                        if (domain.tau[u] < 0.5f * kInfinityTau &&
+                            domain.sdf[u] < domain.sdf[idx] - 1.0e-5f) {
+                            hasStrictlyCloserNeighbor = true;
+                            break;
+                        }
+                    }
+
                     for (int k = 0; k < 6; ++k) {
                         const std::int32_t nb = n6[static_cast<std::size_t>(k)];
                         if (nb < 0) {
@@ -389,8 +403,13 @@ void extendEikonalToExteriorBand(
                         if (nbTau >= 0.5f * kInfinityTau) {
                             continue;
                         }
-                        // Prioritize neighbors closer to the object surface (\phi_sdf smaller)
-                        const float w = (domain.sdf[u] < domain.sdf[idx]) ? 4.0f : 0.6f;
+                        if (hasStrictlyCloserNeighbor && domain.sdf[u] >= domain.sdf[idx] - 1.0e-5f) {
+                            continue;
+                        }
+                        // Extrapolate outward from strictly more-interior shells so outer/same-shell
+                        // neighbors never damp the outward gradient magnitude during the march.
+                        const float sdfDiff = std::max(0.05f * dx, domain.sdf[idx] - domain.sdf[u]);
+                        const float w = hasStrictlyCloserNeighbor ? (dx / sdfDiff) : 1.0f;
                         const float sU = domain.slowness[u];
                         const float deltaTau =
                             sU * dot3(domain.targetDir[u], stepVecs[static_cast<std::size_t>(k)]);
@@ -963,7 +982,9 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
                 const float downwardOverhang = -domain.overhang[i];
                 const float distFromSurface = std::abs(domain.sdf[i]);
 
-                if (downwardOverhang > kOverhangThreshold && distFromSurface < surfaceShellMm) {
+                if (!domain.isSeed[i] &&
+                    downwardOverhang > kOverhangThreshold &&
+                    distFromSurface < surfaceShellMm) {
                     const float shellFactor = 1.0f - (distFromSurface / surfaceShellMm);
                     const float ovSeverity = std::clamp(
                         (downwardOverhang - kOverhangThreshold) / (1.0f - kOverhangThreshold),
@@ -1385,8 +1406,15 @@ EikonalSolveResult solveConstrainedEikonal(
 
     float minInteriorAxialProj = std::numeric_limits<float>::max();
     for (std::size_t i = 0; i < n; ++i) {
-        if (domain.isInterior[i]) {
+        if (domain.isInterior[i] && domain.sdf[i] <= 0.0f) {
             minInteriorAxialProj = std::min(minInteriorAxialProj, axialProjections[i]);
+        }
+    }
+    if (minInteriorAxialProj >= 0.5f * kInfinityTau) {
+        for (std::size_t i = 0; i < n; ++i) {
+            if (domain.isInterior[i]) {
+                minInteriorAxialProj = std::min(minInteriorAxialProj, axialProjections[i]);
+            }
         }
     }
     if (minInteriorAxialProj < 0.5f * kInfinityTau) {
