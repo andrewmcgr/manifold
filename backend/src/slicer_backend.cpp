@@ -1946,141 +1946,150 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         return result;
     }
 
-    // Compute finite-difference |\nabla \tau| and exact \phi_sdf = 0 surface crossings per voxel
+    // Compute finite-difference |\nabla \tau| and exact \phi_sdf = 0 surface crossings per voxel in parallel
     const float invVoxel = 1.0f / std::max(voxelSize, 1.0e-5f);
-    float globalTauMin = std::numeric_limits<float>::max();
-    float globalTauMax = std::numeric_limits<float>::lowest();
-
     const std::array<openvdb::Coord, 3> axes = {
         openvdb::Coord(1, 0, 0),
         openvdb::Coord(0, 1, 0),
         openvdb::Coord(0, 0, 1),
     };
 
-    for (std::size_t i = 0; i < voxels.size(); ++i) {
-        const openvdb::Coord& c = voxels[i].ijk;
-        const float t0 = voxels[i].tau;
-        const float s0 = voxels[i].sdf;
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, voxels.size(), 512),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            auto localEikAcc = eikGrid.getConstAccessor();
+            auto localSdfAcc = sdfGrid.getConstAccessor();
+            auto localIdxAcc = voxelIdxGrid.getConstAccessor();
 
-        std::array<float, 3> gradTau{0.0f, 0.0f, 0.0f};
-        std::array<float, 3> gradSdf{0.0f, 0.0f, 0.0f};
+            for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                const openvdb::Coord& c = voxels[i].ijk;
+                const float t0 = voxels[i].tau;
+                const float s0 = voxels[i].sdf;
 
-        for (int a = 0; a < 3; ++a) {
-            const openvdb::Coord& d = axes[static_cast<std::size_t>(a)];
-            const float tP = eikAccMain.getValue(c + d);
-            const float tM = eikAccMain.getValue(c - d);
-            const float sP = sdfAccMain.getValue(c + d);
-            const float sM = sdfAccMain.getValue(c - d);
-            const bool okP = std::isfinite(tP) && (tP < validTauLimit);
-            const bool okM = std::isfinite(tM) && (tM < validTauLimit);
-            const bool inP = okP && (sP <= 0.05f * voxelSize);
-            const bool inM = okM && (sM <= 0.05f * voxelSize);
-            if (inP && inM) {
-                gradTau[static_cast<std::size_t>(a)] = 0.5f * (tP - tM) * invVoxel;
-            } else if (inP) {
-                gradTau[static_cast<std::size_t>(a)] = (tP - t0) * invVoxel;
-            } else if (inM) {
-                gradTau[static_cast<std::size_t>(a)] = (t0 - tM) * invVoxel;
-            } else if (okP && okM) {
-                gradTau[static_cast<std::size_t>(a)] = 0.5f * (tP - tM) * invVoxel;
-            } else if (okP) {
-                gradTau[static_cast<std::size_t>(a)] = (tP - t0) * invVoxel;
-            } else if (okM) {
-                gradTau[static_cast<std::size_t>(a)] = (t0 - tM) * invVoxel;
-            }
+                std::array<float, 3> gradTau{0.0f, 0.0f, 0.0f};
+                std::array<float, 3> gradSdf{0.0f, 0.0f, 0.0f};
 
-            gradSdf[static_cast<std::size_t>(a)] = 0.5f * (sP - sM) * invVoxel;
-        }
+                for (int a = 0; a < 3; ++a) {
+                    const openvdb::Coord& d = axes[static_cast<std::size_t>(a)];
+                    const float tP = localEikAcc.getValue(c + d);
+                    const float tM = localEikAcc.getValue(c - d);
+                    const float sP = localSdfAcc.getValue(c + d);
+                    const float sM = localSdfAcc.getValue(c - d);
+                    const bool okP = std::isfinite(tP) && (tP < validTauLimit);
+                    const bool okM = std::isfinite(tM) && (tM < validTauLimit);
+                    const bool inP = okP && (sP <= 0.05f * voxelSize);
+                    const bool inM = okM && (sM <= 0.05f * voxelSize);
+                    if (inP && inM) {
+                        gradTau[static_cast<std::size_t>(a)] = 0.5f * (tP - tM) * invVoxel;
+                    } else if (inP) {
+                        gradTau[static_cast<std::size_t>(a)] = (tP - t0) * invVoxel;
+                    } else if (inM) {
+                        gradTau[static_cast<std::size_t>(a)] = (t0 - tM) * invVoxel;
+                    } else if (okP && okM) {
+                        gradTau[static_cast<std::size_t>(a)] = 0.5f * (tP - tM) * invVoxel;
+                    } else if (okP) {
+                        gradTau[static_cast<std::size_t>(a)] = (tP - t0) * invVoxel;
+                    } else if (okM) {
+                        gradTau[static_cast<std::size_t>(a)] = (t0 - tM) * invVoxel;
+                    }
 
-        const float g = std::sqrt(
-            gradTau[0] * gradTau[0] + gradTau[1] * gradTau[1] + gradTau[2] * gradTau[2]);
-        voxels[i].gradMag = (g > 1.0e-3f) ? std::clamp(g, 0.20f, 4.0f) : 1.0f;
+                    gradSdf[static_cast<std::size_t>(a)] = 0.5f * (sP - sM) * invVoxel;
+                }
 
-        if (s0 <= 0.0f) {
-            float tMin = t0;
-            float tMax = t0;
-            // Expand to exact \phi_sdf = 0 crossings along 26-neighbor edges exiting the object
-            for (int dz = -1; dz <= 1; ++dz) {
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        if (dx == 0 && dy == 0 && dz == 0) {
-                            continue;
+                const float g = std::sqrt(
+                    gradTau[0] * gradTau[0] + gradTau[1] * gradTau[1] + gradTau[2] * gradTau[2]);
+                voxels[i].gradMag = (g > 1.0e-3f) ? std::clamp(g, 0.20f, 4.0f) : 1.0f;
+
+                if (s0 <= 0.0f) {
+                    float tMin = t0;
+                    float tMax = t0;
+                    // Expand to exact \phi_sdf = 0 crossings along 26-neighbor edges exiting the object
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                if (dx == 0 && dy == 0 && dz == 0) {
+                                    continue;
+                                }
+                                const openvdb::Coord nb = c + openvdb::Coord(dx, dy, dz);
+                                const float sNb = localSdfAcc.getValue(nb);
+                                if (sNb <= 0.0f) {
+                                    continue;
+                                }
+                                const float tNb = localEikAcc.getValue(nb);
+                                if (!std::isfinite(tNb) || tNb >= validTauLimit) {
+                                    continue;
+                                }
+                                const float denom = sNb - s0;
+                                if (denom > 1.0e-6f) {
+                                    const float alpha = std::clamp(-s0 / denom, 0.0f, 1.0f);
+                                    const float tZero = (1.0f - alpha) * t0 + alpha * tNb;
+                                    tMin = std::min(tMin, tZero);
+                                    tMax = std::max(tMax, tZero);
+                                }
+                            }
                         }
-                        const openvdb::Coord nb = c + openvdb::Coord(dx, dy, dz);
-                        const float sNb = sdfAccMain.getValue(nb);
-                        if (sNb <= 0.0f) {
-                            continue;
+                    }
+                    voxels[i].surfTauMin = tMin;
+                    voxels[i].surfTauMax = tMax;
+                } else {
+                    // Voxel center is in the thin boundary shell (0 < sdf <= 0.85 * voxelSize):
+                    // compute its \tau values Strictly on the \phi_sdf = 0 surface so exterior voxel
+                    // centers never overestimate tauEnd into thin air outside the object.
+                    float tMin = std::numeric_limits<float>::max();
+                    float tMax = std::numeric_limits<float>::lowest();
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                if (dx == 0 && dy == 0 && dz == 0) {
+                                    continue;
+                                }
+                                const int nbIdx = localIdxAcc.getValue(c + openvdb::Coord(dx, dy, dz));
+                                if (nbIdx < 0) {
+                                    continue;
+                                }
+                                const float sNb = voxels[static_cast<std::size_t>(nbIdx)].sdf;
+                                if (sNb > 0.0f) {
+                                    continue;
+                                }
+                                const float tNb = voxels[static_cast<std::size_t>(nbIdx)].tau;
+                                const float denom = s0 - sNb;
+                                const float alpha = (denom > 1.0e-6f)
+                                    ? std::clamp(-sNb / denom, 0.0f, 1.0f)
+                                    : 0.0f;
+                                const float tZero = (1.0f - alpha) * tNb + alpha * t0;
+                                tMin = std::min(tMin, tZero);
+                                tMax = std::max(tMax, tZero);
+                            }
                         }
-                        const float tNb = eikAccMain.getValue(nb);
-                        if (!std::isfinite(tNb) || tNb >= validTauLimit) {
-                            continue;
+                    }
+                    if (tMin <= tMax) {
+                        voxels[i].surfTauMin = tMin;
+                        voxels[i].surfTauMax = tMax;
+                    } else {
+                        // Sub-voxel corner tip with no strictly negative neighbor center: project onto \phi_sdf = 0
+                        const float gSdfLen = std::sqrt(
+                            gradSdf[0] * gradSdf[0] + gradSdf[1] * gradSdf[1] + gradSdf[2] * gradSdf[2]);
+                        float dTauToSurf = 0.0f;
+                        if (gSdfLen > 1.0e-5f) {
+                            dTauToSurf = s0 * (
+                                gradTau[0] * gradSdf[0] +
+                                gradTau[1] * gradSdf[1] +
+                                gradTau[2] * gradSdf[2]) / gSdfLen;
                         }
-                        const float denom = sNb - s0;
-                        if (denom > 1.0e-6f) {
-                            const float alpha = std::clamp(-s0 / denom, 0.0f, 1.0f);
-                            const float tZero = (1.0f - alpha) * t0 + alpha * tNb;
-                            tMin = std::min(tMin, tZero);
-                            tMax = std::max(tMax, tZero);
-                        }
+                        const float tProj = std::max(0.0f, t0 - dTauToSurf);
+                        voxels[i].surfTauMin = tProj;
+                        voxels[i].surfTauMax = tProj;
+                        voxels[i].cornerSdfAllowance = std::clamp(s0, 0.0f, 0.75f * voxelSize);
                     }
                 }
             }
-            voxels[i].surfTauMin = tMin;
-            voxels[i].surfTauMax = tMax;
-        } else {
-            // Voxel center is in the thin boundary shell (0 < sdf <= 0.50 * voxelSize):
-            // compute its \tau values Strictly on the \phi_sdf = 0 surface so exterior voxel
-            // centers never overestimate tauEnd into thin air outside the object.
-            float tMin = std::numeric_limits<float>::max();
-            float tMax = std::numeric_limits<float>::lowest();
-            for (int dz = -1; dz <= 1; ++dz) {
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        if (dx == 0 && dy == 0 && dz == 0) {
-                            continue;
-                        }
-                        const int nbIdx = idxAcc.getValue(c + openvdb::Coord(dx, dy, dz));
-                        if (nbIdx < 0) {
-                            continue;
-                        }
-                        const float sNb = voxels[static_cast<std::size_t>(nbIdx)].sdf;
-                        if (sNb > 0.0f) {
-                            continue;
-                        }
-                        const float tNb = voxels[static_cast<std::size_t>(nbIdx)].tau;
-                        const float denom = s0 - sNb;
-                        const float alpha = (denom > 1.0e-6f)
-                            ? std::clamp(-sNb / denom, 0.0f, 1.0f)
-                            : 0.0f;
-                        const float tZero = (1.0f - alpha) * tNb + alpha * t0;
-                        tMin = std::min(tMin, tZero);
-                        tMax = std::max(tMax, tZero);
-                    }
-                }
-            }
-            if (tMin <= tMax) {
-                voxels[i].surfTauMin = tMin;
-                voxels[i].surfTauMax = tMax;
-            } else {
-                // Sub-voxel corner tip with no strictly negative neighbor center: project onto \phi_sdf = 0
-                const float gSdfLen = std::sqrt(
-                    gradSdf[0] * gradSdf[0] + gradSdf[1] * gradSdf[1] + gradSdf[2] * gradSdf[2]);
-                float dTauToSurf = 0.0f;
-                if (gSdfLen > 1.0e-5f) {
-                    dTauToSurf = s0 * (
-                        gradTau[0] * gradSdf[0] +
-                        gradTau[1] * gradSdf[1] +
-                        gradTau[2] * gradSdf[2]) / gSdfLen;
-                }
-                const float tProj = std::max(0.0f, t0 - dTauToSurf);
-                voxels[i].surfTauMin = tProj;
-                voxels[i].surfTauMax = tProj;
-                voxels[i].cornerSdfAllowance = std::clamp(s0, 0.0f, 0.75f * voxelSize);
-            }
-        }
+        });
 
-        globalTauMin = std::min(globalTauMin, voxels[i].surfTauMin);
-        globalTauMax = std::max(globalTauMax, voxels[i].surfTauMax);
+    float globalTauMin = std::numeric_limits<float>::max();
+    float globalTauMax = std::numeric_limits<float>::lowest();
+    for (const auto& vx : voxels) {
+        globalTauMin = std::min(globalTauMin, vx.surfTauMin);
+        globalTauMax = std::max(globalTauMax, vx.surfTauMax);
     }
 
     // Project exact CAD mesh vertices and triangle centroids onto their containing/nearest
@@ -2618,14 +2627,17 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     }
 
     if (branches.size() > 1) {
+        std::vector<std::pair<openvdb::Coord, int>> frontier;
+        frontier.reserve(voxels.size() / 4 + 64);
+        for (const auto& vx : voxels) {
+            if (vx.sdf >= -1.25f * voxelSize) {
+                frontier.emplace_back(vx.ijk, vx.branchId);
+            }
+        }
+        std::vector<std::pair<openvdb::Coord, int>> nextFrontier;
         for (int pass = 0; pass < 3; ++pass) {
-            std::vector<std::pair<openvdb::Coord, int>> dilationUpdates;
-            for (auto iter = branchGrid.cbeginValueOn(); iter; ++iter) {
-                const int bId = *iter;
-                if (bId < 0) {
-                    continue;
-                }
-                const openvdb::Coord c = iter.getCoord();
+            nextFrontier.clear();
+            for (const auto& [c, bId] : frontier) {
                 for (int dz = -1; dz <= 1; ++dz) {
                     for (int dy = -1; dy <= 1; ++dy) {
                         for (int dx = -1; dx <= 1; ++dx) {
@@ -2634,15 +2646,17 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             }
                             const openvdb::Coord nb = c + openvdb::Coord(dx, dy, dz);
                             if (branchAcc.getValue(nb) < 0) {
-                                dilationUpdates.emplace_back(nb, bId);
+                                nextFrontier.emplace_back(nb, bId);
                             }
                         }
                     }
                 }
             }
-            for (const auto& [coord, bId] : dilationUpdates) {
+            frontier.clear();
+            for (const auto& [coord, bId] : nextFrontier) {
                 if (branchAcc.getValue(coord) < 0) {
                     branchAcc.setValue(coord, bId);
+                    frontier.emplace_back(coord, bId);
                 }
             }
         }
@@ -2949,6 +2963,147 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         }
     }
 
+    // Precompute LeafNode [\tau_min, \tau_max] intervals and exterior-air value-mask culling for
+    // `eikGrid` so that each layer's `volumeToMesh` call only visits the O(N^{2/3}) leaf nodes
+    // that straddle `pl.isovalue` inside/near the object (\phi_sdf <= 2.25 * \Delta x) rather than
+    // scanning the entire 3D grid and meshing the outer narrow-band closure bag in empty air.
+    using EikTreeType = openvdb::FloatGrid::TreeType;
+    using EikLeafType = EikTreeType::LeafNodeType;
+    const float eikBgVal = eikGrid.background();
+    const float activeLeafMaxSdf = 2.25f * voxelSize;
+    const float nearBgMaxSdf = 0.65f * voxelSize;
+
+    std::vector<const EikLeafType*> srcLeaves;
+    srcLeaves.reserve(eikGrid.tree().leafCount());
+    openvdb::Int32Grid leafIdxGrid(-1);
+    auto leafIdxAcc = leafIdxGrid.getAccessor();
+    for (auto leafIter = eikGrid.tree().cbeginLeaf(); leafIter; ++leafIter) {
+        const auto idx = static_cast<std::int32_t>(srcLeaves.size());
+        srcLeaves.push_back(leafIter.getLeaf());
+        leafIdxAcc.setValue(leafIter->origin(), idx);
+    }
+
+    const std::size_t numEikLeaves = srcLeaves.size();
+    std::vector<std::unique_ptr<EikLeafType>> activeMaskedLeaves(numEikLeaves);
+    std::vector<std::unique_ptr<EikLeafType>> haloMaskedLeaves(numEikLeaves);
+    std::vector<float> leafTauMin(numEikLeaves, std::numeric_limits<float>::max());
+    std::vector<float> leafTauMax(numEikLeaves, -std::numeric_limits<float>::max());
+    std::vector<std::uint8_t> leafHasActive(numEikLeaves, 0);
+    std::vector<std::vector<std::uint32_t>> leafHaloNeighbors(numEikLeaves);
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, numEikLeaves),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            auto sdfLeafAcc = sdfGrid.getConstAccessor();
+            auto eikLeafAcc = eikGrid.getConstAccessor();
+            auto idxLeafAcc = leafIdxGrid.getConstAccessor();
+
+            for (std::size_t lIdx = r.begin(); lIdx != r.end(); ++lIdx) {
+                const EikLeafType* srcLeaf = srcLeaves[lIdx];
+                auto haloCopy = std::make_unique<EikLeafType>(*srcLeaf);
+                haloCopy->getValueMask().setOff();
+                haloMaskedLeaves[lIdx] = std::move(haloCopy);
+
+                auto activeCopy = std::make_unique<EikLeafType>(*srcLeaf);
+                float tMin = std::numeric_limits<float>::max();
+                float tMax = -std::numeric_limits<float>::max();
+                bool anyOn = false;
+
+                for (auto vIt = srcLeaf->cbeginValueOn(); vIt; ++vIt) {
+                    const openvdb::Index off = vIt.pos();
+                    const openvdb::Coord c = vIt.getCoord();
+                    const float tau = *vIt;
+                    const float sdf = sdfLeafAcc.getValue(c);
+
+                    bool keepActive =
+                        std::isfinite(tau) && (tau < validTauLimit) && (sdf <= activeLeafMaxSdf);
+                    if (keepActive && sdf > nearBgMaxSdf) {
+                        for (int dz = -1; dz <= 1 && keepActive; ++dz) {
+                            for (int dy = -1; dy <= 1 && keepActive; ++dy) {
+                                for (int dx = -1; dx <= 1; ++dx) {
+                                    if (dx == 0 && dy == 0 && dz == 0) {
+                                        continue;
+                                    }
+                                    const float nbTau =
+                                        eikLeafAcc.getValue(c + openvdb::Coord(dx, dy, dz));
+                                    if (!std::isfinite(nbTau) || nbTau >= validTauLimit) {
+                                        keepActive = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!keepActive) {
+                        activeCopy->setValueOff(off);
+                        continue;
+                    }
+
+                    anyOn = true;
+                    tMin = std::min(tMin, tau);
+                    tMax = std::max(tMax, tau);
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                if (dx == 0 && dy == 0 && dz == 0) {
+                                    continue;
+                                }
+                                const float nbTau =
+                                    eikLeafAcc.getValue(c + openvdb::Coord(dx, dy, dz));
+                                if (std::isfinite(nbTau) && nbTau < validTauLimit) {
+                                    tMin = std::min(tMin, nbTau);
+                                    tMax = std::max(tMax, nbTau);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Also expand [tMin, tMax] across all 512 buffer values in `srcLeaf` so if a
+                // neighbor leaf's active voxel at local coord 7 straddles into `srcLeaf` at coord 0,
+                // `srcLeaf` is guaranteed to be included as an active leaf (never leaving an
+                // open unclipped border at \phi_sdf ~ +2.25 * \Delta x).
+                if (anyOn) {
+                    const float* buf = srcLeaf->buffer().data();
+                    for (openvdb::Index i = 0; i < EikLeafType::SIZE; ++i) {
+                        const float vTau = buf[i];
+                        if (std::isfinite(vTau) && vTau < validTauLimit) {
+                            tMin = std::min(tMin, vTau);
+                            tMax = std::max(tMax, vTau);
+                        }
+                    }
+                }
+
+                if (anyOn && tMin <= tMax) {
+                    leafHasActive[lIdx] = 1;
+                    leafTauMin[lIdx] = tMin - 3.5f * voxelSize;
+                    leafTauMax[lIdx] = tMax + 3.5f * voxelSize;
+                    activeMaskedLeaves[lIdx] = std::move(activeCopy);
+
+                    const openvdb::Coord orig = srcLeaf->origin();
+                    constexpr int kLeafDim = static_cast<int>(EikLeafType::DIM);
+                    auto& nbList = leafHaloNeighbors[lIdx];
+                    nbList.reserve(26);
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                if (dx == 0 && dy == 0 && dz == 0) {
+                                    continue;
+                                }
+                                const openvdb::Coord nbOrig =
+                                    orig.offsetBy(dx * kLeafDim, dy * kLeafDim, dz * kLeafDim);
+                                const std::int32_t nbIdx = idxLeafAcc.getValue(nbOrig);
+                                if (nbIdx >= 0) {
+                                    nbList.push_back(static_cast<std::uint32_t>(nbIdx));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, numLayers),
         [&](const tbb::blocked_range<std::size_t>& r) {
@@ -3151,6 +3306,10 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 return rv;
             };
 
+            std::vector<std::uint8_t> leafInLayerState(numEikLeaves, 0);
+            std::vector<std::size_t> touchedLeaves;
+            touchedLeaves.reserve(std::min<std::size_t>(numEikLeaves, 4096));
+
             for (std::size_t idx = r.begin(); idx != r.end(); ++idx) {
                 const PendingLayer& pl = pending[idx];
                 SelectedLayerInfo info{};
@@ -3166,18 +3325,55 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 info.is_first_layer = pl.isFirstLayer;
                 info.is_top_layer = pl.isTopLayer;
 
+                openvdb::FloatGrid layerEikGrid(eikBgVal);
+                layerEikGrid.setTransform(eikGrid.transform().copy());
+                auto& layerTree = layerEikGrid.tree();
+                bool hasAnyActiveLeaf = false;
+
+                for (std::size_t lIdx = 0; lIdx < numEikLeaves; ++lIdx) {
+                    if (!leafHasActive[lIdx]) {
+                        continue;
+                    }
+                    if (pl.isovalue < leafTauMin[lIdx] || pl.isovalue > leafTauMax[lIdx]) {
+                        continue;
+                    }
+                    leafInLayerState[lIdx] = 2;
+                    touchedLeaves.push_back(lIdx);
+                    layerTree.addLeaf(new EikLeafType(*activeMaskedLeaves[lIdx]));
+                    hasAnyActiveLeaf = true;
+                }
+
+                const std::size_t numStraddling = touchedLeaves.size();
+                for (std::size_t k = 0; k < numStraddling; ++k) {
+                    const std::size_t lIdx = touchedLeaves[k];
+                    for (const std::uint32_t nbIdx : leafHaloNeighbors[lIdx]) {
+                        if (leafInLayerState[nbIdx] == 0) {
+                            leafInLayerState[nbIdx] = 1;
+                            touchedLeaves.push_back(nbIdx);
+                            layerTree.addLeaf(new EikLeafType(*haloMaskedLeaves[nbIdx]));
+                        }
+                    }
+                }
+
+                for (const std::size_t lIdx : touchedLeaves) {
+                    leafInLayerState[lIdx] = 0;
+                }
+                touchedLeaves.clear();
+
                 std::vector<openvdb::Vec3s> points;
                 std::vector<openvdb::Vec3I> triangles;
                 std::vector<openvdb::Vec4I> quads;
 
-                openvdb::tools::volumeToMesh(
-                    eikGrid,
-                    points,
-                    triangles,
-                    quads,
-                    static_cast<double>(pl.isovalue),
-                    0.0,
-                    true);
+                if (hasAnyActiveLeaf) {
+                    openvdb::tools::volumeToMesh(
+                        layerEikGrid,
+                        points,
+                        triangles,
+                        quads,
+                        static_cast<double>(pl.isovalue),
+                        0.0,
+                        true);
+                }
 
                 if (!points.empty() && (!triangles.empty() || !quads.empty())) {
                     std::vector<RenderVertex> verts(points.size());
@@ -3441,6 +3637,8 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     {
                         std::unordered_map<std::uint64_t, std::uint32_t> valleySplitMap;
                         const float maxEndpointSdf = 1.75f * fineVoxelSize;
+                        const float minValleyEdgeSq =
+                            (0.30f * fineVoxelSize) * (0.30f * fineVoxelSize);
 
                         auto considerValleyEdge = [&](std::uint32_t u, std::uint32_t v) {
                             const std::uint32_t lo = std::min(u, v);
@@ -3451,6 +3649,12 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                 std::min(dLo, dHi) > maxEndpointSdf) {
                                 return;
                             }
+                            const float edx = verts[hi].x - verts[lo].x;
+                            const float edy = verts[hi].y - verts[lo].y;
+                            const float edz = verts[hi].z - verts[lo].z;
+                            if (edx * edx + edy * edy + edz * edz < minValleyEdgeSq) {
+                                return;
+                            }
                             const std::uint64_t key =
                                 (static_cast<std::uint64_t>(lo) << 32) |
                                 static_cast<std::uint64_t>(hi);
@@ -3458,17 +3662,28 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                 return;
                             }
 
-                            float bestT = 0.5f;
-                            float bestSdf = std::min(dLo, dHi);
-                            for (const float tCand : {0.25f, 0.50f, 0.75f}) {
-                                const openvdb::Vec3d wpCand(
-                                    verts[lo].x + tCand * (verts[hi].x - verts[lo].x),
-                                    verts[lo].y + tCand * (verts[hi].y - verts[lo].y),
-                                    verts[lo].z + tCand * (verts[hi].z - verts[lo].z));
-                                const float sCand = sampleCompositeSdf(wpCand);
-                                if (sCand < bestSdf) {
-                                    bestSdf = sCand;
-                                    bestT = tCand;
+                            const float minEndpointSdf = std::min(dLo, dHi);
+                            const openvdb::Vec3d wpMid(
+                                verts[lo].x + 0.50f * edx,
+                                verts[lo].y + 0.50f * edy,
+                                verts[lo].z + 0.50f * edz);
+                            const float sMid = sampleCompositeSdf(wpMid);
+                            float bestT = 0.50f;
+                            float bestSdf = std::min(minEndpointSdf, sMid);
+
+                            // Only probe quarter-points (0.25, 0.75) if the midpoint is dipping
+                            // below the lower endpoint or already near the wall boundary.
+                            if (sMid < minEndpointSdf || minEndpointSdf < 0.85f * fineVoxelSize) {
+                                for (const float tCand : {0.25f, 0.75f}) {
+                                    const openvdb::Vec3d wpCand(
+                                        verts[lo].x + tCand * edx,
+                                        verts[lo].y + tCand * edy,
+                                        verts[lo].z + tCand * edz);
+                                    const float sCand = sampleCompositeSdf(wpCand);
+                                    if (sCand < bestSdf) {
+                                        bestSdf = sCand;
+                                        bestT = tCand;
+                                    }
                                 }
                             }
                             if (bestSdf <= 0.0f) {

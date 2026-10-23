@@ -2525,7 +2525,11 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 for (const auto& [ek, count] : edgeTriCounts) {
                     if (count == 1) {
                         const float edgeSdf = 0.5f * (baseMesh.verts[ek.a].sdf + baseMesh.verts[ek.b].sdf);
-                        if (edgeSdf >= -0.85f * voxelSize) {
+                        // Only classify an open mesh boundary edge as the physical outer surface
+                        // \Gamma_outer if its SDF is within the narrow clip-allowance band around
+                        // \phi_sdf = 0 (`[-0.85 * \Delta x, +0.45 * \Delta x]`), never if it is an
+                        // unclipped exterior air border where \phi_sdf > 0.45 * \Delta x.
+                        if (edgeSdf >= -0.85f * voxelSize && edgeSdf <= 0.45f * voxelSize) {
                             baseMesh.verts[ek.a].onOuterBoundary = true;
                             baseMesh.verts[ek.b].onOuterBoundary = true;
                             maxBoundarySdf = std::max({
@@ -2554,7 +2558,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
                 // Normalize vertex SDF relative to the outer boundary contour so \phi_sdf = 0 on \Gamma_outer
                 const float sdfZeroShift = std::isfinite(maxBoundarySdf)
-                    ? std::max(0.0f, maxBoundarySdf)
+                    ? std::clamp(maxBoundarySdf, 0.0f, 0.35f * voxelSize)
                     : 0.0f;
                 for (auto& v : baseMesh.verts) {
                     if (v.onOuterBoundary) {

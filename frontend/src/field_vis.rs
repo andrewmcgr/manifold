@@ -3027,7 +3027,11 @@ mod tests {
             cfg.eikonal.narrow_band_width_voxels as f32
         ));
 
-        // 1. Every selected isosurface layer must have non-empty mesh triangles AND non-empty toolpaths
+        // 1. Every selected isosurface layer must have non-empty mesh triangles AND non-empty toolpaths,
+        //    and no toolpath point may protrude beyond the physical object surface.
+        let sdf_slice_eps = 0.15f32;
+        let bmin = obj.local_min;
+        let bmax = obj.local_max;
         for (i, (l, t)) in layers.layers.iter().zip(tp.layers.iter()).enumerate() {
             assert!(
                 !l.indices.is_empty(),
@@ -3042,6 +3046,26 @@ mod tests {
                 l.isovalue,
                 l.is_top_layer
             );
+            for v in &l.vertices {
+                assert!(
+                    v.x >= bmin.x - sdf_slice_eps && v.x <= bmax.x + sdf_slice_eps &&
+                    v.y >= bmin.y - sdf_slice_eps && v.y <= bmax.y + sdf_slice_eps &&
+                    v.z >= bmin.z - sdf_slice_eps && v.z <= bmax.z + sdf_slice_eps,
+                    "Layer #{i} (iso={:.3}) mesh vertex ({:.2}, {:.2}, {:.2}) protrudes outside object bbox [{bmin:?}..{bmax:?}]",
+                    l.isovalue, v.x, v.y, v.z
+                );
+            }
+            for p in &t.paths {
+                for pt in &p.points {
+                    assert!(
+                        pt.x >= bmin.x - 0.02 && pt.x <= bmax.x + 0.02 &&
+                        pt.y >= bmin.y - 0.02 && pt.y <= bmax.y + 0.02 &&
+                        pt.z >= bmin.z - 0.05 && pt.z <= bmax.z + 0.05,
+                        "Layer #{i} (iso={:.3}) toolpath point ({:.2}, {:.2}, {:.2}, kind={}) protrudes outside object bbox [{bmin:?}..{bmax:?}]",
+                        l.isovalue, pt.x, pt.y, pt.z, p.feature_kind
+                    );
+                }
+            }
         }
 
         // 2. Verify that the top layers on the single-span upper arch branches
@@ -3395,11 +3419,33 @@ mod tests {
         }
 
         // 5. Verify shell & sparse infill toolpath generation succeeds on the Dual-Grid layers
+        //    and that outer walls stay strictly inside the 80x80x60 mm block surface ([-40, 40] x [-40, 40])
+        let cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&cfg);
+        ffi::set_multi_resolution_grid_config(true, 4);
+        ffi::set_slice_layer_height(ffi::LayerHeightSpec {
+            target_mm: 6.0,
+            min_mm: 4.0,
+            max_mm: 8.0,
+            first_layer_mm: 4.0,
+            top_layer_mm: 4.0,
+        });
         let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
         assert!(tp.valid);
         assert!(tp.outer_wall_count > 0, "Expected outer walls in Dual-Grid mode");
         assert!(tp.inner_wall_count > 0, "Expected inner walls in Dual-Grid mode");
         assert!(tp.sparse_infill_count > 0, "Expected sparse infill in Dual-Grid deep core");
+        for l in &tp.layers {
+            for p in &l.paths {
+                for pt in &p.points {
+                    assert!(
+                        pt.x.abs() <= 40.02 && pt.y.abs() <= 40.02,
+                        "Dual-Grid layer (iso={:.2}) toolpath point ({:.3}, {:.3}, {:.3}, kind={}) protrudes beyond [-40, 40] block surface!",
+                        l.isovalue, pt.x, pt.y, pt.z, p.feature_kind
+                    );
+                }
+            }
+        }
 
         let _ = ffi::remove_cad_object(part.object_id);
     }
