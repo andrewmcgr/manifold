@@ -354,6 +354,10 @@ pub mod ffi {
         /// Retrieves the number of outer constraint & tool-orientation relaxation iterations.
         pub fn get_eikonal_solver_iterations() -> u32;
 
+        /// Configures dual-grid multi-resolution volumetric field evaluation (coarse full-interior core
+        /// + fine boundary-shell narrow band).
+        pub fn set_multi_resolution_grid_config(enabled: bool, coarse_ratio: u32);
+
         /// Sets spatial/surface tangency and orthogonality hints for the Eikonal solver.
         pub fn set_spatial_orientation_hints(hints: &[SpatialOrientationHint]);
 

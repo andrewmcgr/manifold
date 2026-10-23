@@ -534,11 +534,36 @@ pub struct PointNormalHint {
     pub weight: f32,
 }
 
+/// Computes the default fine OpenVDB voxel size (mm) from the active tool's nozzle diameter
+/// $d_{\text{nozzle}}$ and target layer height $h_{\text{target}}$:
+/// $$\Delta x_{\text{fine}} = \text{clamp}\!\left(0.375\,d_{\text{nozzle}} + 0.50\,h_{\text{target}},\; 0.08,\; 2.00\right)$$
+/// For a standard $0.40\text{ mm}$ nozzle and $0.20\text{ mm}$ layer height, this yields
+/// $\Delta x_{\text{fine}} = 0.25\text{ mm}$ (placing $\sim 3\text{--}5$ fine voxels across
+/// thin walls of $0.8\text{--}1.2\text{ mm}$), and scales proportionally for larger nozzles
+/// and thicker layers where the physical deposition process sets the achievable feature detail.
+pub fn compute_auto_fine_voxel_size_mm(
+    nozzle_diameter_mm: f32,
+    target_layer_height_mm: f32,
+) -> f32 {
+    let d = nozzle_diameter_mm.max(0.10);
+    let h = target_layer_height_mm.max(0.02);
+    let raw = 0.375 * d + 0.50 * h;
+    ((raw * 100.0).round() / 100.0).clamp(0.08, 2.00)
+}
+
 /// OpenVDB volumetric Eikonal and SDF field parameters and soft orientation hints.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EikonalFieldConfig {
     pub voxel_size_mm: f32,
+    /// Automatically scale the fine grid `voxel_size_mm` from the active nozzle diameter
+    /// and target layer height (`0.375 * nozzle_diameter_mm + 0.50 * target_layer_height_mm`).
+    pub auto_voxel_size: bool,
+    /// Enable Dual-Grid Multi-Resolution (coarse full-interior core + fine boundary-shell narrow band)
+    /// to support large build volumes without excessive memory or compute.
+    pub enable_multi_resolution_grid: bool,
+    /// Coarse-to-fine voxel size multiplier (`2..=8`, default `4`) used for the interior core grid.
+    pub coarse_grid_ratio: u32,
     pub narrow_band_width_voxels: u32,
     pub curvature_regularization: f32,
     /// Number of outer constraint & tool-orientation relaxation iterations (`>= 1`).
@@ -558,7 +583,10 @@ pub struct EikonalFieldConfig {
 impl Default for EikonalFieldConfig {
     fn default() -> Self {
         Self {
-            voxel_size_mm: 0.50,
+            voxel_size_mm: 0.25,
+            auto_voxel_size: true,
+            enable_multi_resolution_grid: true,
+            coarse_grid_ratio: 4,
             narrow_band_width_voxels: 6,
             curvature_regularization: 0.05,
             solver_iterations: 4,
@@ -940,6 +968,22 @@ impl SlicerConfig {
         }
     }
 
+    /// Updates `eikonal.voxel_size_mm` from the active tool's `nozzle_diameter_mm` and
+    /// `slicing.layer_height.target_mm` when `eikonal.auto_voxel_size` is enabled.
+    pub fn sync_auto_voxel_size(&mut self) {
+        if self.eikonal.auto_voxel_size {
+            let nozzle_mm = self
+                .active_tool()
+                .map(|t| t.nozzle_diameter_mm)
+                .unwrap_or(0.40);
+            self.eikonal.voxel_size_mm = compute_auto_fine_voxel_size_mm(
+                nozzle_mm,
+                self.slicing.layer_height.target_mm,
+            );
+        }
+        self.eikonal.coarse_grid_ratio = self.eikonal.coarse_grid_ratio.clamp(2, 8);
+    }
+
     /// Queries the nozzle's local orthonormal frame at `position_bed` moving along `travel_dir_bed`.
     pub fn query_nozzle_frame(&self, position_bed: Vec3, travel_dir_bed: Vec3) -> NozzleFrame {
         self.machine.query_nozzle_frame(position_bed, travel_dir_bed)
@@ -986,11 +1030,38 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
     ParameterDoc {
         key: "eikonal.voxel_size_mm",
         category: "Volumetric Fields & Eikonal Solver",
-        title: "OpenVDB Voxel Size",
+        title: "OpenVDB Fine Voxel Size",
         units: "mm",
-        default_value: "0.50 mm",
-        summary: "Spatial resolution of the OpenVDB signed-distance and Eikonal time-of-arrival grids.",
-        details: "Smaller voxel sizes capture finer geometric detail and sharper non-planar curvature transitions at the cost of cubic memory and compute scaling. Typically set near 1x-1.5x the nozzle diameter.",
+        default_value: "0.25 mm",
+        summary: "Spatial resolution of the fine OpenVDB boundary-shell signed-distance and Eikonal grids.",
+        details: "Smaller voxel sizes capture finer geometric detail, thin walls, and sharper non-planar curvature transitions. When 'Auto Voxel Size' is enabled, this scales automatically with nozzle diameter and target layer height (0.375 * d_nozzle + 0.50 * h_target).",
+    },
+    ParameterDoc {
+        key: "eikonal.auto_voxel_size",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Auto Fine Voxel Size (Nozzle + Layer Height)",
+        units: "",
+        default_value: "true",
+        summary: "Automatically scales the fine OpenVDB voxel size from nozzle diameter and target layer height.",
+        details: "Sets the fine voxel size to 0.375 * d_nozzle + 0.50 * h_target (0.25 mm for a 0.4 mm nozzle at 0.2 mm layers; 0.45 mm for a 0.8 mm nozzle at 0.3 mm layers) so that thin-walled curved parts (~2x nozzle diameter) always span at least 3-5 fine voxels while scaling appropriately for larger nozzles.",
+    },
+    ParameterDoc {
+        key: "eikonal.enable_multi_resolution_grid",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Dual-Grid Multi-Resolution (Coarse Core + Fine Shell)",
+        units: "",
+        default_value: "true",
+        summary: "Uses a coarse full-interior grid for global Eikonal propagation and a fine narrow-band grid in the outer shell.",
+        details: "Eliminates the O(L^3 / dx_fine^3) memory and fast-sweeping bottleneck on large build volumes. The deep interior core (sparse infill region) is solved on a coarse grid (e.g. 4x voxel size = 64x fewer interior voxels), while the outer boundary shell (-T_shell <= phi_sdf <= 0) is voxelized and refined at fine resolution with conformal shell mesh subdivision.",
+    },
+    ParameterDoc {
+        key: "eikonal.coarse_grid_ratio",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Coarse Interior Grid Ratio",
+        units: "× fine voxel",
+        default_value: "4×",
+        summary: "Multiplier between the coarse interior core voxel size and the fine boundary-shell voxel size.",
+        details: "A 4× ratio reduces interior core voxel count and Eikonal sweeping cost by 64× (4^3) while keeping global arrival-time wavefronts, branch saddle detection, and sparse infill layer spacing smooth and accurate.",
     },
     ParameterDoc {
         key: "eikonal.narrow_band_width_voxels",
@@ -1777,8 +1848,36 @@ mod tests {
         }
         assert!(lookup_parameter_doc("gcode.swell_multipliers").is_some());
         assert!(lookup_parameter_doc("gcode.fan_speed_percent").is_some());
+        assert!(lookup_parameter_doc("eikonal.auto_voxel_size").is_some());
+        assert!(lookup_parameter_doc("eikonal.enable_multi_resolution_grid").is_some());
+        assert!(lookup_parameter_doc("eikonal.coarse_grid_ratio").is_some());
         let md = generate_parameter_docs_markdown();
         assert!(md.starts_with("# Manifold2 Parameter Reference"));
         assert!(md.contains("gcode.swell_multipliers"));
+    }
+
+    #[test]
+    fn test_auto_fine_voxel_size_scaling_with_nozzle_and_layer_height() {
+        // Standard 0.40 mm nozzle + 0.20 mm target layer height => 0.25 mm fine voxel size
+        let v_std = compute_auto_fine_voxel_size_mm(0.40, 0.20);
+        assert!((v_std - 0.25).abs() < 1.0e-5, "Expected 0.25 mm, got {v_std}");
+
+        // 0.60 mm nozzle + 0.30 mm target layer height => 0.375 * 0.60 + 0.15 = 0.375 -> 0.38 mm
+        let v_06 = compute_auto_fine_voxel_size_mm(0.60, 0.30);
+        assert!((v_06 - 0.38).abs() < 1.0e-5, "Expected 0.38 mm, got {v_06}");
+
+        // 0.80 mm nozzle + 0.40 mm target layer height => 0.375 * 0.80 + 0.20 = 0.50 mm
+        let v_08 = compute_auto_fine_voxel_size_mm(0.80, 0.40);
+        assert!((v_08 - 0.50).abs() < 1.0e-5, "Expected 0.50 mm, got {v_08}");
+
+        let mut cfg = SlicerConfig::default();
+        assert!(cfg.eikonal.auto_voxel_size);
+        assert!(cfg.eikonal.enable_multi_resolution_grid);
+        assert_eq!(cfg.eikonal.coarse_grid_ratio, 4);
+        assert!((cfg.eikonal.voxel_size_mm - 0.25).abs() < 1.0e-5);
+        cfg.active_tool_index = 1; // T1 - 0.6mm High-Flow
+        cfg.slicing.layer_height.target_mm = 0.30;
+        cfg.sync_auto_voxel_size();
+        assert!((cfg.eikonal.voxel_size_mm - 0.38).abs() < 1.0e-5);
     }
 }

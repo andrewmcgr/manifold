@@ -84,8 +84,11 @@ struct ActiveVolumeDomain {
     /// Angle (degrees) between toolAxis[i] and the reference bed normal.
     std::vector<float> toolTiltDeg;
 
-    /// True if voxel i is a fixed seed on the print bed (\tau = 0).
+    /// True if voxel i is a fixed seed on the print bed (\tau = 0) or inner shell seam.
     std::vector<std::uint8_t> isSeed;
+    /// True if voxel i is a Dirichlet-pinned inner-shell boundary seed that must remain fixed
+    /// during directional guidance sweeps.
+    std::vector<std::uint8_t> isPinnedSeed;
     /// True if voxel i belongs to the object interior or immediate boundary (\phi <= 0.75 * dx).
     std::vector<std::uint8_t> isInterior;
 
@@ -217,6 +220,19 @@ struct EikonalSolveResult {
 /// Runs the full iterative constrained Eikonal + tool-orientation solver on `sdfGrid`.
 EikonalSolveResult solveConstrainedEikonal(
     const openvdb::FloatGrid& sdfGrid,
+    float objectMinZ,
+    float objectMaxZ,
+    float objectMaxSpan,
+    float exteriorBandMm,
+    const EikonalSolverContext& baseContext);
+
+/// Refines the constrained Eikonal and 5/6-axis tool-orientation fields on a fine-resolution
+/// narrow-band shell grid (`fineShellSdfGrid`) using Dirichlet inner-boundary prolongation from
+/// a solved coarse full-interior grid (`coarseSolved`).
+EikonalSolveResult solveFineShellWithCoarseGuidance(
+    const openvdb::FloatGrid& fineShellSdfGrid,
+    const EikonalSolveResult& coarseSolved,
+    float innerShellDepthMm,
     float objectMinZ,
     float objectMaxZ,
     float objectMaxSpan,

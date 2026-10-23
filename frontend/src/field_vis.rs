@@ -3295,6 +3295,256 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_dual_grid_multi_resolution_large_volume_voxel_reduction_and_slicing() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ffi::set_spatial_orientation_hints(&[]);
+        ffi::set_nozzle_axis_bed([0.0, 0.0, 1.0]);
+        ffi::set_gravity_direction_bed([0.0, 0.0, -1.0]);
+
+        // Register a large 80 x 80 x 60 mm solid block (384,000 mm^3 volume).
+        // At 0.50 mm fine voxel size, a uniform interior grid requires >3,000,000 voxels,
+        // whereas Dual-Grid Multi-Resolution (4x coarse core + fine boundary shell) uses
+        // a small fraction of the active voxels while keeping fine 0.50 mm boundary resolution.
+        let positions: [f32; 24] = [
+            -40.0, -40.0, 0.0,
+             40.0, -40.0, 0.0,
+             40.0,  40.0, 0.0,
+            -40.0,  40.0, 0.0,
+            -40.0, -40.0, 60.0,
+             40.0, -40.0, 60.0,
+             40.0,  40.0, 60.0,
+            -40.0,  40.0, 60.0,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2,
+            4, 5, 6, 4, 6, 7,
+            0, 1, 5, 0, 5, 4,
+            1, 2, 6, 1, 6, 5,
+            2, 3, 7, 2, 7, 6,
+            3, 0, 4, 3, 4, 7,
+        ];
+
+        let part = ffi::register_triangle_mesh("test_large_multires_block", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        // 1. Single-resolution uniform fine grid baseline (0.50 mm voxel size)
+        ffi::set_multi_resolution_grid_config(false, 4);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.50, 4.0));
+        let single_res_stats = ffi::get_object_field_stats(part.object_id, "sdf");
+        assert!(single_res_stats.valid);
+
+        // 2. Dual-Grid Multi-Resolution (4x coarse interior + 0.50 mm fine boundary shell)
+        ffi::set_multi_resolution_grid_config(true, 4);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.50, 4.0));
+        let dual_res_stats = ffi::get_object_field_stats(part.object_id, "sdf");
+        assert!(dual_res_stats.valid);
+        assert!(
+            (dual_res_stats.voxel_size - 0.50).abs() < 1.0e-4,
+            "Expected fine boundary shell voxel size 0.50 mm in Dual-Grid mode, got {}",
+            dual_res_stats.voxel_size
+        );
+        assert!(
+            dual_res_stats.active_voxel_count * 2 < single_res_stats.active_voxel_count,
+            "Expected Dual-Grid active_voxel_count ({}) to be < 50% of uniform single-grid ({})",
+            dual_res_stats.active_voxel_count,
+            single_res_stats.active_voxel_count
+        );
+        assert!(
+            dual_res_stats.min_value < -20.0,
+            "Expected Dual-Grid SDF stats to include deep interior core minimum (<-20 mm), got {}",
+            dual_res_stats.min_value
+        );
+
+        // 3. Verify 2D cross-section slice sampling through the deep core is continuous and valid
+        let mid_slice = ffi::sample_field_slice(part.object_id, "eikonal", 2, 0.5, 48);
+        assert!(mid_slice.valid);
+        let center_idx = (24 * 48 + 24) as usize;
+        assert!(
+            mid_slice.sdf_values[center_idx] < -15.0,
+            "Expected deep interior core SDF < -15 mm at slice center, got {}",
+            mid_slice.sdf_values[center_idx]
+        );
+        assert!(
+            mid_slice.values[center_idx] > 10.0 && mid_slice.values[center_idx] < 50.0,
+            "Expected valid solved Eikonal tau at deep core slice center, got {}",
+            mid_slice.values[center_idx]
+        );
+
+        // 4. Verify non-planar layer selection and conformal shell-refined mesh extraction
+        //    on the Dual-Grid object (use 6.0 mm layer thickness for fast test execution)
+        ffi::set_slice_layer_height(ffi::LayerHeightSpec {
+            target_mm: 6.0,
+            min_mm: 4.0,
+            max_mm: 8.0,
+            first_layer_mm: 4.0,
+            top_layer_mm: 4.0,
+        });
+        let selected = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+        assert!(selected.valid);
+        assert!(selected.layers.len() >= 8);
+
+        for layer in &selected.layers {
+            assert!(
+                !layer.indices.is_empty() && !layer.contour_segments.is_empty(),
+                "Layer {} (iso={}) in Dual-Grid mode had empty mesh or contour",
+                layer.layer_index,
+                layer.isovalue
+            );
+        }
+
+        // 5. Verify shell & sparse infill toolpath generation succeeds on the Dual-Grid layers
+        let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp.valid);
+        assert!(tp.outer_wall_count > 0, "Expected outer walls in Dual-Grid mode");
+        assert!(tp.inner_wall_count > 0, "Expected inner walls in Dual-Grid mode");
+        assert!(tp.sparse_infill_count > 0, "Expected sparse infill in Dual-Grid deep core");
+
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_thin_walled_curved_shell_complete_isosurfaces_with_default_auto_voxel() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ffi::set_spatial_orientation_hints(&[]);
+        ffi::set_multi_resolution_grid_config(true, 4);
+
+        // Build a large (~56 x 56 x 24 mm) watertight doubly-curved wavy thin-walled shell
+        // with 0.90 mm radial wall thickness. Previously, both the 0.50 mm default voxel size
+        // and the bounding-box Dual-Grid heuristic caused parts of many isosurfaces to go missing.
+        let n_theta = 72usize;
+        let n_z = 24usize;
+        let height_z = 24.0f32;
+        let wall_thickness = 0.90f32;
+
+        let mut positions = Vec::with_capacity((n_z + 1) * n_theta * 2 * 3);
+        let mut indices = Vec::new();
+
+        for iz in 0..=n_z {
+            let v = iz as f32 / n_z as f32;
+            let z = v * height_z;
+            let z_wave = 3.2 * (v * std::f32::consts::TAU).sin();
+            for it in 0..n_theta {
+                let theta = (it as f32 / n_theta as f32) * std::f32::consts::TAU;
+                let r_mid = 22.0 + 3.5 * (3.0 * theta + 1.5 * v * std::f32::consts::PI).sin() + z_wave;
+                let r_in = r_mid - 0.5 * wall_thickness;
+                let r_out = r_mid + 0.5 * wall_thickness;
+                let (s, c) = theta.sin_cos();
+                // Outer ring vertex (even index)
+                positions.extend_from_slice(&[r_out * c, r_out * s, z]);
+                // Inner ring vertex (odd index)
+                positions.extend_from_slice(&[r_in * c, r_in * s, z]);
+            }
+        }
+
+        let ring_stride = (n_theta * 2) as u32;
+        for iz in 0..n_z {
+            let row0 = (iz as u32) * ring_stride;
+            let row1 = ((iz + 1) as u32) * ring_stride;
+            for it in 0..n_theta {
+                let next_it = (it + 1) % n_theta;
+                let o00 = row0 + (it as u32) * 2;
+                let i00 = o00 + 1;
+                let o01 = row0 + (next_it as u32) * 2;
+                let i01 = o01 + 1;
+
+                let o10 = row1 + (it as u32) * 2;
+                let i10 = o10 + 1;
+                let o11 = row1 + (next_it as u32) * 2;
+                let i11 = o11 + 1;
+
+                // Outer wall (outward normal)
+                indices.extend_from_slice(&[o00, o01, o11, o00, o11, o10]);
+                // Inner wall (inward normal)
+                indices.extend_from_slice(&[i00, i11, i01, i00, i10, i11]);
+            }
+        }
+        // Bottom cap (z = 0, downward normal) and top cap (z = height_z, upward normal)
+        let top_row = (n_z as u32) * ring_stride;
+        for it in 0..n_theta {
+            let next_it = (it + 1) % n_theta;
+            let o_b0 = (it as u32) * 2;
+            let i_b0 = o_b0 + 1;
+            let o_b1 = (next_it as u32) * 2;
+            let i_b1 = o_b1 + 1;
+            indices.extend_from_slice(&[o_b0, i_b1, o_b1, o_b0, i_b0, i_b1]);
+
+            let o_t0 = top_row + (it as u32) * 2;
+            let i_t0 = o_t0 + 1;
+            let o_t1 = top_row + (next_it as u32) * 2;
+            let i_t1 = o_t1 + 1;
+            indices.extend_from_slice(&[o_t0, o_t1, i_t1, o_t0, i_t1, i_t0]);
+        }
+
+        let cfg = crate::config::SlicerConfig::default();
+        assert!((cfg.eikonal.voxel_size_mm - 0.25).abs() < 1.0e-5);
+
+        let part = ffi::register_triangle_mesh("test_thin_curved_shell", &positions, &indices);
+        assert!(part.object_id > 0);
+        assert!(ffi::recompute_object_fields(
+            part.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        ffi::set_slice_layer_height(ffi::LayerHeightSpec {
+            target_mm: 2.0,
+            min_mm: 1.2,
+            max_mm: 2.8,
+            first_layer_mm: 1.5,
+            top_layer_mm: 1.5,
+        });
+
+        let selected = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+        assert!(selected.valid);
+        assert!(
+            selected.layers.len() >= 10,
+            "Expected at least 10 layers on thin-walled curved shell, got {}",
+            selected.layers.len()
+        );
+
+        // Verify that every layer has non-empty mesh & contours, and that all layers spanning
+        // the body of the wavy shell (`iso <= 22.5 mm`, before the top flat rim where the 3 wave
+        // lobes terminate at slightly different Eikonal arc lengths) have unbroken 360-degree
+        // coverage across all 16 angular sectors.
+        let mut full_ring_layers_checked = 0usize;
+        for (idx, layer) in selected.layers.iter().enumerate() {
+            assert!(
+                !layer.indices.is_empty() && !layer.contour_segments.is_empty(),
+                "Layer #{idx} (iso={:.3}) on thin curved shell has empty mesh or contour!",
+                layer.isovalue
+            );
+            if layer.isovalue <= 22.5 {
+                full_ring_layers_checked += 1;
+                let mut sector_tri_counts = [0usize; 16];
+                for tri in layer.indices.chunks_exact(3) {
+                    let v0 = &layer.vertices[tri[0] as usize];
+                    let v1 = &layer.vertices[tri[1] as usize];
+                    let v2 = &layer.vertices[tri[2] as usize];
+                    let cx = (v0.x + v1.x + v2.x) / 3.0;
+                    let cy = (v0.y + v1.y + v2.y) / 3.0;
+                    let angle = cy.atan2(cx).rem_euclid(std::f32::consts::TAU);
+                    let sector = ((angle / std::f32::consts::TAU) * 16.0).floor().clamp(0.0, 15.0) as usize;
+                    sector_tri_counts[sector] += 1;
+                }
+                for (s, &cnt) in sector_tri_counts.iter().enumerate() {
+                    assert!(
+                        cnt > 0,
+                        "Thin-walled curved shell layer #{idx} (iso={:.3}) is missing isosurface section in angular sector {s}/16: {:?}",
+                        layer.isovalue,
+                        sector_tri_counts
+                    );
+                }
+            }
+        }
+        assert!(
+            full_ring_layers_checked >= 10,
+            "Expected at least 10 full-ring body layers on thin-walled curved shell, got {full_ring_layers_checked}"
+        );
+
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
 }
 
 

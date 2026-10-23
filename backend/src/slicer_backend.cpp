@@ -72,6 +72,12 @@ struct ObjectRecord {
     std::map<std::string, openvdb::FloatGrid::Ptr> scalarFields;
     /// Solved 3D unit tool axis field \hat{a}(x) in bed coordinates.
     openvdb::Vec3SGrid::Ptr toolAxisGrid;
+    /// Coarse full-interior grids when `isMultiResolution == true`.
+    std::map<std::string, openvdb::FloatGrid::Ptr> coarseScalarFields;
+    openvdb::Vec3SGrid::Ptr coarseToolAxisGrid;
+    bool isMultiResolution = false;
+    float fineShellInnerDepthMm = 0.0f;
+    std::uint32_t coarseToFineRatio = 1;
     /// Cached selected slicing isosurfaces for this object's current Eikonal field & LayerHeightSpec.
     mutable bool hasCachedSelectedLayers = false;
     mutable float cachedSelectedLayersAdaptivity = -1.0f;
@@ -283,6 +289,11 @@ void buildObjectScalarFields(
 {
     rec.scalarFields.clear();
     rec.toolAxisGrid.reset();
+    rec.coarseScalarFields.clear();
+    rec.coarseToolAxisGrid.reset();
+    rec.isMultiResolution = false;
+    rec.fineShellInnerDepthMm = 0.0f;
+    rec.coarseToFineRatio = 1;
     rec.hasCachedSelectedLayers = false;
     if (rec.vertexBuffer.empty() || rec.indexBuffer.size() < 3) {
         return;
@@ -294,27 +305,7 @@ void buildObjectScalarFields(
     const float spanY = rec.maxY - rec.minY;
     const float spanZ = rec.maxZ - rec.minZ;
     const float maxSpan = std::max({spanX, spanY, spanZ, 1.0f});
-
-    // Allow fine voxel sizes up to ~220 voxels along the longest bounding box axis
-    const double voxelSize = std::max<double>(
-        std::max(requestedVoxelSize, 0.05f),
-        static_cast<double>(maxSpan) / 220.0);
-
-    // Maintain a consistent physical exterior band (at least 20% of maxSpan or narrowBandVoxels * voxelSize)
-    // and a full interior band (60% of maxSpan) so the SDF isovalue range in millimeters
-    // never shrinks when the user selects a finer voxel resolution.
-    const float minExteriorMm = std::max(0.20f * maxSpan, narrowBandVoxels * static_cast<float>(voxelSize));
-    const float exBandVoxels = std::clamp(
-        minExteriorMm / static_cast<float>(voxelSize),
-        3.0f,
-        120.0f);
-    const float inBandVoxels = std::clamp(
-        (0.60f * maxSpan) / static_cast<float>(voxelSize),
-        4.0f,
-        220.0f);
-
-    openvdb::math::Transform::Ptr xform =
-        openvdb::math::Transform::createLinearTransform(voxelSize);
+    const float minBoxSpan = std::max(0.1f, std::min({spanX, spanY, spanZ}));
 
     std::vector<openvdb::Vec3s> points;
     points.reserve(rec.vertexBuffer.size());
@@ -332,14 +323,7 @@ void buildObjectScalarFields(
     }
     std::vector<openvdb::Vec4I> quads;
 
-    // 1. Compute full-interior + exterior Signed Distance Field ("sdf")
-    openvdb::FloatGrid::Ptr sdfGrid =
-        openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
-            *xform, points, triangles, quads, exBandVoxels, inBandVoxels);
-    sdfGrid->setName("sdf");
-    rec.scalarFields["sdf"] = sdfGrid;
-
-    // 2. Prepare solver context from the backend's active tool, layer height, and hints
+    // Prepare solver context from the backend's active tool, layer height, and hints
     const auto& tools = backend.machineTools();
     const std::uint32_t activeIdx = backend.activeToolIndex();
     ToolSpec activeTool{};
@@ -379,7 +363,195 @@ void buildObjectScalarFields(
         ctx.hints.push_back(h);
     }
 
-    // 3. Solve iterative constrained 3D Eikonal + tool orientation fields
+    const float shellThicknessMm = std::max(0.4f, backend.shellPathSpec().shell_thickness_mm);
+    const bool multiResConfig =
+        backend.multiResolutionEnabled() && (backend.multiResolutionCoarseRatio() >= 2);
+
+    if (multiResConfig) {
+        const std::uint32_t ratio =
+            std::clamp<std::uint32_t>(backend.multiResolutionCoarseRatio(), 2, 8);
+        // Because the fine grid only allocates a narrow boundary shell in dual-grid mode
+        // (or a sparse thin-wall shell for thin-walled parts), allow fine voxel sizes down to
+        // maxSpan / 800.0 for large print volumes.
+        const double fineVoxelSize = std::max<double>(
+            std::max(requestedVoxelSize, 0.05f),
+            static_cast<double>(maxSpan) / 800.0);
+        const double coarseVoxelSize = std::max<double>(
+            fineVoxelSize * static_cast<double>(ratio),
+            static_cast<double>(maxSpan) / 180.0);
+        const float inBandFineMm = std::max({
+            shellThicknessMm + 2.5f * static_cast<float>(coarseVoxelSize),
+            8.0f * static_cast<float>(fineVoxelSize),
+        });
+        const double estUniformFineVoxels =
+            (static_cast<double>(spanX) * static_cast<double>(spanY) * static_cast<double>(spanZ)) /
+            (fineVoxelSize * fineVoxelSize * fineVoxelSize);
+
+        if (estUniformFineVoxels >= 120000.0 && coarseVoxelSize >= 1.5 * fineVoxelSize) {
+            setFieldProgress(
+                true,
+                0.06f,
+                "Building fine boundary-shell OpenVDB SDF grid (narrow band)...");
+
+            const float exBandFineVoxels = std::clamp(
+                std::max(narrowBandVoxels, 6.0f),
+                4.0f,
+                32.0f);
+            const float exBandFineMm = exBandFineVoxels * static_cast<float>(fineVoxelSize);
+            const float inBandFineVoxels = std::clamp(
+                std::ceil(inBandFineMm / static_cast<float>(fineVoxelSize)),
+                8.0f,
+                96.0f);
+
+            openvdb::math::Transform::Ptr fineXform =
+                openvdb::math::Transform::createLinearTransform(fineVoxelSize);
+            openvdb::FloatGrid::Ptr fineSdfGrid =
+                openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
+                    *fineXform,
+                    points,
+                    triangles,
+                    quads,
+                    exBandFineVoxels,
+                    inBandFineVoxels);
+            fineSdfGrid->setName("sdf");
+
+            // Check whether the part actually has a deep interior core beyond `inBandFineMm`.
+            // For thin-walled or medium-walled curved parts (even with a very large bounding box),
+            // `deepCoreFloorVoxels == 0` because 100% of the solid interior already fits inside
+            // the sparse narrow-band `fineSdfGrid`. Solving directly on `fineSdfGrid` avoids
+            // coarse-grid under-sampling of thin walls while retaining O(Surface Area) sparsity.
+            const float innerFloorCutoff = -std::max(
+                inBandFineMm - 1.75f * static_cast<float>(fineVoxelSize),
+                2.0f * static_cast<float>(fineVoxelSize));
+            std::size_t deepCoreFloorVoxels = 0;
+            for (auto iter = fineSdfGrid->cbeginValueOn(); iter; ++iter) {
+                if (*iter <= innerFloorCutoff) {
+                    ++deepCoreFloorVoxels;
+                }
+            }
+
+            if (deepCoreFloorVoxels < 128) {
+                rec.scalarFields["sdf"] = fineSdfGrid;
+                EikonalSolveResult fineDirectSolved = solveConstrainedEikonal(
+                    *fineSdfGrid,
+                    rec.minZ,
+                    rec.maxZ,
+                    maxSpan,
+                    exBandFineMm,
+                    ctx);
+                rec.scalarFields["eikonal"] = fineDirectSolved.eikonalGrid;
+                rec.scalarFields["overhang"] = fineDirectSolved.overhangGrid;
+                rec.scalarFields["tool_tilt_deg"] = fineDirectSolved.toolTiltDegGrid;
+                rec.toolAxisGrid = fineDirectSolved.toolAxisGrid;
+                rec.isMultiResolution = false;
+                rec.fineShellInnerDepthMm = 0.0f;
+                rec.coarseToFineRatio = 1;
+                return;
+            }
+
+            if (minBoxSpan > 2.2f * inBandFineMm) {
+                setFieldProgress(
+                    true,
+                    0.18f,
+                    "Building coarse full-interior OpenVDB SDF grid (multi-resolution)...");
+
+                const float minExteriorMm = std::max(
+                    0.20f * maxSpan,
+                    narrowBandVoxels * static_cast<float>(coarseVoxelSize));
+                const float exBandCoarseVoxels = std::clamp(
+                    minExteriorMm / static_cast<float>(coarseVoxelSize),
+                    3.0f,
+                    90.0f);
+                const float inBandCoarseVoxels = std::clamp(
+                    (0.60f * maxSpan) / static_cast<float>(coarseVoxelSize),
+                    4.0f,
+                    180.0f);
+
+                openvdb::math::Transform::Ptr coarseXform =
+                    openvdb::math::Transform::createLinearTransform(coarseVoxelSize);
+                openvdb::FloatGrid::Ptr coarseSdfGrid =
+                    openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
+                        *coarseXform,
+                        points,
+                        triangles,
+                        quads,
+                        exBandCoarseVoxels,
+                        inBandCoarseVoxels);
+                coarseSdfGrid->setName("sdf");
+                rec.coarseScalarFields["sdf"] = coarseSdfGrid;
+
+                EikonalSolverContext coarseCtx = ctx;
+                coarseCtx.reportProgress = [](float frac, const char* msg) {
+                    setFieldProgress(true, 0.22f + 0.32f * frac, msg);
+                };
+                EikonalSolveResult coarseSolved = solveConstrainedEikonal(
+                    *coarseSdfGrid,
+                    rec.minZ,
+                    rec.maxZ,
+                    maxSpan,
+                    minExteriorMm,
+                    coarseCtx);
+
+                rec.coarseScalarFields["eikonal"] = coarseSolved.eikonalGrid;
+                rec.coarseScalarFields["overhang"] = coarseSolved.overhangGrid;
+                rec.coarseScalarFields["tool_tilt_deg"] = coarseSolved.toolTiltDegGrid;
+                rec.coarseToolAxisGrid = coarseSolved.toolAxisGrid;
+
+                rec.scalarFields["sdf"] = fineSdfGrid;
+
+                EikonalSolveResult fineSolved = solveFineShellWithCoarseGuidance(
+                    *fineSdfGrid,
+                    coarseSolved,
+                    inBandFineMm,
+                    rec.minZ,
+                    rec.maxZ,
+                    maxSpan,
+                    exBandFineMm,
+                    ctx);
+
+                rec.scalarFields["eikonal"] = fineSolved.eikonalGrid;
+                rec.scalarFields["overhang"] = fineSolved.overhangGrid;
+                rec.scalarFields["tool_tilt_deg"] = fineSolved.toolTiltDegGrid;
+                rec.toolAxisGrid = fineSolved.toolAxisGrid;
+                rec.isMultiResolution = true;
+                rec.fineShellInnerDepthMm = inBandFineMm;
+                rec.coarseToFineRatio = static_cast<std::uint32_t>(
+                    std::max(2.0, std::round(coarseVoxelSize / fineVoxelSize)));
+                return;
+            }
+        }
+    }
+
+    // Single-resolution path for compact or thin-walled parts
+    const double voxelSize = std::max<double>(
+        std::max(requestedVoxelSize, 0.05f),
+        static_cast<double>(maxSpan) / 450.0);
+
+    // Maintain a consistent physical exterior band (at least 20% of maxSpan or narrowBandVoxels * voxelSize)
+    // and a full interior band (60% of maxSpan) so the SDF isovalue range in millimeters
+    // never shrinks when the user selects a finer voxel resolution.
+    const float minExteriorMm =
+        std::max(0.20f * maxSpan, narrowBandVoxels * static_cast<float>(voxelSize));
+    const float exBandVoxels = std::clamp(
+        minExteriorMm / static_cast<float>(voxelSize),
+        3.0f,
+        150.0f);
+    const float inBandVoxels = std::clamp(
+        (0.60f * maxSpan) / static_cast<float>(voxelSize),
+        4.0f,
+        300.0f);
+
+    openvdb::math::Transform::Ptr xform =
+        openvdb::math::Transform::createLinearTransform(voxelSize);
+
+    // 1. Compute full-interior + exterior Signed Distance Field ("sdf")
+    openvdb::FloatGrid::Ptr sdfGrid =
+        openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
+            *xform, points, triangles, quads, exBandVoxels, inBandVoxels);
+    sdfGrid->setName("sdf");
+    rec.scalarFields["sdf"] = sdfGrid;
+
+    // 2. Solve iterative constrained 3D Eikonal + tool orientation fields
     EikonalSolveResult solved = solveConstrainedEikonal(
         *sdfGrid,
         rec.minZ,
@@ -582,6 +754,8 @@ struct SlicerBackend::Impl {
     std::uint32_t activeToolIndex = 0;
     LayerHeightSpec sliceLayerHeight{0.20f, 0.08f, 0.32f, 0.20f, 0.20f};
     std::uint32_t eikonalSolverIterations = 4;
+    bool multiResolutionEnabled = true;
+    std::uint32_t multiResolutionCoarseRatio = 4;
     std::vector<SpatialOrientationHint> spatialOrientationHints;
     ShellPathSpec shellPathSpec{
         1.60f,
@@ -825,6 +999,18 @@ FieldStats SlicerBackend::getObjectFieldStats(std::uint64_t objectId, const std:
         maxVal = std::max(maxVal, v);
     }
 
+    if (objIt->second.isMultiResolution) {
+        const auto cIt = objIt->second.coarseScalarFields.find(fieldName);
+        if (cIt != objIt->second.coarseScalarFields.end() && cIt->second) {
+            stats.active_voxel_count += cIt->second->activeVoxelCount();
+            for (auto iter = cIt->second->cbeginValueOn(); iter; ++iter) {
+                const float v = *iter;
+                minVal = std::min(minVal, v);
+                maxVal = std::max(maxVal, v);
+            }
+        }
+    }
+
     if (minVal <= maxVal) {
         stats.min_value = minVal;
         stats.max_value = maxVal;
@@ -862,7 +1048,10 @@ bool SlicerBackend::recomputeObjectFields(
         snapshotBackend.impl_->activeToolIndex = impl_->activeToolIndex;
         snapshotBackend.impl_->sliceLayerHeight = impl_->sliceLayerHeight;
         snapshotBackend.impl_->eikonalSolverIterations = impl_->eikonalSolverIterations;
+        snapshotBackend.impl_->multiResolutionEnabled = impl_->multiResolutionEnabled;
+        snapshotBackend.impl_->multiResolutionCoarseRatio = impl_->multiResolutionCoarseRatio;
         snapshotBackend.impl_->spatialOrientationHints = impl_->spatialOrientationHints;
+        snapshotBackend.impl_->shellPathSpec = impl_->shellPathSpec;
     }
 
     setFieldProgress(true, 0.01f, "Preparing mesh & OpenVDB grid...");
@@ -875,6 +1064,11 @@ bool SlicerBackend::recomputeObjectFields(
         if (it != impl_->objects.end()) {
             it->second.scalarFields = std::move(workingRec.scalarFields);
             it->second.toolAxisGrid = std::move(workingRec.toolAxisGrid);
+            it->second.coarseScalarFields = std::move(workingRec.coarseScalarFields);
+            it->second.coarseToolAxisGrid = std::move(workingRec.coarseToolAxisGrid);
+            it->second.isMultiResolution = workingRec.isMultiResolution;
+            it->second.fineShellInnerDepthMm = workingRec.fineShellInnerDepthMm;
+            it->second.coarseToFineRatio = workingRec.coarseToFineRatio;
             it->second.hasCachedSelectedLayers = false;
             committed = true;
         }
@@ -900,7 +1094,25 @@ IsoSurfaceMesh SlicerBackend::extractFieldIsosurface(
         return out;
     }
 
-    const openvdb::FloatGrid& grid = *fieldIt->second;
+    const openvdb::FloatGrid* gridPtr = fieldIt->second.get();
+    if (rec.isMultiResolution) {
+        const auto cIt = rec.coarseScalarFields.find(fieldName);
+        if (cIt != rec.coarseScalarFields.end() && cIt->second) {
+            const float fineDx = static_cast<float>(gridPtr->transform().voxelSize()[0]);
+            if (fieldName == "sdf") {
+                if (isovalue < -(rec.fineShellInnerDepthMm - 2.0f * fineDx) ||
+                    isovalue > gridPtr->background() - 2.0f * fineDx) {
+                    gridPtr = cIt->second.get();
+                }
+            } else {
+                // For full-volume fields ("eikonal", "overhang", "tool_tilt_deg"), extract the
+                // carrier surface from the full-interior coarse grid so no inner narrow-band
+                // closure wall appears inside the part.
+                gridPtr = cIt->second.get();
+            }
+        }
+    }
+    const openvdb::FloatGrid& grid = *gridPtr;
     std::vector<openvdb::Vec3s> points;
     std::vector<openvdb::Vec3I> triangles;
     std::vector<openvdb::Vec4I> quads;
@@ -983,21 +1195,41 @@ IsoSurfaceMesh SlicerBackend::extractFieldIsosurface(
     // Signed Distance Field at every vertex and split straddling triangles along the
     // exact object surface (\phi_sdf = 0) so the interior (\phi_sdf <= 0) and exterior
     // (\phi_sdf > 0) regions have a crisp geometric boundary and a 3D intersection contour.
-    const openvdb::FloatGrid& sdfGrid = *sdfIt->second;
-    const float sdfBg = sdfGrid.background();
-    const float voxelSize = static_cast<float>(sdfGrid.transform().voxelSize()[0]);
+    const openvdb::FloatGrid& fineSdfGrid = *sdfIt->second;
+    const openvdb::FloatGrid* coarseSdfPtr = nullptr;
+    if (rec.isMultiResolution) {
+        const auto cSdfIt = rec.coarseScalarFields.find("sdf");
+        if (cSdfIt != rec.coarseScalarFields.end() && cSdfIt->second) {
+            coarseSdfPtr = cSdfIt->second.get();
+        }
+    }
+    const openvdb::FloatGrid& carrierSdfGrid = (coarseSdfPtr != nullptr) ? *coarseSdfPtr : fineSdfGrid;
+    const float sdfBg = carrierSdfGrid.background();
+    const float voxelSize = static_cast<float>(carrierSdfGrid.transform().voxelSize()[0]);
+    const float fineDx = static_cast<float>(fineSdfGrid.transform().voxelSize()[0]);
+    const float fineInnerCutoff = -std::max(rec.fineShellInnerDepthMm - 1.75f * fineDx, 1.5f * fineDx);
+    const float fineOuterCutoff = fineSdfGrid.background() - 1.5f * fineDx;
     // Strip the artificial closure shell generated by volumeToMesh where active narrow-band
     // voxels jump discontinuously to the background value at the outer fringe of the band.
     const float outerFringeLimit = sdfBg - 1.75f * voxelSize;
 
-    auto sdfAccessor = sdfGrid.getConstAccessor();
+    auto fineSdfAcc = fineSdfGrid.getConstAccessor();
     openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
-        sdfSampler(sdfAccessor, sdfGrid.transform());
+        fineSdfSampler(fineSdfAcc, fineSdfGrid.transform());
+
+    auto carrierSdfAcc = carrierSdfGrid.getConstAccessor();
+    openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+        carrierSdfSampler(carrierSdfAcc, carrierSdfGrid.transform());
 
     std::vector<float> vertSdf(verts.size(), 0.0f);
     for (std::size_t i = 0; i < verts.size(); ++i) {
         const openvdb::Vec3d wp(verts[i].x, verts[i].y, verts[i].z);
-        vertSdf[i] = sdfSampler.wsSample(wp);
+        const float fSdf = fineSdfSampler.wsSample(wp);
+        if (coarseSdfPtr != nullptr && (fSdf <= fineInnerCutoff || fSdf >= fineOuterCutoff)) {
+            vertSdf[i] = carrierSdfSampler.wsSample(wp);
+        } else {
+            vertSdf[i] = fSdf;
+        }
     }
 
     auto lerpVertex = [](const RenderVertex& a, const RenderVertex& b, float t) -> RenderVertex {
@@ -1231,6 +1463,23 @@ FieldSlice2D SlicerBackend::sampleFieldSlice(
         minVal = std::min(minVal, v);
         maxVal = std::max(maxVal, v);
     }
+    const openvdb::FloatGrid* coarseFieldPtr = nullptr;
+    const openvdb::FloatGrid* coarseSdfPtr = nullptr;
+    if (rec.isMultiResolution) {
+        const auto cFieldIt = rec.coarseScalarFields.find(fieldName);
+        if (cFieldIt != rec.coarseScalarFields.end() && cFieldIt->second) {
+            coarseFieldPtr = cFieldIt->second.get();
+            for (auto iter = coarseFieldPtr->cbeginValueOn(); iter; ++iter) {
+                const float v = *iter;
+                minVal = std::min(minVal, v);
+                maxVal = std::max(maxVal, v);
+            }
+        }
+        const auto cSdfIt = rec.coarseScalarFields.find("sdf");
+        if (cSdfIt != rec.coarseScalarFields.end() && cSdfIt->second) {
+            coarseSdfPtr = cSdfIt->second.get();
+        }
+    }
     if (minVal > maxVal) {
         minVal = -1.0f;
         maxVal = 1.0f;
@@ -1249,6 +1498,21 @@ FieldSlice2D SlicerBackend::sampleFieldSlice(
     openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
         sdfSampler(sdfAccessor, sdfGridPtr->transform());
 
+    const openvdb::FloatGrid* fallbackFieldGrid =
+        (coarseFieldPtr != nullptr) ? coarseFieldPtr : &grid;
+    auto coarseFieldAcc = fallbackFieldGrid->getConstAccessor();
+    openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+        coarseFieldSampler(coarseFieldAcc, fallbackFieldGrid->transform());
+
+    const openvdb::FloatGrid* fallbackSdfGrid =
+        (coarseSdfPtr != nullptr) ? coarseSdfPtr : sdfGridPtr;
+    auto coarseSdfAcc = fallbackSdfGrid->getConstAccessor();
+    openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+        coarseSdfSampler(coarseSdfAcc, fallbackSdfGrid->transform());
+
+    const float fineInnerCutoff = -std::max(rec.fineShellInnerDepthMm - 1.75f * voxel, 1.5f * voxel);
+    const float fineOuterCutoff = sdfGridPtr->background() - 1.5f * voxel;
+
     const std::size_t totalPixels = static_cast<std::size_t>(res) * res;
     slice.values.reserve(totalPixels);
     slice.sdf_values.reserve(totalPixels);
@@ -1260,8 +1524,15 @@ FieldSlice2D SlicerBackend::sampleFieldSlice(
                 slice.origin[0] + fu * slice.u_vec[0] + fv * slice.v_vec[0],
                 slice.origin[1] + fu * slice.u_vec[1] + fv * slice.v_vec[1],
                 slice.origin[2] + fu * slice.u_vec[2] + fv * slice.v_vec[2]);
-            slice.values.push_back(sampler.wsSample(wp));
-            slice.sdf_values.push_back(sdfSampler.wsSample(wp));
+            const float fSdf = sdfSampler.wsSample(wp);
+            if (rec.isMultiResolution && coarseSdfPtr != nullptr &&
+                (fSdf <= fineInnerCutoff || fSdf >= fineOuterCutoff)) {
+                slice.values.push_back(coarseFieldSampler.wsSample(wp));
+                slice.sdf_values.push_back(coarseSdfSampler.wsSample(wp));
+            } else {
+                slice.values.push_back(sampler.wsSample(wp));
+                slice.sdf_values.push_back(fSdf);
+            }
         }
     }
 
@@ -1527,6 +1798,19 @@ std::uint32_t SlicerBackend::eikonalSolverIterations() const noexcept {
     return impl_->eikonalSolverIterations;
 }
 
+void SlicerBackend::setMultiResolutionConfig(bool enabled, std::uint32_t coarseRatio) noexcept {
+    impl_->multiResolutionEnabled = enabled;
+    impl_->multiResolutionCoarseRatio = std::clamp<std::uint32_t>(coarseRatio, 2, 8);
+}
+
+bool SlicerBackend::multiResolutionEnabled() const noexcept {
+    return impl_->multiResolutionEnabled;
+}
+
+std::uint32_t SlicerBackend::multiResolutionCoarseRatio() const noexcept {
+    return impl_->multiResolutionCoarseRatio;
+}
+
 void SlicerBackend::setSpatialOrientationHints(const std::vector<SpatialOrientationHint>& hints) {
     impl_->spatialOrientationHints = hints;
 }
@@ -1556,9 +1840,25 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         return result;
     }
 
-    const openvdb::FloatGrid& eikGrid = *eikIt->second;
-    const openvdb::FloatGrid& sdfGrid = *sdfIt->second;
+    const openvdb::FloatGrid& fineEikGrid = *eikIt->second;
+    const openvdb::FloatGrid& fineSdfGrid = *sdfIt->second;
+
+    const openvdb::FloatGrid* coarseEikPtr = nullptr;
+    const openvdb::FloatGrid* coarseSdfPtr = nullptr;
+    if (rec.isMultiResolution) {
+        const auto cEikIt = rec.coarseScalarFields.find("eikonal");
+        const auto cSdfIt = rec.coarseScalarFields.find("sdf");
+        if (cEikIt != rec.coarseScalarFields.end() && cEikIt->second &&
+            cSdfIt != rec.coarseScalarFields.end() && cSdfIt->second) {
+            coarseEikPtr = cEikIt->second.get();
+            coarseSdfPtr = cSdfIt->second.get();
+        }
+    }
+    const bool useDualGridExtraction = (coarseEikPtr != nullptr && coarseSdfPtr != nullptr);
+    const openvdb::FloatGrid& eikGrid = useDualGridExtraction ? *coarseEikPtr : fineEikGrid;
+    const openvdb::FloatGrid& sdfGrid = useDualGridExtraction ? *coarseSdfPtr : fineSdfGrid;
     const float voxelSize = static_cast<float>(eikGrid.transform().voxelSize()[0]);
+    const float fineVoxelSize = static_cast<float>(fineEikGrid.transform().voxelSize()[0]);
     const float eikBg = eikGrid.background();
     const float sdfBg = sdfGrid.background();
 
@@ -1602,9 +1902,12 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
 
     // Distinguish valid solved voxels from the background value `eikBg`
     const float validTauLimit = eikBg - std::max(0.5f * voxelSize, 0.5f);
-    // Include voxels up to +0.50 * voxelSize for 26-connectivity across thin features/corners,
-    // while tracking exact \phi_sdf = 0 surface-clamped [surfTauMin, surfTauMax] per voxel.
+    // Include voxels up to +0.50 * voxelSize for 26-connectivity across thin features/corners
+    // (and up to +0.85 * voxelSize when the voxel is a thin-wall medial valley minimum between
+    // two opposite positive surfaces), while tracking exact \phi_sdf = 0 surface-clamped
+    // [surfTauMin, surfTauMax] per voxel.
     const float interiorSdfCutoff = 0.50f * voxelSize;
+    const float thinWallSdfCutoff = 0.85f * voxelSize;
 
     openvdb::Int32Grid voxelIdxGrid(-1);
     voxelIdxGrid.setTransform(eikGrid.transform().copy());
@@ -1618,7 +1921,20 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         const openvdb::Coord ijk = iter.getCoord();
         const float sdf = sdfAccMain.getValue(ijk);
         if (sdf > interiorSdfCutoff) {
-            continue;
+            if (sdf > thinWallSdfCutoff) {
+                continue;
+            }
+            const float margin = sdf + 0.12f * voxelSize;
+            const bool isThinWallMedial =
+                (sdfAccMain.getValue(ijk.offsetBy(-1, 0, 0)) > margin &&
+                 sdfAccMain.getValue(ijk.offsetBy(1, 0, 0)) > margin) ||
+                (sdfAccMain.getValue(ijk.offsetBy(0, -1, 0)) > margin &&
+                 sdfAccMain.getValue(ijk.offsetBy(0, 1, 0)) > margin) ||
+                (sdfAccMain.getValue(ijk.offsetBy(0, 0, -1)) > margin &&
+                 sdfAccMain.getValue(ijk.offsetBy(0, 0, 1)) > margin);
+            if (!isThinWallMedial) {
+                continue;
+            }
         }
 
         const int vIdx = static_cast<int>(voxels.size());
@@ -2639,7 +2955,94 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             auto sdfAcc = sdfGrid.getConstAccessor();
             openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
                 sdfSampler(sdfAcc, sdfGrid.transform());
+            auto fineSdfAcc = fineSdfGrid.getConstAccessor();
+            openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+                fineSdfSampler(fineSdfAcc, fineSdfGrid.transform());
+            auto fineEikAcc = fineEikGrid.getConstAccessor();
+            openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+                fineEikSampler(fineEikAcc, fineEikGrid.transform());
             auto bAcc = branchGrid.getConstAccessor();
+
+            const float fineInnerCutoff =
+                -std::max(rec.fineShellInnerDepthMm - 1.75f * fineVoxelSize, 1.5f * fineVoxelSize);
+            const float fineOuterCutoff = fineSdfGrid.background() - 1.5f * fineVoxelSize;
+            const float shellThicknessMm = std::max(0.4f, impl_->shellPathSpec.shell_thickness_mm);
+
+            auto sampleCompositeSdf = [&](const openvdb::Vec3d& wp) -> float {
+                float baseSdf = 0.0f;
+                bool usedFineGrid = false;
+                if (!useDualGridExtraction) {
+                    baseSdf = sdfSampler.wsSample(wp);
+                    usedFineGrid = true;
+                } else {
+                    const float fSdf = fineSdfSampler.wsSample(wp);
+                    if (fSdf <= fineInnerCutoff || fSdf >= fineOuterCutoff) {
+                        baseSdf = sdfSampler.wsSample(wp);
+                    } else {
+                        baseSdf = fSdf;
+                        usedFineGrid = true;
+                    }
+                }
+
+                // Compensate for Jensen's positive trilinear interpolation bias across thin curved
+                // walls (where \phi_sdf forms a V-shaped medial valley whose slopes have opposite
+                // signs on either side of the wall). Monotonic single-sided boundaries of thick
+                // parts have identical slope signs on both sides and are completely unaffected.
+                if (usedFineGrid &&
+                    baseSdf > -0.50f * fineVoxelSize &&
+                    baseSdf < 0.90f * fineVoxelSize) {
+                    const openvdb::Vec3d idxPt = fineSdfGrid.transform().worldToIndex(wp);
+                    const openvdb::Coord c = fineSdfGrid.transform().worldToIndexCellCentered(wp);
+                    const float cSdf = fineSdfAcc.getValue(c);
+                    const float slopeThresh = 0.15f * fineVoxelSize;
+                    float maxValleyCorr = 0.0f;
+
+                    auto evalAxisValleyCorr = [&](int axis, double coordVal) {
+                        const int i0 = static_cast<int>(std::floor(coordVal));
+                        const float f = static_cast<float>(coordVal - static_cast<double>(i0));
+                        auto coordAt = [&](int idxAlongAxis) -> openvdb::Coord {
+                            if (axis == 0) return openvdb::Coord(idxAlongAxis, c.y(), c.z());
+                            if (axis == 1) return openvdb::Coord(c.x(), idxAlongAxis, c.z());
+                            return openvdb::Coord(c.x(), c.y(), idxAlongAxis);
+                        };
+                        const float sM1 = fineSdfAcc.getValue(coordAt(i0 - 1));
+                        const float s0  = fineSdfAcc.getValue(coordAt(i0));
+                        const float s1  = fineSdfAcc.getValue(coordAt(i0 + 1));
+                        const float s2  = fineSdfAcc.getValue(coordAt(i0 + 2));
+                        const float gL = s0 - sM1;
+                        const float gR = s2 - s1;
+                        if (gL < -slopeThresh && gR > slopeThresh) {
+                            const float sLin = (1.0f - f) * s0 + f * s1;
+                            const float sVal = std::max(s0 + f * gL, s1 - (1.0f - f) * gR);
+                            if (sVal < sLin) {
+                                maxValleyCorr = std::max(maxValleyCorr, sLin - sVal);
+                            }
+                        }
+                    };
+
+                    evalAxisValleyCorr(0, idxPt.x());
+                    evalAxisValleyCorr(1, idxPt.y());
+                    evalAxisValleyCorr(2, idxPt.z());
+
+                    const float valleyMargin = cSdf + slopeThresh;
+                    const bool isCellValley =
+                        (cSdf < baseSdf) &&
+                        ((fineSdfAcc.getValue(c.offsetBy(-1, 0, 0)) > valleyMargin &&
+                          fineSdfAcc.getValue(c.offsetBy(1, 0, 0)) > valleyMargin) ||
+                         (fineSdfAcc.getValue(c.offsetBy(0, -1, 0)) > valleyMargin &&
+                          fineSdfAcc.getValue(c.offsetBy(0, 1, 0)) > valleyMargin) ||
+                         (fineSdfAcc.getValue(c.offsetBy(0, 0, -1)) > valleyMargin &&
+                          fineSdfAcc.getValue(c.offsetBy(0, 0, 1)) > valleyMargin));
+                    if (isCellValley) {
+                        maxValleyCorr = std::max(maxValleyCorr, 0.65f * (baseSdf - cSdf));
+                    }
+
+                    if (maxValleyCorr > 0.0f) {
+                        baseSdf -= std::min(maxValleyCorr, 0.70f * fineVoxelSize);
+                    }
+                }
+                return baseSdf;
+            };
 
             auto lookupVoxelBranch = [&](float x, float y, float z, int targetBranch) -> int {
                 const openvdb::Coord c =
@@ -2803,12 +3206,368 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         inds.push_back(q[2]);
                     }
 
+                    if (useDualGridExtraction) {
+                        // Conformal edge-midpoint subdivision inside the outer boundary shell band
+                        // followed by smooth Newton projection onto the fine Eikonal isosurface
+                        // \tau_fine(x) = pl.isovalue. Because edge splitting is keyed per undirected
+                        // edge {min(u,v), max(u,v)} and all triangles apply the exact 0/1/2/3-split-edge
+                        // templates, zero T-junctions can ever be created (`hole_edges == 0`).
+                        const float refineMinSdf =
+                            -std::max(shellThicknessMm + 1.5f * voxelSize, 4.0f * fineVoxelSize);
+                        const float refineMaxSdf =
+                            std::min(1.5f * voxelSize, outerFringeLimit - 0.5f * voxelSize);
+                        const float maxShellEdgeSq =
+                            (1.35f * fineVoxelSize) * (1.35f * fineVoxelSize);
+                        const int numSubdivPasses = std::clamp<int>(
+                            static_cast<int>(
+                                std::ceil(std::log2(std::max<std::uint32_t>(2, rec.coarseToFineRatio)))),
+                            1,
+                            3);
+
+                        for (int pass = 0; pass < numSubdivPasses; ++pass) {
+                            std::vector<float> passSdf(verts.size(), 0.0f);
+                            for (std::size_t i = 0; i < verts.size(); ++i) {
+                                passSdf[i] = sampleCompositeSdf(
+                                    openvdb::Vec3d(verts[i].x, verts[i].y, verts[i].z));
+                            }
+
+                            std::unordered_map<std::uint64_t, std::uint32_t> edgeMidpointMap;
+                            edgeMidpointMap.reserve(inds.size());
+
+                            auto considerEdgeForSplit = [&](std::uint32_t u, std::uint32_t v) {
+                                const std::uint32_t lo = std::min(u, v);
+                                const std::uint32_t hi = std::max(u, v);
+                                const std::uint64_t key =
+                                    (static_cast<std::uint64_t>(lo) << 32) |
+                                    static_cast<std::uint64_t>(hi);
+                                if (edgeMidpointMap.find(key) != edgeMidpointMap.end()) {
+                                    return;
+                                }
+                                const float d0 = passSdf[lo];
+                                const float d1 = passSdf[hi];
+                                if (std::max(d0, d1) < refineMinSdf ||
+                                    std::min(d0, d1) > refineMaxSdf) {
+                                    return;
+                                }
+                                const float dx = verts[hi].x - verts[lo].x;
+                                const float dy = verts[hi].y - verts[lo].y;
+                                const float dz = verts[hi].z - verts[lo].z;
+                                if (dx * dx + dy * dy + dz * dz <= maxShellEdgeSq) {
+                                    return;
+                                }
+                                RenderVertex mid{};
+                                mid.x = 0.5f * (verts[lo].x + verts[hi].x);
+                                mid.y = 0.5f * (verts[lo].y + verts[hi].y);
+                                mid.z = 0.5f * (verts[lo].z + verts[hi].z);
+                                mid.nx = 0.0f;
+                                mid.ny = 0.0f;
+                                mid.nz = 1.0f;
+                                const auto midIdx = static_cast<std::uint32_t>(verts.size());
+                                verts.push_back(mid);
+                                edgeMidpointMap.emplace(key, midIdx);
+                            };
+
+                            for (std::size_t t = 0; t + 2 < inds.size(); t += 3) {
+                                const std::uint32_t i0 = inds[t + 0];
+                                const std::uint32_t i1 = inds[t + 1];
+                                const std::uint32_t i2 = inds[t + 2];
+                                considerEdgeForSplit(i0, i1);
+                                considerEdgeForSplit(i1, i2);
+                                considerEdgeForSplit(i2, i0);
+                            }
+
+                            if (edgeMidpointMap.empty()) {
+                                break;
+                            }
+
+                            auto lookupMidpoint = [&](std::uint32_t u, std::uint32_t v) -> std::int32_t {
+                                const std::uint32_t lo = std::min(u, v);
+                                const std::uint32_t hi = std::max(u, v);
+                                const std::uint64_t key =
+                                    (static_cast<std::uint64_t>(lo) << 32) |
+                                    static_cast<std::uint64_t>(hi);
+                                const auto it = edgeMidpointMap.find(key);
+                                return (it != edgeMidpointMap.end())
+                                    ? static_cast<std::int32_t>(it->second)
+                                    : -1;
+                            };
+
+                            std::vector<std::uint32_t> refinedInds;
+                            refinedInds.reserve(inds.size() * 2);
+
+                            auto pushRefinedTri = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+                                refinedInds.push_back(a);
+                                refinedInds.push_back(b);
+                                refinedInds.push_back(c);
+                            };
+
+                            for (std::size_t t = 0; t + 2 < inds.size(); t += 3) {
+                                const std::uint32_t i0 = inds[t + 0];
+                                const std::uint32_t i1 = inds[t + 1];
+                                const std::uint32_t i2 = inds[t + 2];
+
+                                const std::int32_t m01 = lookupMidpoint(i0, i1);
+                                const std::int32_t m12 = lookupMidpoint(i1, i2);
+                                const std::int32_t m20 = lookupMidpoint(i2, i0);
+                                const int splitCount =
+                                    (m01 >= 0 ? 1 : 0) + (m12 >= 0 ? 1 : 0) + (m20 >= 0 ? 1 : 0);
+
+                                if (splitCount == 0) {
+                                    pushRefinedTri(i0, i1, i2);
+                                } else if (splitCount == 3) {
+                                    const auto u01 = static_cast<std::uint32_t>(m01);
+                                    const auto u12 = static_cast<std::uint32_t>(m12);
+                                    const auto u20 = static_cast<std::uint32_t>(m20);
+                                    pushRefinedTri(i0, u01, u20);
+                                    pushRefinedTri(u01, i1, u12);
+                                    pushRefinedTri(u20, u12, i2);
+                                    pushRefinedTri(u01, u12, u20);
+                                } else if (splitCount == 1) {
+                                    // Rotate (A, B, C) so that edge (A, B) is the single split edge
+                                    std::uint32_t A = i0, B = i1, C = i2;
+                                    std::uint32_t mAB = static_cast<std::uint32_t>(m01);
+                                    if (m12 >= 0) {
+                                        A = i1; B = i2; C = i0;
+                                        mAB = static_cast<std::uint32_t>(m12);
+                                    } else if (m20 >= 0) {
+                                        A = i2; B = i0; C = i1;
+                                        mAB = static_cast<std::uint32_t>(m20);
+                                    }
+                                    pushRefinedTri(A, mAB, C);
+                                    pushRefinedTri(mAB, B, C);
+                                } else {
+                                    // splitCount == 2: rotate (A, B, C) so (C, A) is the unsplit edge
+                                    // and edges (A, B) and (B, C) are split at mAB and mBC.
+                                    std::uint32_t A = i0, B = i1, C = i2;
+                                    std::uint32_t mAB = 0, mBC = 0;
+                                    if (m20 < 0) {
+                                        A = i0; B = i1; C = i2;
+                                        mAB = static_cast<std::uint32_t>(m01);
+                                        mBC = static_cast<std::uint32_t>(m12);
+                                    } else if (m01 < 0) {
+                                        A = i1; B = i2; C = i0;
+                                        mAB = static_cast<std::uint32_t>(m12);
+                                        mBC = static_cast<std::uint32_t>(m20);
+                                    } else {
+                                        A = i2; B = i0; C = i1;
+                                        mAB = static_cast<std::uint32_t>(m20);
+                                        mBC = static_cast<std::uint32_t>(m01);
+                                    }
+                                    pushRefinedTri(A, mAB, C);
+                                    pushRefinedTri(mAB, mBC, C);
+                                    pushRefinedTri(mAB, B, mBC);
+                                }
+                            }
+
+                            inds.swap(refinedInds);
+                        }
+
+                        // Project shell-band vertices along \nabla \tau_fine onto the fine Eikonal
+                        // isosurface \tau_fine(x) = pl.isovalue, tapering smoothly to 0 at `fineInnerCutoff`.
+                        const float fullProjDepth = -(shellThicknessMm + 0.5f * fineVoxelSize);
+                        const float taperSpan =
+                            std::max(fullProjDepth - fineInnerCutoff, fineVoxelSize);
+                        const float hStep = 0.5f * fineVoxelSize;
+                        const float maxStepMm = 0.55f * fineVoxelSize;
+                        const float fineEikValidLimit =
+                            fineEikGrid.background() - std::max(0.5f * fineVoxelSize, 0.5f);
+
+                        for (std::size_t i = 0; i < verts.size(); ++i) {
+                            const openvdb::Vec3d wp0(verts[i].x, verts[i].y, verts[i].z);
+                            const float fSdf = fineSdfSampler.wsSample(wp0);
+                            if (fSdf <= fineInnerCutoff || fSdf >= 2.0f * fineVoxelSize) {
+                                continue;
+                            }
+                            float wProj = 1.0f;
+                            if (fSdf < fullProjDepth) {
+                                const float u =
+                                    std::clamp((fSdf - fineInnerCutoff) / taperSpan, 0.0f, 1.0f);
+                                wProj = u * u * (3.0f - 2.0f * u);
+                            }
+                            if (wProj <= 1.0e-3f) {
+                                continue;
+                            }
+
+                            for (int step = 0; step < 2; ++step) {
+                                const openvdb::Vec3d wp(verts[i].x, verts[i].y, verts[i].z);
+                                const float tVal = fineEikSampler.wsSample(wp);
+                                if (!std::isfinite(tVal) || tVal >= fineEikValidLimit) {
+                                    break;
+                                }
+                                const float err = tVal - pl.isovalue;
+                                if (std::abs(err) <= 1.0e-4f) {
+                                    break;
+                                }
+                                const float gx =
+                                    (fineEikSampler.wsSample(wp + openvdb::Vec3d(hStep, 0.0, 0.0)) -
+                                     fineEikSampler.wsSample(wp - openvdb::Vec3d(hStep, 0.0, 0.0))) /
+                                    (2.0f * hStep);
+                                const float gy =
+                                    (fineEikSampler.wsSample(wp + openvdb::Vec3d(0.0, hStep, 0.0)) -
+                                     fineEikSampler.wsSample(wp - openvdb::Vec3d(0.0, hStep, 0.0))) /
+                                    (2.0f * hStep);
+                                const float gz =
+                                    (fineEikSampler.wsSample(wp + openvdb::Vec3d(0.0, 0.0, hStep)) -
+                                     fineEikSampler.wsSample(wp - openvdb::Vec3d(0.0, 0.0, hStep))) /
+                                    (2.0f * hStep);
+                                const float gLenSq = gx * gx + gy * gy + gz * gz;
+                                if (gLenSq < 0.04f || gLenSq > 16.0f) {
+                                    break;
+                                }
+                                const float gLen = std::sqrt(gLenSq);
+                                const float disp =
+                                    std::clamp(err / gLen, -maxStepMm, maxStepMm) * wProj;
+                                verts[i].x -= disp * (gx / gLen);
+                                verts[i].y -= disp * (gy / gLen);
+                                verts[i].z -= disp * (gz / gLen);
+                            }
+                        }
+                    }
+
                     computeMeshNormals(verts, inds);
 
                     std::vector<float> vertSdf(verts.size(), 0.0f);
                     for (std::size_t i = 0; i < verts.size(); ++i) {
-                        vertSdf[i] = sdfSampler.wsSample(
+                        vertSdf[i] = sampleCompositeSdf(
                             openvdb::Vec3d(verts[i].x, verts[i].y, verts[i].z));
+                    }
+
+                    // Conformal Thin-Wall Valley Edge Split:
+                    // If an unclipped isosurface triangle edge straddles a thin curved wall such
+                    // that both endpoints lie outside (\phi > 0) while an interior sample along the
+                    // edge dips inside the wall (\phi <= 0), split the undirected edge at that
+                    // interior valley minimum using the conformal 0/1/2/3-edge templates so
+                    // `clipAgainstSdfThreshold` captures both sides of the thin wall without holes.
+                    {
+                        std::unordered_map<std::uint64_t, std::uint32_t> valleySplitMap;
+                        const float maxEndpointSdf = 1.75f * fineVoxelSize;
+
+                        auto considerValleyEdge = [&](std::uint32_t u, std::uint32_t v) {
+                            const std::uint32_t lo = std::min(u, v);
+                            const std::uint32_t hi = std::max(u, v);
+                            const float dLo = vertSdf[lo];
+                            const float dHi = vertSdf[hi];
+                            if (dLo <= 0.0f || dHi <= 0.0f ||
+                                std::min(dLo, dHi) > maxEndpointSdf) {
+                                return;
+                            }
+                            const std::uint64_t key =
+                                (static_cast<std::uint64_t>(lo) << 32) |
+                                static_cast<std::uint64_t>(hi);
+                            if (valleySplitMap.find(key) != valleySplitMap.end()) {
+                                return;
+                            }
+
+                            float bestT = 0.5f;
+                            float bestSdf = std::min(dLo, dHi);
+                            for (const float tCand : {0.25f, 0.50f, 0.75f}) {
+                                const openvdb::Vec3d wpCand(
+                                    verts[lo].x + tCand * (verts[hi].x - verts[lo].x),
+                                    verts[lo].y + tCand * (verts[hi].y - verts[lo].y),
+                                    verts[lo].z + tCand * (verts[hi].z - verts[lo].z));
+                                const float sCand = sampleCompositeSdf(wpCand);
+                                if (sCand < bestSdf) {
+                                    bestSdf = sCand;
+                                    bestT = tCand;
+                                }
+                            }
+                            if (bestSdf <= 0.0f) {
+                                const RenderVertex mv = lerpVertex(verts[lo], verts[hi], bestT);
+                                const auto midIdx = static_cast<std::uint32_t>(verts.size());
+                                verts.push_back(mv);
+                                vertSdf.push_back(bestSdf);
+                                valleySplitMap.emplace(key, midIdx);
+                            }
+                        };
+
+                        for (std::size_t t = 0; t + 2 < inds.size(); t += 3) {
+                            const std::uint32_t i0 = inds[t + 0];
+                            const std::uint32_t i1 = inds[t + 1];
+                            const std::uint32_t i2 = inds[t + 2];
+                            considerValleyEdge(i0, i1);
+                            considerValleyEdge(i1, i2);
+                            considerValleyEdge(i2, i0);
+                        }
+
+                        if (!valleySplitMap.empty()) {
+                            auto lookupValleySplit =
+                                [&](std::uint32_t u, std::uint32_t v) -> std::int32_t {
+                                const std::uint32_t lo = std::min(u, v);
+                                const std::uint32_t hi = std::max(u, v);
+                                const std::uint64_t key =
+                                    (static_cast<std::uint64_t>(lo) << 32) |
+                                    static_cast<std::uint64_t>(hi);
+                                const auto it = valleySplitMap.find(key);
+                                return (it != valleySplitMap.end())
+                                    ? static_cast<std::int32_t>(it->second)
+                                    : -1;
+                            };
+
+                            std::vector<std::uint32_t> splitInds;
+                            splitInds.reserve(inds.size() + valleySplitMap.size() * 6);
+                            auto pushSplitTri =
+                                [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+                                splitInds.push_back(a);
+                                splitInds.push_back(b);
+                                splitInds.push_back(c);
+                            };
+
+                            for (std::size_t t = 0; t + 2 < inds.size(); t += 3) {
+                                const std::uint32_t i0 = inds[t + 0];
+                                const std::uint32_t i1 = inds[t + 1];
+                                const std::uint32_t i2 = inds[t + 2];
+
+                                const std::int32_t m01 = lookupValleySplit(i0, i1);
+                                const std::int32_t m12 = lookupValleySplit(i1, i2);
+                                const std::int32_t m20 = lookupValleySplit(i2, i0);
+                                const int splitCount =
+                                    (m01 >= 0 ? 1 : 0) + (m12 >= 0 ? 1 : 0) + (m20 >= 0 ? 1 : 0);
+
+                                if (splitCount == 0) {
+                                    pushSplitTri(i0, i1, i2);
+                                } else if (splitCount == 3) {
+                                    const auto u01 = static_cast<std::uint32_t>(m01);
+                                    const auto u12 = static_cast<std::uint32_t>(m12);
+                                    const auto u20 = static_cast<std::uint32_t>(m20);
+                                    pushSplitTri(i0, u01, u20);
+                                    pushSplitTri(u01, i1, u12);
+                                    pushSplitTri(u20, u12, i2);
+                                    pushSplitTri(u01, u12, u20);
+                                } else if (splitCount == 1) {
+                                    std::uint32_t A = i0, B = i1, C = i2;
+                                    std::uint32_t mAB = static_cast<std::uint32_t>(m01);
+                                    if (m12 >= 0) {
+                                        A = i1; B = i2; C = i0;
+                                        mAB = static_cast<std::uint32_t>(m12);
+                                    } else if (m20 >= 0) {
+                                        A = i2; B = i0; C = i1;
+                                        mAB = static_cast<std::uint32_t>(m20);
+                                    }
+                                    pushSplitTri(A, mAB, C);
+                                    pushSplitTri(mAB, B, C);
+                                } else {
+                                    std::uint32_t A = i0, B = i1, C = i2;
+                                    std::uint32_t mAB = 0, mBC = 0;
+                                    if (m20 < 0) {
+                                        A = i0; B = i1; C = i2;
+                                        mAB = static_cast<std::uint32_t>(m01);
+                                        mBC = static_cast<std::uint32_t>(m12);
+                                    } else if (m01 < 0) {
+                                        A = i1; B = i2; C = i0;
+                                        mAB = static_cast<std::uint32_t>(m12);
+                                        mBC = static_cast<std::uint32_t>(m20);
+                                    } else {
+                                        A = i2; B = i0; C = i1;
+                                        mAB = static_cast<std::uint32_t>(m20);
+                                        mBC = static_cast<std::uint32_t>(m01);
+                                    }
+                                    pushSplitTri(A, mAB, C);
+                                    pushSplitTri(mAB, mBC, C);
+                                    pushSplitTri(mAB, B, mBC);
+                                }
+                            }
+                            inds.swap(splitInds);
+                        }
                     }
 
                     auto clipAgainstSdfThreshold = [&](float sdfLimit) {
@@ -3195,6 +3954,20 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         setFieldProgress(true, frac, msg.c_str());
     };
 
+    const openvdb::FloatGrid* coarseSdfPtr = nullptr;
+    const openvdb::FloatGrid* coarseEikPtr = nullptr;
+    const openvdb::Vec3SGrid* coarseToolAxisPtr = nullptr;
+    if (rec.isMultiResolution) {
+        const auto cSdfIt = rec.coarseScalarFields.find("sdf");
+        const auto cEikIt = rec.coarseScalarFields.find("eikonal");
+        if (cSdfIt != rec.coarseScalarFields.end() && cSdfIt->second &&
+            cEikIt != rec.coarseScalarFields.end() && cEikIt->second) {
+            coarseSdfPtr = cSdfIt->second.get();
+            coarseEikPtr = cEikIt->second.get();
+            coarseToolAxisPtr = rec.coarseToolAxisGrid.get();
+        }
+    }
+
     ObjectToolpathsResult res = generateShellToolpathsForLayers(
         selectedLayers,
         *sdfIt->second,
@@ -3203,7 +3976,11 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         impl_->nozzleAxisBed,
         impl_->sliceLayerHeight,
         impl_->shellPathSpec,
-        progressCb);
+        progressCb,
+        coarseSdfPtr,
+        coarseEikPtr,
+        coarseToolAxisPtr,
+        rec.fineShellInnerDepthMm);
     setFieldProgress(false, 1.0f, "Shell toolpaths ready.");
     return res;
 }
@@ -3275,6 +4052,11 @@ void set_eikonal_solver_iterations(std::uint32_t iterations) {
 std::uint32_t get_eikonal_solver_iterations() {
     std::lock_guard<std::mutex> lock(g_backendMutex);
     return globalBackend().eikonalSolverIterations();
+}
+
+void set_multi_resolution_grid_config(bool enabled, std::uint32_t coarse_ratio) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setMultiResolutionConfig(enabled, coarse_ratio);
 }
 
 void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hints) {

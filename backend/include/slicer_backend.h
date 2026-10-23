@@ -144,6 +144,16 @@ public:
     /// Returns the configured number of outer Eikonal solver iterations.
     std::uint32_t eikonalSolverIterations() const noexcept;
 
+    /// Configures dual-grid multi-resolution volumetric field evaluation (coarse full-interior core
+    /// + fine boundary-shell narrow band).
+    void setMultiResolutionConfig(bool enabled, std::uint32_t coarseRatio) noexcept;
+
+    /// Returns whether dual-grid multi-resolution field evaluation is enabled.
+    bool multiResolutionEnabled() const noexcept;
+
+    /// Returns the coarse-to-fine voxel ratio used in dual-grid multi-resolution mode.
+    std::uint32_t multiResolutionCoarseRatio() const noexcept;
+
     /// Sets spatial/surface tangency and orthogonality hints for the Eikonal solver.
     void setSpatialOrientationHints(const std::vector<SpatialOrientationHint>& hints);
 
@@ -230,6 +240,7 @@ void set_slice_layer_height(LayerHeightSpec layer_height);
 LayerHeightSpec get_slice_layer_height();
 void set_eikonal_solver_iterations(std::uint32_t iterations);
 std::uint32_t get_eikonal_solver_iterations();
+void set_multi_resolution_grid_config(bool enabled, std::uint32_t coarse_ratio);
 void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hints);
 SelectedIsosurfacesResult select_slicing_isosurfaces(std::uint64_t object_id, float adaptivity);
 void set_shell_path_spec(ShellPathSpec spec);

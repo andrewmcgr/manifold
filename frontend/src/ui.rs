@@ -401,6 +401,7 @@ pub fn ui_workspace_system(
     plate.ui_hovered_surface_hint_patch = None;
     plate.ui_hovered_point_hint_id = None;
     vis_state.highlighted_selected_layer = None;
+    config.sync_auto_voxel_size();
     let ctx = contexts.ctx_mut();
     vis_state.ui_pointer_down = ctx.is_using_pointer();
 
@@ -1083,10 +1084,46 @@ pub fn ui_workspace_system(
                             });
 
                             ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::Slider::new(&mut config.eikonal.voxel_size_mm, 0.15..=3.0)
-                                        .text("Voxel (mm)"),
+                                if ui
+                                    .checkbox(
+                                        &mut config.eikonal.auto_voxel_size,
+                                        "Auto Fine Voxel (Nozzle + Layer)",
+                                    )
+                                    .changed()
+                                    && config.eikonal.auto_voxel_size
+                                {
+                                    config.sync_auto_voxel_size();
+                                }
+                                param_help_button(ui, "eikonal.auto_voxel_size");
+
+                                ui.checkbox(
+                                    &mut config.eikonal.enable_multi_resolution_grid,
+                                    "Dual-Grid Multi-Res",
                                 );
+                                param_help_button(ui, "eikonal.enable_multi_resolution_grid");
+
+                                if config.eikonal.enable_multi_resolution_grid {
+                                    ui.add(
+                                        egui::DragValue::new(&mut config.eikonal.coarse_grid_ratio)
+                                            .speed(0.1)
+                                            .range(2..=8)
+                                            .prefix("Coarse: ")
+                                            .suffix("×"),
+                                    );
+                                    param_help_button(ui, "eikonal.coarse_grid_ratio");
+                                }
+                            });
+
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut config.eikonal.voxel_size_mm, 0.08..=2.0)
+                                            .text("Fine Voxel (mm)"),
+                                    )
+                                    .changed()
+                                {
+                                    config.eikonal.auto_voxel_size = false;
+                                }
                                 param_help_button(ui, "eikonal.voxel_size_mm");
                                 ui.add(
                                     egui::Slider::new(
@@ -3607,6 +3644,10 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
     });
 
     ffi::set_eikonal_solver_iterations(config.eikonal.solver_iterations);
+    ffi::set_multi_resolution_grid_config(
+        config.eikonal.enable_multi_resolution_grid,
+        config.eikonal.coarse_grid_ratio,
+    );
 }
 
 /// Compiles all active surface-face hints and 3D point hints for `object_id` into

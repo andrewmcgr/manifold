@@ -32,6 +32,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const std::array<float, 3>& defaultNozzleAxisBed,
     const LayerHeightSpec& layerHeightSpec,
     const ShellPathSpec& spec,
-    const std::function<void(std::size_t, std::size_t)>& progressCb = nullptr);
+    const std::function<void(std::size_t, std::size_t)>& progressCb = nullptr,
+    const openvdb::FloatGrid* coarseSdfGrid = nullptr,
+    const openvdb::FloatGrid* coarseEikGrid = nullptr,
+    const openvdb::Vec3SGrid* coarseToolAxisGrid = nullptr,
+    float fineShellDepthMm = 0.0f);
 
 } // namespace manifold

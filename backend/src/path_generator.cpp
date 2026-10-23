@@ -2250,7 +2250,11 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const std::array<float, 3>& defaultNozzleAxisBed,
     const LayerHeightSpec& layerHeightSpec,
     const ShellPathSpec& spec,
-    const std::function<void(std::size_t, std::size_t)>& progressCb)
+    const std::function<void(std::size_t, std::size_t)>& progressCb,
+    const openvdb::FloatGrid* coarseSdfGrid,
+    const openvdb::FloatGrid* coarseEikGrid,
+    const openvdb::Vec3SGrid* coarseToolAxisGrid,
+    float fineShellDepthMm)
 {
     ObjectToolpathsResult result{};
     result.valid = false;
@@ -2292,6 +2296,12 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const float hMin = std::max(0.01f, layerHeightSpec.min_mm);
     const float hMax = std::max(hMin, layerHeightSpec.max_mm);
     const float voxelSize = std::max(0.05f, static_cast<float>(sdfGrid.voxelSize()[0]));
+    const float coarseVoxelSize = (coarseSdfGrid != nullptr)
+        ? std::max(voxelSize, static_cast<float>(coarseSdfGrid->voxelSize()[0]))
+        : voxelSize;
+    const float fineShellCutoff = (fineShellDepthMm > 0.0f)
+        ? -std::max(fineShellDepthMm - 1.75f * voxelSize, 1.5f * voxelSize)
+        : -1.0e9f;
     const Vec3f fallbackNozzle = normalize3(
         {defaultNozzleAxisBed[0], defaultNozzleAxisBed[1], defaultNozzleAxisBed[2]},
         {0.0f, 0.0f, 1.0f});
@@ -2311,6 +2321,22 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
             openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
                 eikSampler(eikAcc, eikGrid.transform());
 
+            using FloatAcc = openvdb::FloatGrid::ConstAccessor;
+            using FloatSampler = openvdb::tools::GridSampler<FloatAcc, openvdb::tools::BoxSampler>;
+            std::unique_ptr<FloatAcc> cSdfAccPtr;
+            std::unique_ptr<FloatSampler> cSdfSamplerPtr;
+            if (coarseSdfGrid != nullptr) {
+                cSdfAccPtr = std::make_unique<FloatAcc>(coarseSdfGrid->getConstAccessor());
+                cSdfSamplerPtr = std::make_unique<FloatSampler>(*cSdfAccPtr, coarseSdfGrid->transform());
+            }
+
+            std::unique_ptr<FloatAcc> cEikAccPtr;
+            std::unique_ptr<FloatSampler> cEikSamplerPtr;
+            if (coarseEikGrid != nullptr) {
+                cEikAccPtr = std::make_unique<FloatAcc>(coarseEikGrid->getConstAccessor());
+                cEikSamplerPtr = std::make_unique<FloatSampler>(*cEikAccPtr, coarseEikGrid->transform());
+            }
+
             using ToolAcc = openvdb::Vec3SGrid::ConstAccessor;
             using ToolSampler = openvdb::tools::GridSampler<ToolAcc, openvdb::tools::BoxSampler>;
             std::unique_ptr<ToolAcc> tAccPtr;
@@ -2320,9 +2346,33 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 tSamplerPtr = std::make_unique<ToolSampler>(*tAccPtr, toolAxisGrid->transform());
             }
 
+            std::unique_ptr<ToolAcc> cToolAccPtr;
+            std::unique_ptr<ToolSampler> cToolSamplerPtr;
+            if (coarseToolAxisGrid != nullptr) {
+                cToolAccPtr = std::make_unique<ToolAcc>(coarseToolAxisGrid->getConstAccessor());
+                cToolSamplerPtr = std::make_unique<ToolSampler>(*cToolAccPtr, coarseToolAxisGrid->transform());
+            }
+
+            auto sampleSdf = [&](const Vec3f& p) -> float {
+                const openvdb::Vec3d wp(p.x, p.y, p.z);
+                const float fineSdf = sdfSampler.wsSample(wp);
+                if (cSdfSamplerPtr != nullptr && fineSdf <= fineShellCutoff) {
+                    return cSdfSamplerPtr->wsSample(wp);
+                }
+                return fineSdf;
+            };
+
             auto sampleNozzleAxis = [&](const Vec3f& p) -> Vec3f {
+                const openvdb::Vec3d wp(p.x, p.y, p.z);
+                if (cToolSamplerPtr != nullptr && sdfSampler.wsSample(wp) <= fineShellCutoff) {
+                    const openvdb::Vec3s v = cToolSamplerPtr->wsSample(wp);
+                    const Vec3f raw{v.x(), v.y(), v.z()};
+                    if (lengthSq3(raw) > 1.0e-4f) {
+                        return normalize3(raw, fallbackNozzle);
+                    }
+                }
                 if (tSamplerPtr != nullptr) {
-                    const openvdb::Vec3s v = tSamplerPtr->wsSample(openvdb::Vec3d(p.x, p.y, p.z));
+                    const openvdb::Vec3s v = tSamplerPtr->wsSample(wp);
                     const Vec3f raw{v.x(), v.y(), v.z()};
                     if (lengthSq3(raw) > 1.0e-4f) {
                         return normalize3(raw, fallbackNozzle);
@@ -2331,21 +2381,24 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 return fallbackNozzle;
             };
 
-            auto sampleSdf = [&](const Vec3f& p) -> float {
-                return sdfSampler.wsSample(openvdb::Vec3d(p.x, p.y, p.z));
-            };
-
             auto sampleEikGradNorm = [&](const Vec3f& p) -> float {
-                const float h = 0.5f * voxelSize;
-                const float sdfCut = 0.05f * voxelSize;
-                const float t0 = eikSampler.wsSample(openvdb::Vec3d(p.x, p.y, p.z));
+                const openvdb::Vec3d wp(p.x, p.y, p.z);
+                const bool useCoarse =
+                    (cEikSamplerPtr != nullptr && cSdfSamplerPtr != nullptr &&
+                     sdfSampler.wsSample(wp) <= fineShellCutoff);
+                const auto& activeEik = useCoarse ? *cEikSamplerPtr : eikSampler;
+                const auto& activeSdf = useCoarse ? *cSdfSamplerPtr : sdfSampler;
+                const float stepVoxel = useCoarse ? coarseVoxelSize : voxelSize;
+                const float h = 0.5f * stepVoxel;
+                const float sdfCut = 0.05f * stepVoxel;
+                const float t0 = activeEik.wsSample(wp);
                 auto axisDeriv = [&](float dx, float dy, float dz) -> float {
                     const openvdb::Vec3d pP(p.x + dx, p.y + dy, p.z + dz);
                     const openvdb::Vec3d pM(p.x - dx, p.y - dy, p.z - dz);
-                    const float tP = eikSampler.wsSample(pP);
-                    const float tM = eikSampler.wsSample(pM);
-                    const bool inP = sdfSampler.wsSample(pP) <= sdfCut;
-                    const bool inM = sdfSampler.wsSample(pM) <= sdfCut;
+                    const float tP = activeEik.wsSample(pP);
+                    const float tM = activeEik.wsSample(pM);
+                    const bool inP = activeSdf.wsSample(pP) <= sdfCut;
+                    const bool inM = activeSdf.wsSample(pM) <= sdfCut;
                     if (inP && inM) {
                         return (tP - tM) / (2.0f * h);
                     } else if (inP) {
@@ -2424,18 +2477,20 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     layerInfo.max_thickness_mm});
 
                 std::vector<float> baseVertGrads(baseMesh.verts.size(), 1.0f);
-                double sumLayerGrad = 0.0;
+                double sumLayerInvGrad = 0.0;
                 std::size_t cntLayerGrad = 0;
                 for (std::size_t i = 0; i < baseMesh.verts.size(); ++i) {
                     const float g = sampleEikGradNorm(baseMesh.verts[i].pos);
                     baseVertGrads[i] = g;
                     if (g > 0.20f && g < 4.0f) {
-                        sumLayerGrad += static_cast<double>(g);
+                        sumLayerInvGrad += 1.0 / static_cast<double>(g);
                         cntLayerGrad += 1;
                     }
                 }
-                const float layerMeanGrad = (cntLayerGrad > 0)
-                    ? static_cast<float>(sumLayerGrad / static_cast<double>(cntLayerGrad))
+                // Use the harmonic mean of |\nabla \tau| so E[meanLayerH * g_harm / g] == meanLayerH
+                // without positive Jensen's inequality drift from 1/g convexity.
+                const float layerMeanGrad = (cntLayerGrad > 0 && sumLayerInvGrad > 1.0e-8)
+                    ? static_cast<float>(static_cast<double>(cntLayerGrad) / sumLayerInvGrad)
                     : 1.0f;
 
                 auto sampleLocalLayerHeight = [&](const Vec3f& p) -> float {
@@ -2548,19 +2603,19 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // Sample 5/6-axis nozzle orientation and local layer height only on the surviving shell vertices
                 {
                     std::vector<float> shellGrads(shellMesh.verts.size(), 1.0f);
-                    double sumShellGrad = 0.0;
+                    double sumShellInvGrad = 0.0;
                     std::size_t cntShellGrad = 0;
                     for (std::size_t i = 0; i < shellMesh.verts.size(); ++i) {
                         shellMesh.verts[i].nozzleAxis = sampleNozzleAxis(shellMesh.verts[i].pos);
                         const float g = sampleEikGradNorm(shellMesh.verts[i].pos);
                         shellGrads[i] = g;
                         if (g > 0.20f && g < 4.0f) {
-                            sumShellGrad += static_cast<double>(g);
+                            sumShellInvGrad += 1.0 / static_cast<double>(g);
                             cntShellGrad += 1;
                         }
                     }
-                    const float shellMeanGrad = (cntShellGrad > 0)
-                        ? static_cast<float>(sumShellGrad / static_cast<double>(cntShellGrad))
+                    const float shellMeanGrad = (cntShellGrad > 0 && sumShellInvGrad > 1.0e-8)
+                        ? static_cast<float>(static_cast<double>(cntShellGrad) / sumShellInvGrad)
                         : layerMeanGrad;
                     for (std::size_t i = 0; i < shellMesh.verts.size(); ++i) {
                         const float g = shellGrads[i];
@@ -3185,6 +3240,33 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         sampleNozzleAxis,
                         sampleLocalLayerHeight,
                         layerOut.paths);
+                }
+
+                // Normalize emitted toolpath point heights so the layer's mean segment height
+                // matches `meanLayerH` (`layerInfo.mean_thickness_mm`) while preserving relative
+                // intra-layer conformal thickness variations (1 / |\nabla \tau|).
+                {
+                    double sumPtH = 0.0;
+                    std::size_t cntPtH = 0;
+                    for (const auto& path : layerOut.paths) {
+                        for (const auto& pt : path.points) {
+                            sumPtH += static_cast<double>(pt.height_mm);
+                            ++cntPtH;
+                        }
+                    }
+                    if (cntPtH > 0) {
+                        const float rawMeanPtH =
+                            static_cast<float>(sumPtH / static_cast<double>(cntPtH));
+                        if (rawMeanPtH > 1.0e-4f) {
+                            const float hScale = meanLayerH / rawMeanPtH;
+                            for (auto& path : layerOut.paths) {
+                                for (auto& pt : path.points) {
+                                    pt.height_mm =
+                                        std::clamp(pt.height_mm * hScale, layerMinH, layerMaxH);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 perLayerResults[layerIdx] = std::move(layerOut);

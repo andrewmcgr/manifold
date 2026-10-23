@@ -10,6 +10,7 @@
 #include <queue>
 #include <string>
 
+#include <openvdb/tools/Interpolation.h>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 
@@ -277,6 +278,9 @@ void runInteriorFastSweeping(
         const std::size_t count = endOff - beginOff;
 
         auto updateVoxel = [&](std::size_t idx) {
+            if (domain.isPinnedSeed[idx]) {
+                return;
+            }
             if (!useDirectionalGuidance) {
                 const float cand = godunovIsotropicUpdate(domain, idx);
                 if (cand < domain.tau[idx]) {
@@ -498,6 +502,7 @@ void ActiveVolumeDomain::initializeFromSdfGrid(
     toolAxis.clear();
     toolTiltDeg.clear();
     isSeed.clear();
+    isPinnedSeed.clear();
     isInterior.clear();
     neighbors6.clear();
 
@@ -532,6 +537,7 @@ void ActiveVolumeDomain::initializeFromSdfGrid(
     toolAxis.assign(n, {0.0f, 0.0f, 1.0f});
     toolTiltDeg.assign(n, 0.0f);
     isSeed.assign(n, 0);
+    isPinnedSeed.assign(n, 0);
     isInterior.assign(n, 0);
     neighbors6.resize(n);
 
@@ -1022,9 +1028,10 @@ void OverhangIslandConstraint::enforceOnField(
 
     // Shift interior \tau so that the earliest bed seed voxel starts at \tau = 0
     // while allowing tilted layers across the bed to have \tau >= 0.
+    // Ignore pinned inner-core boundary seeds (`isPinnedSeed`) when computing `minSeedTau`.
     float minSeedTau = std::numeric_limits<float>::max();
     for (std::size_t i = 0; i < n; ++i) {
-        if (domain.isSeed[i] && domain.tau[i] < 0.5f * kInfinityTau) {
+        if (domain.isSeed[i] && !domain.isPinnedSeed[i] && domain.tau[i] < 0.5f * kInfinityTau) {
             minSeedTau = std::min(minSeedTau, domain.tau[i]);
         }
     }
@@ -1033,7 +1040,8 @@ void OverhangIslandConstraint::enforceOnField(
             tbb::blocked_range<std::size_t>(0, n, 512),
             [&](const tbb::blocked_range<std::size_t>& r) {
                 for (std::size_t i = r.begin(); i != r.end(); ++i) {
-                    if (domain.isInterior[i] && domain.tau[i] < 0.5f * kInfinityTau) {
+                    if (domain.isInterior[i] && !domain.isPinnedSeed[i] &&
+                        domain.tau[i] < 0.5f * kInfinityTau) {
                         domain.tau[i] = std::max(0.0f, domain.tau[i] - minSeedTau);
                     }
                 }
@@ -1375,7 +1383,10 @@ EikonalSolveResult solveConstrainedEikonal(
     // the queried nozzle axis in parallel
     notifyProgress(0.26f, "Evaluating overhang field & bed contact seeds...");
 
-    const float interiorCutoff = 0.75f * dx;
+    // 0.90 * dx exceeds the 3D cubic lattice covering radius (\sqrt{3}/2 * dx \approx 0.866 * dx),
+    // guaranteeing that any thin curved wall at arbitrary 3D orientation forms a 6-connected
+    // interior voxel network.
+    const float interiorCutoff = 0.90f * dx;
     const float seedHeightCutoff = 1.50f * dx;
 
     std::vector<float> axialProjections(n, std::numeric_limits<float>::max());
@@ -1438,6 +1449,72 @@ EikonalSolveResult solveConstrainedEikonal(
     // 2. Step A: Unconstrained Eikonal Fast Sweeping (|\nabla \tau| = 1 from bed seeds)
     notifyProgress(0.32f, "Solving initial unconstrained 3D Eikonal wavefronts...");
     runInteriorFastSweeping(domain, 2, /*useDirectionalGuidance=*/false);
+
+    // Ensure any thin-wall sections connected only diagonally (26-neighbors) or elevated
+    // components are seeded and swept so zero interior voxels remain at `kInfinityTau`.
+    bool hasUnreachedInterior = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (domain.isInterior[i] && domain.tau[i] >= 0.5f * kInfinityTau) {
+            hasUnreachedInterior = true;
+            break;
+        }
+    }
+    if (hasUnreachedInterior && domain.indexGrid) {
+        auto idxAcc = domain.indexGrid->getConstAccessor();
+        for (int bridgePass = 0; bridgePass < 4; ++bridgePass) {
+            bool bridgedAny = false;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!domain.isInterior[i] || domain.tau[i] < 0.5f * kInfinityTau) {
+                    continue;
+                }
+                const openvdb::Coord& c = domain.coords[i];
+                float bestBridgeTau = kInfinityTau;
+                for (int dz = -1; dz <= 1; ++dz) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dxOff = -1; dxOff <= 1; ++dxOff) {
+                            if (dxOff == 0 && dy == 0 && dz == 0) {
+                                continue;
+                            }
+                            const std::int32_t nb =
+                                idxAcc.getValue(c + openvdb::Coord(dxOff, dy, dz));
+                            if (nb < 0) {
+                                continue;
+                            }
+                            const std::size_t u = static_cast<std::size_t>(nb);
+                            if (domain.isInterior[u] && domain.tau[u] < 0.5f * kInfinityTau) {
+                                const float stepDist = dx * std::sqrt(static_cast<float>(
+                                    dxOff * dxOff + dy * dy + dz * dz));
+                                bestBridgeTau = std::min(bestBridgeTau, domain.tau[u] + stepDist);
+                            }
+                        }
+                    }
+                }
+                if (bestBridgeTau < 0.5f * kInfinityTau) {
+                    domain.isSeed[i] = 1;
+                    domain.tau[i] = bestBridgeTau;
+                    bridgedAny = true;
+                }
+            }
+            if (!bridgedAny) {
+                break;
+            }
+            runInteriorFastSweeping(domain, 1, /*useDirectionalGuidance=*/false);
+        }
+
+        // Fallback for any disconnected elevated interior component: seed by axial height
+        bool fallbackSeeded = false;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (domain.isInterior[i] && domain.tau[i] >= 0.5f * kInfinityTau) {
+                const float hAxial = std::max(0.0f, axialProjections[i] - domain.minZBed);
+                domain.isSeed[i] = 1;
+                domain.tau[i] = hAxial;
+                fallbackSeeded = true;
+            }
+        }
+        if (fallbackSeeded) {
+            runInteriorFastSweeping(domain, 1, /*useDirectionalGuidance=*/false);
+        }
+    }
 
     ToolOrientationStrategy orientationStrategy;
     OverhangIslandConstraint overhangConstraint;
@@ -1548,6 +1625,255 @@ EikonalSolveResult solveConstrainedEikonal(
     }
 
     notifyProgress(1.0f, "Field computation complete.");
+
+    EikonalSolveResult result;
+    result.eikonalGrid = eikonalGrid;
+    result.overhangGrid = overhangGrid;
+    result.toolTiltDegGrid = toolTiltGrid;
+    result.toolAxisGrid = toolAxisGrid;
+    return result;
+}
+
+EikonalSolveResult solveFineShellWithCoarseGuidance(
+    const openvdb::FloatGrid& fineShellSdfGrid,
+    const EikonalSolveResult& coarseSolved,
+    float innerShellDepthMm,
+    float objectMinZ,
+    float objectMaxZ,
+    float objectMaxSpan,
+    float exteriorBandMm,
+    const EikonalSolverContext& baseContext)
+{
+    if (!coarseSolved.eikonalGrid || !coarseSolved.toolAxisGrid) {
+        return solveConstrainedEikonal(
+            fineShellSdfGrid,
+            objectMinZ,
+            objectMaxZ,
+            objectMaxSpan,
+            exteriorBandMm,
+            baseContext);
+    }
+
+    auto notifyProgress = [&](float frac, const char* msg) {
+        if (baseContext.reportProgress) {
+            baseContext.reportProgress(frac, msg);
+        }
+    };
+
+    notifyProgress(0.55f, "Initializing fine boundary-shell domain from coarse Eikonal solution...");
+
+    ActiveVolumeDomain domain;
+    domain.initializeFromSdfGrid(fineShellSdfGrid, objectMinZ, objectMaxZ, objectMaxSpan);
+
+    const std::size_t n = domain.coords.size();
+    const float dx = static_cast<float>(domain.voxelSize);
+    // 0.90 * dx exceeds the 3D cubic lattice covering radius (\sqrt{3}/2 * dx \approx 0.866 * dx),
+    // guaranteeing that any thin curved wall at arbitrary 3D orientation forms a 6-connected
+    // interior voxel network.
+    const float interiorCutoff = 0.90f * dx;
+    const float seedHeightCutoff = 1.50f * dx;
+    const float pinDepthThreshold = -std::max(innerShellDepthMm - 1.75f * dx, 2.0f * dx);
+    const float coarseValidLimit =
+        coarseSolved.eikonalGrid->background() - std::max(0.5f * dx, 0.5f);
+
+    std::vector<float> axialProjections(n, std::numeric_limits<float>::max());
+    std::vector<float> coarseTauSampled(n, -1.0f);
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, n, 512),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            auto coarseEikAcc = coarseSolved.eikonalGrid->getConstAccessor();
+            auto coarseAxisAcc = coarseSolved.toolAxisGrid->getConstAccessor();
+            openvdb::tools::GridSampler<
+                openvdb::FloatGrid::ConstAccessor,
+                openvdb::tools::BoxSampler>
+                coarseEikSampler(coarseEikAcc, coarseSolved.eikonalGrid->transform());
+            openvdb::tools::GridSampler<
+                openvdb::Vec3SGrid::ConstAccessor,
+                openvdb::tools::BoxSampler>
+                coarseAxisSampler(coarseAxisAcc, coarseSolved.toolAxisGrid->transform());
+
+            for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                const auto& pos = domain.posBed[i];
+                const openvdb::Vec3d wp(pos[0], pos[1], pos[2]);
+
+                const NozzleBasis nozzleFrame =
+                    baseContext.backend.queryNozzleFrame(pos, {1.0f, 0.0f, 0.0f});
+                const std::array<float, 3> gravityDir =
+                    baseContext.backend.queryGravityDirection(pos);
+
+                const float antiGravityProj = -dot3(domain.sdfGrad[i], gravityDir);
+                domain.overhang[i] = std::clamp(antiGravityProj, -1.0f, 1.0f);
+
+                const openvdb::Vec3s sampledAxis = coarseAxisSampler.wsSample(wp);
+                const std::array<float, 3> unitAxis = normalize3(
+                    {sampledAxis.x(), sampledAxis.y(), sampledAxis.z()},
+                    nozzleFrame.nozzle_axis);
+                domain.toolAxis[i] = unitAxis;
+                domain.targetDir[i] = unitAxis;
+
+                const float cosTilt =
+                    std::clamp(dot3(unitAxis, nozzleFrame.nozzle_axis), -1.0f, 1.0f);
+                domain.toolTiltDeg[i] = std::acos(cosTilt) * kRadToDeg;
+
+                const float cTauRaw = coarseEikSampler.wsSample(wp);
+                const bool hasValidCoarseTau =
+                    std::isfinite(cTauRaw) && (cTauRaw < coarseValidLimit);
+                const float cTau = hasValidCoarseTau ? std::max(0.0f, cTauRaw) : -1.0f;
+                coarseTauSampled[i] = cTau;
+
+                const bool insideOrBoundary = (domain.sdf[i] <= interiorCutoff);
+                domain.isInterior[i] = insideOrBoundary ? 1 : 0;
+                if (insideOrBoundary) {
+                    domain.tau[i] = hasValidCoarseTau ? cTau : kInfinityTau;
+                    axialProjections[i] = dot3(pos, nozzleFrame.nozzle_axis);
+                }
+            }
+        });
+
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!domain.isInterior[i]) {
+            continue;
+        }
+        const float hAxial = axialProjections[i] - domain.minZBed;
+        if (hAxial <= seedHeightCutoff) {
+            domain.isSeed[i] = 1;
+            domain.tau[i] = std::max(0.0f, hAxial);
+            continue;
+        }
+
+        // Voxels along the inner shell-core interface border the deep interior where fine voxels
+        // are inactive; pin them to the coarse Eikonal solution so the fine shell smoothly matches
+        // the coarse core without sweeping the deep interior at fine resolution.
+        if (domain.sdf[i] < -1.5f * dx && coarseTauSampled[i] >= 0.0f) {
+            bool bordersInactiveCore = (domain.sdf[i] <= pinDepthThreshold);
+            if (!bordersInactiveCore) {
+                for (const std::int32_t nb : domain.neighbors6[i]) {
+                    if (nb < 0) {
+                        bordersInactiveCore = true;
+                        break;
+                    }
+                }
+            }
+            if (bordersInactiveCore) {
+                domain.isSeed[i] = 1;
+                domain.isPinnedSeed[i] = 1;
+                domain.tau[i] = coarseTauSampled[i];
+            }
+        }
+    }
+
+    domain.buildWavefrontSchedules();
+
+    // Propagate arrival time into any fine-only features (such as thin fins or ribs attached
+    // to a thick core) that were narrower than the coarse grid resolution.
+    runInteriorFastSweeping(domain, 2, /*useDirectionalGuidance=*/false);
+
+    ToolOrientationStrategy orientationStrategy;
+    OverhangIslandConstraint overhangConstraint;
+    OrientationHintConstraint hintConstraint;
+    ToolClearanceConstraint clearanceConstraint;
+
+    EikonalSolverContext iterCtx = baseContext;
+    const std::uint32_t fineIters =
+        std::clamp<std::uint32_t>( std::min<std::uint32_t>(baseContext.totalIterations, 2), 1, 4);
+
+    for (std::uint32_t iter = 0; iter < fineIters; ++iter) {
+        iterCtx.outerIteration = iter;
+        iterCtx.totalIterations = fineIters;
+
+        const float frac =
+            0.64f + 0.22f * (static_cast<float>(iter) / static_cast<float>(fineIters));
+        notifyProgress(frac, "Refining fine boundary-shell Eikonal field & surface orientations...");
+
+        overhangConstraint.applyPreSweepModifiers(domain, iterCtx);
+        hintConstraint.applyPreSweepModifiers(domain, iterCtx);
+        orientationStrategy.updateToolOrientations(domain, iterCtx);
+        clearanceConstraint.applyPreSweepModifiers(domain, iterCtx);
+
+        runInteriorFastSweeping(domain, 1, /*useDirectionalGuidance=*/true);
+        hintConstraint.enforceOnField(domain, iterCtx);
+        clearanceConstraint.enforceOnField(domain, iterCtx);
+        overhangConstraint.enforceOnField(domain, iterCtx);
+    }
+
+    // Smoothly blend \tau across the inner transition zone into `coarseTauSampled` so the
+    // gradient across the shell-core interface is C^1-continuous.
+    const float blendStartDepth = std::max(innerShellDepthMm - 3.5f * dx, 1.5f * dx);
+    const float blendSpan = std::max(innerShellDepthMm - blendStartDepth, dx);
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, n, 512),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                if (!domain.isInterior[i] ||
+                    domain.tau[i] >= 0.5f * kInfinityTau ||
+                    coarseTauSampled[i] < 0.0f) {
+                    continue;
+                }
+                const float depth = -domain.sdf[i];
+                if (depth > blendStartDepth) {
+                    const float u = std::clamp((depth - blendStartDepth) / blendSpan, 0.0f, 1.0f);
+                    const float wCoarse = u * u * (3.0f - 2.0f * u);
+                    domain.tau[i] =
+                        (1.0f - wCoarse) * domain.tau[i] + wCoarse * coarseTauSampled[i];
+                }
+            }
+        });
+
+    notifyProgress(0.90f, "Extending fine shell Eikonal field into exterior narrow band...");
+    extendEikonalToExteriorBand(domain, baseContext.backend);
+
+    notifyProgress(0.96f, "Packing fine shell OpenVDB scalar & vector grids...");
+    const float spanZ = std::max(objectMaxZ - objectMinZ, 1.0f);
+    float maxSolvedTau = spanZ;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (domain.tau[i] < 0.5f * kInfinityTau) {
+            maxSolvedTau = std::max(maxSolvedTau, domain.tau[i]);
+        }
+    }
+    const float eikonalBg =
+        std::max(maxSolvedTau + 2.0f * exteriorBandMm + 10.0f, coarseSolved.eikonalGrid->background());
+
+    openvdb::FloatGrid::Ptr eikonalGrid = openvdb::FloatGrid::create(eikonalBg);
+    eikonalGrid->setName("eikonal");
+    eikonalGrid->setGridClass(openvdb::GRID_LEVEL_SET);
+    eikonalGrid->setTransform(domain.transform->copy());
+
+    openvdb::FloatGrid::Ptr overhangGrid = openvdb::FloatGrid::create(0.0f);
+    overhangGrid->setName("overhang");
+    overhangGrid->setGridClass(openvdb::GRID_LEVEL_SET);
+    overhangGrid->setTransform(domain.transform->copy());
+
+    openvdb::FloatGrid::Ptr toolTiltGrid = openvdb::FloatGrid::create(0.0f);
+    toolTiltGrid->setName("tool_tilt_deg");
+    toolTiltGrid->setGridClass(openvdb::GRID_FOG_VOLUME);
+    toolTiltGrid->setTransform(domain.transform->copy());
+
+    openvdb::Vec3SGrid::Ptr toolAxisGrid =
+        openvdb::Vec3SGrid::create(openvdb::Vec3s(0.0f, 0.0f, 1.0f));
+    toolAxisGrid->setName("tool_axis");
+    toolAxisGrid->setTransform(domain.transform->copy());
+
+    auto eikAccessor = eikonalGrid->getAccessor();
+    auto ovAccessor = overhangGrid->getAccessor();
+    auto tiltAccessor = toolTiltGrid->getAccessor();
+    auto axisAccessor = toolAxisGrid->getAccessor();
+
+    for (std::size_t i = 0; i < n; ++i) {
+        const openvdb::Coord& ijk = domain.coords[i];
+        const float tauVal = (domain.tau[i] < 0.5f * kInfinityTau) ? domain.tau[i] : eikonalBg;
+        eikAccessor.setValue(ijk, tauVal);
+        ovAccessor.setValue(ijk, domain.overhang[i]);
+        tiltAccessor.setValue(ijk, domain.toolTiltDeg[i]);
+        axisAccessor.setValue(
+            ijk,
+            openvdb::Vec3s(
+                domain.toolAxis[i][0],
+                domain.toolAxis[i][1],
+                domain.toolAxis[i][2]));
+    }
+
+    notifyProgress(1.0f, "Multi-resolution field computation complete.");
 
     EikonalSolveResult result;
     result.eikonalGrid = eikonalGrid;
