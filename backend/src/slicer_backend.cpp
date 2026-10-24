@@ -25,6 +25,8 @@
 #include <BRep_Tool.hxx>
 #include <Bnd_Box.hxx>
 #include <IFSelect_ReturnStatus.hxx>
+#include <IMeshTools_MeshAlgoType.hxx>
+#include <IMeshTools_Parameters.hxx>
 #include <Poly_Triangulation.hxx>
 #include <STEPControl_Reader.hxx>
 #include <STEPControl_StepModelType.hxx>
@@ -271,7 +273,526 @@ FieldComputeProgress getFieldProgressSnapshot() {
     return out;
 }
 
-/// Populates the object's scalar and vector field registry using the iterative
+struct QuantizedVertexKey {
+    std::int64_t ix = 0;
+    std::int64_t iy = 0;
+    std::int64_t iz = 0;
+
+    bool operator==(const QuantizedVertexKey& o) const noexcept {
+        return ix == o.ix && iy == o.iy && iz == o.iz;
+    }
+};
+
+struct QuantizedVertexKeyHash {
+    std::size_t operator()(const QuantizedVertexKey& k) const noexcept {
+        std::size_t h = static_cast<std::size_t>(k.ix) * 73856093ULL;
+        h ^= static_cast<std::size_t>(k.iy) * 19349663ULL;
+        h ^= static_cast<std::size_t>(k.iz) * 83492791ULL;
+        return h;
+    }
+};
+
+struct UndirectedEdgeKey {
+    std::uint32_t u = 0;
+    std::uint32_t v = 0;
+
+    bool operator==(const UndirectedEdgeKey& o) const noexcept {
+        return u == o.u && v == o.v;
+    }
+};
+
+struct UndirectedEdgeKeyHash {
+    std::size_t operator()(const UndirectedEdgeKey& k) const noexcept {
+        return (static_cast<std::size_t>(k.u) << 32) ^ static_cast<std::size_t>(k.v);
+    }
+};
+
+struct BoundaryLoopDescriptor {
+    std::vector<std::uint32_t> vertices;
+    openvdb::Vec3d centroid{0.0, 0.0, 0.0};
+    openvdb::Vec3d normal{0.0, 0.0, 1.0};
+    double normalLen = 0.0;
+    double meanRadius = 0.0;
+};
+
+BoundaryLoopDescriptor analyzeBoundaryLoop(
+    const std::vector<std::uint32_t>& loopVerts,
+    const std::vector<openvdb::Vec3s>& points)
+{
+    BoundaryLoopDescriptor desc;
+    desc.vertices = loopVerts;
+    const std::size_t n = loopVerts.size();
+    if (n == 0) {
+        return desc;
+    }
+
+    openvdb::Vec3d c(0.0, 0.0, 0.0);
+    for (const std::uint32_t vid : loopVerts) {
+        const auto& p = points[vid];
+        c += openvdb::Vec3d(p.x(), p.y(), p.z());
+    }
+    c /= static_cast<double>(n);
+    desc.centroid = c;
+
+    double rSum = 0.0;
+    openvdb::Vec3d newell(0.0, 0.0, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& p0 = points[loopVerts[i]];
+        const auto& p1 = points[loopVerts[(i + 1) % n]];
+        const openvdb::Vec3d d0(p0.x() - c.x(), p0.y() - c.y(), p0.z() - c.z());
+        const openvdb::Vec3d d1(p1.x() - c.x(), p1.y() - c.y(), p1.z() - c.z());
+        rSum += d0.length();
+        newell += d0.cross(d1);
+    }
+    desc.meanRadius = rSum / static_cast<double>(n);
+    desc.normalLen = newell.length();
+    if (desc.normalLen > 1.0e-12) {
+        desc.normal = newell / desc.normalLen;
+    }
+    return desc;
+}
+
+void triangulateSingleBoundaryLoop(
+    const BoundaryLoopDescriptor& desc,
+    const std::vector<openvdb::Vec3s>& points,
+    std::vector<openvdb::Vec3I>& outPatchTris)
+{
+    const auto& loop = desc.vertices;
+    const std::size_t n = loop.size();
+    if (n < 3) {
+        return;
+    }
+    if (n == 3) {
+        if (loop[0] != loop[1] && loop[1] != loop[2] && loop[2] != loop[0]) {
+            outPatchTris.emplace_back(loop[0], loop[1], loop[2]);
+        }
+        return;
+    }
+    if (n == 4) {
+        const double d02 = (points[loop[0]] - points[loop[2]]).lengthSqr();
+        const double d13 = (points[loop[1]] - points[loop[3]]).lengthSqr();
+        if (d02 <= d13) {
+            outPatchTris.emplace_back(loop[0], loop[1], loop[2]);
+            outPatchTris.emplace_back(loop[0], loop[2], loop[3]);
+        } else {
+            outPatchTris.emplace_back(loop[0], loop[1], loop[3]);
+            outPatchTris.emplace_back(loop[1], loop[2], loop[3]);
+        }
+        return;
+    }
+
+    // Build a 2D projection plane orthogonal to desc.normal
+    const openvdb::Vec3d nrm = desc.normal;
+    const openvdb::Vec3d refAxis =
+        (std::abs(nrm.x()) < 0.9) ? openvdb::Vec3d(1.0, 0.0, 0.0) : openvdb::Vec3d(0.0, 1.0, 0.0);
+    openvdb::Vec3d uAxis = (refAxis - refAxis.dot(nrm) * nrm);
+    const double uLen = uAxis.length();
+    if (uLen > 1.0e-12) {
+        uAxis /= uLen;
+    } else {
+        uAxis = openvdb::Vec3d(1.0, 0.0, 0.0);
+    }
+    openvdb::Vec3d vAxis = nrm.cross(uAxis);
+
+    std::vector<openvdb::Vec2d> uv(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& p = points[loop[i]];
+        const openvdb::Vec3d d(p.x() - desc.centroid.x(), p.y() - desc.centroid.y(), p.z() - desc.centroid.z());
+        uv[i] = openvdb::Vec2d(d.dot(uAxis), d.dot(vAxis));
+    }
+
+    double signedArea2 = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& a = uv[i];
+        const auto& b = uv[(i + 1) % n];
+        signedArea2 += a.x() * b.y() - b.x() * a.y();
+    }
+    if (signedArea2 < 0.0) {
+        for (auto& p : uv) {
+            p.y() = -p.y();
+        }
+    }
+
+    std::vector<std::size_t> poly(n);
+    std::iota(poly.begin(), poly.end(), 0);
+
+    auto cross2d = [](const openvdb::Vec2d& a, const openvdb::Vec2d& b, const openvdb::Vec2d& c) -> double {
+        return (b.x() - a.x()) * (c.y() - a.y()) - (b.y() - a.y()) * (c.x() - a.x());
+    };
+    auto pointInTri2d = [&](const openvdb::Vec2d& p,
+                            const openvdb::Vec2d& a,
+                            const openvdb::Vec2d& b,
+                            const openvdb::Vec2d& c) -> bool {
+        const double c0 = cross2d(a, b, p);
+        const double c1 = cross2d(b, c, p);
+        const double c2 = cross2d(c, a, p);
+        return (c0 >= -1.0e-9 && c1 >= -1.0e-9 && c2 >= -1.0e-9);
+    };
+
+    while (poly.size() > 3) {
+        const std::size_t m = poly.size();
+        std::size_t bestIdx = m;
+        double bestDiagSq = std::numeric_limits<double>::max();
+
+        for (std::size_t i = 0; i < m; ++i) {
+            const std::size_t iPrev = poly[(i + m - 1) % m];
+            const std::size_t iCurr = poly[i];
+            const std::size_t iNext = poly[(i + 1) % m];
+            if (loop[iPrev] == loop[iCurr] || loop[iCurr] == loop[iNext] || loop[iNext] == loop[iPrev]) {
+                continue;
+            }
+            const double earCross = cross2d(uv[iPrev], uv[iCurr], uv[iNext]);
+            if (earCross <= 1.0e-9) {
+                continue;
+            }
+            bool anyInside = false;
+            for (std::size_t j = 0; j < m; ++j) {
+                if (j == (i + m - 1) % m || j == i || j == (i + 1) % m) {
+                    continue;
+                }
+                const std::size_t iOther = poly[j];
+                if (loop[iOther] == loop[iPrev] || loop[iOther] == loop[iCurr] || loop[iOther] == loop[iNext]) {
+                    continue;
+                }
+                if (pointInTri2d(uv[iOther], uv[iPrev], uv[iCurr], uv[iNext])) {
+                    anyInside = true;
+                    break;
+                }
+            }
+            if (!anyInside) {
+                const double diagSq = (points[loop[iPrev]] - points[loop[iNext]]).lengthSqr();
+                if (diagSq < bestDiagSq) {
+                    bestDiagSq = diagSq;
+                    bestIdx = i;
+                }
+            }
+        }
+
+        if (bestIdx == m) {
+            // Fallback for non-planar or nearly-collinear 3D loops: pick shortest 3D diagonal
+            for (std::size_t i = 0; i < m; ++i) {
+                const std::size_t iPrev = poly[(i + m - 1) % m];
+                const std::size_t iNext = poly[(i + 1) % m];
+                const double diagSq = (points[loop[iPrev]] - points[loop[iNext]]).lengthSqr();
+                if (diagSq < bestDiagSq) {
+                    bestDiagSq = diagSq;
+                    bestIdx = i;
+                }
+            }
+            if (bestIdx == m) {
+                bestIdx = 0;
+            }
+        }
+
+        const std::size_t iPrev = poly[(bestIdx + m - 1) % m];
+        const std::size_t iCurr = poly[bestIdx];
+        const std::size_t iNext = poly[(bestIdx + 1) % m];
+        if (loop[iPrev] != loop[iCurr] && loop[iCurr] != loop[iNext] && loop[iNext] != loop[iPrev]) {
+            outPatchTris.emplace_back(loop[iPrev], loop[iCurr], loop[iNext]);
+        }
+        poly.erase(poly.begin() + static_cast<std::ptrdiff_t>(bestIdx));
+    }
+
+    if (poly.size() == 3) {
+        const std::uint32_t v0 = loop[poly[0]];
+        const std::uint32_t v1 = loop[poly[1]];
+        const std::uint32_t v2 = loop[poly[2]];
+        if (v0 != v1 && v1 != v2 && v2 != v0) {
+            outPatchTris.emplace_back(v0, v1, v2);
+        }
+    }
+}
+
+void loftCoaxialBoundaryLoops(
+    const BoundaryLoopDescriptor& loopA,
+    const BoundaryLoopDescriptor& loopB,
+    const std::vector<openvdb::Vec3s>& points,
+    std::vector<openvdb::Vec3I>& outPatchTris)
+{
+    const auto& a = loopA.vertices;
+    const auto& bOrig = loopB.vertices;
+    const std::size_t N = a.size();
+    const std::size_t M = bOrig.size();
+    if (N < 3 || M < 3) {
+        return;
+    }
+
+    // Reverse loopB so its traversal circulates in the same angular direction around loopA.normal
+    // while its reversed edges (bRev[k+1] -> bRev[k]) correspond to forward edges of loopB.
+    std::vector<std::uint32_t> bRev(M);
+    for (std::size_t k = 0; k < M; ++k) {
+        bRev[k] = bOrig[(M - k) % M];
+    }
+
+    // Find the index k0 in bRev closest to a[0]
+    std::size_t bestK0 = 0;
+    double bestDistSq = std::numeric_limits<double>::max();
+    for (std::size_t k = 0; k < M; ++k) {
+        const double dSq = (points[a[0]] - points[bRev[k]]).lengthSqr();
+        if (dSq < bestDistSq) {
+            bestDistSq = dSq;
+            bestK0 = k;
+        }
+    }
+
+    std::vector<std::uint32_t> b(M);
+    for (std::size_t k = 0; k < M; ++k) {
+        b[k] = bRev[(bestK0 + k) % M];
+    }
+
+    std::size_t i = 0;
+    std::size_t m = 0;
+    while (i < N || m < M) {
+        const std::uint32_t u0 = a[i % N];
+        const std::uint32_t u1 = a[(i + 1) % N];
+        const std::uint32_t w0 = b[m % M];
+        const std::uint32_t w1 = b[(m + 1) % M];
+
+        bool advanceA = false;
+        if (i >= N) {
+            advanceA = false;
+        } else if (m >= M) {
+            advanceA = true;
+        } else {
+            const double diagU0W1 = (points[u0] - points[w1]).lengthSqr();
+            const double diagU1W0 = (points[u1] - points[w0]).lengthSqr();
+            advanceA = (diagU1W0 < diagU0W1);
+        }
+
+        if (advanceA) {
+            if (u0 != u1 && u1 != w0 && w0 != u0) {
+                outPatchTris.emplace_back(u0, u1, w0);
+            }
+            ++i;
+        } else {
+            if (u0 != w1 && w1 != w0 && w0 != u0) {
+                outPatchTris.emplace_back(u0, w1, w0);
+            }
+            ++m;
+        }
+    }
+}
+
+/// Welds coincident vertices across face boundaries and repairs any open boundary loops
+/// (such as untessellated B-Rep conical/cylindrical frustum faces or micro-gaps) so that
+/// `openvdb::tools::meshToSignedDistanceField` receives a closed, watertight manifold mesh.
+void extractWeldedWatertightMesh(
+    const std::vector<RenderVertex>& vertexBuffer,
+    const std::vector<std::uint32_t>& indexBuffer,
+    std::vector<openvdb::Vec3s>& outPoints,
+    std::vector<openvdb::Vec3I>& outTriangles,
+    std::vector<openvdb::Vec3I>* outPatchTriangles = nullptr)
+{
+    outPoints.clear();
+    outTriangles.clear();
+    if (outPatchTriangles != nullptr) {
+        outPatchTriangles->clear();
+    }
+    if (vertexBuffer.empty() || indexBuffer.size() < 3) {
+        return;
+    }
+
+    // 1. Spatial vertex welding at 1 micrometer (1e-3 mm) resolution
+    constexpr double kQuantScale = 1000.0;
+    std::unordered_map<QuantizedVertexKey, std::uint32_t, QuantizedVertexKeyHash> weldMap;
+    weldMap.reserve(vertexBuffer.size());
+    std::vector<std::uint32_t> oldToWelded(vertexBuffer.size(), 0);
+    outPoints.reserve(vertexBuffer.size() / 2 + 16);
+
+    for (std::size_t i = 0; i < vertexBuffer.size(); ++i) {
+        const auto& v = vertexBuffer[i];
+        const QuantizedVertexKey key{
+            static_cast<std::int64_t>(std::llround(static_cast<double>(v.x) * kQuantScale)),
+            static_cast<std::int64_t>(std::llround(static_cast<double>(v.y) * kQuantScale)),
+            static_cast<std::int64_t>(std::llround(static_cast<double>(v.z) * kQuantScale)),
+        };
+        auto [it, inserted] = weldMap.emplace(key, static_cast<std::uint32_t>(outPoints.size()));
+        if (inserted) {
+            outPoints.emplace_back(v.x, v.y, v.z);
+        }
+        oldToWelded[i] = it->second;
+    }
+
+    outTriangles.reserve(indexBuffer.size() / 3);
+    struct EdgeDirCounts {
+        std::uint32_t forwardCount = 0; // u -> v (u < v)
+        std::uint32_t reverseCount = 0; // v -> u (u < v)
+    };
+    std::unordered_map<UndirectedEdgeKey, EdgeDirCounts, UndirectedEdgeKeyHash> edgeCounts;
+    edgeCounts.reserve(indexBuffer.size() / 2);
+
+    for (std::size_t t = 0; t + 2 < indexBuffer.size(); t += 3) {
+        const std::uint32_t i0 = indexBuffer[t + 0];
+        const std::uint32_t i1 = indexBuffer[t + 1];
+        const std::uint32_t i2 = indexBuffer[t + 2];
+        if (i0 >= vertexBuffer.size() || i1 >= vertexBuffer.size() || i2 >= vertexBuffer.size()) {
+            continue;
+        }
+        const std::uint32_t w0 = oldToWelded[i0];
+        const std::uint32_t w1 = oldToWelded[i1];
+        const std::uint32_t w2 = oldToWelded[i2];
+        if (w0 == w1 || w1 == w2 || w2 == w0) {
+            continue;
+        }
+        outTriangles.emplace_back(w0, w1, w2);
+
+        const std::array<std::pair<std::uint32_t, std::uint32_t>, 3> halfEdges{{
+            {w0, w1},
+            {w1, w2},
+            {w2, w0},
+        }};
+        for (const auto& [a, b] : halfEdges) {
+            const UndirectedEdgeKey ek{ std::min(a, b), std::max(a, b) };
+            auto& cnt = edgeCounts[ek];
+            if (a < b) {
+                ++cnt.forwardCount;
+            } else {
+                ++cnt.reverseCount;
+            }
+        }
+    }
+
+    // 2. Collect open boundary half-edges (in the opposite direction needed to close the hole)
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> openAdj;
+    for (const auto& [ek, cnt] : edgeCounts) {
+        if (cnt.forwardCount == 1 && cnt.reverseCount == 0) {
+            // Existing mesh has u -> v; hole-closing patch needs v -> u
+            openAdj[ek.v].push_back(ek.u);
+        } else if (cnt.reverseCount == 1 && cnt.forwardCount == 0) {
+            // Existing mesh has v -> u; hole-closing patch needs u -> v
+            openAdj[ek.u].push_back(ek.v);
+        }
+    }
+
+    if (!openAdj.empty()) {
+        std::vector<BoundaryLoopDescriptor> loops;
+        for (auto& [startU, neighbors] : openAdj) {
+            while (!neighbors.empty()) {
+                const std::uint32_t firstV = neighbors.back();
+                neighbors.pop_back();
+
+                std::vector<std::uint32_t> path;
+                std::unordered_map<std::uint32_t, std::size_t> posInPath;
+                path.push_back(startU);
+                posInPath[startU] = 0;
+
+                std::uint32_t curr = firstV;
+                while (true) {
+                    auto visitedIt = posInPath.find(curr);
+                    if (visitedIt != posInPath.end()) {
+                        // Extract simple cycle from visitedIt->second .. path.end()
+                        const std::size_t cycleStart = visitedIt->second;
+                        if (path.size() - cycleStart >= 3) {
+                            std::vector<std::uint32_t> cycle(
+                                path.begin() + static_cast<std::ptrdiff_t>(cycleStart),
+                                path.end());
+                            loops.push_back(analyzeBoundaryLoop(cycle, outPoints));
+                        }
+                        for (std::size_t k = cycleStart; k < path.size(); ++k) {
+                            posInPath.erase(path[k]);
+                        }
+                        path.resize(cycleStart);
+                        if (path.empty()) {
+                            break;
+                        }
+                    }
+
+                    path.push_back(curr);
+                    posInPath[curr] = path.size() - 1;
+
+                    auto nextIt = openAdj.find(curr);
+                    if (nextIt == openAdj.end() || nextIt->second.empty()) {
+                        break;
+                    }
+                    const std::uint32_t nxt = nextIt->second.back();
+                    nextIt->second.pop_back();
+                    curr = nxt;
+                }
+            }
+        }
+
+        // 3. Pair coaxial opposite-winding loops (such as missing conical/cylindrical hole faces)
+        std::vector<bool> loopPaired(loops.size(), false);
+        std::vector<openvdb::Vec3I> patchTris;
+
+        for (std::size_t i = 0; i < loops.size(); ++i) {
+            if (loopPaired[i] || loops[i].vertices.size() < 6 || loops[i].normalLen <= 1.0e-9) {
+                continue;
+            }
+            std::size_t bestPartner = loops.size();
+            double bestPartnerDist = std::numeric_limits<double>::max();
+
+            for (std::size_t j = i + 1; j < loops.size(); ++j) {
+                if (loopPaired[j] || loops[j].vertices.size() < 6 || loops[j].normalLen <= 1.0e-9) {
+                    continue;
+                }
+                const std::size_t nMin = std::min(loops[i].vertices.size(), loops[j].vertices.size());
+                const std::size_t nMax = std::max(loops[i].vertices.size(), loops[j].vertices.size());
+                if (nMin * 2 < nMax) {
+                    continue;
+                }
+                const double nDot = loops[i].normal.dot(loops[j].normal);
+                if (nDot > -0.70) {
+                    continue;
+                }
+                const openvdb::Vec3d deltaC = loops[j].centroid - loops[i].centroid;
+                const double distC = deltaC.length();
+                const double rMax = std::max({loops[i].meanRadius, loops[j].meanRadius, 1.0e-4});
+                const double rMin = std::min(loops[i].meanRadius, loops[j].meanRadius);
+                if (rMin < 0.15 * rMax || distC > 4.0 * rMax) {
+                    continue;
+                }
+                if (distC > 1.0e-4) {
+                    const double axialAlign = std::abs(deltaC.dot(loops[i].normal)) / distC;
+                    if (axialAlign < 0.80) {
+                        continue;
+                    }
+                }
+                if (distC < bestPartnerDist) {
+                    bestPartnerDist = distC;
+                    bestPartner = j;
+                }
+            }
+
+            if (bestPartner < loops.size()) {
+                loopPaired[i] = true;
+                loopPaired[bestPartner] = true;
+                loftCoaxialBoundaryLoops(loops[i], loops[bestPartner], outPoints, patchTris);
+            }
+        }
+
+        // 4. Close any remaining unpaired boundary loops via 3D planar ear-clipping
+        for (std::size_t i = 0; i < loops.size(); ++i) {
+            if (!loopPaired[i]) {
+                triangulateSingleBoundaryLoop(loops[i], outPoints, patchTris);
+            }
+        }
+
+        outTriangles.insert(outTriangles.end(), patchTris.begin(), patchTris.end());
+        if (outPatchTriangles != nullptr) {
+            *outPatchTriangles = std::move(patchTris);
+        }
+    }
+
+    // 5. Ensure positive global signed volume (outward surface orientation)
+    double signedVol6 = 0.0;
+    for (const auto& tri : outTriangles) {
+        const openvdb::Vec3d p0(outPoints[tri[0]]);
+        const openvdb::Vec3d p1(outPoints[tri[1]]);
+        const openvdb::Vec3d p2(outPoints[tri[2]]);
+        signedVol6 += p0.dot(p1.cross(p2));
+    }
+    if (signedVol6 < 0.0) {
+        for (auto& tri : outTriangles) {
+            std::swap(tri[1], tri[2]);
+        }
+        if (outPatchTriangles != nullptr) {
+            for (auto& tri : *outPatchTriangles) {
+                std::swap(tri[1], tri[2]);
+            }
+        }
+    }
+}
 /// constrained 3D Eikonal + tool-orientation solver:
 /// 1. `"sdf"`: Full-interior + exterior-band Signed Distance Field via
 ///    `openvdb::tools::meshToSignedDistanceField`.
@@ -308,18 +829,10 @@ void buildObjectScalarFields(
     const float minBoxSpan = std::max(0.1f, std::min({spanX, spanY, spanZ}));
 
     std::vector<openvdb::Vec3s> points;
-    points.reserve(rec.vertexBuffer.size());
-    for (const auto& v : rec.vertexBuffer) {
-        points.emplace_back(v.x, v.y, v.z);
-    }
-
     std::vector<openvdb::Vec3I> triangles;
-    triangles.reserve(rec.indexBuffer.size() / 3);
-    for (std::size_t t = 0; t + 2 < rec.indexBuffer.size(); t += 3) {
-        triangles.emplace_back(
-            rec.indexBuffer[t + 0],
-            rec.indexBuffer[t + 1],
-            rec.indexBuffer[t + 2]);
+    extractWeldedWatertightMesh(rec.vertexBuffer, rec.indexBuffer, points, triangles, nullptr);
+    if (points.empty() || triangles.empty()) {
+        return;
     }
     std::vector<openvdb::Vec4I> quads;
 
@@ -635,8 +1148,33 @@ void tessellateTopoShape(
         return;
     }
 
-    BRepMesh_IncrementalMesh mesher(shape, linearDeflection, Standard_False, angularDeflection, Standard_True);
-    mesher.Perform();
+    IMeshTools_Parameters meshParams;
+    meshParams.Deflection = std::max(linearDeflection, 1.0e-4);
+    meshParams.Angle = std::max(angularDeflection, 1.0e-3);
+    meshParams.InParallel = Standard_True;
+    meshParams.Relative = Standard_False;
+    BRepMesh_IncrementalMesh mesher(shape, meshParams);
+
+    // Check if any face failed the default Watson 2D Delaunay triangulation; if so,
+    // retry with Delabella and relaxed surface-deflection / tolerance controls.
+    bool anyNullFace = false;
+    for (TopExp_Explorer explorer(shape, TopAbs_FACE); explorer.More(); explorer.Next()) {
+        const TopoDS_Face& face = TopoDS::Face(explorer.Current());
+        TopLoc_Location location;
+        if (BRep_Tool::Triangulation(face, location).IsNull()) {
+            anyNullFace = true;
+            break;
+        }
+    }
+    if (anyNullFace) {
+        IMeshTools_Parameters fallbackParams = meshParams;
+        fallbackParams.MeshAlgo = IMeshTools_MeshAlgoType_Delabella;
+        fallbackParams.ForceFaceDeflection = Standard_True;
+        fallbackParams.ControlSurfaceDeflection = Standard_False;
+        fallbackParams.AllowQualityDecrease = Standard_True;
+        fallbackParams.AdjustMinSize = Standard_True;
+        BRepMesh_IncrementalMesh fallbackMesher(shape, fallbackParams);
+    }
 
     std::uint32_t currentFaceId = 0;
     for (TopExp_Explorer explorer(shape, TopAbs_FACE); explorer.More(); explorer.Next()) {
@@ -649,7 +1187,8 @@ void tessellateTopoShape(
         }
 
         const gp_Trsf& trsf = location.Transformation();
-        const bool isReversed = (face.Orientation() == TopAbs_REVERSED);
+        const bool isReversed =
+            (face.Orientation() == TopAbs_REVERSED) != (trsf.IsNegative() == Standard_True);
         const Standard_Integer numNodes = triangulation->NbNodes();
         const Standard_Integer numTriangles = triangulation->NbTriangles();
 
@@ -711,6 +1250,39 @@ void tessellateTopoShape(
             } else {
                 v.nz = 1.0f;
             }
+        }
+        ++currentFaceId;
+    }
+
+    // Reconstruct any faces that failed OCCT triangulation (such as missing conical chamfer
+    // frustums or micro-gaps) by welding boundary vertices and lofting/triangulating open loops.
+    std::vector<openvdb::Vec3s> weldedPts;
+    std::vector<openvdb::Vec3I> weldedTris;
+    std::vector<openvdb::Vec3I> patchTris;
+    extractWeldedWatertightMesh(vertexBuffer, indexBuffer, weldedPts, weldedTris, &patchTris);
+    if (!patchTris.empty()) {
+        for (const auto& tri : patchTris) {
+            const auto& p0 = weldedPts[tri[0]];
+            const auto& p1 = weldedPts[tri[1]];
+            const auto& p2 = weldedPts[tri[2]];
+            const openvdb::Vec3s e1 = p1 - p0;
+            const openvdb::Vec3s e2 = p2 - p0;
+            openvdb::Vec3s nrm = e1.cross(e2);
+            const float nLen = nrm.length();
+            if (nLen > 1.0e-7f) {
+                nrm /= nLen;
+            } else {
+                nrm = openvdb::Vec3s(0.0f, 0.0f, 1.0f);
+            }
+
+            const auto baseIdx = static_cast<std::uint32_t>(vertexBuffer.size());
+            vertexBuffer.push_back(RenderVertex{p0.x(), p0.y(), p0.z(), nrm.x(), nrm.y(), nrm.z()});
+            vertexBuffer.push_back(RenderVertex{p1.x(), p1.y(), p1.z(), nrm.x(), nrm.y(), nrm.z()});
+            vertexBuffer.push_back(RenderVertex{p2.x(), p2.y(), p2.z(), nrm.x(), nrm.y(), nrm.z()});
+            indexBuffer.push_back(baseIdx + 0);
+            indexBuffer.push_back(baseIdx + 1);
+            indexBuffer.push_back(baseIdx + 2);
+            triangleFaceIds.push_back(currentFaceId);
         }
         ++currentFaceId;
     }

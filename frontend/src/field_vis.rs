@@ -3589,7 +3589,221 @@ mod tests {
             "Expected at least 10 full-ring body layers on thin-walled curved shell, got {full_ring_layers_checked}"
         );
 
+        ffi::set_slice_layer_height(ffi::LayerHeightSpec {
+            target_mm: cfg.slicing.layer_height.target_mm,
+            min_mm: cfg.slicing.layer_height.min_mm,
+            max_mm: cfg.slicing.layer_height.max_mm,
+            first_layer_mm: cfg.slicing.layer_height.first_layer_mm,
+            top_layer_mm: cfg.slicing.layer_height.top_layer_mm,
+        });
         let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_a4t_cowling_step_sdf_and_slicing() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let step_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Test Objects/A4T Cowling - Dragon-Rapido UHF [xol-carriage].step");
+        if !step_path.exists() {
+            return;
+        }
+        let cfg = crate::config::SlicerConfig::default();
+        ffi::set_spatial_orientation_hints(&[]);
+        ffi::set_multi_resolution_grid_config(true, 4);
+        ffi::set_slice_layer_height(ffi::LayerHeightSpec {
+            target_mm: cfg.slicing.layer_height.target_mm,
+            min_mm: cfg.slicing.layer_height.min_mm,
+            max_mm: cfg.slicing.layer_height.max_mm,
+            first_layer_mm: cfg.slicing.layer_height.first_layer_mm,
+            top_layer_mm: cfg.slicing.layer_height.top_layer_mm,
+        });
+        let parts = ffi::load_step_assembly(step_path.to_str().unwrap());
+        println!("Loaded {} parts from STEP file", parts.len());
+        assert!(!parts.is_empty(), "Expected at least one part from STEP file");
+
+        for part in &parts {
+            let verts = ffi::get_object_vertices(part.object_id);
+            let indices = ffi::get_object_indices(part.object_id);
+            let mut min_pt = [f32::INFINITY; 3];
+            let mut max_pt = [f32::NEG_INFINITY; 3];
+            for v in &verts {
+                min_pt[0] = min_pt[0].min(v.x);
+                min_pt[1] = min_pt[1].min(v.y);
+                min_pt[2] = min_pt[2].min(v.z);
+                max_pt[0] = max_pt[0].max(v.x);
+                max_pt[1] = max_pt[1].max(v.y);
+                max_pt[2] = max_pt[2].max(v.z);
+            }
+            println!(
+                "  Bounds: X=[{:.2}, {:.2}] ({:.2}), Y=[{:.2}, {:.2}] ({:.2}), Z=[{:.2}, {:.2}] ({:.2})",
+                min_pt[0], max_pt[0], max_pt[0] - min_pt[0],
+                min_pt[1], max_pt[1], max_pt[1] - min_pt[1],
+                min_pt[2], max_pt[2], max_pt[2] - min_pt[2],
+            );
+
+            // Check edge manifoldness before and after spatial vertex welding
+            let mut unwelded_edges: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
+            for tri in indices.chunks_exact(3) {
+                for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                    let key = (a.min(b), a.max(b));
+                    *unwelded_edges.entry(key).or_insert(0) += 1;
+                }
+            }
+            let unwelded_open = unwelded_edges.values().filter(|&&c| c == 1).count();
+            println!(
+                "  Unwelded edges: total={} open(c==1)={} manifold(c==2)={}",
+                unwelded_edges.len(),
+                unwelded_open,
+                unwelded_edges.values().filter(|&&c| c == 2).count()
+            );
+
+            let mut weld_map: std::collections::HashMap<(i64, i64, i64), u32> = std::collections::HashMap::new();
+            let mut welded_idx = Vec::with_capacity(verts.len());
+            let mut unique_count = 0u32;
+            for v in &verts {
+                let key = (
+                    (v.x as f64 * 1000.0).round() as i64,
+                    (v.y as f64 * 1000.0).round() as i64,
+                    (v.z as f64 * 1000.0).round() as i64,
+                );
+                let id = *weld_map.entry(key).or_insert_with(|| {
+                    let id = unique_count;
+                    unique_count += 1;
+                    id
+                });
+                welded_idx.push(id);
+            }
+            let mut welded_edges: std::collections::HashMap<(u32, u32), Vec<bool>> = std::collections::HashMap::new();
+            for tri in indices.chunks_exact(3) {
+                let w0 = welded_idx[tri[0] as usize];
+                let w1 = welded_idx[tri[1] as usize];
+                let w2 = welded_idx[tri[2] as usize];
+                if w0 == w1 || w1 == w2 || w2 == w0 {
+                    continue;
+                }
+                for &(a, b) in &[(w0, w1), (w1, w2), (w2, w0)] {
+                    let key = (a.min(b), a.max(b));
+                    welded_edges.entry(key).or_default().push(a < b);
+                }
+            }
+            let welded_open = welded_edges.values().filter(|v| v.len() == 1).count();
+            let welded_manifold_consistent = welded_edges
+                .values()
+                .filter(|v| v.len() == 2 && v[0] != v[1])
+                .count();
+            let welded_manifold_flipped = welded_edges
+                .values()
+                .filter(|v| v.len() == 2 && v[0] == v[1])
+                .count();
+            let welded_nonmanifold = welded_edges.values().filter(|v| v.len() > 2).count();
+            println!(
+                "  Welded (1um): unique_verts={} total_edges={} open={} consistent_2={} flipped_2={} nonmanifold(>2)={}",
+                unique_count,
+                welded_edges.len(),
+                welded_open,
+                welded_manifold_consistent,
+                welded_manifold_flipped,
+                welded_nonmanifold
+            );
+            assert_eq!(
+                welded_open, 0,
+                "Expected 0 open boundary edges after STEP tessellation hole-closing, got {welded_open}"
+            );
+
+            let mut signed_vol6 = 0.0f64;
+            for tri in indices.chunks_exact(3) {
+                let v0 = &verts[tri[0] as usize];
+                let v1 = &verts[tri[1] as usize];
+                let v2 = &verts[tri[2] as usize];
+                let p0 = [v0.x as f64, v0.y as f64, v0.z as f64];
+                let p1 = [v1.x as f64, v1.y as f64, v1.z as f64];
+                let p2 = [v2.x as f64, v2.y as f64, v2.z as f64];
+                let cx = p1[1] * p2[2] - p1[2] * p2[1];
+                let cy = p1[2] * p2[0] - p1[0] * p2[2];
+                let cz = p1[0] * p2[1] - p1[1] * p2[0];
+                signed_vol6 += p0[0] * cx + p0[1] * cy + p0[2] * cz;
+            }
+            println!(
+                "Part id={} name={} verts={} tris={} signed_volume={:.3} mm^3",
+                part.object_id,
+                part.name,
+                verts.len(),
+                indices.len() / 3,
+                signed_vol6 / 6.0
+            );
+            assert!(signed_vol6 > 0.0, "Expected positive outward signed volume");
+
+            let cfg = crate::config::SlicerConfig::default();
+            assert!(ffi::recompute_object_fields(
+                part.object_id,
+                cfg.eikonal.voxel_size_mm,
+                cfg.eikonal.narrow_band_width_voxels as f32
+            ));
+
+            let sdf_stats = ffi::get_object_field_stats(part.object_id, "sdf");
+            let eik_stats = ffi::get_object_field_stats(part.object_id, "eikonal");
+            let iso0 = ffi::extract_field_isosurface(part.object_id, "sdf", 0.0, 0.0);
+            let iso1 = ffi::extract_field_isosurface(part.object_id, "sdf", 1.0, 0.0);
+            println!(
+                "  SDF stats: valid={} min={:.4} max={:.4} active_voxels={}",
+                sdf_stats.valid,
+                sdf_stats.min_value,
+                sdf_stats.max_value,
+                sdf_stats.active_voxel_count,
+            );
+            println!(
+                "  Eikonal stats: valid={} min={:.4} max={:.4} active_voxels={}",
+                eik_stats.valid,
+                eik_stats.min_value,
+                eik_stats.max_value,
+                eik_stats.active_voxel_count
+            );
+            println!(
+                "  SDF iso=0.0 tris={}, iso=1.0 tris={}",
+                iso0.indices.len() / 3,
+                iso1.indices.len() / 3
+            );
+            assert!(
+                sdf_stats.valid && sdf_stats.min_value < -4.0,
+                "Expected deep negative interior SDF (< -4.0 mm) on A4T Cowling STEP, got min={:.4}",
+                sdf_stats.min_value
+            );
+            assert!(
+                iso0.indices.len() / 3 > 500_000,
+                "Expected complete 0.0 SDF isosurface (>500k tris), got {}",
+                iso0.indices.len() / 3
+            );
+
+            let selected = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+            let non_empty_layers = selected
+                .layers
+                .iter()
+                .filter(|l| !l.contour_segments.is_empty())
+                .count();
+            let toolpaths = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+            println!(
+                "  Selected layers: total={} non_empty={}, toolpath total_paths={} outer={} inner={} infill={}",
+                selected.layers.len(),
+                non_empty_layers,
+                toolpaths.total_path_count,
+                toolpaths.outer_wall_count,
+                toolpaths.inner_wall_count,
+                toolpaths.solid_infill_count
+            );
+            assert!(
+                toolpaths.valid
+                    && toolpaths.outer_wall_count > 1000
+                    && toolpaths.inner_wall_count > 1000
+                    && toolpaths.solid_infill_count > 1000,
+                "Expected full outer wall, inner wall, and infill toolpaths on A4T Cowling STEP, got outer={} inner={} infill={}",
+                toolpaths.outer_wall_count,
+                toolpaths.inner_wall_count,
+                toolpaths.solid_infill_count
+            );
+            let _ = ffi::remove_cad_object(part.object_id);
+        }
     }
 }
 
