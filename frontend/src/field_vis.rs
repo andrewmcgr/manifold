@@ -84,6 +84,41 @@ impl FieldColormap {
     }
 }
 
+/// Color mode for 3D visualization of the CAD object's outer surface mesh.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ObjectSurfaceColorMode {
+    /// Standard solid/translucent CAD material color.
+    #[default]
+    DefaultCad,
+    /// Colors the object surface by overhang angle relative to the queried gravity vector
+    /// $\hat{\mathbf{g}}_{\text{bed}}$ in bed coordinates:
+    /// $\theta_{\text{overhang}} = \arccos(-\hat{\mathbf{n}}_{\text{bed}} \cdot \hat{\mathbf{g}}_{\text{bed}}) \in [0^\circ, 180^\circ]$
+    /// ($0^\circ$ = upward top surface, $90^\circ$ = vertical wall, $135^\circ$ = $45^\circ$ overhang, $180^\circ$ = downward bridge).
+    Overhang,
+    /// Colors the object surface by the angle between the local tool/nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$
+    /// (from the solved 5/6-axis `toolAxisGrid` field when available, or the queried machine `NozzleFrame`)
+    /// and the outward surface normal $\hat{\mathbf{n}}_{\text{bed}}$:
+    /// $\theta_{\text{tool}} = \arccos(\hat{\mathbf{z}}_{\text{nozzle}} \cdot \hat{\mathbf{n}}_{\text{bed}}) \in [0^\circ, 180^\circ]$
+    /// ($0^\circ$ = nozzle perpendicular/conformal to surface, $90^\circ$ = nozzle tangent to surface, $180^\circ$ = opposite).
+    ToolAngleFromNormal,
+}
+
+impl ObjectSurfaceColorMode {
+    pub const ALL: [Self; 3] = [
+        Self::DefaultCad,
+        Self::Overhang,
+        Self::ToolAngleFromNormal,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DefaultCad => "Default CAD Material",
+            Self::Overhang => "Overhang vs. Gravity (0°=Up / 90°=Vertical / 180°=Down)",
+            Self::ToolAngleFromNormal => "Tool Angle from Surface Normal (0°=⊥ / 90°=∥ / 180°=Opp)",
+        }
+    }
+}
+
 /// Color mode for 3D visualization of the selected slicing isosurfaces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SelectedLayersColorMode {
@@ -195,6 +230,18 @@ pub struct FieldVisualizationState {
     /// Opacity of the selected CAD solid mesh (`0.0..=1.0`) so interior slices/isosurfaces are visible.
     pub solid_opacity: f32,
 
+    // --- Object Surface Coloring Controls (Overhang & Tool Angle from Normal) ---
+    pub surface_color_mode: ObjectSurfaceColorMode,
+    pub dirty_surface_colors: bool,
+    pub last_surface_color_transform: Option<Transform>,
+    pub last_surface_color_gravity_bed: [f32; 3],
+    pub last_surface_color_nozzle_bed: [f32; 3],
+    pub last_solved_field_rotation: Option<Quat>,
+    pub surface_color_min_deg: f32,
+    pub surface_color_max_deg: f32,
+    pub surface_color_mean_deg: f32,
+    pub surface_color_uses_solved_tool: bool,
+
     // --- 3D Isosurface & Object Intersection Controls ---
     pub show_isosurface: bool,
     pub isovalue: f32,
@@ -283,6 +330,16 @@ impl Default for FieldVisualizationState {
             cached_stats: None,
             last_object_id: None,
             solid_opacity: 0.25,
+            surface_color_mode: ObjectSurfaceColorMode::DefaultCad,
+            dirty_surface_colors: true,
+            last_surface_color_transform: None,
+            last_surface_color_gravity_bed: [0.0, 0.0, -1.0],
+            last_surface_color_nozzle_bed: [0.0, 0.0, 1.0],
+            last_solved_field_rotation: None,
+            surface_color_min_deg: 0.0,
+            surface_color_max_deg: 180.0,
+            surface_color_mean_deg: 90.0,
+            surface_color_uses_solved_tool: false,
             show_isosurface: false,
             isovalue: 0.0,
             adaptivity: 0.0,
@@ -365,6 +422,7 @@ impl FieldVisualizationState {
         self.dirty_planned_gcode = true;
         self.dirty_toolpaths_mesh = true;
         self.dirty_slice = true;
+        self.dirty_surface_colors = true;
     }
 
     /// Spawns an asynchronous background task on `IoTaskPool` to compute selected slicing
@@ -576,6 +634,16 @@ pub fn sync_field_visualization_system(
 
     // 1. Detect object selection change
     if vis_state.last_object_id != selected_id {
+        if let Some(prev_id) = vis_state.last_object_id {
+            if let Some(prev_obj) = plate.objects.iter().find(|o| o.object_id == prev_id) {
+                if let Some(mesh) = meshes.get_mut(&prev_obj.mesh_handle) {
+                    mesh.insert_attribute(
+                        Mesh::ATTRIBUTE_COLOR,
+                        vec![[1.0f32, 1.0, 1.0, 1.0]; prev_obj.vertices.len()],
+                    );
+                }
+            }
+        }
         vis_state.last_object_id = selected_id;
         vis_state.available_fields.clear();
         vis_state.cached_stats = None;
@@ -590,6 +658,9 @@ pub fn sync_field_visualization_system(
         vis_state.dirty_planned_gcode = true;
         vis_state.dirty_toolpaths_mesh = true;
         vis_state.dirty_slice = true;
+        vis_state.dirty_surface_colors = true;
+        vis_state.last_surface_color_transform = None;
+        vis_state.last_solved_field_rotation = None;
 
         if let Some(id) = selected_id {
             if !vis_state.is_busy() {
@@ -641,6 +712,49 @@ pub fn sync_field_visualization_system(
 
     if vis_state.cached_stats.is_none() && !vis_state.is_busy() {
         vis_state.refresh_stats_for(obj_id);
+    }
+
+    // 1b. Update CAD object surface vertex colors (Default CAD / Overhang / Tool Angle from Normal)
+    let tf_changed = vis_state.last_surface_color_transform != Some(obj_world_tf);
+    let grav_changed = vis_state.last_surface_color_gravity_bed != config.machine.gravity_direction_bed;
+    let nozzle_changed = vis_state.last_surface_color_nozzle_bed != config.machine.nozzle_axis_bed;
+    if vis_state.dirty_surface_colors
+        || (vis_state.surface_color_mode != ObjectSurfaceColorMode::DefaultCad
+            && (tf_changed || grav_changed || nozzle_changed))
+    {
+        vis_state.dirty_surface_colors = false;
+        vis_state.last_surface_color_transform = Some(obj_world_tf);
+        vis_state.last_surface_color_gravity_bed = config.machine.gravity_direction_bed;
+        vis_state.last_surface_color_nozzle_bed = config.machine.nozzle_axis_bed;
+
+        let solved_axes = if vis_state.surface_color_mode == ObjectSurfaceColorMode::ToolAngleFromNormal
+            && !vis_state.is_busy()
+            && vis_state.available_fields.iter().any(|f| f == "tool_tilt_deg" || f == "eikonal")
+            && vis_state
+                .last_solved_field_rotation
+                .map_or(true, |r| r.angle_between(obj_world_tf.rotation) < 1.0e-3)
+        {
+            ffi::get_object_vertex_tool_axes(obj_id)
+        } else {
+            Vec::new()
+        };
+
+        let (colors, min_deg, max_deg, mean_deg, uses_solved) =
+            compute_object_surface_vertex_colors(
+                &scene_obj.vertices,
+                &obj_world_tf,
+                &config,
+                vis_state.surface_color_mode,
+                &solved_axes,
+            );
+        vis_state.surface_color_min_deg = min_deg;
+        vis_state.surface_color_max_deg = max_deg;
+        vis_state.surface_color_mean_deg = mean_deg;
+        vis_state.surface_color_uses_solved_tool = uses_solved;
+
+        if let Some(mesh) = meshes.get_mut(&scene_obj.mesh_handle) {
+            mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+        }
     }
 
     // Check if hover highlight on the selected layers list changed
@@ -1655,6 +1769,92 @@ pub const BRANCH_PALETTE: [[f32; 3]; 8] = [
     [0.58, 0.48, 0.96],
     [0.24, 0.90, 0.92],
 ];
+
+/// Computes per-vertex linear RGBA colors (`Mesh::ATTRIBUTE_COLOR`) and summary angle statistics
+/// `(min_deg, max_deg, mean_deg, uses_solved_tool)` for an object's surface mesh under
+/// `ObjectSurfaceColorMode`.
+///
+/// Obeys `AGENTS.md` kinematic invariants:
+/// - Overhang is always measured relative to the queried gravity vector in bed coordinates
+///   (`config.query_gravity_direction(p_bed)`), never hardcoding `(0, 0, -1)`.
+/// - Tool angle from normal is always measured between the outward surface normal in bed
+///   coordinates and the local nozzle/tool axis (`solved_local_tool_axes` rotated into bed
+///   coordinates when available, or `config.query_nozzle_frame(p_bed, Vec3::X).nozzle_axis`),
+///   never hardcoding `(0, 0, 1)`.
+pub fn compute_object_surface_vertex_colors(
+    vertices: &[ffi::RenderVertex],
+    obj_transform: &Transform,
+    config: &SlicerConfig,
+    mode: ObjectSurfaceColorMode,
+    solved_local_tool_axes: &[f32],
+) -> (Vec<[f32; 4]>, f32, f32, f32, bool) {
+    if vertices.is_empty() || mode == ObjectSurfaceColorMode::DefaultCad {
+        return (
+            vec![[1.0f32, 1.0, 1.0, 1.0]; vertices.len()],
+            0.0,
+            180.0,
+            0.0,
+            false,
+        );
+    }
+
+    let has_solved_axes = solved_local_tool_axes.len() == vertices.len() * 3;
+    let mut colors = Vec::with_capacity(vertices.len());
+    let mut min_deg = f32::INFINITY;
+    let mut max_deg = f32::NEG_INFINITY;
+    let mut sum_deg = 0.0_f64;
+
+    for (i, v) in vertices.iter().enumerate() {
+        let p_local = Vec3::new(v.x, v.y, v.z);
+        let p_bed = obj_transform.transform_point(p_local);
+        let n_local = Vec3::new(v.nx, v.ny, v.nz);
+        let n_bed = (obj_transform.rotation * n_local)
+            .try_normalize()
+            .unwrap_or(Vec3::Z);
+
+        let angle_deg = match mode {
+            ObjectSurfaceColorMode::DefaultCad => 0.0,
+            ObjectSurfaceColorMode::Overhang => {
+                let g_bed = config.query_gravity_bed(p_bed);
+                // -n_bed . g_bed == +1 when outward normal points opposite to gravity (upward top),
+                // 0 on vertical walls, and -1 on downward-facing overhangs/ceilings.
+                let cos_up = (-n_bed.dot(g_bed)).clamp(-1.0, 1.0);
+                cos_up.acos().to_degrees()
+            }
+            ObjectSurfaceColorMode::ToolAngleFromNormal => {
+                let z_nozzle_bed = if has_solved_axes {
+                    let ax = solved_local_tool_axes[i * 3];
+                    let ay = solved_local_tool_axes[i * 3 + 1];
+                    let az = solved_local_tool_axes[i * 3 + 2];
+                    (obj_transform.rotation * Vec3::new(ax, ay, az))
+                        .try_normalize()
+                        .unwrap_or_else(|| config.query_nozzle_frame(p_bed, Vec3::X).nozzle_axis)
+                } else {
+                    config.query_nozzle_frame(p_bed, Vec3::X).nozzle_axis
+                };
+                let cos_tool = n_bed.dot(z_nozzle_bed).clamp(-1.0, 1.0);
+                cos_tool.acos().to_degrees()
+            }
+        };
+
+        min_deg = min_deg.min(angle_deg);
+        max_deg = max_deg.max(angle_deg);
+        sum_deg += angle_deg as f64;
+
+        let t = (angle_deg / 180.0).clamp(0.0, 1.0);
+        let srgba = high_contrast_parameter_ramp(t);
+        colors.push(srgba_to_linear_rgba(srgba));
+    }
+
+    let mean_deg = (sum_deg / (vertices.len() as f64)) as f32;
+    (
+        colors,
+        if min_deg.is_finite() { min_deg } else { 0.0 },
+        if max_deg.is_finite() { max_deg } else { 180.0 },
+        mean_deg,
+        has_solved_axes && mode == ObjectSurfaceColorMode::ToolAngleFromNormal,
+    )
+}
 
 /// Samples the 2D slice plane `FieldColormap` at normalized position `t` in `[0.0, 1.0]`
 /// given `[min_v, max_v]` (used by both the 2D slice rasterizer and the UI legend bar).
@@ -3804,6 +4004,148 @@ mod tests {
             );
             let _ = ffi::remove_cad_object(part.object_id);
         }
+    }
+
+    #[test]
+    fn test_object_surface_coloring_overhang_and_tool_angle() {
+        let _guard = TEST_BACKEND_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let test_verts = vec![
+            // 0: Upward face (+Z)
+            ffi::RenderVertex {
+                x: 0.0,
+                y: 0.0,
+                z: 10.0,
+                nx: 0.0,
+                ny: 0.0,
+                nz: 1.0,
+            },
+            // 1: Right face (+X)
+            ffi::RenderVertex {
+                x: 10.0,
+                y: 0.0,
+                z: 0.0,
+                nx: 1.0,
+                ny: 0.0,
+                nz: 0.0,
+            },
+            // 2: Downward face (-Z)
+            ffi::RenderVertex {
+                x: 0.0,
+                y: 0.0,
+                z: -10.0,
+                nx: 0.0,
+                ny: 0.0,
+                nz: -1.0,
+            },
+        ];
+
+        let mut cfg = SlicerConfig::default();
+        // 1. Default gravity (0, 0, -1) and identity transform:
+        //    v0 (+Z) -> 0 deg overhang, v1 (+X) -> 90 deg, v2 (-Z) -> 180 deg.
+        let (colors_ovh, min_ovh, max_ovh, mean_ovh, uses_solved) =
+            compute_object_surface_vertex_colors(
+                &test_verts,
+                &Transform::IDENTITY,
+                &cfg,
+                ObjectSurfaceColorMode::Overhang,
+                &[],
+            );
+        assert!(!uses_solved);
+        assert!((min_ovh - 0.0).abs() < 1.0e-3);
+        assert!((max_ovh - 180.0).abs() < 1.0e-3);
+        assert!((mean_ovh - 90.0).abs() < 1.0e-3);
+        assert_eq!(colors_ovh[0], srgba_to_linear_rgba(high_contrast_parameter_ramp(0.0)));
+        assert_eq!(colors_ovh[1], srgba_to_linear_rgba(high_contrast_parameter_ramp(0.5)));
+        assert_eq!(colors_ovh[2], srgba_to_linear_rgba(high_contrast_parameter_ramp(1.0)));
+
+        // 2. Tilted gravity in bed coordinates (-X, 0, 0) via query_gravity_direction:
+        //    v1 (+X) points directly opposite to gravity (-X), so v1 has 0 deg overhang!
+        cfg.machine.gravity_direction_bed = [-1.0, 0.0, 0.0];
+        let (colors_tilted_g, _, _, _, _) = compute_object_surface_vertex_colors(
+            &test_verts,
+            &Transform::IDENTITY,
+            &cfg,
+            ObjectSurfaceColorMode::Overhang,
+            &[],
+        );
+        assert_eq!(
+            colors_tilted_g[1],
+            srgba_to_linear_rgba(high_contrast_parameter_ramp(0.0)),
+            "+X normal must have 0° overhang when gravity is (-1, 0, 0)"
+        );
+        assert_eq!(
+            colors_tilted_g[0],
+            srgba_to_linear_rgba(high_contrast_parameter_ramp(0.5)),
+            "+Z normal must have 90° overhang when gravity is (-1, 0, 0)"
+        );
+
+        // 3. ToolAngleFromNormal with tilted nozzle axis (1, 0, 0) via query_nozzle_frame:
+        cfg.machine.nozzle_axis_bed = [1.0, 0.0, 0.0];
+        let (colors_tool_nom, min_tn, max_tn, _, uses_solved_nom) =
+            compute_object_surface_vertex_colors(
+                &test_verts,
+                &Transform::IDENTITY,
+                &cfg,
+                ObjectSurfaceColorMode::ToolAngleFromNormal,
+                &[],
+            );
+        assert!(!uses_solved_nom);
+        assert!((min_tn - 0.0).abs() < 1.0e-3);
+        assert!((max_tn - 90.0).abs() < 1.0e-3);
+        assert_eq!(
+            colors_tool_nom[1],
+            srgba_to_linear_rgba(high_contrast_parameter_ramp(0.0)),
+            "+X normal aligned with +X nozzle axis must give 0° tool angle from normal"
+        );
+
+        // 4. Solved 3D toolAxisGrid via FFI (`get_object_vertex_tool_axes`) on a solid mesh:
+        let positions: [f32; 24] = [
+            -6.0, -6.0, -6.0,
+             6.0, -6.0, -6.0,
+             6.0,  6.0, -6.0,
+            -6.0,  6.0, -6.0,
+            -6.0, -6.0,  6.0,
+             6.0, -6.0,  6.0,
+             6.0,  6.0,  6.0,
+            -6.0,  6.0,  6.0,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2,
+            4, 5, 6, 4, 6, 7,
+            0, 1, 5, 0, 5, 4,
+            1, 2, 6, 1, 6, 5,
+            2, 3, 7, 2, 7, 6,
+            3, 0, 4, 3, 4, 7,
+        ];
+        let part = ffi::register_triangle_mesh("surface_color_box", &positions, &indices);
+        assert!(part.object_id > 0);
+        ffi::set_nozzle_axis_bed([0.0, 0.0, 1.0]);
+        ffi::set_gravity_direction_bed([0.0, 0.0, -1.0]);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.8, 5.0));
+
+        let obj_verts = ffi::get_object_vertices(part.object_id);
+        let solved_axes = ffi::get_object_vertex_tool_axes(part.object_id);
+        assert_eq!(
+            solved_axes.len(),
+            obj_verts.len() * 3,
+            "Expected 3 solved tool axis components per object surface vertex"
+        );
+        let (colors_solved, min_s, max_s, _, uses_solved_field) =
+            compute_object_surface_vertex_colors(
+                &obj_verts,
+                &Transform::IDENTITY,
+                &SlicerConfig::default(),
+                ObjectSurfaceColorMode::ToolAngleFromNormal,
+                &solved_axes,
+            );
+        assert!(uses_solved_field);
+        assert_eq!(colors_solved.len(), obj_verts.len());
+        assert!(min_s >= 0.0 && max_s <= 180.0 && max_s > min_s);
+
+        let _ = ffi::remove_cad_object(part.object_id);
     }
 }
 

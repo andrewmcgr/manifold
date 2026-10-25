@@ -274,6 +274,11 @@ pub mod ffi {
         /// (empty for pure triangle meshes).
         pub fn get_object_triangle_face_ids(object_id: u64) -> Vec<u32>;
 
+        /// Retrieves the solved 3D unit tool axis (`[ax, ay, az]` per vertex in local object
+        /// coordinates, length `3 * vertex_count`) sampled on the object's surface mesh from
+        /// `toolAxisGrid`, or an empty `Vec` if `toolAxisGrid` has not been computed yet.
+        pub fn get_object_vertex_tool_axes(object_id: u64) -> Vec<f32>;
+
         /// Removes `object_id` from the C++ backend without disturbing other objects.
         pub fn remove_cad_object(object_id: u64) -> bool;
 

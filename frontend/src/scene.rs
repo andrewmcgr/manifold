@@ -82,6 +82,7 @@ pub struct SceneObject {
     pub source_file: String,
     pub has_brep: bool,
     pub entity: Entity,
+    pub mesh_handle: Handle<Mesh>,
     pub material_handle: Handle<StandardMaterial>,
     pub vertices: Vec<RenderVertex>,
     pub indices: Vec<u32>,
@@ -280,6 +281,7 @@ pub fn spawn_loaded_objects(
 
         let mut positions = Vec::with_capacity(data.vertices.len());
         let mut normals = Vec::with_capacity(data.vertices.len());
+        let colors = vec![[1.0f32, 1.0, 1.0, 1.0]; data.vertices.len()];
         for v in &data.vertices {
             positions.push([v.x, v.y, v.z]);
             normals.push([v.nx, v.ny, v.nz]);
@@ -291,7 +293,10 @@ pub fn spawn_loaded_objects(
         )
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
         .with_inserted_indices(Indices::U32(data.indices.clone()));
+
+        let mesh_handle = meshes.add(bevy_mesh);
 
         let mat_handle = materials.add(StandardMaterial {
             base_color: Color::srgb(0.24, 0.62, 0.92),
@@ -311,7 +316,7 @@ pub fn spawn_loaded_objects(
         let entity = commands
             .spawn((
                 PbrBundle {
-                    mesh: meshes.add(bevy_mesh),
+                    mesh: mesh_handle.clone(),
                     material: mat_handle.clone(),
                     transform: initial_transform,
                     ..default()
@@ -328,6 +333,7 @@ pub fn spawn_loaded_objects(
             source_file: data.source_file,
             has_brep: data.has_brep,
             entity,
+            mesh_handle,
             material_handle: mat_handle,
             vertices: data.vertices,
             indices: data.indices,
@@ -462,26 +468,43 @@ pub fn update_selection_materials_system(
                 } else {
                     1.0
                 };
+                let use_vertex_colormap = vis_state.surface_color_mode
+                    != crate::field_vis::ObjectSurfaceColorMode::DefaultCad;
                 if alpha < 0.02 {
                     mat.base_color = Color::srgba(0.55, 0.60, 0.68, 0.0);
                     mat.alpha_mode = AlphaMode::Mask(1.0);
                     mat.cull_mode = Some(wgpu::Face::Back);
                 } else if alpha < 0.99 {
-                    // Neutral, low-glare ghost shell so it does not cast a colored or specular
-                    // veil over internal toolpaths, isosurfaces, or scalar slices.
-                    mat.base_color = Color::srgba(0.52, 0.56, 0.64, alpha);
-                    mat.metallic = 0.0;
-                    mat.perceptual_roughness = 0.90;
-                    mat.reflectance = 0.06;
+                    if use_vertex_colormap {
+                        mat.base_color = Color::srgba(1.0, 1.0, 1.0, alpha);
+                        mat.metallic = 0.0;
+                        mat.perceptual_roughness = 0.78;
+                        mat.reflectance = 0.08;
+                    } else {
+                        // Neutral, low-glare ghost shell so it does not cast a colored or specular
+                        // veil over internal toolpaths, isosurfaces, or scalar slices.
+                        mat.base_color = Color::srgba(0.52, 0.56, 0.64, alpha);
+                        mat.metallic = 0.0;
+                        mat.perceptual_roughness = 0.90;
+                        mat.reflectance = 0.06;
+                    }
                     mat.alpha_mode = AlphaMode::Blend;
                     // Backface culling prevents the translucent CAD shell from self-interfering
                     mat.cull_mode = Some(wgpu::Face::Back);
                     mat.double_sided = false;
                 } else {
-                    mat.base_color = Color::srgba(0.32, 0.76, 0.98, 1.0);
-                    mat.metallic = 0.22;
-                    mat.perceptual_roughness = 0.45;
-                    mat.reflectance = 0.50;
+                    if use_vertex_colormap {
+                        // Pure white base_color so per-vertex ATTRIBUTE_COLOR directly drives the surface colormap
+                        mat.base_color = Color::srgba(1.0, 1.0, 1.0, 1.0);
+                        mat.metallic = 0.04;
+                        mat.perceptual_roughness = 0.62;
+                        mat.reflectance = 0.18;
+                    } else {
+                        mat.base_color = Color::srgba(0.32, 0.76, 0.98, 1.0);
+                        mat.metallic = 0.22;
+                        mat.perceptual_roughness = 0.45;
+                        mat.reflectance = 0.50;
+                    }
                     mat.alpha_mode = AlphaMode::Opaque;
                     mat.cull_mode = None;
                     mat.double_sided = true;

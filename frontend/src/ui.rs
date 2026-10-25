@@ -11,8 +11,8 @@ use crate::config::{
 };
 use crate::field_vis::{
     high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
-    FieldVisualizationState, IsoIntersectionMode, SelectedLayersColorMode, SliceAxis,
-    ToolpathColorMode, BRANCH_PALETTE,
+    FieldVisualizationState, IsoIntersectionMode, ObjectSurfaceColorMode,
+    SelectedLayersColorMode, SliceAxis, ToolpathColorMode, BRANCH_PALETTE,
 };
 use crate::hull::rotation_to_place_face_on_bed;
 use crate::io::threemf::{save_project_to_3mf, ExportableObject};
@@ -1200,6 +1200,72 @@ pub fn ui_workspace_system(
                                 egui::Slider::new(&mut vis_state.solid_opacity, 0.0..=1.0)
                                     .text("CAD Mesh Opacity"),
                             );
+
+                            ui.horizontal(|ui| {
+                                ui.label("Object Surface Color:");
+                                egui::ComboBox::from_id_source("object_surface_color_mode_combo")
+                                    .selected_text(vis_state.surface_color_mode.label())
+                                    .show_ui(ui, |ui| {
+                                        for mode in ObjectSurfaceColorMode::ALL {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut vis_state.surface_color_mode,
+                                                    mode,
+                                                    mode.label(),
+                                                )
+                                                .changed()
+                                            {
+                                                vis_state.dirty_surface_colors = true;
+                                            }
+                                        }
+                                    });
+                            });
+
+                            match vis_state.surface_color_mode {
+                                ObjectSurfaceColorMode::DefaultCad => {}
+                                ObjectSurfaceColorMode::Overhang => {
+                                    draw_continuous_gradient_legend(
+                                        ui,
+                                        "Surface Overhang vs. Gravity (0°=Up / 90°=Vert / 135°=45° Overhang / 180°=Down)",
+                                        0.0,
+                                        180.0,
+                                        "°",
+                                        0,
+                                        high_contrast_parameter_ramp,
+                                    );
+                                    ui.small(format!(
+                                        "Surface Overhang Range: [{:.1}°, {:.1}°] (Mean {:.1}°) | Gravity Bed = ({:.2}, {:.2}, {:.2})",
+                                        vis_state.surface_color_min_deg,
+                                        vis_state.surface_color_max_deg,
+                                        vis_state.surface_color_mean_deg,
+                                        config.machine.gravity_direction_bed[0],
+                                        config.machine.gravity_direction_bed[1],
+                                        config.machine.gravity_direction_bed[2],
+                                    ));
+                                }
+                                ObjectSurfaceColorMode::ToolAngleFromNormal => {
+                                    draw_continuous_gradient_legend(
+                                        ui,
+                                        "Tool Angle from Surface Normal (0°=⊥ Conformal / 90°=∥ Tangent / 180°=Opposite)",
+                                        0.0,
+                                        180.0,
+                                        "°",
+                                        0,
+                                        high_contrast_parameter_ramp,
+                                    );
+                                    let source_label = if vis_state.surface_color_uses_solved_tool {
+                                        "Solved 3D Tool Axis Field"
+                                    } else {
+                                        "Nominal Machine Nozzle Frame (Compute Fields for solved 5/6-axis field)"
+                                    };
+                                    ui.small(format!(
+                                        "Tool-Normal Angle Range: [{:.1}°, {:.1}°] (Mean {:.1}°) | Source: {source_label}",
+                                        vis_state.surface_color_min_deg,
+                                        vis_state.surface_color_max_deg,
+                                        vis_state.surface_color_mean_deg,
+                                    ));
+                                }
+                            }
 
                             ui.separator();
 
@@ -3737,6 +3803,7 @@ fn spawn_field_compute_task(
     let task = IoTaskPool::get().spawn(async move {
         ffi::recompute_object_fields(object_id, voxel_size, narrow_band)
     });
+    vis_state.last_solved_field_rotation = Some(obj_rotation);
     vis_state.pending_field_task = Some((object_id, object_name.to_string(), task));
     plate.status_message = format!(
         "Computing OpenVDB scalar fields for '{object_name}' in background (voxel {voxel_size:.2} mm)..."

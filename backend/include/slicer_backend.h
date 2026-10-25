@@ -80,6 +80,10 @@ public:
     /// Returns the per-triangle STEP B-Rep TopoDS_Face index for `objectId` (empty for pure triangle meshes).
     std::vector<std::uint32_t> objectTriangleFaceIds(std::uint64_t objectId) const;
 
+    /// Returns the solved 3D unit tool axis (`3 * vertexBuffer.size()` floats `[ax, ay, az, ...]`)
+    /// sampled at each surface vertex of `objectId` from `toolAxisGrid` (or empty if unavailable).
+    std::vector<float> objectVertexToolAxes(std::uint64_t objectId) const;
+
     /// Lists all named OpenVDB scalar fields stored on `objectId`.
     std::vector<std::string> listObjectFields(std::uint64_t objectId) const;
 
@@ -208,6 +212,7 @@ DecomposedPartInfo register_triangle_mesh(
 rust::Vec<RenderVertex> get_object_vertices(std::uint64_t object_id);
 rust::Vec<std::uint32_t> get_object_indices(std::uint64_t object_id);
 rust::Vec<std::uint32_t> get_object_triangle_face_ids(std::uint64_t object_id);
+rust::Vec<float> get_object_vertex_tool_axes(std::uint64_t object_id);
 bool remove_cad_object(std::uint64_t object_id);
 bool export_object_step_to_path(std::uint64_t object_id, rust::Str path);
 

@@ -1524,6 +1524,64 @@ std::vector<std::uint32_t> SlicerBackend::objectTriangleFaceIds(std::uint64_t ob
     return it->second.triangleFaceIds;
 }
 
+std::vector<float> SlicerBackend::objectVertexToolAxes(std::uint64_t objectId) const {
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return {};
+    }
+    const ObjectRecord& rec = it->second;
+    if (!rec.toolAxisGrid || rec.vertexBuffer.empty()) {
+        return {};
+    }
+
+    const openvdb::Vec3SGrid& grid = *rec.toolAxisGrid;
+    const float voxelSize = static_cast<float>(grid.transform().voxelSize()[0]);
+    const float inwardStep = 0.60f * voxelSize;
+    openvdb::tools::GridSampler<openvdb::Vec3SGrid, openvdb::tools::BoxSampler> sampler(grid);
+
+    std::unique_ptr<openvdb::tools::GridSampler<openvdb::Vec3SGrid, openvdb::tools::BoxSampler>> coarseSampler;
+    if (rec.isMultiResolution && rec.coarseToolAxisGrid) {
+        coarseSampler = std::make_unique<
+            openvdb::tools::GridSampler<openvdb::Vec3SGrid, openvdb::tools::BoxSampler>>(
+            *rec.coarseToolAxisGrid);
+    }
+
+    const std::array<float, 3> fallback = impl_->nozzleAxisBed;
+    auto normalizeVec3 = [](float x, float y, float z, const std::array<float, 3>& fb) -> std::array<float, 3> {
+        const float len = std::sqrt(x * x + y * y + z * z);
+        if (len > 1.0e-7f) {
+            return {x / len, y / len, z / len};
+        }
+        return fb;
+    };
+    std::vector<float> out(rec.vertexBuffer.size() * 3, 0.0f);
+    for (std::size_t i = 0; i < rec.vertexBuffer.size(); ++i) {
+        const RenderVertex& v = rec.vertexBuffer[i];
+        const auto nUnit = normalizeVec3(v.nx, v.ny, v.nz, fallback);
+        // Sample slightly inside the surface (-0.6 * voxelSize * nUnit) so trilinear BoxSampler
+        // reads solved interior voxels rather than exterior air voxels where toolAxis == bedNormal.
+        const openvdb::Vec3d wpIn(
+            v.x - inwardStep * nUnit[0],
+            v.y - inwardStep * nUnit[1],
+            v.z - inwardStep * nUnit[2]);
+        openvdb::Vec3s sampled = sampler.wsSample(wpIn);
+        float lenSq = sampled.x() * sampled.x() + sampled.y() * sampled.y() + sampled.z() * sampled.z();
+        if (lenSq < 1.0e-4f) {
+            const openvdb::Vec3d wp0(v.x, v.y, v.z);
+            sampled = sampler.wsSample(wp0);
+            lenSq = sampled.x() * sampled.x() + sampled.y() * sampled.y() + sampled.z() * sampled.z();
+            if (lenSq < 1.0e-4f && coarseSampler) {
+                sampled = coarseSampler->wsSample(wpIn);
+            }
+        }
+        const auto unitAxis = normalizeVec3(sampled.x(), sampled.y(), sampled.z(), fallback);
+        out[i * 3 + 0] = unitAxis[0];
+        out[i * 3 + 1] = unitAxis[1];
+        out[i * 3 + 2] = unitAxis[2];
+    }
+    return out;
+}
+
 std::vector<std::string> SlicerBackend::listObjectFields(std::uint64_t objectId) const {
     std::vector<std::string> names;
     const auto it = impl_->objects.find(objectId);
@@ -2222,6 +2280,17 @@ rust::Vec<std::uint32_t> get_object_triangle_face_ids(std::uint64_t object_id) {
     out.reserve(src.size());
     for (const std::uint32_t fid : src) {
         out.push_back(fid);
+    }
+    return out;
+}
+
+rust::Vec<float> get_object_vertex_tool_axes(std::uint64_t object_id) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const auto src = globalBackend().objectVertexToolAxes(object_id);
+    rust::Vec<float> out;
+    out.reserve(src.size());
+    for (const float v : src) {
+        out.push_back(v);
     }
     return out;
 }
