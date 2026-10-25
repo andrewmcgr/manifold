@@ -170,6 +170,8 @@ fn render_toolpath_color_legend(
             &[
                 ("Outer Wall", [0.98, 0.44, 0.16, 1.0]),
                 ("Inner Wall", [0.24, 0.90, 0.42, 1.0]),
+                ("Bridge", [0.18, 0.52, 0.98, 1.0]),
+                ("Wave Overhang", [0.98, 0.26, 0.68, 1.0]),
                 ("Solid Infill", [0.22, 0.76, 0.98, 1.0]),
                 ("Sparse Infill", [0.98, 0.78, 0.18, 1.0]),
                 ("Gap Fill", [0.98, 0.32, 0.88, 1.0]),
@@ -1952,6 +1954,58 @@ pub fn ui_workspace_system(
                                 param_help_button(ui, "slicing.infill_angle_deg");
                             });
 
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.small(
+                                    egui::RichText::new("Overhangs (Bridging & Wave Overhangs):")
+                                        .strong(),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut config.slicing.overhang_angle_threshold_deg,
+                                            10.0..=85.0,
+                                        )
+                                        .suffix("°")
+                                        .text("Overhang Threshold"),
+                                    )
+                                    .changed();
+                                param_help_button(ui, "slicing.overhang_angle_threshold_deg");
+                            });
+                            ui.horizontal(|ui| {
+                                tp_cfg_changed |= ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut config.slicing.max_bridge_length_mm,
+                                            0.0..=200.0,
+                                        )
+                                        .suffix(" mm")
+                                        .text("Max Bridge Length"),
+                                    )
+                                    .changed();
+                                param_help_button(ui, "slicing.max_bridge_length_mm");
+                            });
+                            ui.horizontal(|ui| {
+                                let mut overlap_pct =
+                                    config.slicing.wave_overhang_overlap_fraction * 100.0;
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut overlap_pct, 1.0..=45.0)
+                                            .suffix("%")
+                                            .text("Wave Overlap"),
+                                    )
+                                    .changed()
+                                {
+                                    config.slicing.wave_overhang_overlap_fraction =
+                                        overlap_pct / 100.0;
+                                    tp_cfg_changed = true;
+                                }
+                                param_help_button(ui, "slicing.wave_overhang_overlap_fraction");
+                            });
+                            ui.separator();
+
                             // Line Widths: Outer Wall, Inner Wall, Solid Infill, Sparse Infill (Target, Min, Max)
                             ui.horizontal(|ui| {
                                 ui.small(
@@ -2245,10 +2299,12 @@ pub fn ui_workspace_system(
 
                             if let Some(ref tp_res) = vis_state.cached_toolpaths {
                                 ui.small(format!(
-                                    "Paths: {} total ({} outer, {} inner, {} solid/gap, {} sparse)",
+                                    "Paths: {} total ({} outer, {} inner, {} bridge, {} wave, {} solid/gap, {} sparse)",
                                     tp_res.total_path_count,
                                     tp_res.outer_wall_count,
                                     tp_res.inner_wall_count,
+                                    tp_res.bridge_count,
+                                    tp_res.wave_overhang_count,
                                     tp_res.solid_infill_count,
                                     tp_res.sparse_infill_count
                                 ));
@@ -2518,6 +2574,32 @@ pub fn ui_workspace_system(
                                             .changed();
                                         param_help_button(ui, "gcode.first_layer_flow_multiplier");
                                     });
+                                    ui.horizontal(|ui| {
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut gc.bridge_flow_multiplier,
+                                                    0.50..=1.50,
+                                                )
+                                                .suffix("×")
+                                                .text("Bridge Flow Mult"),
+                                            )
+                                            .changed();
+                                        param_help_button(ui, "gcode.bridge_flow_multiplier");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut gc.wave_overhang_flow_multiplier,
+                                                    0.50..=1.50,
+                                                )
+                                                .suffix("×")
+                                                .text("Wave Overhang Mult"),
+                                            )
+                                            .changed();
+                                        param_help_button(ui, "gcode.wave_overhang_flow_multiplier");
+                                    });
 
                                     ui.separator();
                                     ui.horizontal(|ui| {
@@ -2532,6 +2614,35 @@ pub fn ui_workspace_system(
                                             )
                                             .changed();
                                         param_help_button(ui, "gcode.fan_speed_percent");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut gc.bridge_fan_speed_percent,
+                                                    0.0..=100.0,
+                                                )
+                                                .suffix("%")
+                                                .text("Bridge Fan Speed"),
+                                            )
+                                            .changed();
+                                        param_help_button(ui, "gcode.bridge_fan_speed_percent");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut gc.wave_overhang_fan_speed_percent,
+                                                    0.0..=100.0,
+                                                )
+                                                .suffix("%")
+                                                .text("Wave Fan Speed"),
+                                            )
+                                            .changed();
+                                        param_help_button(
+                                            ui,
+                                            "gcode.wave_overhang_fan_speed_percent",
+                                        );
                                     });
                                     ui.horizontal(|ui| {
                                         gc_changed |= ui
@@ -2606,6 +2717,29 @@ pub fn ui_workspace_system(
                                             )
                                             .changed();
                                         param_help_button(ui, "gcode.infill_speeds_mms");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Bridge / Wave (mm/s):");
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut gc.bridge_speed_mms)
+                                                    .speed(1.0)
+                                                    .range(5.0..=400.0)
+                                                    .prefix("Brg: "),
+                                            )
+                                            .changed();
+                                        param_help_button(ui, "gcode.bridge_speed_mms");
+                                        gc_changed |= ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut gc.wave_overhang_speed_mms,
+                                                )
+                                                .speed(1.0)
+                                                .range(5.0..=400.0)
+                                                .prefix("Wave: "),
+                                            )
+                                            .changed();
+                                        param_help_button(ui, "gcode.wave_overhang_speed_mms");
                                     });
                                     ui.horizontal(|ui| {
                                         ui.label("Gap Fill / Z-Hop (mm/s):");
@@ -3707,6 +3841,9 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         sparse_infill_pattern: config.slicing.sparse_infill_pattern.as_u8(),
         infill_angle_deg: config.slicing.infill_angle_deg,
         nozzle_diameter_mm,
+        overhang_angle_threshold_deg: config.slicing.overhang_angle_threshold_deg,
+        max_bridge_length_mm: config.slicing.max_bridge_length_mm,
+        wave_overhang_overlap_fraction: config.slicing.wave_overhang_overlap_fraction,
     });
 
     ffi::set_eikonal_solver_iterations(config.eikonal.solver_iterations);

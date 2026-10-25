@@ -12,10 +12,12 @@ pub enum PlannedMoveKind {
     SolidInfill = 2,
     GapFill = 3,
     SparseInfill = 4,
-    ScarfSeam = 5,
-    Travel = 6,
-    ZHop = 7,
-    Wipe = 8,
+    Bridge = 5,
+    WaveOverhang = 6,
+    ScarfSeam = 7,
+    Travel = 8,
+    ZHop = 9,
+    Wipe = 10,
 }
 
 impl PlannedMoveKind {
@@ -26,6 +28,8 @@ impl PlannedMoveKind {
             2 => Self::SolidInfill,
             3 => Self::GapFill,
             4 => Self::SparseInfill,
+            5 => Self::Bridge,
+            6 => Self::WaveOverhang,
             _ => Self::SolidInfill,
         }
     }
@@ -38,12 +42,17 @@ impl PlannedMoveKind {
                 | Self::SolidInfill
                 | Self::GapFill
                 | Self::SparseInfill
+                | Self::Bridge
+                | Self::WaveOverhang
                 | Self::ScarfSeam
         )
     }
 
     pub fn is_wall(self) -> bool {
-        matches!(self, Self::OuterWall | Self::InnerWall | Self::ScarfSeam)
+        matches!(
+            self,
+            Self::OuterWall | Self::InnerWall | Self::WaveOverhang | Self::ScarfSeam
+        )
     }
 
     pub fn label(self) -> &'static str {
@@ -53,6 +62,8 @@ impl PlannedMoveKind {
             Self::SolidInfill => "Solid Infill",
             Self::GapFill => "Gap Fill",
             Self::SparseInfill => "Sparse Infill",
+            Self::Bridge => "Bridge",
+            Self::WaveOverhang => "Wave Overhang",
             Self::ScarfSeam => "Scarf Seam",
             Self::Travel => "Travel",
             Self::ZHop => "Z-Hop",
@@ -576,16 +587,19 @@ fn order_layer_chains(
     }
 
     let mut walls: Vec<WorkingChain> = Vec::new();
+    let mut wave_overhangs: Vec<WorkingChain> = Vec::new();
+    let mut bridges: Vec<WorkingChain> = Vec::new();
     let mut infills: Vec<WorkingChain> = Vec::new();
     for ch in chains.drain(..) {
-        if ch.base_kind.is_wall() {
-            walls.push(ch);
-        } else {
-            infills.push(ch);
+        match ch.base_kind {
+            PlannedMoveKind::WaveOverhang => wave_overhangs.push(ch),
+            PlannedMoveKind::Bridge => bridges.push(ch),
+            k if k.is_wall() => walls.push(ch),
+            _ => infills.push(ch),
         }
     }
 
-    // Sort walls according to `WallPrintOrder`
+    // Sort supported walls according to `WallPrintOrder`
     let max_wall_idx = walls.iter().map(|w| w.wall_index).max().unwrap_or(0);
     let wall_rank = |w_idx: u32| -> u32 {
         match wall_order {
@@ -609,10 +623,11 @@ fn order_layer_chains(
         d.x * d.x + d.y * d.y + (z_penalty * d.z) * (z_penalty * d.z)
     };
 
-    let mut ordered: Vec<WorkingChain> = Vec::with_capacity(walls.len() + infills.len());
+    let mut ordered: Vec<WorkingChain> =
+        Vec::with_capacity(walls.len() + wave_overhangs.len() + bridges.len() + infills.len());
     let mut curr_pos = start_pos_bed;
 
-    // Group walls by rank and greedily pick nearest within each rank
+    // 1. Group supported walls by rank and greedily pick nearest within each rank
     let mut used_walls = vec![false; walls.len()];
     for _ in 0..walls.len() {
         let min_remaining_rank = walls
@@ -654,7 +669,74 @@ fn order_layer_chains(
         ordered.push(chosen);
     }
 
-    // Greedily order remaining infill & gap-fill chains
+    // 2. Order Wave Overhangs strictly inside-out (`wall_index = 1, 2, ...`) so each pass
+    //    prints in continuous contact with the preceding supported or wave extrusion.
+    wave_overhangs.sort_by_key(|w| w.wall_index);
+    let mut used_waves = vec![false; wave_overhangs.len()];
+    for _ in 0..wave_overhangs.len() {
+        let min_wave_idx = wave_overhangs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !used_waves[*i])
+            .map(|(_, w)| w.wall_index)
+            .min()
+            .unwrap_or(0);
+
+        let mut best_i = 0usize;
+        let mut best_d = f32::MAX;
+        for (i, w) in wave_overhangs.iter().enumerate() {
+            if used_waves[i] || w.wall_index != min_wave_idx || w.pts.is_empty() {
+                continue;
+            }
+            let d = if w.is_closed {
+                w.pts
+                    .iter()
+                    .map(|pt| weighted_dist_sq(curr_pos, pt.pos_bed))
+                    .fold(f32::MAX, f32::min)
+            } else {
+                weighted_dist_sq(curr_pos, w.pts.first().unwrap().pos_bed)
+                    .min(weighted_dist_sq(curr_pos, w.pts.last().unwrap().pos_bed))
+            };
+            if d < best_d {
+                best_d = d;
+                best_i = i;
+            }
+        }
+        used_waves[best_i] = true;
+        let mut chosen = wave_overhangs[best_i].clone();
+        orient_chain_for_minimal_travel(&mut chosen, curr_pos, z_penalty);
+        curr_pos = if chosen.is_closed {
+            chosen.pts.first().unwrap().pos_bed
+        } else {
+            chosen.pts.last().unwrap().pos_bed
+        };
+        ordered.push(chosen);
+    }
+
+    // 3. Order straight-line circular Bridge chains by nearest neighbor
+    let mut used_bridges = vec![false; bridges.len()];
+    for _ in 0..bridges.len() {
+        let mut best_i = 0usize;
+        let mut best_d = f32::MAX;
+        for (i, br) in bridges.iter().enumerate() {
+            if used_bridges[i] || br.pts.is_empty() {
+                continue;
+            }
+            let d = weighted_dist_sq(curr_pos, br.pts.first().unwrap().pos_bed)
+                .min(weighted_dist_sq(curr_pos, br.pts.last().unwrap().pos_bed));
+            if d < best_d {
+                best_d = d;
+                best_i = i;
+            }
+        }
+        used_bridges[best_i] = true;
+        let mut chosen = bridges[best_i].clone();
+        orient_chain_for_minimal_travel(&mut chosen, curr_pos, z_penalty);
+        curr_pos = chosen.pts.last().unwrap().pos_bed;
+        ordered.push(chosen);
+    }
+
+    // 4. Greedily order remaining infill & gap-fill chains
     let mut used_infill = vec![false; infills.len()];
     for _ in 0..infills.len() {
         let mut best_i = 0usize;
@@ -1516,6 +1598,8 @@ pub fn render_toolpath_preview_thumbnails(
                 PlannedMoveKind::InnerWall => [0.32, 0.78, 0.44],
                 PlannedMoveKind::SolidInfill | PlannedMoveKind::GapFill => [0.24, 0.76, 0.88],
                 PlannedMoveKind::SparseInfill => [0.92, 0.74, 0.22],
+                PlannedMoveKind::Bridge => [0.20, 0.56, 0.98],
+                PlannedMoveKind::WaveOverhang => [0.88, 0.32, 0.86],
                 _ => [0.85, 0.50, 0.18],
             };
 
@@ -1838,7 +1922,12 @@ pub fn plan_and_emit_gcode_for_object(
         let mut layer_segments: Vec<PlannedSegment> = Vec::new();
 
         for chain in &ordered_chains {
-            let vertices = subdivide_long_segments(finalize_chain_seam_and_wipe(chain, &gcfg));
+            let vertices = if chain.base_kind == PlannedMoveKind::Bridge {
+                // Keep circular Bridge extrusions as pure un-subdivided straight lines
+                chain.pts.clone()
+            } else {
+                subdivide_long_segments(finalize_chain_seam_and_wipe(chain, &gcfg))
+            };
             if vertices.len() < 2 {
                 continue;
             }
@@ -2032,6 +2121,12 @@ pub fn plan_and_emit_gcode_for_object(
                     PlannedMoveKind::SparseInfill => {
                         (gcfg.sparse_infill_speed_mms, gcfg.infill_accel_mms2)
                     }
+                    PlannedMoveKind::Bridge => {
+                        (gcfg.bridge_speed_mms, gcfg.outer_wall_accel_mms2)
+                    }
+                    PlannedMoveKind::WaveOverhang => {
+                        (gcfg.wave_overhang_speed_mms, gcfg.outer_wall_accel_mms2)
+                    }
                     PlannedMoveKind::Wipe | PlannedMoveKind::Travel => {
                         (gcfg.travel_speed_mms * 0.6, gcfg.travel_accel_mms2)
                     }
@@ -2048,35 +2143,72 @@ pub fn plan_and_emit_gcode_for_object(
                     bbox_min = bbox_min.min(a.pos_bed).min(b.pos_bed);
                     bbox_max = bbox_max.max(a.pos_bed).max(b.pos_bed);
 
-                    // Bead cross-section area A_bead (blending rectangular first layer & stadium upper layers)
-                    let w_eff = width.max(height);
-                    let a_stadium =
-                        height * (w_eff - height) + std::f32::consts::FRAC_PI_4 * height * height;
-                    let a_rect = w_eff * height;
-                    let a_bead = if is_first_layer { a_rect } else { a_stadium };
+                    // Bead cross-section area A_bead:
+                    // - Bridges: free-air circular cross-section A_bridge = (\pi / 4) * width^2
+                    // - Wave Overhangs: stadium cross-section reduced by the lateral overlap
+                    //   \delta_overlap = \eta_wave * w_standard with the adjacent extrusion
+                    // - Standard extrusions: stadium (upper layers) or rectangular (first layer)
+                    let a_bead = if kind == PlannedMoveKind::Bridge {
+                        std::f32::consts::FRAC_PI_4 * width * width
+                    } else {
+                        let w_eff = width.max(height);
+                        let a_stadium = height * (w_eff - height)
+                            + std::f32::consts::FRAC_PI_4 * height * height;
+                        let a_rect = w_eff * height;
+                        let base_area = if is_first_layer { a_rect } else { a_stadium };
+                        if kind == PlannedMoveKind::WaveOverhang {
+                            let std_w = config.slicing.outer_wall_width.target_mm.max(0.10);
+                            let overlap_frac = config
+                                .slicing
+                                .wave_overhang_overlap_fraction
+                                .clamp(0.01, 0.35);
+                            let overlap_mm = overlap_frac * std_w;
+                            let net_width_ratio =
+                                ((width - overlap_mm) / width.max(0.05)).clamp(0.50, 1.0);
+                            base_area * net_width_ratio
+                        } else {
+                            base_area
+                        }
+                    };
 
                     // Surface inclination & trajectory climb cosine along local `z_nozzle` and `up_bed`
-                    let c_surf = if is_first_layer {
+                    let c_slope = if kind == PlannedMoveKind::Bridge {
+                        // Circular free-air bridge extrusions maintain full circular cross-section
+                        // at any accessible 3D angle without substrate cosine compression.
                         1.0
                     } else {
-                        z_nozzle.dot(up_bed).abs().clamp(0.25, 1.0)
+                        let c_surf = if is_first_layer {
+                            1.0
+                        } else {
+                            z_nozzle.dot(up_bed).abs().clamp(0.25, 1.0)
+                        };
+                        let climb_nozzle = seg_dir.dot(z_nozzle);
+                        let c_traj = (1.0 - climb_nozzle * climb_nozzle).max(0.15).sqrt();
+                        c_surf.min(c_traj).clamp(0.25, 1.0)
                     };
-                    let climb_nozzle = seg_dir.dot(z_nozzle);
-                    let c_traj = (1.0 - climb_nozzle * climb_nozzle).max(0.15).sqrt();
-                    let c_slope = c_surf.min(c_traj).clamp(0.25, 1.0);
 
                     // Directional downhill squeeze multiplier
                     let s_climb = seg_dir.dot(up_bed);
-                    let m_dir = if s_climb < 0.0 {
+                    let m_dir = if kind == PlannedMoveKind::Bridge {
+                        1.0
+                    } else if s_climb < 0.0 {
                         (1.0 - 0.12 * (-s_climb).clamp(0.0, 1.0)).max(0.75)
                     } else {
                         1.0
                     };
 
+                    // Dedicated feature flow multiplier for Bridges and Wave Overhangs (in addition
+                    // to global extrusion_multiplier, die swell, corner, and PA/transient multipliers)
+                    let m_feature = match kind {
+                        PlannedMoveKind::Bridge => gcfg.bridge_flow_multiplier,
+                        PlannedMoveKind::WaveOverhang => gcfg.wave_overhang_flow_multiplier,
+                        _ => 1.0,
+                    };
+
                     // Volumetric speed limit v_clamped <= Q_max / A_bead
                     let v_vol_max = gcfg.max_volumetric_flow_mm3s / a_bead.max(1.0e-4);
                     let v_clamped = target_spd.min(v_vol_max).max(5.0);
-                    let q_est = a_bead * v_clamped * rate_mult;
+                    let q_est = a_bead * v_clamped * rate_mult * m_feature;
                     let m_swell = fluid.swell_volume_multiplier(q_est);
                     let m_first = if is_first_layer {
                         gcfg.first_layer_flow_multiplier
@@ -2084,8 +2216,13 @@ pub fn plan_and_emit_gcode_for_object(
                         1.0
                     };
 
-                    let composite_mult =
-                        rate_mult * gcfg.extrusion_multiplier * m_first * c_slope * m_dir * m_swell;
+                    let composite_mult = rate_mult
+                        * gcfg.extrusion_multiplier
+                        * m_feature
+                        * m_first
+                        * c_slope
+                        * m_dir
+                        * m_swell;
                     let delta_e = ((seg_len * a_bead) / filament_area_mm2) * composite_mult;
 
                     layer_segments.push(PlannedSegment {
@@ -2497,27 +2634,51 @@ pub fn plan_and_emit_gcode_for_object(
             gcode.push_str(&format!("EXCLUDE_OBJECT_START NAME={exclude_object_name}\n"));
         }
 
-        // Emit part cooling fan command (`M107` or `M106 S0..255`) when target PWM changes
-        let target_fan_pct = if (layer_ord as u32) < gcfg.disable_fan_first_layers {
+        // Base layer part cooling fan duty cycle (`M107` or `M106 S0..255`)
+        let layer_base_fan_pct = if (layer_ord as u32) < gcfg.disable_fan_first_layers {
             gcfg.first_layer_fan_speed_percent.clamp(0.0, 100.0)
         } else {
             gcfg.fan_speed_percent.clamp(0.0, 100.0)
         };
-        let target_fan_pwm = (target_fan_pct * 2.55).round().clamp(0.0, 255.0) as u8;
-        if emitted_fan_pwm != Some(target_fan_pwm) {
-            if target_fan_pwm == 0 {
+        let layer_base_fan_pwm = (layer_base_fan_pct * 2.55).round().clamp(0.0, 255.0) as u8;
+        if emitted_fan_pwm != Some(layer_base_fan_pwm) {
+            if layer_base_fan_pwm == 0 {
                 gcode.push_str("M107 ; Part cooling fan off\n");
             } else {
                 gcode.push_str(&format!(
-                    "M106 S{target_fan_pwm} ; Part cooling fan {:.0}%\n",
-                    target_fan_pct
+                    "M106 S{layer_base_fan_pwm} ; Part cooling fan {:.0}%\n",
+                    layer_base_fan_pct
                 ));
             }
-            emitted_fan_pwm = Some(target_fan_pwm);
+            emitted_fan_pwm = Some(layer_base_fan_pwm);
         }
 
         for seg in &layer.segments {
             total_time_s += seg.duration_s;
+
+            // Dynamic per-feature cooling fan override for Bridges and Wave Overhangs
+            if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
+                let seg_fan_pct = match seg.kind {
+                    PlannedMoveKind::Bridge => gcfg.bridge_fan_speed_percent.clamp(0.0, 100.0),
+                    PlannedMoveKind::WaveOverhang => {
+                        gcfg.wave_overhang_fan_speed_percent.clamp(0.0, 100.0)
+                    }
+                    _ => layer_base_fan_pct,
+                };
+                let seg_fan_pwm = (seg_fan_pct * 2.55).round().clamp(0.0, 255.0) as u8;
+                if emitted_fan_pwm != Some(seg_fan_pwm) {
+                    if seg_fan_pwm == 0 {
+                        gcode.push_str("M107 ; Part cooling fan off\n");
+                    } else {
+                        gcode.push_str(&format!(
+                            "M106 S{seg_fan_pwm} ; {} cooling fan {:.0}%\n",
+                            seg.kind.label(),
+                            seg_fan_pct
+                        ));
+                    }
+                    emitted_fan_pwm = Some(seg_fan_pwm);
+                }
+            }
 
             // Emit retraction before non-extruding travel if scheduled
             if seg.retract_before_mm > 1.0e-4 && active_retract_mm <= 1.0e-4 {
@@ -2864,6 +3025,8 @@ mod tests {
             inner_wall_count: 1,
             solid_infill_count: 0,
             sparse_infill_count: 1,
+            bridge_count: 0,
+            wave_overhang_count: 0,
         };
 
         let cfg = SlicerConfig::default();
@@ -3005,6 +3168,8 @@ mod tests {
             inner_wall_count: 0,
             solid_infill_count: 0,
             sparse_infill_count: 0,
+            bridge_count: 0,
+            wave_overhang_count: 0,
             layers: vec![
                 make_square_layer(0, 0.20, 0.20),
                 make_square_layer(1, 0.28, 0.08), // thin upper layer (0.08 mm)
@@ -3053,6 +3218,188 @@ mod tests {
         assert!(
             thick_max_q > 2.5 * thin_max_q,
             "Expected thick layer flow rate ({thick_max_q:.2} mm^3/s) > 2.5x thin layer flow rate ({thin_max_q:.2} mm^3/s)"
+        );
+    }
+
+    #[test]
+    fn test_bridge_and_wave_overhang_planning_order_volume_speed_and_cooling() {
+        // Construct an upper layer (layer_index = 2) containing:
+        // - 1 supported inner wall (feature_kind = 1, wall_index = 1)
+        // - 2 wave overhang passes (feature_kind = 6, passed out-of-order with wall_index = 2 then 1)
+        // - 1 3D inclined straight-line circular bridge (feature_kind = 5, 20mm span in 3D)
+        let supported_inner = ExtrusionPath {
+            feature_kind: 1,
+            wall_index: 1,
+            is_closed: false,
+            total_length_mm: 20.0,
+            mean_width_mm: 0.45,
+            points: vec![
+                make_pt(-10.0, 0.0, 2.0, 0.45, 0.20),
+                make_pt(10.0, 0.0, 2.0, 0.45, 0.20),
+            ],
+        };
+        let wave_outer_pass = ExtrusionPath {
+            feature_kind: 6,
+            wall_index: 2, // outer wave pass (must be re-ordered AFTER wall_index = 1)
+            is_closed: false,
+            total_length_mm: 20.0,
+            mean_width_mm: 0.45,
+            points: vec![
+                make_pt(-10.0, 0.828, 2.0, 0.45, 0.20),
+                make_pt(10.0, 0.828, 2.0, 0.45, 0.20),
+            ],
+        };
+        let wave_inner_pass = ExtrusionPath {
+            feature_kind: 6,
+            wall_index: 1, // inner wave pass (must print first among wave overhangs: inside-out!)
+            is_closed: false,
+            total_length_mm: 20.0,
+            mean_width_mm: 0.45,
+            points: vec![
+                make_pt(-10.0, 0.414, 2.0, 0.45, 0.20),
+                make_pt(10.0, 0.414, 2.0, 0.45, 0.20),
+            ],
+        };
+        // Straight 3D bridge climbing from Z=2.0 to Z=4.0 across X=[-10..10]
+        let bridge_path = ExtrusionPath {
+            feature_kind: 5,
+            wall_index: 0,
+            is_closed: false,
+            total_length_mm: (20.0f32 * 20.0 + 2.0 * 2.0).sqrt(),
+            mean_width_mm: 0.40,
+            points: vec![
+                make_pt(-10.0, 5.0, 2.0, 0.40, 0.40),
+                make_pt(10.0, 5.0, 4.0, 0.40, 0.40),
+            ],
+        };
+
+        let raw = ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 4,
+            outer_wall_count: 0,
+            inner_wall_count: 1,
+            solid_infill_count: 0,
+            sparse_infill_count: 0,
+            bridge_count: 1,
+            wave_overhang_count: 2,
+            layers: vec![
+                LayerToolpaths {
+                    layer_index: 0,
+                    branch_id: 0,
+                    isovalue: 0.2,
+                    paths: vec![supported_inner.clone()],
+                },
+                LayerToolpaths {
+                    layer_index: 1,
+                    branch_id: 0,
+                    isovalue: 2.0,
+                    paths: vec![
+                        wave_outer_pass,
+                        bridge_path,
+                        supported_inner,
+                        wave_inner_pass,
+                    ],
+                },
+            ],
+        };
+
+        let mut cfg = SlicerConfig::default();
+        cfg.slicing.wave_overhang_overlap_fraction = 0.08;
+        cfg.gcode.inner_wall_speed_mms = 80.0;
+        cfg.gcode.bridge_speed_mms = 28.0;
+        cfg.gcode.wave_overhang_speed_mms = 22.0;
+        cfg.gcode.bridge_flow_multiplier = 0.90;
+        cfg.gcode.wave_overhang_flow_multiplier = 1.05;
+        cfg.gcode.fan_speed_percent = 50.0;
+        cfg.gcode.bridge_fan_speed_percent = 100.0;
+        cfg.gcode.wave_overhang_fan_speed_percent = 90.0;
+
+        let res = plan_and_emit_gcode_for_object(
+            "BridgeAndWaveTest",
+            1,
+            &raw,
+            Transform::IDENTITY,
+            &cfg,
+        );
+        let segs = &res.layers[1].segments;
+
+        // 1. Verify inside-out ordering: Supported InnerWall -> WaveOverhang(wall_index=1) -> WaveOverhang(wall_index=2) -> Bridge
+        let first_inner_idx = segs
+            .iter()
+            .position(|s| s.kind == PlannedMoveKind::InnerWall)
+            .expect("Expected InnerWall segment");
+        let wave_segs: Vec<(usize, &PlannedSegment)> = segs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind == PlannedMoveKind::WaveOverhang)
+            .collect();
+        let bridge_segs: Vec<(usize, &PlannedSegment)> = segs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind == PlannedMoveKind::Bridge)
+            .collect();
+        assert!(!wave_segs.is_empty(), "Expected WaveOverhang segments");
+        assert_eq!(
+            bridge_segs.len(),
+            1,
+            "Bridge must remain a single un-subdivided straight-line 3D segment"
+        );
+        assert!(
+            first_inner_idx < wave_segs[0].0,
+            "Supported walls must print before WaveOverhangs"
+        );
+        // First wave segment must be at Y = 0.414 (wall_index = 1), last at Y = 0.828 (wall_index = 2)
+        assert!(
+            (wave_segs.first().unwrap().1.p0_local.y - 0.414).abs() < 1.0e-3,
+            "Inside-out WaveOverhang ordering violated: first wave Y={}",
+            wave_segs.first().unwrap().1.p0_local.y
+        );
+        assert!(
+            (wave_segs.last().unwrap().1.p0_local.y - 0.828).abs() < 1.0e-3,
+            "Inside-out WaveOverhang ordering violated: last wave Y={}",
+            wave_segs.last().unwrap().1.p0_local.y
+        );
+
+        // 2. Verify Bridge circular cross-section & 3D straight-line geometry & volume
+        let b_seg = bridge_segs[0].1;
+        assert!((b_seg.width_mm - 0.40).abs() < 1.0e-4);
+        assert!((b_seg.height_mm - 0.40).abs() < 1.0e-4);
+        assert!((b_seg.p0_local.z - 2.0).abs() < 1.0e-4 && (b_seg.p1_local.z - 4.0).abs() < 1.0e-4);
+        assert!(b_seg.cruise_speed_mms <= 28.0 + 1.0e-3);
+
+        let expected_circle_area = std::f32::consts::FRAC_PI_4 * 0.40 * 0.40;
+        let fil_area = std::f32::consts::FRAC_PI_4 * cfg.gcode.filament_diameter_mm.powi(2);
+        let expected_bridge_e =
+            (expected_circle_area * b_seg.length_mm * b_seg.extrusion_multiplier) / fil_area;
+        assert!(
+            (b_seg.delta_e_mm - expected_bridge_e).abs() < 1.0e-3,
+            "Bridge delta_e_mm ({}) did not match circular area volume ({expected_bridge_e})",
+            b_seg.delta_e_mm
+        );
+
+        // 3. Verify WaveOverhang overlap-adjusted volume and speed
+        let w_seg = wave_segs[0].1;
+        assert!(w_seg.cruise_speed_mms <= 22.0 + 1.0e-3);
+        let std_area =
+            0.20 * (0.45 - 0.20) + std::f32::consts::FRAC_PI_4 * 0.20 * 0.20;
+        let overlap_mm = 0.08 * cfg.slicing.outer_wall_width.target_mm;
+        let expected_wave_area = std_area * ((0.45 - overlap_mm) / 0.45);
+        let expected_wave_e =
+            (expected_wave_area * w_seg.length_mm * w_seg.extrusion_multiplier) / fil_area;
+        assert!(
+            (w_seg.delta_e_mm - expected_wave_e).abs() < 1.0e-3,
+            "WaveOverhang delta_e_mm ({}) did not match overlap-reduced volume ({expected_wave_e})",
+            w_seg.delta_e_mm
+        );
+
+        // 4. Verify G-code emits dedicated fan speeds for Bridge (100% -> S255) and WaveOverhang (90% -> S230)
+        assert!(
+            res.gcode_text.contains("M106 S255"),
+            "Expected M106 S255 for 100% Bridge fan cooling"
+        );
+        assert!(
+            res.gcode_text.contains("M106 S230"),
+            "Expected M106 S230 for 90% WaveOverhang fan cooling"
         );
     }
 }

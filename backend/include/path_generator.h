@@ -36,6 +36,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const openvdb::FloatGrid* coarseSdfGrid = nullptr,
     const openvdb::FloatGrid* coarseEikGrid = nullptr,
     const openvdb::Vec3SGrid* coarseToolAxisGrid = nullptr,
-    float fineShellDepthMm = 0.0f);
+    float fineShellDepthMm = 0.0f,
+    const openvdb::FloatGrid* overhangGrid = nullptr,
+    const openvdb::FloatGrid* coarseOverhangGrid = nullptr,
+    const std::array<float, 3>& defaultGravityDirectionBed = {0.0f, 0.0f, -1.0f});
 
 } // namespace manifold

@@ -445,6 +445,14 @@ pub struct SlicingProcessConfig {
     /// Minimum continuous extrusion length (mm); defaults to $2 \times d_{\text{nozzle}}$.
     /// Individual segments of a continuous extrusion may be shorter than this.
     pub min_extrusion_length_mm: f32,
+    /// Overhang angle threshold from vertical (degrees, `5.0..=85.0`) derived from the `"overhang"`
+    /// field above which unsupported extrusions switch to Bridging or Wave Overhangs.
+    pub overhang_angle_threshold_deg: f32,
+    /// Maximum unsupported 3D straight-line span length (mm) for circular Bridging extrusions.
+    pub max_bridge_length_mm: f32,
+    /// Lateral overlap fraction (`0.01..=0.35`, default `0.08` = 8%) of a standard line width
+    /// maintained between each inside-out Wave Overhang extrusion and the preceding extrusion.
+    pub wave_overhang_overlap_fraction: f32,
 }
 
 impl Default for SlicingProcessConfig {
@@ -464,6 +472,9 @@ impl Default for SlicingProcessConfig {
             sparse_infill_width: LineWidthConfig::new(0.45, 0.30, 0.65),
             sparse_infill_pattern: SparseInfillPattern::Gyroid,
             min_extrusion_length_mm: 0.80,
+            overhang_angle_threshold_deg: 45.0,
+            max_bridge_length_mm: 40.0,
+            wave_overhang_overlap_fraction: 0.08,
         }
     }
 }
@@ -479,6 +490,9 @@ impl SlicingProcessConfig {
         self.solid_infill_width.sanitize();
         self.sparse_infill_width.sanitize();
         self.min_extrusion_length_mm = self.min_extrusion_length_mm.max(0.0);
+        self.overhang_angle_threshold_deg = self.overhang_angle_threshold_deg.clamp(5.0, 85.0);
+        self.max_bridge_length_mm = self.max_bridge_length_mm.clamp(0.0, 500.0);
+        self.wave_overhang_overlap_fraction = self.wave_overhang_overlap_fraction.clamp(0.01, 0.35);
     }
 }
 
@@ -718,6 +732,8 @@ pub struct GcodeProcessConfig {
     pub solid_infill_speed_mms: f32,
     pub sparse_infill_speed_mms: f32,
     pub gap_fill_speed_mms: f32,
+    pub bridge_speed_mms: f32,
+    pub wave_overhang_speed_mms: f32,
     pub travel_speed_mms: f32,
     pub z_hop_speed_mms: f32,
 
@@ -762,9 +778,17 @@ pub struct GcodeProcessConfig {
     pub pa_ref_high_flow_mm3s: f32,
     pub swell_low: f32,
     pub swell_high: f32,
+    /// Additional extrusion multiplier for circular Bridge extrusions (applied on top of PA, die swell, etc.).
+    pub bridge_flow_multiplier: f32,
+    /// Additional extrusion multiplier for Wave Overhang extrusions (applied on top of overlap volume, PA, die swell, etc.).
+    pub wave_overhang_flow_multiplier: f32,
     pub fan_speed_percent: f32,
     pub first_layer_fan_speed_percent: f32,
     pub disable_fan_first_layers: u32,
+    /// Part cooling fan speed (%) specifically for circular Bridge extrusions.
+    pub bridge_fan_speed_percent: f32,
+    /// Part cooling fan speed (%) specifically for Wave Overhang extrusions.
+    pub wave_overhang_fan_speed_percent: f32,
 
     // --- Start & End G-code Templates ---
     pub start_gcode_template: String,
@@ -790,6 +814,8 @@ impl Default for GcodeProcessConfig {
             solid_infill_speed_mms: 130.0,
             sparse_infill_speed_mms: 160.0,
             gap_fill_speed_mms: 60.0,
+            bridge_speed_mms: 35.0,
+            wave_overhang_speed_mms: 30.0,
             travel_speed_mms: 250.0,
             z_hop_speed_mms: 25.0,
             outer_wall_accel_mms2: 2500.0,
@@ -828,9 +854,13 @@ impl Default for GcodeProcessConfig {
             pa_ref_high_flow_mm3s: 14.0,
             swell_low: 1.03,
             swell_high: 1.10,
+            bridge_flow_multiplier: 0.95,
+            wave_overhang_flow_multiplier: 1.00,
             fan_speed_percent: 100.0,
             first_layer_fan_speed_percent: 0.0,
             disable_fan_first_layers: 1,
+            bridge_fan_speed_percent: 100.0,
+            wave_overhang_fan_speed_percent: 100.0,
             start_gcode_template: concat!(
                 "; --- Manifold2 Non-Planar Print Start ---\n",
                 "; Print Bounds: X[{bbox_min_x}..{bbox_max_x}] Y[{bbox_min_y}..{bbox_max_y}] Z[{bbox_min_z}..{bbox_max_z}]\n",
@@ -875,6 +905,8 @@ impl GcodeProcessConfig {
         self.solid_infill_speed_mms = self.solid_infill_speed_mms.clamp(5.0, 800.0);
         self.sparse_infill_speed_mms = self.sparse_infill_speed_mms.clamp(5.0, 800.0);
         self.gap_fill_speed_mms = self.gap_fill_speed_mms.clamp(5.0, 500.0);
+        self.bridge_speed_mms = self.bridge_speed_mms.clamp(5.0, 500.0);
+        self.wave_overhang_speed_mms = self.wave_overhang_speed_mms.clamp(5.0, 500.0);
         self.travel_speed_mms = self.travel_speed_mms.clamp(20.0, 1200.0);
         self.z_hop_speed_mms = self.z_hop_speed_mms.clamp(2.0, 200.0);
         self.outer_wall_accel_mms2 = self.outer_wall_accel_mms2.clamp(100.0, 50000.0);
@@ -909,9 +941,13 @@ impl GcodeProcessConfig {
             .clamp(self.pa_ref_low_flow_mm3s + 0.5, 100.0);
         self.swell_low = self.swell_low.clamp(1.0, 2.0);
         self.swell_high = self.swell_high.clamp(self.swell_low, 2.0);
+        self.bridge_flow_multiplier = self.bridge_flow_multiplier.clamp(0.2, 2.0);
+        self.wave_overhang_flow_multiplier = self.wave_overhang_flow_multiplier.clamp(0.2, 2.0);
         self.fan_speed_percent = self.fan_speed_percent.clamp(0.0, 100.0);
         self.first_layer_fan_speed_percent = self.first_layer_fan_speed_percent.clamp(0.0, 100.0);
         self.disable_fan_first_layers = self.disable_fan_first_layers.min(20);
+        self.bridge_fan_speed_percent = self.bridge_fan_speed_percent.clamp(0.0, 100.0);
+        self.wave_overhang_fan_speed_percent = self.wave_overhang_fan_speed_percent.clamp(0.0, 100.0);
     }
 
     /// Effective minimum travel distance before triggering a retraction, accounting for scarf joint length.
@@ -1246,6 +1282,87 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         default_value: "0.42 / 0.28 / 0.56 mm",
         summary: "Target, minimum, and maximum extruded bead widths for Outer Walls, Inner Walls, Solid Infill, and Sparse Infill.",
         details: "Medial-axis adaptive bead sizing dynamically widens or narrows walls within [Min, Max] to fill thin wedges without leaving voids or requiring tiny gap-fill fragments.",
+    },
+    ParameterDoc {
+        key: "slicing.overhang_angle_threshold_deg",
+        category: "Shell & Toolpath Generation",
+        title: "Overhang Angle Threshold",
+        units: "deg (°)",
+        default_value: "45.0°",
+        summary: "Overhang angle from vertical (derived from the gravity-aware overhang field) above which unsupported extrusions use Bridging or Wave Overhangs.",
+        details: "Evaluated against the true bed-coordinate gravity direction via the OpenVDB overhang field.",
+    },
+    ParameterDoc {
+        key: "slicing.max_bridge_length_mm",
+        category: "Shell & Toolpath Generation",
+        title: "Maximum Bridge Length",
+        units: "mm",
+        default_value: "40.0 mm",
+        summary: "Maximum 3D straight-line span length for circular Bridging extrusions across unsupported gaps.",
+        details: "Unsupported spans with accessible supported anchors on both sides within this distance are bridged with straight-line circular extrusions; longer or one-sided spans use inside-out Wave Overhangs.",
+    },
+    ParameterDoc {
+        key: "slicing.wave_overhang_overlap_fraction",
+        category: "Shell & Toolpath Generation",
+        title: "Wave Overhang Overlap Fraction",
+        units: "ratio",
+        default_value: "0.08 (8%)",
+        summary: "Lateral overlap with the adjacent existing extrusion as a fraction of standard line width.",
+        details: "Wave overhang passes are ordered inside-out and maintain continuous contact at this overlap even when line width changes or the 3D centerline rotates around the existing extrusion, with extrusion volume scaled accordingly.",
+    },
+    ParameterDoc {
+        key: "gcode.bridge_speed_mms",
+        category: "Speeds & Accelerations",
+        title: "Bridge Print Speed",
+        units: "mm/s",
+        default_value: "35.0 mm/s",
+        summary: "Feedrate for straight-line circular Bridge extrusions.",
+        details: "Controlled bridging speed keeps the free-spanning circular filament under steady tension while solidifying in the cooling airflow.",
+    },
+    ParameterDoc {
+        key: "gcode.wave_overhang_speed_mms",
+        category: "Speeds & Accelerations",
+        title: "Wave Overhang Print Speed",
+        units: "mm/s",
+        default_value: "30.0 mm/s",
+        summary: "Feedrate for inside-out Wave Overhang extrusions.",
+        details: "Moderate speed gives the laterally-overlapping bead time to bond and solidify against the adjacent supported extrusion.",
+    },
+    ParameterDoc {
+        key: "gcode.bridge_flow_multiplier",
+        category: "Filament, Multipliers & Cooling",
+        title: "Bridge Extrusion Multiplier",
+        units: "ratio",
+        default_value: "0.95",
+        summary: "Dedicated flow multiplier for circular Bridge extrusions, applied in addition to global EM, die swell, and PA multipliers.",
+        details: "Slight under-extrusion (< 1.0) keeps free-air circular bridge strands taut and reduces sag across unsupported gaps.",
+    },
+    ParameterDoc {
+        key: "gcode.wave_overhang_flow_multiplier",
+        category: "Filament, Multipliers & Cooling",
+        title: "Wave Overhang Extrusion Multiplier",
+        units: "ratio",
+        default_value: "1.00",
+        summary: "Dedicated flow multiplier for Wave Overhang extrusions, applied in addition to the overlap volume adjustment, global EM, die swell, corner, and PA multipliers.",
+        details: "Scales the overlap-adjusted extrusion volume of inside-out Wave Overhang passes.",
+    },
+    ParameterDoc {
+        key: "gcode.bridge_fan_speed_percent",
+        category: "Filament, Multipliers & Cooling",
+        title: "Bridge Cooling Fan Speed",
+        units: "%",
+        default_value: "100%",
+        summary: "Part cooling fan duty cycle during circular Bridge extrusions.",
+        details: "Emits M106 before bridge spans to rapidly solidify free-spanning circular extrusions.",
+    },
+    ParameterDoc {
+        key: "gcode.wave_overhang_fan_speed_percent",
+        category: "Filament, Multipliers & Cooling",
+        title: "Wave Overhang Cooling Fan Speed",
+        units: "%",
+        default_value: "100%",
+        summary: "Part cooling fan duty cycle during inside-out Wave Overhang extrusions.",
+        details: "Emits M106 before wave overhang passes to prevent curling or sagging on unsupported perimeters.",
     },
 
     // --- Filament, Multipliers & Cooling ---

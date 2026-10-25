@@ -170,7 +170,7 @@ pub mod ffi {
         pub max_mm: f32,
     }
 
-    /// Shell & sparse infill path generation parameters shared across FFI.
+    /// Shell, overhang (bridging & wave overhangs), and sparse infill path generation parameters shared across FFI.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct ShellPathSpec {
         pub shell_thickness_mm: f32,
@@ -188,6 +188,13 @@ pub mod ffi {
         pub infill_angle_deg: f32,
         pub nozzle_diameter_mm: f32,
         pub min_extrusion_length_mm: f32,
+        /// Overhang angle threshold past vertical (degrees, e.g. `45.0`) above which unsupported extrusions
+        /// use straight-line circular bridging or inside-out wave overhangs.
+        pub overhang_angle_threshold_deg: f32,
+        /// Maximum unsupported straight-line bridge span length (mm).
+        pub max_bridge_length_mm: f32,
+        /// Lateral overlap fraction of standard line width (`0.08` = 8%) for inside-out wave overhang extrusions.
+        pub wave_overhang_overlap_fraction: f32,
     }
 
     /// A single 3D vertex along a continuous non-planar extrusion toolpath.
@@ -209,9 +216,9 @@ pub mod ffi {
     /// A continuous open or closed extrusion path on a non-planar slicing isosurface.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct ExtrusionPath {
-        /// `0 = OuterWall`, `1 = InnerWall`, `2 = SolidInfill`, `3 = GapFill`, `4 = SparseInfill`
+        /// `0 = OuterWall`, `1 = InnerWall`, `2 = SolidInfill`, `3 = GapFill`, `4 = SparseInfill`, `5 = Bridge`, `6 = WaveOverhang`
         pub feature_kind: u8,
-        /// `0` for outer wall, `1..=inner_wall_count` for inner walls, pass index for infill/gap fill.
+        /// `0` for outer wall, `1..=inner_wall_count` for inner walls, inside-out pass index for wave overhangs, pass index for infill/gap fill/bridges.
         pub wall_index: u32,
         pub is_closed: bool,
         pub total_length_mm: f32,
@@ -237,6 +244,8 @@ pub mod ffi {
         pub inner_wall_count: u32,
         pub solid_infill_count: u32,
         pub sparse_infill_count: u32,
+        pub bridge_count: u32,
+        pub wave_overhang_count: u32,
         pub layers: Vec<LayerToolpaths>,
     }
 

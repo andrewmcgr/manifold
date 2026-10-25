@@ -489,6 +489,9 @@ impl FieldVisualizationState {
             sparse_infill_pattern: s.sparse_infill_pattern.as_u8(),
             infill_angle_deg: s.infill_angle_deg,
             nozzle_diameter_mm,
+            overhang_angle_threshold_deg: s.overhang_angle_threshold_deg,
+            max_bridge_length_mm: s.max_bridge_length_mm,
+            wave_overhang_overlap_fraction: s.wave_overhang_overlap_fraction,
         };
         let adaptivity = self.adaptivity;
 
@@ -1251,7 +1254,7 @@ pub fn sync_field_visualization_system(
 
                     for path in &layer_tp.paths {
                         let visible = match path.feature_kind {
-                            0 => show_outer,
+                            0 | 6 => show_outer,
                             1 => show_inner,
                             4 => show_sparse,
                             _ => show_infill,
@@ -1596,12 +1599,14 @@ fn is_planned_segment_visible(
         crate::gcode::PlannedMoveKind::ScarfSeam | crate::gcode::PlannedMoveKind::Wipe => {
             show_scarf_wipes && (show_outer || show_inner)
         }
-        crate::gcode::PlannedMoveKind::OuterWall => show_outer,
+        crate::gcode::PlannedMoveKind::OuterWall | crate::gcode::PlannedMoveKind::WaveOverhang => {
+            show_outer
+        }
         crate::gcode::PlannedMoveKind::InnerWall => show_inner,
         crate::gcode::PlannedMoveKind::SparseInfill => show_sparse,
-        crate::gcode::PlannedMoveKind::SolidInfill | crate::gcode::PlannedMoveKind::GapFill => {
-            show_infill
-        }
+        crate::gcode::PlannedMoveKind::SolidInfill
+        | crate::gcode::PlannedMoveKind::GapFill
+        | crate::gcode::PlannedMoveKind::Bridge => show_infill,
     }
 }
 
@@ -1655,8 +1660,12 @@ fn append_planned_segment_bead_mesh(
         seg.height_mm
     };
 
-    let half_w = (0.48 * w_eff).max(0.03);
-    let half_h = (0.42 * h_eff).max(0.02);
+    let (half_w, half_h) = if seg.kind == crate::gcode::PlannedMoveKind::Bridge {
+        let r = (0.48 * w_eff).max(0.03);
+        (r, r)
+    } else {
+        ((0.48 * w_eff).max(0.03), (0.42 * h_eff).max(0.02))
+    };
 
     let mut rgba = compute_planned_segment_color(seg, planned, color_mode, config);
     rgba[0] = (rgba[0] * brightness_scale).clamp(0.0, 1.0);
@@ -2016,8 +2025,12 @@ fn append_extrusion_path_bead_mesh(
             .unwrap_or_else(|| Vec3::from_array(config.machine.nozzle_axis_bed));
         let frame = NozzleFrame::from_nozzle_and_travel(nozzle_axis, raw_travel);
 
-        let half_w = (0.48 * pt.width_mm).max(0.03);
-        let half_h = (0.42 * pt.height_mm).max(0.02);
+        let (half_w, half_h) = if path.feature_kind == 5 {
+            let r = (0.48 * pt.width_mm).max(0.03);
+            (r, r)
+        } else {
+            ((0.48 * pt.width_mm).max(0.03), (0.42 * pt.height_mm).max(0.02))
+        };
 
         // 4-sided cross-section ring in local (lateral_axis, nozzle_axis):
         // 0: top (+z_nozzle), 1: right (+y_nozzle), 2: bottom (-z_nozzle), 3: left (-y_nozzle)
@@ -2096,11 +2109,17 @@ fn compute_toolpath_point_color(
             }
             2 => [0.22, 0.76, 0.98, 1.0], // Solid Infill: bright sky-blue/cyan
             4 => [0.98, 0.78, 0.18, 1.0], // Sparse Infill: warm gold/amber
+            5 => [0.18, 0.52, 0.98, 1.0], // Bridge: electric royal blue
+            6 => {
+                // Wave Overhang: vivid orchid-rose (with slight inside-out pass shade)
+                let shade = (1.0 - 0.08 * ((wall_index.saturating_sub(1) % 4) as f32)).clamp(0.70, 1.0);
+                [0.98 * shade, 0.26 * shade, 0.68 * shade, 1.0]
+            }
             _ => [0.98, 0.32, 0.88, 1.0], // Gap Fill: vivid magenta
         },
         ToolpathColorMode::ByLineWidth | _ => {
             let spec = match feature_kind {
-                0 => config.slicing.outer_wall_width,
+                0 | 6 => config.slicing.outer_wall_width,
                 1 => config.slicing.inner_wall_width,
                 4 => config.slicing.sparse_infill_width,
                 _ => config.slicing.solid_infill_width,
@@ -2846,6 +2865,9 @@ mod tests {
             sparse_infill_pattern: 0,
             infill_angle_deg: 45.0,
             nozzle_diameter_mm: 0.4,
+            overhang_angle_threshold_deg: 45.0,
+            max_bridge_length_mm: 40.0,
+            wave_overhang_overlap_fraction: 0.08,
         };
         ffi::set_shell_path_spec(base_spec.clone());
 
@@ -3020,6 +3042,9 @@ mod tests {
             sparse_infill_pattern: 0,
             infill_angle_deg: 45.0,
             nozzle_diameter_mm: 0.4,
+            overhang_angle_threshold_deg: 45.0,
+            max_bridge_length_mm: 40.0,
+            wave_overhang_overlap_fraction: 0.08,
         });
 
         let res = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -3112,16 +3137,22 @@ mod tests {
                 "Layer #{i} (branch B{}) must have extruding G-code segments",
                 l.branch_id
             );
-            let mean_seg_h =
-                ext_segs.iter().map(|s| s.height_mm).sum::<f32>() / (ext_segs.len() as f32);
-            assert!(
-                (mean_seg_h - l.mean_thickness_mm).abs() <= 0.03,
-                "Layer #{i} (branch B{}, {}/{}) mean planned segment height ({mean_seg_h:.3} mm) diverged from layer mean_thickness_mm ({:.3} mm)",
-                l.branch_id,
-                l.branch_layer_index + 1,
-                l.branch_layer_count,
-                l.mean_thickness_mm,
-            );
+            let non_bridge_segs: Vec<_> = ext_segs
+                .iter()
+                .filter(|s| s.kind != crate::gcode::PlannedMoveKind::Bridge)
+                .collect();
+            if !non_bridge_segs.is_empty() {
+                let mean_seg_h = non_bridge_segs.iter().map(|s| s.height_mm).sum::<f32>()
+                    / (non_bridge_segs.len() as f32);
+                assert!(
+                    (mean_seg_h - l.mean_thickness_mm).abs() <= 0.03,
+                    "Layer #{i} (branch B{}, {}/{}) mean planned segment height ({mean_seg_h:.3} mm) diverged from layer mean_thickness_mm ({:.3} mm)",
+                    l.branch_id,
+                    l.branch_layer_index + 1,
+                    l.branch_layer_count,
+                    l.mean_thickness_mm,
+                );
+            }
         }
 
         let q_pt = |v: &ffi::RenderVertex| -> (i32, i32, i32) {
@@ -3405,6 +3436,9 @@ mod tests {
             sparse_infill_pattern: 0,
             infill_angle_deg: 45.0,
             nozzle_diameter_mm: 0.40,
+            overhang_angle_threshold_deg: 45.0,
+            max_bridge_length_mm: 40.0,
+            wave_overhang_overlap_fraction: 0.08,
         };
 
         // Test all 7 sparse infill patterns (0..=6: Monotonic, Cubic, Gyroid, SchwarzD, SchwarzP, Concentric, AllWalls)
@@ -4145,6 +4179,250 @@ mod tests {
         assert_eq!(colors_solved.len(), obj_verts.len());
         assert!(min_s >= 0.0 && max_s <= 180.0 && max_s > min_s);
 
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_bridge_and_wave_overhang_generation_from_overhang_field() {
+        // Construct a watertight 3D bridge-arch + cantilever mesh:
+        // - Left pillar:  X in [-10.0, -4.0], Y in [-4.0, 4.0], Z in [0.0, 6.0]
+        // - Right pillar: X in [  4.0, 10.0], Y in [-4.0, 4.0], Z in [0.0, 6.0]
+        // - Top bridge deck connecting both pillars AND cantilevered out to Y = +8.0:
+        //   X in [-10.0, 10.0], Y in [-4.0, 8.0], Z in [4.0, 6.0]
+        // We union three watertight boxes by registering their triangles via boolean-free
+        // exact grid subdivision or separate overlapping boxes (OpenVDB meshToVolume handles
+        // self-intersecting / overlapping closed shells cleanly via winding/unsigned distance,
+        // or we can build the exact 2D profile extruded along Y and X).
+        // Let's build a clean watertight mesh by subdividing the 3D grid of cubes:
+        // X intervals: [-10, -4], [-4, 4], [4, 10]
+        // Y intervals: [-4, 4], [4, 8]
+        // Z intervals: [0, 4], [4, 6]
+        let x_coords = [-10.0f32, -4.0, 4.0, 10.0];
+        let y_coords = [-4.0f32, 4.0, 8.0];
+        let z_coords = [0.0f32, 4.0, 6.0];
+        // Active cells (ix, iy, iz):
+        // - Left pillar bottom:  (0, 0, 0)
+        // - Right pillar bottom: (2, 0, 0)
+        // - Top deck over pillars & bridge span: (0, 0, 1), (1, 0, 1), (2, 0, 1)
+        // - Top deck cantilevered in +Y:         (0, 1, 1), (1, 1, 1), (2, 1, 1)
+        let is_occupied = |ix: i32, iy: i32, iz: i32| -> bool {
+            if ix < 0 || ix >= 3 || iy < 0 || iy >= 2 || iz < 0 || iz >= 2 {
+                return false;
+            }
+            match (ix, iy, iz) {
+                (0, 0, 0) | (2, 0, 0) => true,
+                (_, _, 1) => true,
+                _ => false,
+            }
+        };
+
+        let mut positions: Vec<f32> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut add_quad = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3]| {
+            let base = (positions.len() / 3) as u32;
+            for p in [p0, p1, p2, p3] {
+                positions.extend_from_slice(&p);
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        };
+
+        for ix in 0..3 {
+            for iy in 0..2 {
+                for iz in 0..2 {
+                    if !is_occupied(ix, iy, iz) {
+                        continue;
+                    }
+                    let x0 = x_coords[ix as usize];
+                    let x1 = x_coords[(ix + 1) as usize];
+                    let y0 = y_coords[iy as usize];
+                    let y1 = y_coords[(iy + 1) as usize];
+                    let z0 = z_coords[iz as usize];
+                    let z1 = z_coords[(iz + 1) as usize];
+
+                    // -X face
+                    if !is_occupied(ix - 1, iy, iz) {
+                        add_quad([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]);
+                    }
+                    // +X face
+                    if !is_occupied(ix + 1, iy, iz) {
+                        add_quad([x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]);
+                    }
+                    // -Y face
+                    if !is_occupied(ix, iy - 1, iz) {
+                        add_quad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]);
+                    }
+                    // +Y face
+                    if !is_occupied(ix, iy + 1, iz) {
+                        add_quad([x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]);
+                    }
+                    // -Z face
+                    if !is_occupied(ix, iy, iz - 1) {
+                        add_quad([x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]);
+                    }
+                    // +Z face
+                    if !is_occupied(ix, iy, iz + 1) {
+                        add_quad([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]);
+                    }
+                }
+            }
+        }
+
+        let part = ffi::register_triangle_mesh("bridge_and_wave_arch", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        ffi::set_nozzle_axis_bed([0.0, 0.0, 1.0]);
+        ffi::set_gravity_direction_bed([0.0, 0.0, -1.0]);
+        // Align layers horizontally with the bridge ceiling Z = 4.0 so the first bridge
+        // deck layer spans the full 8.0 mm gap between the left pillar (X=-4) and right pillar (X=+4).
+        let hints = vec![ffi::SpatialOrientationHint {
+            kind: 1,
+            position_bed: [0.0, 2.0, 4.5],
+            direction_bed: [0.0, 0.0, 1.0],
+            influence_radius_mm: 30.0,
+            weight: 1.0,
+            apply_on_surface_only: false,
+        }];
+        ffi::set_spatial_orientation_hints(&hints);
+        ffi::set_slice_layer_height(ffi::LayerHeightSpec {
+            target_mm: 0.40,
+            min_mm: 0.20,
+            max_mm: 0.50,
+            first_layer_mm: 0.40,
+            top_layer_mm: 0.40,
+        });
+        assert!(ffi::recompute_object_fields(part.object_id, 0.45, 5.0));
+
+        // Case A: max_bridge_length_mm = 40.0 mm (spans the 8.0 mm gap between X=-4 and X=+4 with Bridges,
+        // while the one-sided +Y cantilever uses Wave Overhangs).
+        ffi::set_shell_path_spec(ffi::ShellPathSpec {
+            shell_thickness_mm: 1.6,
+            inner_wall_count: 3,
+            outer_wall_width: ffi::LineWidthSpec {
+                target_mm: 0.42,
+                min_mm: 0.30,
+                max_mm: 0.60,
+            },
+            inner_wall_width: ffi::LineWidthSpec {
+                target_mm: 0.45,
+                min_mm: 0.30,
+                max_mm: 0.65,
+            },
+            solid_infill_width: ffi::LineWidthSpec {
+                target_mm: 0.45,
+                min_mm: 0.30,
+                max_mm: 0.65,
+            },
+            solid_infill_pattern: 0,
+            min_extrusion_length_mm: 1.0,
+            sparse_infill_density: 0.20,
+            sparse_infill_width: ffi::LineWidthSpec {
+                target_mm: 0.45,
+                min_mm: 0.32,
+                max_mm: 0.68,
+            },
+            sparse_infill_pattern: 0,
+            infill_angle_deg: 45.0,
+            nozzle_diameter_mm: 0.40,
+            overhang_angle_threshold_deg: 45.0,
+            max_bridge_length_mm: 40.0,
+            wave_overhang_overlap_fraction: 0.08,
+        });
+
+        let tp_bridge = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp_bridge.valid);
+        assert!(
+            tp_bridge.bridge_count > 0,
+            "Expected straight circular Bridge extrusions across the 8mm two-pillar span when max_bridge_length_mm = 40.0"
+        );
+        assert!(
+            tp_bridge.wave_overhang_count > 0,
+            "Expected inside-out WaveOverhang extrusions on the cantilevered overhang region"
+        );
+
+        // Verify every Bridge path is a 2-point straight line with circular cross-section (width == height == 0.40mm)
+        for layer in &tp_bridge.layers {
+            for p in &layer.paths {
+                if p.feature_kind == 5 {
+                    assert_eq!(
+                        p.points.len(),
+                        2,
+                        "Bridge path must be a 2-point straight-line extrusion"
+                    );
+                    for pt in &p.points {
+                        assert!(
+                            (pt.width_mm - 0.40).abs() < 1.0e-3
+                                && (pt.height_mm - 0.40).abs() < 1.0e-3,
+                            "Bridge point must have circular cross-section (0.40 x 0.40 mm), got ({}, {})",
+                            pt.width_mm,
+                            pt.height_mm
+                        );
+                    }
+                }
+            }
+        }
+
+        // Case B: Set max_bridge_length_mm = 2.0 mm (shorter than the 8.0 mm gap).
+        // Now no bridges may exceed 2.0 mm, and the unsupported span falls back to Wave Overhangs!
+        ffi::set_shell_path_spec(ffi::ShellPathSpec {
+            shell_thickness_mm: 1.6,
+            inner_wall_count: 3,
+            outer_wall_width: ffi::LineWidthSpec {
+                target_mm: 0.42,
+                min_mm: 0.30,
+                max_mm: 0.60,
+            },
+            inner_wall_width: ffi::LineWidthSpec {
+                target_mm: 0.45,
+                min_mm: 0.30,
+                max_mm: 0.65,
+            },
+            solid_infill_width: ffi::LineWidthSpec {
+                target_mm: 0.45,
+                min_mm: 0.30,
+                max_mm: 0.65,
+            },
+            solid_infill_pattern: 0,
+            min_extrusion_length_mm: 1.0,
+            sparse_infill_density: 0.20,
+            sparse_infill_width: ffi::LineWidthSpec {
+                target_mm: 0.45,
+                min_mm: 0.32,
+                max_mm: 0.68,
+            },
+            sparse_infill_pattern: 0,
+            infill_angle_deg: 45.0,
+            nozzle_diameter_mm: 0.40,
+            overhang_angle_threshold_deg: 45.0,
+            max_bridge_length_mm: 2.0,
+            wave_overhang_overlap_fraction: 0.08,
+        });
+
+        let tp_wave_only = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp_wave_only.valid);
+        assert_eq!(
+            tp_wave_only.bridge_count, 0,
+            "Expected 0 bridges across the 8.0 mm gap when max_bridge_length_mm is reduced to 2.0 mm"
+        );
+        let wave_len_with_bridges: f32 = tp_bridge
+            .layers
+            .iter()
+            .flat_map(|l| l.paths.iter())
+            .filter(|p| p.feature_kind == 6)
+            .map(|p| p.total_length_mm)
+            .sum();
+        let wave_len_without_bridges: f32 = tp_wave_only
+            .layers
+            .iter()
+            .flat_map(|l| l.paths.iter())
+            .filter(|p| p.feature_kind == 6)
+            .map(|p| p.total_length_mm)
+            .sum();
+        assert!(
+            wave_len_without_bridges > wave_len_with_bridges + 20.0,
+            "Expected significantly more WaveOverhang extrusion length ({wave_len_without_bridges:.1} mm) when max_bridge_length_mm is 2.0 mm vs 40.0 mm ({wave_len_with_bridges:.1} mm)"
+        );
+
+        ffi::set_spatial_orientation_hints(&[]);
         let _ = ffi::remove_cad_object(part.object_id);
     }
 }

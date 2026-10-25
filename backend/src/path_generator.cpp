@@ -28,6 +28,8 @@ constexpr std::uint8_t kFeatureInnerWall = 1;
 constexpr std::uint8_t kFeatureSolidInfill = 2;
 constexpr std::uint8_t kFeatureGapFill = 3;
 constexpr std::uint8_t kFeatureSparseInfill = 4;
+constexpr std::uint8_t kFeatureBridge = 5;
+constexpr std::uint8_t kFeatureWaveOverhang = 6;
 
 constexpr std::uint8_t kPatternConcentric = 1;
 
@@ -2254,7 +2256,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const openvdb::FloatGrid* coarseSdfGrid,
     const openvdb::FloatGrid* coarseEikGrid,
     const openvdb::Vec3SGrid* coarseToolAxisGrid,
-    float fineShellDepthMm)
+    float fineShellDepthMm,
+    const openvdb::FloatGrid* overhangGrid,
+    const openvdb::FloatGrid* coarseOverhangGrid,
+    const std::array<float, 3>& defaultGravityDirectionBed)
 {
     ObjectToolpathsResult result{};
     result.valid = false;
@@ -2263,6 +2268,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     result.inner_wall_count = 0;
     result.solid_infill_count = 0;
     result.sparse_infill_count = 0;
+    result.bridge_count = 0;
+    result.wave_overhang_count = 0;
 
     if (!selectedLayers.valid || selectedLayers.layers.empty()) {
         return result;
@@ -2280,6 +2287,21 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const std::uint8_t sparsePattern = spec.sparse_infill_pattern;
     const float infillAngleDeg = std::isfinite(spec.infill_angle_deg) ? spec.infill_angle_deg : 45.0f;
     const float nozzleDiameterMm = std::max(0.1f, spec.nozzle_diameter_mm);
+    const float overhangAngleThresholdDeg = std::isfinite(spec.overhang_angle_threshold_deg)
+        ? std::clamp(spec.overhang_angle_threshold_deg, 5.0f, 85.0f)
+        : 45.0f;
+    const float sinOverhangThresh =
+        std::sin(overhangAngleThresholdDeg * (3.14159265358979323846f / 180.0f));
+    const float maxBridgeLengthMm = (std::isfinite(spec.max_bridge_length_mm) && spec.max_bridge_length_mm >= 0.0f)
+        ? spec.max_bridge_length_mm
+        : 40.0f;
+    const float waveOverhangOverlapFraction = std::isfinite(spec.wave_overhang_overlap_fraction)
+        ? std::clamp(spec.wave_overhang_overlap_fraction, 0.01f, 0.35f)
+        : 0.08f;
+    const float waveOverlapMm = waveOverhangOverlapFraction * outerW.target_mm;
+    const Vec3f gravityDirBed = normalize3(
+        {defaultGravityDirectionBed[0], defaultGravityDirectionBed[1], defaultGravityDirectionBed[2]},
+        {0.0f, 0.0f, -1.0f});
 
     const float wTargetSumConfig =
         outerW.target_mm + static_cast<float>(numInnerWalls) * innerW.target_mm;
@@ -2353,6 +2375,20 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 cToolSamplerPtr = std::make_unique<ToolSampler>(*cToolAccPtr, coarseToolAxisGrid->transform());
             }
 
+            std::unique_ptr<FloatAcc> ovAccPtr;
+            std::unique_ptr<FloatSampler> ovSamplerPtr;
+            if (overhangGrid != nullptr) {
+                ovAccPtr = std::make_unique<FloatAcc>(overhangGrid->getConstAccessor());
+                ovSamplerPtr = std::make_unique<FloatSampler>(*ovAccPtr, overhangGrid->transform());
+            }
+
+            std::unique_ptr<FloatAcc> cOvAccPtr;
+            std::unique_ptr<FloatSampler> cOvSamplerPtr;
+            if (coarseOverhangGrid != nullptr) {
+                cOvAccPtr = std::make_unique<FloatAcc>(coarseOverhangGrid->getConstAccessor());
+                cOvSamplerPtr = std::make_unique<FloatSampler>(*cOvAccPtr, coarseOverhangGrid->transform());
+            }
+
             auto sampleSdf = [&](const Vec3f& p) -> float {
                 const openvdb::Vec3d wp(p.x, p.y, p.z);
                 const float fineSdf = sdfSampler.wsSample(wp);
@@ -2360,6 +2396,23 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     return cSdfSamplerPtr->wsSample(wp);
                 }
                 return fineSdf;
+            };
+
+            auto sampleOverhang = [&](const Vec3f& p) -> float {
+                const openvdb::Vec3d wp(p.x, p.y, p.z);
+                if (cOvSamplerPtr != nullptr && sdfSampler.wsSample(wp) <= fineShellCutoff) {
+                    return cOvSamplerPtr->wsSample(wp);
+                }
+                if (ovSamplerPtr != nullptr) {
+                    return ovSamplerPtr->wsSample(wp);
+                }
+                // Fallback if overhang grid was not supplied: compute -\nabla \phi_sdf \cdot \hat{g}_bed
+                const float h = 0.5f * voxelSize;
+                const float gx = sampleSdf({p.x + h, p.y, p.z}) - sampleSdf({p.x - h, p.y, p.z});
+                const float gy = sampleSdf({p.x, p.y + h, p.z}) - sampleSdf({p.x, p.y - h, p.z});
+                const float gz = sampleSdf({p.x, p.y, p.z + h}) - sampleSdf({p.x, p.y, p.z - h});
+                const Vec3f gradN = normalize3({gx, gy, gz}, gravityDirBed * -1.0f);
+                return -dot3(gradN, gravityDirBed);
             };
 
             auto sampleNozzleAxis = [&](const Vec3f& p) -> Vec3f {
@@ -2571,10 +2624,21 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // ------------------------------------------------------------
                 // 2. Clip S_k to the Outer Shell Domain (-T_shell <= \phi_sdf <= 0)
                 //    BEFORE subdividing or sampling nozzleAxis / eikGradNorm!
+                //    Also retain any unsupported bottom-skin / bridge-ceiling regions on S_k
+                //    (where stepping one layer down enters exterior air) inside `shellMesh`.
                 // ------------------------------------------------------------
                 std::vector<float> sdfDepth(baseMesh.verts.size(), 0.0f);
                 for (std::size_t i = 0; i < baseMesh.verts.size(); ++i) {
-                    sdfDepth[i] = std::max(0.0f, -baseMesh.verts[i].sdf);
+                    float d = std::max(0.0f, -baseMesh.verts[i].sdf);
+                    if (!layerInfo.is_first_layer && d > shellThicknessMm) {
+                        const float hStep = std::max(1.20f * baseMesh.verts[i].layerHeightMm, 1.15f * meanLayerH);
+                        const Vec3f p = baseMesh.verts[i].pos;
+                        const float sdfDownGrav = sampleSdf(p + (gravityDirBed * hStep)) - sdfZeroShift;
+                        if (sdfDownGrav > -0.20f * outerW.min_mm) {
+                            d = std::min(d, 0.5f * shellThicknessMm);
+                        }
+                    }
+                    sdfDepth[i] = d;
                 }
 
                 SurfaceMesh shellMesh = clipSurfaceMeshByScalar(
@@ -2978,12 +3042,551 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 }
 
                 // ------------------------------------------------------------
-                // 5. Extract Outer Wall (Contacts \phi_sdf = 0) & Inner Walls
+                // 5. Overhang Classification, Bridging, & Wave Overhang Planning
                 // ------------------------------------------------------------
                 const float stitchSnap = std::max(0.05f, 0.25f * targetRefEdge);
                 const float closeLoopTol = std::max(0.15f, 0.65f * outerW.target_mm);
 
-                // 5a. Outer wall: centerline at d_outer(x) = 0.5 * w_outer(x) (clamped on thin top crests)
+                std::vector<bool> isUnsupported(nV, false);
+                std::vector<bool> coveredByBridge(nV, false);
+                bool anyUnsupported = false;
+
+                if (!layerInfo.is_first_layer) {
+                    std::vector<bool> rawUnsupported(nV, false);
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        const Vec3f p = shellMesh.verts[i].pos;
+                        const Vec3f zNoz = shellMesh.verts[i].nozzleAxis;
+                        const float hStep = std::max(1.20f * shellMesh.verts[i].layerHeightMm, 1.15f * meanLayerH);
+                        const float phiCurr = sampleSdf(p) - sdfZeroShift;
+                        const float sdfDownNoz = sampleSdf(p - (zNoz * hStep)) - sdfZeroShift;
+                        const float sdfDownGrav = sampleSdf(p + (gravityDirBed * hStep)) - sdfZeroShift;
+                        const float phiBelow = std::max(sdfDownNoz, sdfDownGrav);
+                        const float downwardSlope = (phiBelow - phiCurr) / std::max(hStep, 1.0e-4f);
+                        const float ov = std::min(
+                            sampleOverhang(p),
+                            sampleOverhang(p + (gravityDirBed * (0.5f * hStep))));
+                        const bool exceedsOverhangAngle =
+                            (ov <= -sinOverhangThresh) || (downwardSlope >= sinOverhangThresh);
+
+                        // 1. Free-air ceiling / cantilevered shelf where stepping one layer down exits the part
+                        const bool isFreeAirCeiling =
+                            (phiBelow > -0.15f * outerW.min_mm) && exceedsOverhangAngle;
+
+                        // 2. Steeply overhanging outer perimeter band where overhang exceeds threshold
+                        const bool isOverhangPerimeter =
+                            (dOuter[i] <= 1.05f * localOuterWidth[i]) &&
+                            exceedsOverhangAngle &&
+                            (phiBelow > -0.65f * localOuterWidth[i]);
+
+                        // Keep interior vertices that sit solidly above the previous layer as supported anchors
+                        const bool isSolidlySupportedAnchor =
+                            (phiBelow <= -0.35f * outerW.min_mm) &&
+                            (dOuter[i] >= 0.95f * localOuterWidth[i]);
+
+                        if ((isFreeAirCeiling || isOverhangPerimeter) && !isSolidlySupportedAnchor) {
+                            rawUnsupported[i] = true;
+                        }
+                    }
+
+                    // Remove isolated single-vertex speckles and ensure each unsupported component
+                    // touches at least one supported vertex on the layer.
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (!rawUnsupported[i]) {
+                            continue;
+                        }
+                        bool nbUnsup = false;
+                        for (std::uint32_t nb : adj[i]) {
+                            if (rawUnsupported[nb]) {
+                                nbUnsup = true;
+                                break;
+                            }
+                        }
+                        if (nbUnsup) {
+                            isUnsupported[i] = true;
+                        }
+                    }
+
+                    std::vector<int> compVis(nV, 0);
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (!isUnsupported[i] || compVis[i] != 0) {
+                            continue;
+                        }
+                        std::vector<std::uint32_t> compVerts;
+                        std::queue<std::uint32_t> q;
+                        q.push(static_cast<std::uint32_t>(i));
+                        compVis[i] = 1;
+                        bool touchesSupported = false;
+                        while (!q.empty()) {
+                            const std::uint32_t u = q.front();
+                            q.pop();
+                            compVerts.push_back(u);
+                            for (std::uint32_t nb : adj[u]) {
+                                if (!isUnsupported[nb]) {
+                                    touchesSupported = true;
+                                } else if (compVis[nb] == 0) {
+                                    compVis[nb] = 1;
+                                    q.push(nb);
+                                }
+                            }
+                        }
+                        if (!touchesSupported) {
+                            for (std::uint32_t u : compVerts) {
+                                isUnsupported[u] = false;
+                            }
+                        } else {
+                            anyUnsupported = true;
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------
+                // 5a. Bridging (`kFeatureBridge = 5`):
+                //     Span unsupported gaps roughly orthogonal to the supported gap boundary edges
+                //     if an accessible supported extrusion exists on the opposite side within
+                //     `maxBridgeLengthMm`. Emits straight-line 3D circular extrusions.
+                // ------------------------------------------------------------
+                struct BridgeSpanSeg {
+                    Vec3f a;
+                    Vec3f b;
+                    Vec3f ab;
+                    float abLenSq;
+                };
+                std::vector<BridgeSpanSeg> emittedBridgeSegs;
+                std::uint32_t bridgePassIdx = 0;
+
+                if (anyUnsupported && maxBridgeLengthMm > minExtrusionLengthMm) {
+                    SurfaceMesh shellForUnsup = shellMesh;
+                    std::vector<float> unsupClipField(nV, 1.0f);
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        shellForUnsup.verts[i].onInnerShellBoundary = false;
+                        unsupClipField[i] = isUnsupported[i] ? -1.0f : 1.0f;
+                    }
+                    SurfaceMesh unsupMesh = clipSurfaceMeshByScalar(
+                        shellForUnsup,
+                        unsupClipField,
+                        0.0f,
+                        true);
+
+                    if (!unsupMesh.tris.empty() && !unsupMesh.verts.empty()) {
+                        // Decompose `unsupMesh` into connected triangle islands
+                        const std::size_t nUTris = unsupMesh.tris.size();
+                        std::unordered_map<EdgeKey, std::vector<std::uint32_t>, EdgeKeyHash> uEdgeToTris;
+                        uEdgeToTris.reserve(nUTris * 3);
+                        for (std::uint32_t t = 0; t < static_cast<std::uint32_t>(nUTris); ++t) {
+                            const auto& tri = unsupMesh.tris[t];
+                            uEdgeToTris[EdgeKey(tri[0], tri[1])].push_back(t);
+                            uEdgeToTris[EdgeKey(tri[1], tri[2])].push_back(t);
+                            uEdgeToTris[EdgeKey(tri[2], tri[0])].push_back(t);
+                        }
+
+                        std::vector<int> uTriIsland(nUTris, -1);
+                        int numUIslands = 0;
+                        for (std::size_t t = 0; t < nUTris; ++t) {
+                            if (uTriIsland[t] >= 0) {
+                                continue;
+                            }
+                            const int islId = numUIslands++;
+                            std::queue<std::uint32_t> q;
+                            q.push(static_cast<std::uint32_t>(t));
+                            uTriIsland[t] = islId;
+                            while (!q.empty()) {
+                                const std::uint32_t curr = q.front();
+                                q.pop();
+                                const auto& tri = unsupMesh.tris[curr];
+                                const EdgeKey edges[3] = {
+                                    EdgeKey(tri[0], tri[1]),
+                                    EdgeKey(tri[1], tri[2]),
+                                    EdgeKey(tri[2], tri[0]),
+                                };
+                                for (const auto& ek : edges) {
+                                    auto it = uEdgeToTris.find(ek);
+                                    if (it == uEdgeToTris.end()) {
+                                        continue;
+                                    }
+                                    for (std::uint32_t nb : it->second) {
+                                        if (uTriIsland[nb] < 0) {
+                                            uTriIsland[nb] = islId;
+                                            q.push(nb);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        const float anchorTol = std::max(0.85f * outerW.target_mm, 2.0f * targetRefEdge);
+                        const float anchorTolSq = anchorTol * anchorTol;
+
+                        for (int isl = 0; isl < numUIslands; ++isl) {
+                            SurfaceMesh islMesh;
+                            std::unordered_map<std::uint32_t, std::uint32_t> vMap;
+                            Vec3f areaWeightedNozzle{0.0f, 0.0f, 0.0f};
+
+                            for (std::size_t t = 0; t < nUTris; ++t) {
+                                if (uTriIsland[t] != isl) {
+                                    continue;
+                                }
+                                const auto& tri = unsupMesh.tris[t];
+                                std::array<std::uint32_t, 3> mapped{};
+                                for (int k = 0; k < 3; ++k) {
+                                    auto it = vMap.find(tri[k]);
+                                    if (it != vMap.end()) {
+                                        mapped[k] = it->second;
+                                    } else {
+                                        const auto newIdx = static_cast<std::uint32_t>(islMesh.verts.size());
+                                        islMesh.verts.push_back(unsupMesh.verts[tri[k]]);
+                                        vMap.emplace(tri[k], newIdx);
+                                        mapped[k] = newIdx;
+                                    }
+                                }
+                                islMesh.tris.push_back(mapped);
+
+                                const Vec3f& p0 = islMesh.verts[mapped[0]].pos;
+                                const Vec3f& p1 = islMesh.verts[mapped[1]].pos;
+                                const Vec3f& p2 = islMesh.verts[mapped[2]].pos;
+                                const float area2 = length3(cross3(p1 - p0, p2 - p0));
+                                const Vec3f avgNoz = normalize3(
+                                    islMesh.verts[mapped[0]].nozzleAxis +
+                                    islMesh.verts[mapped[1]].nozzleAxis +
+                                    islMesh.verts[mapped[2]].nozzleAxis);
+                                areaWeightedNozzle = areaWeightedNozzle + (avgNoz * area2);
+                            }
+
+                            if (islMesh.tris.empty() || islMesh.verts.size() < 3) {
+                                continue;
+                            }
+
+                            // Extract exact boundary edges of `islMesh` that touch the supported region
+                            struct IslAnchorEdge {
+                                Vec3f mid;
+                                Vec3f nIntoGap;
+                                float length;
+                            };
+                            std::unordered_map<EdgeKey, std::pair<std::uint32_t, std::uint32_t>, EdgeKeyHash> islEdgeCountAndOpp;
+                            islEdgeCountAndOpp.reserve(islMesh.tris.size() * 3);
+                            for (const auto& tri : islMesh.tris) {
+                                for (int k = 0; k < 3; ++k) {
+                                    const std::uint32_t va = tri[k];
+                                    const std::uint32_t vb = tri[(k + 1) % 3];
+                                    const std::uint32_t vc = tri[(k + 2) % 3];
+                                    auto& entry = islEdgeCountAndOpp[EdgeKey(va, vb)];
+                                    entry.first += 1;
+                                    entry.second = vc;
+                                }
+                            }
+
+                            std::vector<IslAnchorEdge> islSupEdges;
+                            for (const auto& [ek, countAndOpp] : islEdgeCountAndOpp) {
+                                if (countAndOpp.first != 1) {
+                                    continue;
+                                }
+                                // A boundary edge of `islMesh` is anchored on the supported region of `shellMesh`
+                                // if and only if both of its endpoints were created on the supported/unsupported
+                                // clip interface (`onInnerShellBoundary == true`).
+                                if (!islMesh.verts[ek.a].onInnerShellBoundary ||
+                                    !islMesh.verts[ek.b].onInnerShellBoundary) {
+                                    continue;
+                                }
+                                const Vec3f& pa = islMesh.verts[ek.a].pos;
+                                const Vec3f& pb = islMesh.verts[ek.b].pos;
+                                const Vec3f& pc = islMesh.verts[countAndOpp.second].pos;
+                                const Vec3f mid = lerp3(pa, pb, 0.5f);
+                                const Vec3f edgeVec = pb - pa;
+                                const float edgeLen = length3(edgeVec);
+                                if (edgeLen <= 1.0e-5f) {
+                                    continue;
+                                }
+                                const Vec3f tEdge = edgeVec * (1.0f / edgeLen);
+                                const Vec3f ac = pc - pa;
+                                const Vec3f vIn = ac - (tEdge * dot3(ac, tEdge));
+                                if (lengthSq3(vIn) <= 1.0e-10f) {
+                                    continue;
+                                }
+                                const Vec3f nIntoGap = normalize3(vIn, {1.0f, 0.0f, 0.0f});
+                                islSupEdges.push_back(IslAnchorEdge{mid, nIntoGap, edgeLen});
+                            }
+
+                            if (islSupEdges.size() < 2) {
+                                continue;
+                            }
+
+                            const Vec3f zIsl = normalize3(areaWeightedNozzle, fallbackNozzle);
+                            const Vec3f refAx = (std::abs(zIsl.x) < 0.9f)
+                                ? Vec3f{1.0f, 0.0f, 0.0f}
+                                : Vec3f{0.0f, 1.0f, 0.0f};
+                            const Vec3f e1 = normalize3(refAx - (zIsl * dot3(refAx, zIsl)), {1.0f, 0.0f, 0.0f});
+                            const Vec3f e2 = normalize3(cross3(zIsl, e1), {0.0f, 1.0f, 0.0f});
+
+                            // Accumulate the length-weighted 2D structure tensor of directions orthogonal
+                            // to supported gap boundary edges that have an opposing supported boundary partner
+                            // across the gap within `maxBridgeLengthMm`.
+                            float m11 = 0.0f;
+                            float m12 = 0.0f;
+                            float m22 = 0.0f;
+                            for (std::size_t bIdx = 0; bIdx < islSupEdges.size(); ++bIdx) {
+                                const Vec3f& bp = islSupEdges[bIdx].mid;
+                                const Vec3f& nGap = islSupEdges[bIdx].nIntoGap;
+                                bool hasOpposingPartner = false;
+                                for (std::size_t oIdx = 0; oIdx < islSupEdges.size(); ++oIdx) {
+                                    if (oIdx == bIdx) {
+                                        continue;
+                                    }
+                                    const Vec3f spanVec = islSupEdges[oIdx].mid - bp;
+                                    const float spanLen = length3(spanVec);
+                                    if (spanLen < minExtrusionLengthMm || spanLen > maxBridgeLengthMm) {
+                                        continue;
+                                    }
+                                    const Vec3f spanDir = spanVec * (1.0f / spanLen);
+                                    const Vec3f& nOpp = islSupEdges[oIdx].nIntoGap;
+                                    if (dot3(nGap, spanDir) >= 0.70f &&
+                                        dot3(nOpp, spanDir) <= -0.70f &&
+                                        dot3(nGap, nOpp) <= -0.50f) {
+                                        hasOpposingPartner = true;
+                                        break;
+                                    }
+                                }
+                                if (!hasOpposingPartner) {
+                                    continue;
+                                }
+                                const float wLen = islSupEdges[bIdx].length;
+                                const float c1 = dot3(nGap, e1);
+                                const float c2 = dot3(nGap, e2);
+                                m11 += wLen * c1 * c1;
+                                m12 += wLen * c1 * c2;
+                                m22 += wLen * c2 * c2;
+                            }
+
+                            if (m11 + m22 < 1.0e-5f) {
+                                continue;
+                            }
+
+                            // Principal eigenvector of [[m11, m12], [m12, m22]] gives the dominant
+                            // direction roughly orthogonal to the supported gap boundary edges.
+                            const float halfAngle = 0.5f * std::atan2(2.0f * m12, m11 - m22);
+                            const Vec3f bridgeDir = normalize3(
+                                (e1 * std::cos(halfAngle)) + (e2 * std::sin(halfAngle)),
+                                e1);
+                            const Vec3f scanAxis = normalize3(cross3(zIsl, bridgeDir), e2);
+
+                            const std::size_t nIslV = islMesh.verts.size();
+                            std::vector<float> uCoord(nIslV, 0.0f);
+                            std::vector<float> dummyValid(nIslV, 1.0f);
+                            std::vector<float> bridgeWidths(nIslV, nozzleDiameterMm);
+                            float uMin = std::numeric_limits<float>::max();
+                            float uMax = std::numeric_limits<float>::lowest();
+                            for (std::size_t i = 0; i < nIslV; ++i) {
+                                const float u = dot3(islMesh.verts[i].pos, scanAxis);
+                                uCoord[i] = u;
+                                uMin = std::min(uMin, u);
+                                uMax = std::max(uMax, u);
+                            }
+
+                            const float uSpan = uMax - uMin;
+                            const float pitch = std::max(0.15f, nozzleDiameterMm);
+                            const int nLines = std::max(1, static_cast<int>(std::floor(uSpan / pitch)) + 1);
+                            const float startU = uMin + 0.5f * (uSpan - static_cast<float>(nLines - 1) * pitch);
+
+                            for (int lineIdx = 0; lineIdx < nLines; ++lineIdx) {
+                                const float isoU = startU + static_cast<float>(lineIdx) * pitch;
+                                const auto segs = extractIsoContourSegments(
+                                    islMesh,
+                                    uCoord,
+                                    isoU,
+                                    dummyValid,
+                                    0.0f,
+                                    bridgeWidths);
+                                const auto chains = stitchSegmentsIntoChains(
+                                    segs,
+                                    stitchSnap,
+                                    0.0f); // Bridges are always open straight lines
+
+                                for (const auto& ch : chains) {
+                                    if (ch.pts.size() < 2) {
+                                        continue;
+                                    }
+                                    Vec3f pStart = ch.pts.front().pos;
+                                    Vec3f pEnd = ch.pts.back().pos;
+                                    const float chordLen = dist3(pStart, pEnd);
+                                    if (chordLen < minExtrusionLengthMm ||
+                                        chordLen > maxBridgeLengthMm ||
+                                        chordLen <= 1.0e-4f) {
+                                        continue;
+                                    }
+
+                                    const Vec3f chordDir = (pEnd - pStart) * (1.0f / chordLen);
+
+                                    // Verify both endpoints are anchored on opposing supported gap boundaries
+                                    float bestStartDistSq = anchorTolSq;
+                                    Vec3f startGapNormal{0.0f, 0.0f, 0.0f};
+                                    bool startAnchored = false;
+
+                                    float bestEndDistSq = anchorTolSq;
+                                    Vec3f endGapNormal{0.0f, 0.0f, 0.0f};
+                                    bool endAnchored = false;
+
+                                    for (std::size_t bIdx = 0; bIdx < islSupEdges.size(); ++bIdx) {
+                                        const float dStartSq = lengthSq3(islSupEdges[bIdx].mid - pStart);
+                                        if (dStartSq < bestStartDistSq) {
+                                            bestStartDistSq = dStartSq;
+                                            startGapNormal = islSupEdges[bIdx].nIntoGap;
+                                            startAnchored = true;
+                                        }
+                                        const float dEndSq = lengthSq3(islSupEdges[bIdx].mid - pEnd);
+                                        if (dEndSq < bestEndDistSq) {
+                                            bestEndDistSq = dEndSq;
+                                            endGapNormal = islSupEdges[bIdx].nIntoGap;
+                                            endAnchored = true;
+                                        }
+                                    }
+
+                                    if (!startAnchored || !endAnchored) {
+                                        continue;
+                                    }
+                                    // At start, the into-gap normal must point roughly orthogonal to the gap
+                                    // along +chordDir; at end, the opposing into-gap normal must point along
+                                    // -chordDir, and the two boundaries must genuinely oppose each other.
+                                    if (dot3(startGapNormal, chordDir) < 0.70f ||
+                                        dot3(endGapNormal, chordDir) > -0.70f ||
+                                        dot3(startGapNormal, endGapNormal) > -0.50f) {
+                                        continue;
+                                    }
+
+                                    // Verify the straight 3D line between pStart and pEnd stays inside
+                                    // the part (within 0.45 * d_nozzle of SDF <= 0) and is kinematically accessible.
+                                    const int nSamples = std::max(4, static_cast<int>(std::ceil(chordLen / (0.5f * pitch))));
+                                    bool pathAccessible = true;
+                                    for (int s = 1; s < nSamples; ++s) {
+                                        const float t = static_cast<float>(s) / static_cast<float>(nSamples);
+                                        const Vec3f pMid = lerp3(pStart, pEnd, t);
+                                        const float sdfMid = sampleSdf(pMid) - sdfZeroShift;
+                                        if (sdfMid > 0.45f * nozzleDiameterMm) {
+                                            pathAccessible = false;
+                                            break;
+                                        }
+                                        const Vec3f nozMid = sampleNozzleAxis(pMid);
+                                        if (std::abs(dot3(chordDir, nozMid)) > 0.88f) {
+                                            pathAccessible = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!pathAccessible) {
+                                        continue;
+                                    }
+
+                                    // Extend bridge endpoints slightly into the supported anchor extrusions
+                                    // without exceeding maxBridgeLengthMm
+                                    const float anchorOverlap = std::min(
+                                        0.15f * nozzleDiameterMm,
+                                        0.5f * std::max(0.0f, maxBridgeLengthMm - chordLen));
+                                    if (anchorOverlap > 1.0e-4f) {
+                                        const Vec3f candStart = pStart - (chordDir * anchorOverlap);
+                                        if (sampleSdf(candStart) - sdfZeroShift <= 0.15f * nozzleDiameterMm) {
+                                            pStart = candStart;
+                                        }
+                                        const Vec3f candEnd = pEnd + (chordDir * anchorOverlap);
+                                        if (sampleSdf(candEnd) - sdfZeroShift <= 0.15f * nozzleDiameterMm) {
+                                            pEnd = candEnd;
+                                        }
+                                    }
+
+                                    // Alternate scan direction on odd lines for continuous back-and-forth bridging
+                                    if (lineIdx % 2 == 1) {
+                                        std::swap(pStart, pEnd);
+                                    }
+
+                                    const Vec3f nozStart = sampleNozzleAxis(pStart);
+                                    const Vec3f nozEnd = sampleNozzleAxis(pEnd);
+                                    const float finalLen = dist3(pStart, pEnd);
+
+                                    ExtrusionPath bridgePath{};
+                                    bridgePath.feature_kind = kFeatureBridge;
+                                    bridgePath.wall_index = bridgePassIdx++;
+                                    bridgePath.is_closed = false;
+                                    bridgePath.total_length_mm = finalLen;
+                                    bridgePath.mean_width_mm = nozzleDiameterMm;
+
+                                    ToolpathPoint tp0{};
+                                    tp0.x = pStart.x;
+                                    tp0.y = pStart.y;
+                                    tp0.z = pStart.z;
+                                    tp0.nx = nozStart.x;
+                                    tp0.ny = nozStart.y;
+                                    tp0.nz = nozStart.z;
+                                    tp0.width_mm = nozzleDiameterMm;
+                                    tp0.height_mm = nozzleDiameterMm; // Circular cross-section!
+
+                                    ToolpathPoint tp1{};
+                                    tp1.x = pEnd.x;
+                                    tp1.y = pEnd.y;
+                                    tp1.z = pEnd.z;
+                                    tp1.nx = nozEnd.x;
+                                    tp1.ny = nozEnd.y;
+                                    tp1.nz = nozEnd.z;
+                                    tp1.width_mm = nozzleDiameterMm;
+                                    tp1.height_mm = nozzleDiameterMm; // Circular cross-section!
+
+                                    bridgePath.points.push_back(tp0);
+                                    bridgePath.points.push_back(tp1);
+                                    layerOut.paths.push_back(std::move(bridgePath));
+
+                                    const Vec3f ab = pEnd - pStart;
+                                    emittedBridgeSegs.push_back(BridgeSpanSeg{
+                                        pStart,
+                                        pEnd,
+                                        ab,
+                                        lengthSq3(ab),
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Mark unsupported vertices covered by emitted bridge extrusions
+                    if (!emittedBridgeSegs.empty()) {
+                        const float covRadSq = (0.95f * nozzleDiameterMm) * (0.95f * nozzleDiameterMm);
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            if (!isUnsupported[i]) {
+                                continue;
+                            }
+                            const Vec3f p = shellMesh.verts[i].pos;
+                            for (const auto& bs : emittedBridgeSegs) {
+                                const float tProj = (bs.abLenSq > 1.0e-12f)
+                                    ? std::clamp(dot3(p - bs.a, bs.ab) / bs.abLenSq, 0.0f, 1.0f)
+                                    : 0.5f;
+                                const Vec3f foot = bs.a + (bs.ab * tProj);
+                                if (lengthSq3(p - foot) <= covRadSq) {
+                                    coveredByBridge[i] = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Remaining unsupported regions not spanned by bridges are handled via Wave Overhangs
+                std::vector<bool> isWaveOverhang(nV, false);
+                bool anyWaveOverhang = false;
+                for (std::size_t i = 0; i < nV; ++i) {
+                    if (isUnsupported[i] && !coveredByBridge[i]) {
+                        isWaveOverhang[i] = true;
+                        anyWaveOverhang = true;
+                    }
+                }
+
+                // Mask `availableSpan` for standard walls/infill so they are only emitted on
+                // the supported domain (`!isUnsupported[i]`).
+                std::vector<float> supportedWallValidity = availableSpan;
+                if (anyUnsupported) {
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (isUnsupported[i]) {
+                            supportedWallValidity[i] = -0.25f * outerW.target_mm;
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------
+                // 5b. Extract Supported Outer Wall (Contacts \phi_sdf = 0) & Inner Walls
+                // ------------------------------------------------------------
+                // Outer wall: centerline at d_outer(x) = 0.5 * w_outer(x) (clamped on thin top crests)
                 {
                     std::vector<float> outerLevel(nV, 0.0f);
                     for (std::size_t i = 0; i < nV; ++i) {
@@ -2999,7 +3602,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         shellMesh,
                         outerLevel,
                         0.0f,
-                        availableSpan,
+                        supportedWallValidity,
                         0.02f,
                         localOuterWidth);
                     const auto outerChains =
@@ -3018,7 +3621,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                 }
 
-                // 5b. Inner walls: j = 1 .. numInnerWalls (may be closed loops or open polylines!)
+                // Inner walls: j = 1 .. numInnerWalls (may be closed loops or open polylines!)
                 for (std::uint32_t j = 1; j <= numInnerWalls; ++j) {
                     const float minSpanForWallJ =
                         outerW.min_mm + static_cast<float>(j) * innerW.min_mm;
@@ -3033,7 +3636,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         shellMesh,
                         innerLevel,
                         0.0f,
-                        availableSpan,
+                        supportedWallValidity,
                         minSpanForWallJ,
                         localInnerWidth);
                     const auto innerChains =
@@ -3053,14 +3656,252 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 }
 
                 // ------------------------------------------------------------
+                // 5c. Wave Overhangs (`kFeatureWaveOverhang = 6`):
+                //     Print unsupported non-bridged regions strictly inside-out (`wall_index = 1, 2, ...`)
+                //     approximately parallel to existing supported extrusions, gap-filling out to the
+                //     unsupported outer boundary \Gamma_outer while maintaining continuous contact at
+                //     exact overlap \delta_overlap = \eta_wave * w_standard even when line width
+                //     changes or the 3D centerline rotates around the existing extrusion.
+                // ------------------------------------------------------------
+                if (anyWaveOverhang) {
+                    // Multi-source Dijkstra distance `dFromSupported` starting at 0 on the boundary
+                    // of the supported region (`!isWaveOverhang`) and growing outward toward \Gamma_outer.
+                    std::vector<float> dFromSupported(nV, kInf);
+                    std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> wavePq;
+
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (!isWaveOverhang[i]) {
+                            dFromSupported[i] = 0.0f;
+                            wavePq.push({0.0f, static_cast<std::uint32_t>(i)});
+                        }
+                    }
+
+                    // For wave vertices directly adjacent to a supported vertex across a mesh edge,
+                    // initialize exact distance from the midpoint of the supported/unsupported boundary edge.
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (!isWaveOverhang[i]) {
+                            continue;
+                        }
+                        for (std::uint32_t nb : adj[i]) {
+                            if (!isWaveOverhang[nb]) {
+                                const float halfEdge = 0.5f * dist3(shellMesh.verts[i].pos, shellMesh.verts[nb].pos);
+                                if (halfEdge < dFromSupported[i]) {
+                                    dFromSupported[i] = halfEdge;
+                                    wavePq.push({halfEdge, static_cast<std::uint32_t>(i)});
+                                }
+                            }
+                        }
+                    }
+
+                    while (!wavePq.empty()) {
+                        const auto [dCurr, u] = wavePq.top();
+                        wavePq.pop();
+                        if (dCurr > dFromSupported[u] + 1.0e-6f) {
+                            continue;
+                        }
+                        for (std::uint32_t v : adj[u]) {
+                            const float wEdge = dist3(shellMesh.verts[u].pos, shellMesh.verts[v].pos);
+                            if (dCurr + wEdge < dFromSupported[v]) {
+                                dFromSupported[v] = dCurr + wEdge;
+                                wavePq.push({dFromSupported[v], v});
+                            }
+                        }
+                    }
+
+                    // If the supported/wave boundary cuts across an interior infill region (where
+                    // `dOuter > totalWallSpan`), emit a supported anchor inner-wall contour along
+                    // the supported side of the interface so pass 1 of the wave overhang always has
+                    // a continuous existing extrusion to overlap against.
+                    {
+                        std::vector<float> anchorLevel(nV, 0.0f);
+                        std::vector<float> anchorValidity(nV, -1.0f);
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            const float signedDist = isWaveOverhang[i]
+                                ? dFromSupported[i]
+                                : -0.5f * innerW.target_mm;
+                            anchorLevel[i] = signedDist + 0.25f * innerW.target_mm;
+                            if (dOuter[i] > totalWallSpan[i] - 0.25f * innerW.target_mm) {
+                                anchorValidity[i] = 1.0f;
+                            }
+                        }
+                        const auto anchorSegs = extractIsoContourSegments(
+                            shellMesh,
+                            anchorLevel,
+                            0.0f,
+                            anchorValidity,
+                            0.0f,
+                            localInnerWidth);
+                        const auto anchorChains =
+                            stitchSegmentsIntoChains(anchorSegs, stitchSnap, closeLoopTol);
+                        for (const auto& ch : anchorChains) {
+                            ExtrusionPath ep{};
+                            if (finalizeExtrusionPath(
+                                    ch,
+                                    kFeatureInnerWall,
+                                    numInnerWalls + 1,
+                                    minExtrusionLengthMm,
+                                    ep)) {
+                                layerOut.paths.push_back(std::move(ep));
+                            }
+                        }
+                    }
+
+                    // Compute 3D centerline rotation factor \rho(\beta_i), adapted wave line width
+                    // w_wave[i], and overlap-locked step \Delta d_wave[i] at each vertex.
+                    std::vector<float> waveWidth(nV, outerW.target_mm);
+                    std::vector<float> waveRho(nV, 1.0f);
+                    std::vector<float> waveStep(nV, std::max(0.15f, outerW.target_mm - waveOverlapMm));
+                    std::vector<float> waveTotalSpan(nV, 0.0f);
+                    std::vector<float> waveDomainValidity(nV, -1.0f);
+                    int maxWavePasses = 0;
+
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (!isWaveOverhang[i] || dFromSupported[i] >= kInf * 0.5f) {
+                            waveDomainValidity[i] = -0.20f * outerW.target_mm;
+                            continue;
+                        }
+
+                        // Estimate local outward step direction \hat{u}_out along \nabla dFromSupported
+                        Vec3f gradVec{0.0f, 0.0f, 0.0f};
+                        for (std::uint32_t nb : adj[i]) {
+                            const Vec3f diff = shellMesh.verts[nb].pos - shellMesh.verts[i].pos;
+                            const float lenSq = lengthSq3(diff);
+                            if (lenSq > 1.0e-10f) {
+                                const float dd = dFromSupported[nb] - dFromSupported[i];
+                                gradVec = gradVec + (diff * (dd / lenSq));
+                            }
+                        }
+                        const Vec3f uOut = normalize3(gradVec, closestOuterNormal[i] * -1.0f);
+                        const Vec3f zNoz = shellMesh.verts[i].nozzleAxis;
+
+                        // 3D centerline rotation angle \beta around the existing extrusion:
+                        // \sin\beta = |\hat{u}_out \cdot \hat{z}_nozzle|
+                        const float sinBeta = std::clamp(std::abs(dot3(uOut, zNoz)), 0.0f, 0.96f);
+                        const float cosBeta = std::sqrt(std::max(0.0f, 1.0f - sinBeta * sinBeta));
+                        const float hLocal = std::max(0.04f, shellMesh.verts[i].layerHeightMm);
+                        const float wRef = outerW.target_mm;
+                        const float denomEll = std::sqrt(
+                            (hLocal * cosBeta) * (hLocal * cosBeta) +
+                            (wRef * sinBeta) * (wRef * sinBeta));
+                        const float rho = (denomEll > 1.0e-6f)
+                            ? std::clamp(hLocal / denomEll, 0.35f, 1.0f)
+                            : 1.0f;
+                        waveRho[i] = rho;
+
+                        const float totSpan = std::max(
+                            dFromSupported[i] + dOuter[i],
+                            outerW.min_mm);
+                        waveTotalSpan[i] = totSpan;
+                        waveDomainValidity[i] = totSpan;
+
+                        const float nominalStep =
+                            std::max(0.25f * outerW.min_mm, rho * outerW.target_mm - waveOverlapMm);
+                        const int nPasses =
+                            std::max(1, static_cast<int>(std::round(totSpan / nominalStep)));
+                        maxWavePasses = std::max(maxWavePasses, nPasses);
+
+                        const float adaptedStep = totSpan / static_cast<float>(nPasses);
+                        const float adaptedWidth = std::clamp(
+                            (adaptedStep + waveOverlapMm) / rho,
+                            outerW.min_mm,
+                            outerW.max_mm);
+                        waveWidth[i] = adaptedWidth;
+                        waveStep[i] = std::max(
+                            0.20f * outerW.min_mm,
+                            rho * adaptedWidth - waveOverlapMm);
+                    }
+
+                    // Smooth `waveWidth` and `waveStep` over 1-ring neighborhoods so variable width
+                    // transitions along curved wave overhangs are C^1-smooth while maintaining overlap.
+                    {
+                        std::vector<float> wSmooth = waveWidth;
+                        std::vector<float> sSmooth = waveStep;
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            if (!isWaveOverhang[i] || adj[i].empty()) {
+                                continue;
+                            }
+                            float sumW = waveWidth[i];
+                            float sumRho = waveRho[i];
+                            int cnt = 1;
+                            for (std::uint32_t nb : adj[i]) {
+                                if (isWaveOverhang[nb]) {
+                                    sumW += waveWidth[nb];
+                                    sumRho += waveRho[nb];
+                                    ++cnt;
+                                }
+                            }
+                            const float avgW = sumW / static_cast<float>(cnt);
+                            const float avgRho = sumRho / static_cast<float>(cnt);
+                            wSmooth[i] = std::clamp(avgW, outerW.min_mm, outerW.max_mm);
+                            sSmooth[i] = std::max(
+                                0.20f * outerW.min_mm,
+                                avgRho * wSmooth[i] - waveOverlapMm);
+                        }
+                        waveWidth = std::move(wSmooth);
+                        waveStep = std::move(sSmooth);
+                    }
+
+                    maxWavePasses = std::clamp(maxWavePasses, 1, 96);
+
+                    // Emit Wave Overhang passes in strict inside-out order: p = 1, 2, ..., maxWavePasses
+                    for (int p = 1; p <= maxWavePasses; ++p) {
+                        std::vector<float> waveLevel(nV, 0.0f);
+                        std::vector<float> passValidity(nV, -1.0f);
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            // Centerline distance from the supported boundary for pass p:
+                            // c_p = (p - 0.5) * \rho * w_wave - p * \delta_overlap
+                            //     = (p - 0.5) * waveStep - 0.5 * \delta_overlap
+                            const float centerDist =
+                                (static_cast<float>(p) - 0.5f) * waveStep[i] - 0.5f * waveOverlapMm;
+                            const float outerInset = 0.5f * waveRho[i] * waveWidth[i];
+                            waveLevel[i] = std::max(
+                                dFromSupported[i] - centerDist,
+                                outerInset - dOuter[i]);
+                            if (isWaveOverhang[i]) {
+                                const float prevOuterReach = (p == 1)
+                                    ? 0.0f
+                                    : (static_cast<float>(p - 1) * waveStep[i]);
+                                passValidity[i] = (waveTotalSpan[i] - prevOuterReach) - (0.35f * waveStep[i]);
+                            } else {
+                                passValidity[i] = -0.15f * outerW.min_mm;
+                            }
+                        }
+
+                        const auto waveSegs = extractIsoContourSegments(
+                            shellMesh,
+                            waveLevel,
+                            0.0f,
+                            passValidity,
+                            0.0f,
+                            waveWidth);
+                        const auto waveChains =
+                            stitchSegmentsIntoChains(waveSegs, stitchSnap, closeLoopTol);
+
+                        for (const auto& ch : waveChains) {
+                            ExtrusionPath ep{};
+                            if (finalizeExtrusionPath(
+                                    ch,
+                                    kFeatureWaveOverhang,
+                                    static_cast<std::uint32_t>(p),
+                                    minExtrusionLengthMm,
+                                    ep)) {
+                                layerOut.paths.push_back(std::move(ep));
+                            }
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------
                 // 6. Shell Gap Fill & Solid Infill (`Monotonic` or `Concentric`)
                 // ------------------------------------------------------------
                 std::vector<float> negDRem(nV, 0.0f);
                 std::vector<float> remOneSidedSpan(nV, 0.0f);
                 for (std::size_t i = 0; i < nV; ++i) {
                     const float dRem = dOuter[i] - totalWallSpan[i];
-                    negDRem[i] = -dRem;
-                    remOneSidedSpan[i] = std::max(0.0f, availableSpan[i] - totalWallSpan[i]);
+                    negDRem[i] = isUnsupported[i] ? 1.0f : -dRem;
+                    remOneSidedSpan[i] = isUnsupported[i]
+                        ? 0.0f
+                        : std::max(0.0f, availableSpan[i] - totalWallSpan[i]);
                     shellMesh.verts[i].dRem = std::max(0.0f, dRem);
                     shellMesh.verts[i].remSpan = remOneSidedSpan[i];
                 }
@@ -3249,10 +4090,14 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // Normalize emitted toolpath point heights so the layer's mean segment height
                 // matches `meanLayerH` (`layerInfo.mean_thickness_mm`) while preserving relative
                 // intra-layer conformal thickness variations (1 / |\nabla \tau|).
+                // Circular Bridge extrusions (`kFeatureBridge`) retain `height_mm = width_mm = nozzleDiameterMm`.
                 {
                     double sumPtH = 0.0;
                     std::size_t cntPtH = 0;
                     for (const auto& path : layerOut.paths) {
+                        if (path.feature_kind == kFeatureBridge) {
+                            continue;
+                        }
                         for (const auto& pt : path.points) {
                             sumPtH += static_cast<double>(pt.height_mm);
                             ++cntPtH;
@@ -3264,6 +4109,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         if (rawMeanPtH > 1.0e-4f) {
                             const float hScale = meanLayerH / rawMeanPtH;
                             for (auto& path : layerOut.paths) {
+                                if (path.feature_kind == kFeatureBridge) {
+                                    continue;
+                                }
                                 for (auto& pt : path.points) {
                                     pt.height_mm =
                                         std::clamp(pt.height_mm * hScale, layerMinH, layerMaxH);
@@ -3292,6 +4140,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 result.inner_wall_count += 1;
             } else if (path.feature_kind == kFeatureSparseInfill) {
                 result.sparse_infill_count += 1;
+            } else if (path.feature_kind == kFeatureBridge) {
+                result.bridge_count += 1;
+            } else if (path.feature_kind == kFeatureWaveOverhang) {
+                result.wave_overhang_count += 1;
             } else {
                 result.solid_infill_count += 1;
             }

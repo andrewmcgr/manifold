@@ -1342,6 +1342,9 @@ struct SlicerBackend::Impl {
         45.0f,
         0.40f,
         0.80f,
+        45.0f,
+        40.0f,
+        0.08f,
     };
 };
 
@@ -4770,6 +4773,15 @@ void SlicerBackend::setShellPathSpec(const ShellPathSpec& spec) noexcept {
     s.infill_angle_deg = std::clamp(s.infill_angle_deg, 0.0f, 180.0f);
     s.nozzle_diameter_mm = (s.nozzle_diameter_mm > 0.05f) ? s.nozzle_diameter_mm : 0.40f;
     s.min_extrusion_length_mm = std::max(0.0f, s.min_extrusion_length_mm);
+    s.overhang_angle_threshold_deg = (s.overhang_angle_threshold_deg > 1.0f)
+        ? std::clamp(s.overhang_angle_threshold_deg, 5.0f, 89.0f)
+        : 45.0f;
+    s.max_bridge_length_mm = (s.max_bridge_length_mm > 0.1f)
+        ? std::clamp(s.max_bridge_length_mm, 0.5f, 500.0f)
+        : 40.0f;
+    s.wave_overhang_overlap_fraction = (s.wave_overhang_overlap_fraction > 1.0e-4f)
+        ? std::clamp(s.wave_overhang_overlap_fraction, 0.01f, 0.45f)
+        : 0.08f;
     impl_->shellPathSpec = s;
 }
 
@@ -4810,9 +4822,14 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         setFieldProgress(true, frac, msg.c_str());
     };
 
+    const auto ovIt = rec.scalarFields.find("overhang");
+    const openvdb::FloatGrid* overhangPtr =
+        (ovIt != rec.scalarFields.end() && ovIt->second) ? ovIt->second.get() : nullptr;
+
     const openvdb::FloatGrid* coarseSdfPtr = nullptr;
     const openvdb::FloatGrid* coarseEikPtr = nullptr;
     const openvdb::Vec3SGrid* coarseToolAxisPtr = nullptr;
+    const openvdb::FloatGrid* coarseOverhangPtr = nullptr;
     if (rec.isMultiResolution) {
         const auto cSdfIt = rec.coarseScalarFields.find("sdf");
         const auto cEikIt = rec.coarseScalarFields.find("eikonal");
@@ -4821,6 +4838,10 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
             coarseSdfPtr = cSdfIt->second.get();
             coarseEikPtr = cEikIt->second.get();
             coarseToolAxisPtr = rec.coarseToolAxisGrid.get();
+        }
+        const auto cOvIt = rec.coarseScalarFields.find("overhang");
+        if (cOvIt != rec.coarseScalarFields.end() && cOvIt->second) {
+            coarseOverhangPtr = cOvIt->second.get();
         }
     }
 
@@ -4836,7 +4857,10 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         coarseSdfPtr,
         coarseEikPtr,
         coarseToolAxisPtr,
-        rec.fineShellInnerDepthMm);
+        rec.fineShellInnerDepthMm,
+        overhangPtr,
+        coarseOverhangPtr,
+        impl_->gravityDirectionBed);
     setFieldProgress(false, 1.0f, "Shell toolpaths ready.");
     return res;
 }
