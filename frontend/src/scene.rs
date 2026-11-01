@@ -543,7 +543,9 @@ pub fn viewport_interaction_system(
     mut camera_query: Query<(&Camera, &GlobalTransform, &mut OrbitCamera, &mut Transform), Without<CadObjectEntity>>,
     mut object_transforms: Query<&mut Transform, With<CadObjectEntity>>,
 ) {
-    let ctx = contexts.ctx_mut();
+    let Some(ctx) = contexts.try_ctx_mut() else {
+        return;
+    };
     if ctx.wants_pointer_input() || ctx.is_pointer_over_area() {
         mouse_motion.clear();
         mouse_wheel.clear();

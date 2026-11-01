@@ -126,7 +126,9 @@ fn setup_viewport_scene_and_pipeline(
     render_device: Option<Res<RenderDevice>>,
     mut plate: ResMut<BuildPlateState>,
 ) {
-    configure_egui_symbol_fonts(egui_contexts.ctx_mut());
+    if let Some(ctx) = egui_contexts.try_ctx_mut() {
+        configure_egui_symbol_fonts(ctx);
+    }
 
     let orbit = OrbitCamera::default();
     let eye = compute_orbit_eye(&orbit);

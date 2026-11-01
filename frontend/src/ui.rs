@@ -406,7 +406,9 @@ pub fn ui_workspace_system(
     plate.ui_hovered_point_hint_id = None;
     vis_state.highlighted_selected_layer = None;
     config.sync_auto_voxel_size();
-    let ctx = contexts.ctx_mut();
+    let Some(ctx) = contexts.try_ctx_mut() else {
+        return;
+    };
     vis_state.ui_pointer_down = ctx.is_using_pointer();
 
     // ========================================================================
