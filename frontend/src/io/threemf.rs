@@ -115,6 +115,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
     let mut embedded_step_entries: HashMap<String, Vec<u8>> = HashMap::new();
     let mut embedded_stl_entries: Vec<(String, Vec<u8>)> = Vec::new();
     let mut scene_manifest: Option<SavedSceneManifest> = None;
+    let mut is_manifold_project = false;
     let mut skipped_third_party_entries: Vec<String> = Vec::new();
 
     for i in 0..archive.len() {
@@ -134,6 +135,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
             if entry.read_to_string(&mut text).is_ok() {
                 match SlicerConfig::from_toml_str(&text) {
                     Ok(cfg) => {
+                        is_manifold_project = true;
                         report.restored_config = Some(cfg);
                         report.notices.push(format!(
                             "Restored Manifold2 slicer & bed configuration from '{}'.",
@@ -155,7 +157,10 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
         if raw_name == MANIFOLD_SCENE_ENTRY {
             let mut text = String::new();
             if entry.read_to_string(&mut text).is_ok() {
-                scene_manifest = toml::from_str::<SavedSceneManifest>(&text).ok();
+                if let Ok(manifest) = toml::from_str::<SavedSceneManifest>(&text) {
+                    is_manifold_project = true;
+                    scene_manifest = Some(manifest);
+                }
             }
             continue;
         }
@@ -201,6 +206,12 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
         // Any other file inside the 3MF (e.g., PrusaSlicer/OrcaSlicer/BambuStudio
         // .config, .gcode, thumbnails, custom profile JSONs) is safely ignored.
         skipped_third_party_entries.push(raw_name);
+    }
+
+    if is_manifold_project {
+        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+            report.manifold_project_filename = Some(fname.to_string());
+        }
     }
 
     if !skipped_third_party_entries.is_empty() {
@@ -927,5 +938,47 @@ mod tests {
         let mesh = obj.mesh.as_ref().unwrap();
         assert_eq!(mesh.positions.len(), 12);
         assert_eq!(mesh.indices.len(), 12);
+    }
+
+    #[test]
+    fn test_manifold_3mf_project_filename_recalled_on_load() {
+        let temp_3mf = std::env::temp_dir().join(format!(
+            "custom_manifold_project_{}.3mf",
+            std::process::id()
+        ));
+        let expected_filename = temp_3mf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+
+        let export_objs = vec![ExportableObject {
+            object_id: 1,
+            name: "Tetra".to_string(),
+            has_brep: false,
+            transform: Transform::IDENTITY,
+            vertices: vec![
+                RenderVertex { x: 0.0, y: 0.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+                RenderVertex { x: 10.0, y: 0.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+                RenderVertex { x: 0.0, y: 10.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+                RenderVertex { x: 0.0, y: 0.0, z: 10.0, nx: 0.0, ny: 0.0, nz: 1.0 },
+            ],
+            indices: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
+        }];
+        let cfg = SlicerConfig::default();
+        save_project_to_3mf(&temp_3mf, &export_objs, &cfg).expect("Should write Manifold 3MF");
+
+        let mut report = LoadedBatchReport::default();
+        load_3mf_archive(&temp_3mf, &mut report);
+        let _ = std::fs::remove_file(&temp_3mf);
+
+        assert_eq!(
+            report.manifold_project_filename.as_deref(),
+            Some(expected_filename.as_str())
+        );
+        assert!(report.restored_config.is_some());
+        for obj in &report.objects {
+            let _ = ffi::remove_cad_object(obj.object_id);
+        }
     }
 }

@@ -32,6 +32,8 @@ pub struct LoadedObjectData {
 pub struct LoadedBatchReport {
     pub objects: Vec<LoadedObjectData>,
     pub restored_config: Option<SlicerConfig>,
+    /// File name (e.g. `"cowling_project.3mf"`) when a loaded `.3mf` archive is a Manifold project.
+    pub manifold_project_filename: Option<String>,
     pub notices: Vec<String>,
     pub errors: Vec<String>,
 }

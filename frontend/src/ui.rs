@@ -948,12 +948,16 @@ pub fn ui_workspace_system(
                     });
                 }
                 let cfg_snapshot = (*config).clone();
+                let default_3mf_filename = plate
+                    .project_3mf_filename
+                    .clone()
+                    .unwrap_or_else(|| "project.3mf".to_string());
                 plate.status_message = "Choosing destination for 3MF export...".to_string();
 
                 let save_task = IoTaskPool::get().spawn(async move {
                     let file_handle = rfd::AsyncFileDialog::new()
                         .add_filter("3MF Project Archive", &["3mf"])
-                        .set_file_name("project.3mf")
+                        .set_file_name(&default_3mf_filename)
                         .save_file()
                         .await?;
                     let out_path = file_handle.path().to_path_buf();
@@ -4705,6 +4709,9 @@ pub fn poll_io_tasks_system(
                 preset_lib.selected_filament = config.filament_preset_name.clone();
                 preset_lib.selected_process = config.process_preset_name.clone();
                 sync_config_to_backend(&config);
+            }
+            if let Some(proj_filename) = report.manifold_project_filename {
+                plate.project_3mf_filename = Some(proj_filename);
             }
 
             plate.import_notices = report.notices;

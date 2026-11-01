@@ -220,6 +220,8 @@ pub struct BuildPlateState {
     pub is_dragging_object: bool,
     pub drag_offset_xy: Vec2,
     pub clone_copies_count: u32,
+    /// Remembered `.3mf` file name when a Manifold `.3mf` project was loaded (used as the default on Save 3MF).
+    pub project_3mf_filename: Option<String>,
     pub status_message: String,
     pub import_notices: Vec<String>,
     pub import_errors: Vec<String>,
