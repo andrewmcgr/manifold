@@ -55,7 +55,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Manifold2 — Non-Planar 3D Printing Slicer".into(),
+                title: "Manifold Slicer".into(),
                 resolution: (1440.0_f32, 900.0_f32).into(),
                 ..default()
             }),
