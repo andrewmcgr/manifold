@@ -69,6 +69,10 @@ public:
     /// any other objects (including sibling parts from the same STEP assembly).
     bool removeObject(std::uint64_t objectId);
 
+    /// Clones an existing object (including its B-Rep TopoDS_Shape, tessellated mesh,
+    /// and any computed OpenVDB scalar/vector fields) under a new unique `object_id`.
+    std::uint64_t cloneObject(std::uint64_t sourceObjectId, const std::string& cloneName);
+
     /// Exports an object's underlying OCCT B-Rep TopoDS_Shape to a STEP file
     /// (returns false if the object originated from a pure triangle mesh).
     bool exportObjectStep(std::uint64_t objectId, const std::string& outFilePath) const;
@@ -233,6 +237,7 @@ rust::Vec<std::uint32_t> get_object_triangle_face_ids(std::uint64_t object_id);
 rust::Vec<float> get_object_vertex_tool_axes(std::uint64_t object_id);
 rust::Vec<float> get_object_vertex_support_needed(std::uint64_t object_id);
 bool remove_cad_object(std::uint64_t object_id);
+std::uint64_t clone_cad_object(std::uint64_t source_object_id, rust::Str clone_name);
 bool export_object_step_to_path(std::uint64_t object_id, rust::Str path);
 
 rust::Vec<rust::String> list_object_fields(std::uint64_t object_id);

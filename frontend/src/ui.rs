@@ -19,8 +19,9 @@ use crate::io::threemf::{save_project_to_3mf, ExportableObject};
 use crate::io::load_files_into_backend;
 use crate::presets::{LeftPanelTab, PresetCategory, PresetLibrary};
 use crate::scene::{
-    compute_orbit_eye, remove_object_from_plate, run_auto_arrange_on_plate, snap_object_to_bed,
-    spawn_loaded_objects, BuildPlateState, CadObjectEntity, OrbitCamera, ToolMode,
+    clone_object_on_plate, compute_orbit_eye, remove_object_from_plate, run_auto_arrange_on_plate,
+    snap_object_to_bed, spawn_loaded_objects, BuildPlateState, CadObjectEntity, OrbitCamera,
+    ToolMode,
 };
 
 fn rgba_to_color32(rgba: [f32; 4]) -> egui::Color32 {
@@ -856,6 +857,9 @@ fn render_preset_selector_bar(
 #[allow(clippy::too_many_arguments)]
 pub fn ui_workspace_system(
     mut commands: Commands,
+    render_device: Option<Res<RenderDevice>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut contexts: EguiContexts,
     mut plate: ResMut<BuildPlateState>,
     mut config: ResMut<SlicerConfig>,
@@ -1247,6 +1251,7 @@ pub fn ui_workspace_system(
                         );
                     } else {
                         let mut remove_id: Option<u64> = None;
+                        let mut clone_id: Option<u64> = None;
                         let mut select_id: Option<u64> = None;
                         let current_selected_id = plate.selected_object_id;
 
@@ -1275,6 +1280,14 @@ pub fn ui_workspace_system(
                                     select_id = Some(obj.object_id);
                                 }
 
+                                if ui
+                                    .small_button("Clone")
+                                    .on_hover_text("Add a duplicate of this object onto the build plate")
+                                    .clicked()
+                                {
+                                    clone_id = Some(obj.object_id);
+                                }
+
                                 if ui.small_button("Remove").clicked() {
                                     remove_id = Some(obj.object_id);
                                 }
@@ -1283,6 +1296,19 @@ pub fn ui_workspace_system(
 
                         if let Some(id) = select_id {
                             plate.selected_object_id = Some(id);
+                        }
+                        if let Some(id) = clone_id {
+                            clone_object_on_plate(
+                                &mut commands,
+                                render_device.as_deref(),
+                                &mut meshes,
+                                &mut materials,
+                                &mut plate,
+                                &mut config,
+                                &object_transforms,
+                                id,
+                                1,
+                            );
                         }
                         if let Some(id) = remove_id {
                             remove_object_from_plate(&mut commands, &mut plate, id);
@@ -1301,6 +1327,46 @@ pub fn ui_workspace_system(
                             let hull_face_count = plate.objects[obj_idx].hull.faces.len();
 
                             ui.heading(format!("Selected: {obj_name}"));
+
+                            if plate.clone_copies_count == 0 {
+                                plate.clone_copies_count = 1;
+                            }
+                            let mut pending_clone_copies: Option<usize> = None;
+                            ui.horizontal(|ui| {
+                                ui.label("Clone Object:");
+                                if ui
+                                    .button("+1 Clone")
+                                    .on_hover_text("Add 1 clone of the selected object to the build plate")
+                                    .clicked()
+                                {
+                                    pending_clone_copies = Some(1);
+                                }
+                                ui.add(
+                                    egui::DragValue::new(&mut plate.clone_copies_count)
+                                        .range(1..=64)
+                                        .prefix("×"),
+                                );
+                                if ui
+                                    .button("Add Clones")
+                                    .on_hover_text("Add the specified number of clones of the selected object")
+                                    .clicked()
+                                {
+                                    pending_clone_copies = Some(plate.clone_copies_count as usize);
+                                }
+                            });
+                            if let Some(copies) = pending_clone_copies {
+                                clone_object_on_plate(
+                                    &mut commands,
+                                    render_device.as_deref(),
+                                    &mut meshes,
+                                    &mut materials,
+                                    &mut plate,
+                                    &mut config,
+                                    &object_transforms,
+                                    sel_id,
+                                    copies,
+                                );
+                            }
 
                             if let Ok((mut tf, _)) = object_transforms.get_mut(obj_entity) {
                                 let (w_min, w_max) =

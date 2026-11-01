@@ -339,6 +339,10 @@ pub mod ffi {
         /// Removes `object_id` from the C++ backend without disturbing other objects.
         pub fn remove_cad_object(object_id: u64) -> bool;
 
+        /// Clones `source_object_id` in the C++ backend (including B-Rep shape, mesh, and
+        /// any computed OpenVDB fields) and returns the new `object_id` (or `0` on failure).
+        pub fn clone_cad_object(source_object_id: u64, clone_name: &str) -> u64;
+
         /// Exports the original OCCT B-Rep `TopoDS_Shape` for `object_id` to a STEP file.
         pub fn export_object_step_to_path(object_id: u64, path: &str) -> bool;
 
@@ -687,6 +691,17 @@ mod tests {
         let iso = ffi::extract_field_isosurface(info.object_id, "eikonal", 8.0, 0.0);
         assert!(!iso.interior_indices.is_empty());
 
+        // Clone the object in the backend and verify independent geometry & fields
+        let cloned_id = ffi::clone_cad_object(info.object_id, "TestBox (2)");
+        assert!(cloned_id > 0 && cloned_id != info.object_id);
+        assert_eq!(
+            ffi::get_object_vertices(cloned_id).len(),
+            ffi::get_object_vertices(info.object_id).len()
+        );
+        assert!(ffi::get_object_field_stats(cloned_id, "eikonal").valid);
+
         let _ = ffi::remove_cad_object(info.object_id);
+        assert!(ffi::get_object_field_stats(cloned_id, "eikonal").valid);
+        let _ = ffi::remove_cad_object(cloned_id);
     }
 }

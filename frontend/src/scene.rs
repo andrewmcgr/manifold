@@ -219,6 +219,7 @@ pub struct BuildPlateState {
     pub is_dragging_point_hint_dir: bool,
     pub is_dragging_object: bool,
     pub drag_offset_xy: Vec2,
+    pub clone_copies_count: u32,
     pub status_message: String,
     pub import_notices: Vec<String>,
     pub import_errors: Vec<String>,
@@ -375,6 +376,201 @@ pub fn remove_object_from_plate(
         plate.hovered_surface_patch = None;
         plate.hovered_point_preview = None;
         plate.status_message = format!("Removed object '{}' (ID {object_id}).", removed.name);
+    }
+}
+
+fn strip_clone_number_suffix(name: &str) -> &str {
+    if let Some(open_idx) = name.rfind(" (") {
+        if name.ends_with(')') {
+            let inside = &name[open_idx + 2..name.len() - 1];
+            if !inside.is_empty() && inside.chars().all(|c| c.is_ascii_digit()) {
+                return &name[..open_idx];
+            }
+        }
+    }
+    name
+}
+
+/// Clones an already-imported object `copies` times in both the C++ backend and the
+/// Bevy 3D viewport, placing each clone at a non-overlapping XY position on the build plate
+/// and copying any per-object orientation hints.
+#[allow(clippy::too_many_arguments)]
+pub fn clone_object_on_plate(
+    commands: &mut Commands,
+    render_device: Option<&RenderDevice>,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    plate: &mut BuildPlateState,
+    config: &mut SlicerConfig,
+    transform_query: &Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
+    source_object_id: u64,
+    copies: usize,
+) {
+    let copies = copies.clamp(1, 64);
+    let Some(src_idx) = plate
+        .objects
+        .iter()
+        .position(|o| o.object_id == source_object_id)
+    else {
+        return;
+    };
+
+    let src_tf = transform_query
+        .get(plate.objects[src_idx].entity)
+        .map(|(t, _)| *t)
+        .unwrap_or(Transform::IDENTITY);
+    let (src_min, src_max) = plate.objects[src_idx].compute_world_aabb(&src_tf);
+    let half_extents_xy = 0.5 * Vec2::new(src_max.x - src_min.x, src_max.y - src_min.y);
+    let src_center_xy = 0.5 * Vec2::new(src_min.x + src_max.x, src_min.y + src_max.y);
+    let center_offset_xy = src_center_xy - src_tf.translation.xy();
+
+    let half_clearance = 0.5 * config.arrangement.part_clearance_mm.max(0.0);
+    let dtheta = config.arrangement.spiral_angle_step_rad.max(0.05);
+    let b_coeff = config.arrangement.spiral_radial_pitch_mm.max(1.0) / std::f32::consts::TAU;
+
+    let mut placed_boxes: Vec<(Vec2, Vec2)> = Vec::with_capacity(plate.objects.len() + copies);
+    for obj in &plate.objects {
+        let tf = transform_query
+            .get(obj.entity)
+            .map(|(t, _)| *t)
+            .unwrap_or(Transform::IDENTITY);
+        let (w_min, w_max) = obj.compute_world_aabb(&tf);
+        placed_boxes.push((
+            w_min.xy() - Vec2::splat(half_clearance),
+            w_max.xy() + Vec2::splat(half_clearance),
+        ));
+    }
+
+    let base_name = strip_clone_number_suffix(&plate.objects[src_idx].name).to_string();
+    let src_source_file = plate.objects[src_idx].source_file.clone();
+    let src_has_brep = plate.objects[src_idx].has_brep;
+    let src_vertices = plate.objects[src_idx].vertices.clone();
+    let src_indices = plate.objects[src_idx].indices.clone();
+    let src_local_min = plate.objects[src_idx].local_min;
+    let src_local_max = plate.objects[src_idx].local_max;
+    let src_hull = plate.objects[src_idx].hull.clone();
+    let src_patches = plate.objects[src_idx].surface_patches.clone();
+    let src_tri_to_patch = plate.objects[src_idx].triangle_to_patch.clone();
+
+    let src_surface_hints: Vec<SurfaceFaceHint> = config
+        .eikonal
+        .surface_hints
+        .iter()
+        .filter(|h| h.object_id == source_object_id)
+        .cloned()
+        .collect();
+    let src_point_hints: Vec<PointNormalHint> = config
+        .eikonal
+        .point_hints
+        .iter()
+        .filter(|h| h.object_id == source_object_id)
+        .cloned()
+        .collect();
+
+    let mut next_point_hint_id = config
+        .eikonal
+        .point_hints
+        .iter()
+        .map(|h| h.id)
+        .max()
+        .unwrap_or(0)
+        + 1;
+
+    let mut new_loaded_objects = Vec::with_capacity(copies);
+    let mut theta = dtheta;
+    let padded_half = half_extents_xy + Vec2::splat(half_clearance);
+
+    for _ in 0..copies {
+        let mut suffix_num = 2usize;
+        let clone_name = loop {
+            let candidate = format!("{base_name} ({suffix_num})");
+            let used_on_plate = plate.objects.iter().any(|o| o.name == candidate);
+            let used_in_batch = new_loaded_objects
+                .iter()
+                .any(|o: &LoadedObjectData| o.name == candidate);
+            if !used_on_plate && !used_in_batch {
+                break candidate;
+            }
+            suffix_num += 1;
+        };
+
+        let new_id = ffi::clone_cad_object(source_object_id, &clone_name);
+        if new_id == 0 {
+            continue;
+        }
+
+        // Find the next non-overlapping XY position along an Archimedean spiral around src_center_xy
+        let chosen_center = loop {
+            let r = b_coeff * theta;
+            let candidate_center = src_center_xy + Vec2::new(r * theta.cos(), r * theta.sin());
+            let cand_min = candidate_center - padded_half;
+            let cand_max = candidate_center + padded_half;
+
+            let overlaps = placed_boxes.iter().any(|&(other_min, other_max)| {
+                cand_min.x < other_max.x
+                    && cand_max.x > other_min.x
+                    && cand_min.y < other_max.y
+                    && cand_max.y > other_min.y
+            });
+
+            theta += dtheta;
+            if r > 20.0 {
+                let adaptive_dtheta =
+                    (config.arrangement.spiral_radial_pitch_mm * 0.35 / r).clamp(0.02, dtheta);
+                theta += adaptive_dtheta - dtheta;
+            }
+
+            if !overlaps {
+                placed_boxes.push((cand_min, cand_max));
+                break candidate_center;
+            }
+        };
+
+        for sh in &src_surface_hints {
+            let mut cloned_sh = sh.clone();
+            cloned_sh.object_id = new_id;
+            config.eikonal.surface_hints.push(cloned_sh);
+        }
+        for ph in &src_point_hints {
+            let mut cloned_ph = ph.clone();
+            cloned_ph.id = next_point_hint_id;
+            next_point_hint_id += 1;
+            cloned_ph.object_id = new_id;
+            config.eikonal.point_hints.push(cloned_ph);
+        }
+
+        let target_translation_xy = chosen_center - center_offset_xy;
+        new_loaded_objects.push(LoadedObjectData {
+            object_id: new_id,
+            name: clone_name,
+            source_file: src_source_file.clone(),
+            has_brep: src_has_brep,
+            initial_translation: Vec3::new(target_translation_xy.x, target_translation_xy.y, 0.0),
+            initial_rotation: src_tf.rotation,
+            vertices: src_vertices.clone(),
+            indices: src_indices.clone(),
+            local_min: src_local_min,
+            local_max: src_local_max,
+            hull: src_hull.clone(),
+            surface_patches: src_patches.clone(),
+            triangle_to_patch: src_tri_to_patch.clone(),
+        });
+    }
+
+    let spawned_count = new_loaded_objects.len();
+    if spawned_count > 0 {
+        spawn_loaded_objects(
+            commands,
+            render_device,
+            meshes,
+            materials,
+            plate,
+            new_loaded_objects,
+        );
+        plate.status_message = format!(
+            "Added {spawned_count} clone(s) of '{base_name}'; {} object(s) on build plate.",
+            plate.objects.len()
+        );
     }
 }
 

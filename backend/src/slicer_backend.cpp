@@ -1529,6 +1529,64 @@ bool SlicerBackend::removeObject(std::uint64_t objectId) {
     return impl_->objects.erase(objectId) > 0;
 }
 
+std::uint64_t SlicerBackend::cloneObject(
+    std::uint64_t sourceObjectId,
+    const std::string& cloneName)
+{
+    const auto it = impl_->objects.find(sourceObjectId);
+    if (it == impl_->objects.end()) {
+        return 0;
+    }
+
+    const ObjectRecord& src = it->second;
+    ObjectRecord rec;
+    rec.id = impl_->nextObjectId++;
+    rec.name = cloneName.empty() ? (src.name + " (Copy)") : cloneName;
+    rec.shape = src.shape;
+    rec.hasBrep = src.hasBrep;
+    rec.originX = src.originX;
+    rec.originY = src.originY;
+    rec.originZ = src.originZ;
+    rec.minX = src.minX;
+    rec.minY = src.minY;
+    rec.minZ = src.minZ;
+    rec.maxX = src.maxX;
+    rec.maxY = src.maxY;
+    rec.maxZ = src.maxZ;
+    rec.vertexBuffer = src.vertexBuffer;
+    rec.indexBuffer = src.indexBuffer;
+    rec.triangleFaceIds = src.triangleFaceIds;
+    rec.isMultiResolution = src.isMultiResolution;
+    rec.fineShellInnerDepthMm = src.fineShellInnerDepthMm;
+    rec.coarseToFineRatio = src.coarseToFineRatio;
+    rec.hasCachedSelectedLayers = src.hasCachedSelectedLayers;
+    rec.cachedSelectedLayersAdaptivity = src.cachedSelectedLayersAdaptivity;
+    rec.cachedSelectedLayersSpec = src.cachedSelectedLayersSpec;
+    rec.cachedSelectedLayers = src.cachedSelectedLayers;
+
+    for (const auto& kv : src.scalarFields) {
+        if (kv.second) {
+            rec.scalarFields[kv.first] = kv.second->deepCopy();
+        }
+    }
+    if (src.toolAxisGrid) {
+        rec.toolAxisGrid = src.toolAxisGrid->deepCopy();
+    }
+    for (const auto& kv : src.coarseScalarFields) {
+        if (kv.second) {
+            rec.coarseScalarFields[kv.first] = kv.second->deepCopy();
+        }
+    }
+    if (src.coarseToolAxisGrid) {
+        rec.coarseToolAxisGrid = src.coarseToolAxisGrid->deepCopy();
+    }
+
+    const std::uint64_t newId = rec.id;
+    impl_->lastLoadedId = newId;
+    impl_->objects.emplace(newId, std::move(rec));
+    return newId;
+}
+
 bool SlicerBackend::exportObjectStep(std::uint64_t objectId, const std::string& outFilePath) const {
     const auto it = impl_->objects.find(objectId);
     if (it == impl_->objects.end() || !it->second.hasBrep || it->second.shape.IsNull()) {
@@ -2443,6 +2501,12 @@ rust::Vec<float> get_object_vertex_support_needed(std::uint64_t object_id) {
 bool remove_cad_object(std::uint64_t object_id) {
     std::lock_guard<std::mutex> lock(g_backendMutex);
     return globalBackend().removeObject(object_id);
+}
+
+std::uint64_t clone_cad_object(std::uint64_t source_object_id, rust::Str clone_name) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const std::string nameStr(clone_name.data(), clone_name.size());
+    return globalBackend().cloneObject(source_object_id, nameStr);
 }
 
 bool export_object_step_to_path(std::uint64_t object_id, rust::Str path) {
