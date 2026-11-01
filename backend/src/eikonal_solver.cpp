@@ -501,6 +501,7 @@ void ActiveVolumeDomain::initializeFromSdfGrid(
     targetDir.clear();
     toolAxis.clear();
     toolTiltDeg.clear();
+    supportNeeded.clear();
     isSeed.clear();
     isPinnedSeed.clear();
     isInterior.clear();
@@ -536,6 +537,7 @@ void ActiveVolumeDomain::initializeFromSdfGrid(
     targetDir.assign(n, {0.0f, 0.0f, 1.0f});
     toolAxis.assign(n, {0.0f, 0.0f, 1.0f});
     toolTiltDeg.assign(n, 0.0f);
+    supportNeeded.assign(n, 0.0f);
     isSeed.assign(n, 0);
     isPinnedSeed.assign(n, 0);
     isInterior.assign(n, 0);
@@ -1476,6 +1478,410 @@ void OrientationHintConstraint::enforceOnField(
 // Top-Level Iterative Constrained Eikonal + Tool Orientation Solver
 // ============================================================================
 
+namespace {
+
+/// Detects interior & boundary regions of `domain` that cannot be reached causally by the
+/// constrained Eikonal order field `\tau(x)` without external support, populates
+/// `domain.supportNeeded` in `[0.0, 1.0]`, and optionally seeds unreachable boundary
+/// contact patches as secondary support seeds (`ctx.enableSupportSeeding`).
+void evaluateSupportNeededAndSeedOrderField(
+    ActiveVolumeDomain& domain,
+    const EikonalSolverContext& ctx,
+    const std::vector<std::uint8_t>& isTrueBedSeed)
+{
+    const std::size_t n = domain.coords.size();
+    const float dx = static_cast<float>(domain.voxelSize);
+    domain.supportNeeded.assign(n, 0.0f);
+    if (n == 0 || !domain.indexGrid) {
+        return;
+    }
+
+    // 1. Compute anti-gravity height h_g(x_i) = (x_i - x_min) \cdot (-\hat{g}_{bed}(x_i))
+    std::vector<float> gravHeight(n, 0.0f);
+    float minGravProj = std::numeric_limits<float>::max();
+    std::vector<std::array<float, 3>> upDirs(n, {0.0f, 0.0f, 1.0f});
+
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& pos = domain.posBed[i];
+        const std::array<float, 3> gDir =
+            normalize3(ctx.backend.queryGravityDirection(pos), {0.0f, 0.0f, -1.0f});
+        const std::array<float, 3> uUp{-gDir[0], -gDir[1], -gDir[2]};
+        upDirs[i] = uUp;
+        const float proj = dot3(pos, uUp);
+        gravHeight[i] = proj;
+        if (domain.isInterior[i] && domain.sdf[i] <= 0.0f) {
+            minGravProj = std::min(minGravProj, proj);
+        }
+    }
+    if (minGravProj >= 0.5f * kInfinityTau) {
+        for (std::size_t i = 0; i < n; ++i) {
+            if (domain.isInterior[i]) {
+                minGravProj = std::min(minGravProj, gravHeight[i]);
+            }
+        }
+    }
+    if (minGravProj < 0.5f * kInfinityTau) {
+        for (std::size_t i = 0; i < n; ++i) {
+            gravHeight[i] = std::max(0.0f, gravHeight[i] - minGravProj);
+        }
+    }
+
+    // 2. Causal upward reachability from true build-plate seeds (and multi-res inner core pins)
+    std::vector<std::uint8_t> causallyReachable(n, 0);
+    std::vector<std::size_t> interiorOrder;
+    interiorOrder.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!domain.isInterior[i]) {
+            continue;
+        }
+        if ((i < isTrueBedSeed.size() && isTrueBedSeed[i]) || domain.isPinnedSeed[i]) {
+            causallyReachable[i] = 1;
+        }
+        interiorOrder.push_back(i);
+    }
+
+    std::sort(
+        interiorOrder.begin(),
+        interiorOrder.end(),
+        [&](std::size_t a, std::size_t b) { return gravHeight[a] < gravHeight[b]; });
+
+    auto idxAcc = domain.indexGrid->getConstAccessor();
+    const float causalHeightTol = 0.35f * dx;
+    const float plateauBandTol = 0.85f * dx;
+
+    std::size_t cursor = 0;
+    while (cursor < interiorOrder.size()) {
+        const float bandBaseH = gravHeight[interiorOrder[cursor]];
+        std::size_t bandEnd = cursor + 1;
+        while (bandEnd < interiorOrder.size() &&
+               gravHeight[interiorOrder[bandEnd]] <= bandBaseH + plateauBandTol) {
+            ++bandEnd;
+        }
+
+        // First mark any voxel in [cursor, bandEnd) with a lower or equal reachable 26-neighbor
+        std::queue<std::size_t> bandQueue;
+        for (std::size_t p = cursor; p < bandEnd; ++p) {
+            const std::size_t v = interiorOrder[p];
+            if (causallyReachable[v]) {
+                bandQueue.push(v);
+                continue;
+            }
+            const openvdb::Coord& c = domain.coords[v];
+            const float hV = gravHeight[v];
+            bool reached = false;
+            for (int dz = -1; dz <= 1 && !reached; ++dz) {
+                for (int dy = -1; dy <= 1 && !reached; ++dy) {
+                    for (int dxOff = -1; dxOff <= 1 && !reached; ++dxOff) {
+                        if (dxOff == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        const std::int32_t nb =
+                            idxAcc.getValue(c + openvdb::Coord(dxOff, dy, dz));
+                        if (nb < 0) {
+                            continue;
+                        }
+                        const std::size_t u = static_cast<std::size_t>(nb);
+                        if (domain.isInterior[u] && causallyReachable[u] &&
+                            gravHeight[u] <= hV + causalHeightTol) {
+                            causallyReachable[v] = 1;
+                            bandQueue.push(v);
+                            reached = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Propagate across horizontal plateaus within the current height band
+        while (!bandQueue.empty()) {
+            const std::size_t u = bandQueue.front();
+            bandQueue.pop();
+            const openvdb::Coord& c = domain.coords[u];
+            const float hU = gravHeight[u];
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dxOff = -1; dxOff <= 1; ++dxOff) {
+                        if (dxOff == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        const std::int32_t nb =
+                            idxAcc.getValue(c + openvdb::Coord(dxOff, dy, dz));
+                        if (nb < 0) {
+                            continue;
+                        }
+                        const std::size_t w = static_cast<std::size_t>(nb);
+                        if (!domain.isInterior[w] || causallyReachable[w]) {
+                            continue;
+                        }
+                        if (gravHeight[w] + causalHeightTol >= hU &&
+                            gravHeight[w] <= bandBaseH + plateauBandTol + causalHeightTol) {
+                            causallyReachable[w] = 1;
+                            bandQueue.push(w);
+                        }
+                    }
+                }
+            }
+        }
+
+        cursor = bandEnd;
+    }
+
+    // 3. Evaluate Constrained Layer-Normal vs. Surface-Normal Boundary Starvation & 3D Bridge Subtraction
+    const float critDeg = std::clamp(ctx.overhangThresholdDeg, 5.0f, 89.0f);
+    const float sinCrit = std::sin(critDeg * kDegToRad);
+    const float sinSteep = std::sin(65.0f * kDegToRad);
+    const float maxBridgeMm = std::max(0.0f, ctx.maxBridgeLengthMm);
+    const float shellBandMm = std::max(3.0f * dx, 2.5f * ctx.layerHeight.target_mm);
+
+    // Precompute which causally-reachable interior voxels are valid bridge anchor piers
+    // (supported from below along gravity +\hat{g}_{bed}) so cantilever side edges are never
+    // mistaken for bridge piers.
+    std::vector<std::uint8_t> isValidBridgePier(n, 0);
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, n, 512),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            auto localIdxAcc = domain.indexGrid->getConstAccessor();
+            for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                if (!domain.isInterior[i] || !causallyReachable[i] || (-domain.overhang[i]) > sinCrit) {
+                    continue;
+                }
+                if (gravHeight[i] <= 2.5f * dx) {
+                    isValidBridgePier[i] = 1;
+                    continue;
+                }
+                // Step 1.75*dx downward along gravity (+gDir = -upDirs[i]).
+                // Note: we do not require uBelow to be strictly interior because a self-supporting
+                // sloped wall (< critDeg) has exterior voxels directly below it whose SDF gradient
+                // still satisfies (-overhang[uBelow]) <= sinCrit, whereas a cantilever side-wall
+                // has the downward-facing ceiling (-overhang > sinCrit) directly below it.
+                const auto& pos = domain.posBed[i];
+                const auto& uUp = upDirs[i];
+                const openvdb::Vec3d wpBelow(
+                    pos[0] - 1.75f * dx * uUp[0],
+                    pos[1] - 1.75f * dx * uUp[1],
+                    pos[2] - 1.75f * dx * uUp[2]);
+                const openvdb::Coord ijkBelow = domain.transform->worldToIndexCellCentered(wpBelow);
+                const std::int32_t nbBelow = localIdxAcc.getValue(ijkBelow);
+                if (nbBelow >= 0) {
+                    const std::size_t uBelow = static_cast<std::size_t>(nbBelow);
+                    if ((-domain.overhang[uBelow]) <= sinCrit) {
+                        isValidBridgePier[i] = 1;
+                    }
+                } else if (domain.sdf[i] < -1.2f * dx) {
+                    // Deep interior voxel whose downward step falls inside the solid core beyond the narrow band
+                    isValidBridgePier[i] = 1;
+                }
+            }
+        });
+
+    const int maxBridgeSearchSteps = std::clamp<int>(
+        static_cast<int>(std::ceil(std::max(domain.maxSpanMm, maxBridgeMm * 2.0f) / dx)) + 4,
+        16,
+        1024);
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, n, 512),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            auto localIdxAcc = domain.indexGrid->getConstAccessor();
+            for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                if (!domain.isInterior[i]) {
+                    continue;
+                }
+
+                // Case A: Disconnected floating mid-air component or downward-hanging stalactite
+                // that cannot be reached causally by the constrained order field from the build plate
+                if (!causallyReachable[i] || domain.tau[i] >= 0.5f * kInfinityTau) {
+                    domain.supportNeeded[i] = 1.0f;
+                    continue;
+                }
+
+                // Near the print bed, no support is required
+                if (gravHeight[i] <= 2.5f * dx) {
+                    continue;
+                }
+
+                const float absSdf = std::abs(domain.sdf[i]);
+                if (absSdf > shellBandMm) {
+                    continue;
+                }
+
+                // Gravity overhang sine: s_grav = \hat{n}_{surf} \cdot \hat{g}_{bed} = -overhang[i]
+                const float sGrav = -domain.overhang[i];
+                if (sGrav <= sinCrit) {
+                    continue;
+                }
+
+                // Solved layer normal \hat{n}_\tau = \nabla \tau / |\nabla \tau|
+                const auto gradTau = computeVoxelTauGradient(domain, i);
+                const std::array<float, 3> nTau = normalize3(gradTau, domain.toolAxis[i]);
+                const float sLayer = -dot3(domain.sdfGrad[i], nTau);
+                const float sEff =
+                    (sGrav <= sinSteep) ? sLayer : std::max(sLayer, 0.75f * sGrav);
+
+                if (sEff <= sinCrit) {
+                    continue;
+                }
+
+                // Test whether this overhanging boundary voxel lies on a straight 3D two-pier bridge
+                // (anchored at valid supported piers on both ends in the plane orthogonal to anti-gravity `uUp`)
+                // and measure its shortest two-pier span `minBridgeSpanMm`.
+                const auto& uUp = upDirs[i];
+                const std::array<float, 3> refAxis =
+                    (std::abs(uUp[0]) < 0.9f) ? std::array<float, 3>{1.0f, 0.0f, 0.0f}
+                                              : std::array<float, 3>{0.0f, 1.0f, 0.0f};
+                const float dotRef = dot3(refAxis, uUp);
+                const std::array<float, 3> t0 = normalize3(
+                    {refAxis[0] - dotRef * uUp[0],
+                     refAxis[1] - dotRef * uUp[1],
+                     refAxis[2] - dotRef * uUp[2]},
+                    {1.0f, 0.0f, 0.0f});
+                const std::array<float, 3> t1 = normalize3(
+                    {uUp[1] * t0[2] - uUp[2] * t0[1],
+                     uUp[2] * t0[0] - uUp[0] * t0[2],
+                     uUp[0] * t0[1] - uUp[1] * t0[0]},
+                    {0.0f, 1.0f, 0.0f});
+                const float c45 = 0.70710678f;
+                const float c22 = 0.92387953f;
+                const float s22 = 0.38268343f;
+                const std::array<std::array<float, 3>, 8> bridgeDirs{{
+                    t0,
+                    t1,
+                    {c45 * (t0[0] + t1[0]), c45 * (t0[1] + t1[1]), c45 * (t0[2] + t1[2])},
+                    {c45 * (t0[0] - t1[0]), c45 * (t0[1] - t1[1]), c45 * (t0[2] - t1[2])},
+                    {c22 * t0[0] + s22 * t1[0], c22 * t0[1] + s22 * t1[1], c22 * t0[2] + s22 * t1[2]},
+                    {s22 * t0[0] + c22 * t1[0], s22 * t0[1] + c22 * t1[1], s22 * t0[2] + c22 * t1[2]},
+                    {c22 * t0[0] - s22 * t1[0], c22 * t0[1] - s22 * t1[1], c22 * t0[2] - s22 * t1[2]},
+                    {s22 * t0[0] - c22 * t1[0], s22 * t0[1] - c22 * t1[1], s22 * t0[2] - c22 * t1[2]},
+                }};
+
+                // Nudge ray origin slightly inward along -\nabla\phi_sdf so boundary ceiling voxels
+                // march cleanly inside the bridge deck rather than skimming the exterior air below.
+                std::array<float, 3> pStart = domain.posBed[i];
+                const float nudgeInward = std::clamp(0.85f * dx + domain.sdf[i], 0.0f, 1.25f * dx);
+                if (nudgeInward > 1.0e-4f) {
+                    const std::array<float, 3> pNudged{
+                        pStart[0] - nudgeInward * domain.sdfGrad[i][0],
+                        pStart[1] - nudgeInward * domain.sdfGrad[i][1],
+                        pStart[2] - nudgeInward * domain.sdfGrad[i][2]};
+                    const openvdb::Coord cNudged = domain.transform->worldToIndexCellCentered(
+                        openvdb::Vec3d(pNudged[0], pNudged[1], pNudged[2]));
+                    const std::int32_t nbNudged = localIdxAcc.getValue(cNudged);
+                    if (nbNudged >= 0 && domain.isInterior[static_cast<std::size_t>(nbNudged)]) {
+                        pStart = pNudged;
+                    }
+                }
+
+                bool isTwoPierBridge = false;
+                float minBridgeSpanMm = std::numeric_limits<float>::max();
+
+                for (const auto& bDir : bridgeDirs) {
+                    auto marchBridgeHalf = [&](float sign, float& outDistMm) -> bool {
+                        for (int s = 1; s <= maxBridgeSearchSteps; ++s) {
+                            const float dMm = static_cast<float>(s) * dx;
+                            const openvdb::Vec3d wp(
+                                pStart[0] + sign * dMm * bDir[0],
+                                pStart[1] + sign * dMm * bDir[1],
+                                pStart[2] + sign * dMm * bDir[2]);
+                            const openvdb::Coord cStep =
+                                domain.transform->worldToIndexCellCentered(wp);
+                            const std::int32_t nb = localIdxAcc.getValue(cStep);
+                            if (nb < 0) {
+                                return false;
+                            }
+                            const std::size_t u = static_cast<std::size_t>(nb);
+                            if (!domain.isInterior[u]) {
+                                return false;
+                            }
+                            if (isValidBridgePier[u]) {
+                                outDistMm = dMm;
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+
+                    float distPos = 0.0f;
+                    float distNeg = 0.0f;
+                    if (marchBridgeHalf(1.0f, distPos) &&
+                        marchBridgeHalf(-1.0f, distNeg)) {
+                        isTwoPierBridge = true;
+                        minBridgeSpanMm = std::min(minBridgeSpanMm, distPos + distNeg);
+                    }
+                }
+
+                if (isTwoPierBridge) {
+                    // Self-supporting straight bridge within the configured max bridge length
+                    if (minBridgeSpanMm <= maxBridgeMm) {
+                        continue;
+                    }
+                    // Otherwise (`minBridgeSpanMm > maxBridgeMm`), this is a bridge over the set length
+                    // and requires support in both modes.
+                } else if (ctx.onlySupportUnreachableAndBridges) {
+                    // Causally reachable non-bridge overhang/cantilever: when `onlySupportUnreachableAndBridges`
+                    // is enabled, leave this to non-planar conformal layers / inside-out wave overhangs.
+                    continue;
+                }
+
+                const float sSeverity = std::min(sGrav, sEff);
+                const float rawScore = std::clamp(
+                    0.65f + 0.35f * (sSeverity - sinCrit) / std::max(1.0f - sinCrit, 1.0e-3f),
+                    0.65f,
+                    1.0f);
+                const float wShell = std::clamp(1.0f - 0.4f * (absSdf / shellBandMm), 0.60f, 1.0f);
+                domain.supportNeeded[i] = std::clamp(rawScore * wShell, 0.0f, 1.0f);
+            }
+        });
+
+    // Extrapolate `supportNeeded` 2 shells into the exterior narrow band so
+    // `extract_field_isosurface` and surface vertex sampling interpolate smoothly across \phi = 0
+    for (int extPass = 0; extPass < 2; ++extPass) {
+        std::vector<float> nextSupport = domain.supportNeeded;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (domain.supportNeeded[i] > 0.0f || std::abs(domain.sdf[i]) > 2.5f * dx) {
+                continue;
+            }
+            float maxNb = 0.0f;
+            for (const std::int32_t nb : domain.neighbors6[i]) {
+                if (nb >= 0) {
+                    maxNb = std::max(maxNb, domain.supportNeeded[static_cast<std::size_t>(nb)]);
+                }
+            }
+            if (maxNb > 0.0f) {
+                nextSupport[i] = 0.92f * maxNb;
+            }
+        }
+        domain.supportNeeded.swap(nextSupport);
+    }
+
+    // 4. Optional Step 2: Seed the Constrained Order Field \tau(x) from Causally-Unreachable Support Contact Regions
+    if (ctx.enableSupportSeeding) {
+        bool seededAnySupport = false;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!domain.isInterior[i] || domain.isPinnedSeed[i]) {
+                continue;
+            }
+            if (!causallyReachable[i] &&
+                domain.supportNeeded[i] > 0.50f &&
+                std::abs(domain.sdf[i]) <= 1.50f * dx) {
+                const float hSupport = std::max(0.0f, gravHeight[i]);
+                if (hSupport + 2.0f * dx < domain.tau[i]) {
+                    domain.isSeed[i] = 1;
+                    domain.tau[i] = hSupport;
+                    seededAnySupport = true;
+                }
+            }
+        }
+        if (seededAnySupport) {
+            runInteriorFastSweeping(domain, 2, /*useDirectionalGuidance=*/true);
+            ToolClearanceConstraint clearanceConstraint;
+            clearanceConstraint.enforceOnField(domain, ctx);
+            extendEikonalToExteriorBand(domain, ctx.backend);
+        }
+    }
+}
+
+} // namespace
+
 EikonalSolveResult solveConstrainedEikonal(
     const openvdb::FloatGrid& sdfGrid,
     float objectMinZ,
@@ -1551,6 +1957,7 @@ EikonalSolveResult solveConstrainedEikonal(
         domain.minZBed = minInteriorAxialProj;
     }
 
+    std::vector<std::uint8_t> isTrueBedSeed(n, 0);
     for (std::size_t i = 0; i < n; ++i) {
         if (!domain.isInterior[i]) {
             continue;
@@ -1558,6 +1965,7 @@ EikonalSolveResult solveConstrainedEikonal(
         const float hAxial = axialProjections[i] - domain.minZBed;
         if (hAxial <= seedHeightCutoff) {
             domain.isSeed[i] = 1;
+            isTrueBedSeed[i] = 1;
             domain.tau[i] = std::max(0.0f, hAxial);
         }
     }
@@ -1688,6 +2096,7 @@ EikonalSolveResult solveConstrainedEikonal(
     orientationStrategy.updateToolOrientations(domain, iterCtx);
     clearanceConstraint.enforceOnField(domain, iterCtx);
     overhangConstraint.enforceOnField(domain, iterCtx);
+    evaluateSupportNeededAndSeedOrderField(domain, iterCtx, isTrueBedSeed);
 
     // 4. Smoothly extend \tau(x) into the exterior narrow band in parallel
     notifyProgress(0.92f, "Extending Eikonal field into exterior narrow band...");
@@ -1719,6 +2128,11 @@ EikonalSolveResult solveConstrainedEikonal(
     toolTiltGrid->setGridClass(openvdb::GRID_FOG_VOLUME);
     toolTiltGrid->setTransform(domain.transform->copy());
 
+    openvdb::FloatGrid::Ptr supportNeededGrid = openvdb::FloatGrid::create(0.0f);
+    supportNeededGrid->setName("support_needed");
+    supportNeededGrid->setGridClass(openvdb::GRID_FOG_VOLUME);
+    supportNeededGrid->setTransform(domain.transform->copy());
+
     openvdb::Vec3SGrid::Ptr toolAxisGrid =
         openvdb::Vec3SGrid::create(openvdb::Vec3s(0.0f, 0.0f, 1.0f));
     toolAxisGrid->setName("tool_axis");
@@ -1727,6 +2141,7 @@ EikonalSolveResult solveConstrainedEikonal(
     auto eikAccessor = eikonalGrid->getAccessor();
     auto ovAccessor = overhangGrid->getAccessor();
     auto tiltAccessor = toolTiltGrid->getAccessor();
+    auto supAccessor = supportNeededGrid->getAccessor();
     auto axisAccessor = toolAxisGrid->getAccessor();
 
     for (std::size_t i = 0; i < n; ++i) {
@@ -1735,6 +2150,7 @@ EikonalSolveResult solveConstrainedEikonal(
         eikAccessor.setValue(ijk, tauVal);
         ovAccessor.setValue(ijk, domain.overhang[i]);
         tiltAccessor.setValue(ijk, domain.toolTiltDeg[i]);
+        supAccessor.setValue(ijk, domain.supportNeeded[i]);
         axisAccessor.setValue(
             ijk,
             openvdb::Vec3s(
@@ -1749,6 +2165,7 @@ EikonalSolveResult solveConstrainedEikonal(
     result.eikonalGrid = eikonalGrid;
     result.overhangGrid = overhangGrid;
     result.toolTiltDegGrid = toolTiltGrid;
+    result.supportNeededGrid = supportNeededGrid;
     result.toolAxisGrid = toolAxisGrid;
     return result;
 }
@@ -1850,6 +2267,7 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
             }
         });
 
+    std::vector<std::uint8_t> isTrueBedSeed(n, 0);
     for (std::size_t i = 0; i < n; ++i) {
         if (!domain.isInterior[i]) {
             continue;
@@ -1857,6 +2275,7 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
         const float hAxial = axialProjections[i] - domain.minZBed;
         if (hAxial <= seedHeightCutoff) {
             domain.isSeed[i] = 1;
+            isTrueBedSeed[i] = 1;
             domain.tau[i] = std::max(0.0f, hAxial);
             continue;
         }
@@ -1940,6 +2359,7 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
         });
 
     notifyProgress(0.90f, "Extending fine shell Eikonal field into exterior narrow band...");
+    evaluateSupportNeededAndSeedOrderField(domain, iterCtx, isTrueBedSeed);
     extendEikonalToExteriorBand(domain, baseContext.backend);
 
     notifyProgress(0.96f, "Packing fine shell OpenVDB scalar & vector grids...");
@@ -1968,6 +2388,11 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
     toolTiltGrid->setGridClass(openvdb::GRID_FOG_VOLUME);
     toolTiltGrid->setTransform(domain.transform->copy());
 
+    openvdb::FloatGrid::Ptr supportNeededGrid = openvdb::FloatGrid::create(0.0f);
+    supportNeededGrid->setName("support_needed");
+    supportNeededGrid->setGridClass(openvdb::GRID_FOG_VOLUME);
+    supportNeededGrid->setTransform(domain.transform->copy());
+
     openvdb::Vec3SGrid::Ptr toolAxisGrid =
         openvdb::Vec3SGrid::create(openvdb::Vec3s(0.0f, 0.0f, 1.0f));
     toolAxisGrid->setName("tool_axis");
@@ -1976,6 +2401,7 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
     auto eikAccessor = eikonalGrid->getAccessor();
     auto ovAccessor = overhangGrid->getAccessor();
     auto tiltAccessor = toolTiltGrid->getAccessor();
+    auto supAccessor = supportNeededGrid->getAccessor();
     auto axisAccessor = toolAxisGrid->getAccessor();
 
     for (std::size_t i = 0; i < n; ++i) {
@@ -1984,6 +2410,7 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
         eikAccessor.setValue(ijk, tauVal);
         ovAccessor.setValue(ijk, domain.overhang[i]);
         tiltAccessor.setValue(ijk, domain.toolTiltDeg[i]);
+        supAccessor.setValue(ijk, domain.supportNeeded[i]);
         axisAccessor.setValue(
             ijk,
             openvdb::Vec3s(
@@ -1998,6 +2425,7 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
     result.eikonalGrid = eikonalGrid;
     result.overhangGrid = overhangGrid;
     result.toolTiltDegGrid = toolTiltGrid;
+    result.supportNeededGrid = supportNeededGrid;
     result.toolAxisGrid = toolAxisGrid;
     return result;
 }

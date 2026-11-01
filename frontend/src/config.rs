@@ -453,6 +453,29 @@ pub struct SlicingProcessConfig {
     /// Lateral overlap fraction (`0.01..=0.35`, default `0.08` = 8%) of a standard line width
     /// maintained between each inside-out Wave Overhang extrusion and the preceding extrusion.
     pub wave_overhang_overlap_fraction: f32,
+    /// Enable automatic support detection and support toolpath generation for regions unreachable
+    /// by the constrained Eikonal order field.
+    pub enable_support_generation: bool,
+    /// Seed the constrained Eikonal order field $\tau(\mathbf{x})$ from support contact regions
+    /// so unreachable cantilevers and hanging islands are reached causally.
+    pub seed_order_field_from_supports: bool,
+    /// When true, only generate supports for regions that are actually causally unreachable by
+    /// the constrained order field (floating islands / downward-hanging local minima) and two-pier
+    /// bridges whose span exceeds `max_bridge_length_mm` (leaving reachable overhangs to conformal
+    /// layers and inside-out wave overhangs).
+    pub support_only_unreachable_and_bridges: bool,
+    /// Vertical clearance gap (mm) along anti-gravity between support interface/floor and the part surface.
+    pub support_z_gap_mm: f32,
+    /// Lateral clearance gap (mm) between support structures and the object boundary $\phi_{\text{sdf}} = 0$.
+    pub support_xy_gap_mm: f32,
+    /// Number of dense support interface layers immediately beneath unreachable overhang roofs.
+    pub support_interface_layers: u32,
+    /// Line spacing (mm) for coarse support base scanlines.
+    pub support_base_spacing_mm: f32,
+    /// Line spacing (mm) for dense support interface scanlines.
+    pub support_interface_spacing_mm: f32,
+    /// Extruded line width (mm) for support structures.
+    pub support_line_width_mm: f32,
 }
 
 impl Default for SlicingProcessConfig {
@@ -475,6 +498,15 @@ impl Default for SlicingProcessConfig {
             overhang_angle_threshold_deg: 45.0,
             max_bridge_length_mm: 40.0,
             wave_overhang_overlap_fraction: 0.08,
+            enable_support_generation: true,
+            seed_order_field_from_supports: true,
+            support_only_unreachable_and_bridges: false,
+            support_z_gap_mm: 0.20,
+            support_xy_gap_mm: 0.50,
+            support_interface_layers: 2,
+            support_base_spacing_mm: 2.50,
+            support_interface_spacing_mm: 0.60,
+            support_line_width_mm: 0.40,
         }
     }
 }
@@ -493,6 +525,12 @@ impl SlicingProcessConfig {
         self.overhang_angle_threshold_deg = self.overhang_angle_threshold_deg.clamp(5.0, 85.0);
         self.max_bridge_length_mm = self.max_bridge_length_mm.clamp(0.0, 500.0);
         self.wave_overhang_overlap_fraction = self.wave_overhang_overlap_fraction.clamp(0.01, 0.35);
+        self.support_z_gap_mm = self.support_z_gap_mm.clamp(0.05, 5.0);
+        self.support_xy_gap_mm = self.support_xy_gap_mm.clamp(0.10, 10.0);
+        self.support_interface_layers = self.support_interface_layers.min(16);
+        self.support_base_spacing_mm = self.support_base_spacing_mm.clamp(0.40, 20.0);
+        self.support_interface_spacing_mm = self.support_interface_spacing_mm.clamp(0.20, 5.0);
+        self.support_line_width_mm = self.support_line_width_mm.clamp(0.15, 3.0);
     }
 }
 
@@ -770,6 +808,8 @@ pub struct GcodeProcessConfig {
     pub gap_fill_speed_mms: f32,
     pub bridge_speed_mms: f32,
     pub wave_overhang_speed_mms: f32,
+    pub support_speed_mms: f32,
+    pub support_interface_speed_mms: f32,
     pub travel_speed_mms: f32,
     pub z_hop_speed_mms: f32,
 
@@ -852,6 +892,8 @@ impl Default for GcodeProcessConfig {
             gap_fill_speed_mms: 60.0,
             bridge_speed_mms: 35.0,
             wave_overhang_speed_mms: 30.0,
+            support_speed_mms: 80.0,
+            support_interface_speed_mms: 45.0,
             travel_speed_mms: 250.0,
             z_hop_speed_mms: 25.0,
             outer_wall_accel_mms2: 2500.0,
@@ -943,6 +985,8 @@ impl GcodeProcessConfig {
         self.gap_fill_speed_mms = self.gap_fill_speed_mms.clamp(5.0, 500.0);
         self.bridge_speed_mms = self.bridge_speed_mms.clamp(5.0, 500.0);
         self.wave_overhang_speed_mms = self.wave_overhang_speed_mms.clamp(5.0, 500.0);
+        self.support_speed_mms = self.support_speed_mms.clamp(5.0, 600.0);
+        self.support_interface_speed_mms = self.support_interface_speed_mms.clamp(5.0, 500.0);
         self.travel_speed_mms = self.travel_speed_mms.clamp(20.0, 1200.0);
         self.z_hop_speed_mms = self.z_hop_speed_mms.clamp(2.0, 200.0);
         self.outer_wall_accel_mms2 = self.outer_wall_accel_mms2.clamp(100.0, 50000.0);
@@ -1390,6 +1434,78 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         default_value: "0.08 (8%)",
         summary: "Lateral overlap with the adjacent existing extrusion as a fraction of standard line width.",
         details: "Wave overhang passes are ordered inside-out and maintain continuous contact at this overlap even when line width changes or the 3D centerline rotates around the existing extrusion, with extrusion volume scaled accordingly.",
+    },
+    ParameterDoc {
+        key: "slicing.enable_support_generation",
+        category: "Support Generation",
+        title: "Generate Support Structures",
+        units: "bool",
+        default_value: "true",
+        summary: "Generates gravity-aligned support base and support interface toolpaths for regions unreachable by the constrained order field.",
+        details: "Detects floating islands, downward-hanging local minima, and non-bridgeable overhangs that exceed the constrained Eikonal layer cone, and projects support columns along gravity (+g_bed) to the build plate or lower part surface.",
+    },
+    ParameterDoc {
+        key: "slicing.seed_order_field_from_supports",
+        category: "Support Generation",
+        title: "Seed Order Field from Support Contacts",
+        units: "bool",
+        default_value: "true",
+        summary: "Seeds the constrained Eikonal order field τ(x) at unreachable support contact patches.",
+        details: "Anchors unreachable boundary overhangs and hanging islands to their anti-gravity height so the constrained order field propagates causally upward from the support interface.",
+    },
+    ParameterDoc {
+        key: "slicing.support_only_unreachable_and_bridges",
+        category: "Support Generation",
+        title: "Only Support Unreachable Regions & Long Bridges",
+        units: "bool",
+        default_value: "false",
+        summary: "Restricts support generation to regions that are causally unreachable by the constrained order field (floating islands / downward-hanging local minima) and two-pier bridges exceeding `Max Bridge Length`.",
+        details: "When enabled, causally reachable one-sided overhangs and cantilevers are left unsupported so they can be printed via non-planar conformal layers or inside-out wave overhangs.",
+    },
+    ParameterDoc {
+        key: "slicing.support_z_gap_mm",
+        category: "Support Generation",
+        title: "Support Z Contact Gap",
+        units: "mm",
+        default_value: "0.20 mm",
+        summary: "Vertical separation along anti-gravity between the support interface/floor and the object surface.",
+        details: "Allows supports to detach cleanly from the printed part without fusing.",
+    },
+    ParameterDoc {
+        key: "slicing.support_xy_gap_mm",
+        category: "Support Generation",
+        title: "Support XY Clearance Gap",
+        units: "mm",
+        default_value: "0.50 mm",
+        summary: "Minimum 3D signed-distance clearance between support columns and adjacent part walls.",
+        details: "Prevents support scanlines from colliding with or scarring vertical/sloped object walls.",
+    },
+    ParameterDoc {
+        key: "slicing.support_interface_layers",
+        category: "Support Generation",
+        title: "Support Interface Layers",
+        units: "layers",
+        default_value: "2",
+        summary: "Number of dense support interface layers printed immediately below overhanging contact roofs.",
+        details: "Provides a smooth, closely-spaced support roof beneath unreachable overhangs while keeping the lower support base coarse and fast to print.",
+    },
+    ParameterDoc {
+        key: "slicing.support_base_spacing_mm",
+        category: "Support Generation",
+        title: "Support Base Line Spacing",
+        units: "mm",
+        default_value: "2.50 mm",
+        summary: "Centerline spacing for coarse support base scanlines.",
+        details: "Larger spacing reduces support material consumption and print time.",
+    },
+    ParameterDoc {
+        key: "slicing.support_interface_spacing_mm",
+        category: "Support Generation",
+        title: "Support Interface Line Spacing",
+        units: "mm",
+        default_value: "0.60 mm",
+        summary: "Centerline spacing for dense support interface layers directly beneath the part.",
+        details: "Tight spacing supports overhanging perimeters and skins cleanly.",
     },
     ParameterDoc {
         key: "gcode.bridge_speed_mms",

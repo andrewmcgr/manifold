@@ -860,6 +860,13 @@ void buildObjectScalarFields(
     biasCfg.orthogonalOverhangAngleDeg = std::clamp(biasSpec.orthogonal_overhang_angle_deg, 0.0f, 89.0f);
     biasCfg.transitionWidthDeg = std::clamp(biasSpec.transition_width_deg, 1.0f, 45.0f);
 
+    const ShellPathSpec localShellSpec = backend.shellPathSpec();
+    const SupportSpec localSupportSpec = backend.supportSpec();
+    const float effectiveSupportBridgeMm =
+        (localSupportSpec.max_bridge_length_mm > 0.0f)
+            ? localSupportSpec.max_bridge_length_mm
+            : localShellSpec.max_bridge_length_mm;
+
     EikonalSolverContext ctx{
         backend,
         activeTool,
@@ -872,6 +879,10 @@ void buildObjectScalarFields(
             setFieldProgress(true, frac, msg);
         },
         biasCfg,
+        localShellSpec.overhang_angle_threshold_deg,
+        effectiveSupportBridgeMm,
+        localSupportSpec.enabled && localSupportSpec.seed_order_field,
+        localSupportSpec.only_unreachable_and_long_bridges,
     };
 
     for (const auto& ffiHint : backend.spatialOrientationHints()) {
@@ -964,6 +975,7 @@ void buildObjectScalarFields(
                 rec.scalarFields["eikonal"] = fineDirectSolved.eikonalGrid;
                 rec.scalarFields["overhang"] = fineDirectSolved.overhangGrid;
                 rec.scalarFields["tool_tilt_deg"] = fineDirectSolved.toolTiltDegGrid;
+                rec.scalarFields["support_needed"] = fineDirectSolved.supportNeededGrid;
                 rec.toolAxisGrid = fineDirectSolved.toolAxisGrid;
                 rec.isMultiResolution = false;
                 rec.fineShellInnerDepthMm = 0.0f;
@@ -1017,6 +1029,7 @@ void buildObjectScalarFields(
                 rec.coarseScalarFields["eikonal"] = coarseSolved.eikonalGrid;
                 rec.coarseScalarFields["overhang"] = coarseSolved.overhangGrid;
                 rec.coarseScalarFields["tool_tilt_deg"] = coarseSolved.toolTiltDegGrid;
+                rec.coarseScalarFields["support_needed"] = coarseSolved.supportNeededGrid;
                 rec.coarseToolAxisGrid = coarseSolved.toolAxisGrid;
 
                 rec.scalarFields["sdf"] = fineSdfGrid;
@@ -1034,6 +1047,7 @@ void buildObjectScalarFields(
                 rec.scalarFields["eikonal"] = fineSolved.eikonalGrid;
                 rec.scalarFields["overhang"] = fineSolved.overhangGrid;
                 rec.scalarFields["tool_tilt_deg"] = fineSolved.toolTiltDegGrid;
+                rec.scalarFields["support_needed"] = fineSolved.supportNeededGrid;
                 rec.toolAxisGrid = fineSolved.toolAxisGrid;
                 rec.isMultiResolution = true;
                 rec.fineShellInnerDepthMm = inBandFineMm;
@@ -1085,6 +1099,7 @@ void buildObjectScalarFields(
     rec.scalarFields["eikonal"] = solved.eikonalGrid;
     rec.scalarFields["overhang"] = solved.overhangGrid;
     rec.scalarFields["tool_tilt_deg"] = solved.toolTiltDegGrid;
+    rec.scalarFields["support_needed"] = solved.supportNeededGrid;
     rec.toolAxisGrid = solved.toolAxisGrid;
 }
 
@@ -1362,6 +1377,18 @@ struct SlicerBackend::Impl {
         40.0f,
         0.08f,
     };
+    SupportSpec supportSpec{
+        true,
+        true,
+        false,
+        40.0f,
+        0.20f,
+        0.50f,
+        2,
+        2.50f,
+        0.60f,
+        0.40f,
+    };
 };
 
 SlicerBackend::SlicerBackend() : impl_(std::make_unique<Impl>()) {
@@ -1601,6 +1628,92 @@ std::vector<float> SlicerBackend::objectVertexToolAxes(std::uint64_t objectId) c
     return out;
 }
 
+std::vector<float> SlicerBackend::objectVertexSupportNeeded(std::uint64_t objectId) const {
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return {};
+    }
+    const ObjectRecord& rec = it->second;
+    const auto supIt = rec.scalarFields.find("support_needed");
+    if (supIt == rec.scalarFields.end() || !supIt->second || rec.vertexBuffer.empty()) {
+        return {};
+    }
+
+    const openvdb::FloatGrid& grid = *supIt->second;
+    const float voxelSize = static_cast<float>(grid.transform().voxelSize()[0]);
+    const float inwardStep = 0.60f * voxelSize;
+    openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler> sampler(grid);
+
+    std::unique_ptr<openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler>> coarseSampler;
+    if (rec.isMultiResolution) {
+        const auto cSupIt = rec.coarseScalarFields.find("support_needed");
+        if (cSupIt != rec.coarseScalarFields.end() && cSupIt->second) {
+            coarseSampler = std::make_unique<
+                openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler>>(
+                *cSupIt->second);
+        }
+    }
+
+    const std::array<float, 3> fallback = impl_->nozzleAxisBed;
+    auto normalizeVec3 = [](float x, float y, float z, const std::array<float, 3>& fb) -> std::array<float, 3> {
+        const float len = std::sqrt(x * x + y * y + z * z);
+        if (len > 1.0e-7f) {
+            return {x / len, y / len, z / len};
+        }
+        return fb;
+    };
+
+    std::vector<float> out(rec.vertexBuffer.size(), 0.0f);
+    for (std::size_t i = 0; i < rec.vertexBuffer.size(); ++i) {
+        const RenderVertex& v = rec.vertexBuffer[i];
+        const auto nUnit = normalizeVec3(v.nx, v.ny, v.nz, fallback);
+        const auto gDir = queryGravityDirection({v.x, v.y, v.z});
+        const float cosGrav = nUnit[0] * gDir[0] + nUnit[1] * gDir[1] + nUnit[2] * gDir[2];
+        const openvdb::Vec3d wp0(v.x, v.y, v.z);
+        const openvdb::Vec3d wpIn(
+            v.x - inwardStep * nUnit[0],
+            v.y - inwardStep * nUnit[1],
+            v.z - inwardStep * nUnit[2]);
+        float val = std::max(sampler.wsSample(wp0), sampler.wsSample(wpIn));
+        if (cosGrav > 0.25f) {
+            // For downward-facing overhang vertices lying on sharp 90-degree CAD edges,
+            // also probe 1.25*dx tangent to the face so edge dilution from adjacent vertical walls is avoided.
+            const std::array<float, 3> refAxis =
+                (std::abs(nUnit[0]) < 0.9f) ? std::array<float, 3>{1.0f, 0.0f, 0.0f}
+                                            : std::array<float, 3>{0.0f, 1.0f, 0.0f};
+            const float dRef = refAxis[0] * nUnit[0] + refAxis[1] * nUnit[1] + refAxis[2] * nUnit[2];
+            const auto t0 = normalizeVec3(
+                refAxis[0] - dRef * nUnit[0],
+                refAxis[1] - dRef * nUnit[1],
+                refAxis[2] - dRef * nUnit[2],
+                {1.0f, 0.0f, 0.0f});
+            const auto t1 = normalizeVec3(
+                nUnit[1] * t0[2] - nUnit[2] * t0[1],
+                nUnit[2] * t0[0] - nUnit[0] * t0[2],
+                nUnit[0] * t0[1] - nUnit[1] * t0[0],
+                {0.0f, 1.0f, 0.0f});
+            const double tStep = 1.25 * static_cast<double>(voxelSize);
+            for (const auto& tDir : {t0, t1}) {
+                for (double sgn : {-1.0, 1.0}) {
+                    const openvdb::Vec3d wpT(
+                        wpIn.x() + sgn * tStep * tDir[0],
+                        wpIn.y() + sgn * tStep * tDir[1],
+                        wpIn.z() + sgn * tStep * tDir[2]);
+                    val = std::max(val, sampler.wsSample(wpT));
+                }
+            }
+        } else if (cosGrav < -0.10f && val < 0.95f) {
+            // Upward-facing top surfaces do not require support unless the entire component is floating
+            val = 0.0f;
+        }
+        if (val <= 1.0e-4f && coarseSampler) {
+            val = std::max(val, coarseSampler->wsSample(wpIn));
+        }
+        out[i] = std::clamp(val, 0.0f, 1.0f);
+    }
+    return out;
+}
+
 std::vector<std::string> SlicerBackend::listObjectFields(std::uint64_t objectId) const {
     std::vector<std::string> names;
     const auto it = impl_->objects.find(objectId);
@@ -1702,6 +1815,7 @@ bool SlicerBackend::recomputeObjectFields(
         snapshotBackend.impl_->spatialOrientationHints = impl_->spatialOrientationHints;
         snapshotBackend.impl_->overhangBiasSpec = impl_->overhangBiasSpec;
         snapshotBackend.impl_->shellPathSpec = impl_->shellPathSpec;
+        snapshotBackend.impl_->supportSpec = impl_->supportSpec;
     }
 
     setFieldProgress(true, 0.01f, "Preparing mesh & OpenVDB grid...");
@@ -2307,6 +2421,17 @@ rust::Vec<std::uint32_t> get_object_triangle_face_ids(std::uint64_t object_id) {
 rust::Vec<float> get_object_vertex_tool_axes(std::uint64_t object_id) {
     std::lock_guard<std::mutex> lock(g_backendMutex);
     const auto src = globalBackend().objectVertexToolAxes(object_id);
+    rust::Vec<float> out;
+    out.reserve(src.size());
+    for (const float v : src) {
+        out.push_back(v);
+    }
+    return out;
+}
+
+rust::Vec<float> get_object_vertex_support_needed(std::uint64_t object_id) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const auto src = globalBackend().objectVertexSupportNeeded(object_id);
     rust::Vec<float> out;
     out.reserve(src.size());
     for (const float v : src) {
@@ -4821,6 +4946,28 @@ ShellPathSpec SlicerBackend::shellPathSpec() const noexcept {
     return impl_->shellPathSpec;
 }
 
+void SlicerBackend::setSupportSpec(const SupportSpec& spec) noexcept {
+    SupportSpec s = spec;
+    s.max_bridge_length_mm = std::clamp(s.max_bridge_length_mm, 0.0f, 500.0f);
+    s.z_gap_mm = std::clamp(s.z_gap_mm, 0.0f, 5.0f);
+    s.xy_gap_mm = std::clamp(s.xy_gap_mm, 0.0f, 10.0f);
+    s.interface_layers = std::min<std::uint32_t>(s.interface_layers, 16);
+    s.base_spacing_mm = (s.base_spacing_mm > 0.1f)
+        ? std::clamp(s.base_spacing_mm, 0.4f, 20.0f)
+        : 2.50f;
+    s.interface_spacing_mm = (s.interface_spacing_mm > 0.05f)
+        ? std::clamp(s.interface_spacing_mm, 0.2f, 5.0f)
+        : 0.60f;
+    s.line_width_mm = (s.line_width_mm > 0.05f)
+        ? std::clamp(s.line_width_mm, 0.15f, 3.0f)
+        : 0.40f;
+    impl_->supportSpec = s;
+}
+
+SupportSpec SlicerBackend::supportSpec() const noexcept {
+    return impl_->supportSpec;
+}
+
 ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
     std::uint64_t objectId,
     float adaptivity) const
@@ -4893,6 +5040,366 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         overhangPtr,
         coarseOverhangPtr,
         impl_->gravityDirectionBed);
+
+    // Step 2: Generate Support Base (`feature_kind = 7`) and Support Interface (`feature_kind = 8`)
+    // toolpaths for unreachable order-field regions projected along gravity `+\hat{g}_{bed}`
+    const auto supIt = rec.scalarFields.find("support_needed");
+    if (impl_->supportSpec.enabled && supIt != rec.scalarFields.end() && supIt->second && !res.layers.empty()) {
+        const openvdb::FloatGrid& supGrid = *supIt->second;
+        const openvdb::FloatGrid& sdfGrid = *sdfIt->second;
+        const float dx = static_cast<float>(supGrid.transform().voxelSize()[0]);
+
+        const std::array<float, 3> gRaw = queryGravityDirection({0.0f, 0.0f, 0.0f});
+        const float gLen = std::sqrt(gRaw[0] * gRaw[0] + gRaw[1] * gRaw[1] + gRaw[2] * gRaw[2]);
+        const std::array<float, 3> gDir = (gLen > 1.0e-6f)
+            ? std::array<float, 3>{gRaw[0] / gLen, gRaw[1] / gLen, gRaw[2] / gLen}
+            : std::array<float, 3>{0.0f, 0.0f, -1.0f};
+        const std::array<float, 3> uUp{-gDir[0], -gDir[1], -gDir[2]};
+
+        // Orthonormal basis (tU, tV, uUp) aligned with anti-gravity uUp
+        const std::array<float, 3> refAxis =
+            (std::abs(uUp[0]) < 0.9f) ? std::array<float, 3>{1.0f, 0.0f, 0.0f}
+                                      : std::array<float, 3>{0.0f, 1.0f, 0.0f};
+        const float dotRef = refAxis[0] * uUp[0] + refAxis[1] * uUp[1] + refAxis[2] * uUp[2];
+        std::array<float, 3> tU{
+            refAxis[0] - dotRef * uUp[0],
+            refAxis[1] - dotRef * uUp[1],
+            refAxis[2] - dotRef * uUp[2]};
+        const float tULen = std::sqrt(tU[0] * tU[0] + tU[1] * tU[1] + tU[2] * tU[2]);
+        if (tULen > 1.0e-6f) {
+            tU[0] /= tULen;
+            tU[1] /= tULen;
+            tU[2] /= tULen;
+        } else {
+            tU = {1.0f, 0.0f, 0.0f};
+        }
+        const std::array<float, 3> tV{
+            uUp[1] * tU[2] - uUp[2] * tU[1],
+            uUp[2] * tU[0] - uUp[0] * tU[2],
+            uUp[0] * tU[1] - uUp[1] * tU[0]};
+
+        // Reference build-plate origin P0 and minimum anti-gravity projection hMinObj
+        const std::array<float, 3> pOrigin{0.0f, 0.0f, rec.minZ};
+        float minObjH = std::numeric_limits<float>::max();
+        for (const auto& v : rec.vertexBuffer) {
+            const float h = (v.x - pOrigin[0]) * uUp[0] +
+                            (v.y - pOrigin[1]) * uUp[1] +
+                            (v.z - pOrigin[2]) * uUp[2];
+            minObjH = std::min(minObjH, h);
+        }
+        if (minObjH >= 1.0e5f) {
+            minObjH = 0.0f;
+        }
+
+        // Build a 2D column map in the (tU, tV) plane of unreachable boundary contact roofs
+        const float cellStepMm = std::clamp(dx, 0.40f, 1.00f);
+        struct ColumnSpan {
+            float roofH = -1.0f;
+            float floorH = 0.0f;
+        };
+        std::unordered_map<std::uint64_t, ColumnSpan> supportColumns;
+
+        auto packCellKey = [](std::int32_t iu, std::int32_t iv) -> std::uint64_t {
+            return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(iu)) << 32) |
+                   static_cast<std::uint64_t>(static_cast<std::uint32_t>(iv));
+        };
+        auto unpackCellKey = [](std::uint64_t key, std::int32_t& iu, std::int32_t& iv) {
+            iu = static_cast<std::int32_t>(static_cast<std::uint32_t>(key >> 32));
+            iv = static_cast<std::int32_t>(static_cast<std::uint32_t>(key & 0xFFFFFFFFULL));
+        };
+
+        auto sdfAcc = sdfGrid.getConstAccessor();
+        openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+            sdfSampler(sdfAcc, sdfGrid.transform());
+        std::unique_ptr<openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler>>
+            coarseSdfSamplerPtr;
+        if (coarseSdfPtr != nullptr) {
+            coarseSdfSamplerPtr = std::make_unique<
+                openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler>>(
+                *coarseSdfPtr);
+        }
+        auto samplePartSdf = [&](const openvdb::Vec3d& wp) -> float {
+            const float fVal = sdfSampler.wsSample(wp);
+            if (coarseSdfSamplerPtr && rec.fineShellInnerDepthMm > 0.0f &&
+                fVal <= -(rec.fineShellInnerDepthMm - 1.5f * dx)) {
+                return coarseSdfSamplerPtr->wsSample(wp);
+            }
+            return fVal;
+        };
+
+        const float zGapMm = std::max(0.05f, impl_->supportSpec.z_gap_mm);
+        const float xyGapMm = std::max(0.10f, impl_->supportSpec.xy_gap_mm);
+        const float targetLayerH = std::max(0.05f, impl_->sliceLayerHeight.target_mm);
+
+        auto considerSupportVoxel = [&](const openvdb::Vec3d& wp, float supVal, float sdfVal) {
+            if (supVal < 0.50f || std::abs(sdfVal) > 1.50f * dx) {
+                return;
+            }
+            const float relX = static_cast<float>(wp.x()) - pOrigin[0];
+            const float relY = static_cast<float>(wp.y()) - pOrigin[1];
+            const float relZ = static_cast<float>(wp.z()) - pOrigin[2];
+            const float uCoord = relX * tU[0] + relY * tU[1] + relZ * tU[2];
+            const float vCoord = relX * tV[0] + relY * tV[1] + relZ * tV[2];
+            const float hCoord = (relX * uUp[0] + relY * uUp[1] + relZ * uUp[2]) - minObjH;
+
+            if (hCoord <= zGapMm + targetLayerH) {
+                return;
+            }
+
+            // Ray-march downward along gravity +gDir = -uUp to find floor (build plate h=0 or lower part surface)
+            const float roofH = hCoord - zGapMm;
+            float floorH = 0.0f;
+            const float marchStep = std::max(0.5f * dx, 0.25f);
+            bool exitedUpperBoundary = false;
+            for (float hProbe = hCoord - marchStep; hProbe > 0.0f; hProbe -= marchStep) {
+                const float worldH = hProbe + minObjH;
+                const openvdb::Vec3d wpProbe(
+                    pOrigin[0] + uCoord * tU[0] + vCoord * tV[0] + worldH * uUp[0],
+                    pOrigin[1] + uCoord * tU[1] + vCoord * tV[1] + worldH * uUp[1],
+                    pOrigin[2] + uCoord * tU[2] + vCoord * tV[2] + worldH * uUp[2]);
+                const float sProbe = samplePartSdf(wpProbe);
+                if (!exitedUpperBoundary) {
+                    if (sProbe > 0.25f * dx) {
+                        exitedUpperBoundary = true;
+                    }
+                } else if (sProbe <= 0.0f) {
+                    floorH = hProbe + zGapMm;
+                    break;
+                }
+            }
+            if (!exitedUpperBoundary) {
+                // Voxel is on an upper/internal surface rather than a downward-facing overhang
+                return;
+            }
+            if (roofH <= floorH + 0.5f * targetLayerH) {
+                return;
+            }
+
+            const auto iu = static_cast<std::int32_t>(std::llround(uCoord / cellStepMm));
+            const auto iv = static_cast<std::int32_t>(std::llround(vCoord / cellStepMm));
+            const std::uint64_t key = packCellKey(iu, iv);
+            auto itCol = supportColumns.find(key);
+            if (itCol == supportColumns.end()) {
+                supportColumns.emplace(key, ColumnSpan{roofH, floorH});
+            } else {
+                itCol->second.roofH = std::max(itCol->second.roofH, roofH);
+                itCol->second.floorH = std::min(itCol->second.floorH, floorH);
+            }
+        };
+
+        for (auto iter = supGrid.cbeginValueOn(); iter; ++iter) {
+            const float supVal = *iter;
+            if (supVal < 0.15f) {
+                continue;
+            }
+            const openvdb::Coord ijk = iter.getCoord();
+            const openvdb::Vec3d wp = supGrid.transform().indexToWorld(ijk);
+            const float sdfVal = sdfAcc.getValue(ijk);
+            considerSupportVoxel(wp, supVal, sdfVal);
+        }
+
+        if (!supportColumns.empty()) {
+            std::int32_t minIU = std::numeric_limits<std::int32_t>::max();
+            std::int32_t maxIU = std::numeric_limits<std::int32_t>::lowest();
+            std::int32_t minIV = std::numeric_limits<std::int32_t>::max();
+            std::int32_t maxIV = std::numeric_limits<std::int32_t>::lowest();
+            for (const auto& [key, span] : supportColumns) {
+                std::int32_t iu = 0, iv = 0;
+                unpackCellKey(key, iu, iv);
+                minIU = std::min(minIU, iu);
+                maxIU = std::max(maxIU, iu);
+                minIV = std::min(minIV, iv);
+                maxIV = std::max(maxIV, iv);
+            }
+
+            const float baseSpacingMm = std::max(0.4f, impl_->supportSpec.base_spacing_mm);
+            const float interfaceSpacingMm = std::max(0.2f, impl_->supportSpec.interface_spacing_mm);
+            const float lineWidthMm = std::max(
+                0.15f,
+                (impl_->supportSpec.line_width_mm > 0.05f)
+                    ? impl_->supportSpec.line_width_mm
+                    : impl_->shellPathSpec.nozzle_diameter_mm);
+            const float minSegLenMm = std::max(0.4f, impl_->shellPathSpec.min_extrusion_length_mm);
+
+            float lastSupportIso = -1.0e9f;
+            for (std::size_t layerIdx = 0; layerIdx < res.layers.size(); ++layerIdx) {
+                auto& layer = res.layers[layerIdx];
+                const float hLayer = layer.isovalue;
+                if (hLayer <= 0.0f) {
+                    continue;
+                }
+                // Avoid emitting duplicate support columns at identical isovalues across parallel branches
+                if (std::abs(hLayer - lastSupportIso) < 1.0e-3f) {
+                    continue;
+                }
+
+                float localLayerH = targetLayerH;
+                if (layerIdx < selectedLayers.layers.size() &&
+                    selectedLayers.layers[layerIdx].mean_thickness_mm > 0.01f) {
+                    localLayerH = selectedLayers.layers[layerIdx].mean_thickness_mm;
+                } else if (layerIdx > 0) {
+                    const float dh = layer.isovalue - res.layers[layerIdx - 1].isovalue;
+                    if (dh > 0.02f && dh < 2.0f) {
+                        localLayerH = dh;
+                    }
+                }
+                const float effectiveStepH = std::max(
+                    localLayerH,
+                    std::max(targetLayerH, impl_->sliceLayerHeight.max_mm));
+                const float interfaceBandMm =
+                    static_cast<float>(impl_->supportSpec.interface_layers) * effectiveStepH;
+
+                std::vector<ExtrusionPath> supportPathsForLayer;
+                std::uint32_t supportPassIdx = 0;
+
+                // Helper to scanline-rasterize either Support Base (feature_kind = 7) or
+                // Support Interface (feature_kind = 8) at the requested line spacing
+                auto emitScanlineSupportGroup = [&](std::uint8_t featureKind, float spacingMm, bool swapUV) {
+                    const float minU = static_cast<float>(minIU) * cellStepMm;
+                    const float maxU = static_cast<float>(maxIU) * cellStepMm;
+                    const float minV = static_cast<float>(minIV) * cellStepMm;
+                    const float maxV = static_cast<float>(maxIV) * cellStepMm;
+
+                    const float outerMin = swapUV ? minU : minV;
+                    const float outerMax = swapUV ? maxU : maxV;
+                    const float innerMin = swapUV ? minV : minU;
+                    const float innerMax = swapUV ? maxV : maxU;
+                    const float marchStepMm = std::min(0.5f * cellStepMm, 0.40f);
+
+                    bool zig = false;
+                    for (float outerCoord = outerMin; outerCoord <= outerMax + 1.0e-4f; outerCoord += spacingMm) {
+                        std::vector<ToolpathPoint> activeRun;
+
+                        auto flushRun = [&]() {
+                            if (activeRun.size() < 2) {
+                                activeRun.clear();
+                                return;
+                            }
+                            float lenMm = 0.0f;
+                            for (std::size_t k = 1; k < activeRun.size(); ++k) {
+                                const float dxSeg = activeRun[k].x - activeRun[k - 1].x;
+                                const float dySeg = activeRun[k].y - activeRun[k - 1].y;
+                                const float dzSeg = activeRun[k].z - activeRun[k - 1].z;
+                                lenMm += std::sqrt(dxSeg * dxSeg + dySeg * dySeg + dzSeg * dzSeg);
+                            }
+                            if (lenMm >= minSegLenMm) {
+                                if (zig) {
+                                    std::reverse(activeRun.begin(), activeRun.end());
+                                }
+                                ExtrusionPath ep{};
+                                ep.feature_kind = featureKind;
+                                ep.wall_index = supportPassIdx++;
+                                ep.is_closed = false;
+                                ep.total_length_mm = lenMm;
+                                ep.mean_width_mm = lineWidthMm;
+                                ep.points.reserve(activeRun.size());
+                                for (const auto& pt : activeRun) {
+                                    ep.points.push_back(pt);
+                                }
+                                supportPathsForLayer.push_back(std::move(ep));
+                                if (featureKind == 7) {
+                                    ++res.support_count;
+                                } else {
+                                    ++res.support_interface_count;
+                                }
+                                ++res.total_path_count;
+                                zig = !zig;
+                            }
+                            activeRun.clear();
+                        };
+
+                        for (float innerCoord = innerMin; innerCoord <= innerMax + 1.0e-4f; innerCoord += marchStepMm) {
+                            const float uVal = swapUV ? outerCoord : innerCoord;
+                            const float vVal = swapUV ? innerCoord : outerCoord;
+                            const auto iu = static_cast<std::int32_t>(std::llround(uVal / cellStepMm));
+                            const auto iv = static_cast<std::int32_t>(std::llround(vVal / cellStepMm));
+
+                            // Check 3x3 neighborhood in supportColumns so scanlines connect smoothly across grid cells
+                            bool inColumn = false;
+                            bool isInterface = false;
+                            for (std::int32_t du = -1; du <= 1 && !inColumn; ++du) {
+                                for (std::int32_t dv = -1; dv <= 1 && !inColumn; ++dv) {
+                                    auto itCol = supportColumns.find(packCellKey(iu + du, iv + dv));
+                                    if (itCol != supportColumns.end()) {
+                                        const auto& col = itCol->second;
+                                        if (hLayer >= col.floorH && hLayer <= col.roofH) {
+                                            inColumn = true;
+                                            isInterface = (col.roofH - hLayer <= interfaceBandMm + 1.0e-4f);
+                                        }
+                                    }
+                                }
+                            }
+
+                            const std::uint8_t wantedKind = isInterface ? 8 : 7;
+                            if (!inColumn || wantedKind != featureKind) {
+                                flushRun();
+                                continue;
+                            }
+
+                            const float worldH = hLayer + minObjH;
+                            const std::array<float, 3> pBed{
+                                pOrigin[0] + uVal * tU[0] + vVal * tV[0] + worldH * uUp[0],
+                                pOrigin[1] + uVal * tU[1] + vVal * tV[1] + worldH * uUp[1],
+                                pOrigin[2] + uVal * tU[2] + vVal * tV[2] + worldH * uUp[2]};
+
+                            // Keep support points strictly inside the object's bounding box
+                            if (pBed[0] < rec.minX || pBed[0] > rec.maxX ||
+                                pBed[1] < rec.minY || pBed[1] > rec.maxY ||
+                                pBed[2] < rec.minZ || pBed[2] > rec.maxZ) {
+                                flushRun();
+                                continue;
+                            }
+
+                            // Enforce XY clearance (`xyGapMm`) from the object boundary
+                            const float sHere = samplePartSdf(openvdb::Vec3d(pBed[0], pBed[1], pBed[2]));
+                            if (sHere < xyGapMm) {
+                                flushRun();
+                                continue;
+                            }
+
+                            const std::array<float, 3> travelDir = swapUV ? tV : tU;
+                            const NozzleBasis nb = queryNozzleFrame(pBed, travelDir);
+                            ToolpathPoint tp{};
+                            tp.x = pBed[0];
+                            tp.y = pBed[1];
+                            tp.z = pBed[2];
+                            tp.nx = nb.nozzle_axis[0];
+                            tp.ny = nb.nozzle_axis[1];
+                            tp.nz = nb.nozzle_axis[2];
+                            tp.width_mm = lineWidthMm;
+                            tp.height_mm = localLayerH;
+                            activeRun.push_back(tp);
+                        }
+                        flushRun();
+                    }
+                };
+
+                const bool alternateDir = ((layerIdx % 2) == 1);
+                emitScanlineSupportGroup(7, baseSpacingMm, alternateDir);
+                if (impl_->supportSpec.interface_layers > 0) {
+                    emitScanlineSupportGroup(8, interfaceSpacingMm, !alternateDir);
+                }
+
+                if (!supportPathsForLayer.empty()) {
+                    lastSupportIso = hLayer;
+                    // Prepend support paths before object walls on this layer
+                    std::vector<ExtrusionPath> combined;
+                    combined.reserve(supportPathsForLayer.size() + layer.paths.size());
+                    for (auto& sp : supportPathsForLayer) {
+                        combined.push_back(std::move(sp));
+                    }
+                    for (auto& op : layer.paths) {
+                        combined.push_back(std::move(op));
+                    }
+                    layer.paths.clear();
+                    for (auto& cp : combined) {
+                        layer.paths.push_back(std::move(cp));
+                    }
+                }
+            }
+        }
+    }
+
     setFieldProgress(false, 1.0f, "Shell toolpaths ready.");
     return res;
 }
@@ -5004,6 +5511,16 @@ void set_shell_path_spec(ShellPathSpec spec) {
 ShellPathSpec get_shell_path_spec() {
     std::lock_guard<std::mutex> lock(g_backendMutex);
     return globalBackend().shellPathSpec();
+}
+
+void set_support_spec(SupportSpec spec) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setSupportSpec(spec);
+}
+
+SupportSpec get_support_spec() {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().supportSpec();
 }
 
 ObjectToolpathsResult generate_object_shell_toolpaths(std::uint64_t object_id, float adaptivity) {

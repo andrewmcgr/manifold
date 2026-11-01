@@ -6,7 +6,7 @@ use bevy::tasks::IoTaskPool;
 
 use crate::bridge::ffi::{
     self, ExtrusionPath, FieldSlice2D, FieldStats, LayerHeightSpec, LineWidthSpec,
-    ObjectToolpathsResult, SelectedIsosurfacesResult, ShellPathSpec,
+    ObjectToolpathsResult, SelectedIsosurfacesResult, ShellPathSpec, SupportSpec,
 };
 use crate::config::{NozzleFrame, SlicerConfig};
 use crate::scene::{BuildPlateState, CadObjectEntity};
@@ -101,13 +101,18 @@ pub enum ObjectSurfaceColorMode {
     /// $\theta_{\text{tool}} = \arccos(\hat{\mathbf{z}}_{\text{nozzle}} \cdot \hat{\mathbf{n}}_{\text{bed}}) \in [0^\circ, 180^\circ]$
     /// ($0^\circ$ = nozzle perpendicular/conformal to surface, $90^\circ$ = nozzle tangent to surface, $180^\circ$ = opposite).
     ToolAngleFromNormal,
+    /// Colors the object surface by the `"support_needed"` field ($0\%$ = reachable by constrained order
+    /// field $\tau(\mathbf{x})$ or valid bridge; $100\%$ = unreachable floating island, downward local minimum,
+    /// or un-bridged overhang exceeding the constrained tool/clearance cone).
+    SupportNeeded,
 }
 
 impl ObjectSurfaceColorMode {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::DefaultCad,
         Self::Overhang,
         Self::ToolAngleFromNormal,
+        Self::SupportNeeded,
     ];
 
     pub fn label(self) -> &'static str {
@@ -115,6 +120,7 @@ impl ObjectSurfaceColorMode {
             Self::DefaultCad => "Default CAD Material",
             Self::Overhang => "Overhang vs. Gravity (0°=Up / 90°=Vertical / 180°=Down)",
             Self::ToolAngleFromNormal => "Tool Angle from Surface Normal (0°=⊥ / 90°=∥ / 180°=Opp)",
+            Self::SupportNeeded => "Unreachable / Support Needed (0%=Supported / 100%=Needs Support)",
         }
     }
 }
@@ -280,6 +286,7 @@ pub struct FieldVisualizationState {
     pub show_inner_walls: bool,
     pub show_solid_infill: bool,
     pub show_sparse_infill: bool,
+    pub show_supports: bool,
     pub show_travel_moves: bool,
     pub show_scarf_and_wipes: bool,
     pub show_toolpath_centerlines: bool,
@@ -373,6 +380,7 @@ impl Default for FieldVisualizationState {
             show_inner_walls: true,
             show_solid_infill: true,
             show_sparse_infill: true,
+            show_supports: true,
             show_travel_moves: false,
             show_scarf_and_wipes: true,
             show_toolpath_centerlines: false,
@@ -493,11 +501,24 @@ impl FieldVisualizationState {
             max_bridge_length_mm: s.max_bridge_length_mm,
             wave_overhang_overlap_fraction: s.wave_overhang_overlap_fraction,
         };
+        let support_spec = SupportSpec {
+            enabled: s.enable_support_generation,
+            seed_order_field: s.seed_order_field_from_supports,
+            only_unreachable_and_long_bridges: s.support_only_unreachable_and_bridges,
+            max_bridge_length_mm: s.max_bridge_length_mm,
+            z_gap_mm: s.support_z_gap_mm,
+            xy_gap_mm: s.support_xy_gap_mm,
+            interface_layers: s.support_interface_layers,
+            base_spacing_mm: s.support_base_spacing_mm,
+            interface_spacing_mm: s.support_interface_spacing_mm,
+            line_width_mm: s.support_line_width_mm,
+        };
         let adaptivity = self.adaptivity;
 
         let task = IoTaskPool::get().spawn(async move {
             ffi::set_slice_layer_height(lh_spec);
             ffi::set_shell_path_spec(shell_spec);
+            ffi::set_support_spec(support_spec);
 
             let layers_res = if need_layers {
                 Some(ffi::select_slicing_isosurfaces(object_id, adaptivity))
@@ -738,6 +759,11 @@ pub fn sync_field_visualization_system(
                 .map_or(true, |r| r.angle_between(obj_world_tf.rotation) < 1.0e-3)
         {
             ffi::get_object_vertex_tool_axes(obj_id)
+        } else if vis_state.surface_color_mode == ObjectSurfaceColorMode::SupportNeeded
+            && !vis_state.is_busy()
+            && vis_state.available_fields.iter().any(|f| f == "support_needed" || f == "eikonal")
+        {
+            ffi::get_object_vertex_support_needed(obj_id)
         } else {
             Vec::new()
         };
@@ -1144,6 +1170,7 @@ pub fn sync_field_visualization_system(
         let show_inner = vis_state.show_inner_walls;
         let show_infill = vis_state.show_solid_infill;
         let show_sparse = vis_state.show_sparse_infill;
+        let show_supports = vis_state.show_supports;
         let show_scarf_wipes = vis_state.show_scarf_and_wipes;
         let show_travels = vis_state.show_travel_moves;
 
@@ -1174,6 +1201,7 @@ pub fn sync_field_visualization_system(
                             show_inner,
                             show_infill,
                             show_sparse,
+                            show_supports,
                             show_scarf_wipes,
                             show_travels,
                         ) {
@@ -1210,6 +1238,7 @@ pub fn sync_field_visualization_system(
                             show_inner,
                             show_infill,
                             show_sparse,
+                            show_supports,
                             show_scarf_wipes,
                             show_travels,
                         ) {
@@ -1257,6 +1286,7 @@ pub fn sync_field_visualization_system(
                             0 | 6 => show_outer,
                             1 => show_inner,
                             4 => show_sparse,
+                            7 | 8 => show_supports,
                             _ => show_infill,
                         };
                         if !visible || path.points.len() < 2 {
@@ -1373,6 +1403,7 @@ pub fn sync_field_visualization_system(
                             vis_state.show_inner_walls,
                             vis_state.show_solid_infill,
                             vis_state.show_sparse_infill,
+                            vis_state.show_supports,
                             vis_state.show_scarf_and_wipes,
                             vis_state.show_travel_moves,
                         ) {
@@ -1585,12 +1616,14 @@ pub fn sync_field_visualization_system(
 }
 
 /// Returns whether a `PlannedSegment` should be rendered given the current UI visibility toggles.
+#[allow(clippy::too_many_arguments)]
 fn is_planned_segment_visible(
     seg: &crate::gcode::PlannedSegment,
     show_outer: bool,
     show_inner: bool,
     show_infill: bool,
     show_sparse: bool,
+    show_supports: bool,
     show_scarf_wipes: bool,
     show_travels: bool,
 ) -> bool {
@@ -1604,6 +1637,9 @@ fn is_planned_segment_visible(
         }
         crate::gcode::PlannedMoveKind::InnerWall => show_inner,
         crate::gcode::PlannedMoveKind::SparseInfill => show_sparse,
+        crate::gcode::PlannedMoveKind::Support | crate::gcode::PlannedMoveKind::SupportInterface => {
+            show_supports
+        }
         crate::gcode::PlannedMoveKind::SolidInfill
         | crate::gcode::PlannedMoveKind::GapFill
         | crate::gcode::PlannedMoveKind::Bridge => show_infill,
@@ -1808,6 +1844,8 @@ pub fn compute_object_surface_vertex_colors(
     }
 
     let has_solved_axes = solved_local_tool_axes.len() == vertices.len() * 3;
+    let has_support_vals =
+        mode == ObjectSurfaceColorMode::SupportNeeded && solved_local_tool_axes.len() == vertices.len();
     let mut colors = Vec::with_capacity(vertices.len());
     let mut min_deg = f32::INFINITY;
     let mut max_deg = f32::NEG_INFINITY;
@@ -1821,14 +1859,15 @@ pub fn compute_object_surface_vertex_colors(
             .try_normalize()
             .unwrap_or(Vec3::Z);
 
-        let angle_deg = match mode {
-            ObjectSurfaceColorMode::DefaultCad => 0.0,
+        let (angle_deg, t) = match mode {
+            ObjectSurfaceColorMode::DefaultCad => (0.0, 0.0),
             ObjectSurfaceColorMode::Overhang => {
                 let g_bed = config.query_gravity_bed(p_bed);
                 // -n_bed . g_bed == +1 when outward normal points opposite to gravity (upward top),
                 // 0 on vertical walls, and -1 on downward-facing overhangs/ceilings.
                 let cos_up = (-n_bed.dot(g_bed)).clamp(-1.0, 1.0);
-                cos_up.acos().to_degrees()
+                let deg = cos_up.acos().to_degrees();
+                (deg, (deg / 180.0).clamp(0.0, 1.0))
             }
             ObjectSurfaceColorMode::ToolAngleFromNormal => {
                 let z_nozzle_bed = if has_solved_axes {
@@ -1842,7 +1881,16 @@ pub fn compute_object_surface_vertex_colors(
                     config.query_nozzle_frame(p_bed, Vec3::X).nozzle_axis
                 };
                 let cos_tool = n_bed.dot(z_nozzle_bed).clamp(-1.0, 1.0);
-                cos_tool.acos().to_degrees()
+                let deg = cos_tool.acos().to_degrees();
+                (deg, (deg / 180.0).clamp(0.0, 1.0))
+            }
+            ObjectSurfaceColorMode::SupportNeeded => {
+                let s = if has_support_vals {
+                    solved_local_tool_axes[i].clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                (s * 100.0, s)
             }
         };
 
@@ -1850,18 +1898,19 @@ pub fn compute_object_surface_vertex_colors(
         max_deg = max_deg.max(angle_deg);
         sum_deg += angle_deg as f64;
 
-        let t = (angle_deg / 180.0).clamp(0.0, 1.0);
         let srgba = high_contrast_parameter_ramp(t);
         colors.push(srgba_to_linear_rgba(srgba));
     }
 
     let mean_deg = (sum_deg / (vertices.len() as f64)) as f32;
+    let uses_solved = (has_solved_axes && mode == ObjectSurfaceColorMode::ToolAngleFromNormal)
+        || has_support_vals;
     (
         colors,
         if min_deg.is_finite() { min_deg } else { 0.0 },
         if max_deg.is_finite() { max_deg } else { 180.0 },
         mean_deg,
-        has_solved_axes && mode == ObjectSurfaceColorMode::ToolAngleFromNormal,
+        uses_solved,
     )
 }
 
@@ -2115,6 +2164,8 @@ fn compute_toolpath_point_color(
                 let shade = (1.0 - 0.08 * ((wall_index.saturating_sub(1) % 4) as f32)).clamp(0.70, 1.0);
                 [0.98 * shade, 0.26 * shade, 0.68 * shade, 1.0]
             }
+            7 => [0.22, 0.88, 0.62, 1.0], // Support Base: seafoam/mint green
+            8 => [0.12, 0.96, 0.88, 1.0], // Support Interface: bright aquamarine
             _ => [0.98, 0.32, 0.88, 1.0], // Gap Fill: vivid magenta
         },
         ToolpathColorMode::ByLineWidth | _ => {
@@ -2182,6 +2233,7 @@ fn compute_isosurface_vertex_color(
     let base_inside = match field_name {
         "eikonal" => [1.0, 0.68, 0.14],
         "overhang" => [0.22, 0.92, 0.72],
+        "support_needed" => [0.98, 0.28, 0.36],
         _ => [0.85, 0.44, 0.98],
     };
 
@@ -4596,6 +4648,245 @@ mod tests {
             orthogonal_overhang_angle_deg: default_cfg.orthogonal_overhang_angle_deg,
             transition_width_deg: default_cfg.overhang_bias_transition_deg,
         });
+    }
+
+    #[test]
+    fn test_unreachable_order_field_detection_and_support_generation() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ffi::set_spatial_orientation_hints(&[]);
+        ffi::set_nozzle_axis_bed([0.0, 0.0, 1.0]);
+        ffi::set_gravity_direction_bed([0.0, 0.0, -1.0]);
+
+        // 1. Build a watertight L-shaped cantilever + two-pillar bridge mesh:
+        //    - Left pillar:  X in [-10.0, -4.0], Y in [-4.0, 4.0], Z in [0.0, 6.0]
+        //    - Right pillar: X in [  4.0, 10.0], Y in [-4.0, 4.0], Z in [0.0, 6.0]
+        //    - Top deck spanning the 8.0 mm gap between pillars AND cantilevered out in +Y to Y = +10.0:
+        //      X in [-10.0, 10.0], Y in [-4.0, 10.0], Z in [4.0, 6.0]
+        let x_coords = [-10.0f32, -4.0, 4.0, 10.0];
+        let y_coords = [-4.0f32, 4.0, 10.0];
+        let z_coords = [0.0f32, 4.0, 6.0];
+        let is_occupied = |ix: i32, iy: i32, iz: i32| -> bool {
+            if ix < 0 || ix >= 3 || iy < 0 || iy >= 2 || iz < 0 || iz >= 2 {
+                return false;
+            }
+            match (ix, iy, iz) {
+                (0, 0, 0) | (2, 0, 0) => true,
+                (_, _, 1) => true,
+                _ => false,
+            }
+        };
+
+        let mut positions: Vec<f32> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut add_quad = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3]| {
+            let base = (positions.len() / 3) as u32;
+            for p in [p0, p1, p2, p3] {
+                positions.extend_from_slice(&p);
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        };
+
+        for ix in 0..3 {
+            for iy in 0..2 {
+                for iz in 0..2 {
+                    if !is_occupied(ix, iy, iz) {
+                        continue;
+                    }
+                    let x0 = x_coords[ix as usize];
+                    let x1 = x_coords[(ix + 1) as usize];
+                    let y0 = y_coords[iy as usize];
+                    let y1 = y_coords[(iy + 1) as usize];
+                    let z0 = z_coords[iz as usize];
+                    let z1 = z_coords[(iz + 1) as usize];
+
+                    if !is_occupied(ix - 1, iy, iz) {
+                        add_quad([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]);
+                    }
+                    if !is_occupied(ix + 1, iy, iz) {
+                        add_quad([x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]);
+                    }
+                    if !is_occupied(ix, iy - 1, iz) {
+                        add_quad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]);
+                    }
+                    if !is_occupied(ix, iy + 1, iz) {
+                        add_quad([x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]);
+                    }
+                    if !is_occupied(ix, iy, iz - 1) {
+                        add_quad([x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]);
+                    }
+                    if !is_occupied(ix, iy, iz + 1) {
+                        add_quad([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]);
+                    }
+                }
+            }
+        }
+
+        let part = ffi::register_triangle_mesh("support_detection_test_arch", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        let mut cfg = SlicerConfig::default();
+        cfg.slicing.enable_support_generation = true;
+        cfg.slicing.seed_order_field_from_supports = true;
+        cfg.slicing.max_bridge_length_mm = 40.0;
+        cfg.slicing.overhang_angle_threshold_deg = 45.0;
+        crate::ui::sync_config_to_backend(&cfg);
+
+        assert!(ffi::recompute_object_fields(part.object_id, 0.5, 4.0));
+
+        // 2. Verify `"support_needed"` field is exposed in `list_object_fields` and has positive range
+        let fields = ffi::list_object_fields(part.object_id);
+        assert!(
+            fields.iter().any(|f| f == "support_needed"),
+            "Expected 'support_needed' in list_object_fields, got {fields:?}"
+        );
+        let sn_stats = ffi::get_object_field_stats(part.object_id, "support_needed");
+        assert!(sn_stats.valid);
+        assert!(
+            sn_stats.max_value > 0.5,
+            "Expected support_needed max_value > 0.5 on cantilevered overhang, got {}",
+            sn_stats.max_value
+        );
+
+        // 3. Verify vertex sampling (`get_object_vertex_support_needed`) and `ObjectSurfaceColorMode::SupportNeeded`:
+        //    - Supported pillar base / top deck vertices have support_needed == 0.0
+        //    - Two-pillar bridge underside (X in [-3, 3], Y in [-2, 2], Z = 4.0) is spanned by an 8 mm bridge
+        //      (<= max_bridge_length_mm = 40 mm), so it does NOT require support!
+        //    - One-sided cantilevered overhang underside (Y in [6.5, 9.5], Z = 4.0) cannot be bridged on two piers
+        //      and cannot be reached causally by the constrained order field, so it has support_needed > 0.5!
+        let verts = ffi::get_object_vertices(part.object_id);
+        let vert_support = ffi::get_object_vertex_support_needed(part.object_id);
+        assert_eq!(vert_support.len(), verts.len());
+
+        let (colors_sn, min_sn, max_sn, _mean_sn, uses_sn_field) =
+            compute_object_surface_vertex_colors(
+                &verts,
+                &Transform::IDENTITY,
+                &cfg,
+                ObjectSurfaceColorMode::SupportNeeded,
+                &vert_support,
+            );
+        assert!(uses_sn_field);
+        assert_eq!(colors_sn.len(), verts.len());
+        assert!(min_sn < 1.0 && max_sn > 50.0);
+
+        let mut max_cantilever_support = 0.0f32;
+        let mut max_top_deck_support = 0.0f32;
+        for (v, &s) in verts.iter().zip(vert_support.iter()) {
+            let wy = v.y + part.origin_y;
+            let wz = v.z + part.origin_z;
+            if (wz - 4.0).abs() < 0.25 && v.nz < -0.5 && wy >= 6.0 {
+                max_cantilever_support = max_cantilever_support.max(s);
+            }
+            if (wz - 6.0).abs() < 0.25 && v.nz > 0.5 {
+                max_top_deck_support = max_top_deck_support.max(s);
+            }
+        }
+        assert!(
+            max_cantilever_support > 0.5,
+            "Expected cantilevered underside (Z=4, Y>=6) to require support (> 0.5), got {max_cantilever_support}"
+        );
+        assert!(
+            max_top_deck_support < 0.1,
+            "Expected upward top deck (Z=6) to need 0 support, got {max_top_deck_support}"
+        );
+
+        // Also check the 2D slice of `"support_needed"` at Z = 4.0 mm (normalized pos = 4.0 / 6.0 = 0.667):
+        // The cantilevered region (Y > 5) has positive support_needed whereas the bridged arch center
+        // (X in [-2, 2], Y in [-2, 2]) has 0.0 support_needed when max_bridge_length_mm = 40.0 mm!
+        let slice_z4 = ffi::sample_field_slice(part.object_id, "support_needed", 2, 4.0 / 6.0, 40);
+        assert!(slice_z4.valid);
+
+        // 4. Generate toolpaths and G-code with support generation enabled:
+        let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp.valid);
+        assert!(
+            tp.support_count > 0,
+            "Expected Support Base toolpaths (feature_kind == 7) under the unreachable cantilever, got 0"
+        );
+        assert!(
+            tp.support_interface_count > 0,
+            "Expected Support Interface toolpaths (feature_kind == 8) beneath the cantilever contact ceiling, got 0"
+        );
+
+        let planned = crate::gcode::plan_and_emit_gcode_for_object(
+            "support_detection_test_arch",
+            part.object_id,
+            &tp,
+            Transform::IDENTITY,
+            &cfg,
+        );
+        let gcode_str = &planned.gcode_text;
+        assert!(
+            gcode_str.contains("; TYPE:Support Base") && gcode_str.contains("; TYPE:Support Interface"),
+            "Expected emitted G-code to contain '; TYPE:Support Base' and '; TYPE:Support Interface' moves"
+        );
+
+        // 5. Verify the `support_only_unreachable_and_bridges` toggle:
+        //    (a) With `support_only_unreachable_and_bridges = true` and `max_bridge_length_mm = 40.0` (> 8 mm bridge):
+        //        - The one-sided cantilever (Y in [4, 10]) is causally reachable from the pillars and is NOT
+        //          a two-pier bridge, so it is left unsupported (`support_count == 0`).
+        //        - The 8 mm two-pillar bridge (X in [-4, 4], Y in [-4, 4]) is <= 40 mm, so it is also unsupported.
+        cfg.slicing.support_only_unreachable_and_bridges = true;
+        cfg.slicing.max_bridge_length_mm = 40.0;
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.5, 4.0));
+        let tp_only_unreach_40 = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp_only_unreach_40.valid);
+        assert_eq!(
+            tp_only_unreach_40.support_count, 0,
+            "Expected 0 supports when support_only_unreachable_and_bridges=true and bridge span (8 mm) <= max_bridge_length_mm (40 mm)"
+        );
+
+        //    (b) With `support_only_unreachable_and_bridges = true` and `max_bridge_length_mm = 5.0` (< 8 mm bridge):
+        //        - The 8 mm two-pillar bridge (X in [-4, 4], Y in [-4, 4]) now exceeds `max_bridge_length_mm = 5.0 mm`,
+        //          so support IS generated beneath the bridge span even with `support_only_unreachable_and_bridges = true`!
+        cfg.slicing.support_only_unreachable_and_bridges = true;
+        cfg.slicing.max_bridge_length_mm = 5.0;
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.5, 4.0));
+        let tp_only_unreach_5 = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp_only_unreach_5.valid);
+        assert!(
+            tp_only_unreach_5.support_count > 0,
+            "Expected support beneath the 8 mm two-pillar bridge when support_only_unreachable_and_bridges=true and max_bridge_length_mm=5.0 mm"
+        );
+
+        let _ = ffi::remove_cad_object(part.object_id);
+
+        //    (c) Verify an actually unreachable mid-air island (Z in [2.5, 4.5] alongside a grounded pillar at X in [-8, -2], Z in [0, 5])
+        //        still receives support when `support_only_unreachable_and_bridges = true` and `max_bridge_length_mm = 40.0`:
+        let mut island_pos: Vec<f32> = Vec::new();
+        let mut island_idx: Vec<u32> = Vec::new();
+        let mut push_box = |bx0: f32, bx1: f32, by0: f32, by1: f32, bz0: f32, bz1: f32| {
+            let mut add_q = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3]| {
+                let base = (island_pos.len() / 3) as u32;
+                for p in [p0, p1, p2, p3] {
+                    island_pos.extend_from_slice(&p);
+                }
+                island_idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            };
+            add_q([bx0, by0, bz0], [bx0, by0, bz1], [bx0, by1, bz1], [bx0, by1, bz0]);
+            add_q([bx1, by0, bz0], [bx1, by1, bz0], [bx1, by1, bz1], [bx1, by0, bz1]);
+            add_q([bx0, by0, bz0], [bx1, by0, bz0], [bx1, by0, bz1], [bx0, by0, bz1]);
+            add_q([bx0, by1, bz0], [bx0, by1, bz1], [bx1, by1, bz1], [bx1, by1, bz0]);
+            add_q([bx0, by0, bz0], [bx0, by1, bz0], [bx1, by1, bz0], [bx1, by0, bz0]);
+            add_q([bx0, by0, bz1], [bx1, by0, bz1], [bx1, by1, bz1], [bx0, by1, bz1]);
+        };
+        push_box(-8.0, -2.0, -3.0, 3.0, 0.0, 5.0);
+        push_box(2.0, 8.0, -3.0, 3.0, 2.5, 4.5);
+        let island_part = ffi::register_triangle_mesh("unreachable_island_test", &island_pos, &island_idx);
+        assert!(island_part.object_id > 0);
+        cfg.slicing.support_only_unreachable_and_bridges = true;
+        cfg.slicing.max_bridge_length_mm = 40.0;
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(island_part.object_id, 0.5, 4.0));
+        let tp_island = ffi::generate_object_shell_toolpaths(island_part.object_id, 0.0);
+        assert!(tp_island.valid);
+        assert!(
+            tp_island.support_count > 0,
+            "Expected support beneath the causally unreachable floating island when support_only_unreachable_and_bridges=true"
+        );
+        let _ = ffi::remove_cad_object(island_part.object_id);
     }
 }
 

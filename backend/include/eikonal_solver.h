@@ -92,6 +92,8 @@ struct ActiveVolumeDomain {
     std::vector<std::array<float, 3>> toolAxis;
     /// Angle (degrees) between toolAxis[i] and the reference bed normal.
     std::vector<float> toolTiltDeg;
+    /// Support-needed / unreachable-order-field indicator in `[0.0, 1.0]`.
+    std::vector<float> supportNeeded;
 
     /// True if voxel i is a fixed seed on the print bed (\tau = 0) or inner shell seam.
     std::vector<std::uint8_t> isSeed;
@@ -136,6 +138,10 @@ struct EikonalSolverContext {
     std::vector<OrientationHint> hints;
     std::function<void(float, const char*)> reportProgress;
     OverhangOrientationBiasConfig overhangBias{};
+    float overhangThresholdDeg = 45.0f;
+    float maxBridgeLengthMm = 40.0f;
+    bool enableSupportSeeding = false;
+    bool onlySupportUnreachableAndBridges = false;
 };
 
 /// Pluggable strategy for computing and clamping the local 5/6-axis tool orientation
@@ -224,6 +230,7 @@ struct EikonalSolveResult {
     openvdb::FloatGrid::Ptr eikonalGrid;
     openvdb::FloatGrid::Ptr overhangGrid;
     openvdb::FloatGrid::Ptr toolTiltDegGrid;
+    openvdb::FloatGrid::Ptr supportNeededGrid;
     openvdb::Vec3SGrid::Ptr toolAxisGrid;
 };
 

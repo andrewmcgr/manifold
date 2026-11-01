@@ -191,6 +191,26 @@ pub mod ffi {
         pub max_mm: f32,
     }
 
+    /// Support detection, order-field seeding, and support toolpath generation parameters shared across FFI.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct SupportSpec {
+        pub enabled: bool,
+        pub seed_order_field: bool,
+        /// When true, only generate support for regions that are actually causally unreachable by
+        /// the constrained order field (floating islands / downward-hanging local minima) and
+        /// two-pier bridges whose span exceeds `max_bridge_length_mm` (leaving reachable overhangs
+        /// to non-planar conformal layers and inside-out wave overhangs).
+        pub only_unreachable_and_long_bridges: bool,
+        /// Maximum unsupported two-pier bridge length (mm); if `<= 0.0`, falls back to `ShellPathSpec::max_bridge_length_mm`.
+        pub max_bridge_length_mm: f32,
+        pub z_gap_mm: f32,
+        pub xy_gap_mm: f32,
+        pub interface_layers: u32,
+        pub base_spacing_mm: f32,
+        pub interface_spacing_mm: f32,
+        pub line_width_mm: f32,
+    }
+
     /// Shell, overhang (bridging & wave overhangs), and sparse infill path generation parameters shared across FFI.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct ShellPathSpec {
@@ -237,9 +257,9 @@ pub mod ffi {
     /// A continuous open or closed extrusion path on a non-planar slicing isosurface.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct ExtrusionPath {
-        /// `0 = OuterWall`, `1 = InnerWall`, `2 = SolidInfill`, `3 = GapFill`, `4 = SparseInfill`, `5 = Bridge`, `6 = WaveOverhang`
+        /// `0 = OuterWall`, `1 = InnerWall`, `2 = SolidInfill`, `3 = GapFill`, `4 = SparseInfill`, `5 = Bridge`, `6 = WaveOverhang`, `7 = Support`, `8 = SupportInterface`
         pub feature_kind: u8,
-        /// `0` for outer wall, `1..=inner_wall_count` for inner walls, inside-out pass index for wave overhangs, pass index for infill/gap fill/bridges.
+        /// `0` for outer wall, `1..=inner_wall_count` for inner walls, inside-out pass index for wave overhangs, pass index for infill/gap fill/bridges/supports.
         pub wall_index: u32,
         pub is_closed: bool,
         pub total_length_mm: f32,
@@ -267,6 +287,8 @@ pub mod ffi {
         pub sparse_infill_count: u32,
         pub bridge_count: u32,
         pub wave_overhang_count: u32,
+        pub support_count: u32,
+        pub support_interface_count: u32,
         pub layers: Vec<LayerToolpaths>,
     }
 
@@ -308,6 +330,11 @@ pub mod ffi {
         /// coordinates, length `3 * vertex_count`) sampled on the object's surface mesh from
         /// `toolAxisGrid`, or an empty `Vec` if `toolAxisGrid` has not been computed yet.
         pub fn get_object_vertex_tool_axes(object_id: u64) -> Vec<f32>;
+
+        /// Retrieves the per-vertex `"support_needed"` scalar (`[0.0, 1.0]`, length `vertex_count`)
+        /// sampled on the object's surface mesh, indicating regions unreachable by the constrained
+        /// Eikonal order field without support.
+        pub fn get_object_vertex_support_needed(object_id: u64) -> Vec<f32>;
 
         /// Removes `object_id` from the C++ backend without disturbing other objects.
         pub fn remove_cad_object(object_id: u64) -> bool;
@@ -416,6 +443,12 @@ pub mod ffi {
 
         /// Retrieves the current shell & toolpath generation parameters (`ShellPathSpec`) from the C++ backend.
         pub fn get_shell_path_spec() -> ShellPathSpec;
+
+        /// Sets the support detection, order-field seeding, and support toolpath generation parameters (`SupportSpec`).
+        pub fn set_support_spec(spec: SupportSpec);
+
+        /// Retrieves the current support detection and support toolpath generation parameters (`SupportSpec`).
+        pub fn get_support_spec() -> SupportSpec;
 
         /// Generates outer walls, inner walls, solid infill (`Monotonic` or `Concentric`), and
         /// shell gap fill across all selected non-planar slicing isosurfaces of `object_id`

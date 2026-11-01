@@ -14,10 +14,12 @@ pub enum PlannedMoveKind {
     SparseInfill = 4,
     Bridge = 5,
     WaveOverhang = 6,
-    ScarfSeam = 7,
-    Travel = 8,
-    ZHop = 9,
-    Wipe = 10,
+    Support = 7,
+    SupportInterface = 8,
+    ScarfSeam = 9,
+    Travel = 10,
+    ZHop = 11,
+    Wipe = 12,
 }
 
 impl PlannedMoveKind {
@@ -30,6 +32,8 @@ impl PlannedMoveKind {
             4 => Self::SparseInfill,
             5 => Self::Bridge,
             6 => Self::WaveOverhang,
+            7 => Self::Support,
+            8 => Self::SupportInterface,
             _ => Self::SolidInfill,
         }
     }
@@ -44,8 +48,14 @@ impl PlannedMoveKind {
                 | Self::SparseInfill
                 | Self::Bridge
                 | Self::WaveOverhang
+                | Self::Support
+                | Self::SupportInterface
                 | Self::ScarfSeam
         )
+    }
+
+    pub fn is_support(self) -> bool {
+        matches!(self, Self::Support | Self::SupportInterface)
     }
 
     pub fn is_wall(self) -> bool {
@@ -64,6 +74,8 @@ impl PlannedMoveKind {
             Self::SparseInfill => "Sparse Infill",
             Self::Bridge => "Bridge",
             Self::WaveOverhang => "Wave Overhang",
+            Self::Support => "Support Base",
+            Self::SupportInterface => "Support Interface",
             Self::ScarfSeam => "Scarf Seam",
             Self::Travel => "Travel",
             Self::ZHop => "Z-Hop",
@@ -586,12 +598,14 @@ fn order_layer_chains(
         return chains;
     }
 
+    let mut supports: Vec<WorkingChain> = Vec::new();
     let mut walls: Vec<WorkingChain> = Vec::new();
     let mut wave_overhangs: Vec<WorkingChain> = Vec::new();
     let mut bridges: Vec<WorkingChain> = Vec::new();
     let mut infills: Vec<WorkingChain> = Vec::new();
     for ch in chains.drain(..) {
         match ch.base_kind {
+            PlannedMoveKind::Support | PlannedMoveKind::SupportInterface => supports.push(ch),
             PlannedMoveKind::WaveOverhang => wave_overhangs.push(ch),
             PlannedMoveKind::Bridge => bridges.push(ch),
             k if k.is_wall() => walls.push(ch),
@@ -623,9 +637,34 @@ fn order_layer_chains(
         d.x * d.x + d.y * d.y + (z_penalty * d.z) * (z_penalty * d.z)
     };
 
-    let mut ordered: Vec<WorkingChain> =
-        Vec::with_capacity(walls.len() + wave_overhangs.len() + bridges.len() + infills.len());
+    let mut ordered: Vec<WorkingChain> = Vec::with_capacity(
+        supports.len() + walls.len() + wave_overhangs.len() + bridges.len() + infills.len(),
+    );
     let mut curr_pos = start_pos_bed;
+
+    // 0. Print Support Base and Support Interface chains first on each layer so overhanging
+    //    walls, wave overhangs, and bridges have their support foundation in place.
+    let mut used_supports = vec![false; supports.len()];
+    for _ in 0..supports.len() {
+        let mut best_i = 0usize;
+        let mut best_d = f32::MAX;
+        for (i, sp) in supports.iter().enumerate() {
+            if used_supports[i] || sp.pts.is_empty() {
+                continue;
+            }
+            let d = weighted_dist_sq(curr_pos, sp.pts.first().unwrap().pos_bed)
+                .min(weighted_dist_sq(curr_pos, sp.pts.last().unwrap().pos_bed));
+            if d < best_d {
+                best_d = d;
+                best_i = i;
+            }
+        }
+        used_supports[best_i] = true;
+        let mut chosen = supports[best_i].clone();
+        orient_chain_for_minimal_travel(&mut chosen, curr_pos, z_penalty);
+        curr_pos = chosen.pts.last().unwrap().pos_bed;
+        ordered.push(chosen);
+    }
 
     // 1. Group supported walls by rank and greedily pick nearest within each rank
     let mut used_walls = vec![false; walls.len()];
@@ -1600,6 +1639,8 @@ pub fn render_toolpath_preview_thumbnails(
                 PlannedMoveKind::SparseInfill => [0.92, 0.74, 0.22],
                 PlannedMoveKind::Bridge => [0.20, 0.56, 0.98],
                 PlannedMoveKind::WaveOverhang => [0.88, 0.32, 0.86],
+                PlannedMoveKind::Support => [0.18, 0.82, 0.72],
+                PlannedMoveKind::SupportInterface => [0.10, 0.94, 0.88],
                 _ => [0.85, 0.50, 0.18],
             };
 
@@ -1943,11 +1984,17 @@ pub fn plan_and_emit_gcode_for_object(
                     let needs_retract = travel_dist > min_retract_travel_mm;
                     let is_infill_to_infill = matches!(
                         chain.base_kind,
-                        PlannedMoveKind::SolidInfill | PlannedMoveKind::SparseInfill
+                        PlannedMoveKind::SolidInfill
+                            | PlannedMoveKind::SparseInfill
+                            | PlannedMoveKind::Support
+                            | PlannedMoveKind::SupportInterface
                     ) && layer_segments.last().is_some_and(|s| {
                         matches!(
                             s.kind,
-                            PlannedMoveKind::SolidInfill | PlannedMoveKind::SparseInfill
+                            PlannedMoveKind::SolidInfill
+                                | PlannedMoveKind::SparseInfill
+                                | PlannedMoveKind::Support
+                                | PlannedMoveKind::SupportInterface
                         )
                     });
                     let use_z_hop =
@@ -2126,6 +2173,12 @@ pub fn plan_and_emit_gcode_for_object(
                     }
                     PlannedMoveKind::WaveOverhang => {
                         (gcfg.wave_overhang_speed_mms, gcfg.outer_wall_accel_mms2)
+                    }
+                    PlannedMoveKind::Support => {
+                        (gcfg.support_speed_mms, gcfg.infill_accel_mms2)
+                    }
+                    PlannedMoveKind::SupportInterface => {
+                        (gcfg.support_interface_speed_mms, gcfg.inner_wall_accel_mms2)
                     }
                     PlannedMoveKind::Wipe | PlannedMoveKind::Travel => {
                         (gcfg.travel_speed_mms * 0.6, gcfg.travel_accel_mms2)
@@ -2707,6 +2760,9 @@ pub fn plan_and_emit_gcode_for_object(
 
             // Deadband-compacted `SET_VELOCITY_LIMIT ACCEL=...`
             let kind_changed = last_emitted_kind != Some(seg.kind);
+            if kind_changed && seg.kind.is_extruding() {
+                gcode.push_str(&format!("; TYPE:{}\n", seg.kind.label()));
+            }
             if kind_changed
                 || emitted_accel <= 0.0
                 || ((seg.accel_mms2 - emitted_accel).abs() / emitted_accel.max(1.0)) >= 0.15
@@ -3027,6 +3083,8 @@ mod tests {
             sparse_infill_count: 1,
             bridge_count: 0,
             wave_overhang_count: 0,
+            support_count: 0,
+            support_interface_count: 0,
         };
 
         let cfg = SlicerConfig::default();
@@ -3170,6 +3228,8 @@ mod tests {
             sparse_infill_count: 0,
             bridge_count: 0,
             wave_overhang_count: 0,
+            support_count: 0,
+            support_interface_count: 0,
             layers: vec![
                 make_square_layer(0, 0.20, 0.20),
                 make_square_layer(1, 0.28, 0.08), // thin upper layer (0.08 mm)
@@ -3282,6 +3342,8 @@ mod tests {
             sparse_infill_count: 0,
             bridge_count: 1,
             wave_overhang_count: 2,
+            support_count: 0,
+            support_interface_count: 0,
             layers: vec![
                 LayerToolpaths {
                     layer_index: 0,

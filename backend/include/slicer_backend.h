@@ -25,6 +25,7 @@ struct SpatialOrientationHint;
 struct OverhangBiasSpec;
 struct FieldComputeProgress;
 struct LineWidthSpec;
+struct SupportSpec;
 struct ShellPathSpec;
 struct ToolpathPoint;
 struct ExtrusionPath;
@@ -84,6 +85,10 @@ public:
     /// Returns the solved 3D unit tool axis (`3 * vertexBuffer.size()` floats `[ax, ay, az, ...]`)
     /// sampled at each surface vertex of `objectId` from `toolAxisGrid` (or empty if unavailable).
     std::vector<float> objectVertexToolAxes(std::uint64_t objectId) const;
+
+    /// Returns the per-vertex `"support_needed"` scalar (`vertexBuffer.size()` floats in `[0.0, 1.0]`)
+    /// sampled at each surface vertex of `objectId` from `"support_needed"` (or empty if unavailable).
+    std::vector<float> objectVertexSupportNeeded(std::uint64_t objectId) const;
 
     /// Lists all named OpenVDB scalar fields stored on `objectId`.
     std::vector<std::string> listObjectFields(std::uint64_t objectId) const;
@@ -185,6 +190,12 @@ public:
     /// Returns the current shell & toolpath generation parameters (`ShellPathSpec`).
     ShellPathSpec shellPathSpec() const noexcept;
 
+    /// Sets the support detection, order-field seeding, and support toolpath generation parameters (`SupportSpec`).
+    void setSupportSpec(const SupportSpec& spec) noexcept;
+
+    /// Returns the current support detection and support toolpath generation parameters (`SupportSpec`).
+    SupportSpec supportSpec() const noexcept;
+
     /// Generates outer walls, inner walls, solid infill (`Monotonic` or `Concentric`),
     /// and shell gap fill across all selected non-planar slicing isosurfaces of `objectId`
     /// within the outer shell ($-T_{\text{shell}} \le \phi_{\text{sdf}}(\mathbf{x}) \le 0$).
@@ -220,6 +231,7 @@ rust::Vec<RenderVertex> get_object_vertices(std::uint64_t object_id);
 rust::Vec<std::uint32_t> get_object_indices(std::uint64_t object_id);
 rust::Vec<std::uint32_t> get_object_triangle_face_ids(std::uint64_t object_id);
 rust::Vec<float> get_object_vertex_tool_axes(std::uint64_t object_id);
+rust::Vec<float> get_object_vertex_support_needed(std::uint64_t object_id);
 bool remove_cad_object(std::uint64_t object_id);
 bool export_object_step_to_path(std::uint64_t object_id, rust::Str path);
 
@@ -259,6 +271,8 @@ OverhangBiasSpec get_overhang_orientation_bias_spec();
 SelectedIsosurfacesResult select_slicing_isosurfaces(std::uint64_t object_id, float adaptivity);
 void set_shell_path_spec(ShellPathSpec spec);
 ShellPathSpec get_shell_path_spec();
+void set_support_spec(SupportSpec spec);
+SupportSpec get_support_spec();
 ObjectToolpathsResult generate_object_shell_toolpaths(std::uint64_t object_id, float adaptivity);
 
 } // namespace manifold

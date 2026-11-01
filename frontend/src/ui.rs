@@ -174,6 +174,8 @@ fn render_toolpath_color_legend(
                 ("Wave Overhang", [0.98, 0.26, 0.68, 1.0]),
                 ("Solid Infill", [0.22, 0.76, 0.98, 1.0]),
                 ("Sparse Infill", [0.98, 0.78, 0.18, 1.0]),
+                ("Support Base", [0.22, 0.88, 0.62, 1.0]),
+                ("Support Interface", [0.12, 0.96, 0.88, 1.0]),
                 ("Gap Fill", [0.98, 0.32, 0.88, 1.0]),
                 ("Scarf Seam", [0.76, 0.44, 0.98, 1.0]),
                 ("Wipe", [0.68, 0.76, 0.86, 1.0]),
@@ -1345,6 +1347,28 @@ pub fn ui_workspace_system(
                                         vis_state.surface_color_mean_deg,
                                     ));
                                 }
+                                ObjectSurfaceColorMode::SupportNeeded => {
+                                    draw_continuous_gradient_legend(
+                                        ui,
+                                        "Unreachable Order Field / Support Needed (0%=Supported / 100%=Needs Support)",
+                                        0.0,
+                                        100.0,
+                                        "%",
+                                        0,
+                                        high_contrast_parameter_ramp,
+                                    );
+                                    let source_label = if vis_state.surface_color_uses_solved_tool {
+                                        "Solved Constrained Order Field ('support_needed')"
+                                    } else {
+                                        "Not Computed Yet (Click 'Compute Fields' above)"
+                                    };
+                                    ui.small(format!(
+                                        "Support Needed Range: [{:.0}%, {:.0}%] (Mean {:.1}%) | Source: {source_label}",
+                                        vis_state.surface_color_min_deg,
+                                        vis_state.surface_color_max_deg,
+                                        vis_state.surface_color_mean_deg,
+                                    ));
+                                }
                             }
 
                             ui.separator();
@@ -2084,6 +2108,138 @@ pub fn ui_workspace_system(
                             });
                             ui.separator();
 
+                            // Support Generation for Unreachable Order-Field Regions
+                            let mut support_field_cfg_changed = false;
+                            ui.horizontal(|ui| {
+                                ui.small(
+                                    egui::RichText::new(
+                                        "Unreachable Regions & Support Generation:",
+                                    )
+                                    .strong(),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                tp_cfg_changed |= ui
+                                    .checkbox(
+                                        &mut config.slicing.enable_support_generation,
+                                        "Enable Support Generation",
+                                    )
+                                    .changed();
+                                param_help_button(ui, "slicing.enable_support_generation");
+                                let seed_changed = ui
+                                    .checkbox(
+                                        &mut config.slicing.seed_order_field_from_supports,
+                                        "Seed Order Field (τ)",
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= seed_changed;
+                                support_field_cfg_changed |= seed_changed;
+                                param_help_button(ui, "slicing.seed_order_field_from_supports");
+                            });
+                            ui.horizontal(|ui| {
+                                let only_unreach_changed = ui
+                                    .checkbox(
+                                        &mut config.slicing.support_only_unreachable_and_bridges,
+                                        "Only Unreachable & Bridges >",
+                                    )
+                                    .on_hover_text(
+                                        "When enabled, only generate support for causally unreachable regions (floating islands / downward local minima) and two-pier bridges exceeding Max Bridge Length.",
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= only_unreach_changed;
+                                support_field_cfg_changed |= only_unreach_changed;
+                                let bridge_len_changed = ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut config.slicing.max_bridge_length_mm,
+                                        )
+                                        .speed(0.5)
+                                        .range(0.0..=200.0)
+                                        .suffix(" mm"),
+                                    )
+                                    .changed();
+                                tp_cfg_changed |= bridge_len_changed;
+                                support_field_cfg_changed |= bridge_len_changed;
+                                param_help_button(
+                                    ui,
+                                    "slicing.support_only_unreachable_and_bridges",
+                                );
+                            });
+                            if support_field_cfg_changed && has_eikonal && !is_computing {
+                                config.slicing.sanitize();
+                                spawn_field_compute_task(
+                                    &mut vis_state,
+                                    &mut plate,
+                                    &config,
+                                    sel_id,
+                                    &obj_name,
+                                    obj_rotation,
+                                );
+                            }
+                            if config.slicing.enable_support_generation {
+                                ui.horizontal(|ui| {
+                                    tp_cfg_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(
+                                                &mut config.slicing.support_z_gap_mm,
+                                            )
+                                            .speed(0.01)
+                                            .range(0.0..=2.0)
+                                            .prefix("Z Gap: ")
+                                            .suffix(" mm"),
+                                        )
+                                        .changed();
+                                    tp_cfg_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(
+                                                &mut config.slicing.support_xy_gap_mm,
+                                            )
+                                            .speed(0.02)
+                                            .range(0.05..=5.0)
+                                            .prefix("XY Gap: ")
+                                            .suffix(" mm"),
+                                        )
+                                        .changed();
+                                    param_help_button(ui, "slicing.support_gaps_mm");
+                                });
+                                ui.horizontal(|ui| {
+                                    tp_cfg_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(
+                                                &mut config.slicing.support_interface_layers,
+                                            )
+                                            .speed(0.1)
+                                            .range(0..=10)
+                                            .prefix("Interface Layers: "),
+                                        )
+                                        .changed();
+                                    tp_cfg_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(
+                                                &mut config.slicing.support_base_spacing_mm,
+                                            )
+                                            .speed(0.05)
+                                            .range(0.6..=10.0)
+                                            .prefix("Base Spacing: ")
+                                            .suffix(" mm"),
+                                        )
+                                        .changed();
+                                    tp_cfg_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(
+                                                &mut config.slicing.support_interface_spacing_mm,
+                                            )
+                                            .speed(0.02)
+                                            .range(0.3..=4.0)
+                                            .prefix("Intf: ")
+                                            .suffix(" mm"),
+                                        )
+                                        .changed();
+                                    param_help_button(ui, "slicing.support_density");
+                                });
+                            }
+                            ui.separator();
+
                             // Line Widths: Outer Wall, Inner Wall, Solid Infill, Sparse Infill (Target, Min, Max)
                             ui.horizontal(|ui| {
                                 ui.small(
@@ -2333,6 +2489,15 @@ pub fn ui_workspace_system(
                                     }
                                     if ui
                                         .checkbox(
+                                            &mut vis_state.show_supports,
+                                            "Supports",
+                                        )
+                                        .changed()
+                                    {
+                                        vis_state.dirty_toolpaths_mesh = true;
+                                    }
+                                    if ui
+                                        .checkbox(
                                             &mut vis_state.show_scarf_and_wipes,
                                             "Scarf & Wipes",
                                         )
@@ -2377,14 +2542,16 @@ pub fn ui_workspace_system(
 
                             if let Some(ref tp_res) = vis_state.cached_toolpaths {
                                 ui.small(format!(
-                                    "Paths: {} total ({} outer, {} inner, {} bridge, {} wave, {} solid/gap, {} sparse)",
+                                    "Paths: {} total ({} outer, {} inner, {} bridge, {} wave, {} solid/gap, {} sparse, {} support, {} sup-intf)",
                                     tp_res.total_path_count,
                                     tp_res.outer_wall_count,
                                     tp_res.inner_wall_count,
                                     tp_res.bridge_count,
                                     tp_res.wave_overhang_count,
                                     tp_res.solid_infill_count,
-                                    tp_res.sparse_infill_count
+                                    tp_res.sparse_infill_count,
+                                    tp_res.support_count,
+                                    tp_res.support_interface_count
                                 ));
                             }
 
@@ -3935,6 +4102,18 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         orthogonal_supported_angle_deg: config.eikonal.orthogonal_supported_angle_deg,
         orthogonal_overhang_angle_deg: config.eikonal.orthogonal_overhang_angle_deg,
         transition_width_deg: config.eikonal.overhang_bias_transition_deg,
+    });
+    ffi::set_support_spec(ffi::SupportSpec {
+        enabled: config.slicing.enable_support_generation,
+        seed_order_field: config.slicing.seed_order_field_from_supports,
+        only_unreachable_and_long_bridges: config.slicing.support_only_unreachable_and_bridges,
+        max_bridge_length_mm: config.slicing.max_bridge_length_mm,
+        z_gap_mm: config.slicing.support_z_gap_mm,
+        xy_gap_mm: config.slicing.support_xy_gap_mm,
+        interface_layers: config.slicing.support_interface_layers,
+        base_spacing_mm: config.slicing.support_base_spacing_mm,
+        interface_spacing_mm: config.slicing.support_interface_spacing_mm,
+        line_width_mm: config.slicing.support_line_width_mm,
     });
 }
 
