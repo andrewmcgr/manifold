@@ -1311,20 +1311,36 @@ pub fn ui_workspace_system(
                                     extents.x, extents.y, extents.z
                                 ));
 
+                                let gcode_offset_xy = config.scene_to_gcode_offset().xy();
+                                let mut bed_x = tf.translation.x + gcode_offset_xy.x;
+                                let mut bed_y = tf.translation.y + gcode_offset_xy.y;
                                 let mut changed = false;
                                 ui.horizontal(|ui| {
                                     ui.label("Bed X (mm):");
-                                    changed |= ui
-                                        .add(
-                                            egui::DragValue::new(&mut tf.translation.x).speed(0.5),
-                                        )
-                                        .changed();
+                                    if ui
+                                        .add(egui::DragValue::new(&mut bed_x).speed(0.5))
+                                        .changed()
+                                    {
+                                        tf.translation.x = bed_x - gcode_offset_xy.x;
+                                        changed = true;
+                                    }
                                     ui.label("Y (mm):");
-                                    changed |= ui
-                                        .add(
-                                            egui::DragValue::new(&mut tf.translation.y).speed(0.5),
-                                        )
-                                        .changed();
+                                    if ui
+                                        .add(egui::DragValue::new(&mut bed_y).speed(0.5))
+                                        .changed()
+                                    {
+                                        tf.translation.y = bed_y - gcode_offset_xy.y;
+                                        changed = true;
+                                    }
+                                    if ui
+                                        .small_button("Center")
+                                        .on_hover_text("Move object to the center of the build plate")
+                                        .clicked()
+                                    {
+                                        tf.translation.x = 0.0;
+                                        tf.translation.y = 0.0;
+                                        changed = true;
+                                    }
                                 });
 
                                 ui.horizontal(|ui| {
@@ -1394,6 +1410,7 @@ pub fn ui_workspace_system(
 
                                 if changed {
                                     snap_object_to_bed(&plate.objects[obj_idx], &mut tf);
+                                    vis_state.dirty_planned_gcode = true;
                                 }
                             }
 

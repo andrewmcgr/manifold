@@ -1118,6 +1118,28 @@ impl SlicerConfig {
         self.machine.query_gravity_bed(position_bed)
     }
 
+    /// Returns the 3D viewport scene position of the printer's G-code `(0, 0, 0)` origin.
+    ///
+    /// In Manifold2's scene coordinate system, `Vec3::ZERO` is always the center of the build plate
+    /// (the default spawn location for objects and the origin for spiral auto-arrangement).
+    /// - For rectangular beds with `gcode_origin_at_bed_center == false`, the printer's G-code
+    ///   origin `(0, 0, 0)` is at the front-left corner `(-width_x / 2, -depth_y / 2, 0)`.
+    /// - For circular beds or when `gcode_origin_at_bed_center == true`, the printer's G-code
+    ///   origin `(0, 0, 0)` is at the bed center `(0, 0, 0)`.
+    pub fn gcode_origin_scene_pos(&self) -> Vec3 {
+        if self.gcode.gcode_origin_at_bed_center || self.bed.shape == BedShape::Circular {
+            Vec3::ZERO
+        } else {
+            Vec3::new(-0.5 * self.bed.width_x, -0.5 * self.bed.depth_y, 0.0)
+        }
+    }
+
+    /// Returns the translation offset added to scene coordinates (where `(0, 0)` is bed center)
+    /// to obtain printer G-code coordinates (where `(0, 0)` is at [`Self::gcode_origin_scene_pos`]).
+    pub fn scene_to_gcode_offset(&self) -> Vec3 {
+        -self.gcode_origin_scene_pos()
+    }
+
     pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
@@ -2201,5 +2223,32 @@ mod tests {
         cfg.slicing.layer_height.target_mm = 0.30;
         cfg.sync_auto_voxel_size();
         assert!((cfg.eikonal.voxel_size_mm - 0.38).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn test_gcode_origin_scene_pos_and_offset() {
+        let mut cfg = SlicerConfig::default();
+        // Default: 256x256 Rectangular bed with G-code origin at front-left corner
+        assert_eq!(cfg.bed.shape, BedShape::Rectangular);
+        assert!(!cfg.gcode.gcode_origin_at_bed_center);
+        assert_eq!(
+            cfg.gcode_origin_scene_pos(),
+            Vec3::new(-128.0, -128.0, 0.0)
+        );
+        assert_eq!(
+            cfg.scene_to_gcode_offset(),
+            Vec3::new(128.0, 128.0, 0.0)
+        );
+
+        // Rectangular bed with G-code origin at bed center
+        cfg.gcode.gcode_origin_at_bed_center = true;
+        assert_eq!(cfg.gcode_origin_scene_pos(), Vec3::ZERO);
+        assert_eq!(cfg.scene_to_gcode_offset(), Vec3::ZERO);
+
+        // Circular bed always has G-code origin at bed center
+        cfg.gcode.gcode_origin_at_bed_center = false;
+        cfg.bed.shape = BedShape::Circular;
+        assert_eq!(cfg.gcode_origin_scene_pos(), Vec3::ZERO);
+        assert_eq!(cfg.scene_to_gcode_offset(), Vec3::ZERO);
     }
 }

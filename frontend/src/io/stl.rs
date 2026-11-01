@@ -46,6 +46,9 @@ pub fn load_stl_from_reader<R: Read + Seek>(
     }
 
     let part_info = ffi::register_triangle_mesh(name, &positions, &indices);
-    build_loaded_object_from_part(part_info, source_label)
-        .ok_or_else(|| format!("Backend failed to register STL mesh '{name}'"))
+    let mut obj = build_loaded_object_from_part(part_info, source_label)
+        .ok_or_else(|| format!("Backend failed to register STL mesh '{name}'"))?;
+    // Place newly imported standalone STL meshes at the bed center `(0, 0, 0)` by default
+    obj.initial_translation = bevy::math::Vec3::ZERO;
+    Ok(obj)
 }

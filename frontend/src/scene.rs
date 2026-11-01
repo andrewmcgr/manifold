@@ -1115,10 +1115,41 @@ pub fn draw_viewport_gizmos_system(
         }
     }
 
-    // Coordinate origin axes on the bed corner/center
-    gizmos.line(Vec3::ZERO, Vec3::new(25.0, 0.0, 0.0), Color::srgb(0.95, 0.25, 0.25));
-    gizmos.line(Vec3::ZERO, Vec3::new(0.0, 25.0, 0.0), Color::srgb(0.25, 0.90, 0.35));
-    gizmos.line(Vec3::ZERO, Vec3::new(0.0, 0.0, 25.0), Color::srgb(0.30, 0.55, 0.98));
+    // Coordinate origin axes placed at the printer's G-code origin:
+    // - Front-left corner `(-width_x/2, -depth_y/2, 0)` for rectangular beds with corner origin
+    // - Bed center `(0, 0, 0)` for circular beds or when `gcode_origin_at_bed_center` is enabled
+    let origin_pos = config.gcode_origin_scene_pos();
+    gizmos.line(
+        origin_pos,
+        origin_pos + Vec3::new(25.0, 0.0, 0.0),
+        Color::srgb(0.95, 0.25, 0.25),
+    );
+    gizmos.line(
+        origin_pos,
+        origin_pos + Vec3::new(0.0, 25.0, 0.0),
+        Color::srgb(0.25, 0.90, 0.35),
+    );
+    gizmos.line(
+        origin_pos,
+        origin_pos + Vec3::new(0.0, 0.0, 25.0),
+        Color::srgb(0.30, 0.55, 0.98),
+    );
+
+    // When the printer's G-code origin is at the front-left corner, draw a subtle reticle at the
+    // bed center `(0, 0, 0)` so the default object location / auto-arrangement origin remains clear.
+    if origin_pos.length_squared() > 1.0e-3 {
+        let center_mark_color = Color::srgba(0.62, 0.70, 0.82, 0.65);
+        gizmos.line(
+            Vec3::new(-7.0, 0.0, 0.0),
+            Vec3::new(7.0, 0.0, 0.0),
+            center_mark_color,
+        );
+        gizmos.line(
+            Vec3::new(0.0, -7.0, 0.0),
+            Vec3::new(0.0, 7.0, 0.0),
+            center_mark_color,
+        );
+    }
 
     // Optional 3D visualization of the queried Nozzle Local Frame, active tool XZ clearance
     // profile, and Gravity direction vector in bed coordinates

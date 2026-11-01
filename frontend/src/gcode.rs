@@ -1863,13 +1863,7 @@ pub fn plan_and_emit_gcode_for_object(
 
     // Viewport scene places (0, 0) at the center of the build plate (`[-width_x/2 .. +width_x/2]`),
     // whereas rectangular printers expect G-code (0, 0) at the front-left corner (`[0 .. width_x]`).
-    let bed_origin_offset = if gcfg.gcode_origin_at_bed_center
-        || config.bed.shape == crate::config::BedShape::Circular
-    {
-        Vec3::ZERO
-    } else {
-        Vec3::new(0.5 * config.bed.width_x, 0.5 * config.bed.depth_y, 0.0)
-    };
+    let bed_origin_offset = config.scene_to_gcode_offset();
 
     let inv_world_mat = obj_world_tf.compute_matrix().inverse();
     let to_local_pos =

@@ -102,9 +102,31 @@ pub fn load_step_file_parts(
     let mut loaded_parts = Vec::with_capacity(decomposed.len());
     for part in decomposed {
         if let Some(obj) = build_loaded_object_from_part(part, display_source) {
-            report.objects.push(obj.clone());
             loaded_parts.push(obj);
         }
+    }
+
+    // Center the STEP part (or multi-part STEP assembly as a group) at the bed center `(0, 0)`
+    // in scene coordinates while preserving relative XY offsets between sibling parts.
+    if !loaded_parts.is_empty() {
+        let mut min_xy = Vec2::splat(f32::INFINITY);
+        let mut max_xy = Vec2::splat(f32::NEG_INFINITY);
+        for obj in &loaded_parts {
+            let t_xy = obj.initial_translation.xy();
+            min_xy = min_xy.min(t_xy + obj.local_min.xy());
+            max_xy = max_xy.max(t_xy + obj.local_max.xy());
+        }
+        if min_xy.x.is_finite() && max_xy.x.is_finite() {
+            let assembly_center_xy = 0.5 * (min_xy + max_xy);
+            for obj in &mut loaded_parts {
+                obj.initial_translation.x -= assembly_center_xy.x;
+                obj.initial_translation.y -= assembly_center_xy.y;
+            }
+        }
+    }
+
+    for obj in &loaded_parts {
+        report.objects.push(obj.clone());
     }
     loaded_parts
 }
