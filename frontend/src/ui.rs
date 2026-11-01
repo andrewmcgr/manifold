@@ -20,8 +20,8 @@ use crate::io::load_files_into_backend;
 use crate::presets::{LeftPanelTab, PresetCategory, PresetLibrary};
 use crate::scene::{
     clone_object_on_plate, compute_orbit_eye, remove_object_from_plate, run_auto_arrange_on_plate,
-    snap_object_to_bed, spawn_loaded_objects, BuildPlateState, CadObjectEntity, OrbitCamera,
-    ToolMode,
+    snap_object_to_bed, spawn_loaded_objects, BuildPlateInfo, BuildPlateState, CadObjectEntity,
+    OrbitCamera, ToolMode,
 };
 
 fn rgba_to_color32(rgba: [f32; 4]) -> egui::Color32 {
@@ -942,11 +942,13 @@ pub fn ui_workspace_system(
                         object_id: obj.object_id,
                         name: obj.name.clone(),
                         has_brep: obj.has_brep,
+                        plate_index: obj.plate_index,
                         transform: tf,
                         vertices: obj.vertices.clone(),
                         indices: obj.indices.clone(),
                     });
                 }
+                let plate_names_snapshot = plate.plate_names();
                 let cfg_snapshot = (*config).clone();
                 let default_3mf_filename = plate
                     .project_3mf_filename
@@ -961,8 +963,13 @@ pub fn ui_workspace_system(
                         .save_file()
                         .await?;
                     let out_path = file_handle.path().to_path_buf();
-                    let res = save_project_to_3mf(&out_path, &export_list, &cfg_snapshot)
-                        .map(|()| out_path.to_string_lossy().into_owned());
+                    let res = save_project_to_3mf(
+                        &out_path,
+                        &plate_names_snapshot,
+                        &export_list,
+                        &cfg_snapshot,
+                    )
+                    .map(|()| out_path.to_string_lossy().into_owned());
                     Some(res)
                 });
                 plate.pending_save_task = Some(save_task);
@@ -1030,6 +1037,32 @@ pub fn ui_workspace_system(
                 if ui.selectable_label(selected, mode.label()).clicked() {
                     plate.tool_mode = mode;
                 }
+            }
+
+            ui.separator();
+            ui.label(egui::RichText::new("Plate:").strong());
+            let mut switch_to_plate: Option<usize> = None;
+            for p_idx in 0..plate.plates.len() {
+                let p_count = plate.plate_object_count(p_idx);
+                let p_label = format!("{} ({p_count})", plate.plates[p_idx].name);
+                let is_active = plate.active_plate_index == p_idx;
+                if ui.selectable_label(is_active, p_label).clicked() && !is_active {
+                    switch_to_plate = Some(p_idx);
+                }
+            }
+            if ui
+                .small_button("+ Plate")
+                .on_hover_text("Add a new empty build plate")
+                .clicked()
+            {
+                plate.add_plate(&mut object_transforms);
+            }
+            if let Some(new_p_idx) = switch_to_plate {
+                plate.switch_active_plate(new_p_idx, &mut object_transforms);
+                let active_name = plate.active_plate_name().to_string();
+                let active_cnt = plate.active_plate_object_count();
+                plate.status_message =
+                    format!("Switched to {active_name} ({active_cnt} object(s)).");
             }
 
             ui.separator();
@@ -1236,11 +1269,102 @@ pub fn ui_workspace_system(
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if preset_lib.left_tab == LeftPanelTab::ProjectSetup {
                     // ================================================================
-                    // TAB 1: PROJECT SETUP (Objects, Placement, Orientation Hints)
+                    // TAB 1: PROJECT SETUP (Build Plates, Objects, Placement, Hints)
                     // ================================================================
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Build Plates ({})",
+                                        plate.plates.len()
+                                    ))
+                                    .strong(),
+                                );
+                                if ui
+                                    .small_button("+ Add Plate")
+                                    .on_hover_text("Add a new empty build plate to the project")
+                                    .clicked()
+                                {
+                                    plate.add_plate(&mut object_transforms);
+                                }
+                                if plate.plates.len() > 1
+                                    && ui
+                                        .small_button("Remove Plate")
+                                        .on_hover_text(
+                                            "Remove the currently active build plate and any objects on it",
+                                        )
+                                        .clicked()
+                                {
+                                    let active_idx = plate.active_plate_index;
+                                    plate.remove_plate(
+                                        &mut commands,
+                                        active_idx,
+                                        &mut object_transforms,
+                                    );
+                                }
+                            });
+
+                            let mut switch_to_plate: Option<usize> = None;
+                            ui.horizontal_wrapped(|ui| {
+                                for p_idx in 0..plate.plates.len() {
+                                    let p_count = plate.plate_object_count(p_idx);
+                                    let p_label =
+                                        format!("{} ({p_count})", plate.plates[p_idx].name);
+                                    let is_active = plate.active_plate_index == p_idx;
+                                    if ui.selectable_label(is_active, p_label).clicked()
+                                        && !is_active
+                                    {
+                                        switch_to_plate = Some(p_idx);
+                                    }
+                                }
+                            });
+                            if let Some(new_p_idx) = switch_to_plate {
+                                plate.switch_active_plate(new_p_idx, &mut object_transforms);
+                                let active_name = plate.active_plate_name().to_string();
+                                let active_cnt = plate.active_plate_object_count();
+                                plate.status_message = format!(
+                                    "Switched to {active_name} ({active_cnt} object(s))."
+                                );
+                            }
+
+                            let active_idx = plate.active_plate_index;
+                            if let Some(active_plate_info) = plate.plates.get_mut(active_idx) {
+                                ui.horizontal(|ui| {
+                                    ui.small("Plate Name:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut active_plate_info.name)
+                                            .desired_width(180.0),
+                                    );
+                                });
+                            }
+                        });
+
+                    ui.add_space(4.0);
+                    let active_plate_idx = plate.active_plate_index;
+                    let active_plate_name = plate.active_plate_name().to_string();
+                    let active_obj_count = plate.active_plate_object_count();
+
                     ui.horizontal(|ui| {
-                        ui.heading(format!("Objects ({})", plate.objects.len()));
-                        if !plate.objects.is_empty() && ui.small_button("Clear All").clicked() {
+                        ui.heading(format!(
+                            "Objects on {active_plate_name} ({active_obj_count})"
+                        ));
+                        if active_obj_count > 0 && ui.small_button("Clear Plate").clicked() {
+                            let plate_ids: Vec<u64> = plate
+                                .objects
+                                .iter()
+                                .filter(|o| o.plate_index == active_plate_idx)
+                                .map(|o| o.object_id)
+                                .collect();
+                            for id in plate_ids {
+                                remove_object_from_plate(&mut commands, &mut plate, id);
+                            }
+                        }
+                        if plate.plates.len() > 1
+                            && !plate.objects.is_empty()
+                            && ui.small_button("Clear All Plates").clicked()
+                        {
                             let all_ids: Vec<u64> =
                                 plate.objects.iter().map(|o| o.object_id).collect();
                             for id in all_ids {
@@ -1249,10 +1373,10 @@ pub fn ui_workspace_system(
                         }
                     });
 
-                    if plate.objects.is_empty() {
-                        ui.small(
-                            "No objects loaded. Click 'Import CAD / Mesh / 3MF...' in the top toolbar.",
-                        );
+                    if active_obj_count == 0 {
+                        ui.small(format!(
+                            "No objects on {active_plate_name}. Click 'Import CAD / Mesh / 3MF...' in the top toolbar or switch plates above."
+                        ));
                     } else {
                         let mut remove_id: Option<u64> = None;
                         let mut clone_id: Option<u64> = None;
@@ -1260,6 +1384,9 @@ pub fn ui_workspace_system(
                         let current_selected_id = plate.selected_object_id;
 
                         for obj in &mut plate.objects {
+                            if obj.plate_index != active_plate_idx {
+                                continue;
+                            }
                             let is_selected = current_selected_id == Some(obj.object_id);
                             ui.horizontal(|ui| {
                                 if ui.checkbox(&mut obj.visible, "").changed() {
@@ -1286,7 +1413,7 @@ pub fn ui_workspace_system(
 
                                 if ui
                                     .small_button("Clone")
-                                    .on_hover_text("Add a duplicate of this object onto the build plate")
+                                    .on_hover_text("Add a duplicate of this object onto this build plate")
                                     .clicked()
                                 {
                                     clone_id = Some(obj.object_id);
@@ -1328,9 +1455,61 @@ pub fn ui_workspace_system(
                             ui.separator();
                             let obj_name = plate.objects[obj_idx].name.clone();
                             let obj_entity = plate.objects[obj_idx].entity;
+                            let obj_plate_idx = plate.objects[obj_idx].plate_index;
                             let hull_face_count = plate.objects[obj_idx].hull.faces.len();
 
                             ui.heading(format!("Selected: {obj_name}"));
+
+                            // Move object between build plates
+                            let mut move_to_plate: Option<usize> = None;
+                            let mut move_to_new_plate = false;
+                            ui.horizontal(|ui| {
+                                ui.label("Assigned Plate:");
+                                let cur_p_name = plate
+                                    .plates
+                                    .get(obj_plate_idx)
+                                    .map(|p| p.name.clone())
+                                    .unwrap_or_else(|| format!("Plate {}", obj_plate_idx + 1));
+                                egui::ComboBox::from_id_source("selected_object_plate_combo")
+                                    .selected_text(cur_p_name)
+                                    .width(140.0)
+                                    .show_ui(ui, |ui| {
+                                        for (p_idx, p_info) in plate.plates.iter().enumerate() {
+                                            let is_cur = p_idx == obj_plate_idx;
+                                            if ui
+                                                .selectable_label(is_cur, &p_info.name)
+                                                .clicked()
+                                                && !is_cur
+                                            {
+                                                move_to_plate = Some(p_idx);
+                                            }
+                                        }
+                                    });
+                                if ui
+                                    .small_button("+ Move to New Plate")
+                                    .on_hover_text("Create a new build plate and move this object onto it")
+                                    .clicked()
+                                {
+                                    move_to_new_plate = true;
+                                }
+                            });
+                            if move_to_new_plate {
+                                let new_p_idx = plate.plates.len();
+                                let new_p_name = format!("Plate {}", new_p_idx + 1);
+                                plate.plates.push(BuildPlateInfo {
+                                    name: new_p_name.clone(),
+                                });
+                                move_to_plate = Some(new_p_idx);
+                            }
+                            if let Some(target_p_idx) = move_to_plate {
+                                plate.objects[obj_idx].plate_index = target_p_idx;
+                                plate.active_plate_index = target_p_idx;
+                                plate.selected_object_id = Some(sel_id);
+                                plate.sync_plate_visibility(&mut object_transforms);
+                                let target_name = plate.active_plate_name().to_string();
+                                plate.status_message =
+                                    format!("Moved '{obj_name}' to {target_name}.");
+                            }
 
                             if plate.clone_copies_count == 0 {
                                 plate.clone_copies_count = 1;
@@ -4690,6 +4869,7 @@ pub fn poll_io_tasks_system(
     mut vis_state: ResMut<FieldVisualizationState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut object_transforms: Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
     mut camera_query: Query<(&mut OrbitCamera, &mut Transform), Without<CadObjectEntity>>,
 ) {
     // 1. Poll pending multi-file import task
@@ -4697,7 +4877,7 @@ pub fn poll_io_tasks_system(
         if let Some(result) = block_on(future::poll_once(task)) {
             plate.pending_load_task = None;
 
-            let Some(report) = result else {
+            let Some(mut report) = result else {
                 plate.status_message = "File import cancelled.".to_string();
                 return;
             };
@@ -4719,6 +4899,31 @@ pub fn poll_io_tasks_system(
 
             let loaded_count = report.objects.len();
             if loaded_count > 0 {
+                if !report.plates.is_empty() {
+                    if plate.objects.is_empty() {
+                        plate.plates = report
+                            .plates
+                            .into_iter()
+                            .map(|p| BuildPlateInfo { name: p.name })
+                            .collect();
+                        plate.active_plate_index = 0;
+                    } else {
+                        for (idx, p) in report.plates.into_iter().enumerate() {
+                            if idx < plate.plates.len() {
+                                plate.plates[idx].name = p.name;
+                            } else {
+                                plate.plates.push(BuildPlateInfo { name: p.name });
+                            }
+                        }
+                    }
+                } else {
+                    // Single-plate / CAD / STL import: place newly imported objects onto the currently active plate
+                    let active_idx = plate.active_plate_index;
+                    for obj in &mut report.objects {
+                        obj.plate_index = active_idx;
+                    }
+                }
+
                 spawn_loaded_objects(
                     &mut commands,
                     render_device.as_deref(),
@@ -4727,11 +4932,21 @@ pub fn poll_io_tasks_system(
                     &mut plate,
                     report.objects,
                 );
+                plate.sync_plate_visibility(&mut object_transforms);
                 frame_camera_to_plate(&plate, &config, &mut camera_query);
-                plate.status_message = format!(
-                    "Loaded {loaded_count} object(s); {} total on build plate.",
-                    plate.objects.len()
-                );
+                if plate.plates.len() > 1 {
+                    plate.status_message = format!(
+                        "Loaded {loaded_count} object(s) across {} build plates (viewing {}).",
+                        plate.plates.len(),
+                        plate.active_plate_name()
+                    );
+                } else {
+                    plate.status_message = format!(
+                        "Loaded {loaded_count} object(s); {} total on {}.",
+                        plate.active_plate_object_count(),
+                        plate.active_plate_name()
+                    );
+                }
             } else if !plate.import_errors.is_empty() {
                 plate.status_message = plate.import_errors[0].clone();
             } else {

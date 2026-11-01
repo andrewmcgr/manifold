@@ -75,12 +75,19 @@ impl Default for OrbitCamera {
     }
 }
 
+/// Metadata for a single build plate in the workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildPlateInfo {
+    pub name: String,
+}
+
 /// Complete state of a single loaded object on the build plate.
 pub struct SceneObject {
     pub object_id: u64,
     pub name: String,
     pub source_file: String,
     pub has_brep: bool,
+    pub plate_index: usize,
     pub entity: Entity,
     pub mesh_handle: Handle<Mesh>,
     pub material_handle: Handle<StandardMaterial>,
@@ -202,10 +209,12 @@ pub fn snap_object_to_bed(obj: &SceneObject, transform: &mut Transform) {
     transform.translation.z -= world_min.z;
 }
 
-/// Central resource managing all objects on the build plate, active editing tool,
+/// Central resource managing all build plates, objects on each plate, active editing tool,
 /// selection, hover state, and background I/O tasks.
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct BuildPlateState {
+    pub plates: Vec<BuildPlateInfo>,
+    pub active_plate_index: usize,
     pub objects: Vec<SceneObject>,
     pub selected_object_id: Option<u64>,
     pub tool_mode: ToolMode,
@@ -230,10 +239,173 @@ pub struct BuildPlateState {
     pub pending_save_task: Option<Task<Option<Result<String, String>>>>,
 }
 
+impl Default for BuildPlateState {
+    fn default() -> Self {
+        Self {
+            plates: vec![BuildPlateInfo {
+                name: "Plate 1".to_string(),
+            }],
+            active_plate_index: 0,
+            objects: Vec::new(),
+            selected_object_id: None,
+            tool_mode: ToolMode::default(),
+            hovered_hull_face: None,
+            hovered_surface_patch: None,
+            hovered_point_preview: None,
+            selected_surface_hint_patch: None,
+            selected_point_hint_id: None,
+            ui_hovered_surface_hint_patch: None,
+            ui_hovered_point_hint_id: None,
+            is_dragging_point_hint_dir: false,
+            is_dragging_object: false,
+            drag_offset_xy: Vec2::ZERO,
+            clone_copies_count: 1,
+            project_3mf_filename: None,
+            status_message: String::new(),
+            import_notices: Vec::new(),
+            import_errors: Vec::new(),
+            render_pipeline: None,
+            pending_load_task: None,
+            pending_save_task: None,
+        }
+    }
+}
+
 impl BuildPlateState {
     pub fn selected_object(&self) -> Option<&SceneObject> {
         let id = self.selected_object_id?;
         self.objects.iter().find(|o| o.object_id == id)
+    }
+
+    pub fn active_plate_name(&self) -> &str {
+        self.plates
+            .get(self.active_plate_index)
+            .map(|p| p.name.as_str())
+            .unwrap_or("Plate 1")
+    }
+
+    pub fn plate_object_count(&self, plate_idx: usize) -> usize {
+        self.objects
+            .iter()
+            .filter(|o| o.plate_index == plate_idx)
+            .count()
+    }
+
+    pub fn active_plate_object_count(&self) -> usize {
+        self.plate_object_count(self.active_plate_index)
+    }
+
+    pub fn plate_names(&self) -> Vec<String> {
+        self.plates.iter().map(|p| p.name.clone()).collect()
+    }
+
+    /// Synchronizes Bevy entity visibility so only objects on `active_plate_index` (with `obj.visible == true`)
+    /// are visible in the 3D viewport, and ensures `selected_object_id` belongs to the active plate.
+    pub fn sync_plate_visibility(
+        &mut self,
+        transform_query: &mut Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
+    ) {
+        if self.plates.is_empty() {
+            self.plates.push(BuildPlateInfo {
+                name: "Plate 1".to_string(),
+            });
+        }
+        if self.active_plate_index >= self.plates.len() {
+            self.active_plate_index = self.plates.len() - 1;
+        }
+
+        let active_idx = self.active_plate_index;
+        for obj in &self.objects {
+            if let Ok((_, mut vis)) = transform_query.get_mut(obj.entity) {
+                *vis = if obj.visible && obj.plate_index == active_idx {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+            }
+        }
+
+        let selected_on_active = self.selected_object_id.map_or(false, |sel_id| {
+            self.objects
+                .iter()
+                .any(|o| o.object_id == sel_id && o.plate_index == active_idx)
+        });
+        if !selected_on_active {
+            self.selected_object_id = self
+                .objects
+                .iter()
+                .find(|o| o.plate_index == active_idx)
+                .map(|o| o.object_id);
+        }
+
+        self.hovered_hull_face = None;
+        self.hovered_surface_patch = None;
+        self.hovered_point_preview = None;
+    }
+
+    /// Switches to `new_plate_index` and updates entity visibility and object selection.
+    pub fn switch_active_plate(
+        &mut self,
+        new_plate_index: usize,
+        transform_query: &mut Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
+    ) {
+        if new_plate_index < self.plates.len() {
+            self.active_plate_index = new_plate_index;
+            self.sync_plate_visibility(transform_query);
+        }
+    }
+
+    /// Appends a new empty build plate and switches to it.
+    pub fn add_plate(
+        &mut self,
+        transform_query: &mut Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
+    ) -> usize {
+        let next_num = self.plates.len() + 1;
+        let name = format!("Plate {next_num}");
+        self.plates.push(BuildPlateInfo { name: name.clone() });
+        let new_idx = self.plates.len() - 1;
+        self.active_plate_index = new_idx;
+        self.sync_plate_visibility(transform_query);
+        self.status_message = format!("Added {name}.");
+        new_idx
+    }
+
+    /// Removes the build plate at `plate_idx` (and any objects on it) when `self.plates.len() > 1`.
+    pub fn remove_plate(
+        &mut self,
+        commands: &mut Commands,
+        plate_idx: usize,
+        transform_query: &mut Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
+    ) {
+        if self.plates.len() <= 1 || plate_idx >= self.plates.len() {
+            return;
+        }
+        let removed_plate_name = self.plates.remove(plate_idx).name;
+        let mut removed_objs = 0usize;
+        let mut i = 0;
+        while i < self.objects.len() {
+            if self.objects[i].plate_index == plate_idx {
+                let removed = self.objects.remove(i);
+                commands.entity(removed.entity).despawn_recursive();
+                let _ = ffi::remove_cad_object(removed.object_id);
+                removed_objs += 1;
+            } else {
+                if self.objects[i].plate_index > plate_idx {
+                    self.objects[i].plate_index -= 1;
+                }
+                i += 1;
+            }
+        }
+        if self.active_plate_index >= self.plates.len() {
+            self.active_plate_index = self.plates.len() - 1;
+        } else if self.active_plate_index > plate_idx {
+            self.active_plate_index -= 1;
+        }
+        self.sync_plate_visibility(transform_query);
+        self.status_message = format!(
+            "Removed '{}' ({} object(s) removed).",
+            removed_plate_name, removed_objs
+        );
     }
 
     pub fn total_vertices(&self) -> usize {
@@ -256,7 +428,16 @@ pub fn spawn_loaded_objects(
     plate: &mut BuildPlateState,
     loaded_objects: Vec<LoadedObjectData>,
 ) {
+    let mut selected_on_active: Option<u64> = None;
+
     for data in loaded_objects {
+        while plate.plates.len() <= data.plate_index {
+            let next_num = plate.plates.len() + 1;
+            plate.plates.push(BuildPlateInfo {
+                name: format!("Plate {next_num}"),
+            });
+        }
+
         let mut vertex_buffer = None;
         let mut index_buffer = None;
 
@@ -316,12 +497,20 @@ pub fn spawn_loaded_objects(
             scale: Vec3::ONE,
         };
 
+        let is_on_active_plate = data.plate_index == plate.active_plate_index;
+        let initial_visibility = if is_on_active_plate {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+
         let entity = commands
             .spawn((
                 PbrBundle {
                     mesh: mesh_handle.clone(),
                     material: mat_handle.clone(),
                     transform: initial_transform,
+                    visibility: initial_visibility,
                     ..default()
                 },
                 CadObjectEntity {
@@ -335,6 +524,7 @@ pub fn spawn_loaded_objects(
             name: data.name,
             source_file: data.source_file,
             has_brep: data.has_brep,
+            plate_index: data.plate_index,
             entity,
             mesh_handle,
             material_handle: mat_handle,
@@ -353,8 +543,20 @@ pub fn spawn_loaded_objects(
         snap_object_to_bed(&scene_obj, &mut initial_transform);
         commands.entity(entity).insert(initial_transform);
 
-        plate.selected_object_id = Some(scene_obj.object_id);
+        if is_on_active_plate {
+            selected_on_active = Some(scene_obj.object_id);
+        }
         plate.objects.push(scene_obj);
+    }
+
+    if let Some(sel_id) = selected_on_active {
+        plate.selected_object_id = Some(sel_id);
+    } else if plate.selected_object_id.is_none() {
+        plate.selected_object_id = plate
+            .objects
+            .iter()
+            .find(|o| o.plate_index == plate.active_plate_index)
+            .map(|o| o.object_id);
     }
 }
 
@@ -372,7 +574,13 @@ pub fn remove_object_from_plate(
         let _ = ffi::remove_cad_object(object_id);
 
         if plate.selected_object_id == Some(object_id) {
-            plate.selected_object_id = plate.objects.last().map(|o| o.object_id);
+            let active_idx = plate.active_plate_index;
+            plate.selected_object_id = plate
+                .objects
+                .iter()
+                .rev()
+                .find(|o| o.plate_index == active_idx)
+                .map(|o| o.object_id);
         }
         plate.hovered_hull_face = None;
         plate.hovered_surface_patch = None;
@@ -417,6 +625,7 @@ pub fn clone_object_on_plate(
         return;
     };
 
+    let target_plate_index = plate.objects[src_idx].plate_index;
     let src_tf = transform_query
         .get(plate.objects[src_idx].entity)
         .map(|(t, _)| *t)
@@ -432,6 +641,9 @@ pub fn clone_object_on_plate(
 
     let mut placed_boxes: Vec<(Vec2, Vec2)> = Vec::with_capacity(plate.objects.len() + copies);
     for obj in &plate.objects {
+        if obj.plate_index != target_plate_index {
+            continue;
+        }
         let tf = transform_query
             .get(obj.entity)
             .map(|(t, _)| *t)
@@ -547,6 +759,7 @@ pub fn clone_object_on_plate(
             name: clone_name,
             source_file: src_source_file.clone(),
             has_brep: src_has_brep,
+            plate_index: target_plate_index,
             initial_translation: Vec3::new(target_translation_xy.x, target_translation_xy.y, 0.0),
             initial_rotation: src_tf.rotation,
             vertices: src_vertices.clone(),
@@ -570,26 +783,26 @@ pub fn clone_object_on_plate(
             new_loaded_objects,
         );
         plate.status_message = format!(
-            "Added {spawned_count} clone(s) of '{base_name}'; {} object(s) on build plate.",
-            plate.objects.len()
+            "Added {spawned_count} clone(s) of '{base_name}'; {} object(s) on {}.",
+            plate.plate_object_count(target_plate_index),
+            plate.active_plate_name()
         );
     }
 }
 
 /// Runs the descending-Z-height Archimedean spiral auto-arrangement across all
-/// objects currently on the build plate.
+/// objects currently on the active build plate.
 pub fn run_auto_arrange_on_plate(
     plate: &mut BuildPlateState,
     config: &SlicerConfig,
     transform_query: &mut Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
 ) {
-    if plate.objects.is_empty() {
-        plate.status_message = "No objects on the build plate to arrange.".to_string();
-        return;
-    }
-
+    let active_idx = plate.active_plate_index;
     let mut items = Vec::with_capacity(plate.objects.len());
     for obj in &plate.objects {
+        if obj.plate_index != active_idx {
+            continue;
+        }
         let transform = transform_query
             .get(obj.entity)
             .map(|(t, _)| *t)
@@ -606,6 +819,14 @@ pub fn run_auto_arrange_on_plate(
             center_offset_xy,
             height_z,
         });
+    }
+
+    if items.is_empty() {
+        plate.status_message = format!(
+            "No objects on {} to arrange.",
+            plate.active_plate_name()
+        );
+        return;
     }
 
     let placements = auto_arrange_spiral(&items, &config.bed, &config.arrangement);
@@ -630,13 +851,15 @@ pub fn run_auto_arrange_on_plate(
 
     if out_of_bounds_count == 0 {
         plate.status_message = format!(
-            "Auto-arranged {} object(s) in spiral order by descending Z height.",
-            placements.len()
+            "Auto-arranged {} object(s) on {} in spiral order by descending Z height.",
+            placements.len(),
+            plate.active_plate_name()
         );
     } else {
         plate.status_message = format!(
-            "Auto-arranged {} object(s); warning: {} object(s) exceed current bed dimensions.",
+            "Auto-arranged {} object(s) on {}; warning: {} object(s) exceed current bed dimensions.",
             placements.len(),
+            plate.active_plate_name(),
             out_of_bounds_count
         );
     }
@@ -774,7 +997,12 @@ pub fn viewport_interaction_system(
     plate.hovered_point_preview = None;
 
     if let (Some(ray), Some(sel_id)) = (cursor_ray, plate.selected_object_id) {
-        if let Some(obj) = plate.objects.iter().find(|o| o.object_id == sel_id) {
+        let active_idx = plate.active_plate_index;
+        if let Some(obj) = plate
+            .objects
+            .iter()
+            .find(|o| o.object_id == sel_id && o.plate_index == active_idx)
+        {
             if let Ok(obj_tf) = object_transforms.get(obj.entity) {
                 match plate.tool_mode {
                     ToolMode::PlaceOnFace => {
@@ -966,11 +1194,12 @@ pub fn viewport_interaction_system(
             _ => {}
         }
 
-        // Raycast against all visible objects to select the closest hit
+        // Raycast against all visible objects on the active plate to select the closest hit
         if let Some(ray) = cursor_ray {
+            let active_idx = plate.active_plate_index;
             let mut closest_hit: Option<(u64, f32)> = None;
             for obj in &plate.objects {
-                if !obj.visible {
+                if !obj.visible || obj.plate_index != active_idx {
                     continue;
                 }
                 if let Ok(obj_tf) = object_transforms.get(obj.entity) {
@@ -1442,7 +1671,11 @@ pub fn draw_viewport_gizmos_system(
     let Some(sel_id) = plate.selected_object_id else {
         return;
     };
-    let Some(obj) = plate.objects.iter().find(|o| o.object_id == sel_id) else {
+    let Some(obj) = plate
+        .objects
+        .iter()
+        .find(|o| o.object_id == sel_id && o.plate_index == plate.active_plate_index)
+    else {
         return;
     };
     let Ok(obj_tf) = object_transforms.get(obj.entity) else {

@@ -9,6 +9,12 @@ use crate::hull::{
     build_surface_patches, SimplifiedConvexHull, SurfacePatch, MAX_SIMPLIFIED_HULL_FACES,
 };
 
+/// Metadata for a single build plate parsed from a `.3mf` archive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedPlateInfo {
+    pub name: String,
+}
+
 /// Complete CPU-side payload for a single object loaded and processed by the C++ backend.
 #[derive(Clone, Debug)]
 pub struct LoadedObjectData {
@@ -16,6 +22,8 @@ pub struct LoadedObjectData {
     pub name: String,
     pub source_file: String,
     pub has_brep: bool,
+    /// Zero-based index of the build plate this object belongs to (`0` = Plate 1).
+    pub plate_index: usize,
     pub initial_translation: Vec3,
     pub initial_rotation: Quat,
     pub vertices: Vec<RenderVertex>,
@@ -31,6 +39,8 @@ pub struct LoadedObjectData {
 #[derive(Clone, Debug, Default)]
 pub struct LoadedBatchReport {
     pub objects: Vec<LoadedObjectData>,
+    /// Multi-plate definitions parsed from the imported `.3mf` archive (if present).
+    pub plates: Vec<LoadedPlateInfo>,
     pub restored_config: Option<SlicerConfig>,
     /// File name (e.g. `"cowling_project.3mf"`) when a loaded `.3mf` archive is a Manifold project.
     pub manifold_project_filename: Option<String>,
@@ -167,6 +177,7 @@ pub fn build_loaded_object_from_part(
         name: part.name,
         source_file: source_file.to_string(),
         has_brep: part.has_brep,
+        plate_index: 0,
         // Place at the assembly's XY coordinates with z=0 sitting on the print bed
         initial_translation: Vec3::new(part.origin_x, part.origin_y, 0.0),
         initial_rotation: Quat::IDENTITY,

@@ -14,15 +14,20 @@ use crate::bridge::ffi::{self, RenderVertex};
 use crate::config::SlicerConfig;
 use crate::io::{
     build_loaded_object_from_part, load_step_file_parts, stl, LoadedBatchReport, LoadedObjectData,
+    LoadedPlateInfo,
 };
 
 const MANIFOLD_CONFIG_ENTRY: &str = "Metadata/manifold2_config.toml";
 const MANIFOLD_SCENE_ENTRY: &str = "Metadata/manifold2_scene.toml";
+const MODEL_SETTINGS_CONFIG_ENTRY: &str = "Metadata/model_settings.config";
+const PROJECT_SETTINGS_CONFIG_ENTRY: &str = "Metadata/project_settings.config";
 
 /// Saved metadata for objects exported by Manifold2 so that embedded STEP B-Rep
-/// shapes inside `/Metadata/` reconnect with their exact world transforms upon reload.
+/// shapes inside `/Metadata/` reconnect with their exact world transforms and plate assignments upon reload.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct SavedSceneManifest {
+    #[serde(default)]
+    plates: Vec<String>,
     objects: Vec<SavedObjectEntry>,
 }
 
@@ -32,6 +37,8 @@ struct SavedObjectEntry {
     embedded_step_entry: Option<String>,
     translation: [f32; 3],
     rotation_xyzw: [f32; 4],
+    #[serde(default)]
+    plate_index: usize,
 }
 
 /// Snapshot of an active build-plate object passed to the 3MF exporter.
@@ -39,9 +46,28 @@ pub struct ExportableObject {
     pub object_id: u64,
     pub name: String,
     pub has_brep: bool,
+    pub plate_index: usize,
     pub transform: Transform,
     pub vertices: Vec<RenderVertex>,
     pub indices: Vec<u32>,
+}
+
+/// Parsed `<plate>` block from `Metadata/model_settings.config` (OrcaSlicer / Bambu Studio / PrusaSlicer).
+#[derive(Clone, Debug, Default)]
+struct ParsedConfigPlate {
+    plater_id: u32,
+    plater_name: String,
+    /// Pairs of `(object_id, instance_id)` assigned to this build plate.
+    instances: Vec<(String, u32)>,
+}
+
+/// Parsed metadata from `Metadata/model_settings.config`.
+#[derive(Clone, Debug, Default)]
+struct ParsedModelSettingsConfig {
+    /// Human-readable object names keyed by `<object id="...">`.
+    object_names: HashMap<String, String>,
+    /// Multi-plate definitions ordered by `plater_id`.
+    plates: Vec<ParsedConfigPlate>,
 }
 
 /// Raw `<mesh>` parsed from a `.model` XML inside a `.3mf` archive.
@@ -111,10 +137,13 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
     };
 
     let archive_label = path.to_string_lossy().into_owned();
+    let objects_start_idx = report.objects.len();
     let mut model_files: HashMap<String, ParsedModelFile> = HashMap::new();
     let mut embedded_step_entries: HashMap<String, Vec<u8>> = HashMap::new();
     let mut embedded_stl_entries: Vec<(String, Vec<u8>)> = Vec::new();
     let mut scene_manifest: Option<SavedSceneManifest> = None;
+    let mut model_settings: Option<ParsedModelSettingsConfig> = None;
+    let mut project_settings_bed_size: Option<(f32, f32)> = None;
     let mut is_manifold_project = false;
     let mut skipped_third_party_entries: Vec<String> = Vec::new();
 
@@ -161,6 +190,24 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                     is_manifold_project = true;
                     scene_manifest = Some(manifest);
                 }
+            }
+            continue;
+        }
+
+        if lower_name.eq_ignore_ascii_case(MODEL_SETTINGS_CONFIG_ENTRY) {
+            let mut xml_bytes = Vec::new();
+            if entry.read_to_end(&mut xml_bytes).is_ok() {
+                if let Ok(parsed_settings) = parse_model_settings_config_xml(&xml_bytes) {
+                    model_settings = Some(parsed_settings);
+                }
+            }
+            continue;
+        }
+
+        if lower_name.eq_ignore_ascii_case(PROJECT_SETTINGS_CONFIG_ENTRY) {
+            let mut text = String::new();
+            if entry.read_to_string(&mut text).is_ok() {
+                project_settings_bed_size = parse_project_settings_bed_size(&text);
             }
             continue;
         }
@@ -214,6 +261,47 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
         }
     }
 
+    // Populate multi-plate list from Manifold's `SavedSceneManifest` first, or from
+    // `Metadata/model_settings.config` (OrcaSlicer / Bambu Studio) when present.
+    let mut instance_to_plate: HashMap<(String, u32), usize> = HashMap::new();
+    let mut object_to_plate: HashMap<String, usize> = HashMap::new();
+
+    if let Some(ref manifest) = scene_manifest {
+        if !manifest.plates.is_empty() && report.plates.is_empty() {
+            report.plates = manifest
+                .plates
+                .iter()
+                .map(|name| LoadedPlateInfo { name: name.clone() })
+                .collect();
+        }
+    }
+
+    if let Some(ref ms) = model_settings {
+        for (plate_idx, plate_cfg) in ms.plates.iter().enumerate() {
+            let plate_name = if plate_cfg.plater_name.trim().is_empty() {
+                format!("Plate {}", plate_idx + 1)
+            } else {
+                plate_cfg.plater_name.trim().to_string()
+            };
+            if !is_manifold_project && report.plates.len() <= plate_idx {
+                report.plates.push(LoadedPlateInfo { name: plate_name });
+            }
+            for (obj_id, inst_id) in &plate_cfg.instances {
+                instance_to_plate.insert((obj_id.clone(), *inst_id), plate_idx);
+                object_to_plate.entry(obj_id.clone()).or_insert(plate_idx);
+            }
+        }
+        if !is_manifold_project && ms.plates.len() > 1 {
+            report.notices.push(format!(
+                "Imported {} build plates from '{}'.",
+                ms.plates.len(),
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&archive_label)
+            ));
+        }
+    }
+
     if !skipped_third_party_entries.is_empty() {
         let preview: Vec<&str> = skipped_third_party_entries
             .iter()
@@ -250,6 +338,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                     ) {
                         for obj in &mut loaded_objs {
                             obj.name = saved_obj.name.clone();
+                            obj.plate_index = saved_obj.plate_index;
                             obj.initial_translation = Vec3::from_array(saved_obj.translation);
                             obj.initial_rotation =
                                 Quat::from_array(saved_obj.rotation_xyzw).normalize();
@@ -257,6 +346,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                         if let Some(last) = report.objects.last_mut() {
                             if loaded_objs.len() == 1 {
                                 last.name = saved_obj.name.clone();
+                                last.plate_index = saved_obj.plate_index;
                                 last.initial_translation = Vec3::from_array(saved_obj.translation);
                                 last.initial_rotation =
                                     Quat::from_array(saved_obj.rotation_xyzw).normalize();
@@ -325,18 +415,65 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                 let name = obj
                     .name
                     .clone()
+                    .or_else(|| {
+                        model_settings
+                            .as_ref()
+                            .and_then(|ms| ms.object_names.get(&obj.id).cloned())
+                    })
                     .unwrap_or_else(|| format!("{file_stem}_obj_{}", obj.id));
-                instantiate_3mf_mesh(&name, mesh, Mat4::IDENTITY, &archive_label, report);
+                let plate_idx = object_to_plate.get(&obj.id).copied().unwrap_or(0);
+                instantiate_3mf_mesh(&name, mesh, Mat4::IDENTITY, plate_idx, &archive_label, report);
             }
         }
     } else {
         let mut visited = HashSet::new();
+        let mut instance_counts: HashMap<String, u32> = HashMap::new();
         for (idx, item) in root_model.build_items.iter().enumerate() {
+            // If this item was already restored from a lossless embedded STEP file via `scene_manifest`, skip its mesh fallback
+            if manifest_step_loaded {
+                if let Some(saved_obj) = scene_manifest.as_ref().and_then(|m| m.objects.get(idx)) {
+                    if saved_obj.embedded_step_entry.is_some() {
+                        continue;
+                    }
+                }
+            }
+
+            let inst_id = *instance_counts
+                .entry(item.object_id.clone())
+                .and_modify(|c| *c += 1)
+                .or_insert(0);
+
+            let plate_idx = if let Some(saved_obj) =
+                scene_manifest.as_ref().and_then(|m| m.objects.get(idx))
+            {
+                saved_obj.plate_index
+            } else {
+                instance_to_plate
+                    .get(&(item.object_id.clone(), inst_id))
+                    .copied()
+                    .or_else(|| object_to_plate.get(&item.object_id).copied())
+                    .unwrap_or(0)
+            };
+
+            let preferred_name = scene_manifest
+                .as_ref()
+                .and_then(|m| m.objects.get(idx))
+                .map(|o| o.name.as_str())
+                .or_else(|| {
+                    model_settings
+                        .as_ref()
+                        .and_then(|ms| ms.object_names.get(&item.object_id).map(String::as_str))
+                });
+
             let target_model = item
                 .model_path
                 .as_deref()
                 .map(|p| p.trim_start_matches('/').to_string())
                 .unwrap_or_else(|| root_key.clone());
+
+            let default_fallback = preferred_name
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{file_stem}_{}", idx + 1));
 
             visited.clear();
             instantiate_3mf_object_recursive(
@@ -344,11 +481,78 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
                 &target_model,
                 &item.object_id,
                 item.transform,
-                &format!("{file_stem}_{}", idx + 1),
+                plate_idx,
+                &default_fallback,
                 &archive_label,
                 &mut visited,
                 report,
             );
+        }
+    }
+
+    // 4. For third-party 3MF archives (OrcaSlicer / Bambu Studio / PrusaSlicer), convert global
+    //    multi-plate platter XY coordinates into plate-local scene coordinates centered at `(0, 0)`.
+    if !is_manifold_project && report.objects.len() > objects_start_idx {
+        let max_plate_idx = report.objects[objects_start_idx..]
+            .iter()
+            .map(|o| o.plate_index)
+            .max()
+            .unwrap_or(0);
+        let num_plates = (max_plate_idx + 1).max(report.plates.len()).max(1);
+        let has_third_party_platter =
+            model_settings.is_some() || project_settings_bed_size.is_some() || num_plates > 1;
+
+        if has_third_party_platter {
+            for p_idx in 0..num_plates {
+                let mut min_xy = Vec2::splat(f32::INFINITY);
+                let mut max_xy = Vec2::splat(f32::NEG_INFINITY);
+                let mut count_on_plate = 0usize;
+
+                for obj in &report.objects[objects_start_idx..] {
+                    if obj.plate_index == p_idx {
+                        let t_xy = obj.initial_translation.xy();
+                        min_xy = min_xy.min(t_xy + obj.local_min.xy());
+                        max_xy = max_xy.max(t_xy + obj.local_max.xy());
+                        count_on_plate += 1;
+                    }
+                }
+                if count_on_plate == 0 || !min_xy.x.is_finite() || !max_xy.x.is_finite() {
+                    continue;
+                }
+
+                let bbox_center_xy = 0.5 * (min_xy + max_xy);
+                let plate_origin_xy = if let Some((w, d)) = project_settings_bed_size {
+                    if w > 10.0 && d > 10.0 {
+                        // OrcaSlicer / Bambu Studio places plates on a 2D grid with stride `1.2 * W` along `+X`
+                        // and `1.2 * D` along `-Y`, with Plate (0, 0) centered at `(0.5 * W, 0.5 * D)`.
+                        let col = ((bbox_center_xy.x - 0.5 * w) / (1.2 * w)).round();
+                        let row = ((0.5 * d - bbox_center_xy.y) / (1.2 * d)).round();
+                        let grid_center = Vec2::new((0.5 + 1.2 * col) * w, (0.5 - 1.2 * row) * d);
+                        if (bbox_center_xy.x - grid_center.x).abs() <= 0.65 * w
+                            && (bbox_center_xy.y - grid_center.y).abs() <= 0.65 * d
+                        {
+                            grid_center
+                        } else {
+                            bbox_center_xy
+                        }
+                    } else {
+                        bbox_center_xy
+                    }
+                } else {
+                    bbox_center_xy
+                };
+
+                for obj in &mut report.objects[objects_start_idx..] {
+                    if obj.plate_index == p_idx {
+                        obj.initial_translation.x -= plate_origin_xy.x;
+                        obj.initial_translation.y -= plate_origin_xy.y;
+                    }
+                }
+            }
+
+            if num_plates > 1 {
+                report.objects[objects_start_idx..].sort_by_key(|o| o.plate_index);
+            }
         }
     }
 }
@@ -359,6 +563,7 @@ fn instantiate_3mf_object_recursive(
     model_key: &str,
     object_id: &str,
     accumulated_transform: Mat4,
+    plate_index: usize,
     fallback_name: &str,
     archive_label: &str,
     visited: &mut HashSet<(String, String)>,
@@ -395,9 +600,17 @@ fn instantiate_3mf_object_recursive(
         .unwrap_or(fallback_name);
 
     if let Some(ref mesh) = xml_obj.mesh {
-        instantiate_3mf_mesh(obj_name, mesh, accumulated_transform, archive_label, report);
+        instantiate_3mf_mesh(
+            obj_name,
+            mesh,
+            accumulated_transform,
+            plate_index,
+            archive_label,
+            report,
+        );
     }
 
+    let is_single_wrapper = xml_obj.mesh.is_none() && xml_obj.components.len() == 1;
     for (comp_idx, comp) in xml_obj.components.iter().enumerate() {
         let next_model = comp
             .model_path
@@ -405,12 +618,17 @@ fn instantiate_3mf_object_recursive(
             .map(|p| p.trim_start_matches('/').to_string())
             .unwrap_or_else(|| model_key.to_string());
         let next_transform = accumulated_transform * comp.transform;
-        let child_fallback = format!("{obj_name}_part_{}", comp_idx + 1);
+        let child_fallback = if is_single_wrapper {
+            obj_name.to_string()
+        } else {
+            format!("{obj_name}_part_{}", comp_idx + 1)
+        };
         instantiate_3mf_object_recursive(
             model_files,
             &next_model,
             &comp.object_id,
             next_transform,
+            plate_index,
             &child_fallback,
             archive_label,
             visited,
@@ -423,6 +641,7 @@ fn instantiate_3mf_mesh(
     name: &str,
     mesh: &ParsedXmlMesh,
     world_transform: Mat4,
+    plate_index: usize,
     archive_label: &str,
     report: &mut LoadedBatchReport,
 ) {
@@ -448,7 +667,8 @@ fn instantiate_3mf_mesh(
     }
 
     let part_info = ffi::register_triangle_mesh(name, &transformed_positions, &mesh.indices);
-    if let Some(obj) = build_loaded_object_from_part(part_info, archive_label) {
+    if let Some(mut obj) = build_loaded_object_from_part(part_info, archive_label) {
+        obj.plate_index = plate_index;
         report.objects.push(obj);
     }
 }
@@ -478,10 +698,11 @@ fn load_embedded_step_bytes(
     Some(loaded)
 }
 
-/// Saves the current build plate arrangement, meshes, embedded STEP B-Rep geometry
+/// Saves the current multi-plate build arrangement, meshes, embedded STEP B-Rep geometry
 /// (when available), and `SlicerConfig` into a standards-compliant `.3mf` archive.
 pub fn save_project_to_3mf(
     out_path: &Path,
+    plate_names: &[String],
     objects: &[ExportableObject],
     config: &SlicerConfig,
 ) -> Result<(), String> {
@@ -495,6 +716,7 @@ pub fn save_project_to_3mf(
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+  <Default Extension="config" ContentType="text/xml"/>
   <Default Extension="toml" ContentType="application/toml"/>
   <Default Extension="step" ContentType="application/step"/>
 </Types>"#;
@@ -560,7 +782,44 @@ pub fn save_project_to_3mf(
     zip.write_all(model_xml.as_bytes())
         .map_err(|e| e.to_string())?;
 
-    // 4. Embed `/Metadata/manifold2_config.toml`
+    // 4. Write `Metadata/model_settings.config` for multi-plate cross-slicer compatibility
+    let max_obj_plate = objects.iter().map(|o| o.plate_index).max().unwrap_or(0);
+    let total_plates = plate_names.len().max(max_obj_plate + 1).max(1);
+    let mut model_settings_xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n");
+    for (idx, obj) in objects.iter().enumerate() {
+        let xml_id = idx + 1;
+        let escaped_name = escape_xml_attr(&obj.name);
+        model_settings_xml.push_str(&format!(
+            "  <object id=\"{xml_id}\">\n    <metadata key=\"name\" value=\"{escaped_name}\"/>\n  </object>\n"
+        ));
+    }
+    for p_idx in 0..total_plates {
+        let plater_id = p_idx + 1;
+        let p_name = plate_names
+            .get(p_idx)
+            .cloned()
+            .unwrap_or_else(|| format!("Plate {plater_id}"));
+        let escaped_pname = escape_xml_attr(&p_name);
+        model_settings_xml.push_str(&format!(
+            "  <plate>\n    <metadata key=\"plater_id\" value=\"{plater_id}\"/>\n    <metadata key=\"plater_name\" value=\"{escaped_pname}\"/>\n"
+        ));
+        for (idx, obj) in objects.iter().enumerate() {
+            if obj.plate_index == p_idx {
+                let xml_id = idx + 1;
+                model_settings_xml.push_str(&format!(
+                    "    <model_instance>\n      <metadata key=\"object_id\" value=\"{xml_id}\"/>\n      <metadata key=\"instance_id\" value=\"0\"/>\n    </model_instance>\n"
+                ));
+            }
+        }
+        model_settings_xml.push_str("  </plate>\n");
+    }
+    model_settings_xml.push_str("</config>\n");
+    zip.start_file(MODEL_SETTINGS_CONFIG_ENTRY, options)
+        .map_err(|e| e.to_string())?;
+    zip.write_all(model_settings_xml.as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    // 5. Embed `/Metadata/manifold2_config.toml`
     let config_toml = config
         .to_toml_string()
         .map_err(|e| format!("Failed to serialize SlicerConfig: {e}"))?;
@@ -569,8 +828,18 @@ pub fn save_project_to_3mf(
     zip.write_all(config_toml.as_bytes())
         .map_err(|e| e.to_string())?;
 
-    // 5. Export any B-Rep STEP shapes into `/Metadata/cad_<id>.step` and write `manifold2_scene.toml`
-    let mut scene_manifest = SavedSceneManifest::default();
+    // 6. Export any B-Rep STEP shapes into `/Metadata/cad_<id>.step` and write `manifold2_scene.toml`
+    let mut scene_manifest = SavedSceneManifest {
+        plates: (0..total_plates)
+            .map(|p_idx| {
+                plate_names
+                    .get(p_idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Plate {}", p_idx + 1))
+            })
+            .collect(),
+        objects: Vec::with_capacity(objects.len()),
+    };
     for obj in objects {
         let mut embedded_step_entry = None;
         if obj.has_brep {
@@ -598,6 +867,7 @@ pub fn save_project_to_3mf(
             embedded_step_entry,
             translation: obj.transform.translation.to_array(),
             rotation_xyzw: obj.transform.rotation.to_array(),
+            plate_index: obj.plate_index,
         });
     }
 
@@ -880,6 +1150,203 @@ fn escape_xml_attr(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Parses `Metadata/model_settings.config` (OrcaSlicer / Bambu Studio / PrusaSlicer XML)
+/// to extract `<object id="...">` names and `<plate>` (`plater_id`, `plater_name`, `<model_instance>`) assignments.
+fn parse_model_settings_config_xml(xml_bytes: &[u8]) -> Result<ParsedModelSettingsConfig, String> {
+    let mut reader = Reader::from_reader(xml_bytes);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut result = ParsedModelSettingsConfig::default();
+    let mut current_object_id: Option<String> = None;
+    let mut in_part = false;
+    let mut current_plate: Option<ParsedConfigPlate> = None;
+    let mut current_instance: Option<(Option<String>, Option<u32>)> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let qname = e.name();
+                let local = local_tag_name(qname.as_ref());
+                match local {
+                    b"object" => {
+                        for attr in e.attributes().flatten() {
+                            if local_tag_name(attr.key.as_ref()) == b"id" {
+                                current_object_id =
+                                    Some(String::from_utf8_lossy(&attr.value).into_owned());
+                            }
+                        }
+                        in_part = false;
+                    }
+                    b"part" => {
+                        in_part = true;
+                    }
+                    b"plate" => {
+                        current_plate = Some(ParsedConfigPlate::default());
+                    }
+                    b"model_instance" => {
+                        current_instance = Some((None, None));
+                    }
+                    b"metadata" => {
+                        handle_model_settings_metadata(
+                            e,
+                            &current_object_id,
+                            in_part,
+                            &mut current_plate,
+                            &mut current_instance,
+                            &mut result.object_names,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                let qname = e.name();
+                let local = local_tag_name(qname.as_ref());
+                if local == b"metadata" {
+                    handle_model_settings_metadata(
+                        e,
+                        &current_object_id,
+                        in_part,
+                        &mut current_plate,
+                        &mut current_instance,
+                        &mut result.object_names,
+                    );
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let qname = e.name();
+                let local = local_tag_name(qname.as_ref());
+                match local {
+                    b"object" => {
+                        current_object_id = None;
+                        in_part = false;
+                    }
+                    b"part" => {
+                        in_part = false;
+                    }
+                    b"model_instance" => {
+                        if let (Some(ref mut plate), Some((Some(obj_id), inst_opt))) =
+                            (&mut current_plate, current_instance.take())
+                        {
+                            plate.instances.push((obj_id, inst_opt.unwrap_or(0)));
+                        }
+                    }
+                    b"plate" => {
+                        if let Some(plate) = current_plate.take() {
+                            result.plates.push(plate);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(format!(
+                    "XML error in model_settings.config at {}: {e}",
+                    reader.error_position()
+                ))
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    result.plates.sort_by_key(|p| {
+        if p.plater_id == 0 {
+            u32::MAX
+        } else {
+            p.plater_id
+        }
+    });
+    Ok(result)
+}
+
+fn handle_model_settings_metadata(
+    e: &quick_xml::events::BytesStart<'_>,
+    current_object_id: &Option<String>,
+    in_part: bool,
+    current_plate: &mut Option<ParsedConfigPlate>,
+    current_instance: &mut Option<(Option<String>, Option<u32>)>,
+    object_names: &mut HashMap<String, String>,
+) {
+    let mut key = String::new();
+    let mut value = String::new();
+    for attr in e.attributes().flatten() {
+        match local_tag_name(attr.key.as_ref()) {
+            b"key" => key = String::from_utf8_lossy(&attr.value).into_owned(),
+            b"value" => value = String::from_utf8_lossy(&attr.value).into_owned(),
+            _ => {}
+        }
+    }
+
+    if let Some((ref mut obj_id_slot, ref mut inst_id_slot)) = current_instance {
+        match key.as_str() {
+            "object_id" => *obj_id_slot = Some(value),
+            "instance_id" => *inst_id_slot = value.parse::<u32>().ok(),
+            _ => {}
+        }
+    } else if let Some(ref mut plate) = current_plate {
+        match key.as_str() {
+            "plater_id" => {
+                if let Ok(id) = value.parse::<u32>() {
+                    plate.plater_id = id;
+                }
+            }
+            "plater_name" => {
+                plate.plater_name = value;
+            }
+            _ => {}
+        }
+    } else if let Some(ref obj_id) = current_object_id {
+        if key == "name" && !value.trim().is_empty() {
+            if !in_part || !object_names.contains_key(obj_id) {
+                object_names.insert(obj_id.clone(), value);
+            }
+        }
+    }
+}
+
+/// Extracts `(width_x, depth_y)` in mm from `"printable_area"` inside `Metadata/project_settings.config`
+/// (e.g. `"printable_area": ["0x0", "350x0", "350x350", "0x350"]`).
+fn parse_project_settings_bed_size(json_text: &str) -> Option<(f32, f32)> {
+    let key_idx = json_text.find("\"printable_area\"")?;
+    let after_key = &json_text[key_idx + "\"printable_area\"".len()..];
+    let open_bracket = after_key.find('[')?;
+    let after_open = &after_key[open_bracket + 1..];
+    let close_bracket = after_open.find(']')?;
+    let array_body = &after_open[..close_bracket];
+
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut count = 0usize;
+
+    for token in array_body.split(',') {
+        let trimmed = token.trim().trim_matches('"').trim();
+        let Some((x_str, y_str)) = trimmed.split_once(['x', 'X']) else {
+            continue;
+        };
+        if let (Ok(x), Ok(y)) = (x_str.trim().parse::<f32>(), y_str.trim().parse::<f32>()) {
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+            count += 1;
+        }
+    }
+
+    if count >= 2 {
+        let w = max_x - min_x;
+        let d = max_y - min_y;
+        if w > 10.0 && d > 10.0 {
+            return Some((w, d));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -952,21 +1419,40 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let export_objs = vec![ExportableObject {
-            object_id: 1,
-            name: "Tetra".to_string(),
-            has_brep: false,
-            transform: Transform::IDENTITY,
-            vertices: vec![
-                RenderVertex { x: 0.0, y: 0.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
-                RenderVertex { x: 10.0, y: 0.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
-                RenderVertex { x: 0.0, y: 10.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
-                RenderVertex { x: 0.0, y: 0.0, z: 10.0, nx: 0.0, ny: 0.0, nz: 1.0 },
-            ],
-            indices: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
-        }];
+        let plate_names = vec!["Plate 1".to_string(), "Plate 2 (Rear)".to_string()];
+        let export_objs = vec![
+            ExportableObject {
+                object_id: 1,
+                name: "TetraA".to_string(),
+                has_brep: false,
+                plate_index: 0,
+                transform: Transform::IDENTITY,
+                vertices: vec![
+                    RenderVertex { x: 0.0, y: 0.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+                    RenderVertex { x: 10.0, y: 0.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+                    RenderVertex { x: 0.0, y: 10.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+                    RenderVertex { x: 0.0, y: 0.0, z: 10.0, nx: 0.0, ny: 0.0, nz: 1.0 },
+                ],
+                indices: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
+            },
+            ExportableObject {
+                object_id: 2,
+                name: "TetraB".to_string(),
+                has_brep: false,
+                plate_index: 1,
+                transform: Transform::from_xyz(15.0, -10.0, 0.0),
+                vertices: vec![
+                    RenderVertex { x: 0.0, y: 0.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+                    RenderVertex { x: 10.0, y: 0.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+                    RenderVertex { x: 0.0, y: 10.0, z: 0.0, nx: 0.0, ny: 0.0, nz: -1.0 },
+                    RenderVertex { x: 0.0, y: 0.0, z: 10.0, nx: 0.0, ny: 0.0, nz: 1.0 },
+                ],
+                indices: vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
+            },
+        ];
         let cfg = SlicerConfig::default();
-        save_project_to_3mf(&temp_3mf, &export_objs, &cfg).expect("Should write Manifold 3MF");
+        save_project_to_3mf(&temp_3mf, &plate_names, &export_objs, &cfg)
+            .expect("Should write Manifold 3MF");
 
         let mut report = LoadedBatchReport::default();
         load_3mf_archive(&temp_3mf, &mut report);
@@ -977,6 +1463,65 @@ mod tests {
             Some(expected_filename.as_str())
         );
         assert!(report.restored_config.is_some());
+        assert_eq!(report.plates.len(), 2);
+        assert_eq!(report.plates[0].name, "Plate 1");
+        assert_eq!(report.plates[1].name, "Plate 2 (Rear)");
+        assert_eq!(report.objects.len(), 2);
+        assert_eq!(report.objects[0].name, "TetraA");
+        assert_eq!(report.objects[0].plate_index, 0);
+        assert_eq!(report.objects[1].name, "TetraB");
+        assert_eq!(report.objects[1].plate_index, 1);
+        for obj in &report.objects {
+            let _ = ffi::remove_cad_object(obj.object_id);
+        }
+    }
+
+    #[test]
+    fn test_import_orca_multi_plate_3mf_iron_heart() {
+        let sample_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../Test Objects/Iron heart MOD (deepergrain).3mf");
+        if !sample_path.exists() {
+            return;
+        }
+
+        let mut report = LoadedBatchReport::default();
+        load_3mf_archive(&sample_path, &mut report);
+
+        assert!(
+            report.errors.is_empty(),
+            "Expected no errors importing Iron heart MOD 3mf, got: {:?}",
+            report.errors
+        );
+        assert_eq!(report.plates.len(), 3, "Expected 3 build plates");
+        assert_eq!(report.plates[0].name, "Plate 1");
+        assert_eq!(report.plates[1].name, "Plate 2");
+        assert_eq!(report.plates[2].name, "Plate 3");
+
+        assert_eq!(report.objects.len(), 3, "Expected 3 objects (1 per plate)");
+        assert_eq!(report.objects[0].name, "Front shroud 80mm (2)");
+        assert_eq!(report.objects[0].plate_index, 0);
+        assert!(
+            report.objects[0].initial_translation.xy().length() < 1.0,
+            "Plate 1 object should be centered near (0, 0), got {:?}",
+            report.objects[0].initial_translation
+        );
+
+        assert_eq!(report.objects[1].name, "Rear Shroud 80mm (2)");
+        assert_eq!(report.objects[1].plate_index, 1);
+        assert!(
+            report.objects[1].initial_translation.xy().length() < 1.0,
+            "Plate 2 object should be centered near (0, 0), got {:?}",
+            report.objects[1].initial_translation
+        );
+
+        assert_eq!(report.objects[2].name, "Burly Z cable chain mount");
+        assert_eq!(report.objects[2].plate_index, 2);
+        assert!(
+            report.objects[2].initial_translation.xy().length() < 1.0,
+            "Plate 3 object should be centered near (0, 0), got {:?}",
+            report.objects[2].initial_translation
+        );
+
         for obj in &report.objects {
             let _ = ffi::remove_cad_object(obj.object_id);
         }
