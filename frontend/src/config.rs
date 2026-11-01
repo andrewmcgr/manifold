@@ -1053,6 +1053,10 @@ pub struct SlicerConfig {
     pub machine: MachineKinematicsConfig,
     pub tools: Vec<ToolConfig>,
     pub active_tool_index: usize,
+    pub printer_preset_name: String,
+    pub tool_preset_name: String,
+    pub filament_preset_name: String,
+    pub process_preset_name: String,
 }
 
 impl Default for SlicerConfig {
@@ -1069,6 +1073,10 @@ impl Default for SlicerConfig {
                 ToolConfig::standard_tool(1, "T1 - 0.6mm High-Flow", 0.60, 230.0),
             ],
             active_tool_index: 0,
+            printer_preset_name: "256³ CoreXY (Standard Klipper)".to_string(),
+            tool_preset_name: "0.4mm Standard 5/6-Axis Conical".to_string(),
+            filament_preset_name: "Generic PLA".to_string(),
+            process_preset_name: "0.20mm Standard Non-Planar".to_string(),
         }
     }
 }

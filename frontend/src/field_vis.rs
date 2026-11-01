@@ -123,6 +123,15 @@ impl ObjectSurfaceColorMode {
             Self::SupportNeeded => "Unreachable / Support Needed (0%=Supported / 100%=Needs Support)",
         }
     }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::DefaultCad => "Default CAD Material",
+            Self::Overhang => "Overhang vs. Gravity (°)",
+            Self::ToolAngleFromNormal => "Tool Angle from Normal (°)",
+            Self::SupportNeeded => "Unreachable / Support Needed (%)",
+        }
+    }
 }
 
 /// Color mode for 3D visualization of the selected slicing isosurfaces.
@@ -142,6 +151,14 @@ impl SelectedLayersColorMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::ByLayerThickness => "Layer Thickness (Min=Blue / Target=Green / Max=Amber)",
+            Self::ByBranch => "Topological Branch ID",
+            Self::AlternatingBands => "Alternating Layer Bands",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::ByLayerThickness => "Layer Thickness Δh (mm)",
             Self::ByBranch => "Topological Branch ID",
             Self::AlternatingBands => "Alternating Layer Bands",
         }
@@ -203,6 +220,20 @@ impl ToolpathColorMode {
             Self::ByExtrusionMultiplier => "Flow Multiplier M (Corner + Transient)",
             Self::ByPressureAdvance => "Dynamic Pressure Advance k_PA (s)",
             Self::ByMeltZonePressure => "Melt-Zone Pressure P_melt (MPa)",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::ByFeatureType => "Feature / Line Type",
+            Self::ByLineWidth => "Line Width W (mm)",
+            Self::ByLayerHeight => "Layer Height H (mm)",
+            Self::BySpeed => "Planned Speed v (mm/s)",
+            Self::ByAcceleration => "Acceleration a (mm/s²)",
+            Self::ByVolumetricFlow => "Volumetric Flow Q (mm³/s)",
+            Self::ByExtrusionMultiplier => "Flow Multiplier M (×)",
+            Self::ByPressureAdvance => "Dynamic PA k_PA (s)",
+            Self::ByMeltZonePressure => "Melt-Zone Pressure P_melt",
         }
     }
 }
@@ -284,11 +315,17 @@ pub struct FieldVisualizationState {
     pub show_toolpaths: bool,
     pub show_outer_walls: bool,
     pub show_inner_walls: bool,
+    pub show_bridges: bool,
+    pub show_wave_overhangs: bool,
     pub show_solid_infill: bool,
     pub show_sparse_infill: bool,
+    pub show_gap_fill: bool,
     pub show_supports: bool,
+    pub show_support_interface: bool,
+    pub show_scarf_seams: bool,
+    pub show_wipes: bool,
     pub show_travel_moves: bool,
-    pub show_scarf_and_wipes: bool,
+    pub show_z_hops: bool,
     pub show_toolpath_centerlines: bool,
     pub toolpath_color_mode: ToolpathColorMode,
     pub cached_toolpaths: Option<ObjectToolpathsResult>,
@@ -378,11 +415,17 @@ impl Default for FieldVisualizationState {
             show_toolpaths: false,
             show_outer_walls: true,
             show_inner_walls: true,
+            show_bridges: true,
+            show_wave_overhangs: true,
             show_solid_infill: true,
             show_sparse_infill: true,
+            show_gap_fill: true,
             show_supports: true,
+            show_support_interface: true,
+            show_scarf_seams: true,
+            show_wipes: true,
             show_travel_moves: false,
-            show_scarf_and_wipes: true,
+            show_z_hops: false,
             show_toolpath_centerlines: false,
             toolpath_color_mode: ToolpathColorMode::ByFeatureType,
             cached_toolpaths: None,
@@ -1166,13 +1209,6 @@ pub fn sync_field_visualization_system(
         let max_idx = vis_state.selected_layer_max_idx;
         let highlighted = vis_state.highlighted_selected_layer;
         let color_mode = vis_state.toolpath_color_mode;
-        let show_outer = vis_state.show_outer_walls;
-        let show_inner = vis_state.show_inner_walls;
-        let show_infill = vis_state.show_solid_infill;
-        let show_sparse = vis_state.show_sparse_infill;
-        let show_supports = vis_state.show_supports;
-        let show_scarf_wipes = vis_state.show_scarf_and_wipes;
-        let show_travels = vis_state.show_travel_moves;
 
         let mut positions: Vec<[f32; 3]> = Vec::new();
         let mut normals: Vec<[f32; 3]> = Vec::new();
@@ -1195,16 +1231,7 @@ pub fn sync_field_visualization_system(
                         continue;
                     }
                     for seg in &layer_p.segments {
-                        if is_planned_segment_visible(
-                            seg,
-                            show_outer,
-                            show_inner,
-                            show_infill,
-                            show_sparse,
-                            show_supports,
-                            show_scarf_wipes,
-                            show_travels,
-                        ) {
+                        if vis_state.is_planned_segment_visible(seg) {
                             est_segs += 1;
                         }
                     }
@@ -1232,16 +1259,7 @@ pub fn sync_field_visualization_system(
                     };
 
                     for seg in &layer_p.segments {
-                        if !is_planned_segment_visible(
-                            seg,
-                            show_outer,
-                            show_inner,
-                            show_infill,
-                            show_sparse,
-                            show_supports,
-                            show_scarf_wipes,
-                            show_travels,
-                        ) {
+                        if !vis_state.is_planned_segment_visible(seg) {
                             continue;
                         }
                         append_planned_segment_bead_mesh(
@@ -1282,13 +1300,7 @@ pub fn sync_field_visualization_system(
                     };
 
                     for path in &layer_tp.paths {
-                        let visible = match path.feature_kind {
-                            0 | 6 => show_outer,
-                            1 => show_inner,
-                            4 => show_sparse,
-                            7 | 8 => show_supports,
-                            _ => show_infill,
-                        };
+                        let visible = vis_state.is_raw_path_visible(path.feature_kind);
                         if !visible || path.points.len() < 2 {
                             continue;
                         }
@@ -1367,7 +1379,9 @@ pub fn sync_field_visualization_system(
 
     // Optional crisp gizmo centerlines and travel/Z-hop trajectories on top of toolpath beads
     if vis_state.show_toolpaths
-        && (vis_state.show_toolpath_centerlines || vis_state.show_travel_moves)
+        && (vis_state.show_toolpath_centerlines
+            || vis_state.show_travel_moves
+            || vis_state.show_z_hops)
     {
         if let Some(ref planned) = vis_state.cached_planned_gcode {
             let total = planned.layers.len();
@@ -1391,22 +1405,10 @@ pub fn sync_field_visualization_system(
                             crate::gcode::PlannedMoveKind::Travel
                                 | crate::gcode::PlannedMoveKind::ZHop
                         );
-                        if is_travel && !vis_state.show_travel_moves {
-                            continue;
-                        }
                         if !is_travel && !vis_state.show_toolpath_centerlines {
                             continue;
                         }
-                        if !is_planned_segment_visible(
-                            seg,
-                            vis_state.show_outer_walls,
-                            vis_state.show_inner_walls,
-                            vis_state.show_solid_infill,
-                            vis_state.show_sparse_infill,
-                            vis_state.show_supports,
-                            vis_state.show_scarf_and_wipes,
-                            vis_state.show_travel_moves,
-                        ) {
+                        if !vis_state.is_planned_segment_visible(seg) {
                             continue;
                         }
                         let rgba = compute_planned_segment_color(
@@ -1615,34 +1617,40 @@ pub fn sync_field_visualization_system(
     }
 }
 
-/// Returns whether a `PlannedSegment` should be rendered given the current UI visibility toggles.
-#[allow(clippy::too_many_arguments)]
-fn is_planned_segment_visible(
-    seg: &crate::gcode::PlannedSegment,
-    show_outer: bool,
-    show_inner: bool,
-    show_infill: bool,
-    show_sparse: bool,
-    show_supports: bool,
-    show_scarf_wipes: bool,
-    show_travels: bool,
-) -> bool {
-    match seg.kind {
-        crate::gcode::PlannedMoveKind::Travel | crate::gcode::PlannedMoveKind::ZHop => show_travels,
-        crate::gcode::PlannedMoveKind::ScarfSeam | crate::gcode::PlannedMoveKind::Wipe => {
-            show_scarf_wipes && (show_outer || show_inner)
+impl FieldVisualizationState {
+    /// Returns whether a `PlannedSegment` should be rendered given the current UI visibility toggles.
+    pub fn is_planned_segment_visible(&self, seg: &crate::gcode::PlannedSegment) -> bool {
+        match seg.kind {
+            crate::gcode::PlannedMoveKind::OuterWall => self.show_outer_walls,
+            crate::gcode::PlannedMoveKind::InnerWall => self.show_inner_walls,
+            crate::gcode::PlannedMoveKind::Bridge => self.show_bridges,
+            crate::gcode::PlannedMoveKind::WaveOverhang => self.show_wave_overhangs,
+            crate::gcode::PlannedMoveKind::SolidInfill => self.show_solid_infill,
+            crate::gcode::PlannedMoveKind::SparseInfill => self.show_sparse_infill,
+            crate::gcode::PlannedMoveKind::GapFill => self.show_gap_fill,
+            crate::gcode::PlannedMoveKind::Support => self.show_supports,
+            crate::gcode::PlannedMoveKind::SupportInterface => self.show_support_interface,
+            crate::gcode::PlannedMoveKind::ScarfSeam => self.show_scarf_seams,
+            crate::gcode::PlannedMoveKind::Wipe => self.show_wipes,
+            crate::gcode::PlannedMoveKind::Travel => self.show_travel_moves,
+            crate::gcode::PlannedMoveKind::ZHop => self.show_z_hops,
         }
-        crate::gcode::PlannedMoveKind::OuterWall | crate::gcode::PlannedMoveKind::WaveOverhang => {
-            show_outer
+    }
+
+    /// Returns whether a raw `ExtrusionPath` should be rendered given its `feature_kind`.
+    pub fn is_raw_path_visible(&self, feature_kind: u8) -> bool {
+        match feature_kind {
+            0 => self.show_outer_walls,
+            1 => self.show_inner_walls,
+            2 => self.show_solid_infill,
+            3 => self.show_gap_fill,
+            4 => self.show_sparse_infill,
+            5 => self.show_bridges,
+            6 => self.show_wave_overhangs,
+            7 => self.show_supports,
+            8 => self.show_support_interface,
+            _ => self.show_solid_infill,
         }
-        crate::gcode::PlannedMoveKind::InnerWall => show_inner,
-        crate::gcode::PlannedMoveKind::SparseInfill => show_sparse,
-        crate::gcode::PlannedMoveKind::Support | crate::gcode::PlannedMoveKind::SupportInterface => {
-            show_supports
-        }
-        crate::gcode::PlannedMoveKind::SolidInfill
-        | crate::gcode::PlannedMoveKind::GapFill
-        | crate::gcode::PlannedMoveKind::Bridge => show_infill,
     }
 }
 

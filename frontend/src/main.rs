@@ -5,6 +5,7 @@ pub mod field_vis;
 pub mod gcode;
 pub mod hull;
 pub mod io;
+pub mod presets;
 pub mod scene;
 pub mod ui;
 
@@ -67,6 +68,7 @@ fn main() {
             brightness: 450.0,
         })
         .init_resource::<SlicerConfig>()
+        .init_resource::<presets::PresetLibrary>()
         .init_resource::<BuildPlateState>()
         .init_resource::<FieldVisualizationState>()
         .add_systems(Startup, setup_viewport_scene_and_pipeline)
