@@ -135,6 +135,89 @@ impl SceneObject {
         }
     }
 
+    /// Returns the sanitized Klipper `EXCLUDE_OBJECT_DEFINE NAME=...` identifier for this object.
+    pub fn exclude_object_name(&self) -> String {
+        crate::gcode::sanitize_exclude_object_name(&self.name, self.object_id)
+    }
+
+    /// Computes this object's closed 2D `exclude_object` convex-hull footprint polygon
+    /// `[[x0,y0],[x1,y1],...,[x0,y0]]` and `[center_x, center_y]` in scene build-plate coordinates.
+    pub fn compute_exclude_object_polygon_scene_xy(
+        &self,
+        transform: &Transform,
+    ) -> (Vec<[f32; 2]>, [f32; 2]) {
+        let mut min_pt = Vec3::splat(f32::INFINITY);
+        let mut max_pt = Vec3::splat(f32::NEG_INFINITY);
+        let mut pts: Vec<[f32; 2]> = Vec::new();
+
+        for face in &self.hull.faces {
+            for &p in &face.polygon {
+                let wp = transform.transform_point(p);
+                min_pt = min_pt.min(wp);
+                max_pt = max_pt.max(wp);
+                pts.push([wp.x, wp.y]);
+            }
+        }
+
+        let step = (self.vertices.len() / 1024).max(1);
+        for v in self.vertices.iter().step_by(step) {
+            let wp = transform.transform_point(Vec3::new(v.x, v.y, v.z));
+            min_pt = min_pt.min(wp);
+            max_pt = max_pt.max(wp);
+            pts.push([wp.x, wp.y]);
+        }
+
+        if min_pt.x.is_infinite() {
+            let c = [transform.translation.x, transform.translation.y];
+            let poly = crate::gcode::build_exclude_object_hull_polygon_2d(Vec::new(), c, c);
+            return (poly, c);
+        }
+
+        let bbox_min_xy = [min_pt.x, min_pt.y];
+        let bbox_max_xy = [max_pt.x, max_pt.y];
+        let center_xy = [
+            0.5 * (bbox_min_xy[0] + bbox_max_xy[0]),
+            0.5 * (bbox_min_xy[1] + bbox_max_xy[1]),
+        ];
+        let poly =
+            crate::gcode::build_exclude_object_hull_polygon_2d(pts, bbox_min_xy, bbox_max_xy);
+        (poly, center_xy)
+    }
+
+    /// Returns the object's closed 2D `exclude_object` polygon and center in scene coordinates,
+    /// reusing the cached `PlannedGcodeResult::exclude_object_polygon_bed` when up-to-date for
+    /// this object and falling back to [`Self::compute_exclude_object_polygon_scene_xy`].
+    pub fn exclude_object_polygon_and_center_scene_xy(
+        &self,
+        transform: &Transform,
+        config: &SlicerConfig,
+        vis_state: &crate::field_vis::FieldVisualizationState,
+    ) -> (Vec<[f32; 2]>, [f32; 2]) {
+        let (mesh_poly, mesh_center) = self.compute_exclude_object_polygon_scene_xy(transform);
+        if vis_state.last_object_id == Some(self.object_id) && !vis_state.dirty_planned_gcode {
+            if let Some(ref planned) = vis_state.cached_planned_gcode {
+                if planned.exclude_object_polygon_bed.len() >= 4 {
+                    let gcode_offset = config.scene_to_gcode_offset();
+                    let planned_scene_center = [
+                        planned.exclude_object_center_bed[0] - gcode_offset.x,
+                        planned.exclude_object_center_bed[1] - gcode_offset.y,
+                    ];
+                    let dx = planned_scene_center[0] - mesh_center[0];
+                    let dy = planned_scene_center[1] - mesh_center[1];
+                    if dx * dx + dy * dy <= 4.0 {
+                        let poly_scene = planned
+                            .exclude_object_polygon_bed
+                            .iter()
+                            .map(|&[x, y]| [x - gcode_offset.x, y - gcode_offset.y])
+                            .collect();
+                        return (poly_scene, planned_scene_center);
+                    }
+                }
+            }
+        }
+        (mesh_poly, mesh_center)
+    }
+
     /// Raycasts a world-space ray against this object's triangle mesh.
     pub fn raycast_mesh(&self, transform: &Transform, ray: Ray3d) -> Option<f32> {
         self.raycast_surface_patch(transform, ray)
@@ -229,6 +312,8 @@ pub struct BuildPlateState {
     pub is_dragging_object: bool,
     pub drag_offset_xy: Vec2,
     pub clone_copies_count: u32,
+    /// Whether to display `exclude_object` name labels on the build plate in the 3D viewport.
+    pub show_object_labels: bool,
     /// Remembered `.3mf` file name when a Manifold `.3mf` project was loaded (used as the default on Save 3MF).
     pub project_3mf_filename: Option<String>,
     pub status_message: String,
@@ -260,6 +345,7 @@ impl Default for BuildPlateState {
             is_dragging_object: false,
             drag_offset_xy: Vec2::ZERO,
             clone_copies_count: 1,
+            show_object_labels: true,
             project_3mf_filename: None,
             status_message: String::new(),
             import_notices: Vec::new(),
@@ -1449,6 +1535,7 @@ pub fn draw_viewport_gizmos_system(
     mut gizmos: Gizmos,
     config: Res<SlicerConfig>,
     plate: Res<BuildPlateState>,
+    vis_state: Res<crate::field_vis::FieldVisualizationState>,
     object_transforms: Query<&Transform, With<CadObjectEntity>>,
 ) {
     let bed = &config.bed;
@@ -1664,6 +1751,30 @@ pub fn draw_viewport_gizmos_system(
                     gizmos.linestrip(meridian, profile_color);
                 }
             }
+        }
+    }
+
+    // Draw each visible object's 2D `exclude_object` convex-hull footprint polygon on the build plate
+    for obj in plate
+        .objects
+        .iter()
+        .filter(|o| o.visible && o.plate_index == plate.active_plate_index)
+    {
+        let Ok(obj_tf) = object_transforms.get(obj.entity) else {
+            continue;
+        };
+        let (poly_xy, _) = obj.exclude_object_polygon_and_center_scene_xy(obj_tf, &config, &vis_state);
+        if poly_xy.len() >= 2 {
+            let is_sel = plate.selected_object_id == Some(obj.object_id);
+            let outline_color = if is_sel {
+                Color::srgba(0.98, 0.78, 0.22, 0.95)
+            } else {
+                Color::srgba(0.32, 0.82, 0.96, 0.78)
+            };
+            gizmos.linestrip(
+                poly_xy.iter().map(|&[x, y]| Vec3::new(x, y, 0.02)),
+                outline_color,
+            );
         }
     }
 

@@ -1328,27 +1328,17 @@ pub fn sanitize_exclude_object_name(raw_name: &str, object_id: u64) -> String {
     }
 }
 
-/// Computes a compact 2D convex hull polygon `[[x0,y0],[x1,y1],...,[x0,y0]]` in G-code bed
-/// coordinates (`mm`) for Klipper's `EXCLUDE_OBJECT_DEFINE POLYGON=...` parameter.
-pub fn compute_exclude_object_polygon_2d(
-    layers: &[PlannedLayerGcode],
-    bbox_min: Vec3,
-    bbox_max: Vec3,
+/// Builds a compact, closed 2D convex hull polygon `[[x0,y0],[x1,y1],...,[x0,y0]]`
+/// (with `<= 24` vertices and `>= 1.0 mm` vertex spacing) from a set of 2D XY points
+/// and fallback bounding-box corners, matching Klipper's `EXCLUDE_OBJECT_DEFINE POLYGON=...`.
+pub fn build_exclude_object_hull_polygon_2d(
+    mut pts: Vec<[f32; 2]>,
+    bbox_min_xy: [f32; 2],
+    bbox_max_xy: [f32; 2],
 ) -> Vec<[f32; 2]> {
     #[inline]
     fn cross_2d(o: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
         (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-    }
-
-    // Collect quantized 2D points (0.05 mm grid) from extruding moves to build the convex hull
-    let mut pts: Vec<[f32; 2]> = Vec::new();
-    for layer in layers {
-        for seg in &layer.segments {
-            if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
-                pts.push([seg.p0_bed.x, seg.p0_bed.y]);
-                pts.push([seg.p1_bed.x, seg.p1_bed.y]);
-            }
-        }
     }
 
     pts.sort_by(|a, b| {
@@ -1382,10 +1372,10 @@ pub fn compute_exclude_object_polygon_2d(
 
     // Fallback to the 2D bounding-box rectangle if hull is degenerate (< 3 vertices)
     if hull.len() < 3 {
-        let x0 = bbox_min.x;
-        let y0 = bbox_min.y;
-        let x1 = bbox_max.x.max(x0 + 0.1);
-        let y1 = bbox_max.y.max(y0 + 0.1);
+        let x0 = bbox_min_xy[0];
+        let y0 = bbox_min_xy[1];
+        let x1 = bbox_max_xy[0].max(x0 + 0.1);
+        let y1 = bbox_max_xy[1].max(y0 + 0.1);
         return vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]];
     }
 
@@ -1415,6 +1405,30 @@ pub fn compute_exclude_object_polygon_2d(
         }
     }
     simplified
+}
+
+/// Computes a compact 2D convex hull polygon `[[x0,y0],[x1,y1],...,[x0,y0]]` in G-code bed
+/// coordinates (`mm`) for Klipper's `EXCLUDE_OBJECT_DEFINE POLYGON=...` parameter.
+pub fn compute_exclude_object_polygon_2d(
+    layers: &[PlannedLayerGcode],
+    bbox_min: Vec3,
+    bbox_max: Vec3,
+) -> Vec<[f32; 2]> {
+    // Collect quantized 2D points (0.05 mm grid) from extruding moves to build the convex hull
+    let mut pts: Vec<[f32; 2]> = Vec::new();
+    for layer in layers {
+        for seg in &layer.segments {
+            if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
+                pts.push([seg.p0_bed.x, seg.p0_bed.y]);
+                pts.push([seg.p1_bed.x, seg.p1_bed.y]);
+            }
+        }
+    }
+    build_exclude_object_hull_polygon_2d(
+        pts,
+        [bbox_min.x, bbox_min.y],
+        [bbox_max.x, bbox_max.y],
+    )
 }
 
 /// Formats a Klipper `EXCLUDE_OBJECT_DEFINE` G-code line with zero internal spaces inside

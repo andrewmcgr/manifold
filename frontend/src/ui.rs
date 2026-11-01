@@ -866,7 +866,10 @@ pub fn ui_workspace_system(
     mut preset_lib: ResMut<PresetLibrary>,
     mut vis_state: ResMut<FieldVisualizationState>,
     mut object_transforms: Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
-    mut camera_query: Query<(&mut OrbitCamera, &mut Transform), Without<CadObjectEntity>>,
+    mut camera_query: Query<
+        (&Camera, &GlobalTransform, &mut OrbitCamera, &mut Transform),
+        Without<CadObjectEntity>,
+    >,
 ) {
     plate.ui_hovered_surface_hint_patch = None;
     plate.ui_hovered_point_hint_id = None;
@@ -1072,6 +1075,10 @@ pub fn ui_workspace_system(
             if ui.button("Frame All").clicked() {
                 frame_camera_to_plate(&plate, &config, &mut camera_query);
             }
+            ui.toggle_value(&mut plate.show_object_labels, "Object Labels")
+                .on_hover_text(
+                    "Show/hide each object's Klipper exclude_object name label on the build plate",
+                );
 
             ui.separator();
             ui.toggle_value(
@@ -2223,6 +2230,20 @@ pub fn ui_workspace_system(
                     render_selected_layers_color_legend(ui, &vis_state, &config);
                 }
             });
+    }
+
+    // 4. Viewport build-plate labels showing each object's `exclude_object` name
+    if plate.show_object_labels {
+        let viewport_rect = ctx.available_rect();
+        render_build_plate_object_labels(
+            ctx,
+            viewport_rect,
+            &plate,
+            &config,
+            &vis_state,
+            &object_transforms,
+            &camera_query,
+        );
     }
 }
 
@@ -4148,6 +4169,10 @@ fn render_view_and_inspection_panel(
                 }
             }
 
+            ui.checkbox(
+                &mut plate.show_object_labels,
+                "Show Build-Plate Object Labels (EXCLUDE_OBJECT)",
+            );
             ui.checkbox(&mut config.bed.show_volume_box, "Show Build Volume Box");
             ui.checkbox(
                 &mut config.machine.show_nozzle_clearance_gizmo,
@@ -4870,7 +4895,10 @@ pub fn poll_io_tasks_system(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut object_transforms: Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
-    mut camera_query: Query<(&mut OrbitCamera, &mut Transform), Without<CadObjectEntity>>,
+    mut camera_query: Query<
+        (&Camera, &GlobalTransform, &mut OrbitCamera, &mut Transform),
+        Without<CadObjectEntity>,
+    >,
 ) {
     // 1. Poll pending multi-file import task
     if let Some(ref mut task) = plate.pending_load_task {
@@ -5039,13 +5067,109 @@ pub fn poll_io_tasks_system(
     }
 }
 
+/// Renders a build-plate label (`EXCLUDE_OBJECT_DEFINE NAME=...`) for each visible object on the
+/// active plate, anchored to its projected `exclude_object` footprint outline on `z = 0`.
+fn render_build_plate_object_labels(
+    ctx: &egui::Context,
+    viewport_rect: egui::Rect,
+    plate: &BuildPlateState,
+    config: &SlicerConfig,
+    vis_state: &FieldVisualizationState,
+    object_transforms: &Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
+    camera_query: &Query<
+        (&Camera, &GlobalTransform, &mut OrbitCamera, &mut Transform),
+        Without<CadObjectEntity>,
+    >,
+) {
+    let Ok((camera, cam_global, _, _)) = camera_query.get_single() else {
+        return;
+    };
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new("build_plate_exclude_object_labels"),
+        ))
+        .with_clip_rect(viewport_rect);
+
+    let font_id = egui::FontId::monospace(11.5);
+    for obj in plate
+        .objects
+        .iter()
+        .filter(|o| o.visible && o.plate_index == plate.active_plate_index)
+    {
+        let Ok((obj_tf, _)) = object_transforms.get(obj.entity) else {
+            continue;
+        };
+        let (poly_xy, center_xy) =
+            obj.exclude_object_polygon_and_center_scene_xy(obj_tf, config, vis_state);
+
+        // Project all build-plate outline vertices (`z = 0.02`) to viewport screen coordinates
+        // and place the label just below the front-most edge of the polygon on the build plate.
+        let mut min_sx = f32::INFINITY;
+        let mut max_sx = f32::NEG_INFINITY;
+        let mut max_sy = f32::NEG_INFINITY;
+        let mut projected_any = false;
+        for &[x, y] in &poly_xy {
+            if let Some(vp) = camera.world_to_viewport(cam_global, Vec3::new(x, y, 0.02)) {
+                min_sx = min_sx.min(vp.x);
+                max_sx = max_sx.max(vp.x);
+                max_sy = max_sy.max(vp.y);
+                projected_any = true;
+            }
+        }
+
+        let label_pos = if projected_any {
+            egui::pos2(0.5 * (min_sx + max_sx), max_sy + 12.0)
+        } else if let Some(vp) =
+            camera.world_to_viewport(cam_global, Vec3::new(center_xy[0], center_xy[1], 0.02))
+        {
+            egui::pos2(vp.x, vp.y + 12.0)
+        } else {
+            continue;
+        };
+
+        if !viewport_rect.expand(40.0).contains(label_pos) {
+            continue;
+        }
+
+        let is_sel = plate.selected_object_id == Some(obj.object_id);
+        let label_text = obj.exclude_object_name();
+        let text_color = if is_sel {
+            egui::Color32::from_rgb(255, 224, 110)
+        } else {
+            egui::Color32::from_rgb(175, 236, 252)
+        };
+        let border_color = if is_sel {
+            egui::Color32::from_rgba_unmultiplied(250, 199, 56, 225)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(82, 209, 245, 185)
+        };
+        let bg_color = egui::Color32::from_rgba_unmultiplied(15, 19, 26, 215);
+
+        let galley = painter.layout_no_wrap(label_text, font_id.clone(), text_color);
+        let text_size = galley.size();
+        let pad = egui::vec2(6.0, 2.5);
+        let pill_rect = egui::Rect::from_center_size(label_pos, text_size + 2.0 * pad);
+        painter.rect(
+            pill_rect,
+            egui::Rounding::same(4.0),
+            bg_color,
+            egui::Stroke::new(1.0_f32, border_color),
+        );
+        painter.galley(pill_rect.min + pad, galley, text_color);
+    }
+}
+
 fn frame_camera_to_plate(
     plate: &BuildPlateState,
     config: &SlicerConfig,
-    camera_query: &mut Query<(&mut OrbitCamera, &mut Transform), Without<CadObjectEntity>>,
+    camera_query: &mut Query<
+        (&Camera, &GlobalTransform, &mut OrbitCamera, &mut Transform),
+        Without<CadObjectEntity>,
+    >,
 ) {
     let bed_span = config.bed.width_x.max(config.bed.depth_y).max(100.0);
-    for (mut orbit, mut transform) in camera_query.iter_mut() {
+    for (_, _, mut orbit, mut transform) in camera_query.iter_mut() {
         orbit.focus = Vec3::new(0.0, 0.0, 20.0);
         orbit.radius = if plate.objects.is_empty() {
             bed_span * 1.35
