@@ -31,6 +31,15 @@ struct OrientationHint {
     bool applyOnSurfaceOnly = true;
 };
 
+/// Overhang-driven conformal vs. orthogonal surface orientation bias configuration for the Eikonal solver.
+struct OverhangOrientationBiasConfig {
+    bool enabled = true;
+    float weight = 0.75f;
+    float orthogonalSupportedAngleDeg = 30.0f;
+    float orthogonalOverhangAngleDeg = 60.0f;
+    float transitionWidthDeg = 15.0f;
+};
+
 /// Mode for computing the local 5/6-axis tool orientation vector \hat{a}(x).
 enum class ToolOrientationMode : std::uint8_t {
     /// Follow the constrained Eikonal gradient \nabla \tau(x) (default).
@@ -126,6 +135,7 @@ struct EikonalSolverContext {
     ToolOrientationMode orientationMode = ToolOrientationMode::FollowEikonalGradient;
     std::vector<OrientationHint> hints;
     std::function<void(float, const char*)> reportProgress;
+    OverhangOrientationBiasConfig overhangBias{};
 };
 
 /// Pluggable strategy for computing and clamping the local 5/6-axis tool orientation

@@ -728,9 +728,9 @@ void ToolOrientationStrategy::updateToolOrientations(
                 std::array<float, 3> desiredAxis = bedNormal;
                 if (domain.isInterior[i]) {
                     // `domain.targetDir[i]` already combines the current Eikonal gradient,
-                    // overhang guidance, and diffused soft orientation hints.
+                    // overhang conformal/orthogonal guidance, and diffused soft orientation hints.
                     desiredAxis = domain.targetDir[i];
-                    if (ctx.hints.empty()) {
+                    if (ctx.hints.empty() && !ctx.overhangBias.enabled) {
                         const auto gradTau = computeVoxelTauGradient(domain, i);
                         const float gradLen = length3(gradTau);
                         if (gradLen > 1.0e-5f) {
@@ -959,8 +959,19 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
 {
     const std::size_t n = domain.coords.size();
     const float dx = static_cast<float>(domain.voxelSize);
-    const float surfaceShellMm = 4.0f * dx;
-    constexpr float kOverhangThreshold = 0.42f;
+    const float surfaceShellMm = std::max(6.0f * dx, 3.0f * ctx.layerHeight.target_mm);
+    const bool biasEnabled = ctx.overhangBias.enabled && (ctx.overhangBias.weight > 1.0e-4f);
+    const float userWeight = std::clamp(ctx.overhangBias.weight, 0.0f, 1.0f);
+    const float thetaMinDeg = -std::clamp(ctx.overhangBias.orthogonalSupportedAngleDeg, 0.0f, 89.0f);
+    const float thetaMaxDeg = +std::clamp(ctx.overhangBias.orthogonalOverhangAngleDeg, 0.0f, 89.0f);
+    const float transDeg = std::max(1.0f, ctx.overhangBias.transitionWidthDeg);
+    const float halfTrans = 0.5f * transDeg;
+
+    auto smoothstep01 = [](float edge0, float edge1, float x) noexcept -> float {
+        const float span = std::max(edge1 - edge0, 1.0e-4f);
+        const float u = std::clamp((x - edge0) / span, 0.0f, 1.0f);
+        return u * u * (3.0f - 2.0f * u);
+    };
 
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, n, 512),
@@ -983,36 +994,143 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
                 }
                 domain.targetDir[i] = baseDir;
 
-                // `domain.overhang[i]` is -\nabla\phi_sdf \cdot \hat{g}_{bed}, which is negative
-                // on downward-facing overhangs (\nabla\phi_sdf aligned with gravity \hat{g}_{bed}).
-                const float downwardOverhang = -domain.overhang[i];
-                const float distFromSurface = std::abs(domain.sdf[i]);
-
-                if (!domain.isSeed[i] &&
-                    downwardOverhang > kOverhangThreshold &&
-                    distFromSurface < surfaceShellMm) {
-                    const float shellFactor = 1.0f - (distFromSurface / surfaceShellMm);
-                    const float ovSeverity = std::clamp(
-                        (downwardOverhang - kOverhangThreshold) / (1.0f - kOverhangThreshold),
-                        0.0f,
-                        1.0f);
-
-                    const std::array<float, 3> gravityDir =
-                        ctx.backend.queryGravityDirection(domain.posBed[i]);
-                    const auto& nOut = domain.sdfGrad[i];
-                    const float gProj = dot3(nOut, gravityDir);
-                    const std::array<float, 3> lateralOut = normalize3(
-                        {nOut[0] - gProj * gravityDir[0],
-                         nOut[1] - gProj * gravityDir[1],
-                         nOut[2] - gProj * gravityDir[2]},
-                        aAxis);
-                    const float wBias = 0.25f * shellFactor * ovSeverity;
-                    domain.targetDir[i] = normalize3(
-                        {(1.0f - wBias) * domain.targetDir[i][0] + wBias * lateralOut[0],
-                         (1.0f - wBias) * domain.targetDir[i][1] + wBias * lateralOut[1],
-                         (1.0f - wBias) * domain.targetDir[i][2] + wBias * lateralOut[2]},
-                        aAxis);
+                if (!biasEnabled || domain.isSeed[i]) {
+                    continue;
                 }
+
+                const float distFromSurface = std::abs(domain.sdf[i]);
+                if (distFromSurface >= surfaceShellMm) {
+                    continue;
+                }
+
+                // Check local normal coherence across 6-neighbors so sharp 90° box edges and
+                // 1-voxel thin-wall medial creases are smoothly damped without spurious tilt.
+                const auto& nSurf = domain.sdfGrad[i];
+                float minNrmDot = 1.0f;
+                float sumNrmDot = 0.0f;
+                int nrmCount = 0;
+                for (const std::int32_t nb : domain.neighbors6[i]) {
+                    if (nb >= 0) {
+                        const float d = dot3(nSurf, domain.sdfGrad[static_cast<std::size_t>(nb)]);
+                        minNrmDot = std::min(minNrmDot, d);
+                        sumNrmDot += d;
+                        ++nrmCount;
+                    }
+                }
+                const float avgNrmDot =
+                    (nrmCount > 0) ? (sumNrmDot / static_cast<float>(nrmCount)) : 1.0f;
+
+                // Also probe inward along -n_surf to verify that this surface is backed by solid
+                // interior rather than a thin fin/arch tip where opposite walls would fight each other.
+                const int probeSteps =
+                    std::clamp<int>(static_cast<int>(std::lround(1.5f / dx)), 3, 6);
+                const openvdb::Coord probeCoord = domain.coords[i].offsetBy(
+                    static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[0])),
+                    static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[1])),
+                    static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[2])));
+                const std::int32_t probeIdx = domain.findVoxelIndex(probeCoord);
+                if (probeIdx < 0 || !domain.isInterior[static_cast<std::size_t>(probeIdx)]) {
+                    continue;
+                }
+                const float probeDot =
+                    dot3(nSurf, domain.sdfGrad[static_cast<std::size_t>(probeIdx)]);
+
+                const float coherenceFactor =
+                    smoothstep01(0.75f, 0.94f, avgNrmDot) *
+                    smoothstep01(0.35f, 0.80f, minNrmDot) *
+                    smoothstep01(0.55f, 0.85f, probeDot);
+                if (coherenceFactor <= 1.0e-4f) {
+                    continue;
+                }
+
+                const NozzleBasis baseFrame =
+                    ctx.backend.queryNozzleFrame(domain.posBed[i], {1.0f, 0.0f, 0.0f});
+                const float hBed =
+                    std::max(0.0f, dot3(domain.posBed[i], baseFrame.nozzle_axis) - domain.minZBed);
+                const float bedFactor = smoothstep01(1.5f * dx, 3.5f * dx, hBed);
+                if (bedFactor <= 1.0e-4f) {
+                    continue;
+                }
+
+                const std::array<float, 3> gravityDir =
+                    ctx.backend.queryGravityDirection(domain.posBed[i]);
+                const std::array<float, 3> upDir{
+                    -gravityDir[0],
+                    -gravityDir[1],
+                    -gravityDir[2]};
+
+                // `domain.overhang[i]` is o_i = -n_surf \cdot g_bed = n_surf \cdot u_up \in [-1, 1].
+                // Signed overhang angle relative to vertical (0°):
+                //   \theta_ovh = arcsin(-o_i) \in [-90° (flat top), +90° (flat overhang ceiling)]
+                const float ovh = std::clamp(domain.overhang[i], -1.0f, 1.0f);
+                const float signedOverhangDeg =
+                    std::asin(std::clamp(-ovh, -1.0f, 1.0f)) * kRadToDeg;
+
+                // Smooth C^1 transition weight \alpha_orth \in [0, 1]:
+                //   1.0 inside [\theta_min, \theta_max] (default [-30°, +60°]),
+                //   0.0 outside (conformal to surface for < -30° supported tops and > +60° overhangs).
+                const float wLow = smoothstep01(
+                    thetaMinDeg - halfTrans,
+                    thetaMinDeg + halfTrans,
+                    signedOverhangDeg);
+                const float wHigh = 1.0f - smoothstep01(
+                    thetaMaxDeg - halfTrans,
+                    thetaMaxDeg + halfTrans,
+                    signedOverhangDeg);
+                const float alphaOrth = std::clamp(wLow * wHigh, 0.0f, 1.0f);
+                const float alphaConf = 1.0f - alphaOrth;
+
+                // 1. Orthogonal-to-surface target (\nabla \tau \perp n_surf):
+                //    Blend `baseDir` and `upDir` by |ovh| so vertical side walls (ovh \approx 0)
+                //    only project out their normal component without fighting lateral tilt, while
+                //    sloped walls (\theta_ovh \neq 0) tilt along the upward slope tangent.
+                const float slopeMix = std::clamp(std::abs(ovh) * 1.5f, 0.15f, 1.0f);
+                const std::array<float, 3> refIn = normalize3(
+                    {(1.0f - slopeMix) * baseDir[0] + slopeMix * upDir[0],
+                     (1.0f - slopeMix) * baseDir[1] + slopeMix * upDir[1],
+                     (1.0f - slopeMix) * baseDir[2] + slopeMix * upDir[2]},
+                    upDir);
+                const float refDotN = dot3(refIn, nSurf);
+                std::array<float, 3> orthRaw{
+                    refIn[0] - refDotN * nSurf[0],
+                    refIn[1] - refDotN * nSurf[1],
+                    refIn[2] - refDotN * nSurf[2]};
+                if (length3(orthRaw) < 1.0e-3f) {
+                    const float upDotN = dot3(upDir, nSurf);
+                    orthRaw = {
+                        upDir[0] - upDotN * nSurf[0],
+                        upDir[1] - upDotN * nSurf[1],
+                        upDir[2] - upDotN * nSurf[2]};
+                }
+                std::array<float, 3> dOrth = normalize3(orthRaw, baseDir);
+                if (dot3(dOrth, upDir) < -0.05f) {
+                    dOrth = {-dOrth[0], -dOrth[1], -dOrth[2]};
+                }
+
+                // 2. Conformal-to-surface target (\nabla \tau \parallel \pm n_surf):
+                //    +n_surf on supported top surfaces (ovh >= 0, \theta_ovh <= 0°),
+                //    -n_surf on overhanging undersides / ceilings (ovh < 0, \theta_ovh > 0°).
+                const std::array<float, 3> dConf = (ovh >= 0.0f)
+                    ? nSurf
+                    : std::array<float, 3>{-nSurf[0], -nSurf[1], -nSurf[2]};
+
+                // 3. Smoothly blended overhang target direction:
+                const std::array<float, 3> dOvh = normalize3(
+                    {alphaOrth * dOrth[0] + alphaConf * dConf[0],
+                     alphaOrth * dOrth[1] + alphaConf * dConf[1],
+                     alphaOrth * dOrth[2] + alphaConf * dConf[2]},
+                    baseDir);
+
+                const float uShell = std::clamp(1.0f - (distFromSurface / surfaceShellMm), 0.0f, 1.0f);
+                const float shellFactor = uShell * uShell * (3.0f - 2.0f * uShell);
+                const float wBias =
+                    std::clamp(userWeight * shellFactor * coherenceFactor * bedFactor, 0.0f, 1.0f);
+
+                domain.targetDir[i] = normalize3(
+                    {(1.0f - wBias) * baseDir[0] + wBias * dOvh[0],
+                     (1.0f - wBias) * baseDir[1] + wBias * dOvh[1],
+                     (1.0f - wBias) * baseDir[2] + wBias * dOvh[2]},
+                    aAxis);
             }
         });
 }
@@ -1349,7 +1467,8 @@ void OrientationHintConstraint::enforceOnField(
     }
 
     // Perform an additional directional wavefront integration round along the clearance-clamped
-    // `domain.targetDir` when hints are active so `\tau` converges tightly to the hinted slope.
+    // `domain.targetDir` when hints are active so `\tau` converges tightly to the hinted slope
+    // before hard clearance & causality enforcement.
     runInteriorFastSweeping(domain, 1, /*useDirectionalGuidance=*/true);
 }
 

@@ -4425,6 +4425,178 @@ mod tests {
         ffi::set_spatial_orientation_hints(&[]);
         let _ = ffi::remove_cad_object(part.object_id);
     }
+
+    #[test]
+    fn test_overhang_field_conformal_and_orthogonal_surface_bias() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ffi::set_spatial_orientation_hints(&[]);
+
+        // 1. Verify default configuration & FFI round-trip
+        let default_cfg = crate::config::EikonalFieldConfig::default();
+        assert!(default_cfg.enable_overhang_orientation_bias);
+        assert!((default_cfg.orthogonal_supported_angle_deg - 30.0).abs() < 1.0e-5);
+        assert!((default_cfg.orthogonal_overhang_angle_deg - 60.0).abs() < 1.0e-5);
+
+        let custom_spec = ffi::OverhangBiasSpec {
+            enabled: true,
+            weight: 0.85,
+            orthogonal_supported_angle_deg: 30.0,
+            orthogonal_overhang_angle_deg: 60.0,
+            transition_width_deg: 10.0,
+        };
+        ffi::set_overhang_orientation_bias_spec(custom_spec);
+        let readback = ffi::get_overhang_orientation_bias_spec();
+        assert!(readback.enabled);
+        assert!((readback.weight - 0.85).abs() < 1.0e-5);
+        assert!((readback.orthogonal_supported_angle_deg - 30.0).abs() < 1.0e-5);
+        assert!((readback.orthogonal_overhang_angle_deg - 60.0).abs() < 1.0e-5);
+        assert!((readback.transition_width_deg - 10.0).abs() < 1.0e-5);
+
+        // Configure a 5/6-axis tool with generous clearance so we can observe the surface bias
+        // across all overhang regimes, while still enforcing a hard 45 deg max tool tilt.
+        let tools = vec![ffi::ToolSpec {
+            id: 0,
+            name: "OverhangBiasTestTool".to_string(),
+            nozzle_diameter_mm: 0.4,
+            temperature_celsius: 215.0,
+            has_rotational_axes: true,
+            max_angle_from_bed_normal_deg: 45.0,
+            clearance_profile_xz: vec![
+                ffi::ClearanceXZ { x_radius_mm: 0.6, z_height_mm: 0.0 },
+                ffi::ClearanceXZ { x_radius_mm: 12.0, z_height_mm: 6.0 },
+            ],
+        }];
+        ffi::set_machine_tools(&tools, 0);
+        ffi::set_eikonal_solver_iterations(3);
+
+        // Helper that builds a prism spanning Y in [-8, 8], Z in [0, 12], with a vertical left
+        // wall at X = -10 and a sloped +X wall from x_bot at Z = 0 to x_top at Z = 12, then
+        // measures the average X-component of the `eikonal` field isosurface normal near the +X wall.
+        let measure_right_wall_iso_nx =
+            |x_bot: f32, x_top: f32, enable_bias: bool, supp_deg: f32, ovh_deg: f32| -> f32 {
+                let positions: [f32; 24] = [
+                    -10.0, -8.0,  0.0,
+                    x_bot, -8.0,  0.0,
+                    x_bot,  8.0,  0.0,
+                    -10.0,  8.0,  0.0,
+                    -10.0, -8.0, 12.0,
+                    x_top, -8.0, 12.0,
+                    x_top,  8.0, 12.0,
+                    -10.0,  8.0, 12.0,
+                ];
+                let indices: [u32; 36] = [
+                    0, 2, 1, 0, 3, 2, // bottom
+                    4, 5, 6, 4, 6, 7, // top
+                    0, 1, 5, 0, 5, 4, // -Y
+                    1, 2, 6, 1, 6, 5, // +X sloped wall
+                    2, 3, 7, 2, 7, 6, // +Y
+                    3, 0, 4, 3, 4, 7, // -X vertical wall
+                ];
+                let part =
+                    ffi::register_triangle_mesh("test_overhang_bias_prism", &positions, &indices);
+                assert!(part.object_id > 0);
+
+                ffi::set_overhang_orientation_bias_spec(ffi::OverhangBiasSpec {
+                    enabled: enable_bias,
+                    weight: 0.90,
+                    orthogonal_supported_angle_deg: supp_deg,
+                    orthogonal_overhang_angle_deg: ovh_deg,
+                    transition_width_deg: 6.0,
+                });
+                assert!(ffi::recompute_object_fields(part.object_id, 0.5, 3.0));
+
+                let mut nx_sum = 0.0f32;
+                let mut count = 0usize;
+                for &iso in &[4.0f32, 5.0, 6.0, 7.0, 8.0, 9.0, 11.0, 13.0, 15.0, 18.0] {
+                    let mesh = ffi::extract_field_isosurface(part.object_id, "eikonal", iso, 0.0);
+                    for (v, &sdf_val) in mesh.vertices.iter().zip(mesh.vertex_sdf.iter()) {
+                        if sdf_val <= 0.0 && v.y.abs() <= 5.0 && v.z >= 3.5 && v.z <= 9.5 {
+                            let t_z = (v.z / 12.0).clamp(0.0, 1.0);
+                            let x_wall = (x_bot + (x_top - x_bot) * t_z) - part.origin_x;
+                            if v.x >= x_wall - 2.5 && v.x <= x_wall + 0.25 {
+                                nx_sum += v.nx;
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+
+                let tilt_stats = ffi::get_object_field_stats(part.object_id, "tool_tilt_deg");
+                assert!(tilt_stats.valid);
+                assert!(
+                    tilt_stats.max_value <= 45.05,
+                    "Overhang orientation bias must never violate hard max_angle_from_bed_normal_deg (45 deg), got {}",
+                    tilt_stats.max_value
+                );
+
+                let _ = ffi::remove_cad_object(part.object_id);
+                assert!(
+                    count > 10,
+                    "Expected sufficient isosurface vertices near sloped wall (x_bot={x_bot}, x_top={x_top}, enable={enable_bias}, supp={supp_deg}, ovh={ovh_deg}), got {count}"
+                );
+                nx_sum / (count as f32)
+            };
+
+        // Case A: Steep supported slope (theta_ovh = -18.4 deg, inside [-30 deg, +60 deg] orthogonal band).
+        // x_bot = 10.0, x_top = 6.0 over dz = 12.0 -> outward normal n_surf = (+0.9487, 0, +0.3162).
+        // Orthogonal upward tangent t_up = (-0.3162, 0, +0.9487) has NEGATIVE X component (nx < 0).
+        let nx_supp_ortho_off = measure_right_wall_iso_nx(10.0, 6.0, false, 30.0, 60.0);
+        let nx_supp_ortho_on = measure_right_wall_iso_nx(10.0, 6.0, true, 30.0, 60.0);
+        assert!(
+            nx_supp_ortho_on < nx_supp_ortho_off - 0.04 && nx_supp_ortho_on < -0.04,
+            "Expected steep supported wall (-18.4 deg in [-30, +60] deg band) to bias toward ORTHOGONAL (nx < 0), got off={nx_supp_ortho_off:.4}, on={nx_supp_ortho_on:.4}"
+        );
+
+        // Case B: Shallow supported roof (theta_ovh = -60.0 deg, below -30 deg -> CONFORMAL regime).
+        // x_bot = 18.0, x_top = -2.785 over dz = 12.0 -> outward normal n_surf = (+0.5, 0, +0.866).
+        // Conformal target +n_surf = (+0.5, 0, +0.866) has POSITIVE X component (nx > 0), whereas
+        // expanding orthogonal_supported_angle_deg to 75 deg flips the exact same roof to ORTHOGONAL (nx < 0)!
+        let nx_supp_conf_off = measure_right_wall_iso_nx(18.0, -2.785, false, 30.0, 60.0);
+        let nx_supp_conf_on = measure_right_wall_iso_nx(18.0, -2.785, true, 30.0, 60.0);
+        let nx_supp_forced_ortho = measure_right_wall_iso_nx(18.0, -2.785, true, 75.0, 60.0);
+        assert!(
+            nx_supp_conf_on > nx_supp_conf_off + 0.025 && nx_supp_conf_on > 0.025,
+            "Expected shallow supported roof (-60 deg < -30 deg) to bias toward CONFORMAL (nx > 0), got off={nx_supp_conf_off:.4}, on={nx_supp_conf_on:.4}"
+        );
+        assert!(
+            nx_supp_forced_ortho < 0.0 && nx_supp_conf_on > nx_supp_forced_ortho + 0.045,
+            "Expected expanding orthogonal_supported_angle_deg to 75 deg to flip -60 deg roof from CONFORMAL ({nx_supp_conf_on:.4}) to ORTHOGONAL ({nx_supp_forced_ortho:.4})"
+        );
+
+        // Case C: Moderate overhang wall (theta_ovh = +40.0 deg, inside [-30 deg, +60 deg] orthogonal band).
+        // x_bot = 6.0, x_top = 16.07 over dz = 12.0 -> outward normal n_surf = (+0.766, 0, -0.643).
+        // Orthogonal upward tangent t_up = (+0.643, 0, +0.766) has strong POSITIVE X component (nx > 0.50),
+        // whereas reducing orthogonal_overhang_angle_deg to 20 deg switches +40 deg to CONFORMAL (-n_surf),
+        // pulling nx downward!
+        let nx_ovh_ortho_on = measure_right_wall_iso_nx(6.0, 16.07, true, 30.0, 60.0);
+        let nx_ovh_forced_conf = measure_right_wall_iso_nx(6.0, 16.07, true, 30.0, 20.0);
+        assert!(
+            nx_ovh_ortho_on > 0.45 && nx_ovh_ortho_on > nx_ovh_forced_conf + 0.25,
+            "Expected 40 deg overhang (inside [-30, +60] deg band) to maintain ORTHOGONAL alignment (on={nx_ovh_ortho_on:.4} > forced_conf={nx_ovh_forced_conf:.4})"
+        );
+
+        // Case D: Steep overhang ceiling (theta_ovh = +63.4 deg > +60 deg -> CONFORMAL regime).
+        // x_bot = 4.0, x_top = 28.0 over dz = 12.0 -> outward normal n_surf = (+0.4472, 0, -0.8944).
+        // Conformal upward target -n_surf = (-0.4472, 0, +0.8944) pulls nx strongly downward
+        // relative to both the unbiased field (nx_ovh_conf_off) and the orthogonal overhang regime
+        // when orthogonal_overhang_angle_deg is expanded to 80 deg (nx_ovh_forced_ortho)!
+        let nx_ovh_conf_off = measure_right_wall_iso_nx(4.0, 28.0, false, 30.0, 55.0);
+        let nx_ovh_conf_on = measure_right_wall_iso_nx(4.0, 28.0, true, 30.0, 55.0);
+        let nx_ovh_forced_ortho = measure_right_wall_iso_nx(4.0, 28.0, true, 30.0, 80.0);
+        assert!(
+            nx_ovh_conf_on < nx_ovh_conf_off - 0.05 && nx_ovh_forced_ortho > nx_ovh_conf_on + 0.25,
+            "Expected steep 63.4 deg overhang (> +60 deg) to bias toward CONFORMAL (on={nx_ovh_conf_on:.4} < off={nx_ovh_conf_off:.4} and << forced_ortho={nx_ovh_forced_ortho:.4})"
+        );
+
+        // Restore default overhang bias spec
+        ffi::set_overhang_orientation_bias_spec(ffi::OverhangBiasSpec {
+            enabled: default_cfg.enable_overhang_orientation_bias,
+            weight: default_cfg.overhang_bias_weight,
+            orthogonal_supported_angle_deg: default_cfg.orthogonal_supported_angle_deg,
+            orthogonal_overhang_angle_deg: default_cfg.orthogonal_overhang_angle_deg,
+            transition_width_deg: default_cfg.overhang_bias_transition_deg,
+        });
+    }
 }
 
 

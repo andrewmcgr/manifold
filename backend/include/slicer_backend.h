@@ -22,6 +22,7 @@ struct LayerHeightSpec;
 struct SelectedLayerInfo;
 struct SelectedIsosurfacesResult;
 struct SpatialOrientationHint;
+struct OverhangBiasSpec;
 struct FieldComputeProgress;
 struct LineWidthSpec;
 struct ShellPathSpec;
@@ -164,6 +165,12 @@ public:
     /// Returns the configured spatial/surface orientation hints.
     const std::vector<SpatialOrientationHint>& spatialOrientationHints() const noexcept;
 
+    /// Sets the overhang-driven conformal/orthogonal surface orientation bias parameters for the Eikonal solver.
+    void setOverhangOrientationBiasSpec(const OverhangBiasSpec& spec) noexcept;
+
+    /// Returns the current overhang-driven conformal/orthogonal surface orientation bias parameters.
+    OverhangBiasSpec overhangOrientationBiasSpec() const noexcept;
+
     /// Selects the non-planar slicing isosurfaces for `objectId` using a bidirectional
     /// branch-aware relaxation algorithm honoring `min_mm`, `max_mm`, `target_mm`,
     /// `first_layer_mm`, and `top_layer_mm`, and extracts their interior-clipped 3D
@@ -247,6 +254,8 @@ void set_eikonal_solver_iterations(std::uint32_t iterations);
 std::uint32_t get_eikonal_solver_iterations();
 void set_multi_resolution_grid_config(bool enabled, std::uint32_t coarse_ratio);
 void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hints);
+void set_overhang_orientation_bias_spec(OverhangBiasSpec spec);
+OverhangBiasSpec get_overhang_orientation_bias_spec();
 SelectedIsosurfacesResult select_slicing_isosurfaces(std::uint64_t object_id, float adaptivity);
 void set_shell_path_spec(ShellPathSpec spec);
 ShellPathSpec get_shell_path_spec();

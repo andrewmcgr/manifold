@@ -154,6 +154,27 @@ pub mod ffi {
         pub apply_on_surface_only: bool,
     }
 
+    /// Overhang-driven conformal vs. orthogonal Eikonal surface orientation bias parameters
+    /// shared across the C++/Rust boundary.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct OverhangBiasSpec {
+        pub enabled: bool,
+        /// Overall soft blend weight in `[0.0, 1.0]` for the overhang-driven surface orientation bias.
+        pub weight: f32,
+        /// Supported surface angle threshold from vertical (degrees, e.g. `30.0` for 30° supported,
+        /// corresponding to signed overhang angle `-30°`). Surfaces between `-supported_angle_deg`
+        /// and `+overhang_angle_deg` bias toward orthogonal ($\nabla \tau \perp \hat{\mathbf{n}}_{\text{surf}}$);
+        /// shallower supported surfaces ($< -\text{supported\_angle\_deg}$) bias toward conformal.
+        pub orthogonal_supported_angle_deg: f32,
+        /// Overhang surface angle threshold past vertical (degrees, e.g. `60.0` for 60° overhang,
+        /// corresponding to signed overhang angle `+60°`). Steeper overhangs ($> +\text{overhang\_angle\_deg}$)
+        /// bias toward conformal ($\nabla \tau \parallel -\hat{\mathbf{n}}_{\text{surf}}$).
+        pub orthogonal_overhang_angle_deg: f32,
+        /// Smooth cubic Hermite (`smoothstep`) transition width (degrees, e.g. `15.0`) around
+        /// `-orthogonal_supported_angle_deg` and `+orthogonal_overhang_angle_deg`.
+        pub transition_width_deg: f32,
+    }
+
     /// Lock-free progress snapshot for background OpenVDB & Eikonal field computation.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct FieldComputeProgress {
@@ -374,6 +395,12 @@ pub mod ffi {
 
         /// Sets spatial/surface tangency and orthogonality hints for the Eikonal solver.
         pub fn set_spatial_orientation_hints(hints: &[SpatialOrientationHint]);
+
+        /// Sets the overhang-driven conformal/orthogonal surface orientation bias parameters for the Eikonal solver.
+        pub fn set_overhang_orientation_bias_spec(spec: OverhangBiasSpec);
+
+        /// Retrieves the current overhang-driven conformal/orthogonal surface orientation bias parameters.
+        pub fn get_overhang_orientation_bias_spec() -> OverhangBiasSpec;
 
         /// Selects the non-planar slicing isosurfaces for `object_id` using a bidirectional
         /// branch-aware relaxation algorithm honoring `min_mm`, `max_mm`, `target_mm`,

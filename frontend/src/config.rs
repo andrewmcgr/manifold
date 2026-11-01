@@ -588,6 +588,23 @@ pub struct EikonalFieldConfig {
     pub default_point_hint_radius_mm: f32,
     /// Default soft blend weight (`0.0..=1.0`) for newly placed hints.
     pub default_hint_weight: f32,
+    /// Enable automatic overhang-driven conformal vs. orthogonal surface orientation bias
+    /// using the gravity-aware `"overhang"` scalar field ($o = -\nabla \phi_{\text{sdf}} \cdot \hat{\mathbf{g}}_{\text{bed}}$).
+    pub enable_overhang_orientation_bias: bool,
+    /// Soft blend weight (`0.0..=1.0`, default `0.75`) for the overhang-driven surface orientation bias.
+    pub overhang_bias_weight: f32,
+    /// Supported surface angle from vertical (degrees, default `30.0`, i.e., `-30°` signed overhang angle)
+    /// marking the lower boundary of the orthogonal-to-surface regime ($\nabla \tau \perp \hat{\mathbf{n}}_{\text{surf}}$).
+    /// Shallower supported surfaces ($< -30^\circ$) bias toward conformal ($\nabla \tau \parallel +\hat{\mathbf{n}}_{\text{surf}}$).
+    pub orthogonal_supported_angle_deg: f32,
+    /// Overhang surface angle past vertical (degrees, default `60.0`, i.e., `+60°` signed overhang angle)
+    /// marking the upper boundary of the orthogonal-to-surface regime ($\nabla \tau \perp \hat{\mathbf{n}}_{\text{surf}}$).
+    /// Steeper overhangs ($> +60^\circ$) bias toward conformal ($\nabla \tau \parallel -\hat{\mathbf{n}}_{\text{surf}}$).
+    pub orthogonal_overhang_angle_deg: f32,
+    /// Smooth transition width (degrees, default `15.0`) over which the weight transitions ($C^1$ cubic
+    /// Hermite `smoothstep`) between orthogonal and conformal around `-orthogonal_supported_angle_deg`
+    /// and `+orthogonal_overhang_angle_deg`.
+    pub overhang_bias_transition_deg: f32,
     /// Active surface-face hints placed on STEP B-Rep faces or contiguous planar mesh patches.
     pub surface_hints: Vec<SurfaceFaceHint>,
     /// Active 3D point normal hints placed in space.
@@ -607,9 +624,28 @@ impl Default for EikonalFieldConfig {
             default_surface_hint_depth_mm: 12.0,
             default_point_hint_radius_mm: 18.0,
             default_hint_weight: 0.85,
+            enable_overhang_orientation_bias: true,
+            overhang_bias_weight: 0.75,
+            orthogonal_supported_angle_deg: 30.0,
+            orthogonal_overhang_angle_deg: 60.0,
+            overhang_bias_transition_deg: 15.0,
             surface_hints: Vec::new(),
             point_hints: Vec::new(),
         }
+    }
+}
+
+impl EikonalFieldConfig {
+    pub fn sanitize(&mut self) {
+        self.voxel_size_mm = self.voxel_size_mm.clamp(0.05, 5.0);
+        self.coarse_grid_ratio = self.coarse_grid_ratio.clamp(2, 8);
+        self.narrow_band_width_voxels = self.narrow_band_width_voxels.clamp(2, 32);
+        self.curvature_regularization = self.curvature_regularization.clamp(0.0, 1.0);
+        self.solver_iterations = self.solver_iterations.clamp(1, 16);
+        self.overhang_bias_weight = self.overhang_bias_weight.clamp(0.0, 1.0);
+        self.orthogonal_supported_angle_deg = self.orthogonal_supported_angle_deg.clamp(0.0, 89.0);
+        self.orthogonal_overhang_angle_deg = self.orthogonal_overhang_angle_deg.clamp(0.0, 89.0);
+        self.overhang_bias_transition_deg = self.overhang_bias_transition_deg.clamp(1.0, 45.0);
     }
 }
 
@@ -1152,6 +1188,51 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         default_value: "0.85",
         summary: "Relative blending strength of newly placed orientation hints against gravity/nozzle defaults.",
         details: "Hints act as soft constraints: they steer the layer normal where feasible but never override hard toolhead clearance or maximum slope limits.",
+    },
+    ParameterDoc {
+        key: "eikonal.enable_overhang_orientation_bias",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Overhang Conformal / Orthogonal Surface Bias",
+        units: "",
+        default_value: "true",
+        summary: "Automatically steers Eikonal layer orientation between orthogonal and conformal based on the gravity-aware overhang field.",
+        details: "Uses the local signed overhang angle θ_ovh = arcsin(∇φ_sdf · g_bed) ∈ [-90°, +90°] to bias slicing isosurfaces toward orthogonal (∇τ ⊥ n_surf) on walls and moderate slopes/overhangs (default 30° supported to 60° overhang), and toward conformal (∇τ ∥ ±n_surf) on shallow supported roofs/domes (< -30°) and steep overhangs/ceilings (> +60°).",
+    },
+    ParameterDoc {
+        key: "eikonal.overhang_bias_weight",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Overhang Surface Bias Weight",
+        units: "0.0 .. 1.0",
+        default_value: "0.75",
+        summary: "Soft blending weight of the automatic overhang-driven conformal/orthogonal surface orientation bias.",
+        details: "Controls how strongly the boundary overhang regime steers the Eikonal layer normal and 5/6-axis tool orientation before hard tool clearance cone clamping. Explicit user surface or point hints always take precedence where placed.",
+    },
+    ParameterDoc {
+        key: "eikonal.orthogonal_supported_angle_deg",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Orthogonal Band Supported Limit",
+        units: "° supported",
+        default_value: "30.0°",
+        summary: "Supported slope angle from vertical below which the surface bias transitions from conformal to orthogonal.",
+        details: "Corresponds to signed overhang angle θ_min = -orthogonal_supported_angle_deg (default -30°, i.e., 30° supported). Upward-facing surfaces flatter than this angle (θ_ovh < -30°, such as shallow domes and top skins) bias toward conformal layers (∇τ ∥ +n_surf) to eliminate stair-stepping, while steeper walls (θ_ovh ≥ -30°) bias toward orthogonal layers (∇τ ⊥ n_surf).",
+    },
+    ParameterDoc {
+        key: "eikonal.orthogonal_overhang_angle_deg",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Orthogonal Band Overhang Limit",
+        units: "° overhang",
+        default_value: "60.0°",
+        summary: "Overhang angle past vertical up to which the surface bias stays orthogonal before transitioning to conformal.",
+        details: "Corresponds to signed overhang angle θ_max = +orthogonal_overhang_angle_deg (default +60°, i.e., 60° overhang). Overhangs up to this angle bias toward orthogonal layers (∇τ ⊥ n_surf) so each layer tilts to support the overhang face at 90°, whereas steeper overhangs and bridge ceilings (θ_ovh > +60°) transition smoothly to conformal layers (∇τ ∥ -n_surf).",
+    },
+    ParameterDoc {
+        key: "eikonal.overhang_bias_transition_deg",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Overhang Bias Smooth Transition Width",
+        units: "°",
+        default_value: "15.0°",
+        summary: "Angular width of the C¹ cubic Hermite smoothstep transition between orthogonal and conformal regimes.",
+        details: "Blends the orthogonal and conformal target directions smoothly over [θ_min - 0.5·Δθ, θ_min + 0.5·Δθ] and [θ_max - 0.5·Δθ, θ_max + 0.5·Δθ] so the target director field has no angular discontinuities across curved surfaces.",
     },
 
     // --- Non-Planar Slicing & Variable Layer Height ---

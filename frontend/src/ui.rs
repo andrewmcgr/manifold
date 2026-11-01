@@ -767,6 +767,84 @@ pub fn ui_workspace_system(
                                 param_help_button(ui, "eikonal.default_hint_weight");
                             });
 
+                            // Automatic Overhang-Driven Conformal / Orthogonal Surface Bias
+                            ui.separator();
+                            let mut ovh_bias_changed = false;
+                            ui.horizontal(|ui| {
+                                ovh_bias_changed |= ui
+                                    .checkbox(
+                                        &mut config.eikonal.enable_overhang_orientation_bias,
+                                        "Overhang Conformal / Orthogonal Surface Bias",
+                                    )
+                                    .changed();
+                                param_help_button(ui, "eikonal.enable_overhang_orientation_bias");
+                            });
+                            if config.eikonal.enable_overhang_orientation_bias {
+                                ui.horizontal(|ui| {
+                                    ovh_bias_changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut config.eikonal.overhang_bias_weight,
+                                                0.0..=1.0,
+                                            )
+                                            .text("Bias Weight"),
+                                        )
+                                        .changed();
+                                    param_help_button(ui, "eikonal.overhang_bias_weight");
+                                    ovh_bias_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(
+                                                &mut config.eikonal.overhang_bias_transition_deg,
+                                            )
+                                            .speed(0.5)
+                                            .range(1.0..=45.0)
+                                            .prefix("Transition: ")
+                                            .suffix("°"),
+                                        )
+                                        .changed();
+                                    param_help_button(ui, "eikonal.overhang_bias_transition_deg");
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.small("Orthogonal Band:");
+                                    ovh_bias_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(
+                                                &mut config.eikonal.orthogonal_supported_angle_deg,
+                                            )
+                                            .speed(0.5)
+                                            .range(0.0..=89.0)
+                                            .prefix("Supported ≤ ")
+                                            .suffix("°"),
+                                        )
+                                        .changed();
+                                    param_help_button(ui, "eikonal.orthogonal_supported_angle_deg");
+                                    ovh_bias_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(
+                                                &mut config.eikonal.orthogonal_overhang_angle_deg,
+                                            )
+                                            .speed(0.5)
+                                            .range(0.0..=89.0)
+                                            .prefix("Overhang ≤ ")
+                                            .suffix("°"),
+                                        )
+                                        .changed();
+                                    param_help_button(ui, "eikonal.orthogonal_overhang_angle_deg");
+                                });
+                                ui.small(format!(
+                                    "Orthogonal (∇τ ⊥ n) in [-{:.0}° supported .. +{:.0}° overhang], Conformal (∇τ ∥ ±n) outside (±{:.0}° smooth transition).",
+                                    config.eikonal.orthogonal_supported_angle_deg,
+                                    config.eikonal.orthogonal_overhang_angle_deg,
+                                    config.eikonal.overhang_bias_transition_deg,
+                                ));
+                            }
+                            if ovh_bias_changed {
+                                config.eikonal.sanitize();
+                                if !vis_state.is_busy() {
+                                    sync_config_to_backend(&config);
+                                }
+                            }
+
                             // 1. Surface Face Hints List (Collapsible)
                             ui.separator();
                             egui::CollapsingHeader::new(
@@ -3851,6 +3929,13 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         config.eikonal.enable_multi_resolution_grid,
         config.eikonal.coarse_grid_ratio,
     );
+    ffi::set_overhang_orientation_bias_spec(ffi::OverhangBiasSpec {
+        enabled: config.eikonal.enable_overhang_orientation_bias,
+        weight: config.eikonal.overhang_bias_weight,
+        orthogonal_supported_angle_deg: config.eikonal.orthogonal_supported_angle_deg,
+        orthogonal_overhang_angle_deg: config.eikonal.orthogonal_overhang_angle_deg,
+        transition_width_deg: config.eikonal.overhang_bias_transition_deg,
+    });
 }
 
 /// Compiles all active surface-face hints and 3D point hints for `object_id` into

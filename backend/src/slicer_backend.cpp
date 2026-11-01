@@ -852,6 +852,14 @@ void buildObjectScalarFields(
     }
 
     const LayerHeightSpec localLayerHeight = backend.sliceLayerHeight();
+    const OverhangBiasSpec biasSpec = backend.overhangOrientationBiasSpec();
+    OverhangOrientationBiasConfig biasCfg{};
+    biasCfg.enabled = biasSpec.enabled;
+    biasCfg.weight = std::clamp(biasSpec.weight, 0.0f, 1.0f);
+    biasCfg.orthogonalSupportedAngleDeg = std::clamp(biasSpec.orthogonal_supported_angle_deg, 0.0f, 89.0f);
+    biasCfg.orthogonalOverhangAngleDeg = std::clamp(biasSpec.orthogonal_overhang_angle_deg, 0.0f, 89.0f);
+    biasCfg.transitionWidthDeg = std::clamp(biasSpec.transition_width_deg, 1.0f, 45.0f);
+
     EikonalSolverContext ctx{
         backend,
         activeTool,
@@ -863,6 +871,7 @@ void buildObjectScalarFields(
         [](float frac, const char* msg) {
             setFieldProgress(true, frac, msg);
         },
+        biasCfg,
     };
 
     for (const auto& ffiHint : backend.spatialOrientationHints()) {
@@ -1329,6 +1338,13 @@ struct SlicerBackend::Impl {
     bool multiResolutionEnabled = true;
     std::uint32_t multiResolutionCoarseRatio = 4;
     std::vector<SpatialOrientationHint> spatialOrientationHints;
+    OverhangBiasSpec overhangBiasSpec{
+        true,
+        0.75f,
+        30.0f,
+        60.0f,
+        15.0f,
+    };
     ShellPathSpec shellPathSpec{
         1.60f,
         2,
@@ -1684,6 +1700,7 @@ bool SlicerBackend::recomputeObjectFields(
         snapshotBackend.impl_->multiResolutionEnabled = impl_->multiResolutionEnabled;
         snapshotBackend.impl_->multiResolutionCoarseRatio = impl_->multiResolutionCoarseRatio;
         snapshotBackend.impl_->spatialOrientationHints = impl_->spatialOrientationHints;
+        snapshotBackend.impl_->overhangBiasSpec = impl_->overhangBiasSpec;
         snapshotBackend.impl_->shellPathSpec = impl_->shellPathSpec;
     }
 
@@ -2461,6 +2478,21 @@ void SlicerBackend::setSpatialOrientationHints(const std::vector<SpatialOrientat
 
 const std::vector<SpatialOrientationHint>& SlicerBackend::spatialOrientationHints() const noexcept {
     return impl_->spatialOrientationHints;
+}
+
+void SlicerBackend::setOverhangOrientationBiasSpec(const OverhangBiasSpec& spec) noexcept {
+    OverhangBiasSpec s = spec;
+    s.weight = std::clamp(s.weight, 0.0f, 1.0f);
+    s.orthogonal_supported_angle_deg = std::clamp(s.orthogonal_supported_angle_deg, 0.0f, 89.0f);
+    s.orthogonal_overhang_angle_deg = std::clamp(s.orthogonal_overhang_angle_deg, 0.0f, 89.0f);
+    s.transition_width_deg = (s.transition_width_deg >= 0.5f)
+        ? std::clamp(s.transition_width_deg, 1.0f, 45.0f)
+        : 15.0f;
+    impl_->overhangBiasSpec = s;
+}
+
+OverhangBiasSpec SlicerBackend::overhangOrientationBiasSpec() const noexcept {
+    return impl_->overhangBiasSpec;
 }
 
 SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
@@ -4947,6 +4979,16 @@ void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hin
         copied.push_back(h);
     }
     globalBackend().setSpatialOrientationHints(copied);
+}
+
+void set_overhang_orientation_bias_spec(OverhangBiasSpec spec) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setOverhangOrientationBiasSpec(spec);
+}
+
+OverhangBiasSpec get_overhang_orientation_bias_spec() {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().overhangOrientationBiasSpec();
 }
 
 SelectedIsosurfacesResult select_slicing_isosurfaces(std::uint64_t object_id, float adaptivity) {
