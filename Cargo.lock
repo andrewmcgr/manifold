@@ -3078,6 +3078,7 @@ dependencies = [
  "quick-xml 0.39.4",
  "rfd",
  "serde",
+ "serde_json",
  "stl_io",
  "toml",
  "wgpu",
