@@ -3846,9 +3846,26 @@ fn render_process_config_tab(
                         egui::DragValue::new(&mut config.slicing.support_interface_layers)
                             .speed(0.1)
                             .range(0..=10)
-                            .prefix("Interface Layers: "),
+                            .prefix("Roof Intf Layers: "),
+                    )
+                    .on_hover_text(
+                        "Number of dense support interface layers printed immediately beneath overhanging part roofs.",
                     )
                     .changed();
+                tp_cfg_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.slicing.support_bed_interface_layers)
+                            .speed(0.1)
+                            .range(0..=10)
+                            .prefix("Bed Intf Layers: "),
+                    )
+                    .on_hover_text(
+                        "Number of dense support interface layers printed on the build plate at the base of support columns for strong bed adhesion.",
+                    )
+                    .changed();
+                param_help_button(ui, "slicing.support_bed_interface_layers");
+            });
+            ui.horizontal(|ui| {
                 tp_cfg_changed |= ui
                     .add(
                         egui::DragValue::new(&mut config.slicing.support_base_spacing_mm)
@@ -3863,7 +3880,7 @@ fn render_process_config_tab(
                         egui::DragValue::new(&mut config.slicing.support_interface_spacing_mm)
                             .speed(0.02)
                             .range(0.3..=4.0)
-                            .prefix("Intf: ")
+                            .prefix("Intf Spacing: ")
                             .suffix(" mm"),
                     )
                     .changed();
@@ -3887,6 +3904,20 @@ fn render_process_config_tab(
             config.slicing.sanitize();
             if !is_computing {
                 sync_config_to_backend(config);
+                if let Some(&(_, _, _, obj_rotation)) = selected_obj_info {
+                    let inv_rot = obj_rotation.inverse();
+                    let local_nozzle = (inv_rot * Vec3::from_array(config.machine.nozzle_axis_bed))
+                        .normalize_or_zero();
+                    if local_nozzle.length_squared() > 1.0e-6 {
+                        ffi::set_nozzle_axis_bed(local_nozzle.to_array());
+                    }
+                    let local_gravity =
+                        (inv_rot * Vec3::from_array(config.machine.gravity_direction_bed))
+                            .normalize_or_zero();
+                    if local_gravity.length_squared() > 1.0e-6 {
+                        ffi::set_gravity_direction_bed(local_gravity.to_array());
+                    }
+                }
             }
             vis_state.dirty_toolpaths = true;
         }
@@ -4783,6 +4814,7 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         z_gap_mm: config.slicing.support_z_gap_mm,
         xy_gap_mm: config.slicing.support_xy_gap_mm,
         interface_layers: config.slicing.support_interface_layers,
+        bed_interface_layers: config.slicing.support_bed_interface_layers,
         base_spacing_mm: config.slicing.support_base_spacing_mm,
         interface_spacing_mm: config.slicing.support_interface_spacing_mm,
         line_width_mm: config.slicing.support_line_width_mm,

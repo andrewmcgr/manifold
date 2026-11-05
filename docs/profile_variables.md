@@ -206,7 +206,8 @@ Manifold Slicer identifies overhangs that exceed the constrained Eikonal slope c
 | `slicing.support_only_unreachable_and_bridges` | `bool` | `false` | Process | When `true`, generates supports **only** for regions that are causally unreachable by the constrained Eikonal field (floating islands / downward-hanging local minima) and two-pier bridges longer than `max_bridge_length_mm`, leaving reachable overhangs to conformal layers and inside-out wave overhangs. |
 | `slicing.support_z_gap_mm` | `f32` (`0.05..=5.0` mm) | `0.20` | Process | Separation distance along $-\hat{\mathbf{g}}_{\text{bed}}$ between the top support interface (or bottom support floor) and the object surface so supports detach cleanly. |
 | `slicing.support_xy_gap_mm` | `f32` (`0.10..=10.0` mm) | `0.50` | Process | Minimum lateral 3D signed-distance clearance ($\phi_{\text{sdf}} \ge d_{xy}$) maintained between support columns and adjacent part walls. |
-| `slicing.support_interface_layers` | `u32` (`0..=16`) | `2` | Process | Number of dense `SupportInterface` layers printed immediately below overhanging contact roofs (and above part contact floors). |
+| `slicing.support_interface_layers` | `u32` (`0..=16`) | `2` | Process | Number of dense `SupportInterface` layers printed immediately below overhanging contact roofs. |
+| `slicing.support_bed_interface_layers` | `u32` (`0..=16`) | `1` | Process | Number of dense `SupportInterface` layers printed on the build plate at the base of support columns for strong bed adhesion. |
 | `slicing.support_base_spacing_mm` | `f32` (`0.40..=20.0` mm) | `2.50` | Process | Centerline scanline spacing for coarse `Support` base columns. |
 | `slicing.support_interface_spacing_mm` | `f32` (`0.20..=5.0` mm) | `0.60` | Process | Centerline scanline spacing for dense `SupportInterface` roofs/floors. |
 | `slicing.support_line_width_mm` | `f32` (`0.15..=3.0` mm) | `0.40` | Process | Extruded bead width for support base and support interface lines. |

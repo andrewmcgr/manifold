@@ -206,6 +206,7 @@ pub mod ffi {
         pub z_gap_mm: f32,
         pub xy_gap_mm: f32,
         pub interface_layers: u32,
+        pub bed_interface_layers: u32,
         pub base_spacing_mm: f32,
         pub interface_spacing_mm: f32,
         pub line_width_mm: f32,

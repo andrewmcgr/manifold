@@ -604,6 +604,7 @@ pub struct ProcessPreset {
     pub support_z_gap_mm: f32,
     pub support_xy_gap_mm: f32,
     pub support_interface_layers: u32,
+    pub support_bed_interface_layers: u32,
     pub support_base_spacing_mm: f32,
     pub support_interface_spacing_mm: f32,
     pub support_line_width_mm: f32,
@@ -680,6 +681,7 @@ impl ProcessPreset {
             support_z_gap_mm: cfg.slicing.support_z_gap_mm,
             support_xy_gap_mm: cfg.slicing.support_xy_gap_mm,
             support_interface_layers: cfg.slicing.support_interface_layers,
+            support_bed_interface_layers: cfg.slicing.support_bed_interface_layers,
             support_base_spacing_mm: cfg.slicing.support_base_spacing_mm,
             support_interface_spacing_mm: cfg.slicing.support_interface_spacing_mm,
             support_line_width_mm: cfg.slicing.support_line_width_mm,
@@ -742,6 +744,7 @@ impl ProcessPreset {
         cfg.slicing.support_z_gap_mm = self.support_z_gap_mm;
         cfg.slicing.support_xy_gap_mm = self.support_xy_gap_mm;
         cfg.slicing.support_interface_layers = self.support_interface_layers;
+        cfg.slicing.support_bed_interface_layers = self.support_bed_interface_layers;
         cfg.slicing.support_base_spacing_mm = self.support_base_spacing_mm;
         cfg.slicing.support_interface_spacing_mm = self.support_interface_spacing_mm;
         cfg.slicing.support_line_width_mm = self.support_line_width_mm;
@@ -846,6 +849,7 @@ impl ProcessPreset {
             && approx_eq(self.support_z_gap_mm, cfg.slicing.support_z_gap_mm)
             && approx_eq(self.support_xy_gap_mm, cfg.slicing.support_xy_gap_mm)
             && self.support_interface_layers == cfg.slicing.support_interface_layers
+            && self.support_bed_interface_layers == cfg.slicing.support_bed_interface_layers
             && approx_eq(
                 self.support_base_spacing_mm,
                 cfg.slicing.support_base_spacing_mm,

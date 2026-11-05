@@ -1385,6 +1385,7 @@ struct SlicerBackend::Impl {
         0.20f,
         0.50f,
         2,
+        1,
         2.50f,
         0.60f,
         0.40f,
@@ -5016,6 +5017,7 @@ void SlicerBackend::setSupportSpec(const SupportSpec& spec) noexcept {
     s.z_gap_mm = std::clamp(s.z_gap_mm, 0.0f, 5.0f);
     s.xy_gap_mm = std::clamp(s.xy_gap_mm, 0.0f, 10.0f);
     s.interface_layers = std::min<std::uint32_t>(s.interface_layers, 16);
+    s.bed_interface_layers = std::min<std::uint32_t>(s.bed_interface_layers, 16);
     s.base_spacing_mm = (s.base_spacing_mm > 0.1f)
         ? std::clamp(s.base_spacing_mm, 0.4f, 20.0f)
         : 2.50f;
@@ -5285,6 +5287,20 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                     : impl_->shellPathSpec.nozzle_diameter_mm);
             const float minSegLenMm = std::max(0.4f, impl_->shellPathSpec.min_extrusion_length_mm);
 
+            std::vector<float> uniqueLayerIsos;
+            uniqueLayerIsos.reserve(res.layers.size());
+            for (const auto& lyr : res.layers) {
+                if (lyr.isovalue <= 0.0f) {
+                    continue;
+                }
+                if (uniqueLayerIsos.empty() ||
+                    std::abs(lyr.isovalue - uniqueLayerIsos.back()) >= 1.0e-3f) {
+                    uniqueLayerIsos.push_back(lyr.isovalue);
+                }
+            }
+            const float firstSupportIso =
+                uniqueLayerIsos.empty() ? targetLayerH : uniqueLayerIsos.front();
+
             float lastSupportIso = -1.0e9f;
             for (std::size_t layerIdx = 0; layerIdx < res.layers.size(); ++layerIdx) {
                 auto& layer = res.layers[layerIdx];
@@ -5295,6 +5311,15 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                 // Avoid emitting duplicate support columns at identical isovalues across parallel branches
                 if (std::abs(hLayer - lastSupportIso) < 1.0e-3f) {
                     continue;
+                }
+
+                std::uint32_t bedLayerOrdinal = 0;
+                for (std::size_t uIdx = 0; uIdx < uniqueLayerIsos.size(); ++uIdx) {
+                    if (uniqueLayerIsos[uIdx] <= hLayer + 1.0e-3f) {
+                        bedLayerOrdinal = static_cast<std::uint32_t>(uIdx);
+                    } else {
+                        break;
+                    }
                 }
 
                 float localLayerH = targetLayerH;
@@ -5312,6 +5337,12 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                     std::max(targetLayerH, impl_->sliceLayerHeight.max_mm));
                 const float interfaceBandMm =
                     static_cast<float>(impl_->supportSpec.interface_layers) * effectiveStepH;
+                const float bedInterfaceBandMm =
+                    firstSupportIso +
+                    ((impl_->supportSpec.bed_interface_layers > 0)
+                         ? static_cast<float>(impl_->supportSpec.bed_interface_layers - 1) *
+                               effectiveStepH
+                         : 0.0f);
 
                 std::vector<ExtrusionPath> supportPathsForLayer;
                 std::uint32_t supportPassIdx = 0;
@@ -5329,6 +5360,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                     const float innerMin = swapUV ? minV : minU;
                     const float innerMax = swapUV ? maxV : maxU;
                     const float marchStepMm = std::min(0.5f * cellStepMm, 0.40f);
+                    const float bboxMarginMm = 2.0f * cellStepMm;
 
                     bool zig = false;
                     for (float outerCoord = outerMin; outerCoord <= outerMax + 1.0e-4f; outerCoord += spacingMm) {
@@ -5350,23 +5382,53 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 if (zig) {
                                     std::reverse(activeRun.begin(), activeRun.end());
                                 }
-                                ExtrusionPath ep{};
-                                ep.feature_kind = featureKind;
-                                ep.wall_index = supportPassIdx++;
-                                ep.is_closed = false;
-                                ep.total_length_mm = lenMm;
-                                ep.mean_width_mm = lineWidthMm;
-                                ep.points.reserve(activeRun.size());
-                                for (const auto& pt : activeRun) {
-                                    ep.points.push_back(pt);
+                                // Chain adjacent scanlines into a continuous boustrophedon (zig-zag)
+                                // path when the turnaround step stays within the support pad and
+                                // respects `xyGapMm` clearance from the part surface.
+                                bool chainedToPrev = false;
+                                if (!supportPathsForLayer.empty() &&
+                                    supportPathsForLayer.back().feature_kind == featureKind &&
+                                    !supportPathsForLayer.back().points.empty()) {
+                                    const ToolpathPoint& prevEnd = supportPathsForLayer.back().points.back();
+                                    const ToolpathPoint& currStart = activeRun.front();
+                                    const float tx = currStart.x - prevEnd.x;
+                                    const float ty = currStart.y - prevEnd.y;
+                                    const float tz = currStart.z - prevEnd.z;
+                                    const float turnDist = std::sqrt(tx * tx + ty * ty + tz * tz);
+                                    if (turnDist <= 2.5f * spacingMm) {
+                                        const openvdb::Vec3d midPt(
+                                            0.5 * (prevEnd.x + currStart.x),
+                                            0.5 * (prevEnd.y + currStart.y),
+                                            0.5 * (prevEnd.z + currStart.z));
+                                        if (samplePartSdf(midPt) >= xyGapMm) {
+                                            auto& prevPath = supportPathsForLayer.back();
+                                            for (const auto& pt : activeRun) {
+                                                prevPath.points.push_back(pt);
+                                            }
+                                            prevPath.total_length_mm += turnDist + lenMm;
+                                            chainedToPrev = true;
+                                        }
+                                    }
                                 }
-                                supportPathsForLayer.push_back(std::move(ep));
-                                if (featureKind == 7) {
-                                    ++res.support_count;
-                                } else {
-                                    ++res.support_interface_count;
+                                if (!chainedToPrev) {
+                                    ExtrusionPath ep{};
+                                    ep.feature_kind = featureKind;
+                                    ep.wall_index = supportPassIdx++;
+                                    ep.is_closed = false;
+                                    ep.total_length_mm = lenMm;
+                                    ep.mean_width_mm = lineWidthMm;
+                                    ep.points.reserve(activeRun.size());
+                                    for (const auto& pt : activeRun) {
+                                        ep.points.push_back(pt);
+                                    }
+                                    supportPathsForLayer.push_back(std::move(ep));
+                                    if (featureKind == 7) {
+                                        ++res.support_count;
+                                    } else {
+                                        ++res.support_interface_count;
+                                    }
+                                    ++res.total_path_count;
                                 }
-                                ++res.total_path_count;
                                 zig = !zig;
                             }
                             activeRun.clear();
@@ -5381,14 +5443,24 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             // Check 3x3 neighborhood in supportColumns so scanlines connect smoothly across grid cells
                             bool inColumn = false;
                             bool isInterface = false;
-                            for (std::int32_t du = -1; du <= 1 && !inColumn; ++du) {
-                                for (std::int32_t dv = -1; dv <= 1 && !inColumn; ++dv) {
+                            for (std::int32_t du = -1; du <= 1; ++du) {
+                                for (std::int32_t dv = -1; dv <= 1; ++dv) {
                                     auto itCol = supportColumns.find(packCellKey(iu + du, iv + dv));
                                     if (itCol != supportColumns.end()) {
                                         const auto& col = itCol->second;
                                         if (hLayer >= col.floorH && hLayer <= col.roofH) {
                                             inColumn = true;
-                                            isInterface = (col.roofH - hLayer <= interfaceBandMm + 1.0e-4f);
+                                            const bool isRoofIntf =
+                                                (impl_->supportSpec.interface_layers > 0) &&
+                                                (col.roofH - hLayer <= interfaceBandMm + 1.0e-4f);
+                                            const bool isBedIntf =
+                                                (impl_->supportSpec.bed_interface_layers > 0) &&
+                                                (col.floorH <= 1.0e-3f) &&
+                                                (bedLayerOrdinal < impl_->supportSpec.bed_interface_layers ||
+                                                 (hLayer - col.floorH) <= bedInterfaceBandMm + 1.0e-4f);
+                                            if (isRoofIntf || isBedIntf) {
+                                                isInterface = true;
+                                            }
                                         }
                                     }
                                 }
@@ -5406,10 +5478,10 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 pOrigin[1] + uVal * tU[1] + vVal * tV[1] + worldH * uUp[1],
                                 pOrigin[2] + uVal * tU[2] + vVal * tV[2] + worldH * uUp[2]};
 
-                            // Keep support points strictly inside the object's bounding box
-                            if (pBed[0] < rec.minX || pBed[0] > rec.maxX ||
-                                pBed[1] < rec.minY || pBed[1] > rec.maxY ||
-                                pBed[2] < rec.minZ || pBed[2] > rec.maxZ) {
+                            // Keep support points within the dilated object bounding box
+                            if (pBed[0] < rec.minX - bboxMarginMm || pBed[0] > rec.maxX + bboxMarginMm ||
+                                pBed[1] < rec.minY - bboxMarginMm || pBed[1] > rec.maxY + bboxMarginMm ||
+                                pBed[2] < rec.minZ - 1.0e-3f || pBed[2] > rec.maxZ + bboxMarginMm) {
                                 flushRun();
                                 continue;
                             }
@@ -5440,7 +5512,8 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
 
                 const bool alternateDir = ((layerIdx % 2) == 1);
                 emitScanlineSupportGroup(7, baseSpacingMm, alternateDir);
-                if (impl_->supportSpec.interface_layers > 0) {
+                if (impl_->supportSpec.interface_layers > 0 ||
+                    impl_->supportSpec.bed_interface_layers > 0) {
                     emitScanlineSupportGroup(8, interfaceSpacingMm, !alternateDir);
                 }
 

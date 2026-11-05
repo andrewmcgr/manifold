@@ -660,6 +660,9 @@ pub fn resolve_canonical_config_key(cfg_val: &JsonValue, raw_key: &str) -> Resul
         "bed_shape" => {
             return Ok("bed.shape".to_string());
         }
+        "support_bed_interface" | "support_bottom_interface_layers" => {
+            return Ok("slicing.support_bed_interface_layers".to_string());
+        }
         _ => {}
     }
 

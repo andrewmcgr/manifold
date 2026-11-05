@@ -470,6 +470,8 @@ pub struct SlicingProcessConfig {
     pub support_xy_gap_mm: f32,
     /// Number of dense support interface layers immediately beneath unreachable overhang roofs.
     pub support_interface_layers: u32,
+    /// Number of dense support interface layers printed on the build plate at the base of support columns for strong bed adhesion.
+    pub support_bed_interface_layers: u32,
     /// Line spacing (mm) for coarse support base scanlines.
     pub support_base_spacing_mm: f32,
     /// Line spacing (mm) for dense support interface scanlines.
@@ -504,6 +506,7 @@ impl Default for SlicingProcessConfig {
             support_z_gap_mm: 0.20,
             support_xy_gap_mm: 0.50,
             support_interface_layers: 2,
+            support_bed_interface_layers: 1,
             support_base_spacing_mm: 2.50,
             support_interface_spacing_mm: 0.60,
             support_line_width_mm: 0.40,
@@ -528,6 +531,7 @@ impl SlicingProcessConfig {
         self.support_z_gap_mm = self.support_z_gap_mm.clamp(0.05, 5.0);
         self.support_xy_gap_mm = self.support_xy_gap_mm.clamp(0.10, 10.0);
         self.support_interface_layers = self.support_interface_layers.min(16);
+        self.support_bed_interface_layers = self.support_bed_interface_layers.min(16);
         self.support_base_spacing_mm = self.support_base_spacing_mm.clamp(0.40, 20.0);
         self.support_interface_spacing_mm = self.support_interface_spacing_mm.clamp(0.20, 5.0);
         self.support_line_width_mm = self.support_line_width_mm.clamp(0.15, 3.0);
@@ -1513,11 +1517,20 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
     ParameterDoc {
         key: "slicing.support_interface_layers",
         category: "Support Generation",
-        title: "Support Interface Layers",
+        title: "Support Roof Interface Layers",
         units: "layers",
         default_value: "2",
         summary: "Number of dense support interface layers printed immediately below overhanging contact roofs.",
         details: "Provides a smooth, closely-spaced support roof beneath unreachable overhangs while keeping the lower support base coarse and fast to print.",
+    },
+    ParameterDoc {
+        key: "slicing.support_bed_interface_layers",
+        category: "Support Generation",
+        title: "Support Bed Interface Layers",
+        units: "layers",
+        default_value: "1",
+        summary: "Number of dense support interface layers printed on the build plate at the base of support columns.",
+        details: "Lays down a closely-spaced, continuous boustrophedon interface pad on the build plate so support structures adhere firmly and do not detach during printing.",
     },
     ParameterDoc {
         key: "slicing.support_base_spacing_mm",

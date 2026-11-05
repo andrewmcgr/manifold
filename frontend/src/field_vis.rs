@@ -552,6 +552,7 @@ impl FieldVisualizationState {
             z_gap_mm: s.support_z_gap_mm,
             xy_gap_mm: s.support_xy_gap_mm,
             interface_layers: s.support_interface_layers,
+            bed_interface_layers: s.support_bed_interface_layers,
             base_spacing_mm: s.support_base_spacing_mm,
             interface_spacing_mm: s.support_interface_spacing_mm,
             line_width_mm: s.support_line_width_mm,
@@ -4815,6 +4816,35 @@ mod tests {
             tp.support_interface_count > 0,
             "Expected Support Interface toolpaths (feature_kind == 8) beneath the cantilever contact ceiling, got 0"
         );
+        // Verify that the first layer on the build plate lays down a SupportInterface pad (feature_kind == 8)
+        // when `support_bed_interface_layers >= 1` (default 1):
+        let first_layer_has_bed_intf = tp
+            .layers
+            .first()
+            .is_some_and(|l| l.paths.iter().any(|p| p.feature_kind == 8));
+        assert!(
+            first_layer_has_bed_intf,
+            "Expected first layer (on the build plate) to contain a SupportInterface (feature_kind == 8) pad when support_bed_interface_layers = 1"
+        );
+
+        // Verify that setting `support_bed_interface_layers = 0` switches the first layer back to Support Base (feature_kind == 7):
+        cfg.slicing.support_bed_interface_layers = 0;
+        crate::ui::sync_config_to_backend(&cfg);
+        let tp_no_bed_intf = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        let first_layer_intf_when_zero = tp_no_bed_intf
+            .layers
+            .first()
+            .is_some_and(|l| l.paths.iter().any(|p| p.feature_kind == 8));
+        let first_layer_base_when_zero = tp_no_bed_intf
+            .layers
+            .first()
+            .is_some_and(|l| l.paths.iter().any(|p| p.feature_kind == 7));
+        assert!(
+            !first_layer_intf_when_zero && first_layer_base_when_zero,
+            "Expected first layer to use Support Base (7) and not SupportInterface (8) when support_bed_interface_layers = 0"
+        );
+        cfg.slicing.support_bed_interface_layers = 1;
+        crate::ui::sync_config_to_backend(&cfg);
 
         let planned = crate::gcode::plan_and_emit_gcode_for_object(
             "support_detection_test_arch",
