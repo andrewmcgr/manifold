@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <openvdb/openvdb.h>
@@ -191,8 +192,13 @@ public:
         const EikonalSolverContext& ctx) const override;
 
     /// Computes the maximum allowable layer slope angle \alpha_{max} (radians) relative to the
-    /// plane perpendicular to the tool axis from a tool's XZ clearance profile.
+    /// plane perpendicular to the tool axis from a tool's clearance profile.
     static float computeMaxClearanceSlopeRad(const ToolSpec& tool) noexcept;
+
+    /// Computes the maximum allowable layer slope angles (\alpha_{max,X}, \alpha_{max,Y}) (radians)
+    /// along the local nozzle frame's `travel_axis` (X) and `lateral_axis` (Y) relative to the
+    /// plane perpendicular to `nozzle_axis`.
+    static std::pair<float, float> computeMaxClearanceSlopeXYRad(const ToolSpec& tool) noexcept;
 };
 
 /// Uses the gravity-aware `"overhang"` field to accelerate outward layer growth into

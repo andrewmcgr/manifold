@@ -2549,6 +2549,7 @@ mod tests {
                 ffi::ClearanceXZ { x_radius_mm: 0.6, z_height_mm: 0.0 },
                 ffi::ClearanceXZ { x_radius_mm: 4.0, z_height_mm: 5.0 },
             ],
+            ..Default::default()
         }];
         ffi::set_machine_tools(&tools, 0);
         ffi::set_eikonal_solver_iterations(3);
@@ -2623,6 +2624,7 @@ mod tests {
                 ffi::ClearanceXZ { x_radius_mm: 0.6, z_height_mm: 0.0 },
                 ffi::ClearanceXZ { x_radius_mm: 5.0, z_height_mm: 1.0 },
             ],
+            ..Default::default()
         }];
         ffi::set_machine_tools(&narrow_fixed_tool, 0);
         assert!(ffi::recompute_object_fields(part.object_id, 1.0, 3.0));
@@ -2797,6 +2799,7 @@ mod tests {
                 ffi::ClearanceXZ { x_radius_mm: 0.5, z_height_mm: 0.0 },
                 ffi::ClearanceXZ { x_radius_mm: 3.0, z_height_mm: 6.0 },
             ],
+            ..Default::default()
         }];
         ffi::set_machine_tools(&tools, 0);
         ffi::set_eikonal_solver_iterations(4);
@@ -4526,6 +4529,7 @@ mod tests {
                 ffi::ClearanceXZ { x_radius_mm: 0.6, z_height_mm: 0.0 },
                 ffi::ClearanceXZ { x_radius_mm: 12.0, z_height_mm: 6.0 },
             ],
+            ..Default::default()
         }];
         ffi::set_machine_tools(&tools, 0);
         ffi::set_eikonal_solver_iterations(3);
@@ -4925,6 +4929,77 @@ mod tests {
             "Expected support beneath the causally unreachable floating island when support_only_unreachable_and_bridges=true"
         );
         let _ = ffi::remove_cad_object(island_part.object_id);
+    }
+
+    #[test]
+    fn test_rectilinear_cone_clearance_clamps_anisotropic_slopes() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let positions: [f32; 24] = [
+            -6.0, -6.0, 0.0,
+             6.0, -6.0, 0.0,
+             6.0,  6.0, 0.0,
+            -6.0,  6.0, 0.0,
+            -6.0, -6.0, 12.0,
+             6.0, -6.0, 12.0,
+             6.0,  6.0, 12.0,
+            -6.0,  6.0, 12.0,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2,
+            4, 5, 6, 4, 6, 7,
+            0, 1, 5, 0, 5, 4,
+            2, 3, 7, 2, 7, 6,
+            0, 4, 7, 0, 7, 3,
+            1, 2, 6, 1, 6, 5,
+        ];
+        let part = ffi::register_triangle_mesh("rect_cone_cube", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        // Configure a 3-axis tool (has_rotational_axes = false) with an asymmetric RectilinearCone:
+        // - In X: narrow cone (rect_half_angle_x_deg = 25° => max layer slope α_max,X = 65°)
+        // - In Y: wide shroud (rect_half_angle_y_deg = 78° => max layer slope α_max,Y = 12°)
+        let mut cfg = crate::config::SlicerConfig::default();
+        cfg.tools[0].has_rotational_axes = false;
+        cfg.tools[0].clearance_mode = crate::config::ClearanceProfileMode::RectilinearCone;
+        cfg.tools[0].rect_tip_half_width_x_mm = 0.5;
+        cfg.tools[0].rect_tip_half_width_y_mm = 0.5;
+        cfg.tools[0].rect_half_angle_x_deg = 25.0;
+        cfg.tools[0].rect_half_angle_y_deg = 78.0;
+        cfg.tools[0].rect_height_mm = 45.0;
+        crate::ui::sync_config_to_backend(&cfg);
+
+        // Apply an equal diagonal 3D orientation hint in +X and +Y: (0.60, 0.60, 0.529)
+        let hints = vec![ffi::SpatialOrientationHint {
+            kind: 1,
+            position_bed: [0.0, 0.0, 6.0],
+            direction_bed: [0.60, 0.60, 0.52915],
+            influence_radius_mm: 25.0,
+            weight: 1.0,
+            apply_on_surface_only: false,
+        }];
+        ffi::set_spatial_orientation_hints(&hints);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.8, 3.0));
+
+        // Sample the Eikonal field on a mid-height Z slice (axis=2, normalizedPos=0.5)
+        // Because α_max,X = 65° >> α_max,Y = 12°, the Eikonal arrival time τ must vary much
+        // more strongly across X (cols) than across Y (rows).
+        let z_slice = ffi::sample_field_slice(part.object_id, "eikonal", 2, 0.5, 16);
+        assert!(z_slice.valid);
+        let mid = 8usize;
+        let tau_x_neg = z_slice.values[mid * 16 + 4];
+        let tau_x_pos = z_slice.values[mid * 16 + 11];
+        let tau_y_neg = z_slice.values[4 * 16 + mid];
+        let tau_y_pos = z_slice.values[11 * 16 + mid];
+        let delta_x = (tau_x_pos - tau_x_neg).abs();
+        let delta_y = (tau_y_pos - tau_y_neg).abs();
+        assert!(
+            delta_x > 1.8 * delta_y,
+            "Expected asymmetric RectilinearCone to allow much steeper slope in X than Y (delta_x={delta_x}, delta_y={delta_y})"
+        );
+
+        ffi::set_spatial_orientation_hints(&[]);
+        let _ = ffi::remove_cad_object(part.object_id);
     }
 }
 

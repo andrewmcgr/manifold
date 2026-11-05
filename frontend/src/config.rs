@@ -91,6 +91,53 @@ impl ClearancePointXZ {
     }
 }
 
+/// Geometry representation mode for a tool's collision clearance envelope in the local nozzle frame
+/// $(\hat{\mathbf{x}}_{\text{nozzle}}, \hat{\mathbf{y}}_{\text{nozzle}}, \hat{\mathbf{z}}_{\text{nozzle}})$.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ClearanceProfileMode {
+    /// Multi-point piecewise-linear `(X_radius, Z_height)` profile revolved around `nozzle_axis`.
+    #[default]
+    PiecewiseXZ,
+    /// Single straight-sided parametric circular cone defined by tip radius, cone half-angle from
+    /// `nozzle_axis`, and axial height.
+    ParametricCone,
+    /// 4-sided rectangular / pyramidal rectilinear cone in the local nozzle frame with independent
+    /// X (`travel_axis`) and Y (`lateral_axis`) tip half-widths and cone half-angles around `nozzle_axis`.
+    RectilinearCone,
+}
+
+impl ClearanceProfileMode {
+    pub const ALL: [Self; 3] = [
+        Self::PiecewiseXZ,
+        Self::ParametricCone,
+        Self::RectilinearCone,
+    ];
+
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::PiecewiseXZ => 0,
+            Self::ParametricCone => 1,
+            Self::RectilinearCone => 2,
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::ParametricCone,
+            2 => Self::RectilinearCone,
+            _ => Self::PiecewiseXZ,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PiecewiseXZ => "Piecewise XZ",
+            Self::ParametricCone => "Circular Cone",
+            Self::RectilinearCone => "Rectilinear Cone (XY)",
+        }
+    }
+}
+
 /// Properties, rotational axis capabilities, and local-frame clearance envelope for one machine extrusion tool.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -105,9 +152,27 @@ pub struct ToolConfig {
     pub has_rotational_axes: bool,
     /// Maximum allowable angle (in degrees) between the tool axis (`nozzle_axis`) and the bed normal (`+Z_bed`).
     pub max_angle_from_bed_normal_deg: f32,
+    /// Clearance envelope geometry mode (`PiecewiseXZ`, `ParametricCone`, or `RectilinearCone`).
+    pub clearance_mode: ClearanceProfileMode,
     /// Piecewise-linear clearance profile in the nozzle frame `(radius_x_mm, height_z_mm)`,
     /// ordered by ascending `z_height_mm` from the nozzle tip (`z = 0`).
     pub clearance_profile_xz: Vec<ClearancePointXZ>,
+    /// Parametric circular cone tip flat radius at `z = 0` in the local nozzle frame (mm).
+    pub cone_tip_radius_mm: f32,
+    /// Parametric circular cone half-angle measured from `nozzle_axis` ($\hat{\mathbf{z}}_{\text{nozzle}}$) in degrees.
+    pub cone_half_angle_deg: f32,
+    /// Parametric circular cone axial height along `nozzle_axis` (mm).
+    pub cone_height_mm: f32,
+    /// Rectilinear pyramid cone tip half-width along `travel_axis` ($\hat{\mathbf{x}}_{\text{nozzle}}$) at `z = 0` (mm).
+    pub rect_tip_half_width_x_mm: f32,
+    /// Rectilinear pyramid cone tip half-width along `lateral_axis` ($\hat{\mathbf{y}}_{\text{nozzle}}$) at `z = 0` (mm).
+    pub rect_tip_half_width_y_mm: f32,
+    /// Rectilinear pyramid cone half-angle in the local $XZ$ plane measured from `nozzle_axis` (deg).
+    pub rect_half_angle_x_deg: f32,
+    /// Rectilinear pyramid cone half-angle in the local $YZ$ plane measured from `nozzle_axis` (deg).
+    pub rect_half_angle_y_deg: f32,
+    /// Rectilinear pyramid cone axial height along `nozzle_axis` (mm).
+    pub rect_height_mm: f32,
 }
 
 impl Default for ToolConfig {
@@ -133,6 +198,7 @@ impl ToolConfig {
             temperature_celsius,
             has_rotational_axes: true,
             max_angle_from_bed_normal_deg: 45.0,
+            clearance_mode: ClearanceProfileMode::PiecewiseXZ,
             clearance_profile_xz: vec![
                 ClearancePointXZ::new(tip_outer_r, 0.0),
                 ClearancePointXZ::new(2.5, 2.0),
@@ -140,12 +206,68 @@ impl ToolConfig {
                 ClearancePointXZ::new(22.0, 18.0),
                 ClearancePointXZ::new(28.0, 45.0),
             ],
+            cone_tip_radius_mm: tip_outer_r,
+            cone_half_angle_deg: 35.0,
+            cone_height_mm: 45.0,
+            rect_tip_half_width_x_mm: tip_outer_r,
+            rect_tip_half_width_y_mm: tip_outer_r,
+            rect_half_angle_x_deg: 35.0,
+            rect_half_angle_y_deg: 25.0,
+            rect_height_mm: 45.0,
         }
     }
 
-    /// Evaluates the interpolated clearance radius (mm) at a given height `z_mm` above the nozzle tip
-    /// in the nozzle's local frame.
-    pub fn clearance_radius_at_z(&self, z_mm: f32) -> Option<f32> {
+    /// Evaluates the local-frame `(half_width_x_mm, half_width_y_mm)` clearance at height `z_mm`
+    /// above the nozzle tip along `nozzle_axis`.
+    pub fn clearance_half_widths_xy_at_z(&self, z_mm: f32) -> Option<(f32, f32)> {
+        if z_mm < 0.0 {
+            return None;
+        }
+        match self.clearance_mode {
+            ClearanceProfileMode::PiecewiseXZ => {
+                let r = self.piecewise_radius_at_z(z_mm)?;
+                Some((r, r))
+            }
+            ClearanceProfileMode::ParametricCone => {
+                let z_clamped = z_mm.min(self.cone_height_mm.max(1.0));
+                let r0 = self
+                    .cone_tip_radius_mm
+                    .max(0.5 * self.nozzle_diameter_mm)
+                    .max(0.2);
+                let tan_theta = self
+                    .cone_half_angle_deg
+                    .clamp(5.0, 80.0)
+                    .to_radians()
+                    .tan();
+                let r = r0 + z_clamped * tan_theta;
+                Some((r, r))
+            }
+            ClearanceProfileMode::RectilinearCone => {
+                let z_clamped = z_mm.min(self.rect_height_mm.max(1.0));
+                let wx0 = self
+                    .rect_tip_half_width_x_mm
+                    .max(0.5 * self.nozzle_diameter_mm)
+                    .max(0.2);
+                let wy0 = self
+                    .rect_tip_half_width_y_mm
+                    .max(0.5 * self.nozzle_diameter_mm)
+                    .max(0.2);
+                let tan_x = self
+                    .rect_half_angle_x_deg
+                    .clamp(5.0, 80.0)
+                    .to_radians()
+                    .tan();
+                let tan_y = self
+                    .rect_half_angle_y_deg
+                    .clamp(5.0, 80.0)
+                    .to_radians()
+                    .tan();
+                Some((wx0 + z_clamped * tan_x, wy0 + z_clamped * tan_y))
+            }
+        }
+    }
+
+    fn piecewise_radius_at_z(&self, z_mm: f32) -> Option<f32> {
         if self.clearance_profile_xz.is_empty() || z_mm < 0.0 {
             return None;
         }
@@ -166,6 +288,86 @@ impl ToolConfig {
             }
         }
         self.clearance_profile_xz.last().map(|p| p.x_radius_mm)
+    }
+
+    /// Evaluates the conservative radial clearance (mm) at a given height `z_mm` above the nozzle tip
+    /// in the nozzle's local frame.
+    pub fn clearance_radius_at_z(&self, z_mm: f32) -> Option<f32> {
+        self.clearance_half_widths_xy_at_z(z_mm)
+            .map(|(wx, wy)| wx.max(wy))
+    }
+
+    /// Returns the maximum allowable layer slope angles `(alpha_max_x_deg, alpha_max_y_deg)`
+    /// relative to the plane perpendicular to `nozzle_axis` along local X (`travel_axis`) and Y (`lateral_axis`).
+    pub fn max_layer_slope_xy_deg(&self) -> (f32, f32) {
+        match self.clearance_mode {
+            ClearanceProfileMode::PiecewiseXZ => {
+                if self.clearance_profile_xz.is_empty() {
+                    return (45.0, 45.0);
+                }
+                let mut r0 = (0.5 * self.nozzle_diameter_mm).max(0.2);
+                for pt in &self.clearance_profile_xz {
+                    if pt.z_height_mm <= 1.0e-3 {
+                        r0 = r0.max(pt.x_radius_mm);
+                    }
+                }
+                let mut min_tan = 75.0_f32.to_radians().tan();
+                let mut found = false;
+                for pt in &self.clearance_profile_xz {
+                    if pt.z_height_mm > 0.05 {
+                        found = true;
+                        let dr = (pt.x_radius_mm - r0).max(0.05);
+                        min_tan = min_tan.min(pt.z_height_mm / dr);
+                    }
+                }
+                let alpha = if found {
+                    min_tan.atan().to_degrees().clamp(8.0, 75.0)
+                } else {
+                    45.0
+                };
+                (alpha, alpha)
+            }
+            ClearanceProfileMode::ParametricCone => {
+                let alpha = (90.0 - self.cone_half_angle_deg.clamp(5.0, 80.0)).clamp(8.0, 75.0);
+                (alpha, alpha)
+            }
+            ClearanceProfileMode::RectilinearCone => {
+                let alpha_x =
+                    (90.0 - self.rect_half_angle_x_deg.clamp(5.0, 80.0)).clamp(8.0, 75.0);
+                let alpha_y =
+                    (90.0 - self.rect_half_angle_y_deg.clamp(5.0, 80.0)).clamp(8.0, 75.0);
+                (alpha_x, alpha_y)
+            }
+        }
+    }
+
+    /// Converts this `ToolConfig` into the C++/Rust FFI `ToolSpec` struct.
+    pub fn to_ffi_tool_spec(&self) -> crate::bridge::ffi::ToolSpec {
+        crate::bridge::ffi::ToolSpec {
+            id: self.id,
+            name: self.name.clone(),
+            nozzle_diameter_mm: self.nozzle_diameter_mm,
+            temperature_celsius: self.temperature_celsius,
+            has_rotational_axes: self.has_rotational_axes,
+            max_angle_from_bed_normal_deg: self.max_angle_from_bed_normal_deg,
+            clearance_mode: self.clearance_mode.as_u8(),
+            clearance_profile_xz: self
+                .clearance_profile_xz
+                .iter()
+                .map(|p| crate::bridge::ffi::ClearanceXZ {
+                    x_radius_mm: p.x_radius_mm,
+                    z_height_mm: p.z_height_mm,
+                })
+                .collect(),
+            cone_tip_radius_mm: self.cone_tip_radius_mm,
+            cone_half_angle_deg: self.cone_half_angle_deg,
+            cone_height_mm: self.cone_height_mm,
+            rect_tip_half_width_x_mm: self.rect_tip_half_width_x_mm,
+            rect_tip_half_width_y_mm: self.rect_tip_half_width_y_mm,
+            rect_half_angle_x_deg: self.rect_half_angle_x_deg,
+            rect_half_angle_y_deg: self.rect_half_angle_y_deg,
+            rect_height_mm: self.rect_height_mm,
+        }
     }
 }
 
@@ -2042,11 +2244,11 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
     ParameterDoc {
         key: "tools.clearance_profile_xz",
         category: "Machine Tools & Multi-Axis Kinematics",
-        title: "Nozzle Clearance Profile (XZ in Nozzle Frame)",
-        units: "mm (X radius, Z height)",
-        default_value: "4-point cone profile",
-        summary: "Piecewise-linear radial envelope `(X_radius, Z_height)` of the nozzle tip, heater block, and fan shroud.",
-        details: "Defined in the local nozzle frame (`Z >= 0` up along `nozzle_axis`, `X >= 0` radial distance) to bound collision-free non-planar slopes.",
+        title: "Nozzle Clearance Profile (Piecewise XZ / Circular Cone / Rectilinear XY Cone)",
+        units: "mm / deg (°)",
+        default_value: "Piecewise XZ (5-point profile)",
+        summary: "Collision clearance envelope of the nozzle tip, heater block, and fan shroud in the local nozzle frame.",
+        details: "Supports three modes in the local nozzle frame `(x_nozzle, y_nozzle, z_nozzle)` (`Z >= 0` up along `nozzle_axis`): (1) `PiecewiseXZ` multi-point revolved `(X_radius, Z_height)` table, (2) `ParametricCone` straight-sided circular cone (`cone_tip_radius_mm`, `cone_half_angle_deg`, `cone_height_mm`), and (3) `RectilinearCone` 4-sided rectangular pyramid (`rect_tip_half_width_x/y_mm`, `rect_half_angle_x/y_deg`, `rect_height_mm`) for asymmetric rectangular fan shrouds and heater blocks.",
     },
     ParameterDoc {
         key: "machine.bed_tilt_deg",
@@ -2263,5 +2465,43 @@ mod tests {
         cfg.bed.shape = BedShape::Circular;
         assert_eq!(cfg.gcode_origin_scene_pos(), Vec3::ZERO);
         assert_eq!(cfg.scene_to_gcode_offset(), Vec3::ZERO);
+    }
+
+    #[test]
+    fn test_parametric_and_rectilinear_cone_clearance_modes() {
+        let mut tool = ToolConfig::default();
+        assert_eq!(tool.clearance_mode, ClearanceProfileMode::PiecewiseXZ);
+
+        // 1. Parametric Circular Cone: tip r0 = 0.5 mm, half-angle = 45 deg, height = 40 mm
+        tool.clearance_mode = ClearanceProfileMode::ParametricCone;
+        tool.cone_tip_radius_mm = 0.5;
+        tool.cone_half_angle_deg = 45.0;
+        tool.cone_height_mm = 40.0;
+        let (ax, ay) = tool.max_layer_slope_xy_deg();
+        assert!((ax - 45.0).abs() < 1.0e-4);
+        assert!((ay - 45.0).abs() < 1.0e-4);
+        let (wx10, wy10) = tool.clearance_half_widths_xy_at_z(10.0).unwrap();
+        assert!((wx10 - 10.5).abs() < 1.0e-4);
+        assert!((wy10 - 10.5).abs() < 1.0e-4);
+
+        // 2. Rectilinear (XY) Pyramid Cone: asymmetric X (30 deg) vs. Y (60 deg)
+        tool.clearance_mode = ClearanceProfileMode::RectilinearCone;
+        tool.rect_tip_half_width_x_mm = 0.6;
+        tool.rect_tip_half_width_y_mm = 0.8;
+        tool.rect_half_angle_x_deg = 30.0; // max slope X = 60 deg
+        tool.rect_half_angle_y_deg = 60.0; // max slope Y = 30 deg
+        tool.rect_height_mm = 45.0;
+        let (rx_deg, ry_deg) = tool.max_layer_slope_xy_deg();
+        assert!((rx_deg - 60.0).abs() < 1.0e-4);
+        assert!((ry_deg - 30.0).abs() < 1.0e-4);
+        let (wx, wy) = tool.clearance_half_widths_xy_at_z(10.0).unwrap();
+        assert!((wx - (0.6 + 10.0 * 30.0_f32.to_radians().tan())).abs() < 1.0e-4);
+        assert!((wy - (0.8 + 10.0 * 60.0_f32.to_radians().tan())).abs() < 1.0e-4);
+        assert!((tool.clearance_radius_at_z(10.0).unwrap() - wy).abs() < 1.0e-4);
+
+        let ffi_spec = tool.to_ffi_tool_spec();
+        assert_eq!(ffi_spec.clearance_mode, 2);
+        assert!((ffi_spec.rect_half_angle_x_deg - 30.0).abs() < 1.0e-4);
+        assert!((ffi_spec.rect_half_angle_y_deg - 60.0).abs() < 1.0e-4);
     }
 }

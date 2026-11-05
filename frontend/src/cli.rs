@@ -657,6 +657,33 @@ pub fn resolve_canonical_config_key(cfg_val: &JsonValue, raw_key: &str) -> Resul
         "clearance_profile_xz" => {
             return Ok("tools.0.clearance_profile_xz".to_string());
         }
+        "clearance_mode" => {
+            return Ok("tools.0.clearance_mode".to_string());
+        }
+        "cone_tip_radius_mm" => {
+            return Ok("tools.0.cone_tip_radius_mm".to_string());
+        }
+        "cone_half_angle_deg" => {
+            return Ok("tools.0.cone_half_angle_deg".to_string());
+        }
+        "cone_height_mm" => {
+            return Ok("tools.0.cone_height_mm".to_string());
+        }
+        "rect_tip_half_width_x_mm" => {
+            return Ok("tools.0.rect_tip_half_width_x_mm".to_string());
+        }
+        "rect_tip_half_width_y_mm" => {
+            return Ok("tools.0.rect_tip_half_width_y_mm".to_string());
+        }
+        "rect_half_angle_x_deg" => {
+            return Ok("tools.0.rect_half_angle_x_deg".to_string());
+        }
+        "rect_half_angle_y_deg" => {
+            return Ok("tools.0.rect_half_angle_y_deg".to_string());
+        }
+        "rect_height_mm" => {
+            return Ok("tools.0.rect_height_mm".to_string());
+        }
         "bed_shape" => {
             return Ok("bed.shape".to_string());
         }

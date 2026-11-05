@@ -77,8 +77,90 @@ std::array<float, 3> clampUnitVectorToCone(
     return normalize3(clamped, refAxis);
 }
 
+/// Constructs the orthonormal right-handed local nozzle basis `(travel_axis, lateral_axis, nozzle_axis)`
+/// for a tilted tool axis `nozzleAxisInput` and reference travel direction `travelDirInput`.
+NozzleBasis buildNozzleBasisForToolAxis(
+    const std::array<float, 3>& nozzleAxisInput,
+    const std::array<float, 3>& travelDirInput) noexcept
+{
+    const auto zNozzle = normalize3(nozzleAxisInput, {0.0f, 0.0f, 1.0f});
+    const float dotTZ = dot3(travelDirInput, zNozzle);
+    std::array<float, 3> tRaw{
+        travelDirInput[0] - dotTZ * zNozzle[0],
+        travelDirInput[1] - dotTZ * zNozzle[1],
+        travelDirInput[2] - dotTZ * zNozzle[2]};
+    float tLen = length3(tRaw);
+    if (tLen <= 1.0e-6f) {
+        const std::array<float, 3> refAxis =
+            (std::abs(zNozzle[0]) < 0.9f) ? std::array<float, 3>{1.0f, 0.0f, 0.0f}
+                                          : std::array<float, 3>{0.0f, 1.0f, 0.0f};
+        const float dotRef = dot3(refAxis, zNozzle);
+        tRaw = {
+            refAxis[0] - dotRef * zNozzle[0],
+            refAxis[1] - dotRef * zNozzle[1],
+            refAxis[2] - dotRef * zNozzle[2]};
+        tLen = length3(tRaw);
+    }
+    const std::array<float, 3> xTravel = (tLen > 1.0e-7f)
+        ? std::array<float, 3>{tRaw[0] / tLen, tRaw[1] / tLen, tRaw[2] / tLen}
+        : std::array<float, 3>{1.0f, 0.0f, 0.0f};
+    const std::array<float, 3> lRaw{
+        zNozzle[1] * xTravel[2] - zNozzle[2] * xTravel[1],
+        zNozzle[2] * xTravel[0] - zNozzle[0] * xTravel[2],
+        zNozzle[0] * xTravel[1] - zNozzle[1] * xTravel[0]};
+    const auto yLateral = normalize3(lRaw, {0.0f, 1.0f, 0.0f});
+    NozzleBasis basis{};
+    basis.nozzle_axis = zNozzle;
+    basis.travel_axis = xTravel;
+    basis.lateral_axis = yLateral;
+    return basis;
+}
+
+/// Clamps unit vector `u` onto the 4-sided rectilinear pyramid cone in the local nozzle frame
+/// `basis` with half-angles `maxAngleXRad` (in the local XZ plane) and `maxAngleYRad` (in the
+/// local YZ plane) around `basis.nozzle_axis`, independently clamping the tangent components
+/// `(tx, ty)` onto `[-\tan\alpha_{max,X}, +\tan\alpha_{max,X}] \times [-\tan\alpha_{max,Y}, +\tan\alpha_{max,Y}]`.
+std::array<float, 3> clampUnitVectorToRectilinearCone(
+    const std::array<float, 3>& u,
+    const NozzleBasis& basis,
+    float maxAngleXRad,
+    float maxAngleYRad) noexcept
+{
+    const float clampedMaxX = std::clamp(maxAngleXRad, 0.0f, 0.495f * kPi);
+    const float clampedMaxY = std::clamp(maxAngleYRad, 0.0f, 0.495f * kPi);
+    if (clampedMaxX <= 1.0e-6f || clampedMaxY <= 1.0e-6f) {
+        return basis.nozzle_axis;
+    }
+
+    const float tanMaxX = std::tan(clampedMaxX);
+    const float tanMaxY = std::tan(clampedMaxY);
+    const float ux = dot3(u, basis.travel_axis);
+    const float uy = dot3(u, basis.lateral_axis);
+    const float uz = dot3(u, basis.nozzle_axis);
+
+    if (uz > 0.0f &&
+        std::abs(ux) <= uz * tanMaxX &&
+        std::abs(uy) <= uz * tanMaxY) {
+        return u;
+    }
+
+    const float rXY = std::hypot(ux, uy);
+    if (rXY <= 1.0e-6f) {
+        return basis.nozzle_axis;
+    }
+
+    const float uzEff = std::max(uz, 1.0e-4f);
+    const float tx = std::clamp(ux / uzEff, -tanMaxX, tanMaxX);
+    const float ty = std::clamp(uy / uzEff, -tanMaxY, tanMaxY);
+    const std::array<float, 3> clamped{
+        basis.nozzle_axis[0] + tx * basis.travel_axis[0] + ty * basis.lateral_axis[0],
+        basis.nozzle_axis[1] + tx * basis.travel_axis[1] + ty * basis.lateral_axis[1],
+        basis.nozzle_axis[2] + tx * basis.travel_axis[2] + ty * basis.lateral_axis[2]};
+    return normalize3(clamped, basis.nozzle_axis);
+}
+
 /// Computes the maximum tilt angle \gamma (radians) from the bed normal at height `hBedMm`
-/// above the bed so that none of the XZ clearance profile stages (r_m, z_m) intersect the bed:
+/// above the bed so that none of the clearance profile stages (r_m, z_m) intersect the bed:
 ///   hBedMm + z_m * cos(\gamma) - r_m * sin(\gamma) >= 0.
 float computeBedSafeTiltRad(
     const ToolSpec& tool,
@@ -86,24 +168,45 @@ float computeBedSafeTiltRad(
     float userMaxAngleRad) noexcept
 {
     float safeMax = std::clamp(userMaxAngleRad, 0.0f, 85.0f * kDegToRad);
-    if (safeMax <= 1.0e-5f || tool.clearance_profile_xz.empty()) {
+    if (safeMax <= 1.0e-5f) {
         return safeMax;
     }
 
     const float h = std::max(0.0f, hBedMm);
-    for (const auto& pt : tool.clearance_profile_xz) {
-        const float r = std::max(0.0f, pt.x_radius_mm);
-        const float z = std::max(0.0f, pt.z_height_mm);
-        // Skip the z=0 nozzle tip orifice flat so the tip itself can tilt on lower layers;
-        // upper clearance profile stages (z > 0) constrain bed collision as a function of hBedMm.
+    auto clampStageRZ = [&](float r, float z) {
         if (r <= 1.0e-4f || z <= 1.0e-3f) {
-            continue;
+            return;
         }
         const float hypotRZ = std::hypot(r, z);
         const float phi = std::atan2(z, r);
         const float ratio = std::clamp(h / std::max(hypotRZ, 1.0e-5f), 0.0f, 1.0f);
         const float limitRad = phi + std::asin(ratio);
         safeMax = std::min(safeMax, limitRad);
+    };
+
+    if (tool.clearance_mode == 1) {
+        const float zTop = std::max(1.0f, tool.cone_height_mm);
+        const float r0 = std::max({tool.cone_tip_radius_mm, 0.5f * tool.nozzle_diameter_mm, 0.2f});
+        const float thetaRad = std::clamp(tool.cone_half_angle_deg, 5.0f, 80.0f) * kDegToRad;
+        const float rTop = r0 + zTop * std::tan(thetaRad);
+        clampStageRZ(rTop, zTop);
+    } else if (tool.clearance_mode == 2) {
+        const float zTop = std::max(1.0f, tool.rect_height_mm);
+        const float wx0 = std::max({tool.rect_tip_half_width_x_mm, 0.5f * tool.nozzle_diameter_mm, 0.2f});
+        const float wy0 = std::max({tool.rect_tip_half_width_y_mm, 0.5f * tool.nozzle_diameter_mm, 0.2f});
+        const float thetaXRad = std::clamp(tool.rect_half_angle_x_deg, 5.0f, 80.0f) * kDegToRad;
+        const float thetaYRad = std::clamp(tool.rect_half_angle_y_deg, 5.0f, 80.0f) * kDegToRad;
+        const float wxTop = wx0 + zTop * std::tan(thetaXRad);
+        const float wyTop = wy0 + zTop * std::tan(thetaYRad);
+        clampStageRZ(std::max(wxTop, wyTop), zTop);
+    } else {
+        for (const auto& pt : tool.clearance_profile_xz) {
+            const float r = std::max(0.0f, pt.x_radius_mm);
+            const float z = std::max(0.0f, pt.z_height_mm);
+            // Skip the z=0 nozzle tip orifice flat so the tip itself can tilt on lower layers;
+            // upper clearance profile stages (z > 0) constrain bed collision as a function of hBedMm.
+            clampStageRZ(r, z);
+        }
     }
 
     return std::max(0.0f, safeMax);
@@ -839,9 +942,24 @@ void ToolOrientationStrategy::updateToolOrientations(
 // 1. ToolClearanceConstraint Implementation (Parallelized via TBB)
 // ============================================================================
 
-float ToolClearanceConstraint::computeMaxClearanceSlopeRad(const ToolSpec& tool) noexcept {
+std::pair<float, float> ToolClearanceConstraint::computeMaxClearanceSlopeXYRad(
+    const ToolSpec& tool) noexcept
+{
+    if (tool.clearance_mode == 1) {
+        const float thetaDeg = std::clamp(tool.cone_half_angle_deg, 5.0f, 80.0f);
+        const float alphaRad = std::clamp((90.0f - thetaDeg) * kDegToRad, 8.0f * kDegToRad, 75.0f * kDegToRad);
+        return {alphaRad, alphaRad};
+    }
+    if (tool.clearance_mode == 2) {
+        const float thetaXDeg = std::clamp(tool.rect_half_angle_x_deg, 5.0f, 80.0f);
+        const float thetaYDeg = std::clamp(tool.rect_half_angle_y_deg, 5.0f, 80.0f);
+        const float alphaXRad = std::clamp((90.0f - thetaXDeg) * kDegToRad, 8.0f * kDegToRad, 75.0f * kDegToRad);
+        const float alphaYRad = std::clamp((90.0f - thetaYDeg) * kDegToRad, 8.0f * kDegToRad, 75.0f * kDegToRad);
+        return {alphaXRad, alphaYRad};
+    }
+
     if (tool.clearance_profile_xz.empty()) {
-        return 45.0f * kDegToRad;
+        return {45.0f * kDegToRad, 45.0f * kDegToRad};
     }
 
     float r0 = std::max(0.5f * tool.nozzle_diameter_mm, 0.2f);
@@ -863,18 +981,24 @@ float ToolClearanceConstraint::computeMaxClearanceSlopeRad(const ToolSpec& tool)
     }
 
     if (!foundPositiveZ) {
-        return 45.0f * kDegToRad;
+        return {45.0f * kDegToRad, 45.0f * kDegToRad};
     }
 
-    const float alphaRad = std::atan(minTanAlpha);
-    return std::clamp(alphaRad, 8.0f * kDegToRad, 75.0f * kDegToRad);
+    const float alphaRad = std::clamp(std::atan(minTanAlpha), 8.0f * kDegToRad, 75.0f * kDegToRad);
+    return {alphaRad, alphaRad};
+}
+
+float ToolClearanceConstraint::computeMaxClearanceSlopeRad(const ToolSpec& tool) noexcept {
+    const auto [alphaX, alphaY] = computeMaxClearanceSlopeXYRad(tool);
+    return std::min(alphaX, alphaY);
 }
 
 void ToolClearanceConstraint::applyPreSweepModifiers(
     ActiveVolumeDomain& domain,
     const EikonalSolverContext& ctx) const
 {
-    const float alphaMaxRad = computeMaxClearanceSlopeRad(ctx.activeTool);
+    const auto [alphaMaxXRad, alphaMaxYRad] = computeMaxClearanceSlopeXYRad(ctx.activeTool);
+    const bool isRectilinear = (ctx.activeTool.clearance_mode == 2);
     const std::size_t n = domain.coords.size();
 
     tbb::parallel_for(
@@ -888,10 +1012,18 @@ void ToolClearanceConstraint::applyPreSweepModifiers(
                 const auto& rawDir = domain.targetDir[i];
 
                 // Strictly clamp the target isosurface normal (including any soft orientation hints)
-                // to the tool's clearance cone centered on the ACTUAL solved tool axis `aAxis`.
-                // Note: Do not negate `rawDir` when `dot(rawDir, aAxis) < 0` as that would flip
-                // its radial azimuth by 180 degrees; `clampUnitVectorToCone` preserves radial azimuth.
-                domain.targetDir[i] = clampUnitVectorToCone(rawDir, aAxis, alphaMaxRad);
+                // to the tool's clearance cone or 4-sided rectilinear pyramid centered on the
+                // ACTUAL solved tool axis `aAxis` in the local nozzle frame.
+                if (isRectilinear) {
+                    const NozzleBasis baseFrame =
+                        ctx.backend.queryNozzleFrame(domain.posBed[i], {1.0f, 0.0f, 0.0f});
+                    const NozzleBasis localFrame =
+                        buildNozzleBasisForToolAxis(aAxis, baseFrame.travel_axis);
+                    domain.targetDir[i] = clampUnitVectorToRectilinearCone(
+                        rawDir, localFrame, alphaMaxXRad, alphaMaxYRad);
+                } else {
+                    domain.targetDir[i] = clampUnitVectorToCone(rawDir, aAxis, alphaMaxXRad);
+                }
             }
         });
 }
@@ -905,12 +1037,14 @@ void ToolClearanceConstraint::enforceOnField(
         return;
     }
 
-    const float alphaMaxRad = computeMaxClearanceSlopeRad(ctx.activeTool);
-    const float cosAlphaMax = std::cos(alphaMaxRad);
+    const auto [alphaMaxXRad, alphaMaxYRad] = computeMaxClearanceSlopeXYRad(ctx.activeTool);
+    const bool isRectilinear = (ctx.activeTool.clearance_mode == 2);
+    const float cosAlphaMax = std::cos(alphaMaxXRad);
+    const float tanAlphaMaxX = std::tan(std::clamp(alphaMaxXRad, 0.0f, 0.495f * kPi));
+    const float tanAlphaMaxY = std::tan(std::clamp(alphaMaxYRad, 0.0f, 0.495f * kPi));
 
     // 1. Check whether the discrete gradient \nabla \tau at any interior voxel violates
-    // the clearance cone of half-angle `alphaMaxRad` around the ACTUAL tool axis `domain.toolAxis[i]`.
-    // Voxels whose gradient already satisfies \angle(\nabla \tau, toolAxis) <= alphaMaxRad are untouched.
+    // the clearance cone / rectilinear pyramid around the ACTUAL tool axis `domain.toolAxis[i]`.
     std::vector<std::uint8_t> violatesCone(n, 0);
     std::atomic<bool> anyViolation{false};
 
@@ -925,18 +1059,45 @@ void ToolClearanceConstraint::enforceOnField(
                 const auto& aAxis = domain.toolAxis[i];
                 const auto g = computeVoxelTauGradient(domain, i);
                 const float gLen = length3(g);
-                if (gLen > 1.0e-4f) {
-                    const std::array<float, 3> gUnit{g[0] / gLen, g[1] / gLen, g[2] / gLen};
-                    const float cosTheta = dot3(gUnit, aAxis);
-                    if (cosTheta < cosAlphaMax - 1.0e-3f) {
-                        domain.targetDir[i] = clampUnitVectorToCone(gUnit, aAxis, alphaMaxRad);
-                        violatesCone[i] = 1;
-                        localViol = true;
+                if (isRectilinear) {
+                    const NozzleBasis baseFrame =
+                        ctx.backend.queryNozzleFrame(domain.posBed[i], {1.0f, 0.0f, 0.0f});
+                    const NozzleBasis localFrame =
+                        buildNozzleBasisForToolAxis(aAxis, baseFrame.travel_axis);
+                    if (gLen > 1.0e-4f) {
+                        const std::array<float, 3> gUnit{g[0] / gLen, g[1] / gLen, g[2] / gLen};
+                        const float ux = dot3(gUnit, localFrame.travel_axis);
+                        const float uy = dot3(gUnit, localFrame.lateral_axis);
+                        const float uz = dot3(gUnit, localFrame.nozzle_axis);
+                        if (uz <= 1.0e-4f ||
+                            std::abs(ux) > uz * tanAlphaMaxX + 1.0e-3f ||
+                            std::abs(uy) > uz * tanAlphaMaxY + 1.0e-3f) {
+                            domain.targetDir[i] = clampUnitVectorToRectilinearCone(
+                                gUnit, localFrame, alphaMaxXRad, alphaMaxYRad);
+                            violatesCone[i] = 1;
+                            localViol = true;
+                        } else {
+                            domain.targetDir[i] = clampUnitVectorToRectilinearCone(
+                                domain.targetDir[i], localFrame, alphaMaxXRad, alphaMaxYRad);
+                        }
                     } else {
-                        domain.targetDir[i] = clampUnitVectorToCone(domain.targetDir[i], aAxis, alphaMaxRad);
+                        domain.targetDir[i] = clampUnitVectorToRectilinearCone(
+                            domain.targetDir[i], localFrame, alphaMaxXRad, alphaMaxYRad);
                     }
                 } else {
-                    domain.targetDir[i] = clampUnitVectorToCone(domain.targetDir[i], aAxis, alphaMaxRad);
+                    if (gLen > 1.0e-4f) {
+                        const std::array<float, 3> gUnit{g[0] / gLen, g[1] / gLen, g[2] / gLen};
+                        const float cosTheta = dot3(gUnit, aAxis);
+                        if (cosTheta < cosAlphaMax - 1.0e-3f) {
+                            domain.targetDir[i] = clampUnitVectorToCone(gUnit, aAxis, alphaMaxXRad);
+                            violatesCone[i] = 1;
+                            localViol = true;
+                        } else {
+                            domain.targetDir[i] = clampUnitVectorToCone(domain.targetDir[i], aAxis, alphaMaxXRad);
+                        }
+                    } else {
+                        domain.targetDir[i] = clampUnitVectorToCone(domain.targetDir[i], aAxis, alphaMaxXRad);
+                    }
                 }
             }
             if (localViol) {

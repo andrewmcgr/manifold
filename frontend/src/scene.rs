@@ -11,7 +11,8 @@ use wgpu::util::DeviceExt;
 use crate::arrange::{auto_arrange_spiral, ArrangeItem};
 use crate::bridge::ffi::{self, RenderVertex};
 use crate::config::{
-    BedShape, PointNormalHint, SlicerConfig, SurfaceFaceHint, SurfaceHintMode,
+    BedShape, ClearanceProfileMode, PointNormalHint, SlicerConfig, SurfaceFaceHint,
+    SurfaceHintMode,
 };
 use crate::field_vis::SliceAxis;
 use crate::hull::{
@@ -1710,45 +1711,133 @@ pub fn draw_viewport_gizmos_system(
             Color::srgb(0.98, 0.32, 0.88),
         );
 
-        // Draw the active tool's revolved XZ clearance profile in the nozzle's local frame
+        // Draw the active tool's clearance profile in the nozzle's local frame
         if let Some(tool) = config.active_tool() {
             let profile_color = Color::srgba(1.0, 0.72, 0.18, 0.85);
-            let ring_segments = 24usize;
-            for pt in &tool.clearance_profile_xz {
-                let mut ring = Vec::with_capacity(ring_segments + 1);
-                for k in 0..=ring_segments {
-                    let theta = (k as f32 / ring_segments as f32) * std::f32::consts::TAU;
-                    let local_p = Vec3::new(
-                        pt.x_radius_mm * theta.cos(),
-                        pt.x_radius_mm * theta.sin(),
-                        pt.z_height_mm,
-                    );
-                    ring.push(frame.nozzle_local_to_bed(tip_bed, local_p));
-                }
-                gizmos.linestrip(ring, profile_color);
-            }
-            for dir_2d in [
-                Vec2::new(1.0, 0.0),
-                Vec2::new(-1.0, 0.0),
-                Vec2::new(0.0, 1.0),
-                Vec2::new(0.0, -1.0),
-            ] {
-                let meridian: Vec<Vec3> = tool
-                    .clearance_profile_xz
-                    .iter()
-                    .map(|pt| {
-                        frame.nozzle_local_to_bed(
-                            tip_bed,
-                            Vec3::new(
-                                dir_2d.x * pt.x_radius_mm,
-                                dir_2d.y * pt.x_radius_mm,
+            match tool.clearance_mode {
+                ClearanceProfileMode::PiecewiseXZ => {
+                    let ring_segments = 24usize;
+                    for pt in &tool.clearance_profile_xz {
+                        let mut ring = Vec::with_capacity(ring_segments + 1);
+                        for k in 0..=ring_segments {
+                            let theta = (k as f32 / ring_segments as f32) * std::f32::consts::TAU;
+                            let local_p = Vec3::new(
+                                pt.x_radius_mm * theta.cos(),
+                                pt.x_radius_mm * theta.sin(),
                                 pt.z_height_mm,
-                            ),
-                        )
-                    })
-                    .collect();
-                if meridian.len() >= 2 {
-                    gizmos.linestrip(meridian, profile_color);
+                            );
+                            ring.push(frame.nozzle_local_to_bed(tip_bed, local_p));
+                        }
+                        gizmos.linestrip(ring, profile_color);
+                    }
+                    for dir_2d in [
+                        Vec2::new(1.0, 0.0),
+                        Vec2::new(-1.0, 0.0),
+                        Vec2::new(0.0, 1.0),
+                        Vec2::new(0.0, -1.0),
+                    ] {
+                        let meridian: Vec<Vec3> = tool
+                            .clearance_profile_xz
+                            .iter()
+                            .map(|pt| {
+                                frame.nozzle_local_to_bed(
+                                    tip_bed,
+                                    Vec3::new(
+                                        dir_2d.x * pt.x_radius_mm,
+                                        dir_2d.y * pt.x_radius_mm,
+                                        pt.z_height_mm,
+                                    ),
+                                )
+                            })
+                            .collect();
+                        if meridian.len() >= 2 {
+                            gizmos.linestrip(meridian, profile_color);
+                        }
+                    }
+                }
+                ClearanceProfileMode::ParametricCone => {
+                    let ring_segments = 24usize;
+                    let h = tool.cone_height_mm.max(2.0);
+                    let z_levels = [0.0_f32, 0.5 * h, h];
+                    for &z in &z_levels {
+                        if let Some((r, _)) = tool.clearance_half_widths_xy_at_z(z) {
+                            let mut ring = Vec::with_capacity(ring_segments + 1);
+                            for k in 0..=ring_segments {
+                                let theta =
+                                    (k as f32 / ring_segments as f32) * std::f32::consts::TAU;
+                                let local_p = Vec3::new(r * theta.cos(), r * theta.sin(), z);
+                                ring.push(frame.nozzle_local_to_bed(tip_bed, local_p));
+                            }
+                            gizmos.linestrip(ring, profile_color);
+                        }
+                    }
+                    if let (Some((r0, _)), Some((r1, _))) = (
+                        tool.clearance_half_widths_xy_at_z(0.0),
+                        tool.clearance_half_widths_xy_at_z(h),
+                    ) {
+                        for dir_2d in [
+                            Vec2::new(1.0, 0.0),
+                            Vec2::new(-1.0, 0.0),
+                            Vec2::new(0.0, 1.0),
+                            Vec2::new(0.0, -1.0),
+                        ] {
+                            let p0 = frame.nozzle_local_to_bed(
+                                tip_bed,
+                                Vec3::new(dir_2d.x * r0, dir_2d.y * r0, 0.0),
+                            );
+                            let p1 = frame.nozzle_local_to_bed(
+                                tip_bed,
+                                Vec3::new(dir_2d.x * r1, dir_2d.y * r1, h),
+                            );
+                            gizmos.line(p0, p1, profile_color);
+                        }
+                    }
+                }
+                ClearanceProfileMode::RectilinearCone => {
+                    let h = tool.rect_height_mm.max(2.0);
+                    let z_levels = [0.0_f32, 0.5 * h, h];
+                    for &z in &z_levels {
+                        if let Some((wx, wy)) = tool.clearance_half_widths_xy_at_z(z) {
+                            let corners = [
+                                Vec3::new(wx, wy, z),
+                                Vec3::new(-wx, wy, z),
+                                Vec3::new(-wx, -wy, z),
+                                Vec3::new(wx, -wy, z),
+                                Vec3::new(wx, wy, z),
+                            ];
+                            let rect_strip: Vec<Vec3> = corners
+                                .iter()
+                                .map(|&c| frame.nozzle_local_to_bed(tip_bed, c))
+                                .collect();
+                            gizmos.linestrip(rect_strip, profile_color);
+                        }
+                    }
+                    if let (Some((wx0, wy0)), Some((wx1, wy1))) = (
+                        tool.clearance_half_widths_xy_at_z(0.0),
+                        tool.clearance_half_widths_xy_at_z(h),
+                    ) {
+                        // 4 corner pyramid edges + 4 principal axis face-center lines
+                        for (sx, sy) in [
+                            (1.0_f32, 1.0_f32),
+                            (-1.0, 1.0),
+                            (-1.0, -1.0),
+                            (1.0, -1.0),
+                            (1.0, 0.0),
+                            (-1.0, 0.0),
+                            (0.0, 1.0),
+                            (0.0, -1.0),
+                        ] {
+                            let p0 = frame.nozzle_local_to_bed(
+                                tip_bed,
+                                Vec3::new(sx * wx0, sy * wy0, 0.0),
+                            );
+                            let p1 = frame.nozzle_local_to_bed(
+                                tip_bed,
+                                Vec3::new(sx * wx1, sy * wy1, h),
+                            );
+                            gizmos.line(p0, p1, profile_color);
+                        }
+                    }
                 }
             }
         }

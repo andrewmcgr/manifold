@@ -1320,12 +1320,21 @@ ToolSpec makeDefaultTool(std::uint32_t id, const char* name, float diameterMm, f
     t.temperature_celsius = tempC;
     t.has_rotational_axes = true;
     t.max_angle_from_bed_normal_deg = 45.0f;
+    t.clearance_mode = 0;
     const float tipOuterR = std::max(diameterMm * 1.25f, 0.4f);
     t.clearance_profile_xz.push_back(ClearanceXZ{tipOuterR, 0.0f});
     t.clearance_profile_xz.push_back(ClearanceXZ{2.5f, 2.0f});
     t.clearance_profile_xz.push_back(ClearanceXZ{9.0f, 6.0f});
     t.clearance_profile_xz.push_back(ClearanceXZ{22.0f, 18.0f});
     t.clearance_profile_xz.push_back(ClearanceXZ{28.0f, 45.0f});
+    t.cone_tip_radius_mm = tipOuterR;
+    t.cone_half_angle_deg = 35.0f;
+    t.cone_height_mm = 45.0f;
+    t.rect_tip_half_width_x_mm = tipOuterR;
+    t.rect_tip_half_width_y_mm = tipOuterR;
+    t.rect_half_angle_x_deg = 35.0f;
+    t.rect_half_angle_y_deg = 25.0f;
+    t.rect_height_mm = 45.0f;
     return t;
 }
 

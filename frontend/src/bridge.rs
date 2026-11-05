@@ -101,7 +101,17 @@ pub mod ffi {
         pub temperature_celsius: f32,
         pub has_rotational_axes: bool,
         pub max_angle_from_bed_normal_deg: f32,
+        /// `0` = `PiecewiseXZ`, `1` = `ParametricCone`, `2` = `RectilinearCone`
+        pub clearance_mode: u8,
         pub clearance_profile_xz: Vec<ClearanceXZ>,
+        pub cone_tip_radius_mm: f32,
+        pub cone_half_angle_deg: f32,
+        pub cone_height_mm: f32,
+        pub rect_tip_half_width_x_mm: f32,
+        pub rect_tip_half_width_y_mm: f32,
+        pub rect_half_angle_x_deg: f32,
+        pub rect_half_angle_y_deg: f32,
+        pub rect_height_mm: f32,
     }
 
     /// Variable layer height specification (`target_mm`, `min_mm`, `max_mm`, `first_layer_mm`, `top_layer_mm`)
@@ -550,6 +560,7 @@ mod tests {
                         z_height_mm: 15.0,
                     },
                 ],
+                ..Default::default()
             },
             ToolSpec {
                 id: 1,
@@ -568,6 +579,7 @@ mod tests {
                         z_height_mm: 20.0,
                     },
                 ],
+                ..Default::default()
             },
         ];
         ffi::set_machine_tools(&tools, 1);
@@ -664,6 +676,7 @@ mod tests {
                     z_height_mm: 10.0,
                 },
             ],
+            ..Default::default()
         }];
         ffi::set_machine_tools(&rot_tools, 0);
         ffi::set_spatial_orientation_hints(&[super::ffi::SpatialOrientationHint {

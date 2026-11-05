@@ -4,8 +4,8 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    BedShape, ClearancePointXZ, LayerHeightConfig, LineWidthConfig, SlicerConfig,
-    SolidInfillPattern, SparseInfillPattern, ToolConfig, WallPrintOrder,
+    BedShape, ClearancePointXZ, ClearanceProfileMode, LayerHeightConfig, LineWidthConfig,
+    SlicerConfig, SolidInfillPattern, SparseInfillPattern, ToolConfig, WallPrintOrder,
 };
 
 /// Top-level tab in the left workspace panel (`Project Setup` vs. `Configuration`).
@@ -241,7 +241,16 @@ pub struct ToolPreset {
     pub has_rotational_axes: bool,
     pub max_angle_from_bed_normal_deg: f32,
     pub enable_flat_nozzle_comp: bool,
+    pub clearance_mode: ClearanceProfileMode,
     pub clearance_profile_xz: Vec<ClearancePointXZ>,
+    pub cone_tip_radius_mm: f32,
+    pub cone_half_angle_deg: f32,
+    pub cone_height_mm: f32,
+    pub rect_tip_half_width_x_mm: f32,
+    pub rect_tip_half_width_y_mm: f32,
+    pub rect_half_angle_x_deg: f32,
+    pub rect_half_angle_y_deg: f32,
+    pub rect_height_mm: f32,
 
     // Extruder Hotend Capacity & Retraction / Wipe Baseline
     pub max_volumetric_flow_mm3s: f32,
@@ -273,7 +282,16 @@ impl ToolPreset {
             has_rotational_axes: tool.has_rotational_axes,
             max_angle_from_bed_normal_deg: tool.max_angle_from_bed_normal_deg,
             enable_flat_nozzle_comp: cfg.gcode.enable_flat_nozzle_comp,
+            clearance_mode: tool.clearance_mode,
             clearance_profile_xz: tool.clearance_profile_xz,
+            cone_tip_radius_mm: tool.cone_tip_radius_mm,
+            cone_half_angle_deg: tool.cone_half_angle_deg,
+            cone_height_mm: tool.cone_height_mm,
+            rect_tip_half_width_x_mm: tool.rect_tip_half_width_x_mm,
+            rect_tip_half_width_y_mm: tool.rect_tip_half_width_y_mm,
+            rect_half_angle_x_deg: tool.rect_half_angle_x_deg,
+            rect_half_angle_y_deg: tool.rect_half_angle_y_deg,
+            rect_height_mm: tool.rect_height_mm,
             max_volumetric_flow_mm3s: cfg.gcode.max_volumetric_flow_mm3s,
             retract_length_mm: cfg.gcode.retract_length_mm,
             retract_speed_mms: cfg.gcode.retract_speed_mms,
@@ -296,7 +314,16 @@ impl ToolPreset {
             tool.nozzle_diameter_mm = self.nozzle_diameter_mm;
             tool.has_rotational_axes = self.has_rotational_axes;
             tool.max_angle_from_bed_normal_deg = self.max_angle_from_bed_normal_deg;
+            tool.clearance_mode = self.clearance_mode;
             tool.clearance_profile_xz = self.clearance_profile_xz.clone();
+            tool.cone_tip_radius_mm = self.cone_tip_radius_mm;
+            tool.cone_half_angle_deg = self.cone_half_angle_deg;
+            tool.cone_height_mm = self.cone_height_mm;
+            tool.rect_tip_half_width_x_mm = self.rect_tip_half_width_x_mm;
+            tool.rect_tip_half_width_y_mm = self.rect_tip_half_width_y_mm;
+            tool.rect_half_angle_x_deg = self.rect_half_angle_x_deg;
+            tool.rect_half_angle_y_deg = self.rect_half_angle_y_deg;
+            tool.rect_height_mm = self.rect_height_mm;
         }
         cfg.gcode.enable_flat_nozzle_comp = self.enable_flat_nozzle_comp;
         cfg.gcode.max_volumetric_flow_mm3s = self.max_volumetric_flow_mm3s;
@@ -314,18 +341,36 @@ impl ToolPreset {
         let Some(tool) = cfg.active_tool() else {
             return false;
         };
-        if self.clearance_profile_xz.len() != tool.clearance_profile_xz.len() {
+        if self.clearance_mode != tool.clearance_mode {
             return false;
         }
-        let profile_matches = self
-            .clearance_profile_xz
-            .iter()
-            .zip(tool.clearance_profile_xz.iter())
-            .all(|(a, b)| {
-                approx_eq(a.x_radius_mm, b.x_radius_mm) && approx_eq(a.z_height_mm, b.z_height_mm)
-            });
+        let clearance_matches = match self.clearance_mode {
+            ClearanceProfileMode::PiecewiseXZ => {
+                self.clearance_profile_xz.len() == tool.clearance_profile_xz.len()
+                    && self
+                        .clearance_profile_xz
+                        .iter()
+                        .zip(tool.clearance_profile_xz.iter())
+                        .all(|(a, b)| {
+                            approx_eq(a.x_radius_mm, b.x_radius_mm)
+                                && approx_eq(a.z_height_mm, b.z_height_mm)
+                        })
+            }
+            ClearanceProfileMode::ParametricCone => {
+                approx_eq(self.cone_tip_radius_mm, tool.cone_tip_radius_mm)
+                    && approx_eq(self.cone_half_angle_deg, tool.cone_half_angle_deg)
+                    && approx_eq(self.cone_height_mm, tool.cone_height_mm)
+            }
+            ClearanceProfileMode::RectilinearCone => {
+                approx_eq(self.rect_tip_half_width_x_mm, tool.rect_tip_half_width_x_mm)
+                    && approx_eq(self.rect_tip_half_width_y_mm, tool.rect_tip_half_width_y_mm)
+                    && approx_eq(self.rect_half_angle_x_deg, tool.rect_half_angle_x_deg)
+                    && approx_eq(self.rect_half_angle_y_deg, tool.rect_half_angle_y_deg)
+                    && approx_eq(self.rect_height_mm, tool.rect_height_mm)
+            }
+        };
 
-        profile_matches
+        clearance_matches
             && approx_eq(self.nozzle_diameter_mm, tool.nozzle_diameter_mm)
             && self.has_rotational_axes == tool.has_rotational_axes
             && approx_eq(
@@ -1003,7 +1048,16 @@ impl PresetLibrary {
             ClearancePointXZ::new(26.0, 48.0),
         ];
 
-        vec![t_04, t_06, t_025]
+        let mut t_rect =
+            ToolPreset::from_config("0.4mm Rectilinear Shroud Cone (XY)", &base_cfg, true);
+        t_rect.clearance_mode = ClearanceProfileMode::RectilinearCone;
+        t_rect.rect_tip_half_width_x_mm = 0.60;
+        t_rect.rect_tip_half_width_y_mm = 0.60;
+        t_rect.rect_half_angle_x_deg = 38.0;
+        t_rect.rect_half_angle_y_deg = 24.0;
+        t_rect.rect_height_mm = 45.0;
+
+        vec![t_04, t_06, t_025, t_rect]
     }
 
     pub fn builtin_filaments() -> Vec<FilamentPreset> {

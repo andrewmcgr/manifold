@@ -6,8 +6,9 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::bridge::ffi;
 use crate::config::{
-    lookup_parameter_doc, BedShape, ClearancePointXZ, PointNormalHint, SlicerConfig,
-    SolidInfillPattern, SparseInfillPattern, SurfaceHintMode, ToolConfig, WallPrintOrder,
+    lookup_parameter_doc, BedShape, ClearancePointXZ, ClearanceProfileMode, PointNormalHint,
+    SlicerConfig, SolidInfillPattern, SparseInfillPattern, SurfaceHintMode, ToolConfig,
+    WallPrintOrder,
 };
 use crate::field_vis::{
     high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
@@ -3002,76 +3003,246 @@ fn render_tool_config_tab(
 
     ui.add_space(4.0);
     egui::CollapsingHeader::new(
-        egui::RichText::new("Clearance Profile (XZ in Local Nozzle Frame)").strong(),
+        egui::RichText::new("Clearance Profile (Local Nozzle Frame)").strong(),
     )
     .id_source("tool_clearance_profile_xz_section")
     .default_open(true)
     .show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.small("Radius X (mm) from nozzle axis vs. height Z (mm) along nozzle axis:");
+            ui.label("Profile Mode:");
             param_help_button(ui, "tools.clearance_profile_xz");
         });
 
         let active_idx = config.active_tool_index;
         if let Some(tool) = config.tools.get_mut(active_idx) {
-            let mut remove_pt_idx: Option<usize> = None;
-            let profile_len = tool.clearance_profile_xz.len();
-            for (p_idx, pt) in tool.clearance_profile_xz.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(format!("#{p_idx}"));
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut pt.x_radius_mm)
-                                .speed(0.1)
-                                .range(0.0..=200.0)
-                                .prefix("X (r): ")
-                                .suffix(" mm"),
-                        )
-                        .changed()
-                    {
-                        dirty_backend = true;
-                    }
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut pt.z_height_mm)
-                                .speed(0.1)
-                                .range(0.0..=300.0)
-                                .prefix("Z: ")
-                                .suffix(" mm"),
-                        )
-                        .changed()
-                    {
-                        dirty_backend = true;
-                    }
-                    if profile_len > 2 && ui.small_button("✕").clicked() {
-                        remove_pt_idx = Some(p_idx);
-                    }
-                });
-            }
-            if let Some(rm_idx) = remove_pt_idx {
-                tool.clearance_profile_xz.remove(rm_idx);
-                dirty_backend = true;
-            }
-            ui.horizontal(|ui| {
-                if ui.small_button("+ Add XZ Point").clicked() {
-                    let (next_x, next_z) = tool
-                        .clearance_profile_xz
-                        .last()
-                        .map(|p| (p.x_radius_mm + 4.0, p.z_height_mm + 10.0))
-                        .unwrap_or((1.0, 0.0));
-                    tool.clearance_profile_xz
-                        .push(ClearancePointXZ::new(next_x, next_z));
-                    dirty_backend = true;
-                }
-                if ui.small_button("Sort by Z").clicked() {
-                    tool.clearance_profile_xz.sort_by(|a, b| {
-                        a.z_height_mm
-                            .partial_cmp(&b.z_height_mm)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(18, 22, 29))
+                .rounding(egui::Rounding::same(6.0))
+                .inner_margin(egui::Margin::symmetric(5.0, 4.0))
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    egui::Color32::from_rgb(48, 56, 70),
+                ))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for mode in ClearanceProfileMode::ALL {
+                            if render_delineated_pill_tab(
+                                ui,
+                                tool.clearance_mode == mode,
+                                mode.label(),
+                            )
+                            .clicked()
+                            {
+                                tool.clearance_mode = mode;
+                                dirty_backend = true;
+                            }
+                        }
                     });
-                    dirty_backend = true;
+                });
+
+            let (alpha_x_deg, alpha_y_deg) = tool.max_layer_slope_xy_deg();
+            ui.small(format!(
+                "Max collision-free layer slope: α_max,X = {alpha_x_deg:.1}°, α_max,Y = {alpha_y_deg:.1}°"
+            ));
+            ui.add_space(2.0);
+
+            match tool.clearance_mode {
+                ClearanceProfileMode::PiecewiseXZ => {
+                    ui.small("Radius X (mm) from nozzle axis vs. height Z (mm) along nozzle axis:");
+                    let mut remove_pt_idx: Option<usize> = None;
+                    let profile_len = tool.clearance_profile_xz.len();
+                    for (p_idx, pt) in tool.clearance_profile_xz.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("#{p_idx}"));
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut pt.x_radius_mm)
+                                        .speed(0.1)
+                                        .range(0.0..=200.0)
+                                        .prefix("X (r): ")
+                                        .suffix(" mm"),
+                                )
+                                .changed()
+                            {
+                                dirty_backend = true;
+                            }
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut pt.z_height_mm)
+                                        .speed(0.1)
+                                        .range(0.0..=300.0)
+                                        .prefix("Z: ")
+                                        .suffix(" mm"),
+                                )
+                                .changed()
+                            {
+                                dirty_backend = true;
+                            }
+                            if profile_len > 2 && ui.small_button("✕").clicked() {
+                                remove_pt_idx = Some(p_idx);
+                            }
+                        });
+                    }
+                    if let Some(rm_idx) = remove_pt_idx {
+                        tool.clearance_profile_xz.remove(rm_idx);
+                        dirty_backend = true;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.small_button("+ Add XZ Point").clicked() {
+                            let (next_x, next_z) = tool
+                                .clearance_profile_xz
+                                .last()
+                                .map(|p| (p.x_radius_mm + 4.0, p.z_height_mm + 10.0))
+                                .unwrap_or((1.0, 0.0));
+                            tool.clearance_profile_xz
+                                .push(ClearancePointXZ::new(next_x, next_z));
+                            dirty_backend = true;
+                        }
+                        if ui.small_button("Sort by Z").clicked() {
+                            tool.clearance_profile_xz.sort_by(|a, b| {
+                                a.z_height_mm
+                                    .partial_cmp(&b.z_height_mm)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            dirty_backend = true;
+                        }
+                    });
                 }
-            });
+                ClearanceProfileMode::ParametricCone => {
+                    ui.small("Straight-sided circular cone revolved around local nozzle_axis (+Z):");
+                    ui.horizontal(|ui| {
+                        ui.label("Tip Radius (z=0):");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut tool.cone_tip_radius_mm)
+                                    .speed(0.05)
+                                    .range(0.1..=50.0)
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            dirty_backend = true;
+                        }
+                        ui.label("Height Z:");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut tool.cone_height_mm)
+                                    .speed(0.5)
+                                    .range(2.0..=300.0)
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            dirty_backend = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Cone Half-Angle θ:");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut tool.cone_half_angle_deg, 5.0..=80.0)
+                                    .suffix("°"),
+                            )
+                            .changed()
+                        {
+                            dirty_backend = true;
+                        }
+                    });
+                    if let Some((r_top, _)) =
+                        tool.clearance_half_widths_xy_at_z(tool.cone_height_mm)
+                    {
+                        ui.small(format!(
+                            "Top radius at Z = {:.1} mm: {:.1} mm (diameter {:.1} mm)",
+                            tool.cone_height_mm,
+                            r_top,
+                            2.0 * r_top
+                        ));
+                    }
+                }
+                ClearanceProfileMode::RectilinearCone => {
+                    ui.small(
+                        "4-sided rectangular pyramid cone in local nozzle frame (X = travel_axis, Y = lateral_axis):",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Tip Half-Width (z=0):");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut tool.rect_tip_half_width_x_mm)
+                                    .speed(0.05)
+                                    .range(0.1..=50.0)
+                                    .prefix("±X: ")
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            dirty_backend = true;
+                        }
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut tool.rect_tip_half_width_y_mm)
+                                    .speed(0.05)
+                                    .range(0.1..=50.0)
+                                    .prefix("±Y: ")
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            dirty_backend = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Half-Angle X (XZ):");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut tool.rect_half_angle_x_deg, 5.0..=80.0)
+                                    .suffix("°"),
+                            )
+                            .changed()
+                        {
+                            dirty_backend = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Half-Angle Y (YZ):");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut tool.rect_half_angle_y_deg, 5.0..=80.0)
+                                    .suffix("°"),
+                            )
+                            .changed()
+                        {
+                            dirty_backend = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Cone Height Z:");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut tool.rect_height_mm)
+                                    .speed(0.5)
+                                    .range(2.0..=300.0)
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            dirty_backend = true;
+                        }
+                    });
+                    if let Some((wx_top, wy_top)) =
+                        tool.clearance_half_widths_xy_at_z(tool.rect_height_mm)
+                    {
+                        ui.small(format!(
+                            "Top footprint at Z = {:.1} mm: {:.1} × {:.1} mm (±{:.1} X, ±{:.1} Y)",
+                            tool.rect_height_mm,
+                            2.0 * wx_top,
+                            2.0 * wy_top,
+                            wx_top,
+                            wy_top
+                        ));
+                    }
+                }
+            }
         }
     });
 
@@ -4951,22 +5122,7 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
     let ffi_tools: Vec<ffi::ToolSpec> = config
         .tools
         .iter()
-        .map(|t| ffi::ToolSpec {
-            id: t.id,
-            name: t.name.clone(),
-            nozzle_diameter_mm: t.nozzle_diameter_mm,
-            temperature_celsius: t.temperature_celsius,
-            has_rotational_axes: t.has_rotational_axes,
-            max_angle_from_bed_normal_deg: t.max_angle_from_bed_normal_deg,
-            clearance_profile_xz: t
-                .clearance_profile_xz
-                .iter()
-                .map(|p| ffi::ClearanceXZ {
-                    x_radius_mm: p.x_radius_mm,
-                    z_height_mm: p.z_height_mm,
-                })
-                .collect(),
-        })
+        .map(ToolConfig::to_ffi_tool_spec)
         .collect();
     ffi::set_machine_tools(&ffi_tools, config.active_tool_index as u32);
 
