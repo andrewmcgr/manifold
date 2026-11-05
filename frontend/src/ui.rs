@@ -683,6 +683,216 @@ fn param_help_button(ui: &mut egui::Ui, key: &str) {
     btn.on_hover_ui(render_card);
 }
 
+/// Renders a delineated horizontal folder-style tab bar spanning the full available width.
+///
+/// Each entry in `tabs` is `(label, has_modified_indicator)`.
+/// - Inactive tabs are drawn with a recessed dark background, a 3-sided border, and a continuous
+///   bottom baseline stroke so every tab is clearly separated.
+/// - The active tab is drawn with a raised surface background, a 3px `active_accent` top highlight
+///   bar, bold white text, and an open bottom edge that visually connects to the panel below.
+///
+/// Returns `Some(clicked_index)` if the user clicked a tab.
+fn render_folder_tab_bar(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    tabs: &[(&str, bool)],
+    active_index: usize,
+    height: f32,
+    active_accent: egui::Color32,
+) -> Option<usize> {
+    if tabs.is_empty() {
+        return None;
+    }
+
+    let count = tabs.len();
+    let gap = 3.0_f32;
+    let total_width = ui.available_width().max(120.0);
+    let total_gaps = gap * (count.saturating_sub(1) as f32);
+    let tab_width = ((total_width - total_gaps) / (count as f32)).max(28.0);
+
+    let (bar_rect, _) =
+        ui.allocate_exact_size(egui::vec2(total_width, height), egui::Sense::hover());
+
+    let mut clicked_tab = None;
+    let baseline_y = bar_rect.max.y - 1.0;
+    let baseline_stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(86, 96, 116));
+
+    // Pre-collect interaction responses before borrowing the painter
+    let mut tab_rects_and_states = Vec::with_capacity(count);
+    for idx in 0..count {
+        let min_x = bar_rect.min.x + (idx as f32) * (tab_width + gap);
+        let max_x = if idx + 1 == count {
+            bar_rect.max.x
+        } else {
+            (min_x + tab_width).min(bar_rect.max.x)
+        };
+        let tab_rect = egui::Rect::from_min_max(
+            egui::pos2(min_x, bar_rect.min.y),
+            egui::pos2(max_x, baseline_y),
+        );
+        let tab_id = ui.id().with(id_salt).with(idx);
+        let resp = ui.interact(tab_rect, tab_id, egui::Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            clicked_tab = Some(idx);
+        }
+        tab_rects_and_states.push((tab_rect, resp.hovered()));
+    }
+
+    let painter = ui.painter();
+
+    // Draw continuous bottom baseline across the entire tab strip first
+    painter.line_segment(
+        [
+            egui::pos2(bar_rect.min.x, baseline_y),
+            egui::pos2(bar_rect.max.x, baseline_y),
+        ],
+        baseline_stroke,
+    );
+
+    for (idx, (&(label, is_modified), &(tab_rect, hovered))) in
+        tabs.iter().zip(tab_rects_and_states.iter()).enumerate()
+    {
+        let is_active = idx == active_index;
+
+        let bg_fill = if is_active {
+            egui::Color32::from_rgb(48, 56, 72)
+        } else if hovered {
+            egui::Color32::from_rgb(36, 42, 54)
+        } else {
+            egui::Color32::from_rgb(23, 26, 33)
+        };
+
+        // Tab body fill (active tab extends 1px over the baseline to leave its bottom open)
+        let fill_rect = if is_active {
+            egui::Rect::from_min_max(tab_rect.min, egui::pos2(tab_rect.max.x, baseline_y + 1.0))
+        } else {
+            egui::Rect::from_min_max(tab_rect.min, egui::pos2(tab_rect.max.x, baseline_y - 0.5))
+        };
+        painter.rect_filled(
+            fill_rect,
+            egui::Rounding {
+                nw: 6.0,
+                ne: 6.0,
+                sw: 0.0,
+                se: 0.0,
+            },
+            bg_fill,
+        );
+
+        // Top accent bar on the active tab
+        if is_active {
+            let accent_rect = egui::Rect::from_min_max(
+                egui::pos2(tab_rect.min.x + 1.0, tab_rect.min.y),
+                egui::pos2(tab_rect.max.x - 1.0, tab_rect.min.y + 3.0),
+            );
+            painter.rect_filled(
+                accent_rect,
+                egui::Rounding {
+                    nw: 5.0,
+                    ne: 5.0,
+                    sw: 0.0,
+                    se: 0.0,
+                },
+                active_accent,
+            );
+        }
+
+        // 3-sided tab outline (left, chamfered top corners, top, right)
+        let side_stroke = if is_active {
+            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(104, 118, 144))
+        } else if hovered {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(92, 104, 126))
+        } else {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(64, 72, 88))
+        };
+        let top_stroke = if is_active {
+            egui::Stroke::new(1.5_f32, active_accent)
+        } else {
+            side_stroke
+        };
+        let corner = 4.0_f32;
+        let p_bl = egui::pos2(tab_rect.min.x, baseline_y);
+        let p_tl_low = egui::pos2(tab_rect.min.x, tab_rect.min.y + corner);
+        let p_tl_high = egui::pos2(tab_rect.min.x + corner, tab_rect.min.y);
+        let p_tr_high = egui::pos2(tab_rect.max.x - corner, tab_rect.min.y);
+        let p_tr_low = egui::pos2(tab_rect.max.x, tab_rect.min.y + corner);
+        let p_br = egui::pos2(tab_rect.max.x, baseline_y);
+
+        painter.line_segment([p_bl, p_tl_low], side_stroke);
+        painter.line_segment([p_tl_low, p_tl_high], top_stroke);
+        painter.line_segment([p_tl_high, p_tr_high], top_stroke);
+        painter.line_segment([p_tr_high, p_tr_low], top_stroke);
+        painter.line_segment([p_tr_low, p_br], side_stroke);
+
+        // Label + optional modified amber dot
+        let font_id = if is_active {
+            egui::FontId::proportional(13.5)
+        } else {
+            egui::FontId::proportional(12.8)
+        };
+        let text_color = if is_active {
+            egui::Color32::WHITE
+        } else if hovered {
+            egui::Color32::from_rgb(232, 238, 248)
+        } else {
+            egui::Color32::from_rgb(172, 180, 198)
+        };
+        let galley = painter.layout_no_wrap(label.to_string(), font_id, text_color);
+        let dot_space = if is_modified { 10.0 } else { 0.0 };
+        let content_w = galley.size().x + dot_space;
+        let text_pos = egui::pos2(
+            (tab_rect.center().x - content_w * 0.5).max(tab_rect.min.x + 5.0),
+            tab_rect.center().y - galley.size().y * 0.5 + 1.0,
+        );
+        painter.galley(text_pos, galley.clone(), text_color);
+
+        if is_modified {
+            let dot_center = egui::pos2(
+                (text_pos.x + galley.size().x + 6.0).min(tab_rect.max.x - 5.0),
+                tab_rect.center().y + 1.0,
+            );
+            painter.circle_filled(dot_center, 3.2, egui::Color32::from_rgb(255, 192, 56));
+        }
+    }
+
+    clicked_tab
+}
+
+/// Renders a clearly delineated bordered pill/tab button for inline mode & selector strips
+/// (e.g., `ToolMode`, `Build Plate` switchers, `Extrusion Tool` tabs, and `Scalar Field` tabs).
+fn render_delineated_pill_tab(
+    ui: &mut egui::Ui,
+    is_active: bool,
+    label: impl Into<String>,
+) -> egui::Response {
+    let label_str = label.into();
+    let text = if is_active {
+        egui::RichText::new(label_str)
+            .strong()
+            .color(egui::Color32::WHITE)
+    } else {
+        egui::RichText::new(label_str).color(egui::Color32::from_rgb(195, 203, 218))
+    };
+    let fill = if is_active {
+        egui::Color32::from_rgb(44, 96, 166)
+    } else {
+        egui::Color32::from_rgb(28, 32, 40)
+    };
+    let stroke = if is_active {
+        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(104, 178, 255))
+    } else {
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(72, 80, 96))
+    };
+    let btn = egui::Button::new(text)
+        .fill(fill)
+        .stroke(stroke)
+        .rounding(egui::Rounding::same(5.0));
+    ui.add(btn)
+}
+
 /// Renders the reusable Preset Selector Bar at the top of a configuration sub-tab (`Printer`, `Tool`, `Filament`, `Process`).
 /// Returns `true` if a preset was selected or reverted so the caller can synchronize with the backend and mark caches dirty.
 fn render_preset_selector_bar(
@@ -1037,7 +1247,7 @@ pub fn ui_workspace_system(
                 ToolMode::PointHint,
             ] {
                 let selected = plate.tool_mode == mode;
-                if ui.selectable_label(selected, mode.label()).clicked() {
+                if render_delineated_pill_tab(ui, selected, mode.label()).clicked() {
                     plate.tool_mode = mode;
                 }
             }
@@ -1049,7 +1259,7 @@ pub fn ui_workspace_system(
                 let p_count = plate.plate_object_count(p_idx);
                 let p_label = format!("{} ({p_count})", plate.plates[p_idx].name);
                 let is_active = plate.active_plate_index == p_idx;
-                if ui.selectable_label(is_active, p_label).clicked() && !is_active {
+                if render_delineated_pill_tab(ui, is_active, p_label).clicked() && !is_active {
                     switch_to_plate = Some(p_idx);
                 }
             }
@@ -1240,38 +1450,89 @@ pub fn ui_workspace_system(
         .default_width(390.0)
         .resizable(true)
         .show(ctx, |ui| {
-            // Top-level Left Panel Mode Switcher
+            // Top-level Left Panel Mode Switcher (Folder-style tab bar)
             let any_preset_dirty = PresetCategory::ALL
                 .iter()
                 .any(|&cat| preset_lib.is_category_modified(cat, &config));
-            ui.horizontal(|ui| {
-                let setup_label = format!("Project Setup ({})", plate.objects.len());
-                if ui
-                    .selectable_label(
-                        preset_lib.left_tab == LeftPanelTab::ProjectSetup,
-                        egui::RichText::new(setup_label).strong(),
-                    )
-                    .clicked()
-                {
-                    preset_lib.left_tab = LeftPanelTab::ProjectSetup;
-                }
-
-                let cfg_label = if any_preset_dirty {
-                    "Configuration & Presets (•)"
+            let setup_label = format!("Project Setup ({})", plate.objects.len());
+            let top_tabs = [
+                (setup_label.as_str(), false),
+                ("Configuration & Presets", any_preset_dirty),
+            ];
+            let active_top_idx = match preset_lib.left_tab {
+                LeftPanelTab::ProjectSetup => 0,
+                LeftPanelTab::Configuration => 1,
+            };
+            if let Some(clicked_idx) = render_folder_tab_bar(
+                ui,
+                "left_panel_primary_tabs",
+                &top_tabs,
+                active_top_idx,
+                30.0,
+                egui::Color32::from_rgb(76, 166, 255),
+            ) {
+                preset_lib.left_tab = if clicked_idx == 0 {
+                    LeftPanelTab::ProjectSetup
                 } else {
-                    "Configuration & Presets"
+                    LeftPanelTab::Configuration
                 };
-                if ui
-                    .selectable_label(
-                        preset_lib.left_tab == LeftPanelTab::Configuration,
-                        egui::RichText::new(cfg_label).strong(),
-                    )
-                    .clicked()
-                {
-                    preset_lib.left_tab = LeftPanelTab::Configuration;
+            }
+            ui.add_space(4.0);
+
+            // When in Configuration & Presets mode, keep the 4 category sub-tabs and preset
+            // selector bar pinned above the scroll area so they stay visible while scrolling.
+            if preset_lib.left_tab == LeftPanelTab::Configuration {
+                let sub_tabs = [
+                    (
+                        PresetCategory::Printer.label(),
+                        preset_lib.is_category_modified(PresetCategory::Printer, &config),
+                    ),
+                    (
+                        PresetCategory::Tool.label(),
+                        preset_lib.is_category_modified(PresetCategory::Tool, &config),
+                    ),
+                    (
+                        PresetCategory::Filament.label(),
+                        preset_lib.is_category_modified(PresetCategory::Filament, &config),
+                    ),
+                    (
+                        PresetCategory::Process.label(),
+                        preset_lib.is_category_modified(PresetCategory::Process, &config),
+                    ),
+                ];
+                let active_sub_idx = PresetCategory::ALL
+                    .iter()
+                    .position(|&c| c == preset_lib.config_subtab)
+                    .unwrap_or(0);
+                if let Some(clicked_sub) = render_folder_tab_bar(
+                    ui,
+                    "left_panel_config_subtabs",
+                    &sub_tabs,
+                    active_sub_idx,
+                    28.0,
+                    egui::Color32::from_rgb(240, 168, 56),
+                ) {
+                    preset_lib.config_subtab = PresetCategory::ALL[clicked_sub];
                 }
-            });
-            ui.separator();
+                ui.add_space(4.0);
+
+                let active_category = preset_lib.config_subtab;
+                if render_preset_selector_bar(
+                    ui,
+                    active_category,
+                    &mut preset_lib,
+                    &mut config,
+                    &mut plate.status_message,
+                ) {
+                    if !is_computing {
+                        sync_config_to_backend(&config);
+                    }
+                    vis_state.dirty_selected_layers = true;
+                    vis_state.dirty_toolpaths = true;
+                    vis_state.dirty_planned_gcode = true;
+                }
+                ui.add_space(6.0);
+            }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if preset_lib.left_tab == LeftPanelTab::ProjectSetup {
@@ -1320,7 +1581,7 @@ pub fn ui_workspace_system(
                                     let p_label =
                                         format!("{} ({p_count})", plate.plates[p_idx].name);
                                     let is_active = plate.active_plate_index == p_idx;
-                                    if ui.selectable_label(is_active, p_label).clicked()
+                                    if render_delineated_pill_tab(ui, is_active, p_label).clicked()
                                         && !is_active
                                     {
                                         switch_to_plate = Some(p_idx);
@@ -2086,47 +2347,9 @@ pub fn ui_workspace_system(
                 } else {
                     // ================================================================
                     // TAB 2: CONFIGURATION & SAVED PRESETS (Printer | Tool | Filament | Process)
+                    // (Sub-tabs and Preset Selector Bar are pinned above the ScrollArea)
                     // ================================================================
-                    ui.horizontal_wrapped(|ui| {
-                        for cat in PresetCategory::ALL {
-                            let is_active = preset_lib.config_subtab == cat;
-                            let is_mod = preset_lib.is_category_modified(cat, &config);
-                            let tab_text = if is_mod {
-                                format!("{} •", cat.label())
-                            } else {
-                                cat.label().to_string()
-                            };
-                            if ui
-                                .selectable_label(
-                                    is_active,
-                                    egui::RichText::new(tab_text).strong(),
-                                )
-                                .clicked()
-                            {
-                                preset_lib.config_subtab = cat;
-                            }
-                        }
-                    });
-                    ui.add_space(4.0);
-
-                    let active_category = preset_lib.config_subtab;
-                    if render_preset_selector_bar(
-                        ui,
-                        active_category,
-                        &mut preset_lib,
-                        &mut config,
-                        &mut plate.status_message,
-                    ) {
-                        if !is_computing {
-                            sync_config_to_backend(&config);
-                        }
-                        vis_state.dirty_selected_layers = true;
-                        vis_state.dirty_toolpaths = true;
-                        vis_state.dirty_planned_gcode = true;
-                    }
-                    ui.add_space(6.0);
-
-                    match active_category {
+                    match preset_lib.config_subtab {
                         PresetCategory::Printer => {
                             render_printer_config_tab(ui, &mut config, &mut vis_state, is_computing);
                         }
@@ -2597,12 +2820,12 @@ fn render_tool_config_tab(
             let mut clicked_idx = None;
             for (idx, tool) in config.tools.iter().enumerate() {
                 let selected = current_active == idx;
-                if ui
-                    .selectable_label(
-                        selected,
-                        format!("T{} ({:.2}mm)", tool.id, tool.nozzle_diameter_mm),
-                    )
-                    .clicked()
+                if render_delineated_pill_tab(
+                    ui,
+                    selected,
+                    format!("T{} ({:.2}mm)", tool.id, tool.nozzle_diameter_mm),
+                )
+                .clicked()
                 {
                     clicked_idx = Some(idx);
                 }
@@ -4234,7 +4457,9 @@ fn render_view_and_inspection_panel(
             } else {
                 for fname in &avail {
                     let selected = &vis_state.active_field_name == fname;
-                    if ui.selectable_label(selected, fname).clicked() && !selected {
+                    if render_delineated_pill_tab(ui, selected, fname.as_str()).clicked()
+                        && !selected
+                    {
                         vis_state.active_field_name = fname.clone();
                         vis_state.mark_all_dirty();
                         if !is_computing {
