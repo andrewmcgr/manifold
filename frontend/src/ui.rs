@@ -24,6 +24,7 @@ use crate::scene::{
     snap_object_to_bed, spawn_loaded_objects, BuildPlateInfo, BuildPlateState, CadObjectEntity,
     OrbitCamera, ToolMode,
 };
+use crate::surface_ui::{render_delineated_icon_pill_tab, render_icon_button, UiIcon};
 
 fn rgba_to_color32(rgba: [f32; 4]) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(
@@ -1114,9 +1115,14 @@ pub fn ui_workspace_system(
     egui::TopBottomPanel::top("top_editing_toolbar").show(ctx, |ui| {
         // Row 1: File I/O, Viewport Editing Mode, Scene Actions, and Right Panel Toggle
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(!is_io_busy, egui::Button::new("Import CAD / Mesh / 3MF..."))
-                .clicked()
+            if render_icon_button(
+                ui,
+                UiIcon::ImportFile,
+                "Import CAD / Mesh / 3MF...",
+                false,
+                !is_io_busy,
+            )
+            .clicked()
             {
                 plate.status_message =
                     "Select one or more STEP, STL, or 3MF files...".to_string();
@@ -1139,12 +1145,14 @@ pub fn ui_workspace_system(
                 plate.pending_load_task = Some(task);
             }
 
-            if ui
-                .add_enabled(
-                    !is_io_busy && !plate.objects.is_empty(),
-                    egui::Button::new("Save 3MF..."),
-                )
-                .clicked()
+            if render_icon_button(
+                ui,
+                UiIcon::SaveProject,
+                "Save 3MF...",
+                false,
+                !is_io_busy && !plate.objects.is_empty(),
+            )
+            .clicked()
             {
                 let mut export_list = Vec::with_capacity(plate.objects.len());
                 for obj in &plate.objects {
@@ -1190,13 +1198,15 @@ pub fn ui_workspace_system(
             }
 
             let has_planned = vis_state.cached_planned_gcode.is_some();
-            if ui
-                .add_enabled(
-                    has_planned && !is_computing && !is_io_busy,
-                    egui::Button::new("Export G-code..."),
-                )
-                .on_hover_text("Export planned non-planar G-code (.gcode) for the selected object")
-                .clicked()
+            if render_icon_button(
+                ui,
+                UiIcon::ExportGcode,
+                "Export G-code...",
+                false,
+                has_planned && !is_computing && !is_io_busy,
+            )
+            .on_hover_text("Export planned non-planar G-code (.gcode) for the selected object")
+            .clicked()
             {
                 if let (Some((_, _, ref obj_name, _)), Some(ref planned)) =
                     (&selected_obj_info, &vis_state.cached_planned_gcode)
@@ -1248,7 +1258,14 @@ pub fn ui_workspace_system(
                 ToolMode::PointHint,
             ] {
                 let selected = plate.tool_mode == mode;
-                if render_delineated_pill_tab(ui, selected, mode.label()).clicked() {
+                if render_delineated_icon_pill_tab(
+                    ui,
+                    selected,
+                    Some(UiIcon::for_tool_mode(mode)),
+                    mode.label(),
+                )
+                .clicked()
+                {
                     plate.tool_mode = mode;
                 }
             }
@@ -1260,12 +1277,19 @@ pub fn ui_workspace_system(
                 let p_count = plate.plate_object_count(p_idx);
                 let p_label = format!("{} ({p_count})", plate.plates[p_idx].name);
                 let is_active = plate.active_plate_index == p_idx;
-                if render_delineated_pill_tab(ui, is_active, p_label).clicked() && !is_active {
+                if render_delineated_icon_pill_tab(
+                    ui,
+                    is_active,
+                    Some(UiIcon::BuildPlate),
+                    p_label,
+                )
+                .clicked()
+                    && !is_active
+                {
                     switch_to_plate = Some(p_idx);
                 }
             }
-            if ui
-                .small_button("+ Plate")
+            if render_icon_button(ui, UiIcon::AddPlate, "Plate", true, true)
                 .on_hover_text("Add a new empty build plate")
                 .clicked()
             {
@@ -1280,16 +1304,25 @@ pub fn ui_workspace_system(
             }
 
             ui.separator();
-            if ui.button("Auto-Arrange").clicked() {
+            if render_icon_button(ui, UiIcon::AutoArrange, "Auto-Arrange", false, true).clicked() {
                 run_auto_arrange_on_plate(&mut plate, &config, &mut object_transforms);
             }
-            if ui.button("Frame All").clicked() {
+            if render_icon_button(ui, UiIcon::FrameCamera, "Frame All", false, true).clicked() {
                 frame_camera_to_plate(&plate, &config, &mut camera_query);
             }
-            ui.toggle_value(&mut plate.show_object_labels, "Object Labels")
-                .on_hover_text(
-                    "Show/hide each object's Klipper exclude_object name label on the build plate",
-                );
+            if render_delineated_icon_pill_tab(
+                ui,
+                plate.show_object_labels,
+                Some(UiIcon::ObjectLabels),
+                "Object Labels",
+            )
+            .on_hover_text(
+                "Show/hide each object's Klipper exclude_object name label on the build plate",
+            )
+            .clicked()
+            {
+                plate.show_object_labels = !plate.show_object_labels;
+            }
 
             ui.separator();
             ui.toggle_value(
@@ -1551,20 +1584,24 @@ pub fn ui_workspace_system(
                                     ))
                                     .strong(),
                                 );
-                                if ui
-                                    .small_button("+ Add Plate")
+                                if render_icon_button(ui, UiIcon::AddPlate, "Add Plate", true, true)
                                     .on_hover_text("Add a new empty build plate to the project")
                                     .clicked()
                                 {
                                     plate.add_plate(&mut object_transforms);
                                 }
                                 if plate.plates.len() > 1
-                                    && ui
-                                        .small_button("Remove Plate")
-                                        .on_hover_text(
-                                            "Remove the currently active build plate and any objects on it",
-                                        )
-                                        .clicked()
+                                    && render_icon_button(
+                                        ui,
+                                        UiIcon::DeleteObject,
+                                        "Remove Plate",
+                                        true,
+                                        true,
+                                    )
+                                    .on_hover_text(
+                                        "Remove the currently active build plate and any objects on it",
+                                    )
+                                    .clicked()
                                 {
                                     let active_idx = plate.active_plate_index;
                                     plate.remove_plate(
@@ -1582,7 +1619,13 @@ pub fn ui_workspace_system(
                                     let p_label =
                                         format!("{} ({p_count})", plate.plates[p_idx].name);
                                     let is_active = plate.active_plate_index == p_idx;
-                                    if render_delineated_pill_tab(ui, is_active, p_label).clicked()
+                                    if render_delineated_icon_pill_tab(
+                                        ui,
+                                        is_active,
+                                        Some(UiIcon::BuildPlate),
+                                        p_label,
+                                    )
+                                    .clicked()
                                         && !is_active
                                     {
                                         switch_to_plate = Some(p_idx);
@@ -1619,7 +1662,10 @@ pub fn ui_workspace_system(
                         ui.heading(format!(
                             "Objects on {active_plate_name} ({active_obj_count})"
                         ));
-                        if active_obj_count > 0 && ui.small_button("Clear Plate").clicked() {
+                        if active_obj_count > 0
+                            && render_icon_button(ui, UiIcon::DeleteObject, "Clear Plate", true, true)
+                                .clicked()
+                        {
                             let plate_ids: Vec<u64> = plate
                                 .objects
                                 .iter()
@@ -1632,7 +1678,14 @@ pub fn ui_workspace_system(
                         }
                         if plate.plates.len() > 1
                             && !plate.objects.is_empty()
-                            && ui.small_button("Clear All Plates").clicked()
+                            && render_icon_button(
+                                ui,
+                                UiIcon::DeleteObject,
+                                "Clear All Plates",
+                                true,
+                                true,
+                            )
+                            .clicked()
                         {
                             let all_ids: Vec<u64> =
                                 plate.objects.iter().map(|o| o.object_id).collect();
@@ -1680,15 +1733,19 @@ pub fn ui_workspace_system(
                                     select_id = Some(obj.object_id);
                                 }
 
-                                if ui
-                                    .small_button("Clone")
-                                    .on_hover_text("Add a duplicate of this object onto this build plate")
+                                if render_icon_button(ui, UiIcon::CloneObject, "Clone", true, true)
+                                    .on_hover_text(
+                                        "Add a duplicate of this object onto this build plate",
+                                    )
                                     .clicked()
                                 {
                                     clone_id = Some(obj.object_id);
                                 }
 
-                                if ui.small_button("Remove").clicked() {
+                                if render_icon_button(ui, UiIcon::DeleteObject, "Remove", true, true)
+                                    .on_hover_text("Remove this object from the build plate")
+                                    .clicked()
+                                {
                                     remove_id = Some(obj.object_id);
                                 }
                             });
@@ -1754,10 +1811,17 @@ pub fn ui_workspace_system(
                                             }
                                         }
                                     });
-                                if ui
-                                    .small_button("+ Move to New Plate")
-                                    .on_hover_text("Create a new build plate and move this object onto it")
-                                    .clicked()
+                                if render_icon_button(
+                                    ui,
+                                    UiIcon::BuildPlate,
+                                    "Move to New Plate",
+                                    true,
+                                    true,
+                                )
+                                .on_hover_text(
+                                    "Create a new build plate and move this object onto it",
+                                )
+                                .clicked()
                                 {
                                     move_to_new_plate = true;
                                 }
@@ -1786,9 +1850,10 @@ pub fn ui_workspace_system(
                             let mut pending_clone_copies: Option<usize> = None;
                             ui.horizontal(|ui| {
                                 ui.label("Clone Object:");
-                                if ui
-                                    .button("+1 Clone")
-                                    .on_hover_text("Add 1 clone of the selected object to the build plate")
+                                if render_icon_button(ui, UiIcon::CloneObject, "+1 Clone", false, true)
+                                    .on_hover_text(
+                                        "Add 1 clone of the selected object to the build plate",
+                                    )
                                     .clicked()
                                 {
                                     pending_clone_copies = Some(1);
@@ -1798,10 +1863,17 @@ pub fn ui_workspace_system(
                                         .range(1..=64)
                                         .prefix("×"),
                                 );
-                                if ui
-                                    .button("Add Clones")
-                                    .on_hover_text("Add the specified number of clones of the selected object")
-                                    .clicked()
+                                if render_icon_button(
+                                    ui,
+                                    UiIcon::CloneObject,
+                                    "Add Clones",
+                                    false,
+                                    true,
+                                )
+                                .on_hover_text(
+                                    "Add the specified number of clones of the selected object",
+                                )
+                                .clicked()
                                 {
                                     pending_clone_copies = Some(plate.clone_copies_count as usize);
                                 }
@@ -1850,10 +1922,15 @@ pub fn ui_workspace_system(
                                         tf.translation.y = bed_y - gcode_offset_xy.y;
                                         changed = true;
                                     }
-                                    if ui
-                                        .small_button("Center")
-                                        .on_hover_text("Move object to the center of the build plate")
-                                        .clicked()
+                                    if render_icon_button(
+                                        ui,
+                                        UiIcon::CenterOnBed,
+                                        "Center",
+                                        true,
+                                        true,
+                                    )
+                                    .on_hover_text("Move object to the center of the build plate")
+                                    .clicked()
                                     {
                                         tf.translation.x = 0.0;
                                         tf.translation.y = 0.0;
@@ -1863,28 +1940,60 @@ pub fn ui_workspace_system(
 
                                 ui.horizontal(|ui| {
                                     ui.label("Quick Rotate:");
-                                    if ui.button("X +90°").clicked() {
+                                    if render_icon_button(
+                                        ui,
+                                        UiIcon::RotateObject,
+                                        "X +90°",
+                                        false,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
                                         tf.rotation = (Quat::from_rotation_x(
                                             std::f32::consts::FRAC_PI_2,
                                         ) * tf.rotation)
                                             .normalize();
                                         changed = true;
                                     }
-                                    if ui.button("Y +90°").clicked() {
+                                    if render_icon_button(
+                                        ui,
+                                        UiIcon::RotateObject,
+                                        "Y +90°",
+                                        false,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
                                         tf.rotation = (Quat::from_rotation_y(
                                             std::f32::consts::FRAC_PI_2,
                                         ) * tf.rotation)
                                             .normalize();
                                         changed = true;
                                     }
-                                    if ui.button("Z +45°").clicked() {
+                                    if render_icon_button(
+                                        ui,
+                                        UiIcon::RotateObject,
+                                        "Z +45°",
+                                        false,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
                                         tf.rotation = (Quat::from_rotation_z(
                                             std::f32::consts::FRAC_PI_4,
                                         ) * tf.rotation)
                                             .normalize();
                                         changed = true;
                                     }
-                                    if ui.button("Reset").clicked() {
+                                    if render_icon_button(
+                                        ui,
+                                        UiIcon::ResetTransform,
+                                        "Reset",
+                                        false,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
                                         tf.rotation = Quat::IDENTITY;
                                         changed = true;
                                     }
@@ -1909,7 +2018,15 @@ pub fn ui_workspace_system(
                                                 face.normal.y,
                                                 face.normal.z
                                             );
-                                            if ui.small_button(label).clicked() {
+                                            if render_icon_button(
+                                                ui,
+                                                UiIcon::LayOnFace,
+                                                label,
+                                                true,
+                                                true,
+                                            )
+                                            .clicked()
+                                            {
                                                 chosen_normal = Some((face.face_index, face.normal));
                                             }
                                         }
@@ -1981,7 +2098,14 @@ pub fn ui_workspace_system(
                                         ToolMode::PointHint,
                                     ] {
                                         let active = plate.tool_mode == mode;
-                                        if ui.selectable_label(active, mode.label()).clicked() {
+                                        if render_delineated_icon_pill_tab(
+                                            ui,
+                                            active,
+                                            Some(UiIcon::for_tool_mode(mode)),
+                                            mode.label(),
+                                        )
+                                        .clicked()
+                                        {
                                             plate.tool_mode =
                                                 if active { ToolMode::Select } else { mode };
                                         }
@@ -2000,7 +2124,14 @@ pub fn ui_workspace_system(
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     if surface_hint_count > 0
-                                        && ui.small_button("Clear Surface Hints").clicked()
+                                        && render_icon_button(
+                                            ui,
+                                            UiIcon::DeleteObject,
+                                            "Clear Surface Hints",
+                                            true,
+                                            true,
+                                        )
+                                        .clicked()
                                     {
                                         config
                                             .eikonal
@@ -2045,10 +2176,23 @@ pub fn ui_workspace_system(
                                                         Some(sh.patch_id)
                                                     };
                                                 }
-                                                if ui
-                                                    .small_button(sh.mode.short_label())
-                                                    .on_hover_text("Click to toggle between Normal ⊥ Surface and Normal ∥ Surface")
-                                                    .clicked()
+                                                let hint_icon = match sh.mode {
+                                                    SurfaceHintMode::NormalOrthogonalToSurface => {
+                                                        UiIcon::SurfaceHintOrthogonal
+                                                    }
+                                                    SurfaceHintMode::NormalTangentToSurface => {
+                                                        UiIcon::SurfaceHintTangent
+                                                    }
+                                                };
+                                                if render_icon_button(
+                                                    ui,
+                                                    hint_icon,
+                                                    sh.mode.short_label(),
+                                                    true,
+                                                    true,
+                                                )
+                                                .on_hover_text("Click to toggle between Normal ⊥ Surface and Normal ∥ Surface")
+                                                .clicked()
                                                 {
                                                     sh.mode = match sh.mode {
                                                         SurfaceHintMode::NormalOrthogonalToSurface => {
@@ -2071,7 +2215,16 @@ pub fn ui_workspace_system(
                                                         .range(0.05..=1.0)
                                                         .prefix("w="),
                                                 );
-                                                if ui.small_button("✕").clicked() {
+                                                if render_icon_button(
+                                                    ui,
+                                                    UiIcon::DeleteObject,
+                                                    "",
+                                                    true,
+                                                    true,
+                                                )
+                                                .on_hover_text("Remove this surface hint")
+                                                .clicked()
+                                                {
                                                     remove_surf_idx = Some(idx);
                                                 }
                                             });
@@ -2107,7 +2260,15 @@ pub fn ui_workspace_system(
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        if ui.small_button("+ Add at Center").clicked() {
+                                        if render_icon_button(
+                                            ui,
+                                            UiIcon::AddPlate,
+                                            "Add at Center",
+                                            true,
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
                                             let next_id = config
                                                 .eikonal
                                                 .point_hints
@@ -2134,7 +2295,14 @@ pub fn ui_workspace_system(
                                             plate.selected_point_hint_id = Some(next_id);
                                         }
                                         if point_hint_count > 0
-                                            && ui.small_button("Clear Point Hints").clicked()
+                                            && render_icon_button(
+                                                ui,
+                                                UiIcon::DeleteObject,
+                                                "Clear Point Hints",
+                                                true,
+                                                true,
+                                            )
+                                            .clicked()
                                         {
                                             config
                                                 .eikonal
@@ -2190,7 +2358,16 @@ pub fn ui_workspace_system(
                                                             .range(0.05..=1.0)
                                                             .prefix("w="),
                                                     );
-                                                    if ui.small_button("✕").clicked() {
+                                                    if render_icon_button(
+                                                        ui,
+                                                        UiIcon::DeleteObject,
+                                                        "",
+                                                        true,
+                                                        true,
+                                                    )
+                                                    .on_hover_text("Remove this 3D point hint")
+                                                    .clicked()
+                                                    {
                                                         remove_pt_idx = Some(idx);
                                                     }
                                                 });
