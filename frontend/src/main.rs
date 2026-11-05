@@ -8,6 +8,7 @@ pub mod hull;
 pub mod io;
 pub mod presets;
 pub mod scene;
+pub mod surface_ui;
 pub mod ui;
 
 use bevy::prelude::*;
@@ -89,12 +90,14 @@ fn main() {
         .insert_resource(StartupFiles(gui_opts.initial_files))
         .init_resource::<BuildPlateState>()
         .init_resource::<FieldVisualizationState>()
+        .init_resource::<surface_ui::SurfaceUiState>()
         .add_systems(Startup, setup_viewport_scene_and_pipeline)
         .add_systems(
             Update,
             (
                 ui_workspace_system,
                 poll_io_tasks_system,
+                surface_ui::sync_and_interact_surface_ui_system,
                 viewport_interaction_system,
                 sync_field_visualization_system,
                 update_selection_materials_system,

@@ -1048,13 +1048,14 @@ pub fn viewport_interaction_system(
     mut plate: ResMut<BuildPlateState>,
     mut config: ResMut<SlicerConfig>,
     vis_state: Res<crate::field_vis::FieldVisualizationState>,
+    surface_ui: Res<crate::surface_ui::SurfaceUiState>,
     mut camera_query: Query<(&Camera, &GlobalTransform, &mut OrbitCamera, &mut Transform), Without<CadObjectEntity>>,
     mut object_transforms: Query<&mut Transform, With<CadObjectEntity>>,
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else {
         return;
     };
-    if ctx.wants_pointer_input() || ctx.is_pointer_over_area() {
+    if ctx.wants_pointer_input() || ctx.is_pointer_over_area() || surface_ui.is_interacting() {
         mouse_motion.clear();
         mouse_wheel.clear();
         plate.hovered_hull_face = None;
