@@ -883,6 +883,7 @@ void buildObjectScalarFields(
         effectiveSupportBridgeMm,
         localSupportSpec.enabled && localSupportSpec.seed_order_field,
         localSupportSpec.only_unreachable_and_long_bridges,
+        backend.orderFieldMode() == 1,
     };
 
     for (const auto& ffiHint : backend.spatialOrientationHints()) {
@@ -1358,6 +1359,7 @@ struct SlicerBackend::Impl {
     };
     std::uint32_t activeToolIndex = 0;
     LayerHeightSpec sliceLayerHeight{0.20f, 0.08f, 0.32f, 0.20f, 0.20f};
+    std::uint8_t orderFieldMode = 0;
     std::uint32_t eikonalSolverIterations = 4;
     bool multiResolutionEnabled = true;
     std::uint32_t multiResolutionCoarseRatio = 4;
@@ -1877,6 +1879,7 @@ bool SlicerBackend::recomputeObjectFields(
         snapshotBackend.impl_->tools = impl_->tools;
         snapshotBackend.impl_->activeToolIndex = impl_->activeToolIndex;
         snapshotBackend.impl_->sliceLayerHeight = impl_->sliceLayerHeight;
+        snapshotBackend.impl_->orderFieldMode = impl_->orderFieldMode;
         snapshotBackend.impl_->eikonalSolverIterations = impl_->eikonalSolverIterations;
         snapshotBackend.impl_->multiResolutionEnabled = impl_->multiResolutionEnabled;
         snapshotBackend.impl_->multiResolutionCoarseRatio = impl_->multiResolutionCoarseRatio;
@@ -2648,6 +2651,14 @@ void SlicerBackend::setSliceLayerHeight(const LayerHeightSpec& spec) noexcept {
 
 LayerHeightSpec SlicerBackend::sliceLayerHeight() const noexcept {
     return impl_->sliceLayerHeight;
+}
+
+void SlicerBackend::setOrderFieldMode(std::uint8_t mode) noexcept {
+    impl_->orderFieldMode = (mode == 1) ? 1 : 0;
+}
+
+std::uint8_t SlicerBackend::orderFieldMode() const noexcept {
+    return impl_->orderFieldMode;
 }
 
 void SlicerBackend::setEikonalSolverIterations(std::uint32_t iterations) noexcept {
@@ -5607,6 +5618,16 @@ void set_slice_layer_height(LayerHeightSpec layer_height) {
 LayerHeightSpec get_slice_layer_height() {
     std::lock_guard<std::mutex> lock(g_backendMutex);
     return globalBackend().sliceLayerHeight();
+}
+
+void set_order_field_mode(std::uint8_t mode) {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    globalBackend().setOrderFieldMode(mode);
+}
+
+std::uint8_t get_order_field_mode() {
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    return globalBackend().orderFieldMode();
 }
 
 void set_eikonal_solver_iterations(std::uint32_t iterations) {

@@ -5001,6 +5001,95 @@ mod tests {
         ffi::set_spatial_orientation_hints(&[]);
         let _ = ffi::remove_cad_object(part.object_id);
     }
+
+    #[test]
+    fn test_height_only_planar_order_field_mode_respects_queried_nozzle_axis() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let positions: [f32; 24] = [
+            -6.0, -6.0, 0.0,
+             6.0, -6.0, 0.0,
+             6.0,  6.0, 0.0,
+            -6.0,  6.0, 0.0,
+            -6.0, -6.0, 12.0,
+             6.0, -6.0, 12.0,
+             6.0,  6.0, 12.0,
+            -6.0,  6.0, 12.0,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2,
+            4, 5, 6, 4, 6, 7,
+            0, 1, 5, 0, 5, 4,
+            2, 3, 7, 2, 7, 6,
+            0, 4, 7, 0, 7, 3,
+            1, 2, 6, 1, 6, 5,
+        ];
+        let part = ffi::register_triangle_mesh("planar_mode_cube", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        // 1. Vertical nozzle axis (0, 0, 1) with HeightOnlyPlanar mode:
+        // Even with a strong diagonal 3D hint, τ on a constant-Z slice must be constant
+        // and tool_tilt_deg must be identically 0.
+        let mut cfg = crate::config::SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        crate::ui::sync_config_to_backend(&cfg);
+        assert_eq!(ffi::get_order_field_mode(), 1);
+
+        let hints = vec![ffi::SpatialOrientationHint {
+            kind: 1,
+            position_bed: [0.0, 0.0, 6.0],
+            direction_bed: [0.70, 0.0, 0.714],
+            influence_radius_mm: 25.0,
+            weight: 1.0,
+            apply_on_surface_only: false,
+        }];
+        ffi::set_spatial_orientation_hints(&hints);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.8, 3.0));
+
+        let z_slice = ffi::sample_field_slice(part.object_id, "eikonal", 2, 0.5, 16);
+        assert!(z_slice.valid);
+        let mid = 8usize;
+        let tau_x_neg = z_slice.values[mid * 16 + 4];
+        let tau_x_pos = z_slice.values[mid * 16 + 11];
+        assert!(
+            (tau_x_pos - tau_x_neg).abs() < 1.0e-4,
+            "Expected zero X slope on constant-Z slice in HeightOnlyPlanar mode with vertical nozzle, got tau_x_neg={tau_x_neg}, tau_x_pos={tau_x_pos}"
+        );
+
+        let tilt_stats = ffi::get_object_field_stats(part.object_id, "tool_tilt_deg");
+        assert!(tilt_stats.valid && tilt_stats.active_voxel_count > 0);
+        assert!(
+            tilt_stats.max_value.abs() < 1.0e-4,
+            "Expected 0 deg tool tilt in HeightOnlyPlanar mode, got max={}",
+            tilt_stats.max_value
+        );
+
+        let all_layers = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+        assert!(all_layers.valid);
+        assert!(all_layers.layers.len() >= 10);
+
+        // 2. Tilted 6-axis nozzle axis (0.6, 0.0, 0.8) in bed coordinates:
+        // HeightOnlyPlanar must query nozzle_axis_bed rather than hardcoding +Z, so τ on a
+        // constant-Z slice must vary linearly with X (Δτ / Δx = 0.6).
+        cfg.machine.nozzle_axis_bed = [0.6, 0.0, 0.8];
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.8, 3.0));
+
+        let tilted_z_slice = ffi::sample_field_slice(part.object_id, "eikonal", 2, 0.5, 16);
+        assert!(tilted_z_slice.valid);
+        let tau_tilted_neg = tilted_z_slice.values[mid * 16 + 4];
+        let tau_tilted_pos = tilted_z_slice.values[mid * 16 + 11];
+        assert!(
+            tau_tilted_pos - tau_tilted_neg > 1.5,
+            "Expected HeightOnlyPlanar to project along queried tilted nozzle_axis_bed [0.6, 0, 0.8], got tau_neg={tau_tilted_neg}, tau_pos={tau_tilted_pos}"
+        );
+
+        // Reset backend state to defaults
+        ffi::set_spatial_orientation_hints(&[]);
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
 }
 
 

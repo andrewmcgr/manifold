@@ -431,6 +431,12 @@ pub mod ffi {
         /// Retrieves the number of outer constraint & tool-orientation relaxation iterations.
         pub fn get_eikonal_solver_iterations() -> u32;
 
+        /// Sets the order field mode (`0` = `ConstrainedNonPlanar`, `1` = `HeightOnlyPlanar`).
+        pub fn set_order_field_mode(mode: u8);
+
+        /// Retrieves the order field mode (`0` = `ConstrainedNonPlanar`, `1` = `HeightOnlyPlanar`).
+        pub fn get_order_field_mode() -> u8;
+
         /// Configures dual-grid multi-resolution volumetric field evaluation (coarse full-interior core
         /// + fine boundary-shell narrow band).
         pub fn set_multi_resolution_grid_config(enabled: bool, coarse_ratio: u32);

@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     BedShape, ClearancePointXZ, ClearanceProfileMode, LayerHeightConfig, LineWidthConfig,
-    SlicerConfig, SolidInfillPattern, SparseInfillPattern, ToolConfig, WallPrintOrder,
+    OrderFieldMode, SlicerConfig, SolidInfillPattern, SparseInfillPattern, ToolConfig,
+    WallPrintOrder,
 };
 
 /// Top-level tab in the left workspace panel (`Project Setup` vs. `Configuration`).
@@ -603,6 +604,7 @@ pub struct ProcessPreset {
     pub is_builtin: bool,
 
     // Volumetric Eikonal Solver & Overhang Surface Bias
+    pub order_field_mode: OrderFieldMode,
     pub auto_voxel_size: bool,
     pub voxel_size_mm: f32,
     pub enable_multi_resolution_grid: bool,
@@ -688,6 +690,7 @@ impl ProcessPreset {
         Self {
             name: name.into(),
             is_builtin,
+            order_field_mode: cfg.eikonal.order_field_mode,
             auto_voxel_size: cfg.eikonal.auto_voxel_size,
             voxel_size_mm: cfg.eikonal.voxel_size_mm,
             enable_multi_resolution_grid: cfg.eikonal.enable_multi_resolution_grid,
@@ -749,6 +752,7 @@ impl ProcessPreset {
 
     pub fn apply_to_config(&self, cfg: &mut SlicerConfig) {
         cfg.process_preset_name = self.name.clone();
+        cfg.eikonal.order_field_mode = self.order_field_mode;
         cfg.eikonal.auto_voxel_size = self.auto_voxel_size;
         cfg.eikonal.voxel_size_mm = self.voxel_size_mm;
         cfg.eikonal.enable_multi_resolution_grid = self.enable_multi_resolution_grid;
@@ -821,7 +825,8 @@ impl ProcessPreset {
         } else {
             approx_eq(self.voxel_size_mm, cfg.eikonal.voxel_size_mm)
         };
-        self.auto_voxel_size == cfg.eikonal.auto_voxel_size
+        self.order_field_mode == cfg.eikonal.order_field_mode
+            && self.auto_voxel_size == cfg.eikonal.auto_voxel_size
             && voxel_ok
             && self.enable_multi_resolution_grid == cfg.eikonal.enable_multi_resolution_grid
             && self.coarse_grid_ratio == cfg.eikonal.coarse_grid_ratio
@@ -1145,7 +1150,14 @@ impl PresetLibrary {
         pr_draft.infill_density_percent = 30.0;
         pr_draft.sparse_infill_pattern = SparseInfillPattern::Cubic;
 
-        vec![pr_std, pr_fine, pr_draft]
+        let mut pr_planar = ProcessPreset::from_config(
+            "0.20mm Standard Planar (Height-Only)",
+            &base_cfg,
+            true,
+        );
+        pr_planar.order_field_mode = OrderFieldMode::HeightOnlyPlanar;
+
+        vec![pr_std, pr_fine, pr_draft, pr_planar]
     }
 
     pub fn presets_root_dir() -> Option<PathBuf> {

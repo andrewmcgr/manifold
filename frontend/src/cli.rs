@@ -860,13 +860,27 @@ fn parse_cli_value_for_target(target: &JsonValue, raw_val: &str, key: &str) -> R
         }
         JsonValue::String(_) => {
             // Strip optional surrounding quotes if passed
-            if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+            let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
                 || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
             {
-                Ok(JsonValue::String(trimmed[1..trimmed.len() - 1].to_string()))
+                &trimmed[1..trimmed.len() - 1]
             } else {
-                Ok(JsonValue::String(trimmed.to_string()))
+                trimmed
+            };
+            if key.ends_with("order_field_mode") {
+                match unquoted.to_ascii_lowercase().as_str() {
+                    "planar" | "height" | "heightonly" | "height_only" | "heightonlyplanar"
+                    | "height_only_planar" => {
+                        return Ok(JsonValue::String("HeightOnlyPlanar".to_string()));
+                    }
+                    "nonplanar" | "non_planar" | "eikonal" | "constrained"
+                    | "constrainednonplanar" | "constrained_non_planar" => {
+                        return Ok(JsonValue::String("ConstrainedNonPlanar".to_string()));
+                    }
+                    _ => {}
+                }
             }
+            Ok(JsonValue::String(unquoted.to_string()))
         }
         JsonValue::Array(_) | JsonValue::Object(_) => serde_json::from_str(trimmed).map_err(|e| {
             format!("Expected valid JSON array/object for '{key}', got '{raw_val}' ({e})")

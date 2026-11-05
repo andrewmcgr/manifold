@@ -6,9 +6,9 @@ use bevy_egui::{egui, EguiContexts};
 
 use crate::bridge::ffi;
 use crate::config::{
-    lookup_parameter_doc, BedShape, ClearancePointXZ, ClearanceProfileMode, PointNormalHint,
-    SlicerConfig, SolidInfillPattern, SparseInfillPattern, SurfaceHintMode, ToolConfig,
-    WallPrintOrder,
+    lookup_parameter_doc, BedShape, ClearancePointXZ, ClearanceProfileMode, OrderFieldMode,
+    PointNormalHint, SlicerConfig, SolidInfillPattern, SparseInfillPattern, SurfaceHintMode,
+    ToolConfig, WallPrintOrder,
 };
 use crate::field_vis::{
     high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
@@ -3915,15 +3915,46 @@ fn render_process_config_tab(
         }
     });
 
-    // 2. Volumetric Eikonal Field Solver & Overhang Surface Bias
+    // 2. Volumetric Order Field & Eikonal Solver
     ui.add_space(4.0);
     egui::CollapsingHeader::new(
-        egui::RichText::new("Volumetric Eikonal Solver & Overhang Bias").strong(),
+        egui::RichText::new("Volumetric Order Field & Eikonal Solver").strong(),
     )
     .id_source("process_eikonal_solver_section")
     .default_open(true)
     .show(ui, |ui| {
         let mut eik_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Order Field:").strong());
+            for mode in OrderFieldMode::ALL {
+                let selected = config.eikonal.order_field_mode == mode;
+                if render_delineated_pill_tab(ui, selected, mode.label())
+                    .on_hover_text(match mode {
+                        OrderFieldMode::ConstrainedNonPlanar => {
+                            "Constrained non-planar Eikonal solver with nozzle-clearance cone projection and overhang surface bias."
+                        }
+                        OrderFieldMode::HeightOnlyPlanar => {
+                            "Height-only planar order field τ(x) = max(0, x · ẑ_nozzle − z_min,bed) evaluated along the queried nozzle axis with 0° tool tilt."
+                        }
+                    })
+                    .clicked()
+                    && !selected
+                {
+                    config.eikonal.order_field_mode = mode;
+                    eik_changed = true;
+                }
+            }
+            param_help_button(ui, "eikonal.order_field_mode");
+        });
+        if config.eikonal.order_field_mode == OrderFieldMode::HeightOnlyPlanar {
+            ui.small(
+                egui::RichText::new(
+                    "Planar mode: τ(x) = max(0, x · ẑ_nozzle(x) − z_min,bed) along the queried nozzle frame (0° tilt). Gravity-aware overhang and support detection remain active.",
+                )
+                .color(egui::Color32::from_rgb(135, 205, 245)),
+            );
+        }
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
             if ui
                 .checkbox(
@@ -3961,6 +3992,8 @@ fn render_process_config_tab(
             }
         });
 
+        let non_planar_active =
+            config.eikonal.order_field_mode == OrderFieldMode::ConstrainedNonPlanar;
         ui.horizontal(|ui| {
             if ui
                 .add(
@@ -3973,12 +4006,15 @@ fn render_process_config_tab(
                 eik_changed = true;
             }
             param_help_button(ui, "eikonal.voxel_size_mm");
-            eik_changed |= ui
-                .add(
-                    egui::Slider::new(&mut config.eikonal.solver_iterations, 1..=12).text("Iters"),
-                )
-                .changed();
-            param_help_button(ui, "eikonal.solver_iterations");
+            ui.add_enabled_ui(non_planar_active, |ui| {
+                eik_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut config.eikonal.solver_iterations, 1..=12)
+                            .text("Iters"),
+                    )
+                    .changed();
+                param_help_button(ui, "eikonal.solver_iterations");
+            });
         });
 
         ui.horizontal(|ui| {
@@ -3992,69 +4028,75 @@ fn render_process_config_tab(
                 )
                 .changed();
             param_help_button(ui, "eikonal.narrow_band_width_voxels");
-            eik_changed |= ui
-                .add(
-                    egui::Slider::new(&mut config.eikonal.curvature_regularization, 0.0..=1.0)
-                        .text("Curvature Reg."),
-                )
-                .changed();
-            param_help_button(ui, "eikonal.curvature_regularization");
+            ui.add_enabled_ui(non_planar_active, |ui| {
+                eik_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut config.eikonal.curvature_regularization, 0.0..=1.0)
+                            .text("Curvature Reg."),
+                    )
+                    .changed();
+                param_help_button(ui, "eikonal.curvature_regularization");
+            });
         });
 
         ui.separator();
-        ui.horizontal(|ui| {
-            eik_changed |= ui
-                .checkbox(
-                    &mut config.eikonal.enable_overhang_orientation_bias,
-                    "Overhang Conformal / Orthogonal Surface Bias",
-                )
-                .changed();
-            param_help_button(ui, "eikonal.enable_overhang_orientation_bias");
-        });
-        if config.eikonal.enable_overhang_orientation_bias {
+        ui.add_enabled_ui(non_planar_active, |ui| {
             ui.horizontal(|ui| {
                 eik_changed |= ui
-                    .add(
-                        egui::Slider::new(&mut config.eikonal.overhang_bias_weight, 0.0..=1.0)
-                            .text("Bias Weight"),
+                    .checkbox(
+                        &mut config.eikonal.enable_overhang_orientation_bias,
+                        "Overhang Conformal / Orthogonal Surface Bias",
                     )
                     .changed();
-                param_help_button(ui, "eikonal.overhang_bias_weight");
-                eik_changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut config.eikonal.overhang_bias_transition_deg)
-                            .speed(0.5)
-                            .range(1.0..=45.0)
-                            .prefix("Transition: ")
-                            .suffix("°"),
-                    )
-                    .changed();
-                param_help_button(ui, "eikonal.overhang_bias_transition_deg");
+                param_help_button(ui, "eikonal.enable_overhang_orientation_bias");
             });
-            ui.horizontal(|ui| {
-                ui.small("Orthogonal Band:");
-                eik_changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut config.eikonal.orthogonal_supported_angle_deg)
+            if config.eikonal.enable_overhang_orientation_bias {
+                ui.horizontal(|ui| {
+                    eik_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut config.eikonal.overhang_bias_weight, 0.0..=1.0)
+                                .text("Bias Weight"),
+                        )
+                        .changed();
+                    param_help_button(ui, "eikonal.overhang_bias_weight");
+                    eik_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut config.eikonal.overhang_bias_transition_deg)
+                                .speed(0.5)
+                                .range(1.0..=45.0)
+                                .prefix("Transition: ")
+                                .suffix("°"),
+                        )
+                        .changed();
+                    param_help_button(ui, "eikonal.overhang_bias_transition_deg");
+                });
+                ui.horizontal(|ui| {
+                    ui.small("Orthogonal Band:");
+                    eik_changed |= ui
+                        .add(
+                            egui::DragValue::new(
+                                &mut config.eikonal.orthogonal_supported_angle_deg,
+                            )
                             .speed(0.5)
                             .range(0.0..=89.0)
                             .prefix("Supported ≤ ")
                             .suffix("°"),
-                    )
-                    .changed();
-                param_help_button(ui, "eikonal.orthogonal_supported_angle_deg");
-                eik_changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut config.eikonal.orthogonal_overhang_angle_deg)
-                            .speed(0.5)
-                            .range(0.0..=89.0)
-                            .prefix("Overhang ≤ ")
-                            .suffix("°"),
-                    )
-                    .changed();
-                param_help_button(ui, "eikonal.orthogonal_overhang_angle_deg");
-            });
-        }
+                        )
+                        .changed();
+                    param_help_button(ui, "eikonal.orthogonal_supported_angle_deg");
+                    eik_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut config.eikonal.orthogonal_overhang_angle_deg)
+                                .speed(0.5)
+                                .range(0.0..=89.0)
+                                .prefix("Overhang ≤ ")
+                                .suffix("°"),
+                        )
+                        .changed();
+                    param_help_button(ui, "eikonal.orthogonal_overhang_angle_deg");
+                });
+            }
+        });
 
         ui.separator();
         ui.small("Default Soft Hint Placement Parameters:");
@@ -5338,6 +5380,7 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         wave_overhang_overlap_fraction: config.slicing.wave_overhang_overlap_fraction,
     });
 
+    ffi::set_order_field_mode(config.eikonal.order_field_mode.as_u8());
     ffi::set_eikonal_solver_iterations(config.eikonal.solver_iterations);
     ffi::set_multi_resolution_grid_config(
         config.eikonal.enable_multi_resolution_grid,

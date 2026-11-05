@@ -809,10 +809,57 @@ pub fn compute_auto_fine_voxel_size_mm(
     ((raw * 100.0).round() / 100.0).clamp(0.08, 2.00)
 }
 
+/// Mode used to construct the volumetric order field $\tau(\mathbf{x})$ whose isosurfaces
+/// $\tau(\mathbf{x}) = \tau_k$ define the slicing layers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderFieldMode {
+    /// Iterative constrained 3D non-planar Eikonal solver with 5/6-axis tool clearance,
+    /// overhang conformal/orthogonal surface bias, and soft orientation hints.
+    #[default]
+    ConstrainedNonPlanar,
+    /// Height-only planar order field $\tau(\mathbf{x}) = \max(0,\; \mathbf{x} \cdot \hat{\mathbf{z}}_{\text{nozzle}}(\mathbf{x}) - z_{\min,\text{bed}})$
+    /// projected along the queried local nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$ for planar slicing.
+    HeightOnlyPlanar,
+}
+
+impl OrderFieldMode {
+    pub const ALL: [Self; 2] = [Self::ConstrainedNonPlanar, Self::HeightOnlyPlanar];
+
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::ConstrainedNonPlanar => 0,
+            Self::HeightOnlyPlanar => 1,
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::HeightOnlyPlanar,
+            _ => Self::ConstrainedNonPlanar,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ConstrainedNonPlanar => "Constrained Non-Planar (Eikonal)",
+            Self::HeightOnlyPlanar => "Height-Only (Planar Slicing)",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::ConstrainedNonPlanar => "Non-Planar Eikonal",
+            Self::HeightOnlyPlanar => "Height-Only (Planar)",
+        }
+    }
+}
+
 /// OpenVDB volumetric Eikonal and SDF field parameters and soft orientation hints.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EikonalFieldConfig {
+    /// Order field generation mode (`ConstrainedNonPlanar` vs. `HeightOnlyPlanar`).
+    pub order_field_mode: OrderFieldMode,
     pub voxel_size_mm: f32,
     /// Automatically scale the fine grid `voxel_size_mm` from the active nozzle diameter
     /// and target layer height (`0.375 * nozzle_diameter_mm + 0.50 * target_layer_height_mm`).
@@ -858,6 +905,7 @@ pub struct EikonalFieldConfig {
 impl Default for EikonalFieldConfig {
     fn default() -> Self {
         Self {
+            order_field_mode: OrderFieldMode::ConstrainedNonPlanar,
             voxel_size_mm: 0.25,
             auto_voxel_size: true,
             enable_multi_resolution_grid: true,
@@ -1379,6 +1427,15 @@ pub struct ParameterDoc {
 /// Complete structured parameter documentation catalog for Manifold2.
 pub const PARAMETER_DOCS: &[ParameterDoc] = &[
     // --- Eikonal Field & Orientation Hints ---
+    ParameterDoc {
+        key: "eikonal.order_field_mode",
+        category: "Volumetric Fields & Eikonal Solver",
+        title: "Order Field Mode (Non-Planar Eikonal vs. Height-Only Planar)",
+        units: "",
+        default_value: "Constrained Non-Planar (Eikonal)",
+        summary: "Selects whether the slicing order field τ(x) is solved via the 3D Constrained Non-Planar Eikonal solver or evaluated as a linear height field along the queried local nozzle axis for planar slicing.",
+        details: "In 'Constrained Non-Planar (Eikonal)' mode, τ(x) is solved iteratively subject to 5/6-axis tool clearance cones, overhang conformal/orthogonal surface bias, and soft orientation hints. In 'Height-Only (Planar Slicing)' mode, τ(x) = max(0, x · z_nozzle(x) - z_min,bed) is evaluated directly along the queried local nozzle axis (AGENTS.md Rule 1) with zero tool tilt, producing flat planar layers perpendicular to z_nozzle while retaining full 3D SDF shell classification, variable layer heights, bridging, and causal overhang/bridge support detection.",
+    },
     ParameterDoc {
         key: "eikonal.voxel_size_mm",
         category: "Volumetric Fields & Eikonal Solver",
@@ -2503,5 +2560,16 @@ mod tests {
         assert_eq!(ffi_spec.clearance_mode, 2);
         assert!((ffi_spec.rect_half_angle_x_deg - 30.0).abs() < 1.0e-4);
         assert!((ffi_spec.rect_half_angle_y_deg - 60.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn test_order_field_mode_roundtrip() {
+        assert_eq!(OrderFieldMode::default(), OrderFieldMode::ConstrainedNonPlanar);
+        for mode in OrderFieldMode::ALL {
+            assert_eq!(OrderFieldMode::from_u8(mode.as_u8()), mode);
+            let json = serde_json::to_string(&mode).unwrap();
+            let decoded: OrderFieldMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, mode);
+        }
     }
 }

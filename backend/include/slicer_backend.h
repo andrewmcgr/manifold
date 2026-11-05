@@ -158,6 +158,12 @@ public:
     /// Returns the configured number of outer Eikonal solver iterations.
     std::uint32_t eikonalSolverIterations() const noexcept;
 
+    /// Sets the order field mode (`0` = `ConstrainedNonPlanar`, `1` = `HeightOnlyPlanar`).
+    void setOrderFieldMode(std::uint8_t mode) noexcept;
+
+    /// Returns the configured order field mode (`0` = `ConstrainedNonPlanar`, `1` = `HeightOnlyPlanar`).
+    std::uint8_t orderFieldMode() const noexcept;
+
     /// Configures dual-grid multi-resolution volumetric field evaluation (coarse full-interior core
     /// + fine boundary-shell narrow band).
     void setMultiResolutionConfig(bool enabled, std::uint32_t coarseRatio) noexcept;
@@ -269,6 +275,8 @@ void set_slice_layer_height(LayerHeightSpec layer_height);
 LayerHeightSpec get_slice_layer_height();
 void set_eikonal_solver_iterations(std::uint32_t iterations);
 std::uint32_t get_eikonal_solver_iterations();
+void set_order_field_mode(std::uint8_t mode);
+std::uint8_t get_order_field_mode();
 void set_multi_resolution_grid_config(bool enabled, std::uint32_t coarse_ratio);
 void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hints);
 void set_overhang_orientation_bias_spec(OverhangBiasSpec spec);

@@ -143,6 +143,7 @@ struct EikonalSolverContext {
     float maxBridgeLengthMm = 40.0f;
     bool enableSupportSeeding = false;
     bool onlySupportUnreachableAndBridges = false;
+    bool heightOnlyOrderField = false;
 };
 
 /// Pluggable strategy for computing and clamping the local 5/6-axis tool orientation
@@ -238,6 +239,7 @@ struct EikonalSolveResult {
     openvdb::FloatGrid::Ptr toolTiltDegGrid;
     openvdb::FloatGrid::Ptr supportNeededGrid;
     openvdb::Vec3SGrid::Ptr toolAxisGrid;
+    float minAxialBed = 0.0f;
 };
 
 /// Runs the full iterative constrained Eikonal + tool-orientation solver on `sdfGrid`.
