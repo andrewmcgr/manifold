@@ -2014,15 +2014,14 @@ void evaluateSupportNeededAndSeedOrderField(
         domain.supportNeeded.swap(nextSupport);
     }
 
-    // 4. Optional Step 2: Seed the Constrained Order Field \tau(x) from Causally-Unreachable Support Contact Regions
+    // 4. Optional Step 2: Seed the Constrained Order Field \tau(x) from Support Contact Regions
     if (ctx.enableSupportSeeding) {
         bool seededAnySupport = false;
         for (std::size_t i = 0; i < n; ++i) {
             if (!domain.isInterior[i] || domain.isPinnedSeed[i]) {
                 continue;
             }
-            if (!causallyReachable[i] &&
-                domain.supportNeeded[i] > 0.50f &&
+            if (domain.supportNeeded[i] > 0.50f &&
                 std::abs(domain.sdf[i]) <= 1.50f * dx) {
                 const float hSupport = std::max(0.0f, gravHeight[i]);
                 if (hSupport + 2.0f * dx < domain.tau[i]) {

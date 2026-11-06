@@ -205,6 +205,12 @@ pub mod ffi {
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct SupportSpec {
         pub enabled: bool,
+        /// Tool index into `SlicerBackend::tools` used for support generation (`-1` = active object tool).
+        pub support_tool_index: i32,
+        /// `0 = ColumnarGrid`, `1 = NonPlanarTree`
+        pub support_style: u8,
+        /// When true, supports are never placed on upper model surfaces (tree branches route around the part to the bed).
+        pub on_bed_only: bool,
         pub seed_order_field: bool,
         /// When true, only generate support for regions that are actually causally unreachable by
         /// the constrained order field (floating islands / downward-hanging local minima) and
@@ -220,6 +226,10 @@ pub mod ffi {
         pub base_spacing_mm: f32,
         pub interface_spacing_mm: f32,
         pub line_width_mm: f32,
+        pub tree_branch_angle_deg: f32,
+        pub tree_tip_diameter_mm: f32,
+        pub tree_trunk_max_diameter_mm: f32,
+        pub tree_branch_wall_count: u32,
     }
 
     /// Shell, overhang (bridging & wave overhangs), and sparse infill path generation parameters shared across FFI.

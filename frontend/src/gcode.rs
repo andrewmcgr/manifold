@@ -101,6 +101,8 @@ pub struct PlannedSegment {
     pub nozzle_bed_0: Vec3,
     pub nozzle_bed_1: Vec3,
     pub kind: PlannedMoveKind,
+    /// Extruder tool ID (`T{tool_id}`, e.g. `0` for `T0`, `1` for `T1`) assigned to this segment.
+    pub tool_id: u32,
     pub wall_index: u32,
     pub width_mm: f32,
     pub height_mm: f32,
@@ -1871,6 +1873,16 @@ pub fn plan_and_emit_gcode_for_object(
         .map(|t| t.temperature_celsius)
         .unwrap_or(215.0);
 
+    let support_tool = config.support_tool();
+    let support_tool_id = support_tool.map(|t| t.id).unwrap_or(tool_id);
+    let support_nozzle_diam_mm = support_tool
+        .map(|t| t.nozzle_diameter_mm)
+        .unwrap_or(nozzle_diam_mm)
+        .max(0.10);
+    let support_nozzle_temp_c = support_tool
+        .map(|t| t.temperature_celsius)
+        .unwrap_or(nozzle_temp_c);
+
     // Query gravity direction in bed coordinates (AGENTS.md Rule 2: never hardcode -Z!)
     let gravity_bed = config.query_gravity_bed(Vec3::ZERO);
     let up_bed = (-gravity_bed).try_normalize().unwrap_or(Vec3::Z);
@@ -1891,7 +1903,7 @@ pub fn plan_and_emit_gcode_for_object(
     let filament_area_mm2 =
         std::f32::consts::FRAC_PI_4 * gcfg.filament_diameter_mm * gcfg.filament_diameter_mm;
     let fluid = FluidDynamicsModel::from_config(&gcfg, nozzle_temp_c);
-    let simplify_tol_mm = 0.04 * nozzle_diam_mm;
+    let support_fluid = FluidDynamicsModel::from_config(&gcfg, support_nozzle_temp_c);
     let min_retract_travel_mm = gcfg.effective_min_travel_for_retract();
 
     let mut planned_layers: Vec<PlannedLayerGcode> = Vec::with_capacity(raw_toolpaths.layers.len());
@@ -1899,6 +1911,8 @@ pub fn plan_and_emit_gcode_for_object(
     let mut curr_nozzle_axis_bed = Vec3::from_array(config.machine.nozzle_axis_bed)
         .try_normalize()
         .unwrap_or(up_bed);
+    let mut curr_planned_tool_id = tool_id;
+    let mut curr_planned_is_support = false;
 
     let mut bbox_min = Vec3::splat(f32::MAX);
     let mut bbox_max = Vec3::splat(f32::MIN);
@@ -1942,7 +1956,17 @@ pub fn plan_and_emit_gcode_for_object(
                 wall_index: raw_path.wall_index,
                 is_closed: raw_path.is_closed,
             };
-            simplify_working_chain(&mut wc, simplify_tol_mm);
+            let chain_nozzle_diam = if base_kind.is_support() {
+                support_nozzle_diam_mm
+            } else {
+                nozzle_diam_mm
+            };
+            let chain_fluid = if base_kind.is_support() {
+                &support_fluid
+            } else {
+                &fluid
+            };
+            simplify_working_chain(&mut wc, 0.04 * chain_nozzle_diam);
             let nom_spd = if is_first_layer {
                 gcfg.first_layer_speed_mms
             } else {
@@ -1950,10 +1974,10 @@ pub fn plan_and_emit_gcode_for_object(
             };
             compensate_wall_geometry(
                 &mut wc,
-                nozzle_diam_mm,
+                chain_nozzle_diam,
                 config.slicing.outer_wall_width.target_mm,
                 up_bed,
-                &fluid,
+                chain_fluid,
                 nom_spd,
                 gcfg.enable_flat_nozzle_comp,
             );
@@ -1971,6 +1995,23 @@ pub fn plan_and_emit_gcode_for_object(
         let mut layer_segments: Vec<PlannedSegment> = Vec::new();
 
         for chain in &ordered_chains {
+            let chain_is_support = chain.base_kind.is_support();
+            let chain_tool_id = if chain_is_support {
+                support_tool_id
+            } else {
+                tool_id
+            };
+            let chain_nozzle_diam = if chain_is_support {
+                support_nozzle_diam_mm
+            } else {
+                nozzle_diam_mm
+            };
+            let chain_fluid = if chain_is_support {
+                &support_fluid
+            } else {
+                &fluid
+            };
+
             let vertices = if chain.base_kind == PlannedMoveKind::Bridge {
                 // Keep circular Bridge extrusions as pure un-subdivided straight lines
                 chain.pts.clone()
@@ -1984,29 +2025,32 @@ pub fn plan_and_emit_gcode_for_object(
             let chain_start_bed = vertices[0].pos_bed;
             let chain_start_nozzle = vertices[0].nozzle_bed;
 
-            // Emit inter-path travel + conditional Z-hop along local nozzle axis (`z_nozzle`)
+            // Emit inter-path travel + conditional Z-hop along local nozzle axis (`z_nozzle`).
+            // Always Z-hop when crossing between support and object extrusions, when traveling
+            // between separate support structures, or when switching tools so the nozzle never
+            // drags across support or object walls!
             if let Some(prev_bed) = curr_nozzle_bed {
                 let travel_vec = chain_start_bed - prev_bed;
                 let travel_dist = travel_vec.length();
-                if travel_dist > 1.0e-3 {
-                    let needs_retract = travel_dist > min_retract_travel_mm;
+                let tool_changed = chain_tool_id != curr_planned_tool_id;
+                let support_boundary_crossing = chain_is_support != curr_planned_is_support;
+                if travel_dist > 1.0e-3 || tool_changed {
+                    let needs_retract = travel_dist > min_retract_travel_mm
+                        || tool_changed
+                        || support_boundary_crossing;
                     let is_infill_to_infill = matches!(
                         chain.base_kind,
-                        PlannedMoveKind::SolidInfill
-                            | PlannedMoveKind::SparseInfill
-                            | PlannedMoveKind::Support
-                            | PlannedMoveKind::SupportInterface
+                        PlannedMoveKind::SolidInfill | PlannedMoveKind::SparseInfill
                     ) && layer_segments.last().is_some_and(|s| {
                         matches!(
                             s.kind,
-                            PlannedMoveKind::SolidInfill
-                                | PlannedMoveKind::SparseInfill
-                                | PlannedMoveKind::Support
-                                | PlannedMoveKind::SupportInterface
+                            PlannedMoveKind::SolidInfill | PlannedMoveKind::SparseInfill
                         )
                     });
-                    let use_z_hop =
-                        needs_retract && gcfg.z_hop_mm > 1.0e-3 && !is_infill_to_infill;
+                    let use_z_hop = gcfg.z_hop_mm > 1.0e-3
+                        && ((needs_retract && !is_infill_to_infill)
+                            || tool_changed
+                            || support_boundary_crossing);
 
                     if use_z_hop {
                         let lift_dir = curr_nozzle_axis_bed.try_normalize().unwrap_or(up_bed);
@@ -2025,8 +2069,9 @@ pub fn plan_and_emit_gcode_for_object(
                             nozzle_bed_0: curr_nozzle_axis_bed,
                             nozzle_bed_1: curr_nozzle_axis_bed,
                             kind: PlannedMoveKind::ZHop,
+                            tool_id: curr_planned_tool_id,
                             wall_index: 0,
-                            width_mm: nozzle_diam_mm * 0.35,
+                            width_mm: chain_nozzle_diam * 0.35,
                             height_mm: gcfg.z_hop_mm,
                             length_mm: gcfg.z_hop_mm,
                             nominal_speed_mms: gcfg.z_hop_speed_mms,
@@ -2056,8 +2101,9 @@ pub fn plan_and_emit_gcode_for_object(
                             nozzle_bed_0: curr_nozzle_axis_bed,
                             nozzle_bed_1: chain_start_nozzle,
                             kind: PlannedMoveKind::Travel,
+                            tool_id: chain_tool_id,
                             wall_index: 0,
-                            width_mm: nozzle_diam_mm * 0.35,
+                            width_mm: chain_nozzle_diam * 0.35,
                             height_mm: 0.15,
                             length_mm: mid_len,
                             nominal_speed_mms: gcfg.travel_speed_mms,
@@ -2086,8 +2132,9 @@ pub fn plan_and_emit_gcode_for_object(
                             nozzle_bed_0: chain_start_nozzle,
                             nozzle_bed_1: chain_start_nozzle,
                             kind: PlannedMoveKind::ZHop,
+                            tool_id: chain_tool_id,
                             wall_index: 0,
-                            width_mm: nozzle_diam_mm * 0.35,
+                            width_mm: chain_nozzle_diam * 0.35,
                             height_mm: gcfg.z_hop_mm,
                             length_mm: gcfg.z_hop_mm,
                             nominal_speed_mms: gcfg.z_hop_speed_mms,
@@ -2120,10 +2167,11 @@ pub fn plan_and_emit_gcode_for_object(
                             nozzle_bed_0: curr_nozzle_axis_bed,
                             nozzle_bed_1: chain_start_nozzle,
                             kind: PlannedMoveKind::Travel,
+                            tool_id: chain_tool_id,
                             wall_index: 0,
-                            width_mm: nozzle_diam_mm * 0.35,
+                            width_mm: chain_nozzle_diam * 0.35,
                             height_mm: 0.15,
-                            length_mm: travel_dist,
+                            length_mm: travel_dist.max(1.0e-4),
                             nominal_speed_mms: gcfg.travel_speed_mms,
                             entry_speed_mms: 0.0,
                             cruise_speed_mms: gcfg.travel_speed_mms,
@@ -2270,7 +2318,7 @@ pub fn plan_and_emit_gcode_for_object(
                     let v_vol_max = gcfg.max_volumetric_flow_mm3s / a_bead.max(1.0e-4);
                     let v_clamped = target_spd.min(v_vol_max).max(5.0);
                     let q_est = a_bead * v_clamped * rate_mult * m_feature;
-                    let m_swell = fluid.swell_volume_multiplier(q_est);
+                    let m_swell = chain_fluid.swell_volume_multiplier(q_est);
                     let m_first = if is_first_layer {
                         gcfg.first_layer_flow_multiplier
                     } else {
@@ -2296,6 +2344,7 @@ pub fn plan_and_emit_gcode_for_object(
                         nozzle_bed_0: a.nozzle_bed,
                         nozzle_bed_1: b.nozzle_bed,
                         kind,
+                        tool_id: chain_tool_id,
                         wall_index: chain.wall_index,
                         width_mm: width,
                         height_mm: height,
@@ -2309,7 +2358,7 @@ pub fn plan_and_emit_gcode_for_object(
                         delta_e_mm: delta_e,
                         volumetric_flow_mm3s: q_est,
                         extrusion_multiplier: composite_mult,
-                        pressure_advance_s: fluid.pressure_advance_s(
+                        pressure_advance_s: chain_fluid.pressure_advance_s(
                             q_est,
                             gcfg.enable_dynamic_pa,
                             gcfg.pa_low_flow_s,
@@ -2329,6 +2378,7 @@ pub fn plan_and_emit_gcode_for_object(
                         nozzle_bed_0: a.nozzle_bed,
                         nozzle_bed_1: b.nozzle_bed,
                         kind: PlannedMoveKind::Wipe,
+                        tool_id: chain_tool_id,
                         wall_index: chain.wall_index,
                         width_mm: width * 0.5,
                         height_mm: height * 0.5,
@@ -2438,6 +2488,8 @@ pub fn plan_and_emit_gcode_for_object(
             if let Some(last_v) = vertices.last() {
                 curr_nozzle_bed = Some(last_v.pos_bed);
                 curr_nozzle_axis_bed = last_v.nozzle_bed;
+                curr_planned_tool_id = chain_tool_id;
+                curr_planned_is_support = chain_is_support;
             }
         }
 
@@ -2481,6 +2533,7 @@ pub fn plan_and_emit_gcode_for_object(
                 nozzle_bed_0: last_ext.nozzle_bed_1,
                 nozzle_bed_1: last_ext.nozzle_bed_1,
                 kind: PlannedMoveKind::Wipe,
+                tool_id: last_ext.tool_id,
                 wall_index: 0,
                 width_mm: nozzle_diam_mm * 0.4,
                 height_mm: 0.15,
@@ -2510,6 +2563,7 @@ pub fn plan_and_emit_gcode_for_object(
                 nozzle_bed_0: last_ext.nozzle_bed_1,
                 nozzle_bed_1: last_ext.nozzle_bed_1,
                 kind: PlannedMoveKind::ZHop,
+                tool_id: last_ext.tool_id,
                 wall_index: 0,
                 width_mm: nozzle_diam_mm * 0.35,
                 height_mm: 2.0,
@@ -2538,8 +2592,13 @@ pub fn plan_and_emit_gcode_for_object(
 
     for layer in &mut planned_layers {
         for seg in &mut layer.segments {
+            let seg_fluid = if seg.kind.is_support() {
+                &support_fluid
+            } else {
+                &fluid
+            };
             if seg.retract_before_mm > 0.0 {
-                seg.retract_before_mm = fluid.adaptive_retract_length_mm(
+                seg.retract_before_mm = seg_fluid.adaptive_retract_length_mm(
                     last_q_mm3s,
                     last_pa_s,
                     filament_area_mm2,
@@ -2548,7 +2607,11 @@ pub fn plan_and_emit_gcode_for_object(
             }
             if seg.kind.is_extruding() && seg.delta_e_mm > 0.0 {
                 let q_nom = (seg.delta_e_mm * filament_area_mm2) / seg.duration_s.max(1.0e-4);
-                let pa_s = fluid.pressure_advance_s(q_nom, gcfg.enable_dynamic_pa, gcfg.pa_low_flow_s);
+                let pa_s = seg_fluid.pressure_advance_s(
+                    q_nom,
+                    gcfg.enable_dynamic_pa,
+                    gcfg.pa_low_flow_s,
+                );
                 let (m_trans, p_avg) = pressure_tracker.step_extrusion(
                     q_nom,
                     seg.duration_s,
@@ -2560,7 +2623,7 @@ pub fn plan_and_emit_gcode_for_object(
                 seg.extrusion_multiplier *= m_trans;
                 seg.volumetric_flow_mm3s =
                     (seg.delta_e_mm * filament_area_mm2) / seg.duration_s.max(1.0e-4);
-                seg.pressure_advance_s = fluid.pressure_advance_s(
+                seg.pressure_advance_s = seg_fluid.pressure_advance_s(
                     seg.volumetric_flow_mm3s,
                     gcfg.enable_dynamic_pa,
                     gcfg.pa_low_flow_s,
@@ -2655,6 +2718,18 @@ pub fn plan_and_emit_gcode_for_object(
         gcode.push('\n');
     }
     gcode.push_str("M83 ; Ensure relative extrusion\n");
+    if support_tool_id != tool_id {
+        let has_support_segs = planned_layers.iter().any(|l| {
+            l.segments
+                .iter()
+                .any(|s| s.kind.is_support() && s.delta_e_mm > 1.0e-6)
+        });
+        if has_support_segs {
+            gcode.push_str(&format!(
+                "M104 S{support_nozzle_temp_c:.0} T{support_tool_id} ; Preheat support tool T{support_tool_id}\n"
+            ));
+        }
+    }
     if gcfg.enable_slicer_pa_subdivision {
         gcode.push_str("SET_PRESSURE_ADVANCE ADVANCE=0.0000 ; Slicer-side PA active\n");
     }
@@ -2664,6 +2739,7 @@ pub fn plan_and_emit_gcode_for_object(
     let mut emitted_pa = -1.0f32;
     let mut emitted_fan_pwm: Option<u8> = None;
     let mut last_emitted_kind: Option<PlannedMoveKind> = None;
+    let mut emitted_tool_id = tool_id;
     let mut active_retract_mm = 0.0f32;
     let mut accum_travel_time_s = 0.0f32;
 
@@ -2753,11 +2829,46 @@ pub fn plan_and_emit_gcode_for_object(
                 total_time_s += r_len / gcfg.retract_speed_mms.max(1.0);
             }
 
+            // Emit toolchange (`T{id}`) before resuming extrusion if the segment uses a different tool
+            if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 && seg.tool_id != emitted_tool_id {
+                if active_retract_mm <= 1.0e-4 && gcfg.retract_length_mm > 1.0e-4 {
+                    let r_len = gcfg.retract_length_mm;
+                    let r_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
+                    gcode.push_str(&format!(
+                        "G1 E-{r_len:.5} F{r_feed:.0} ; Retract before toolchange\n"
+                    ));
+                    active_retract_mm = r_len;
+                    accum_travel_time_s = 0.0;
+                    retract_count += 1;
+                    total_time_s += r_len / gcfg.retract_speed_mms.max(1.0);
+                }
+                let target_temp_c = if seg.tool_id == support_tool_id {
+                    support_nozzle_temp_c
+                } else {
+                    nozzle_temp_c
+                };
+                gcode.push_str(&format!(
+                    "M104 S{target_temp_c:.0} T{}\nT{} ; Switch tool ({})\n",
+                    seg.tool_id,
+                    seg.tool_id,
+                    seg.kind.label()
+                ));
+                emitted_tool_id = seg.tool_id;
+                emitted_pa = -1.0;
+                emitted_feed_mm_min = -1.0;
+            }
+
             if !seg.kind.is_extruding() || seg.delta_e_mm <= 1.0e-6 {
                 accum_travel_time_s += seg.duration_s;
             } else if active_retract_mm > 1.0e-4 {
                 // Unretract before resuming extrusion (with thermal ooze / swell relaxation)
-                let u_len = fluid.unretract_length_mm(active_retract_mm, accum_travel_time_s, &gcfg);
+                let seg_fluid = if seg.kind.is_support() {
+                    &support_fluid
+                } else {
+                    &fluid
+                };
+                let u_len =
+                    seg_fluid.unretract_length_mm(active_retract_mm, accum_travel_time_s, &gcfg);
                 let u_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
                 gcode.push_str(&format!("G1 E{u_len:.5} F{u_feed:.0} ; Unretract\n"));
                 active_retract_mm = 0.0;

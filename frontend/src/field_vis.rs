@@ -546,6 +546,9 @@ impl FieldVisualizationState {
         };
         let support_spec = SupportSpec {
             enabled: s.enable_support_generation,
+            support_tool_index: s.support_tool_index.map(|idx| idx as i32).unwrap_or(-1),
+            support_style: s.support_style.as_u8(),
+            on_bed_only: s.support_on_bed_only,
             seed_order_field: s.seed_order_field_from_supports,
             only_unreachable_and_long_bridges: s.support_only_unreachable_and_bridges,
             max_bridge_length_mm: s.max_bridge_length_mm,
@@ -556,6 +559,10 @@ impl FieldVisualizationState {
             base_spacing_mm: s.support_base_spacing_mm,
             interface_spacing_mm: s.support_interface_spacing_mm,
             line_width_mm: s.support_line_width_mm,
+            tree_branch_angle_deg: s.tree_branch_angle_deg,
+            tree_tip_diameter_mm: s.tree_tip_diameter_mm,
+            tree_trunk_max_diameter_mm: s.tree_trunk_max_diameter_mm,
+            tree_branch_wall_count: s.tree_branch_wall_count,
         };
         let adaptivity = self.adaptivity;
 
@@ -4820,35 +4827,16 @@ mod tests {
             tp.support_interface_count > 0,
             "Expected Support Interface toolpaths (feature_kind == 8) beneath the cantilever contact ceiling, got 0"
         );
-        // Verify that the first layer on the build plate lays down a SupportInterface pad (feature_kind == 8)
-        // when `support_bed_interface_layers >= 1` (default 1):
+        // Verify that layer 0 (the build plate) includes the bottom bed adhesion floor
+        // (SupportInterface, feature_kind == 8) when support_bed_interface_layers >= 1:
         let first_layer_has_bed_intf = tp
             .layers
             .first()
             .is_some_and(|l| l.paths.iter().any(|p| p.feature_kind == 8));
         assert!(
             first_layer_has_bed_intf,
-            "Expected first layer (on the build plate) to contain a SupportInterface (feature_kind == 8) pad when support_bed_interface_layers = 1"
+            "Expected first layer on the build plate to include a bottom SupportInterface bed adhesion floor (8)"
         );
-
-        // Verify that setting `support_bed_interface_layers = 0` switches the first layer back to Support Base (feature_kind == 7):
-        cfg.slicing.support_bed_interface_layers = 0;
-        crate::ui::sync_config_to_backend(&cfg);
-        let tp_no_bed_intf = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
-        let first_layer_intf_when_zero = tp_no_bed_intf
-            .layers
-            .first()
-            .is_some_and(|l| l.paths.iter().any(|p| p.feature_kind == 8));
-        let first_layer_base_when_zero = tp_no_bed_intf
-            .layers
-            .first()
-            .is_some_and(|l| l.paths.iter().any(|p| p.feature_kind == 7));
-        assert!(
-            !first_layer_intf_when_zero && first_layer_base_when_zero,
-            "Expected first layer to use Support Base (7) and not SupportInterface (8) when support_bed_interface_layers = 0"
-        );
-        cfg.slicing.support_bed_interface_layers = 1;
-        crate::ui::sync_config_to_backend(&cfg);
 
         let planned = crate::gcode::plan_and_emit_gcode_for_object(
             "support_detection_test_arch",
@@ -5089,6 +5077,492 @@ mod tests {
         let default_cfg = crate::config::SlicerConfig::default();
         crate::ui::sync_config_to_backend(&default_cfg);
         let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_nonplanar_tree_support_routes_around_part_in_bed_only_mode() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Build a C-shaped bracket where an upper overhang (X in [0, 4.5], Y in [-1.5, 1.5], Z in [7, 9])
+        // sits completely inside the horizontal footprint of a wider lower shelf (X in [-4, 6.5], Y in [-3.0, 3.0], Z in [0, 2.5]):
+        // - Vertical spine: X in [-4, 0], Y in [-3.0, 3.0], Z in [0, 9]
+        // - Wider lower base shelf: X in [0, 6.5], Y in [-3.0, 3.0], Z in [0, 2.5]
+        // - Narrower upper overhang arm: X in [0, 4.5], Y in [-1.5, 1.5], Z in [7, 9]
+        let mut c_pos: Vec<f32> = Vec::new();
+        let mut c_idx: Vec<u32> = Vec::new();
+        let mut push_box = |bx0: f32, bx1: f32, by0: f32, by1: f32, bz0: f32, bz1: f32| {
+            let mut add_q = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3]| {
+                let base = (c_pos.len() / 3) as u32;
+                for p in [p0, p1, p2, p3] {
+                    c_pos.extend_from_slice(&p);
+                }
+                c_idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            };
+            add_q([bx0, by0, bz0], [bx0, by0, bz1], [bx0, by1, bz1], [bx0, by1, bz0]);
+            add_q([bx1, by0, bz0], [bx1, by1, bz0], [bx1, by1, bz1], [bx1, by0, bz1]);
+            add_q([bx0, by0, bz0], [bx1, by0, bz0], [bx1, by0, bz1], [bx0, by0, bz1]);
+            add_q([bx0, by1, bz0], [bx0, by1, bz1], [bx1, by1, bz1], [bx1, by1, bz0]);
+            add_q([bx0, by0, bz0], [bx0, by1, bz0], [bx1, by1, bz0], [bx1, by0, bz0]);
+            add_q([bx0, by0, bz1], [bx1, by0, bz1], [bx1, by1, bz1], [bx0, by1, bz1]);
+        };
+        push_box(-4.0, 0.0, -3.0, 3.0, 0.0, 9.0);
+        push_box(0.0, 6.5, -3.0, 3.0, 0.0, 2.5);
+        push_box(0.0, 4.5, -1.5, 1.5, 7.0, 9.0);
+
+        let part = ffi::register_triangle_mesh("c_bracket_tree_test", &c_pos, &c_idx);
+        assert!(part.object_id > 0);
+
+        let mut cfg = crate::config::SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.slicing.enable_support_generation = true;
+        cfg.slicing.support_only_unreachable_and_bridges = false;
+
+        // 1. ColumnarGrid with `support_on_bed_only = true`:
+        // Because the lower shelf (Z in [0, 2.5], X in [0, 6], Y in [-2, 2]) lies directly beneath
+        // the upper overhang (X in [0, 5], Y in [-2, 2]), straight vertical columns are blocked!
+        cfg.slicing.support_style = crate::config::SupportStyle::ColumnarGrid;
+        cfg.slicing.support_on_bed_only = true;
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.5, 4.0));
+
+        let tp_col_bed_only = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp_col_bed_only.valid);
+        assert_eq!(
+            tp_col_bed_only.support_count, 0,
+            "Expected 0 columnar supports when support_on_bed_only=true and overhang is directly over the lower shelf"
+        );
+
+        // 2. NonPlanarTree with `support_on_bed_only = true`:
+        // Tree branches start under the upper overhang (Z ~ 6.8 mm), steer laterally in Y/X around
+        // the narrow lower shelf (Y in [-2, 2]), and anchor on the build plate (Z = 0) with 5/6-axis
+        // branch-tangent nozzle tilt!
+        cfg.slicing.support_style = crate::config::SupportStyle::NonPlanarTree;
+        cfg.slicing.support_on_bed_only = true;
+        cfg.slicing.tree_branch_angle_deg = 50.0;
+        cfg.tools[0].has_rotational_axes = true;
+        cfg.tools[0].max_angle_from_bed_normal_deg = 45.0;
+        crate::ui::sync_config_to_backend(&cfg);
+
+        let tp_tree_bed_only = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp_tree_bed_only.valid);
+        assert!(
+            tp_tree_bed_only.support_count > 0 && tp_tree_bed_only.support_interface_count > 0,
+            "Expected NonPlanarTree support to route around the lower shelf to the build plate (got base={}, intf={})",
+            tp_tree_bed_only.support_count,
+            tp_tree_bed_only.support_interface_count
+        );
+
+        // Verify that the first layer on the build plate has a grounded tree trunk bed adhesion
+        // floor pad (feature_kind == 8), and that leaning mid-height tree branches
+        // tilt the 5/6-axis nozzle axis along the branch tangent!
+        let first_layer_has_floor_intf = tp_tree_bed_only
+            .layers
+            .first()
+            .is_some_and(|l| l.paths.iter().any(|p| p.feature_kind == 8));
+        assert!(
+            first_layer_has_floor_intf,
+            "Expected NonPlanarTree trunk to reach the build plate (layer 0) with a bed adhesion floor pad (8)"
+        );
+
+        let mut max_lateral_nozzle_tilt = 0.0f32;
+        for lyr in &tp_tree_bed_only.layers {
+            for path in &lyr.paths {
+                if path.feature_kind == 7 || path.feature_kind == 8 {
+                    for pt in &path.points {
+                        let lat = (pt.nx * pt.nx + pt.ny * pt.ny).sqrt();
+                        max_lateral_nozzle_tilt = max_lateral_nozzle_tilt.max(lat);
+                    }
+                }
+            }
+        }
+        assert!(
+            max_lateral_nozzle_tilt > 0.10,
+            "Expected 5/6-axis nozzle axis on leaning tree support branch to tilt along 3D branch tangent, got max lateral component={max_lateral_nozzle_tilt}"
+        );
+
+        // Verify that every closed tree branch perimeter ring (feature_kind == 7, is_closed == true)
+        // on layer k > 0 is continuously supported by the layer immediately below it (no unsupported
+        // branch overhang jumps where a tree support forks):
+        let mut prev_layer_sup_pts: Vec<[f32; 3]> = Vec::new();
+        for (lyr_idx, lyr) in tp_tree_bed_only.layers.iter().enumerate() {
+            let mut curr_sup_pts: Vec<[f32; 3]> = Vec::new();
+            for path in &lyr.paths {
+                if path.feature_kind == 7 || path.feature_kind == 8 {
+                    for pt in &path.points {
+                        curr_sup_pts.push([pt.x, pt.y, pt.z]);
+                    }
+                }
+            }
+            if lyr_idx > 0 && !prev_layer_sup_pts.is_empty() {
+                for path in &lyr.paths {
+                    if path.feature_kind == 7 && path.is_closed {
+                        for pt in &path.points {
+                            let min_d_xy = prev_layer_sup_pts
+                                .iter()
+                                .map(|p| ((pt.x - p[0]).powi(2) + (pt.y - p[1]).powi(2)).sqrt())
+                                .fold(f32::INFINITY, f32::min);
+                            assert!(
+                                min_d_xy <= 0.95,
+                                "Unsupported tree branch wall point at layer {} ({:.2}, {:.2}, {:.2}): nearest lower-layer support point is {:.3} mm away horizontally",
+                                lyr_idx,
+                                pt.x,
+                                pt.y,
+                                pt.z,
+                                min_d_xy
+                            );
+                        }
+                    }
+                }
+            }
+            if !curr_sup_pts.is_empty() {
+                prev_layer_sup_pts = curr_sup_pts;
+            }
+        }
+
+        // Verify that the tree support trunk expands toward the build plate (lower trunk outer
+        // wall radius on layer 1 is significantly larger than the upper branch tip radius):
+        let ring_radius = |p: &ffi::ExtrusionPath| -> f32 {
+            let n = p.points.len().max(1) as f32;
+            let cx = p.points.iter().map(|pt| pt.x).sum::<f32>() / n;
+            let cy = p.points.iter().map(|pt| pt.y).sum::<f32>() / n;
+            p.points
+                .iter()
+                .map(|pt| ((pt.x - cx).powi(2) + (pt.y - cy).powi(2)).sqrt())
+                .fold(0.0f32, f32::max)
+        };
+        let lower_trunk_max_r = tp_tree_bed_only
+            .layers
+            .iter()
+            .skip(1)
+            .take(3)
+            .flat_map(|l| l.paths.iter())
+            .filter(|p| p.feature_kind == 7)
+            .map(&ring_radius)
+            .fold(0.0f32, f32::max);
+        let upper_branch_max_r = tp_tree_bed_only
+            .layers
+            .iter()
+            .rev()
+            .filter(|l| l.paths.iter().any(|p| p.feature_kind == 7 && p.is_closed))
+            .take(3)
+            .flat_map(|l| l.paths.iter())
+            .filter(|p| p.feature_kind == 7 && p.is_closed)
+            .map(&ring_radius)
+            .fold(0.0f32, f32::max);
+        assert!(
+            lower_trunk_max_r > upper_branch_max_r + 0.35,
+            "Expected tree support trunk to expand toward the bed (lower_trunk_max_r={lower_trunk_max_r:.3} mm vs upper_branch_max_r={upper_branch_max_r:.3} mm)"
+        );
+
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_pvm_l_series_c_board_bracket_support_coverage() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let stl_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Test Objects/PVM_L_Series_C_Board_Bracket.stl");
+        let obj = crate::io::stl::load_stl_file(&stl_path)
+            .expect("Failed to load PVM_L_Series_C_Board_Bracket.stl");
+
+        // Extract elevated downward-facing overhang triangle centroids from the mesh
+        let min_z = obj.local_min.z;
+        let mut overhang_centroids: Vec<[f32; 3]> = Vec::new();
+        for tri in obj.indices.chunks_exact(3) {
+            let v0 = &obj.vertices[tri[0] as usize];
+            let v1 = &obj.vertices[tri[1] as usize];
+            let v2 = &obj.vertices[tri[2] as usize];
+            let p0 = [v0.x, v0.y, v0.z];
+            let p1 = [v1.x, v1.y, v1.z];
+            let p2 = [v2.x, v2.y, v2.z];
+            let ux = p1[0] - p0[0];
+            let uy = p1[1] - p0[1];
+            let uz = p1[2] - p0[2];
+            let vx = p2[0] - p0[0];
+            let vy = p2[1] - p0[1];
+            let vz = p2[2] - p0[2];
+            let nx = uy * vz - uz * vy;
+            let ny = uz * vx - ux * vz;
+            let nz = ux * vy - uy * vx;
+            let area2 = (nx * nx + ny * ny + nz * nz).sqrt();
+            if area2 < 0.20 {
+                continue;
+            }
+            let unit_nz = nz / area2;
+            let cz = (p0[2] + p1[2] + p2[2]) / 3.0;
+            // Steep downward-facing overhang triangles elevated > 3 mm above the build plate
+            if unit_nz < -0.80 && (cz - min_z) > 3.0 {
+                let cx = (p0[0] + p1[0] + p2[0]) / 3.0;
+                let cy = (p0[1] + p1[1] + p2[1]) / 3.0;
+                overhang_centroids.push([cx, cy, cz]);
+            }
+        }
+        assert!(
+            !overhang_centroids.is_empty(),
+            "Expected PVM_L_Series_C_Board_Bracket.stl to have elevated downward-facing overhang triangles"
+        );
+
+        for (style, on_bed_only) in [
+            (crate::config::SupportStyle::ColumnarGrid, false),
+            (crate::config::SupportStyle::NonPlanarTree, false),
+            (crate::config::SupportStyle::NonPlanarTree, true),
+        ] {
+            let mut cfg = crate::config::SlicerConfig::default();
+            cfg.slicing.enable_support_generation = true;
+            cfg.slicing.support_style = style;
+            cfg.slicing.support_on_bed_only = on_bed_only;
+            cfg.slicing.support_only_unreachable_and_bridges = false;
+            crate::ui::sync_config_to_backend(&cfg);
+
+            assert!(ffi::recompute_object_fields(
+                obj.object_id,
+                cfg.eikonal.voxel_size_mm,
+                cfg.eikonal.narrow_band_width_voxels as f32
+            ));
+
+            let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+            assert!(tp.valid);
+            assert!(
+                tp.support_count > 0 && tp.support_interface_count > 0,
+                "Expected support & support interface paths for {:?} (on_bed_only={}) on PVM_L_Series_C_Board_Bracket.stl (got support={}, intf={})",
+                style,
+                on_bed_only,
+                tp.support_count,
+                tp.support_interface_count
+            );
+
+            // Collect all support points (7 or 8)
+            let mut support_pts: Vec<[f32; 3]> = Vec::new();
+            for lyr in &tp.layers {
+                for path in &lyr.paths {
+                    if path.feature_kind == 7 || path.feature_kind == 8 {
+                        for pt in &path.points {
+                            support_pts.push([pt.x, pt.y, pt.z]);
+                        }
+                    }
+                }
+            }
+
+            // Verify that at least 85% of downward-facing overhang centroids have a support point
+            // directly underneath them (within 1.6 mm horizontally and 0.05..1.6 mm vertically below)
+            let mut covered_count = 0usize;
+            for &[cx, cy, cz] in &overhang_centroids {
+                let has_contact_below = support_pts.iter().any(|&[sx, sy, sz]| {
+                    let dx = sx - cx;
+                    let dy = sy - cy;
+                    let dz = cz - sz;
+                    (dx * dx + dy * dy) <= 1.6 * 1.6 && dz >= 0.05 && dz <= 1.6
+                });
+                if has_contact_below {
+                    covered_count += 1;
+                }
+            }
+            let coverage_ratio = covered_count as f32 / overhang_centroids.len() as f32;
+            assert!(
+                coverage_ratio >= 0.85,
+                "Expected {:?} (on_bed_only={}) to support the interior of PVM_L_Series_C_Board_Bracket.stl overhangs (>= 85% coverage), got {:.1}% ({}/{})",
+                style,
+                on_bed_only,
+                coverage_ratio * 100.0,
+                covered_count,
+                overhang_centroids.len()
+            );
+
+            // Verify 3D collision avoidance between support paths (7 or 8) and object extrusion paths (<= 6)
+            // on every layer: no support bead may laterally interpenetrate a same-layer object wall/infill bead!
+            for lyr in &tp.layers {
+                let mut obj_pts: Vec<([f32; 3], f32)> = Vec::new();
+                let mut sup_pts: Vec<([f32; 3], f32)> = Vec::new();
+                for path in &lyr.paths {
+                    if path.feature_kind <= 6 {
+                        for pt in &path.points {
+                            obj_pts.push(([pt.x, pt.y, pt.z], 0.5 * pt.width_mm.max(0.15)));
+                        }
+                    } else if path.feature_kind == 7 || path.feature_kind == 8 {
+                        for pt in &path.points {
+                            sup_pts.push(([pt.x, pt.y, pt.z], 0.5 * pt.width_mm.max(0.15)));
+                        }
+                    }
+                }
+                for &(sp, sw) in &sup_pts {
+                    for &(op, ow) in &obj_pts {
+                        let dz = (sp[2] - op[2]).abs();
+                        if dz < 0.15 {
+                            let d_xy = ((sp[0] - op[0]).powi(2) + (sp[1] - op[1]).powi(2)).sqrt();
+                            assert!(
+                                d_xy >= sw + ow + 0.05,
+                                "Support point {:?} collided laterally with same-layer object extrusion {:?} (d_xy={:.3} < min {:.3})",
+                                sp,
+                                op,
+                                d_xy,
+                                sw + ow + 0.05
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Verify on every layer (including the bed adhesion floor and support base layers)
+            // that no two support paths intersect each other in 2D:
+            for (lyr_idx, lyr) in tp.layers.iter().enumerate() {
+                let mut layer_segs: Vec<(usize, usize, [f32; 2], [f32; 2])> = Vec::new();
+                for (p_idx, path) in lyr.paths.iter().enumerate() {
+                    if path.feature_kind == 7 || path.feature_kind == 8 {
+                        for (s_idx, w) in path.points.windows(2).enumerate() {
+                            let a = [w[0].x, w[0].y];
+                            let b = [w[1].x, w[1].y];
+                            if ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)) > 1.0e-6 {
+                                layer_segs.push((p_idx, s_idx, a, b));
+                            }
+                        }
+                    }
+                }
+                for i in 0..layer_segs.len() {
+                    let (p1, _s1, a, b) = layer_segs[i];
+                    for j in (i + 1)..layer_segs.len() {
+                        let (p2, _s2, c, d) = layer_segs[j];
+                        if p1 == p2 {
+                            continue;
+                        }
+                        let ccw = |u: [f32; 2], v: [f32; 2], w: [f32; 2]| -> f32 {
+                            (v[0] - u[0]) * (w[1] - u[1]) - (v[1] - u[1]) * (w[0] - u[0])
+                        };
+                        let d1 = ccw(a, b, c);
+                        let d2 = ccw(a, b, d);
+                        let d3 = ccw(c, d, a);
+                        let d4 = ccw(c, d, b);
+                        if ((d1 > 1.0e-5 && d2 < -1.0e-5) || (d1 < -1.0e-5 && d2 > 1.0e-5))
+                            && ((d3 > 1.0e-5 && d4 < -1.0e-5) || (d3 < -1.0e-5 && d4 > 1.0e-5))
+                        {
+                            panic!(
+                                "Intersecting {:?} (on_bed_only={}) support segments on layer {} between path {} ({:?}->{:?}) and path {} ({:?}->{:?})",
+                                style, on_bed_only, lyr_idx, p1, a, b, p2, c, d
+                            );
+                        }
+                    }
+                }
+            }
+
+            // In NonPlanarTree + on_bed_only mode, verify that every closed tree branch perimeter
+            // ring on layer k > 0 is supported from below without unsupported fork overhangs:
+            if style == crate::config::SupportStyle::NonPlanarTree && on_bed_only {
+                let mut prev_sup_pts: Vec<[f32; 3]> = Vec::new();
+                for (lyr_idx, lyr) in tp.layers.iter().enumerate() {
+                    let mut curr_sup_pts: Vec<[f32; 3]> = Vec::new();
+                    for path in &lyr.paths {
+                        if path.feature_kind == 7 || path.feature_kind == 8 {
+                            for pt in &path.points {
+                                curr_sup_pts.push([pt.x, pt.y, pt.z]);
+                            }
+                        }
+                    }
+
+                    if lyr_idx > 0 && !prev_sup_pts.is_empty() {
+                        for path in &lyr.paths {
+                            if path.feature_kind == 7 && path.is_closed {
+                                for pt in &path.points {
+                                    let min_d_xy = prev_sup_pts
+                                        .iter()
+                                        .map(|p| ((pt.x - p[0]).powi(2) + (pt.y - p[1]).powi(2)).sqrt())
+                                        .fold(f32::INFINITY, f32::min);
+                                    assert!(
+                                        min_d_xy <= 0.95,
+                                        "Unsupported tree branch fork/wall point on PVM bracket at layer {} ({:.2}, {:.2}, {:.2}): nearest lower-layer support point is {:.3} mm away horizontally",
+                                        lyr_idx,
+                                        pt.x,
+                                        pt.y,
+                                        pt.z,
+                                        min_d_xy
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if !curr_sup_pts.is_empty() {
+                        prev_sup_pts = curr_sup_pts;
+                    }
+                }
+
+                // Verify that tree support trunks on PVM_L_Series_C_Board_Bracket.stl expand
+                // significantly toward the build plate for strong bed adhesion:
+                let ring_radius = |p: &ffi::ExtrusionPath| -> f32 {
+                    let n = p.points.len().max(1) as f32;
+                    let cx = p.points.iter().map(|pt| pt.x).sum::<f32>() / n;
+                    let cy = p.points.iter().map(|pt| pt.y).sum::<f32>() / n;
+                    p.points
+                        .iter()
+                        .map(|pt| ((pt.x - cx).powi(2) + (pt.y - cy).powi(2)).sqrt())
+                        .fold(0.0f32, f32::max)
+                };
+                let base_trunk_max_r = tp
+                    .layers
+                    .iter()
+                    .skip(1)
+                    .take(4)
+                    .flat_map(|l| l.paths.iter())
+                    .filter(|p| p.feature_kind == 7 && p.is_closed)
+                    .map(&ring_radius)
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    base_trunk_max_r >= 1.80,
+                    "Expected PVM bracket tree support trunks to expand toward the build plate (got base_trunk_max_r={base_trunk_max_r:.3} mm, tip outer wall is ~0.99 mm)"
+                );
+            }
+        }
+
+        // Verify zero support interface spacing (`0.0 mm` = 100% solid touching contact roof)
+        // and multi-tool support (`support_tool_index = Some(1)` -> `T1` toolchange in G-code):
+        let mut cfg_zero = crate::config::SlicerConfig::default();
+        cfg_zero.slicing.enable_support_generation = true;
+        cfg_zero.slicing.support_style = crate::config::SupportStyle::NonPlanarTree;
+        cfg_zero.slicing.support_interface_spacing_mm = 0.0; // Zero gap!
+        cfg_zero.slicing.support_line_width_mm = 0.0; // Auto from support tool nozzle diameter
+        cfg_zero.tools[1].id = 1;
+        cfg_zero.tools[1].nozzle_diameter_mm = 0.50;
+        cfg_zero.tools[1].temperature_celsius = 240.0;
+        cfg_zero.slicing.support_tool_index = Some(1);
+        cfg_zero.slicing.sanitize();
+        assert_eq!(
+            cfg_zero.slicing.support_interface_spacing_mm, 0.0,
+            "Zero support_interface_spacing_mm must not be clamped above 0.0"
+        );
+        crate::ui::sync_config_to_backend(&cfg_zero);
+
+        let tp_zero = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(tp_zero.valid && tp_zero.support_interface_count > 0);
+        // Support paths must inherit tool 1's 0.50 mm nozzle diameter when support_line_width_mm == 0.0
+        let has_t1_width = tp_zero.layers.iter().any(|l| {
+            l.paths
+                .iter()
+                .any(|p| (p.feature_kind == 7 || p.feature_kind == 8) && (p.mean_width_mm - 0.50).abs() < 1.0e-3)
+        });
+        assert!(
+            has_t1_width,
+            "Expected support paths to use selected Support Tool T1's nozzle diameter (0.50 mm)"
+        );
+
+        let planned_multi = crate::gcode::plan_and_emit_gcode_for_object(
+            "PVM_Bracket_MultiTool",
+            obj.object_id,
+            &tp_zero,
+            Transform::IDENTITY,
+            &cfg_zero,
+        );
+        assert!(
+            planned_multi.gcode_text.contains("M104 S240 T1")
+                && planned_multi.gcode_text.contains("T1 ; Switch tool")
+                && planned_multi.gcode_text.contains("T0 ; Switch tool"),
+            "Expected multi-tool G-code to preheat and switch between T1 (support) and T0 (object)"
+        );
+
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(obj.object_id);
     }
 }
 

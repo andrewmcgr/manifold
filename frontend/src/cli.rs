@@ -880,6 +880,17 @@ fn parse_cli_value_for_target(target: &JsonValue, raw_val: &str, key: &str) -> R
                     _ => {}
                 }
             }
+            if key.ends_with("support_style") {
+                match unquoted.to_ascii_lowercase().as_str() {
+                    "tree" | "nonplanartree" | "non_planar_tree" | "organic" => {
+                        return Ok(JsonValue::String("NonPlanarTree".to_string()));
+                    }
+                    "grid" | "columnar" | "columnargrid" | "columnar_grid" | "normal" => {
+                        return Ok(JsonValue::String("ColumnarGrid".to_string()));
+                    }
+                    _ => {}
+                }
+            }
             Ok(JsonValue::String(unquoted.to_string()))
         }
         JsonValue::Array(_) | JsonValue::Object(_) => serde_json::from_str(trimmed).map_err(|e| {

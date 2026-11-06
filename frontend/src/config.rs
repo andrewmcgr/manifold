@@ -616,6 +616,44 @@ impl SparseInfillPattern {
     }
 }
 
+/// Support structure topology & toolpath generation style.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SupportStyle {
+    /// Classic gravity-aligned rectilinear scanline columns (`ColumnarGrid`).
+    #[default]
+    ColumnarGrid,
+    /// Organic coalescing tree supports (`NonPlanarTree`) that route around part geometry
+    /// using the 3D SDF $\phi_{\text{sdf}}(\mathbf{x})$, merge into hollow/ribbed trunks on the
+    /// build plate, conform to non-planar slicing isosurfaces, and orient nozzle beads along
+    /// the 3D branch tangent on 5/6-axis hardware.
+    NonPlanarTree,
+}
+
+impl SupportStyle {
+    pub const ALL: [Self; 2] = [Self::ColumnarGrid, Self::NonPlanarTree];
+
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::ColumnarGrid => 0,
+            Self::NonPlanarTree => 1,
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::NonPlanarTree,
+            _ => Self::ColumnarGrid,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ColumnarGrid => "Columnar Grid",
+            Self::NonPlanarTree => "Non-Planar Tree",
+        }
+    }
+}
+
 /// Non-planar slicing process & shell/sparse toolpath generation configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -658,6 +696,17 @@ pub struct SlicingProcessConfig {
     /// Enable automatic support detection and support toolpath generation for regions unreachable
     /// by the constrained Eikonal order field.
     pub enable_support_generation: bool,
+    /// Optional dedicated tool index into `SlicerConfig::tools` used for support generation
+    /// (`None` = use the active object tool `active_tool_index`). Allows printing supports and
+    /// support interfaces with a different tool/nozzle and support material (e.g., breakaway or soluble).
+    pub support_tool_index: Option<usize>,
+    /// Support structure style (`ColumnarGrid` vs. `NonPlanarTree`).
+    pub support_style: SupportStyle,
+    /// When true ("On Build Plate Only"), supports are never placed on upper model surfaces:
+    /// columnar supports skip columns blocked by lower part surfaces, while `NonPlanarTree`
+    /// branches actively steer around the part's 3D SDF $\phi_{\text{sdf}}(\mathbf{x})$ along
+    /// gravity $\hat{\mathbf{g}}_{\text{bed}}$ to anchor exclusively on the build plate.
+    pub support_on_bed_only: bool,
     /// Seed the constrained Eikonal order field $\tau(\mathbf{x})$ from support contact regions
     /// so unreachable cantilevers and hanging islands are reached causally.
     pub seed_order_field_from_supports: bool,
@@ -672,14 +721,27 @@ pub struct SlicingProcessConfig {
     pub support_xy_gap_mm: f32,
     /// Number of dense support interface layers immediately beneath unreachable overhang roofs.
     pub support_interface_layers: u32,
-    /// Number of dense support interface layers printed on the build plate at the base of support columns for strong bed adhesion.
+    /// Number of dense bottom support interface floor layers printed directly on the build plate for bed adhesion (`0` = disabled).
     pub support_bed_interface_layers: u32,
     /// Line spacing (mm) for coarse support base scanlines.
     pub support_base_spacing_mm: f32,
-    /// Line spacing (mm) for dense support interface scanlines.
+    /// Edge-to-edge gap (mm, `>= 0.0`) between adjacent support interface extrusions (`0.0` = zero gap / 100% solid contact roof where center-to-center pitch equals line width).
     pub support_interface_spacing_mm: f32,
     /// Extruded line width (mm) for support structures.
     pub support_line_width_mm: f32,
+    /// Maximum lateral branch lean angle (degrees, `15.0..=65.0`, default `45.0`) relative to
+    /// anti-gravity $-\hat{\mathbf{g}}_{\text{bed}}$ for `NonPlanarTree` supports as branches
+    /// steer around part obstacles and coalesce into trunks.
+    pub tree_branch_angle_deg: f32,
+    /// Initial branch tip diameter (mm, `0.8..=8.0`, default `2.4`) at the overhang roof interface
+    /// for `NonPlanarTree` supports.
+    pub tree_tip_diameter_mm: f32,
+    /// Maximum merged trunk diameter (mm, `2.0..=30.0`, default `12.0`) at the build plate for
+    /// `NonPlanarTree` supports.
+    pub tree_trunk_max_diameter_mm: f32,
+    /// Number of concentric perimeter walls (`1..=4`, default `2`) printed for hollow `NonPlanarTree`
+    /// branches and trunks.
+    pub tree_branch_wall_count: u32,
 }
 
 impl Default for SlicingProcessConfig {
@@ -703,6 +765,9 @@ impl Default for SlicingProcessConfig {
             max_bridge_length_mm: 40.0,
             wave_overhang_overlap_fraction: 0.08,
             enable_support_generation: true,
+            support_tool_index: None,
+            support_style: SupportStyle::ColumnarGrid,
+            support_on_bed_only: false,
             seed_order_field_from_supports: true,
             support_only_unreachable_and_bridges: false,
             support_z_gap_mm: 0.20,
@@ -710,8 +775,12 @@ impl Default for SlicingProcessConfig {
             support_interface_layers: 2,
             support_bed_interface_layers: 1,
             support_base_spacing_mm: 2.50,
-            support_interface_spacing_mm: 0.60,
+            support_interface_spacing_mm: 0.15,
             support_line_width_mm: 0.40,
+            tree_branch_angle_deg: 45.0,
+            tree_tip_diameter_mm: 2.40,
+            tree_trunk_max_diameter_mm: 12.00,
+            tree_branch_wall_count: 2,
         }
     }
 }
@@ -733,10 +802,20 @@ impl SlicingProcessConfig {
         self.support_z_gap_mm = self.support_z_gap_mm.clamp(0.05, 5.0);
         self.support_xy_gap_mm = self.support_xy_gap_mm.clamp(0.10, 10.0);
         self.support_interface_layers = self.support_interface_layers.min(16);
-        self.support_bed_interface_layers = self.support_bed_interface_layers.min(16);
+        self.support_bed_interface_layers = self.support_bed_interface_layers.min(8);
         self.support_base_spacing_mm = self.support_base_spacing_mm.clamp(0.40, 20.0);
-        self.support_interface_spacing_mm = self.support_interface_spacing_mm.clamp(0.20, 5.0);
-        self.support_line_width_mm = self.support_line_width_mm.clamp(0.15, 3.0);
+        self.support_interface_spacing_mm = self.support_interface_spacing_mm.clamp(0.0, 5.0);
+        self.support_line_width_mm = if self.support_line_width_mm <= 0.05 {
+            0.0
+        } else {
+            self.support_line_width_mm.clamp(0.15, 3.0)
+        };
+        self.tree_branch_angle_deg = self.tree_branch_angle_deg.clamp(15.0, 65.0);
+        self.tree_tip_diameter_mm = self.tree_tip_diameter_mm.clamp(0.80, 8.00);
+        self.tree_trunk_max_diameter_mm = self
+            .tree_trunk_max_diameter_mm
+            .clamp(self.tree_tip_diameter_mm.max(2.0), 30.0);
+        self.tree_branch_wall_count = self.tree_branch_wall_count.clamp(1, 4);
     }
 }
 
@@ -1346,6 +1425,28 @@ impl SlicerConfig {
         }
     }
 
+    /// Returns the resolved tool index into `self.tools` used for support structures
+    /// (`slicing.support_tool_index` if set and valid, otherwise `active_tool_index`).
+    pub fn support_tool_index_resolved(&self) -> usize {
+        if self.tools.is_empty() {
+            return 0;
+        }
+        let max_idx = self.tools.len() - 1;
+        match self.slicing.support_tool_index {
+            Some(idx) => idx.min(max_idx),
+            None => self.active_tool_index.min(max_idx),
+        }
+    }
+
+    /// Returns the tool configuration used for support structures (`Support` and `SupportInterface`).
+    pub fn support_tool(&self) -> Option<&ToolConfig> {
+        if self.tools.is_empty() {
+            None
+        } else {
+            self.tools.get(self.support_tool_index_resolved())
+        }
+    }
+
     /// Updates `eikonal.voxel_size_mm` from the active tool's `nozzle_diameter_mm` and
     /// `slicing.layer_height.target_mm` when `eikonal.auto_voxel_size` is enabled.
     pub fn sync_auto_voxel_size(&mut self) {
@@ -1735,7 +1836,34 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         units: "bool",
         default_value: "true",
         summary: "Generates gravity-aligned support base and support interface toolpaths for regions unreachable by the constrained order field.",
-        details: "Detects floating islands, downward-hanging local minima, and non-bridgeable overhangs that exceed the constrained Eikonal layer cone, and projects support columns along gravity (+g_bed) to the build plate or lower part surface.",
+        details: "Detects floating islands, downward-hanging local minima, and non-bridgeable overhangs that exceed the constrained Eikonal layer cone, and projects support structures along gravity (+g_bed) to the build plate or lower part surface.",
+    },
+    ParameterDoc {
+        key: "slicing.support_style",
+        category: "Support Generation",
+        title: "Support Structure Style (Columnar Grid vs. Non-Planar Tree)",
+        units: "enum",
+        default_value: "ColumnarGrid",
+        summary: "Selects between classic rectilinear columnar supports and organic coalescing Non-Planar Tree supports.",
+        details: "Non-Planar Tree supports grow branches from overhang contact tips downward along gravity (+g_bed), steering around the part's 3D SDF φ_sdf(x) to avoid scarring upper part surfaces, coalescing into hollow cylindrical trunks on the build plate, conforming to non-planar layer isosurfaces τ(x), and tilting the nozzle along the 3D branch tangent on 5/6-axis hardware.",
+    },
+    ParameterDoc {
+        key: "slicing.support_on_bed_only",
+        category: "Support Generation",
+        title: "Support on Build Plate Only",
+        units: "bool",
+        default_value: "false",
+        summary: "Prevents support structures from resting on top of upper model surfaces.",
+        details: "In Columnar Grid mode, columns whose downward gravity ray intersects a lower part surface are omitted. In Non-Planar Tree mode, branches originating above the model actively steer outward along +∇φ_sdf(x) up to `tree_branch_angle_deg` to route around lower model features and anchor exclusively on the build plate.",
+    },
+    ParameterDoc {
+        key: "slicing.tree_support_params",
+        category: "Support Generation",
+        title: "Non-Planar Tree Support Geometry (Branch Angle, Tip & Trunk Diameter, Walls)",
+        units: "deg / mm / walls",
+        default_value: "45° / 2.4 mm tip / 12.0 mm trunk / 2 walls",
+        summary: "Controls maximum branch lean angle, tip contact diameter, merged trunk diameter, and perimeter wall count for Non-Planar Tree supports.",
+        details: "Higher branch angles allow tree branches to reach further laterally around bulky lower part geometry to reach the build plate. On 5/6-axis tools (`has_rotational_axes`), the nozzle tilts along the 3D branch centerline tangent so steep leaning branches print self-supportingly without overhang step-over failure.",
     },
     ParameterDoc {
         key: "slicing.seed_order_field_from_supports",
@@ -1783,13 +1911,13 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         details: "Provides a smooth, closely-spaced support roof beneath unreachable overhangs while keeping the lower support base coarse and fast to print.",
     },
     ParameterDoc {
-        key: "slicing.support_bed_interface_layers",
+        key: "slicing.support_tool_index",
         category: "Support Generation",
-        title: "Support Bed Interface Layers",
-        units: "layers",
-        default_value: "1",
-        summary: "Number of dense support interface layers printed on the build plate at the base of support columns.",
-        details: "Lays down a closely-spaced, continuous boustrophedon interface pad on the build plate so support structures adhere firmly and do not detach during printing.",
+        title: "Support Tool / Material",
+        units: "tool",
+        default_value: "Active Object Tool",
+        summary: "Selects which tool (and material/temperature) from the Multi-Tool Registry is used to print support structures.",
+        details: "When set to a specific tool (e.g. T1), Support Base and Support Interface paths use that tool's nozzle diameter, rotational limits, and print temperature, and the G-code planner automatically emits toolchange commands (T{id}) and temperature transitions when switching between support and object paths.",
     },
     ParameterDoc {
         key: "slicing.support_base_spacing_mm",
@@ -1803,11 +1931,11 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
     ParameterDoc {
         key: "slicing.support_interface_spacing_mm",
         category: "Support Generation",
-        title: "Support Interface Line Spacing",
+        title: "Support Interface Gap Spacing",
         units: "mm",
-        default_value: "0.60 mm",
-        summary: "Centerline spacing for dense support interface layers directly beneath the part.",
-        details: "Tight spacing supports overhanging perimeters and skins cleanly.",
+        default_value: "0.15 mm",
+        summary: "Edge-to-edge gap (mm) between adjacent support interface extrusions directly beneath overhangs (0.0 mm = solid 100% touching roof).",
+        details: "Center-to-center pitch is line_width + interface_spacing_mm. Setting 0.0 mm produces a 100% solid touching support roof (particularly useful with dedicated breakaway or soluble support tools).",
     },
     ParameterDoc {
         key: "gcode.bridge_speed_mms",

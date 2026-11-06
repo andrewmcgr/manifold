@@ -1390,6 +1390,9 @@ struct SlicerBackend::Impl {
     };
     SupportSpec supportSpec{
         true,
+        -1,
+        0,
+        false,
         true,
         false,
         40.0f,
@@ -1398,8 +1401,12 @@ struct SlicerBackend::Impl {
         2,
         1,
         2.50f,
-        0.60f,
+        0.15f,
         0.40f,
+        45.0f,
+        2.40f,
+        12.00f,
+        2,
     };
 };
 
@@ -5033,20 +5040,34 @@ ShellPathSpec SlicerBackend::shellPathSpec() const noexcept {
 
 void SlicerBackend::setSupportSpec(const SupportSpec& spec) noexcept {
     SupportSpec s = spec;
+    s.support_tool_index = std::max<std::int32_t>(-1, s.support_tool_index);
+    s.support_style = (s.support_style == 1) ? 1 : 0;
     s.max_bridge_length_mm = std::clamp(s.max_bridge_length_mm, 0.0f, 500.0f);
     s.z_gap_mm = std::clamp(s.z_gap_mm, 0.0f, 5.0f);
     s.xy_gap_mm = std::clamp(s.xy_gap_mm, 0.0f, 10.0f);
     s.interface_layers = std::min<std::uint32_t>(s.interface_layers, 16);
-    s.bed_interface_layers = std::min<std::uint32_t>(s.bed_interface_layers, 16);
+    s.bed_interface_layers = std::min<std::uint32_t>(s.bed_interface_layers, 8);
     s.base_spacing_mm = (s.base_spacing_mm > 0.1f)
         ? std::clamp(s.base_spacing_mm, 0.4f, 20.0f)
         : 2.50f;
-    s.interface_spacing_mm = (s.interface_spacing_mm > 0.05f)
-        ? std::clamp(s.interface_spacing_mm, 0.2f, 5.0f)
-        : 0.60f;
+    s.interface_spacing_mm = std::isfinite(s.interface_spacing_mm)
+        ? std::clamp(s.interface_spacing_mm, 0.0f, 5.0f)
+        : 0.15f;
     s.line_width_mm = (s.line_width_mm > 0.05f)
         ? std::clamp(s.line_width_mm, 0.15f, 3.0f)
-        : 0.40f;
+        : 0.0f;
+    s.tree_branch_angle_deg = (s.tree_branch_angle_deg > 1.0f)
+        ? std::clamp(s.tree_branch_angle_deg, 15.0f, 65.0f)
+        : 45.0f;
+    s.tree_tip_diameter_mm = (s.tree_tip_diameter_mm > 0.1f)
+        ? std::clamp(s.tree_tip_diameter_mm, 0.80f, 8.00f)
+        : 2.40f;
+    s.tree_trunk_max_diameter_mm = (s.tree_trunk_max_diameter_mm > 0.5f)
+        ? std::clamp(s.tree_trunk_max_diameter_mm, std::max(2.0f, s.tree_tip_diameter_mm), 30.0f)
+        : 12.00f;
+    s.tree_branch_wall_count = (s.tree_branch_wall_count >= 1)
+        ? std::clamp<std::uint32_t>(s.tree_branch_wall_count, 1, 4)
+        : 2;
     impl_->supportSpec = s;
 }
 
@@ -5217,6 +5238,222 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         const float xyGapMm = std::max(0.10f, impl_->supportSpec.xy_gap_mm);
         const float targetLayerH = std::max(0.05f, impl_->sliceLayerHeight.target_mm);
 
+        // Resolve the tool used for support extrusion (`support_tool_index >= 0` selects a specific
+        // tool from the multi-tool registry; `< 0` defaults to `activeToolIndex`).
+        std::size_t supportToolIdx = impl_->activeToolIndex;
+        if (impl_->supportSpec.support_tool_index >= 0 && !impl_->tools.empty()) {
+            supportToolIdx = std::min<std::size_t>(
+                static_cast<std::size_t>(impl_->supportSpec.support_tool_index),
+                impl_->tools.size() - 1);
+        } else if (!impl_->tools.empty()) {
+            supportToolIdx = std::min<std::size_t>(impl_->activeToolIndex, impl_->tools.size() - 1);
+        }
+        const float supportToolNozzleDiamMm =
+            (!impl_->tools.empty() && supportToolIdx < impl_->tools.size())
+                ? std::max(0.10f, impl_->tools[supportToolIdx].nozzle_diameter_mm)
+                : std::max(0.10f, impl_->shellPathSpec.nozzle_diameter_mm);
+        const float lineWidthMm = std::max(
+            0.15f,
+            (impl_->supportSpec.line_width_mm > 0.05f)
+                ? impl_->supportSpec.line_width_mm
+                : supportToolNozzleDiamMm);
+
+        // Build a 3D spatial hash of all generated object extrusion path vertices & segment midpoints
+        // (`feature_kind <= 6`) so support generation enforces direct 3D bead-to-bead collision avoidance
+        // against actual object extrusions (walls, infill, bridges, and wave overhangs) in addition to
+        // the voxelized part SDF!
+        const float objGridCellMm = 1.50f;
+        struct ObjBeadSample {
+            float x = 0.0f;
+            float y = 0.0f;
+            float z = 0.0f;
+            float halfW = 0.21f;
+            float halfH = 0.10f;
+        };
+        auto packGrid3D = [](std::int32_t ix, std::int32_t iy, std::int32_t iz) -> std::uint64_t {
+            const std::uint64_t ux = static_cast<std::uint64_t>(static_cast<std::uint32_t>(ix)) & 0x1FFFFFULL;
+            const std::uint64_t uy = static_cast<std::uint64_t>(static_cast<std::uint32_t>(iy)) & 0x1FFFFFULL;
+            const std::uint64_t uz = static_cast<std::uint64_t>(static_cast<std::uint32_t>(iz)) & 0x1FFFFFULL;
+            return (ux << 42) | (uy << 21) | uz;
+        };
+        std::unordered_map<std::uint64_t, std::vector<ObjBeadSample>> objectExtrusionGrid;
+        auto insertObjSample = [&](float px, float py, float pz, float hw, float hh) {
+            const auto ix = static_cast<std::int32_t>(std::floor(px / objGridCellMm));
+            const auto iy = static_cast<std::int32_t>(std::floor(py / objGridCellMm));
+            const auto iz = static_cast<std::int32_t>(std::floor(pz / objGridCellMm));
+            objectExtrusionGrid[packGrid3D(ix, iy, iz)].push_back(ObjBeadSample{px, py, pz, hw, hh});
+        };
+        for (const auto& lyr : res.layers) {
+            for (const auto& op : lyr.paths) {
+                if (op.feature_kind > 6 || op.points.empty()) {
+                    continue;
+                }
+                for (std::size_t k = 0; k < op.points.size(); ++k) {
+                    const auto& pt = op.points[k];
+                    const float hw = 0.5f * std::max(0.15f, pt.width_mm);
+                    const float hh = 0.5f * std::max(0.05f, pt.height_mm);
+                    insertObjSample(pt.x, pt.y, pt.z, hw, hh);
+                    if (k > 0) {
+                        const auto& prev = op.points[k - 1];
+                        const float dxSeg = pt.x - prev.x;
+                        const float dySeg = pt.y - prev.y;
+                        const float dzSeg = pt.z - prev.z;
+                        const float segLen = std::sqrt(dxSeg * dxSeg + dySeg * dySeg + dzSeg * dzSeg);
+                        if (segLen > 0.65f) {
+                            const int nSub = std::min(8, static_cast<int>(std::ceil(segLen / 0.65f)));
+                            for (int s = 1; s < nSub; ++s) {
+                                const float frac = static_cast<float>(s) / static_cast<float>(nSub);
+                                insertObjSample(
+                                    prev.x + frac * dxSeg,
+                                    prev.y + frac * dySeg,
+                                    prev.z + frac * dzSeg,
+                                    hw,
+                                    hh);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Direct 3D collision check between a candidate support bead at `pBed` (with half-width
+        // `supHalfW` and half-height `supHalfH`) and all nearby object extrusion beads.
+        // Decomposes separation along anti-gravity `uUp = -\hat{g}_{bed}` (AGENTS.md Rule 2):
+        // - Same-layer / overlapping-height beads (`dh < supHalfH + objHalfH + 0.02 mm`) must maintain
+        //   center-to-center horizontal separation >= `supHalfW + objHalfW + max(0.08 mm, 0.65 * xyGapMm)`.
+        // - Vertically adjacent beads (`dh < 0.45 * zGapMm + supHalfH + objHalfH`) must not overlap
+        //   when not in a roof contact zone, and even in a roof contact zone must never physically
+        //   interpenetrate (`dh < 0.85 * (supHalfH + objHalfH)` with `dHoriz < supHalfW + objHalfW`).
+        auto hasObjectExtrusionClearance = [&](const std::array<float, 3>& pBed,
+                                               float supHalfW,
+                                               float supHalfH,
+                                               bool isRoofContactZone) -> bool {
+            if (objectExtrusionGrid.empty()) {
+                return true;
+            }
+            const auto cx = static_cast<std::int32_t>(std::floor(pBed[0] / objGridCellMm));
+            const auto cy = static_cast<std::int32_t>(std::floor(pBed[1] / objGridCellMm));
+            const auto cz = static_cast<std::int32_t>(std::floor(pBed[2] / objGridCellMm));
+            const float latGap = std::max(0.08f, 0.65f * xyGapMm);
+
+            for (std::int32_t dz = -1; dz <= 1; ++dz) {
+                for (std::int32_t dy = -1; dy <= 1; ++dy) {
+                    for (std::int32_t dxCell = -1; dxCell <= 1; ++dxCell) {
+                        auto it = objectExtrusionGrid.find(packGrid3D(cx + dxCell, cy + dy, cz + dz));
+                        if (it == objectExtrusionGrid.end()) {
+                            continue;
+                        }
+                        for (const auto& ob : it->second) {
+                            const float rx = ob.x - pBed[0];
+                            const float ry = ob.y - pBed[1];
+                            const float rz = ob.z - pBed[2];
+                            const float dh = std::abs(rx * uUp[0] + ry * uUp[1] + rz * uUp[2]);
+                            const float vSumH = supHalfH + ob.halfH;
+                            if (dh >= vSumH + zGapMm) {
+                                continue;
+                            }
+                            const float dSq = rx * rx + ry * ry + rz * rz;
+                            const float dHoriz = std::sqrt(std::max(0.0f, dSq - dh * dh));
+                            const float hSumW = supHalfW + ob.halfW;
+
+                            // 1. Same-layer lateral collision (never allowed, even in roof contact zone)
+                            if (dh < 0.88f * vSumH) {
+                                if (dHoriz < hSumW + latGap) {
+                                    return false;
+                                }
+                            } else if (!isRoofContactZone && dh < vSumH + 0.45f * zGapMm) {
+                                // 2. Non-roof vertical proximity collision
+                                if (dHoriz < hSumW + 0.35f * xyGapMm) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return true;
+        };
+
+        auto uvHToBed = [&](float uVal, float vVal, float hVal) -> std::array<float, 3> {
+            const float worldH = hVal + minObjH;
+            return {
+                pOrigin[0] + uVal * tU[0] + vVal * tV[0] + worldH * uUp[0],
+                pOrigin[1] + uVal * tU[1] + vVal * tV[1] + worldH * uUp[1],
+                pOrigin[2] + uVal * tU[2] + vVal * tV[2] + worldH * uUp[2]};
+        };
+        auto sampleSdfAtUVH = [&](float uVal, float vVal, float hVal) -> float {
+            const auto p = uvHToBed(uVal, vVal, hVal);
+            return samplePartSdf(openvdb::Vec3d(p[0], p[1], p[2]));
+        };
+
+        // Directional clearance check in (u, v, h) coordinates:
+        // - Enforces direct 3D bead-to-bead clearance against generated object extrusion paths.
+        // - Enforces `minRoofClearance` (~0.75 * zGapMm) vertically against downward-facing
+        //   overhang ceilings (and upward-facing floors when `on_bed_only == false`).
+        // - Enforces `xyGapMm + 0.5f * lineWidthMm + extraHorizR` horizontally against vertical/sloped
+        //   side walls (so the outer edge of the support bead respects `xyGapMm`).
+        auto hasSupportClearanceAtUVH = [&](float uVal,
+                                            float vVal,
+                                            float hVal,
+                                            float extraHorizR,
+                                            bool isRoofContactZone) -> bool {
+            const std::array<float, 3> pBed = uvHToBed(uVal, vVal, hVal);
+            if (!hasObjectExtrusionClearance(
+                    pBed,
+                    0.5f * lineWidthMm + extraHorizR,
+                    0.5f * targetLayerH,
+                    isRoofContactZone)) {
+                return false;
+            }
+            const float sHere = samplePartSdf(openvdb::Vec3d(pBed[0], pBed[1], pBed[2]));
+            const float minRoofClearance = std::min(0.75f * zGapMm, xyGapMm);
+            if (sHere < minRoofClearance) {
+                return false;
+            }
+            const float reqHoriz = xyGapMm + 0.5f * lineWidthMm + extraHorizR;
+            if (sHere >= reqHoriz) {
+                return true;
+            }
+            const float eps = std::max(0.5f * dx, 0.25f);
+            const float gu =
+                sampleSdfAtUVH(uVal + eps, vVal, hVal) - sampleSdfAtUVH(uVal - eps, vVal, hVal);
+            const float gv =
+                sampleSdfAtUVH(uVal, vVal + eps, hVal) - sampleSdfAtUVH(uVal, vVal - eps, hVal);
+            const float gh =
+                sampleSdfAtUVH(uVal, vVal, hVal + eps) - sampleSdfAtUVH(uVal, vVal, hVal - eps);
+            const float gNorm = std::sqrt(gu * gu + gv * gv + gh * gh);
+            if (gNorm <= 1.0e-5f) {
+                return isRoofContactZone && (sHere >= minRoofClearance);
+            }
+            const float nUp = gh / gNorm; // < 0 beneath overhang ceiling, > 0 above floor
+            const float nHoriz = std::sqrt(std::max(0.0f, 1.0f - nUp * nUp));
+
+            if (impl_->supportSpec.on_bed_only && nUp > 0.30f) {
+                return false;
+            }
+
+            if (nUp < -0.38f || (!impl_->supportSpec.on_bed_only && nUp > 0.38f)) {
+                // Predominantly vertical contact with overhang ceiling (or allowed floor).
+                // Verify we are not simultaneously within `xyGapMm + 0.5f * lineWidthMm` of a vertical
+                // side wall that extends below `hVal - zGapMm`.
+                const float hNorm = std::sqrt(gu * gu + gv * gv);
+                if (hNorm > 0.35f * gNorm && hVal > zGapMm + 0.10f) {
+                    const float wallStep = xyGapMm + 0.5f * lineWidthMm;
+                    const float uWall = uVal - wallStep * (gu / hNorm);
+                    const float vWall = vVal - wallStep * (gv / hNorm);
+                    const float sWall =
+                        sampleSdfAtUVH(uWall, vWall, std::max(0.05f, hVal - zGapMm));
+                    if (sWall <= 0.0f) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            const float reqDirectional = reqHoriz * nHoriz + minRoofClearance * std::abs(nUp);
+            return sHere >= reqDirectional;
+        };
+
         auto considerSupportVoxel = [&](const openvdb::Vec3d& wp, float supVal, float sdfVal) {
             if (supVal < 0.50f || std::abs(sdfVal) > 1.50f * dx) {
                 return;
@@ -5232,32 +5469,87 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                 return;
             }
 
-            // Ray-march downward along gravity +gDir = -uUp to find floor (build plate h=0 or lower part surface)
-            const float roofH = hCoord - zGapMm;
-            float floorH = 0.0f;
-            const float marchStep = std::max(0.5f * dx, 0.25f);
-            bool exitedUpperBoundary = false;
-            for (float hProbe = hCoord - marchStep; hProbe > 0.0f; hProbe -= marchStep) {
-                const float worldH = hProbe + minObjH;
-                const openvdb::Vec3d wpProbe(
-                    pOrigin[0] + uCoord * tU[0] + vCoord * tV[0] + worldH * uUp[0],
-                    pOrigin[1] + uCoord * tU[1] + vCoord * tV[1] + worldH * uUp[1],
-                    pOrigin[2] + uCoord * tU[2] + vCoord * tV[2] + worldH * uUp[2]);
-                const float sProbe = samplePartSdf(wpProbe);
-                if (!exitedUpperBoundary) {
-                    if (sProbe > 0.25f * dx) {
-                        exitedUpperBoundary = true;
+            // Locate the exact \phi = 0 downward-facing overhang ceiling surface `hCeiling`
+            // along the vertical column `(uCoord, vCoord)`, rejecting horizontally extrapolated
+            // narrow-band voxels that have no solid part overhang above them.
+            const float marchStep = std::min(0.45f * dx, 0.25f);
+            float hCeiling = -1.0f;
+            if (sdfVal <= 0.0f) {
+                float hPrev = hCoord;
+                float sPrev = sdfVal;
+                const float minSearchH = std::max(0.0f, hCoord - 2.5f * dx);
+                for (float hProbe = hCoord - marchStep; hProbe >= minSearchH; hProbe -= marchStep) {
+                    const float sProbe = sampleSdfAtUVH(uCoord, vCoord, hProbe);
+                    if (sProbe > 0.0f) {
+                        const float denom = std::max(1.0e-5f, sProbe - sPrev);
+                        const float t = std::clamp(-sPrev / denom, 0.0f, 1.0f);
+                        hCeiling = hPrev + t * (hProbe - hPrev);
+                        break;
                     }
-                } else if (sProbe <= 0.0f) {
-                    floorH = hProbe + zGapMm;
-                    break;
+                    hPrev = hProbe;
+                    sPrev = sProbe;
+                }
+            } else {
+                float hPrev = hCoord;
+                float sPrev = sdfVal;
+                const float maxSearchH = hCoord + 1.85f * dx;
+                for (float hProbe = hCoord + marchStep; hProbe <= maxSearchH; hProbe += marchStep) {
+                    const float sProbe = sampleSdfAtUVH(uCoord, vCoord, hProbe);
+                    if (sProbe <= 0.0f) {
+                        const float denom = std::max(1.0e-5f, sPrev - sProbe);
+                        const float t = std::clamp(sPrev / denom, 0.0f, 1.0f);
+                        hCeiling = hPrev + t * (hProbe - hPrev);
+                        break;
+                    }
+                    hPrev = hProbe;
+                    sPrev = sProbe;
                 }
             }
-            if (!exitedUpperBoundary) {
-                // Voxel is on an upper/internal surface rather than a downward-facing overhang
+            if (hCeiling <= zGapMm + targetLayerH) {
                 return;
             }
+
+            // Place `roofH` at vertical distance `zGapMm` below the exact \phi = 0 overhang surface,
+            // and nudge slightly lower on steep tilted overhangs so 3D surface clearance >= 0.85 * zGapMm.
+            float roofH = hCeiling - zGapMm;
+            const float sAtRoof = sampleSdfAtUVH(uCoord, vCoord, roofH);
+            if (sAtRoof <= 0.0f) {
+                return;
+            }
+            if (sAtRoof < 0.85f * zGapMm) {
+                roofH -= (0.90f * zGapMm - sAtRoof);
+                if (sampleSdfAtUVH(uCoord, vCoord, roofH) < 0.70f * zGapMm) {
+                    return;
+                }
+            }
+
+            // Ray-march downward from `roofH` along gravity `+\hat{g}_{bed} = -uUp` to find `floorH`
+            float floorH = 0.0f;
+            float hPrev = roofH;
+            float sPrev = sampleSdfAtUVH(uCoord, vCoord, roofH);
+            for (float hProbe = roofH - marchStep; hProbe > 0.0f; hProbe -= marchStep) {
+                const float sProbe = sampleSdfAtUVH(uCoord, vCoord, hProbe);
+                if (sProbe <= 0.0f) {
+                    const float denom = std::max(1.0e-5f, sPrev - sProbe);
+                    const float t = std::clamp(sPrev / denom, 0.0f, 1.0f);
+                    const float hFloorSurf = hPrev + t * (hProbe - hPrev);
+                    floorH = hFloorSurf + zGapMm;
+                    break;
+                }
+                hPrev = hProbe;
+                sPrev = sProbe;
+            }
             if (roofH <= floorH + 0.5f * targetLayerH) {
+                return;
+            }
+            // In ColumnarGrid mode with `on_bed_only` enabled, never place support columns on
+            // upper part surfaces (`floorH > 0`). In NonPlanarTree mode (`support_style == 1`),
+            // keep the overhang contact cell even when `floorH > 0` so tree branches can grow
+            // from `(uCoord, vCoord, roofH)` and steer laterally around the lower model surface
+            // down to the build plate (`h = 0`).
+            if (impl_->supportSpec.support_style == 0 &&
+                impl_->supportSpec.on_bed_only &&
+                floorH > 1.0e-3f) {
                 return;
             }
 
@@ -5268,8 +5560,15 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
             if (itCol == supportColumns.end()) {
                 supportColumns.emplace(key, ColumnSpan{roofH, floorH});
             } else {
-                itCol->second.roofH = std::max(itCol->second.roofH, roofH);
-                itCol->second.floorH = std::min(itCol->second.floorH, floorH);
+                if (std::abs(roofH - itCol->second.roofH) <= 2.5f * dx) {
+                    // Same overhang surface: keep the conservative (lower) roofH so no voxel in
+                    // the cell violates `zGapMm` against a sloped overhang ceiling.
+                    itCol->second.roofH = std::min(itCol->second.roofH, roofH);
+                    itCol->second.floorH = std::max(itCol->second.floorH, floorH);
+                } else if (roofH > itCol->second.roofH) {
+                    itCol->second.roofH = roofH;
+                    itCol->second.floorH = std::min(itCol->second.floorH, floorH);
+                }
             }
         };
 
@@ -5299,12 +5598,10 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
             }
 
             const float baseSpacingMm = std::max(0.4f, impl_->supportSpec.base_spacing_mm);
-            const float interfaceSpacingMm = std::max(0.2f, impl_->supportSpec.interface_spacing_mm);
-            const float lineWidthMm = std::max(
-                0.15f,
-                (impl_->supportSpec.line_width_mm > 0.05f)
-                    ? impl_->supportSpec.line_width_mm
-                    : impl_->shellPathSpec.nozzle_diameter_mm);
+            // `interface_spacing_mm` is the edge-to-edge gap (>= 0.0 mm) between adjacent support
+            // interface extrusions (`0.0 mm` = 100% solid touching interface roof/floor with pitch == `lineWidthMm`).
+            const float interfaceGapMm = std::max(0.0f, impl_->supportSpec.interface_spacing_mm);
+            const float interfaceSpacingMm = lineWidthMm + interfaceGapMm;
             const float minSegLenMm = std::max(0.4f, impl_->shellPathSpec.min_extrusion_length_mm);
 
             std::vector<float> uniqueLayerIsos;
@@ -5320,6 +5617,893 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
             }
             const float firstSupportIso =
                 uniqueLayerIsos.empty() ? targetLayerH : uniqueLayerIsos.front();
+
+            // =========================================================================
+            // Non-Planar Tree Support Growth, Obstacle-Avoiding Routing & Coalescence
+            // =========================================================================
+            struct TreeStation {
+                float h = 0.0f;
+                float u = 0.0f;
+                float v = 0.0f;
+                float radius = 1.0f;
+                std::array<float, 3> tangentUp{0.0f, 0.0f, 1.0f};
+            };
+            struct TreeBranch {
+                float roofH = 0.0f;
+                float floorH = 0.0f;
+                bool groundedOnBed = false;
+                std::int32_t mergedIntoBranch = -1;
+                std::vector<float> forkHeights;
+                std::vector<TreeStation> stations; // Ordered top-down (decreasing `h`)
+            };
+            std::vector<TreeBranch> treeBranches;
+
+            struct CanopyCellLink {
+                std::int32_t iu = 0;
+                std::int32_t iv = 0;
+                float u = 0.0f;
+                float v = 0.0f;
+                float roofH = 0.0f;
+                float floorH = 0.0f;
+                std::size_t branchIdx = 0;
+            };
+            std::vector<CanopyCellLink> treeCanopyCells;
+            float treeCanopyTransitionMm = 2.0f;
+
+            const bool useTreeSupport = (impl_->supportSpec.support_style == 1);
+            if (useTreeSupport) {
+                const bool onBedOnly = impl_->supportSpec.on_bed_only;
+                const float branchAngleRad =
+                    std::clamp(impl_->supportSpec.tree_branch_angle_deg, 15.0f, 65.0f) *
+                    (3.14159265358979323846f / 180.0f);
+                const float tanBranchMax = std::tan(branchAngleRad);
+                const float tipRadiusMm = std::max(
+                    lineWidthMm,
+                    0.5f * std::clamp(impl_->supportSpec.tree_tip_diameter_mm, 0.80f, 8.00f));
+                const float maxTrunkRadiusMm = std::max(
+                    tipRadiusMm,
+                    0.5f * std::clamp(impl_->supportSpec.tree_trunk_max_diameter_mm, 2.00f, 30.00f));
+
+                // 1. Cluster overhang roof cells into Tree Tip Seeds
+                struct RawRoofCell {
+                    std::int32_t iu = 0;
+                    std::int32_t iv = 0;
+                    float u = 0.0f;
+                    float v = 0.0f;
+                    float roofH = 0.0f;
+                    float floorH = 0.0f;
+                };
+                std::vector<RawRoofCell> rawCells;
+                rawCells.reserve(supportColumns.size());
+                float maxRoofH = 0.0f;
+                for (const auto& [key, span] : supportColumns) {
+                    std::int32_t iu = 0, iv = 0;
+                    unpackCellKey(key, iu, iv);
+                    rawCells.push_back(RawRoofCell{
+                        iu,
+                        iv,
+                        static_cast<float>(iu) * cellStepMm,
+                        static_cast<float>(iv) * cellStepMm,
+                        span.roofH,
+                        span.floorH});
+                    maxRoofH = std::max(maxRoofH, span.roofH);
+                }
+                std::sort(
+                    rawCells.begin(),
+                    rawCells.end(),
+                    [](const RawRoofCell& a, const RawRoofCell& b) {
+                        return a.roofH > b.roofH;
+                    });
+
+                struct TipSeed {
+                    float sumU = 0.0f;
+                    float sumV = 0.0f;
+                    float roofH = 0.0f;
+                    float floorH = 0.0f;
+                    std::uint32_t count = 0;
+                    bool spawned = false;
+                };
+                const float clusterRadiusMm = std::max(1.5f * cellStepMm, 1.35f * tipRadiusMm);
+                const float clusterRadiusSq = clusterRadiusMm * clusterRadiusMm;
+                treeCanopyTransitionMm =
+                    std::max(1.5f * targetLayerH, clusterRadiusMm / std::max(0.35f, tanBranchMax));
+                std::vector<TipSeed> tipSeeds;
+                for (const auto& rc : rawCells) {
+                    bool mergedToSeed = false;
+                    for (auto& ts : tipSeeds) {
+                        const float cu = ts.sumU / static_cast<float>(ts.count);
+                        const float cv = ts.sumV / static_cast<float>(ts.count);
+                        const float du = rc.u - cu;
+                        const float dv = rc.v - cv;
+                        if (du * du + dv * dv <= clusterRadiusSq &&
+                            std::abs(rc.roofH - ts.roofH) <= 3.0f * targetLayerH) {
+                            ts.sumU += rc.u;
+                            ts.sumV += rc.v;
+                            ts.roofH = std::max(ts.roofH, rc.roofH);
+                            ts.floorH = std::min(ts.floorH, rc.floorH);
+                            ++ts.count;
+                            mergedToSeed = true;
+                            break;
+                        }
+                    }
+                    if (!mergedToSeed) {
+                        tipSeeds.push_back(TipSeed{rc.u, rc.v, rc.roofH, rc.floorH, 1, false});
+                    }
+                }
+
+                // 2. Top-down step-by-step tree growth along gravity `+\hat{g}_{bed}` (`-uUp`)
+                struct ActiveNode {
+                    std::size_t branchIdx = 0;
+                    float u = 0.0f;
+                    float v = 0.0f;
+                    float radius = 1.0f;
+                    float targetRadius = 1.0f;
+                    float roofH = 0.0f;
+                    float floorH = 0.0f;
+                    float origFloorH = 0.0f;
+                    bool alive = true;
+                };
+                std::vector<ActiveNode> activeNodes;
+
+                // Evaluate lookahead clearance along the downward gravity ray so branches
+                // start steering around lower part ledges well before colliding with them,
+                // without mistaking the overhang ceiling above `nodeRoofH` for a lateral wall.
+                auto evaluateLookaheadScore = [&](float uCand,
+                                                  float vCand,
+                                                  float hCand,
+                                                  float rCand,
+                                                  float nodeRoofH) -> float {
+                    const bool inRoofZone =
+                        (nodeRoofH - hCand) <= (3.5f * targetLayerH + zGapMm);
+                    const float sNow = sampleSdfAtUVH(uCand, vCand, hCand);
+                    const float rCenterClear = std::min(rCand, tipRadiusMm);
+                    if (!hasSupportClearanceAtUVH(
+                            uCand,
+                            vCand,
+                            hCand,
+                            inRoofZone ? 0.0f : 0.35f * rCenterClear,
+                            inRoofZone)) {
+                        return -1000.0f + sNow;
+                    }
+                    const float reqClearance = xyGapMm + 0.65f * rCenterClear;
+                    const float roofVertDist = std::max(zGapMm, nodeRoofH - hCand + zGapMm);
+                    const float effNow =
+                        (sNow < reqClearance && sNow >= 0.72f * roofVertDist)
+                            ? reqClearance
+                            : sNow;
+                    float minLookSdf = effNow;
+                    const std::array<float, 5> lookaheadOffsetsMm{1.2f, 2.8f, 5.5f, 9.5f, 15.0f};
+                    for (const float dhLook : lookaheadOffsetsMm) {
+                        const float hProbe = hCand - dhLook;
+                        if (hProbe <= 0.1f) {
+                            break;
+                        }
+                        if (!onBedOnly && hProbe <= 0.5f * targetLayerH) {
+                            break;
+                        }
+                        const float sLook = sampleSdfAtUVH(uCand, vCand, hProbe);
+                        const float probeRoofDist =
+                            std::max(zGapMm, nodeRoofH - hProbe + zGapMm);
+                        if (sLook < 0.80f * probeRoofDist) {
+                            minLookSdf = std::min(minLookSdf, sLook);
+                        }
+                    }
+                    float perimBonus = 0.0f;
+                    if (!inRoofZone) {
+                        const float rProbe =
+                            std::min(maxTrunkRadiusMm, std::max(rCand, tipRadiusMm + 0.8f));
+                        const float sE = sampleSdfAtUVH(uCand + rProbe, vCand, hCand);
+                        const float sW = sampleSdfAtUVH(uCand - rProbe, vCand, hCand);
+                        const float sN = sampleSdfAtUVH(uCand, vCand + rProbe, hCand);
+                        const float sS = sampleSdfAtUVH(uCand, vCand - rProbe, hCand);
+                        const float minPerimSdf = std::min({sE, sW, sN, sS});
+                        perimBonus = 0.35f * std::clamp(minPerimSdf - xyGapMm, -2.0f, 1.5f);
+                    }
+                    float score = std::min(effNow - reqClearance, 3.0f) +
+                                  1.35f * std::min(minLookSdf - reqClearance, 4.0f) +
+                                  perimBonus;
+                    return score;
+                };
+
+                // Check whether a trunk disk of radius `rTest` centered at `(uCenter, vCenter)`
+                // at height `hVal` has full perimeter clearance around the part. Evaluating
+                // `hasSupportClearanceAtUVH` on the perimeter avoids narrow-band SDF saturation
+                // at the trunk center so trunks can expand up to `maxTrunkRadiusMm`.
+                auto isTrunkPerimeterClear = [&](float uCenter,
+                                                 float vCenter,
+                                                 float hVal,
+                                                 float rTest,
+                                                 bool roofZone) -> bool {
+                    if (rTest <= 0.5f * lineWidthMm) {
+                        return hasSupportClearanceAtUVH(uCenter, vCenter, hVal, 0.0f, roofZone);
+                    }
+                    const float minRingR = std::min(rTest, tipRadiusMm);
+                    for (float rRing = rTest; rRing >= minRingR - 1.0e-4f; rRing -= 0.70f) {
+                        const float rSample = std::max(minRingR, rRing);
+                        for (int k = 0; k < 24; ++k) {
+                            const float ang =
+                                static_cast<float>(k) * (2.0f * 3.14159265358979323846f / 24.0f);
+                            const float uPt = uCenter + rSample * std::cos(ang);
+                            const float vPt = vCenter + rSample * std::sin(ang);
+                            if (!hasSupportClearanceAtUVH(uPt, vPt, hVal, 0.0f, roofZone)) {
+                                return false;
+                            }
+                        }
+                        if (rSample <= minRingR + 1.0e-4f) {
+                            break;
+                        }
+                    }
+                    return true;
+                };
+
+                const float dhStep = std::clamp(targetLayerH, 0.15f, 0.35f);
+                const float topAnchorBandMm =
+                    static_cast<float>(std::max<std::uint32_t>(1, impl_->supportSpec.interface_layers)) *
+                    targetLayerH;
+                const int numSteps = static_cast<int>(std::ceil(maxRoofH / dhStep)) + 1;
+                for (int step = 0; step <= numSteps; ++step) {
+                    const float hCurr = std::max(0.0f, maxRoofH - static_cast<float>(step) * dhStep);
+                    const float hNext = std::max(0.0f, hCurr - dhStep);
+                    const float dhActual = hCurr - hNext;
+
+                    // Spawn any tip seeds whose roofH is reached at `hCurr`
+                    for (auto& ts : tipSeeds) {
+                        if (!ts.spawned && ts.roofH >= hCurr - 1.0e-4f) {
+                            ts.spawned = true;
+                            const float u0 = ts.sumU / static_cast<float>(ts.count);
+                            const float v0 = ts.sumV / static_cast<float>(ts.count);
+                            const float cellArea = static_cast<float>(ts.count) * cellStepMm * cellStepMm;
+                            const float areaRadius = std::sqrt(cellArea / 3.14159265f);
+                            const float r0 = tipRadiusMm;
+                            const float rTarget0 = std::clamp(
+                                std::max(tipRadiusMm, 0.85f * areaRadius),
+                                tipRadiusMm,
+                                std::min(maxTrunkRadiusMm, 1.8f * tipRadiusMm));
+
+                            TreeBranch br{};
+                            br.roofH = ts.roofH;
+                            br.floorH = onBedOnly ? 0.0f : ts.floorH;
+                            br.stations.push_back(TreeStation{
+                                ts.roofH,
+                                u0,
+                                v0,
+                                r0,
+                                uUp});
+                            if (ts.roofH > hCurr + 1.0e-3f) {
+                                br.stations.push_back(TreeStation{
+                                    hCurr,
+                                    u0,
+                                    v0,
+                                    r0,
+                                    uUp});
+                            }
+                            const std::size_t bIdx = treeBranches.size();
+                            treeBranches.push_back(std::move(br));
+                            activeNodes.push_back(ActiveNode{
+                                bIdx,
+                                u0,
+                                v0,
+                                r0,
+                                rTarget0,
+                                ts.roofH,
+                                onBedOnly ? 0.0f : ts.floorH,
+                                ts.floorH,
+                                true});
+                        }
+                    }
+
+                    if (dhActual <= 1.0e-5f) {
+                        // Reached the build plate (`hCurr == 0.0f`)
+                        for (auto& node : activeNodes) {
+                            if (node.alive) {
+                                treeBranches[node.branchIdx].groundedOnBed = true;
+                            }
+                        }
+                        break;
+                    }
+
+                    const float maxLatStep = dhActual * tanBranchMax;
+
+                    // Step 2a: Obstacle-avoiding steering around the part SDF
+                    for (std::size_t nodeIdx = 0; nodeIdx < activeNodes.size(); ++nodeIdx) {
+                        auto& node = activeNodes[nodeIdx];
+                        if (!node.alive) {
+                            continue;
+                        }
+                        if (!onBedOnly && hNext <= node.floorH + 1.0e-4f) {
+                            // Landed on lower part surface (allowed when `on_bed_only == false`)
+                            treeBranches[node.branchIdx].stations.push_back(TreeStation{
+                                node.floorH,
+                                node.u,
+                                node.v,
+                                node.radius,
+                                uUp});
+                            node.alive = false;
+                            continue;
+                        }
+
+                        float bestU = node.u;
+                        float bestV = node.v;
+                        float usedLatStep = 0.0f;
+
+                        // Keep the branch tip stationary directly beneath the overhang across the
+                        // top roof interface layers unless an immediate obstacle below requires early escape.
+                        const float maxAnchorBand =
+                            (onBedOnly && node.origFloorH > 1.0e-3f)
+                                ? std::min(topAnchorBandMm, 0.20f * std::max(0.0f, node.roofH - node.origFloorH))
+                                : topAnchorBandMm;
+                        const bool holdTipUnderRoof =
+                            ((node.roofH - hNext) <= maxAnchorBand) &&
+                            hasSupportClearanceAtUVH(node.u, node.v, hNext, 0.0f, true);
+
+                        const float straightScore =
+                            evaluateLookaheadScore(node.u, node.v, hNext, node.radius, node.roofH);
+                        if (holdTipUnderRoof && straightScore > -500.0f) {
+                            usedLatStep = maxLatStep;
+                        } else if (straightScore < 0.35f) {
+                            // Need obstacle-avoiding lateral steering!
+                            float bestScore = straightScore;
+                            // Estimate 2D horizontal SDF gradient at (node.u, node.v, hNext)
+                            const float eps = std::max(0.5f * dx, 0.35f);
+                            const float gx =
+                                sampleSdfAtUVH(node.u + eps, node.v, hNext) -
+                                sampleSdfAtUVH(node.u - eps, node.v, hNext);
+                            const float gy =
+                                sampleSdfAtUVH(node.u, node.v + eps, hNext) -
+                                sampleSdfAtUVH(node.u, node.v - eps, hNext);
+                            const float gNorm = std::sqrt(gx * gx + gy * gy);
+
+                            auto tryCandidate = [&](float cu, float cv, float stepLen) {
+                                const float sc =
+                                    evaluateLookaheadScore(cu, cv, hNext, node.radius, node.roofH);
+                                if (sc > bestScore + 1.0e-4f) {
+                                    bestScore = sc;
+                                    bestU = cu;
+                                    bestV = cv;
+                                    usedLatStep = stepLen;
+                                }
+                            };
+
+                            if (gNorm > 1.0e-5f) {
+                                const float dirU = gx / gNorm;
+                                const float dirV = gy / gNorm;
+                                tryCandidate(
+                                    node.u + maxLatStep * dirU,
+                                    node.v + maxLatStep * dirV,
+                                    maxLatStep);
+                            }
+
+                            // Also probe steering directly toward nearby clear active branches
+                            for (const auto& other : activeNodes) {
+                                if (!other.alive || other.branchIdx == node.branchIdx) {
+                                    continue;
+                                }
+                                const float du = other.u - node.u;
+                                const float dv = other.v - node.v;
+                                const float d = std::sqrt(du * du + dv * dv);
+                                if (d > 1.0e-4f &&
+                                    d <= std::max(10.0f, 4.0f * (node.radius + other.radius))) {
+                                    const float stepLen = std::min(maxLatStep, d);
+                                    tryCandidate(
+                                        node.u + stepLen * (du / d),
+                                        node.v + stepLen * (dv / d),
+                                        stepLen);
+                                }
+                            }
+
+                            // Probe 16 directions at 0.6x and 1.0x `maxLatStep` (and 1.35x in emergency when `onBedOnly`)
+                            const std::array<float, 3> radialFracs{
+                                0.60f,
+                                1.00f,
+                                onBedOnly ? 1.35f : 1.00f};
+                            for (const float frac : radialFracs) {
+                                const float rStep = frac * maxLatStep;
+                                for (int k = 0; k < 16; ++k) {
+                                    const float ang =
+                                        static_cast<float>(k) * (2.0f * 3.14159265358979323846f / 16.0f);
+                                    tryCandidate(
+                                        node.u + rStep * std::cos(ang),
+                                        node.v + rStep * std::sin(ang),
+                                        rStep);
+                                }
+                            }
+
+                            // If local steps still sit above a wide flat lower obstacle (where the 3D SDF
+                            // gradient inside the lower shelf points vertically rather than horizontally),
+                            // find the shortest horizontal escape vector to a clear vertical corridor!
+                            if (bestScore < 0.35f) {
+                                float hBlocked = -1.0f;
+                                const float reqClear =
+                                    xyGapMm + 0.65f * std::min(node.radius, tipRadiusMm);
+                                for (float hProbe = hNext - 0.8f; hProbe >= 0.25f; hProbe -= 0.8f) {
+                                    const float probeRoofDist =
+                                        std::max(zGapMm, node.roofH - hProbe + zGapMm);
+                                    const float sProbe = sampleSdfAtUVH(node.u, node.v, hProbe);
+                                    if (sProbe < reqClear && sProbe < 0.80f * probeRoofDist) {
+                                        hBlocked = hProbe;
+                                        break;
+                                    }
+                                }
+                                if (hBlocked >= 0.0f) {
+                                    bool foundCorridor = false;
+                                    for (float rSearch = 1.0f; rSearch <= 28.0f && !foundCorridor; rSearch += 1.0f) {
+                                        float bestCorridorSdf = -1.0e9f;
+                                        float escDirU = 0.0f;
+                                        float escDirV = 0.0f;
+                                        for (int k = 0; k < 16; ++k) {
+                                            const float ang =
+                                                static_cast<float>(k) * (2.0f * 3.14159265358979323846f / 16.0f);
+                                            const float dirU = std::cos(ang);
+                                            const float dirV = std::sin(ang);
+                                            const float uEsc = node.u + rSearch * dirU;
+                                            const float vEsc = node.v + rSearch * dirV;
+                                            const float sBlock = sampleSdfAtUVH(uEsc, vEsc, hBlocked);
+                                            const float sBed = sampleSdfAtUVH(
+                                                uEsc,
+                                                vEsc,
+                                                std::max(0.25f, 0.5f * targetLayerH));
+                                            const float minCorridor = std::min(sBlock, sBed);
+                                            if (minCorridor >= reqClear && minCorridor > bestCorridorSdf) {
+                                                bestCorridorSdf = minCorridor;
+                                                escDirU = dirU;
+                                                escDirV = dirV;
+                                                foundCorridor = true;
+                                            }
+                                        }
+                                        if (foundCorridor) {
+                                            const float stepLen = std::min(maxLatStep, rSearch);
+                                            const float cu = node.u + stepLen * escDirU;
+                                            const float cv = node.v + stepLen * escDirV;
+                                            const bool inRoofZone =
+                                                (node.roofH - hNext) <= (3.5f * targetLayerH + zGapMm);
+                                            if (hasSupportClearanceAtUVH(cu, cv, hNext, 0.0f, inRoofZone)) {
+                                                bestU = cu;
+                                                bestV = cv;
+                                                usedLatStep = stepLen;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Verify directional clearance at `(bestU, bestV, hNext)`
+                        const bool inRoofZone =
+                            (node.roofH - hNext) <= (3.5f * targetLayerH + zGapMm);
+                        if (!hasSupportClearanceAtUVH(bestU, bestV, hNext, 0.0f, inRoofZone)) {
+                            // Blocked by part geometry even after lateral steering
+                            if (!onBedOnly) {
+                                treeBranches[node.branchIdx].stations.push_back(TreeStation{
+                                    std::max(hNext, node.floorH),
+                                    node.u,
+                                    node.v,
+                                    node.radius,
+                                    uUp});
+                            }
+                            node.alive = false;
+                            continue;
+                        }
+
+                        node.u = bestU;
+                        node.v = bestV;
+
+                        // Step 2b: Mutual attraction toward nearby active branches within merge horizon.
+                        // Prioritize the closest merge partner within `2.5 * (r_node + r_other)` so pairs
+                        // of branches converge all the way to a shared center (`dist <= maxLatStep`) without
+                        // stalling between opposing pulls from more distant branches.
+                        bool hasCloseMergePartner = false;
+                        const float remBudget = std::max(0.0f, maxLatStep - usedLatStep);
+                        if (remBudget > 1.0e-3f && !inRoofZone) {
+                            std::size_t bestPartnerIdx = activeNodes.size();
+                            float bestPartnerDist = std::numeric_limits<float>::max();
+                            float attractU = 0.0f;
+                            float attractV = 0.0f;
+                            float attractWeight = 0.0f;
+
+                            for (std::size_t otherIdx = 0; otherIdx < activeNodes.size(); ++otherIdx) {
+                                const auto& other = activeNodes[otherIdx];
+                                if (!other.alive || other.branchIdx == node.branchIdx) {
+                                    continue;
+                                }
+                                const float du = other.u - node.u;
+                                const float dv = other.v - node.v;
+                                const float dist = std::sqrt(du * du + dv * dv);
+                                const float closePartnerHorizon = 2.5f * (node.radius + other.radius);
+                                if (dist <= closePartnerHorizon && dist < bestPartnerDist &&
+                                    (other.roofH - hNext) > topAnchorBandMm) {
+                                    bestPartnerDist = dist;
+                                    bestPartnerIdx = otherIdx;
+                                }
+                                const float horizon =
+                                    std::max(8.0f, 3.8f * (node.radius + other.radius));
+                                if (dist > 1.0e-3f && dist <= horizon) {
+                                    const float w = (other.radius * other.radius) / (dist + 0.5f);
+                                    attractU += w * (du / dist);
+                                    attractV += w * (dv / dist);
+                                    attractWeight += w;
+                                }
+                            }
+
+                            float dirU = 0.0f;
+                            float dirV = 0.0f;
+                            float maxNudge = 0.0f;
+                            if (bestPartnerIdx < activeNodes.size()) {
+                                hasCloseMergePartner = true;
+                                const auto& partner = activeNodes[bestPartnerIdx];
+                                const float du = partner.u - node.u;
+                                const float dv = partner.v - node.v;
+                                const float dist = std::sqrt(du * du + dv * dv);
+                                if (dist <= node.radius + partner.radius) {
+                                    node.targetRadius = std::max(
+                                        node.targetRadius,
+                                        std::min(maxTrunkRadiusMm, partner.radius));
+                                }
+                                if (dist > 1.0e-4f) {
+                                    dirU = du / dist;
+                                    dirV = dv / dist;
+                                    const float maxClose =
+                                        (bestPartnerIdx < nodeIdx) ? dist : (0.60f * dist);
+                                    maxNudge = std::min(remBudget, maxClose);
+                                }
+                            } else if (attractWeight > 0.0f) {
+                                const float aNorm =
+                                    std::sqrt(attractU * attractU + attractV * attractV);
+                                if (aNorm > 1.0e-5f) {
+                                    dirU = attractU / aNorm;
+                                    dirV = attractV / aNorm;
+                                    maxNudge = 0.75f * remBudget;
+                                }
+                            }
+
+                            if (maxNudge > 1.0e-4f) {
+                                const float candU = node.u + maxNudge * dirU;
+                                const float candV = node.v + maxNudge * dirV;
+                                const float candScore =
+                                    evaluateLookaheadScore(candU, candV, hNext, node.radius, node.roofH);
+                                if ((candScore >= 0.25f || candScore >= straightScore - 0.25f) &&
+                                    hasSupportClearanceAtUVH(candU, candV, hNext, 0.0f, false)) {
+                                    node.u = candU;
+                                    node.v = candV;
+                                    usedLatStep += maxNudge;
+                                }
+                            }
+                        }
+
+                        // Step 2b.5: Trunk radius expansion toward the build plate (conical trunk
+                        // taper plus basal root flare in the bottom 10 mm for bed adhesion), with
+                        // perimeter-based wall push-away (including downward lookahead) and clearance
+                        // clamping so narrow-band SDF saturation never prevents trunks from expanding
+                        // up to `maxTrunkRadiusMm`.
+                        if (!inRoofZone) {
+                            const bool groundsToBed = onBedOnly || (node.floorH <= 1.0e-3f);
+                            const float basalFlareZoneMm = 10.0f;
+                            float flareSlope = 0.0f;
+                            if (groundsToBed && hNext < basalFlareZoneMm) {
+                                const float flareFrac =
+                                    std::clamp(1.0f - (hNext / basalFlareZoneMm), 0.0f, 1.0f);
+                                flareSlope = 0.30f * (0.35f + 0.65f * flareFrac);
+                            }
+                            const float dTargetR = (0.18f + flareSlope) * dhActual;
+                            node.targetRadius = std::min(
+                                maxTrunkRadiusMm,
+                                std::max(node.targetRadius, node.radius + dTargetR));
+
+                            const float maxDrStep = 0.42f * maxLatStep;
+                            const float desiredR = std::min(
+                                maxTrunkRadiusMm,
+                                std::min(node.targetRadius, node.radius + maxDrStep));
+
+                            const float remSteer = std::max(0.0f, maxLatStep - usedLatStep);
+                            if (remSteer > 1.0e-4f && !hasCloseMergePartner) {
+                                const float rProbe = std::min(
+                                    maxTrunkRadiusMm,
+                                    std::max(node.targetRadius + 0.5f, node.radius + 1.2f));
+                                const float hLook =
+                                    groundsToBed
+                                        ? std::max(0.30f, hNext - std::min(4.5f, 0.65f * hNext))
+                                        : hNext;
+                                float pushU = 0.0f;
+                                float pushV = 0.0f;
+                                int blockedCount = 0;
+                                for (int k = 0; k < 16; ++k) {
+                                    const float ang =
+                                        static_cast<float>(k) * (2.0f * 3.14159265358979323846f / 16.0f);
+                                    const float ca = std::cos(ang);
+                                    const float sa = std::sin(ang);
+                                    const float uP = node.u + rProbe * ca;
+                                    const float vP = node.v + rProbe * sa;
+                                    if (!hasSupportClearanceAtUVH(uP, vP, hNext, 0.0f, false) ||
+                                        !hasSupportClearanceAtUVH(uP, vP, hLook, 0.0f, false)) {
+                                        pushU -= ca;
+                                        pushV -= sa;
+                                        ++blockedCount;
+                                    }
+                                }
+                                const float pushNorm = std::hypot(pushU, pushV);
+                                if (blockedCount > 0 && blockedCount < 14 && pushNorm > 1.0e-4f) {
+                                    const float nudgeDist = 0.85f * remSteer;
+                                    const float nudgeU = node.u + nudgeDist * (pushU / pushNorm);
+                                    const float nudgeV = node.v + nudgeDist * (pushV / pushNorm);
+                                    if (hasSupportClearanceAtUVH(nudgeU, nudgeV, hNext, 0.0f, false) &&
+                                        isTrunkPerimeterClear(nudgeU, nudgeV, hNext, node.radius, false)) {
+                                        node.u = nudgeU;
+                                        node.v = nudgeV;
+                                        usedLatStep += nudgeDist;
+                                    }
+                                }
+                            }
+
+                            if (isTrunkPerimeterClear(node.u, node.v, hNext, desiredR, false)) {
+                                node.radius = desiredR;
+                            } else {
+                                float rLow = tipRadiusMm;
+                                float rHigh = std::max(tipRadiusMm, desiredR);
+                                float bestR = rLow;
+                                for (int iter = 0; iter < 5; ++iter) {
+                                    const float rMid = 0.5f * (rLow + rHigh);
+                                    if (isTrunkPerimeterClear(node.u, node.v, hNext, rMid, false)) {
+                                        bestR = rMid;
+                                        rLow = rMid;
+                                    } else {
+                                        rHigh = rMid;
+                                    }
+                                }
+                                node.radius = bestR;
+                            }
+                        }
+                    }
+
+                    // Step 2c: Coalesce (merge) nearby active branches into shared trunks once their
+                    // centers have converged close enough that connecting both branches to `(mu, mv)`
+                    // at `hNext` respects `maxLatStep` (preventing unsupported horizontal jumps at forks).
+                    for (std::size_t i = 0; i < activeNodes.size(); ++i) {
+                        if (!activeNodes[i].alive) {
+                            continue;
+                        }
+                        for (std::size_t j = i + 1; j < activeNodes.size(); ++j) {
+                            if (!activeNodes[j].alive) {
+                                continue;
+                            }
+                            auto& a = activeNodes[i];
+                            auto& b = activeNodes[j];
+                            // Only merge branches below their roof contact zone
+                            if ((a.roofH - hNext) <= topAnchorBandMm ||
+                                (b.roofH - hNext) <= topAnchorBandMm) {
+                                continue;
+                            }
+                            const float du = b.u - a.u;
+                            const float dv = b.v - a.v;
+                            const float dist = std::sqrt(du * du + dv * dv);
+                            if (dist > 1.35f * maxLatStep) {
+                                continue;
+                            }
+                            const auto& aPrev = treeBranches[a.branchIdx].stations.back();
+                            const auto& bPrev = treeBranches[b.branchIdx].stations.back();
+
+                            const float areaA = a.radius * a.radius;
+                            const float areaB = b.radius * b.radius;
+                            const float invArea = 1.0f / std::max(areaA + areaB, 1.0e-4f);
+                            const float mu = (areaA * a.u + areaB * b.u) * invArea;
+                            const float mv = (areaA * a.v + areaB * b.v) * invArea;
+
+                            // Ensure neither branch exceeds `1.08 * maxLatStep` from `hCurr` to `hNext`
+                            const float stepA = std::hypot(mu - aPrev.u, mv - aPrev.v);
+                            const float stepB = std::hypot(mu - bPrev.u, mv - bPrev.v);
+                            if (stepA > 1.08f * maxLatStep || stepB > 1.08f * maxLatStep) {
+                                continue;
+                            }
+
+                            if (hasSupportClearanceAtUVH(mu, mv, hNext, 0.0f, false)) {
+                                const float maxDrStep = 0.42f * maxLatStep;
+                                const float rMergedGoal = std::min(
+                                    maxTrunkRadiusMm,
+                                    std::max(a.radius, b.radius));
+                                float rMerged = tipRadiusMm;
+                                if (isTrunkPerimeterClear(mu, mv, hNext, rMergedGoal, false)) {
+                                    rMerged = rMergedGoal;
+                                } else {
+                                    float rLow = tipRadiusMm;
+                                    float rHigh = std::max(tipRadiusMm, rMergedGoal);
+                                    for (int iter = 0; iter < 5; ++iter) {
+                                        const float rMid = 0.5f * (rLow + rHigh);
+                                        if (isTrunkPerimeterClear(mu, mv, hNext, rMid, false)) {
+                                            rMerged = rMid;
+                                            rLow = rMid;
+                                        } else {
+                                            rHigh = rMid;
+                                        }
+                                    }
+                                }
+                                const float rBEnd = std::clamp(
+                                    rMerged,
+                                    b.radius - maxDrStep,
+                                    b.radius + maxDrStep);
+                                // Connect child branch `b` into merged trunk `a` at `(mu, mv, hNext)`
+                                treeBranches[b.branchIdx].stations.push_back(TreeStation{
+                                    hNext,
+                                    mu,
+                                    mv,
+                                    rBEnd,
+                                    uUp});
+                                treeBranches[b.branchIdx].mergedIntoBranch =
+                                    static_cast<std::int32_t>(a.branchIdx);
+                                treeBranches[a.branchIdx].forkHeights.push_back(hNext);
+                                b.alive = false;
+
+                                a.u = mu;
+                                a.v = mv;
+                                a.radius = rMerged;
+                                a.targetRadius = std::min(
+                                    maxTrunkRadiusMm,
+                                    std::max({a.targetRadius, b.targetRadius, std::sqrt(areaA + areaB)}));
+                                a.roofH = std::max(a.roofH, b.roofH);
+                            }
+                        }
+                    }
+
+                    // Record station at `hNext` for all surviving branches
+                    for (auto& node : activeNodes) {
+                        if (!node.alive) {
+                            continue;
+                        }
+                        treeBranches[node.branchIdx].stations.push_back(TreeStation{
+                            hNext,
+                            node.u,
+                            node.v,
+                            node.radius,
+                            uUp});
+                        if (hNext <= 1.0e-4f) {
+                            treeBranches[node.branchIdx].groundedOnBed = true;
+                        }
+                    }
+                }
+
+                // Enforce bottom-up radius monotonicity (`s[k-1].radius <= s[k].radius`) along
+                // every branch and across child-to-parent fork junctions so trunks strictly
+                // expand (never narrow) toward the build plate and no upper branch station
+                // ever overhangs a narrower lower neck.
+                for (int pass = 0; pass < 3; ++pass) {
+                    for (auto& br : treeBranches) {
+                        if (br.stations.size() < 2) {
+                            continue;
+                        }
+                        if (br.mergedIntoBranch >= 0 &&
+                            static_cast<std::size_t>(br.mergedIntoBranch) < treeBranches.size()) {
+                            const auto& parentBr =
+                                treeBranches[static_cast<std::size_t>(br.mergedIntoBranch)];
+                            const float hMerge = br.stations.back().h;
+                            for (std::size_t pk = 0; pk + 1 < parentBr.stations.size(); ++pk) {
+                                const auto& ps0 = parentBr.stations[pk];
+                                const auto& ps1 = parentBr.stations[pk + 1];
+                                if (hMerge <= ps0.h + 1.0e-4f && hMerge >= ps1.h - 1.0e-4f) {
+                                    const float denom = std::max(1.0e-5f, ps0.h - ps1.h);
+                                    const float t = std::clamp((ps0.h - hMerge) / denom, 0.0f, 1.0f);
+                                    const float parentR = ps0.radius + t * (ps1.radius - ps0.radius);
+                                    br.stations.back().radius =
+                                        std::min(br.stations.back().radius, parentR);
+                                    break;
+                                }
+                            }
+                        }
+                        for (std::size_t k = br.stations.size() - 1; k > 0; --k) {
+                            br.stations[k - 1].radius =
+                                std::min(br.stations[k - 1].radius, br.stations[k].radius);
+                        }
+                    }
+                }
+
+                // If `onBedOnly` is enabled, discard any stub branch that became trapped in an
+                // internal pocket and neither reached the build plate (`h == 0`) nor merged into a
+                // trunk that reached the build plate.
+                if (onBedOnly && !treeBranches.empty()) {
+                    // Propagate `groundedOnBed` upward strictly along actual merged parent links
+                    bool changed = true;
+                    while (changed) {
+                        changed = false;
+                        for (auto& br : treeBranches) {
+                            if (br.groundedOnBed || br.stations.empty()) {
+                                continue;
+                            }
+                            const auto& endSt = br.stations.back();
+                            if (endSt.h <= 1.0e-3f) {
+                                br.groundedOnBed = true;
+                                changed = true;
+                                continue;
+                            }
+                            if (br.mergedIntoBranch >= 0 &&
+                                static_cast<std::size_t>(br.mergedIntoBranch) < treeBranches.size() &&
+                                treeBranches[static_cast<std::size_t>(br.mergedIntoBranch)].groundedOnBed) {
+                                br.groundedOnBed = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                    treeBranches.erase(
+                        std::remove_if(
+                            treeBranches.begin(),
+                            treeBranches.end(),
+                            [](const TreeBranch& br) {
+                                return !br.groundedOnBed || br.stations.size() < 2;
+                            }),
+                        treeBranches.end());
+                }
+
+                // 3. Compute 3D unit centerline tangents `tangentUp` (pointing from trunk to tip)
+                //    in bed coordinates so 5/6-axis tools can orient nozzle beads along the branch!
+                for (auto& br : treeBranches) {
+                    const std::size_t m = br.stations.size();
+                    for (std::size_t k = 0; k < m; ++k) {
+                        const std::size_t kUpper = (k > 0) ? (k - 1) : 0;
+                        const std::size_t kLower = (k + 1 < m) ? (k + 1) : (m - 1);
+                        const float du = br.stations[kUpper].u - br.stations[kLower].u;
+                        const float dv = br.stations[kUpper].v - br.stations[kLower].v;
+                        const float dh = std::max(1.0e-3f, br.stations[kUpper].h - br.stations[kLower].h);
+                        std::array<float, 3> rawT{
+                            du * tU[0] + dv * tV[0] + dh * uUp[0],
+                            du * tU[1] + dv * tV[1] + dh * uUp[1],
+                            du * tU[2] + dv * tV[2] + dh * uUp[2]};
+                        const float tLen =
+                            std::sqrt(rawT[0] * rawT[0] + rawT[1] * rawT[1] + rawT[2] * rawT[2]);
+                        if (tLen > 1.0e-5f) {
+                            br.stations[k].tangentUp = {
+                                rawT[0] / tLen,
+                                rawT[1] / tLen,
+                                rawT[2] / tLen};
+                        } else {
+                            br.stations[k].tangentUp = uUp;
+                        }
+                    }
+                }
+
+                // 4. Link every overhang contact cell `(iu, iv)` in `supportColumns` to its nearest
+                //    surviving `TreeBranch` so the full overhang contact area is supported at `roofH`
+                //    and funnels smoothly into the branch tips across `treeCanopyTransitionMm`.
+                if (!treeBranches.empty()) {
+                    const float maxCanopyReachSq =
+                        (2.8f * clusterRadiusMm + 3.0f) * (2.8f * clusterRadiusMm + 3.0f);
+                    treeCanopyCells.reserve(rawCells.size());
+                    for (const auto& rc : rawCells) {
+                        std::size_t bestIdx = treeBranches.size();
+                        float bestDistSq = maxCanopyReachSq;
+                        for (std::size_t bIdx = 0; bIdx < treeBranches.size(); ++bIdx) {
+                            const auto& br = treeBranches[bIdx];
+                            if (br.stations.empty()) {
+                                continue;
+                            }
+                            if (std::abs(br.roofH - rc.roofH) > 4.0f * targetLayerH + 1.5f) {
+                                continue;
+                            }
+                            const float du = rc.u - br.stations.front().u;
+                            const float dv = rc.v - br.stations.front().v;
+                            const float dSq = du * du + dv * dv;
+                            if (dSq <= bestDistSq) {
+                                bestDistSq = dSq;
+                                bestIdx = bIdx;
+                            }
+                        }
+                        if (bestIdx < treeBranches.size()) {
+                            treeCanopyCells.push_back(CanopyCellLink{
+                                rc.iu,
+                                rc.iv,
+                                rc.u,
+                                rc.v,
+                                rc.roofH,
+                                onBedOnly ? 0.0f : rc.floorH,
+                                bestIdx});
+                        }
+                    }
+                }
+            }
+
+            // Query support tool rotational capabilities for 5/6-axis branch-tangent nozzle orientation
+            bool toolHasRotationalAxes = false;
+            float toolMaxTiltRad = 0.0f;
+            if (!impl_->tools.empty() && supportToolIdx < impl_->tools.size()) {
+                toolHasRotationalAxes = impl_->tools[supportToolIdx].has_rotational_axes;
+                toolMaxTiltRad =
+                    std::clamp(impl_->tools[supportToolIdx].max_angle_from_bed_normal_deg, 0.0f, 85.0f) *
+                    (3.14159265358979323846f / 180.0f);
+            }
 
             float lastSupportIso = -1.0e9f;
             for (std::size_t layerIdx = 0; layerIdx < res.layers.size(); ++layerIdx) {
@@ -5367,108 +6551,614 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                 std::vector<ExtrusionPath> supportPathsForLayer;
                 std::uint32_t supportPassIdx = 0;
 
-                // Helper to scanline-rasterize either Support Base (feature_kind = 7) or
-                // Support Interface (feature_kind = 8) at the requested line spacing
-                auto emitScanlineSupportGroup = [&](std::uint8_t featureKind, float spacingMm, bool swapUV) {
-                    const float minU = static_cast<float>(minIU) * cellStepMm;
-                    const float maxU = static_cast<float>(maxIU) * cellStepMm;
-                    const float minV = static_cast<float>(minIV) * cellStepMm;
-                    const float maxV = static_cast<float>(maxIV) * cellStepMm;
+                if (useTreeSupport) {
+                    // =====================================================================
+                    // Emit Non-Planar Tree Support Cross-Sections at `hLayer`
+                    // =====================================================================
+                    struct LayerBranchDisk {
+                        std::size_t branchIdx = 0;
+                        float u = 0.0f;
+                        float v = 0.0f;
+                        float radius = 1.0f;
+                        float roofH = 0.0f;
+                        float floorH = 0.0f;
+                        bool groundedOnBed = false;
+                        bool hasForkDiaphragm = false;
+                        std::array<float, 3> tangentUp{0.0f, 0.0f, 1.0f};
+                    };
+                    std::vector<LayerBranchDisk> disks;
+                    std::vector<std::int32_t> branchToDiskIdx(treeBranches.size(), -1);
 
-                    const float outerMin = swapUV ? minU : minV;
-                    const float outerMax = swapUV ? maxU : maxV;
-                    const float innerMin = swapUV ? minV : minU;
-                    const float innerMax = swapUV ? maxV : maxU;
-                    const float marchStepMm = std::min(0.5f * cellStepMm, 0.40f);
-                    const float bboxMarginMm = 2.0f * cellStepMm;
-
-                    bool zig = false;
-                    for (float outerCoord = outerMin; outerCoord <= outerMax + 1.0e-4f; outerCoord += spacingMm) {
-                        std::vector<ToolpathPoint> activeRun;
-
-                        auto flushRun = [&]() {
-                            if (activeRun.size() < 2) {
-                                activeRun.clear();
-                                return;
-                            }
-                            float lenMm = 0.0f;
-                            for (std::size_t k = 1; k < activeRun.size(); ++k) {
-                                const float dxSeg = activeRun[k].x - activeRun[k - 1].x;
-                                const float dySeg = activeRun[k].y - activeRun[k - 1].y;
-                                const float dzSeg = activeRun[k].z - activeRun[k - 1].z;
-                                lenMm += std::sqrt(dxSeg * dxSeg + dySeg * dySeg + dzSeg * dzSeg);
-                            }
-                            if (lenMm >= minSegLenMm) {
-                                if (zig) {
-                                    std::reverse(activeRun.begin(), activeRun.end());
-                                }
-                                // Chain adjacent scanlines into a continuous boustrophedon (zig-zag)
-                                // path when the turnaround step stays within the support pad and
-                                // respects `xyGapMm` clearance from the part surface.
-                                bool chainedToPrev = false;
-                                if (!supportPathsForLayer.empty() &&
-                                    supportPathsForLayer.back().feature_kind == featureKind &&
-                                    !supportPathsForLayer.back().points.empty()) {
-                                    const ToolpathPoint& prevEnd = supportPathsForLayer.back().points.back();
-                                    const ToolpathPoint& currStart = activeRun.front();
-                                    const float tx = currStart.x - prevEnd.x;
-                                    const float ty = currStart.y - prevEnd.y;
-                                    const float tz = currStart.z - prevEnd.z;
-                                    const float turnDist = std::sqrt(tx * tx + ty * ty + tz * tz);
-                                    if (turnDist <= 2.5f * spacingMm) {
-                                        const openvdb::Vec3d midPt(
-                                            0.5 * (prevEnd.x + currStart.x),
-                                            0.5 * (prevEnd.y + currStart.y),
-                                            0.5 * (prevEnd.z + currStart.z));
-                                        if (samplePartSdf(midPt) >= xyGapMm) {
-                                            auto& prevPath = supportPathsForLayer.back();
-                                            for (const auto& pt : activeRun) {
-                                                prevPath.points.push_back(pt);
-                                            }
-                                            prevPath.total_length_mm += turnDist + lenMm;
-                                            chainedToPrev = true;
-                                        }
+                    for (std::size_t bIdx = 0; bIdx < treeBranches.size(); ++bIdx) {
+                        const auto& br = treeBranches[bIdx];
+                        if (br.stations.size() < 2) {
+                            continue;
+                        }
+                        const float hTop = br.stations.front().h;
+                        const float hBot = br.stations.back().h;
+                        const float minHForBranch =
+                            (br.mergedIntoBranch >= 0)
+                                ? (hBot - 1.0e-4f)
+                                : (hBot - 1.0f * effectiveStepH);
+                        if (hLayer > hTop + 0.5f * effectiveStepH ||
+                            hLayer < minHForBranch) {
+                            continue;
+                        }
+                        const float hClamped = std::clamp(hLayer, hBot, hTop);
+                        for (std::size_t k = 0; k + 1 < br.stations.size(); ++k) {
+                            const auto& s0 = br.stations[k];     // higher h
+                            const auto& s1 = br.stations[k + 1]; // lower h
+                            if (hClamped <= s0.h + 1.0e-4f && hClamped >= s1.h - 1.0e-4f) {
+                                const float denom = std::max(1.0e-5f, s0.h - s1.h);
+                                const float t = std::clamp((s0.h - hClamped) / denom, 0.0f, 1.0f);
+                                LayerBranchDisk d{};
+                                d.branchIdx = bIdx;
+                                d.u = s0.u + t * (s1.u - s0.u);
+                                d.v = s0.v + t * (s1.v - s0.v);
+                                d.radius = s0.radius + t * (s1.radius - s0.radius);
+                                d.roofH = br.roofH;
+                                d.floorH = br.floorH;
+                                d.groundedOnBed = br.groundedOnBed;
+                                for (const float hFork : br.forkHeights) {
+                                    if (hLayer >= hFork - 2.0f * effectiveStepH - 1.0e-4f &&
+                                        hLayer <= hFork + 2.0f * effectiveStepH + 1.0e-4f) {
+                                        d.hasForkDiaphragm = true;
+                                        break;
                                     }
                                 }
-                                if (!chainedToPrev) {
-                                    ExtrusionPath ep{};
-                                    ep.feature_kind = featureKind;
-                                    ep.wall_index = supportPassIdx++;
-                                    ep.is_closed = false;
-                                    ep.total_length_mm = lenMm;
-                                    ep.mean_width_mm = lineWidthMm;
-                                    ep.points.reserve(activeRun.size());
-                                    for (const auto& pt : activeRun) {
-                                        ep.points.push_back(pt);
-                                    }
-                                    supportPathsForLayer.push_back(std::move(ep));
-                                    if (featureKind == 7) {
-                                        ++res.support_count;
-                                    } else {
-                                        ++res.support_interface_count;
-                                    }
-                                    ++res.total_path_count;
+                                if (br.mergedIntoBranch >= 0 &&
+                                    hLayer <= hBot + 1.5f * effectiveStepH + 1.0e-4f) {
+                                    d.hasForkDiaphragm = true;
                                 }
-                                zig = !zig;
+                                d.tangentUp = {
+                                    s0.tangentUp[0] + t * (s1.tangentUp[0] - s0.tangentUp[0]),
+                                    s0.tangentUp[1] + t * (s1.tangentUp[1] - s0.tangentUp[1]),
+                                    s0.tangentUp[2] + t * (s1.tangentUp[2] - s0.tangentUp[2])};
+                                const float tNorm = std::sqrt(
+                                    d.tangentUp[0] * d.tangentUp[0] +
+                                    d.tangentUp[1] * d.tangentUp[1] +
+                                    d.tangentUp[2] * d.tangentUp[2]);
+                                if (tNorm > 1.0e-5f) {
+                                    d.tangentUp[0] /= tNorm;
+                                    d.tangentUp[1] /= tNorm;
+                                    d.tangentUp[2] /= tNorm;
+                                } else {
+                                    d.tangentUp = uUp;
+                                }
+                                branchToDiskIdx[bIdx] = static_cast<std::int32_t>(disks.size());
+                                disks.push_back(d);
+                                break;
                             }
-                            activeRun.clear();
+                        }
+                    }
+
+                    // Only deduplicate truly concentric/coincident disks (`dist <= 0.20 * lineWidthMm`)
+                    // right at the exact fork point; never suppress a diverging branch disk while it
+                    // separates from its parent trunk!
+                    std::vector<LayerBranchDisk> uniqueDisks;
+                    const float concentricTolSq = (0.20f * lineWidthMm) * (0.20f * lineWidthMm);
+                    for (const auto& d : disks) {
+                        bool absorbed = false;
+                        for (auto& ud : uniqueDisks) {
+                            const float du = d.u - ud.u;
+                            const float dv = d.v - ud.v;
+                            if (du * du + dv * dv <= concentricTolSq) {
+                                if (std::abs(d.radius - ud.radius) > 0.25f * lineWidthMm) {
+                                    ud.hasForkDiaphragm = true;
+                                }
+                                ud.radius = std::max(ud.radius, d.radius);
+                                ud.roofH = std::max(ud.roofH, d.roofH);
+                                ud.groundedOnBed = ud.groundedOnBed || d.groundedOnBed;
+                                ud.hasForkDiaphragm = ud.hasForkDiaphragm || d.hasForkDiaphragm;
+                                absorbed = true;
+                                break;
+                            }
+                        }
+                        if (!absorbed) {
+                            uniqueDisks.push_back(d);
+                        }
+                    }
+
+                    // Helper to compute local nozzle axis for a tree support point `pBed`
+                    // honoring Rule 1 (`queryNozzleFrame`) and 5/6-axis branch-tangent tilt
+                    const float bedTiltScale =
+                        std::clamp(hLayer / std::max(3.0f * targetLayerH, 0.6f), 0.0f, 1.0f);
+                    auto makeTreePoint = [&](float uVal,
+                                             float vVal,
+                                             const std::array<float, 3>& travelDir,
+                                             const std::array<float, 3>& branchTangentUp,
+                                             bool isRoofContactZone) -> std::pair<bool, ToolpathPoint> {
+                        if (!hasSupportClearanceAtUVH(uVal, vVal, hLayer, 0.0f, isRoofContactZone)) {
+                            return {false, ToolpathPoint{}};
+                        }
+                        const std::array<float, 3> pBed = uvHToBed(uVal, vVal, hLayer);
+                        const NozzleBasis nb = queryNozzleFrame(pBed, travelDir);
+                        std::array<float, 3> nAxis = nb.nozzle_axis;
+                        if (toolHasRotationalAxes && toolMaxTiltRad > 1.0e-4f && bedTiltScale > 1.0e-3f) {
+                            const float maxAng = bedTiltScale * toolMaxTiltRad;
+                            const float cosDot = std::clamp(
+                                nAxis[0] * branchTangentUp[0] +
+                                    nAxis[1] * branchTangentUp[1] +
+                                    nAxis[2] * branchTangentUp[2],
+                                -1.0f,
+                                1.0f);
+                            const float ang = std::acos(cosDot);
+                            if (ang > 1.0e-4f) {
+                                const float alpha = std::min(1.0f, maxAng / ang);
+                                std::array<float, 3> blended{
+                                    (1.0f - alpha) * nAxis[0] + alpha * branchTangentUp[0],
+                                    (1.0f - alpha) * nAxis[1] + alpha * branchTangentUp[1],
+                                    (1.0f - alpha) * nAxis[2] + alpha * branchTangentUp[2]};
+                                const float bLen = std::sqrt(
+                                    blended[0] * blended[0] +
+                                    blended[1] * blended[1] +
+                                    blended[2] * blended[2]);
+                                if (bLen > 1.0e-5f) {
+                                    nAxis = {blended[0] / bLen, blended[1] / bLen, blended[2] / bLen};
+                                }
+                            }
+                        }
+                        ToolpathPoint tp{};
+                        tp.x = pBed[0];
+                        tp.y = pBed[1];
+                        tp.z = pBed[2];
+                        tp.nx = nAxis[0];
+                        tp.ny = nAxis[1];
+                        tp.nz = nAxis[2];
+                        tp.width_mm = lineWidthMm;
+                        tp.height_mm = localLayerH;
+                        return {true, tp};
+                    };
+
+                    auto pushSupportPath = [&](std::uint8_t featureKind,
+                                               bool isClosed,
+                                               std::vector<ToolpathPoint>&& pts) {
+                        if (pts.size() < 2) {
+                            return;
+                        }
+                        float lenMm = 0.0f;
+                        for (std::size_t k = 1; k < pts.size(); ++k) {
+                            const float dxSeg = pts[k].x - pts[k - 1].x;
+                            const float dySeg = pts[k].y - pts[k - 1].y;
+                            const float dzSeg = pts[k].z - pts[k - 1].z;
+                            lenMm += std::sqrt(dxSeg * dxSeg + dySeg * dySeg + dzSeg * dzSeg);
+                        }
+                        if (lenMm < minSegLenMm) {
+                            return;
+                        }
+                        ExtrusionPath ep{};
+                        ep.feature_kind = featureKind;
+                        ep.wall_index = supportPassIdx++;
+                        ep.is_closed = isClosed;
+                        ep.total_length_mm = lenMm;
+                        ep.mean_width_mm = lineWidthMm;
+                        ep.points.reserve(pts.size());
+                        for (const auto& pt : pts) {
+                            ep.points.push_back(pt);
+                        }
+                        supportPathsForLayer.push_back(std::move(ep));
+                        if (featureKind == 7) {
+                            ++res.support_count;
+                        } else {
+                            ++res.support_interface_count;
+                        }
+                        ++res.total_path_count;
+                    };
+
+                    const std::uint32_t wallCount =
+                        std::clamp<std::uint32_t>(impl_->supportSpec.tree_branch_wall_count, 1, 4);
+                    const bool swapUV = ((layerIdx % 2) == 1);
+
+                    // Precompute each disk's mode (`isBedIntf`, `isRoofIntf`) and outer boundary
+                    // radius `diskOuterR` on `hLayer`, and propagate `hasForkDiaphragm` across
+                    // overlapping non-bed disks so all overlapping disks share a single boolean-union
+                    // level-set offset family `S_union(u, v) = c` without intersecting rings!
+                    const std::size_t numUniqueDisks = uniqueDisks.size();
+                    std::vector<bool> diskIsBedIntf(numUniqueDisks, false);
+                    std::vector<bool> diskIsRoofIntf(numUniqueDisks, false);
+                    std::vector<float> diskOuterR(numUniqueDisks, 0.0f);
+                    std::vector<bool> diskEmitted(numUniqueDisks, false);
+
+                    for (std::size_t i = 0; i < numUniqueDisks; ++i) {
+                        const auto& d = uniqueDisks[i];
+                        diskIsBedIntf[i] =
+                            (impl_->supportSpec.bed_interface_layers > 0) &&
+                            d.groundedOnBed &&
+                            (bedLayerOrdinal < impl_->supportSpec.bed_interface_layers ||
+                             hLayer <= bedInterfaceBandMm + 1.0e-4f);
+                        diskIsRoofIntf[i] =
+                            !diskIsBedIntf[i] &&
+                            (impl_->supportSpec.interface_layers > 0) &&
+                            (d.roofH - hLayer <= interfaceBandMm + 1.0e-4f);
+                        diskOuterR[i] = diskIsBedIntf[i] ? (d.radius + 1.0f) : d.radius;
+                    }
+
+                    // Mark `hasForkDiaphragm = true` on any overlapping pair of `Support Base`
+                    // disks so overlapping disks always share the same solid `lineWidthMm`
+                    // union level-set offset family `S_union(u, v) = c` without hollow gaps.
+                    for (std::size_t i = 0; i < numUniqueDisks; ++i) {
+                        if (diskIsBedIntf[i] || diskIsRoofIntf[i]) {
+                            continue;
+                        }
+                        for (std::size_t j = i + 1; j < numUniqueDisks; ++j) {
+                            if (diskIsBedIntf[j] || diskIsRoofIntf[j]) {
+                                continue;
+                            }
+                            const float distIJ = std::hypot(
+                                uniqueDisks[i].u - uniqueDisks[j].u,
+                                uniqueDisks[i].v - uniqueDisks[j].v);
+                            if (distIJ <= diskOuterR[i] + diskOuterR[j] + 0.25f * lineWidthMm) {
+                                uniqueDisks[i].hasForkDiaphragm = true;
+                                uniqueDisks[j].hasForkDiaphragm = true;
+                            }
+                        }
+                    }
+
+                    // Emit a ring on `uniqueDisks[diskIdx]` at radius `ringRadius = diskOuterR[diskIdx] - c`,
+                    // clipped against all other disks `j != diskIdx` so overlapping base pads and
+                    // forking branch rings trace the smooth boolean-union contour `S_union(u, v) = c`
+                    // and never intersect each other on the same layer.
+                    auto emitRingOnDisk = [&](std::size_t diskIdx,
+                                              float ringRadius,
+                                              std::uint8_t featureKind,
+                                              bool isRoofContactZone) {
+                        if (ringRadius < 0.35f * lineWidthMm) {
+                            return;
+                        }
+                        const auto& d = uniqueDisks[diskIdx];
+                        const float cOffset = std::max(0.0f, diskOuterR[diskIdx] - ringRadius);
+                        const int numSegs = std::clamp<int>(
+                            static_cast<int>(std::ceil(2.0f * 3.14159265f * ringRadius / 0.45f)),
+                            12,
+                            64);
+                        std::vector<ToolpathPoint> currentArc;
+                        currentArc.reserve(static_cast<std::size_t>(numSegs) + 1);
+                        bool allValid = true;
+                        for (int s = 0; s <= numSegs; ++s) {
+                            const float ang =
+                                static_cast<float>(s) * (2.0f * 3.14159265358979323846f / static_cast<float>(numSegs));
+                            const float ca = std::cos(ang);
+                            const float sa = std::sin(ang);
+                            const float uPt = d.u + ringRadius * ca;
+                            const float vPt = d.v + ringRadius * sa;
+
+                            bool insideOtherDisk = false;
+                            for (std::size_t j = 0; j < numUniqueDisks; ++j) {
+                                if (j == diskIdx) {
+                                    continue;
+                                }
+                                if (diskIsRoofIntf[j] && !treeCanopyCells.empty()) {
+                                    continue;
+                                }
+                                const float rJ = diskOuterR[j] - cOffset;
+                                const float distIJ = std::hypot(
+                                    d.u - uniqueDisks[j].u,
+                                    d.v - uniqueDisks[j].v);
+                                if (diskIsBedIntf[diskIdx] == diskIsBedIntf[j] &&
+                                    distIJ + rJ <= ringRadius + 0.02f * lineWidthMm) {
+                                    continue;
+                                }
+                                const float sinFactor = std::clamp(
+                                    distIJ / std::max({ringRadius, rJ, 0.1f}),
+                                    0.01f,
+                                    1.0f);
+                                const float seamMargin = 0.08f * lineWidthMm * sinFactor;
+                                const float minAllowedR =
+                                    (diskIsBedIntf[diskIdx] == diskIsBedIntf[j])
+                                        ? (rJ + seamMargin)
+                                        : (diskOuterR[j] + 0.50f * lineWidthMm);
+                                if (minAllowedR <= 0.0f) {
+                                    continue;
+                                }
+                                const float duJ = uPt - uniqueDisks[j].u;
+                                const float dvJ = vPt - uniqueDisks[j].v;
+                                if (duJ * duJ + dvJ * dvJ < minAllowedR * minAllowedR) {
+                                    insideOtherDisk = true;
+                                    break;
+                                }
+                            }
+                            if (insideOtherDisk) {
+                                allValid = false;
+                                if (currentArc.size() >= 2) {
+                                    pushSupportPath(featureKind, false, std::move(currentArc));
+                                }
+                                currentArc.clear();
+                                continue;
+                            }
+
+                            const std::array<float, 3> tangDir{
+                                -sa * tU[0] + ca * tV[0],
+                                -sa * tU[1] + ca * tV[1],
+                                -sa * tU[2] + ca * tV[2]};
+                            auto [ok, tp] =
+                                makeTreePoint(uPt, vPt, tangDir, d.tangentUp, isRoofContactZone);
+                            if (ok) {
+                                currentArc.push_back(tp);
+                            } else {
+                                allValid = false;
+                                if (currentArc.size() >= 2) {
+                                    pushSupportPath(featureKind, false, std::move(currentArc));
+                                }
+                                currentArc.clear();
+                            }
+                        }
+                        if (currentArc.size() >= 2) {
+                            pushSupportPath(featureKind, allValid, std::move(currentArc));
+                        }
+                    };
+
+                    // 1. Emit branch / trunk disks at `hLayer`
+                    for (std::size_t diskIdx = 0; diskIdx < numUniqueDisks; ++diskIdx) {
+                        const auto& d = uniqueDisks[diskIdx];
+                        const bool isBedIntf = diskIsBedIntf[diskIdx];
+                        const bool isRoofIntf = diskIsRoofIntf[diskIdx];
+
+                        if (isBedIntf) {
+                            // Dense flanged bed adhesion floor pad (`feature_kind = 8`), clipped to boolean union
+                            diskEmitted[diskIdx] = true;
+                            const float flangeR = diskOuterR[diskIdx];
+                            for (float rRing = flangeR - 0.5f * lineWidthMm;
+                                 rRing >= 0.45f * lineWidthMm;
+                                 rRing -= interfaceSpacingMm) {
+                                emitRingOnDisk(diskIdx, rRing, 8, false);
+                            }
+                        } else if (isRoofIntf) {
+                            // When `treeCanopyCells` is empty, emit outer framing ring on roof interface;
+                            // when `treeCanopyCells` is populated, Step 2 emits the uniform parallel roof
+                            // interface lines across the entire overhang contact patch without intersecting rings.
+                            if (treeCanopyCells.empty()) {
+                                diskEmitted[diskIdx] = true;
+                                const float outerR =
+                                    std::max(0.5f * lineWidthMm, d.radius - 0.25f * lineWidthMm);
+                                emitRingOnDisk(diskIdx, outerR, 8, true);
+                            }
+                        } else {
+                            // Hollow / ribbed organic tree branch & trunk walls (`feature_kind = 7`)
+                            diskEmitted[diskIdx] = true;
+                            float innerCoreR = d.radius;
+                            for (std::uint32_t w = 0; w < wallCount; ++w) {
+                                const float rWall =
+                                    d.radius - (static_cast<float>(w) + 0.5f) * lineWidthMm;
+                                if (rWall < 0.40f * lineWidthMm) {
+                                    break;
+                                }
+                                emitRingOnDisk(diskIdx, rWall, 7, false);
+                                innerCoreR = rWall - 0.5f * lineWidthMm;
+                            }
+                            // Internal concentric structural bracing & fork diaphragm rings on the
+                            // exact `c_w = (w + 0.5) * lineWidthMm` union level-set offset lattice
+                            // so all branch walls, expanded trunks, and fork junctions belong to a
+                            // single continuous non-intersecting offset family across all layers.
+                            for (float rInner = innerCoreR - 0.5f * lineWidthMm;
+                                 rInner >= 0.45f * lineWidthMm;
+                                 rInner -= lineWidthMm) {
+                                emitRingOnDisk(diskIdx, rInner, 7, false);
+                            }
+                        }
+                    }
+
+                    // 2. Emit Full-Footprint Roof Contact Interface (`feature_kind = 8`) and
+                    //    Canopy Funnel Transition (`feature_kind = 7`) across `treeCanopyCells`
+                    //    so every overhanging region makes complete area contact at `roofH` and
+                    //    tapers smoothly into the cylindrical tree branches below!
+                    if (!treeCanopyCells.empty()) {
+                        struct ActiveCanopyCell {
+                            std::uint8_t kind = 8; // 8 = roof interface, 7 = funnel transition
+                            std::array<float, 3> tangentUp{0.0f, 0.0f, 1.0f};
                         };
+                        std::unordered_map<std::uint64_t, ActiveCanopyCell> layerCanopy;
+                        std::int32_t cMinIU = std::numeric_limits<std::int32_t>::max();
+                        std::int32_t cMaxIU = std::numeric_limits<std::int32_t>::lowest();
+                        std::int32_t cMinIV = std::numeric_limits<std::int32_t>::max();
+                        std::int32_t cMaxIV = std::numeric_limits<std::int32_t>::lowest();
 
-                        for (float innerCoord = innerMin; innerCoord <= innerMax + 1.0e-4f; innerCoord += marchStepMm) {
-                            const float uVal = swapUV ? outerCoord : innerCoord;
-                            const float vVal = swapUV ? innerCoord : outerCoord;
-                            const auto iu = static_cast<std::int32_t>(std::llround(uVal / cellStepMm));
-                            const auto iv = static_cast<std::int32_t>(std::llround(vVal / cellStepMm));
+                        const float maxCanopyDepth = interfaceBandMm + treeCanopyTransitionMm;
+                        for (const auto& cc : treeCanopyCells) {
+                            const float depthFromRoof = cc.roofH - hLayer;
+                            if (depthFromRoof < -0.5f * effectiveStepH ||
+                                depthFromRoof > maxCanopyDepth + 1.0e-4f ||
+                                hLayer < cc.floorH) {
+                                continue;
+                            }
+                            const bool isRoofIntf =
+                                (impl_->supportSpec.interface_layers > 0) &&
+                                (depthFromRoof <= interfaceBandMm + 1.0e-4f);
+                            float uCell = cc.u;
+                            float vCell = cc.v;
+                            std::array<float, 3> tang = uUp;
+                            if (cc.branchIdx < branchToDiskIdx.size() &&
+                                branchToDiskIdx[cc.branchIdx] >= 0) {
+                                const auto& bDisk =
+                                    disks[static_cast<std::size_t>(branchToDiskIdx[cc.branchIdx])];
+                                tang = bDisk.tangentUp;
+                                if (!isRoofIntf && treeCanopyTransitionMm > 1.0e-4f) {
+                                    const float alpha = std::clamp(
+                                        (depthFromRoof - interfaceBandMm) / treeCanopyTransitionMm,
+                                        0.0f,
+                                        1.0f);
+                                    uCell = (1.0f - alpha) * cc.u + alpha * bDisk.u;
+                                    vCell = (1.0f - alpha) * cc.v + alpha * bDisk.v;
+                                }
+                            } else if (!isRoofIntf) {
+                                continue;
+                            }
 
-                            // Check 3x3 neighborhood in supportColumns so scanlines connect smoothly across grid cells
+                            const auto iu = static_cast<std::int32_t>(std::llround(uCell / cellStepMm));
+                            const auto iv = static_cast<std::int32_t>(std::llround(vCell / cellStepMm));
+                            cMinIU = std::min(cMinIU, iu);
+                            cMaxIU = std::max(cMaxIU, iu);
+                            cMinIV = std::min(cMinIV, iv);
+                            cMaxIV = std::max(cMaxIV, iv);
+                            const std::uint64_t key = packCellKey(iu, iv);
+                            const std::uint8_t kKind = isRoofIntf ? 8 : 7;
+                            auto itC = layerCanopy.find(key);
+                            if (itC == layerCanopy.end()) {
+                                layerCanopy.emplace(key, ActiveCanopyCell{kKind, tang});
+                            } else if (kKind == 8) {
+                                itC->second.kind = 8;
+                            }
+                        }
+
+                        if (!layerCanopy.empty()) {
+                            auto emitCanopyGroup = [&](std::uint8_t featureKind,
+                                                       float spacingMm,
+                                                       bool groupSwapUV) {
+                                const float minU = static_cast<float>(cMinIU) * cellStepMm;
+                                const float maxU = static_cast<float>(cMaxIU) * cellStepMm;
+                                const float minV = static_cast<float>(cMinIV) * cellStepMm;
+                                const float maxV = static_cast<float>(cMaxIV) * cellStepMm;
+                                const float outerMin = groupSwapUV ? minU : minV;
+                                const float outerMax = groupSwapUV ? maxU : maxV;
+                                const float innerMin = groupSwapUV ? minV : minU;
+                                const float innerMax = groupSwapUV ? maxV : maxU;
+                                const float marchStepMm =
+                                    std::min({0.5f * cellStepMm, 0.40f, 0.5f * lineWidthMm});
+                                const std::array<float, 3> travelDir = groupSwapUV ? tV : tU;
+
+                                bool zig = false;
+                                for (float outerCoord = outerMin;
+                                     outerCoord <= outerMax + 1.0e-4f;
+                                     outerCoord += spacingMm) {
+                                    std::vector<ToolpathPoint> activeRun;
+                                    auto flushCanopyRun = [&]() {
+                                        if (activeRun.size() >= 2) {
+                                            if (zig) {
+                                                std::reverse(activeRun.begin(), activeRun.end());
+                                            }
+                                            pushSupportPath(featureKind, false, std::move(activeRun));
+                                            zig = !zig;
+                                        }
+                                        activeRun.clear();
+                                    };
+
+                                    for (float innerCoord = innerMin;
+                                         innerCoord <= innerMax + 1.0e-4f;
+                                         innerCoord += marchStepMm) {
+                                        const float uVal = groupSwapUV ? outerCoord : innerCoord;
+                                        const float vVal = groupSwapUV ? innerCoord : outerCoord;
+
+                                        // Never cross inside any branch/trunk disk already emitted in Step 1
+                                        bool insideEmittedDisk = false;
+                                        for (std::size_t j = 0; j < numUniqueDisks; ++j) {
+                                            if (!diskEmitted[j]) {
+                                                continue;
+                                            }
+                                            const float exclR = diskOuterR[j] + 0.55f * lineWidthMm;
+                                            const float duJ = uVal - uniqueDisks[j].u;
+                                            const float dvJ = vVal - uniqueDisks[j].v;
+                                            if (duJ * duJ + dvJ * dvJ < exclR * exclR) {
+                                                insideEmittedDisk = true;
+                                                break;
+                                            }
+                                        }
+                                        if (insideEmittedDisk) {
+                                            flushCanopyRun();
+                                            continue;
+                                        }
+
+                                        const auto iu =
+                                            static_cast<std::int32_t>(std::llround(uVal / cellStepMm));
+                                        const auto iv =
+                                            static_cast<std::int32_t>(std::llround(vVal / cellStepMm));
+
+                                        // Resolve a single unique canopy kind at `(iu, iv)` so orthogonal
+                                        // Support Base (7) and Support Interface (8) scanlines never cross!
+                                        bool any7 = false;
+                                        bool any8 = false;
+                                        std::array<float, 3> cellTang = uUp;
+                                        for (std::int32_t du = -1; du <= 1; ++du) {
+                                            for (std::int32_t dv = -1; dv <= 1; ++dv) {
+                                                auto itC = layerCanopy.find(packCellKey(iu + du, iv + dv));
+                                                if (itC != layerCanopy.end()) {
+                                                    if (itC->second.kind == 8) {
+                                                        any8 = true;
+                                                        cellTang = itC->second.tangentUp;
+                                                    } else if (itC->second.kind == 7) {
+                                                        any7 = true;
+                                                        if (!any8) {
+                                                            cellTang = itC->second.tangentUp;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        bool matched = false;
+                                        if (featureKind == 8) {
+                                            matched = any8;
+                                        } else {
+                                            // Keep Support Base (7) separated from orthogonal Support Interface (8)
+                                            bool near8 = any8;
+                                            if (any7 && !near8) {
+                                                for (std::int32_t du = -2; du <= 2 && !near8; ++du) {
+                                                    for (std::int32_t dv = -2; dv <= 2; ++dv) {
+                                                        auto itC = layerCanopy.find(packCellKey(iu + du, iv + dv));
+                                                        if (itC != layerCanopy.end() && itC->second.kind == 8) {
+                                                            near8 = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            matched = any7 && !near8;
+                                        }
+                                        if (!matched) {
+                                            flushCanopyRun();
+                                            continue;
+                                        }
+                                        auto [ok, tp] = makeTreePoint(
+                                            uVal,
+                                            vVal,
+                                            travelDir,
+                                            cellTang,
+                                            featureKind == 8);
+                                        if (!ok) {
+                                            flushCanopyRun();
+                                            continue;
+                                        }
+                                        activeRun.push_back(tp);
+                                    }
+                                    flushCanopyRun();
+                                }
+                            };
+
+                            emitCanopyGroup(7, baseSpacingMm, swapUV);
+                            if (impl_->supportSpec.interface_layers > 0) {
+                                emitCanopyGroup(8, interfaceSpacingMm, !swapUV);
+                            }
+                        }
+                    }
+                } else {
+                    // =====================================================================
+                    // Emit Classic Columnar Grid Scanline Supports at `hLayer`
+                    // =====================================================================
+                    auto emitScanlineSupportGroup = [&](std::uint8_t featureKind, float spacingMm, bool swapUV) {
+                        const float minU = static_cast<float>(minIU) * cellStepMm;
+                        const float maxU = static_cast<float>(maxIU) * cellStepMm;
+                        const float minV = static_cast<float>(minIV) * cellStepMm;
+                        const float maxV = static_cast<float>(maxIV) * cellStepMm;
+
+                        const float outerMin = swapUV ? minU : minV;
+                        const float outerMax = swapUV ? maxU : maxV;
+                        const float innerMin = swapUV ? minV : minU;
+                        const float innerMax = swapUV ? maxV : maxU;
+                        const float marchStepMm =
+                            std::min({0.5f * cellStepMm, 0.40f, 0.5f * lineWidthMm});
+                        const float bboxMarginMm = 2.0f * cellStepMm;
+
+                        auto isCellValidForKind = [&](float uSample,
+                                                      float vSample,
+                                                      bool& outRoofContact) -> bool {
+                            const auto iu = static_cast<std::int32_t>(std::llround(uSample / cellStepMm));
+                            const auto iv = static_cast<std::int32_t>(std::llround(vSample / cellStepMm));
                             bool inColumn = false;
                             bool isInterface = false;
+                            outRoofContact = false;
                             for (std::int32_t du = -1; du <= 1; ++du) {
                                 for (std::int32_t dv = -1; dv <= 1; ++dv) {
                                     auto itCol = supportColumns.find(packCellKey(iu + du, iv + dv));
                                     if (itCol != supportColumns.end()) {
                                         const auto& col = itCol->second;
-                                        if (hLayer >= col.floorH && hLayer <= col.roofH) {
+                                        if (hLayer >= col.floorH && hLayer <= col.roofH + 0.5f * effectiveStepH) {
                                             inColumn = true;
                                             const bool isRoofIntf =
                                                 (impl_->supportSpec.interface_layers > 0) &&
@@ -5478,6 +7168,9 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                                 (col.floorH <= 1.0e-3f) &&
                                                 (bedLayerOrdinal < impl_->supportSpec.bed_interface_layers ||
                                                  (hLayer - col.floorH) <= bedInterfaceBandMm + 1.0e-4f);
+                                            if (isRoofIntf) {
+                                                outRoofContact = true;
+                                            }
                                             if (isRoofIntf || isBedIntf) {
                                                 isInterface = true;
                                             }
@@ -5485,56 +7178,174 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                     }
                                 }
                             }
-
+                            if (featureKind == 7 && inColumn && !isInterface) {
+                                for (std::int32_t du = -2; du <= 2 && !isInterface; ++du) {
+                                    for (std::int32_t dv = -2; dv <= 2; ++dv) {
+                                        auto itCol = supportColumns.find(packCellKey(iu + du, iv + dv));
+                                        if (itCol != supportColumns.end()) {
+                                            const auto& col = itCol->second;
+                                            if (hLayer >= col.floorH && hLayer <= col.roofH + 0.5f * effectiveStepH) {
+                                                const bool isRoofIntf =
+                                                    (impl_->supportSpec.interface_layers > 0) &&
+                                                    (col.roofH - hLayer <= interfaceBandMm + 1.0e-4f);
+                                                const bool isBedIntf =
+                                                    (impl_->supportSpec.bed_interface_layers > 0) &&
+                                                    (col.floorH <= 1.0e-3f) &&
+                                                    (bedLayerOrdinal < impl_->supportSpec.bed_interface_layers ||
+                                                     (hLayer - col.floorH) <= bedInterfaceBandMm + 1.0e-4f);
+                                                if (isRoofIntf || isBedIntf) {
+                                                    isInterface = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             const std::uint8_t wantedKind = isInterface ? 8 : 7;
-                            if (!inColumn || wantedKind != featureKind) {
-                                flushRun();
-                                continue;
+                            return inColumn && (wantedKind == featureKind);
+                        };
+
+                        bool zig = false;
+                        float prevRunOuterCoord = -1.0e9f;
+                        for (float outerCoord = outerMin; outerCoord <= outerMax + 1.0e-4f; outerCoord += spacingMm) {
+                            std::vector<ToolpathPoint> activeRun;
+
+                            auto flushRun = [&]() {
+                                if (activeRun.size() < 2) {
+                                    activeRun.clear();
+                                    return;
+                                }
+                                float lenMm = 0.0f;
+                                for (std::size_t k = 1; k < activeRun.size(); ++k) {
+                                    const float dxSeg = activeRun[k].x - activeRun[k - 1].x;
+                                    const float dySeg = activeRun[k].y - activeRun[k - 1].y;
+                                    const float dzSeg = activeRun[k].z - activeRun[k - 1].z;
+                                    lenMm += std::sqrt(dxSeg * dxSeg + dySeg * dySeg + dzSeg * dzSeg);
+                                }
+                                if (lenMm >= minSegLenMm) {
+                                    if (zig) {
+                                        std::reverse(activeRun.begin(), activeRun.end());
+                                    }
+                                    bool chainedToPrev = false;
+                                    // Never chain two broken halves of the SAME scanline (`outerCoord == prevRunOuterCoord`)
+                                    // across an obstacle or interface patch! Only chain adjacent scanlines
+                                    // (`std::abs(outerCoord - prevRunOuterCoord) >= 0.8f * spacingMm`) when the turn
+                                    // midpoint also belongs to the same support feature kind.
+                                    if (!supportPathsForLayer.empty() &&
+                                        supportPathsForLayer.back().feature_kind == featureKind &&
+                                        !supportPathsForLayer.back().points.empty() &&
+                                        std::abs(outerCoord - prevRunOuterCoord) >= 0.8f * spacingMm &&
+                                        std::abs(outerCoord - prevRunOuterCoord) <= 1.25f * spacingMm) {
+                                        const ToolpathPoint& prevEnd = supportPathsForLayer.back().points.back();
+                                        const ToolpathPoint& currStart = activeRun.front();
+                                        const float tx = currStart.x - prevEnd.x;
+                                        const float ty = currStart.y - prevEnd.y;
+                                        const float tz = currStart.z - prevEnd.z;
+                                        const float turnDist = std::sqrt(tx * tx + ty * ty + tz * tz);
+                                        if (turnDist <= 1.35f * spacingMm) {
+                                            const std::array<float, 3> midBed{
+                                                0.5f * (prevEnd.x + currStart.x),
+                                                0.5f * (prevEnd.y + currStart.y),
+                                                0.5f * (prevEnd.z + currStart.z)};
+                                            const float relMidX = midBed[0] - pOrigin[0];
+                                            const float relMidY = midBed[1] - pOrigin[1];
+                                            const float relMidZ = midBed[2] - pOrigin[2];
+                                            const float uMid = relMidX * tU[0] + relMidY * tU[1] + relMidZ * tU[2];
+                                            const float vMid = relMidX * tV[0] + relMidY * tV[1] + relMidZ * tV[2];
+                                            bool midRoofContact = false;
+                                            const openvdb::Vec3d midPt(midBed[0], midBed[1], midBed[2]);
+                                            const float minTurnClear =
+                                                (featureKind == 8)
+                                                    ? std::min(0.75f * zGapMm, xyGapMm)
+                                                    : (xyGapMm + 0.5f * lineWidthMm);
+                                            if (isCellValidForKind(uMid, vMid, midRoofContact) &&
+                                                samplePartSdf(midPt) >= minTurnClear &&
+                                                hasObjectExtrusionClearance(
+                                                    midBed,
+                                                    0.5f * lineWidthMm,
+                                                    0.5f * localLayerH,
+                                                    featureKind == 8)) {
+                                                auto& prevPath = supportPathsForLayer.back();
+                                                for (const auto& pt : activeRun) {
+                                                    prevPath.points.push_back(pt);
+                                                }
+                                                prevPath.total_length_mm += turnDist + lenMm;
+                                                chainedToPrev = true;
+                                            }
+                                        }
+                                    }
+                                    if (!chainedToPrev) {
+                                        ExtrusionPath ep{};
+                                        ep.feature_kind = featureKind;
+                                        ep.wall_index = supportPassIdx++;
+                                        ep.is_closed = false;
+                                        ep.total_length_mm = lenMm;
+                                        ep.mean_width_mm = lineWidthMm;
+                                        ep.points.reserve(activeRun.size());
+                                        for (const auto& pt : activeRun) {
+                                            ep.points.push_back(pt);
+                                        }
+                                        supportPathsForLayer.push_back(std::move(ep));
+                                        if (featureKind == 7) {
+                                            ++res.support_count;
+                                        } else {
+                                            ++res.support_interface_count;
+                                        }
+                                        ++res.total_path_count;
+                                    }
+                                    prevRunOuterCoord = outerCoord;
+                                    zig = !zig;
+                                }
+                                activeRun.clear();
+                            };
+
+                            for (float innerCoord = innerMin; innerCoord <= innerMax + 1.0e-4f; innerCoord += marchStepMm) {
+                                const float uVal = swapUV ? outerCoord : innerCoord;
+                                const float vVal = swapUV ? innerCoord : outerCoord;
+                                bool isRoofContact = false;
+                                if (!isCellValidForKind(uVal, vVal, isRoofContact)) {
+                                    flushRun();
+                                    continue;
+                                }
+
+                                const std::array<float, 3> pBed = uvHToBed(uVal, vVal, hLayer);
+
+                                if (pBed[0] < rec.minX - bboxMarginMm || pBed[0] > rec.maxX + bboxMarginMm ||
+                                    pBed[1] < rec.minY - bboxMarginMm || pBed[1] > rec.maxY + bboxMarginMm ||
+                                    pBed[2] < rec.minZ - 1.0e-3f || pBed[2] > rec.maxZ + bboxMarginMm) {
+                                    flushRun();
+                                    continue;
+                                }
+
+                                if (!hasSupportClearanceAtUVH(uVal, vVal, hLayer, 0.0f, isRoofContact)) {
+                                    flushRun();
+                                    continue;
+                                }
+
+                                const std::array<float, 3> travelDir = swapUV ? tV : tU;
+                                const NozzleBasis nb = queryNozzleFrame(pBed, travelDir);
+                                ToolpathPoint tp{};
+                                tp.x = pBed[0];
+                                tp.y = pBed[1];
+                                tp.z = pBed[2];
+                                tp.nx = nb.nozzle_axis[0];
+                                tp.ny = nb.nozzle_axis[1];
+                                tp.nz = nb.nozzle_axis[2];
+                                tp.width_mm = lineWidthMm;
+                                tp.height_mm = localLayerH;
+                                activeRun.push_back(tp);
                             }
-
-                            const float worldH = hLayer + minObjH;
-                            const std::array<float, 3> pBed{
-                                pOrigin[0] + uVal * tU[0] + vVal * tV[0] + worldH * uUp[0],
-                                pOrigin[1] + uVal * tU[1] + vVal * tV[1] + worldH * uUp[1],
-                                pOrigin[2] + uVal * tU[2] + vVal * tV[2] + worldH * uUp[2]};
-
-                            // Keep support points within the dilated object bounding box
-                            if (pBed[0] < rec.minX - bboxMarginMm || pBed[0] > rec.maxX + bboxMarginMm ||
-                                pBed[1] < rec.minY - bboxMarginMm || pBed[1] > rec.maxY + bboxMarginMm ||
-                                pBed[2] < rec.minZ - 1.0e-3f || pBed[2] > rec.maxZ + bboxMarginMm) {
-                                flushRun();
-                                continue;
-                            }
-
-                            // Enforce XY clearance (`xyGapMm`) from the object boundary
-                            const float sHere = samplePartSdf(openvdb::Vec3d(pBed[0], pBed[1], pBed[2]));
-                            if (sHere < xyGapMm) {
-                                flushRun();
-                                continue;
-                            }
-
-                            const std::array<float, 3> travelDir = swapUV ? tV : tU;
-                            const NozzleBasis nb = queryNozzleFrame(pBed, travelDir);
-                            ToolpathPoint tp{};
-                            tp.x = pBed[0];
-                            tp.y = pBed[1];
-                            tp.z = pBed[2];
-                            tp.nx = nb.nozzle_axis[0];
-                            tp.ny = nb.nozzle_axis[1];
-                            tp.nz = nb.nozzle_axis[2];
-                            tp.width_mm = lineWidthMm;
-                            tp.height_mm = localLayerH;
-                            activeRun.push_back(tp);
+                            flushRun();
                         }
-                        flushRun();
-                    }
-                };
+                    };
 
-                const bool alternateDir = ((layerIdx % 2) == 1);
-                emitScanlineSupportGroup(7, baseSpacingMm, alternateDir);
-                if (impl_->supportSpec.interface_layers > 0 ||
-                    impl_->supportSpec.bed_interface_layers > 0) {
-                    emitScanlineSupportGroup(8, interfaceSpacingMm, !alternateDir);
+                    const bool alternateDir = ((layerIdx % 2) == 1);
+                    emitScanlineSupportGroup(7, baseSpacingMm, alternateDir);
+                    if (impl_->supportSpec.interface_layers > 0 ||
+                        impl_->supportSpec.bed_interface_layers > 0) {
+                        emitScanlineSupportGroup(8, interfaceSpacingMm, !alternateDir);
+                    }
                 }
 
                 if (!supportPathsForLayer.empty()) {

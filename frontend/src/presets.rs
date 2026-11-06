@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     BedShape, ClearancePointXZ, ClearanceProfileMode, LayerHeightConfig, LineWidthConfig,
-    OrderFieldMode, SlicerConfig, SolidInfillPattern, SparseInfillPattern, ToolConfig,
-    WallPrintOrder,
+    OrderFieldMode, SlicerConfig, SolidInfillPattern, SparseInfillPattern, SupportStyle,
+    ToolConfig, WallPrintOrder,
 };
 
 /// Top-level tab in the left workspace panel (`Project Setup` vs. `Configuration`).
@@ -646,6 +646,9 @@ pub struct ProcessPreset {
 
     // Supports (Unreachable Order-Field Regions & Long Bridges)
     pub enable_support_generation: bool,
+    pub support_tool_index: Option<usize>,
+    pub support_style: SupportStyle,
+    pub support_on_bed_only: bool,
     pub seed_order_field_from_supports: bool,
     pub support_only_unreachable_and_bridges: bool,
     pub support_z_gap_mm: f32,
@@ -655,6 +658,10 @@ pub struct ProcessPreset {
     pub support_base_spacing_mm: f32,
     pub support_interface_spacing_mm: f32,
     pub support_line_width_mm: f32,
+    pub tree_branch_angle_deg: f32,
+    pub tree_tip_diameter_mm: f32,
+    pub tree_trunk_max_diameter_mm: f32,
+    pub tree_branch_wall_count: u32,
 
     // 3D Conformal Scarf Seam
     pub enable_scarf_joint: bool,
@@ -724,6 +731,9 @@ impl ProcessPreset {
             max_bridge_length_mm: cfg.slicing.max_bridge_length_mm,
             wave_overhang_overlap_fraction: cfg.slicing.wave_overhang_overlap_fraction,
             enable_support_generation: cfg.slicing.enable_support_generation,
+            support_tool_index: cfg.slicing.support_tool_index,
+            support_style: cfg.slicing.support_style,
+            support_on_bed_only: cfg.slicing.support_on_bed_only,
             seed_order_field_from_supports: cfg.slicing.seed_order_field_from_supports,
             support_only_unreachable_and_bridges: cfg.slicing.support_only_unreachable_and_bridges,
             support_z_gap_mm: cfg.slicing.support_z_gap_mm,
@@ -733,6 +743,10 @@ impl ProcessPreset {
             support_base_spacing_mm: cfg.slicing.support_base_spacing_mm,
             support_interface_spacing_mm: cfg.slicing.support_interface_spacing_mm,
             support_line_width_mm: cfg.slicing.support_line_width_mm,
+            tree_branch_angle_deg: cfg.slicing.tree_branch_angle_deg,
+            tree_tip_diameter_mm: cfg.slicing.tree_tip_diameter_mm,
+            tree_trunk_max_diameter_mm: cfg.slicing.tree_trunk_max_diameter_mm,
+            tree_branch_wall_count: cfg.slicing.tree_branch_wall_count,
             enable_scarf_joint: cfg.gcode.enable_scarf_joint,
             scarf_length_mm: cfg.gcode.scarf_length_mm,
             scarf_start_height_ratio: cfg.gcode.scarf_start_height_ratio,
@@ -787,6 +801,9 @@ impl ProcessPreset {
         cfg.slicing.max_bridge_length_mm = self.max_bridge_length_mm;
         cfg.slicing.wave_overhang_overlap_fraction = self.wave_overhang_overlap_fraction;
         cfg.slicing.enable_support_generation = self.enable_support_generation;
+        cfg.slicing.support_tool_index = self.support_tool_index;
+        cfg.slicing.support_style = self.support_style;
+        cfg.slicing.support_on_bed_only = self.support_on_bed_only;
         cfg.slicing.seed_order_field_from_supports = self.seed_order_field_from_supports;
         cfg.slicing.support_only_unreachable_and_bridges =
             self.support_only_unreachable_and_bridges;
@@ -797,6 +814,10 @@ impl ProcessPreset {
         cfg.slicing.support_base_spacing_mm = self.support_base_spacing_mm;
         cfg.slicing.support_interface_spacing_mm = self.support_interface_spacing_mm;
         cfg.slicing.support_line_width_mm = self.support_line_width_mm;
+        cfg.slicing.tree_branch_angle_deg = self.tree_branch_angle_deg;
+        cfg.slicing.tree_tip_diameter_mm = self.tree_tip_diameter_mm;
+        cfg.slicing.tree_trunk_max_diameter_mm = self.tree_trunk_max_diameter_mm;
+        cfg.slicing.tree_branch_wall_count = self.tree_branch_wall_count;
 
         cfg.gcode.enable_scarf_joint = self.enable_scarf_joint;
         cfg.gcode.scarf_length_mm = self.scarf_length_mm;
@@ -893,6 +914,9 @@ impl ProcessPreset {
                 cfg.slicing.wave_overhang_overlap_fraction,
             )
             && self.enable_support_generation == cfg.slicing.enable_support_generation
+            && self.support_tool_index == cfg.slicing.support_tool_index
+            && self.support_style == cfg.slicing.support_style
+            && self.support_on_bed_only == cfg.slicing.support_on_bed_only
             && self.seed_order_field_from_supports == cfg.slicing.seed_order_field_from_supports
             && self.support_only_unreachable_and_bridges
                 == cfg.slicing.support_only_unreachable_and_bridges
@@ -912,6 +936,19 @@ impl ProcessPreset {
                 self.support_line_width_mm,
                 cfg.slicing.support_line_width_mm,
             )
+            && approx_eq(
+                self.tree_branch_angle_deg,
+                cfg.slicing.tree_branch_angle_deg,
+            )
+            && approx_eq(
+                self.tree_tip_diameter_mm,
+                cfg.slicing.tree_tip_diameter_mm,
+            )
+            && approx_eq(
+                self.tree_trunk_max_diameter_mm,
+                cfg.slicing.tree_trunk_max_diameter_mm,
+            )
+            && self.tree_branch_wall_count == cfg.slicing.tree_branch_wall_count
             && self.enable_scarf_joint == cfg.gcode.enable_scarf_joint
             && approx_eq(self.scarf_length_mm, cfg.gcode.scarf_length_mm)
             && approx_eq(
@@ -1157,7 +1194,15 @@ impl PresetLibrary {
         );
         pr_planar.order_field_mode = OrderFieldMode::HeightOnlyPlanar;
 
-        vec![pr_std, pr_fine, pr_draft, pr_planar]
+        let mut pr_tree = ProcessPreset::from_config(
+            "0.20mm Non-Planar Tree Support (Bed Only)",
+            &base_cfg,
+            true,
+        );
+        pr_tree.support_style = SupportStyle::NonPlanarTree;
+        pr_tree.support_on_bed_only = true;
+
+        vec![pr_std, pr_fine, pr_draft, pr_planar, pr_tree]
     }
 
     pub fn presets_root_dir() -> Option<PathBuf> {

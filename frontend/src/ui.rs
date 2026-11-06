@@ -7,8 +7,8 @@ use bevy_egui::{egui, EguiContexts};
 use crate::bridge::ffi;
 use crate::config::{
     lookup_parameter_doc, BedShape, ClearancePointXZ, ClearanceProfileMode, OrderFieldMode,
-    PointNormalHint, SlicerConfig, SolidInfillPattern, SparseInfillPattern, SurfaceHintMode,
-    ToolConfig, WallPrintOrder,
+    PointNormalHint, SlicerConfig, SolidInfillPattern, SparseInfillPattern, SupportStyle,
+    SurfaceHintMode, ToolConfig, WallPrintOrder,
 };
 use crate::field_vis::{
     high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
@@ -4419,6 +4419,190 @@ fn render_process_config_tab(
 
         if config.slicing.enable_support_generation {
             ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Support Tool:").strong());
+                let selected_support_label = match config.slicing.support_tool_index {
+                    None => {
+                        let obj_tool_lbl = config
+                            .active_tool()
+                            .map(|t| format!("Active Tool ({})", t.name))
+                            .unwrap_or_else(|| "Active Object Tool".to_string());
+                        obj_tool_lbl
+                    }
+                    Some(idx) => config
+                        .tools
+                        .get(idx)
+                        .map(|t| format!("{} ({:.2}mm, {:.0}°C)", t.name, t.nozzle_diameter_mm, t.temperature_celsius))
+                        .unwrap_or_else(|| format!("Tool #{idx}")),
+                };
+                egui::ComboBox::from_id_source("support_tool_selector_combo")
+                    .selected_text(selected_support_label)
+                    .width(210.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(
+                                &mut config.slicing.support_tool_index,
+                                None,
+                                "Active Object Tool (Same Material)",
+                            )
+                            .changed()
+                        {
+                            tp_cfg_changed = true;
+                        }
+                        for (idx, tool) in config.tools.iter().enumerate() {
+                            let lbl = format!(
+                                "{} ({:.2}mm, {:.0}°C)",
+                                tool.name, tool.nozzle_diameter_mm, tool.temperature_celsius
+                            );
+                            if ui
+                                .selectable_value(
+                                    &mut config.slicing.support_tool_index,
+                                    Some(idx),
+                                    lbl,
+                                )
+                                .changed()
+                            {
+                                config.slicing.support_line_width_mm = tool.nozzle_diameter_mm;
+                                tp_cfg_changed = true;
+                            }
+                        }
+                    });
+                if ui
+                    .small_button("+ Tool")
+                    .on_hover_text("Add a dedicated support tool/extruder to the Multi-Tool Registry")
+                    .clicked()
+                {
+                    let next_id = config.tools.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+                    let new_name = format!("T{next_id} - Support Material");
+                    config.tools.push(ToolConfig::standard_tool(
+                        next_id,
+                        new_name,
+                        active_nozzle_mm,
+                        215.0,
+                    ));
+                    config.slicing.support_tool_index = Some(config.tools.len() - 1);
+                    tp_cfg_changed = true;
+                }
+                param_help_button(ui, "slicing.support_tool_index");
+            });
+
+            if let Some(sup_idx) = config.slicing.support_tool_index {
+                if let Some(sup_tool) = config.tools.get_mut(sup_idx) {
+                    ui.horizontal(|ui| {
+                        ui.small(egui::RichText::new(format!("T{} Support Material:", sup_tool.id)).strong());
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut sup_tool.nozzle_diameter_mm)
+                                    .speed(0.02)
+                                    .range(0.15..=2.0)
+                                    .prefix("Nozzle: ")
+                                    .suffix(" mm"),
+                            )
+                            .changed()
+                        {
+                            tp_cfg_changed = true;
+                        }
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut sup_tool.temperature_celsius)
+                                    .speed(1.0)
+                                    .range(150.0..=350.0)
+                                    .prefix("Temp: ")
+                                    .suffix(" °C"),
+                            )
+                            .changed()
+                        {
+                            vis_state.dirty_planned_gcode = true;
+                        }
+                    });
+                }
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Support Style:").strong());
+                for style in SupportStyle::ALL {
+                    let selected = config.slicing.support_style == style;
+                    if render_delineated_pill_tab(ui, selected, style.label())
+                        .on_hover_text(match style {
+                            SupportStyle::ColumnarGrid => {
+                                "Classic gravity-aligned rectilinear scanline columns."
+                            }
+                            SupportStyle::NonPlanarTree => {
+                                "Organic coalescing tree branches that steer around the part's 3D SDF φ_sdf(x) along gravity, merge into hollow/ribbed trunks, and orient nozzle beads along the 3D branch tangent."
+                            }
+                        })
+                        .clicked()
+                        && !selected
+                    {
+                        config.slicing.support_style = style;
+                        tp_cfg_changed = true;
+                    }
+                }
+                param_help_button(ui, "slicing.support_style");
+            });
+
+            ui.horizontal(|ui| {
+                tp_cfg_changed |= ui
+                    .checkbox(
+                        &mut config.slicing.support_on_bed_only,
+                        "On Build Plate Only (Avoid Upper Part Surfaces)",
+                    )
+                    .on_hover_text(
+                        "Prevents supports from resting on top of upper model surfaces. In Non-Planar Tree mode, branches above the model steer laterally around the part's 3D SDF φ_sdf(x) to anchor exclusively on the build plate.",
+                    )
+                    .changed();
+                param_help_button(ui, "slicing.support_on_bed_only");
+            });
+
+            if config.slicing.support_style == SupportStyle::NonPlanarTree {
+                ui.horizontal(|ui| {
+                    tp_cfg_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut config.slicing.tree_branch_angle_deg)
+                                .speed(0.5)
+                                .range(15.0..=65.0)
+                                .prefix("Branch Angle: ")
+                                .suffix("°"),
+                        )
+                        .on_hover_text(
+                            "Maximum lateral lean angle of tree branches relative to anti-gravity (-g_bed) when routing around the model and coalescing into trunks.",
+                        )
+                        .changed();
+                    tp_cfg_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut config.slicing.tree_branch_wall_count)
+                                .speed(0.1)
+                                .range(1..=4)
+                                .prefix("Walls: "),
+                        )
+                        .on_hover_text(
+                            "Number of concentric perimeter walls per hollow tree branch/trunk.",
+                        )
+                        .changed();
+                    param_help_button(ui, "slicing.tree_support_params");
+                });
+                ui.horizontal(|ui| {
+                    tp_cfg_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut config.slicing.tree_tip_diameter_mm)
+                                .speed(0.05)
+                                .range(0.8..=8.0)
+                                .prefix("Tip Ø: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                    tp_cfg_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut config.slicing.tree_trunk_max_diameter_mm)
+                                .speed(0.1)
+                                .range(2.0..=30.0)
+                                .prefix("Max Trunk Ø: ")
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                });
+            }
+
+            ui.horizontal(|ui| {
                 tp_cfg_changed |= ui
                     .add(
                         egui::DragValue::new(&mut config.slicing.support_z_gap_mm)
@@ -4455,14 +4639,14 @@ fn render_process_config_tab(
                     .add(
                         egui::DragValue::new(&mut config.slicing.support_bed_interface_layers)
                             .speed(0.1)
-                            .range(0..=10)
-                            .prefix("Bed Intf Layers: "),
+                            .range(0..=8)
+                            .prefix("Bed Floor Layers: "),
                     )
                     .on_hover_text(
-                        "Number of dense support interface layers printed on the build plate at the base of support columns for strong bed adhesion.",
+                        "Number of dense bottom support floor layers printed directly on the build plate for bed adhesion (0 = disabled).",
                     )
                     .changed();
-                param_help_button(ui, "slicing.support_bed_interface_layers");
+                param_help_button(ui, "slicing.support_interface_layers");
             });
             ui.horizontal(|ui| {
                 tp_cfg_changed |= ui
@@ -4477,13 +4661,26 @@ fn render_process_config_tab(
                 tp_cfg_changed |= ui
                     .add(
                         egui::DragValue::new(&mut config.slicing.support_interface_spacing_mm)
-                            .speed(0.02)
-                            .range(0.3..=4.0)
-                            .prefix("Intf Spacing: ")
+                            .speed(0.01)
+                            .range(0.0..=4.0)
+                            .prefix("Intf Gap: ")
                             .suffix(" mm"),
                     )
+                    .on_hover_text(
+                        "Edge-to-edge gap between adjacent support interface extrusions (0.0 mm = solid 100% touching roof/floor interface).",
+                    )
                     .changed();
-                param_help_button(ui, "slicing.support_density");
+                tp_cfg_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.slicing.support_line_width_mm)
+                            .speed(0.01)
+                            .range(0.15..=2.0)
+                            .prefix("Width: ")
+                            .suffix(" mm"),
+                    )
+                    .on_hover_text("Extrusion line width for support structures.")
+                    .changed();
+                param_help_button(ui, "slicing.support_interface_spacing_mm");
             });
         }
 
@@ -5395,6 +5592,13 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
     });
     ffi::set_support_spec(ffi::SupportSpec {
         enabled: config.slicing.enable_support_generation,
+        support_tool_index: config
+            .slicing
+            .support_tool_index
+            .map(|idx| idx as i32)
+            .unwrap_or(-1),
+        support_style: config.slicing.support_style.as_u8(),
+        on_bed_only: config.slicing.support_on_bed_only,
         seed_order_field: config.slicing.seed_order_field_from_supports,
         only_unreachable_and_long_bridges: config.slicing.support_only_unreachable_and_bridges,
         max_bridge_length_mm: config.slicing.max_bridge_length_mm,
@@ -5405,6 +5609,10 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         base_spacing_mm: config.slicing.support_base_spacing_mm,
         interface_spacing_mm: config.slicing.support_interface_spacing_mm,
         line_width_mm: config.slicing.support_line_width_mm,
+        tree_branch_angle_deg: config.slicing.tree_branch_angle_deg,
+        tree_tip_diameter_mm: config.slicing.tree_tip_diameter_mm,
+        tree_trunk_max_diameter_mm: config.slicing.tree_trunk_max_diameter_mm,
+        tree_branch_wall_count: config.slicing.tree_branch_wall_count,
     });
 }
 

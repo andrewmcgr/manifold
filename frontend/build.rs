@@ -55,11 +55,18 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=src/bridge.rs");
-    println!("cargo:rerun-if-changed=../backend/include/slicer_backend.h");
-    println!("cargo:rerun-if-changed=../backend/include/eikonal_solver.h");
-    println!("cargo:rerun-if-changed=../backend/include/path_generator.h");
-    println!("cargo:rerun-if-changed=../backend/src/slicer_backend.cpp");
-    println!("cargo:rerun-if-changed=../backend/src/eikonal_solver.cpp");
-    println!("cargo:rerun-if-changed=../backend/src/path_generator.cpp");
-    println!("cargo:rerun-if-changed=../backend/CMakeLists.txt");
+    for rel in [
+        "include/slicer_backend.h",
+        "include/eikonal_solver.h",
+        "include/path_generator.h",
+        "src/slicer_backend.cpp",
+        "src/eikonal_solver.cpp",
+        "src/path_generator.cpp",
+        "CMakeLists.txt",
+    ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            backend_dir.join(rel).display()
+        );
+    }
 }
