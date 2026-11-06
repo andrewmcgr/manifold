@@ -1133,6 +1133,7 @@ fn finalize_calibration_gcode_result(
     let mut emitted_fan_pwm: Option<u8> = None;
     let mut last_emitted_kind: Option<PlannedMoveKind> = None;
     let mut active_retract_mm = 0.0f32;
+    let mut e_rounding_residual_mm = 0.0f64;
 
     for (layer_ord, layer) in planned_layers.iter().enumerate() {
         if layer.segments.is_empty() {
@@ -1155,7 +1156,7 @@ fn finalize_calibration_gcode_result(
         };
 
         gcode.push_str(&format!(
-            "\n; --- LAYER {} (Iso {:.3}) ---\n;LAYER_CHANGE\n;Z:{:.3}\n;HEIGHT:{:.3}\n",
+            "\n; --- LAYER {} (Iso {:.4}) ---\n;LAYER_CHANGE\n;Z:{:.4}\n;HEIGHT:{:.4}\n",
             layer.layer_index, layer.isovalue, layer_max_z, layer_mean_h
         ));
         if gcfg.emit_exclude_object {
@@ -1186,7 +1187,7 @@ fn finalize_calibration_gcode_result(
             if seg.retract_before_mm > 1.0e-4 && active_retract_mm <= 1.0e-4 {
                 let r_len = seg.retract_before_mm;
                 let r_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
-                gcode.push_str(&format!("G1 E-{r_len:.5} F{r_feed:.0} ; Retract\n"));
+                gcode.push_str(&format!("G1 E-{r_len:.6} F{r_feed:.1} ; Retract\n"));
                 active_retract_mm = r_len;
                 emitted_feed_mm_min = r_feed;
                 retract_count += 1;
@@ -1196,7 +1197,7 @@ fn finalize_calibration_gcode_result(
             if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 && active_retract_mm > 1.0e-4 {
                 let u_len = active_retract_mm;
                 let u_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
-                gcode.push_str(&format!("G1 E{u_len:.5} F{u_feed:.0} ; Unretract\n"));
+                gcode.push_str(&format!("G1 E{u_len:.6} F{u_feed:.1} ; Unretract\n"));
                 active_retract_mm = 0.0;
                 emitted_feed_mm_min = u_feed;
                 total_time_s += u_len / gcfg.retract_speed_mms.max(1.0);
@@ -1239,17 +1240,21 @@ fn finalize_calibration_gcode_result(
                 max_h = max_h.max(seg.height_mm);
 
                 let pa_tol = if force_emit_pa_every_change {
-                    1.0e-4
+                    1.0e-5
                 } else {
                     0.002
                 };
                 if emitted_pa < 0.0 || (seg.pressure_advance_s - emitted_pa).abs() >= pa_tol {
                     gcode.push_str(&format!(
-                        "SET_PRESSURE_ADVANCE ADVANCE={:.4}\n",
+                        "SET_PRESSURE_ADVANCE ADVANCE={:.5}\n",
                         seg.pressure_advance_s
                     ));
                     emitted_pa = seg.pressure_advance_s;
                 }
+
+                let e_desired = (seg.delta_e_mm as f64) + e_rounding_residual_mm;
+                let e_emitted = ((e_desired * 1_000_000.0).round() * 1.0e-6).max(0.0);
+                e_rounding_residual_mm = e_desired - e_emitted;
 
                 let feed_mm_min = (seg.cruise_speed_mms * 60.0).max(30.0);
                 if kind_changed
@@ -1257,21 +1262,21 @@ fn finalize_calibration_gcode_result(
                     || (feed_mm_min - emitted_feed_mm_min).abs() >= 6.0
                 {
                     gcode.push_str(&format!(
-                        "G1 X{:.3} Y{:.3} Z{:.3} E{:.5} F{:.0}\n",
-                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, seg.delta_e_mm, feed_mm_min
+                        "G1 X{:.4} Y{:.4} Z{:.4} E{:.6} F{:.1}\n",
+                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, e_emitted, feed_mm_min
                     ));
                     emitted_feed_mm_min = feed_mm_min;
                 } else {
                     gcode.push_str(&format!(
-                        "G1 X{:.3} Y{:.3} Z{:.3} E{:.5}\n",
-                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, seg.delta_e_mm
+                        "G1 X{:.4} Y{:.4} Z{:.4} E{:.6}\n",
+                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, e_emitted
                     ));
                 }
             } else {
                 travel_move_count += 1;
                 let feed_mm_min = (seg.cruise_speed_mms * 60.0).max(60.0);
                 gcode.push_str(&format!(
-                    "G0 X{:.3} Y{:.3} Z{:.3} F{:.0}\n",
+                    "G0 X{:.4} Y{:.4} Z{:.4} F{:.1}\n",
                     seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, feed_mm_min
                 ));
                 emitted_feed_mm_min = feed_mm_min;

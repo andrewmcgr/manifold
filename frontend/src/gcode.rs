@@ -1442,11 +1442,11 @@ pub fn format_exclude_object_define(name: &str, center: [f32; 2], polygon: &[[f3
         if i > 0 {
             poly_json.push(',');
         }
-        poly_json.push_str(&format!("[{:.3},{:.3}]", pt[0], pt[1]));
+        poly_json.push_str(&format!("[{:.4},{:.4}]", pt[0], pt[1]));
     }
     poly_json.push(']');
     format!(
-        "EXCLUDE_OBJECT_DEFINE NAME={} CENTER={:.3},{:.3} POLYGON={}",
+        "EXCLUDE_OBJECT_DEFINE NAME={} CENTER={:.4},{:.4} POLYGON={}",
         name, center[0], center[1], poly_json
     )
 }
@@ -1815,9 +1815,9 @@ fn format_moonraker_metadata_footer(
             "; filament used [g] = {:.2}\n",
             "; total filament used [g] = {:.2}\n",
             "; estimated printing time (normal mode) = {}\n",
-            "; first_layer_height = {:.3}\n",
-            "; layer_height = {:.3}\n",
-            "; max_print_height = {:.3}\n",
+            "; first_layer_height = {:.4}\n",
+            "; layer_height = {:.4}\n",
+            "; max_print_height = {:.4}\n",
             "; total layers count = {}\n",
             "; nozzle_diameter = {:.2}\n",
             "; filament_diameter = {:.2}\n",
@@ -2734,7 +2734,7 @@ pub fn plan_and_emit_gcode_for_object(
         }
     }
     if gcfg.enable_slicer_pa_subdivision {
-        gcode.push_str("SET_PRESSURE_ADVANCE ADVANCE=0.0000 ; Slicer-side PA active\n");
+        gcode.push_str("SET_PRESSURE_ADVANCE ADVANCE=0.00000 ; Slicer-side PA active\n");
     }
 
     let mut emitted_accel = -1.0f32;
@@ -2745,6 +2745,10 @@ pub fn plan_and_emit_gcode_for_object(
     let mut emitted_tool_id = tool_id;
     let mut active_retract_mm = 0.0f32;
     let mut accum_travel_time_s = 0.0f32;
+    // Track relative E-axis (`M83`) output rounding error in `f64` (error diffusion)
+    // so cumulative filament extrusion across thousands of short non-planar/scarf segments
+    // never drifts from the exact analytical volume integral.
+    let mut e_rounding_residual_mm = 0.0f64;
 
     for (layer_ord, layer) in planned_layers.iter().enumerate() {
         if layer.segments.is_empty() {
@@ -2767,7 +2771,7 @@ pub fn plan_and_emit_gcode_for_object(
         };
 
         gcode.push_str(&format!(
-            "\n; --- LAYER {} (Branch {}, Iso {:.3}) ---\n;LAYER_CHANGE\n;Z:{:.3}\n;HEIGHT:{:.3}\n",
+            "\n; --- LAYER {} (Branch {}, Iso {:.4}) ---\n;LAYER_CHANGE\n;Z:{:.4}\n;HEIGHT:{:.4}\n",
             layer.layer_index, layer.branch_id, layer.isovalue, layer_max_z, layer_mean_h
         ));
         if gcfg.emit_exclude_object {
@@ -2824,7 +2828,7 @@ pub fn plan_and_emit_gcode_for_object(
             if seg.retract_before_mm > 1.0e-4 && active_retract_mm <= 1.0e-4 {
                 let r_len = seg.retract_before_mm;
                 let r_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
-                gcode.push_str(&format!("G1 E-{r_len:.5} F{r_feed:.0} ; Retract\n"));
+                gcode.push_str(&format!("G1 E-{r_len:.6} F{r_feed:.1} ; Retract\n"));
                 active_retract_mm = r_len;
                 accum_travel_time_s = 0.0;
                 emitted_feed_mm_min = r_feed;
@@ -2838,7 +2842,7 @@ pub fn plan_and_emit_gcode_for_object(
                     let r_len = gcfg.retract_length_mm;
                     let r_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
                     gcode.push_str(&format!(
-                        "G1 E-{r_len:.5} F{r_feed:.0} ; Retract before toolchange\n"
+                        "G1 E-{r_len:.6} F{r_feed:.1} ; Retract before toolchange\n"
                     ));
                     active_retract_mm = r_len;
                     accum_travel_time_s = 0.0;
@@ -2859,6 +2863,7 @@ pub fn plan_and_emit_gcode_for_object(
                 emitted_tool_id = seg.tool_id;
                 emitted_pa = -1.0;
                 emitted_feed_mm_min = -1.0;
+                e_rounding_residual_mm = 0.0;
             }
 
             if !seg.kind.is_extruding() || seg.delta_e_mm <= 1.0e-6 {
@@ -2873,7 +2878,7 @@ pub fn plan_and_emit_gcode_for_object(
                 let u_len =
                     seg_fluid.unretract_length_mm(active_retract_mm, accum_travel_time_s, &gcfg);
                 let u_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
-                gcode.push_str(&format!("G1 E{u_len:.5} F{u_feed:.0} ; Unretract\n"));
+                gcode.push_str(&format!("G1 E{u_len:.6} F{u_feed:.1} ; Unretract\n"));
                 active_retract_mm = 0.0;
                 accum_travel_time_s = 0.0;
                 emitted_feed_mm_min = u_feed;
@@ -2926,11 +2931,16 @@ pub fn plan_and_emit_gcode_for_object(
                             >= 0.08)
                 {
                     gcode.push_str(&format!(
-                        "SET_PRESSURE_ADVANCE ADVANCE={:.4}\n",
+                        "SET_PRESSURE_ADVANCE ADVANCE={:.5}\n",
                         seg.pressure_advance_s
                     ));
                     emitted_pa = seg.pressure_advance_s;
                 }
+
+                // Error-diffusion quantization of relative extrusion `E` at 6 decimal places (`1e-6 mm`)
+                let e_desired = (seg.delta_e_mm as f64) + e_rounding_residual_mm;
+                let e_emitted = ((e_desired * 1_000_000.0).round() * 1.0e-6).max(0.0);
+                e_rounding_residual_mm = e_desired - e_emitted;
 
                 let feed_mm_min = (seg.cruise_speed_mms * 60.0).max(30.0);
                 let emit_f = kind_changed
@@ -2940,14 +2950,14 @@ pub fn plan_and_emit_gcode_for_object(
 
                 if emit_f {
                     gcode.push_str(&format!(
-                        "G1 X{:.3} Y{:.3} Z{:.3} E{:.5} F{:.0}\n",
-                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, seg.delta_e_mm, feed_mm_min
+                        "G1 X{:.4} Y{:.4} Z{:.4} E{:.6} F{:.1}\n",
+                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, e_emitted, feed_mm_min
                     ));
                     emitted_feed_mm_min = feed_mm_min;
                 } else {
                     gcode.push_str(&format!(
-                        "G1 X{:.3} Y{:.3} Z{:.3} E{:.5}\n",
-                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, seg.delta_e_mm
+                        "G1 X{:.4} Y{:.4} Z{:.4} E{:.6}\n",
+                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, e_emitted
                     ));
                 }
             } else {
@@ -2960,13 +2970,13 @@ pub fn plan_and_emit_gcode_for_object(
 
                 if emit_f {
                     gcode.push_str(&format!(
-                        "G0 X{:.3} Y{:.3} Z{:.3} F{:.0}\n",
+                        "G0 X{:.4} Y{:.4} Z{:.4} F{:.1}\n",
                         seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, feed_mm_min
                     ));
                     emitted_feed_mm_min = feed_mm_min;
                 } else {
                     gcode.push_str(&format!(
-                        "G0 X{:.3} Y{:.3} Z{:.3}\n",
+                        "G0 X{:.4} Y{:.4} Z{:.4}\n",
                         seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z
                     ));
                 }
@@ -3584,6 +3594,102 @@ mod tests {
         assert!(
             res.gcode_text.contains("M106 S230"),
             "Expected M106 S230 for 90% WaveOverhang fan cooling"
+        );
+    }
+
+    #[test]
+    fn test_gcode_extra_decimal_precision_and_e_rounding_error_compensation() {
+        // Construct a fine non-planar perimeter loop with 360 short segments (~0.35 mm each)
+        // and scarf-joint ramping where per-segment dE is very small (~0.0005 to ~0.008 mm)
+        // and systematic rounding without error diffusion would accumulate noticeable drift.
+        let n_pts = 360usize;
+        let radius = 20.0f32;
+        let mut pts = Vec::with_capacity(n_pts);
+        for i in 0..n_pts {
+            let theta = (i as f32) * std::f32::consts::TAU / (n_pts as f32);
+            let z = 0.25 + 0.04 * (3.0 * theta).sin();
+            pts.push(make_pt(
+                radius * theta.cos(),
+                radius * theta.sin(),
+                z,
+                0.36,
+                0.12,
+            ));
+        }
+        let fine_loop = ExtrusionPath {
+            points: pts,
+            feature_kind: 0,
+            wall_index: 0,
+            is_closed: true,
+            total_length_mm: std::f32::consts::TAU * radius,
+            mean_width_mm: 0.36,
+        };
+        let raw = ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 1,
+            outer_wall_count: 1,
+            inner_wall_count: 0,
+            solid_infill_count: 0,
+            sparse_infill_count: 0,
+            bridge_count: 0,
+            wave_overhang_count: 0,
+            support_count: 0,
+            support_interface_count: 0,
+            layers: vec![LayerToolpaths {
+                layer_index: 0,
+                branch_id: 0,
+                isovalue: 0.25,
+                paths: vec![fine_loop],
+            }],
+        };
+
+        let cfg = SlicerConfig::default();
+        let res = plan_and_emit_gcode_for_object(
+            "PrecisionAndRoundingTest",
+            1,
+            &raw,
+            Transform::IDENTITY,
+            &cfg,
+        );
+
+        let exact_sum_e: f64 = res.layers[0]
+            .segments
+            .iter()
+            .filter(|s| s.kind.is_extruding() && s.delta_e_mm > 1.0e-6)
+            .map(|s| s.delta_e_mm as f64)
+            .sum();
+
+        let mut emitted_sum_e = 0.0f64;
+        let mut checked_coord_decimals = false;
+        for line in res.gcode_text.lines() {
+            if line.starts_with("G1 X") {
+                for token in line.split_whitespace() {
+                    if let Some(x_str) = token.strip_prefix('X') {
+                        let dot_pos = x_str.find('.').expect("X coordinate must have decimal");
+                        assert_eq!(
+                            x_str.len() - dot_pos - 1,
+                            4,
+                            "Expected 4 decimal places on X coordinate, got {token}"
+                        );
+                        checked_coord_decimals = true;
+                    } else if let Some(e_str) = token.strip_prefix('E') {
+                        let dot_pos = e_str.find('.').expect("E value must have decimal");
+                        assert_eq!(
+                            e_str.len() - dot_pos - 1,
+                            6,
+                            "Expected 6 decimal places on E axis, got {token}"
+                        );
+                        let e_val: f64 = e_str.parse().expect("Valid float E");
+                        emitted_sum_e += e_val;
+                    }
+                }
+            }
+        }
+        assert!(checked_coord_decimals);
+        let total_rounding_drift_mm = (emitted_sum_e - exact_sum_e).abs();
+        assert!(
+            total_rounding_drift_mm <= 0.55e-6,
+            "Expected cumulative E rounding drift <= 0.55e-6 mm with error diffusion, got {total_rounding_drift_mm:.9} mm (emitted={emitted_sum_e:.8}, exact={exact_sum_e:.8})"
         );
     }
 }
