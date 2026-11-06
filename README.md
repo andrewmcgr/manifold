@@ -93,6 +93,11 @@ manifold-frontend profile init my_profile.json --filament "Generic ASA (Enclosed
 manifold-frontend profile set my_profile.json layer_height.target_mm=0.16 enable_scarf_joint=true
 manifold-frontend profile diff my_profile.json
 manifold-frontend profile keys --filter overhang
+
+# Generate rheology calibration G-code patterns (Extrusion Multiplier, Ellis PA, Transient Melt Pressure)
+manifold-frontend calibrate em -p my_profile.json -t T0 --pass 1 -o calib_em_pass1.gcode
+manifold-frontend calibrate pa -p my_profile.json -t T0 --mode dual -o calib_pa_dual.gcode
+manifold-frontend calibrate transient -p my_profile.json -t T0 --pass 1 -o calib_transient_gamma.gcode
 ```
 
 ---
@@ -102,8 +107,9 @@ manifold-frontend profile keys --filter overhang
 Detailed guides and technical references are available in the [`docs/`](docs/) directory:
 
 - **[Application Capabilities (`docs/capabilities.md`)](docs/capabilities.md)** — Hardware targets, CAD/3MF formats, volumetric fields, 3D toolpath features, rheology models, and Klipper integration.
-- **[User Interface Guide (`docs/ui_guide.md`)](docs/ui_guide.md)** — Interactive 3D viewport tools, multi-plate workflow, orientation hint authoring, VDB field inspection, and toolpath preview controls.
-- **[Command-Line Interface Reference (`docs/cli.md`)](docs/cli.md)** — Complete syntax and examples for `manifold-frontend slice` and `manifold-frontend profile` verbs.
+- **[Polymer Rheology & Flow Calibration Guide (`docs/calibration_guide.md`)](docs/calibration_guide.md)** — Visual and quantitative guide to generating and reading Extrusion Multiplier, Viscoelastic Die Swell, Dual-Band Ellis Pressure Advance, and Transient Melt-Zone Pressure calibration patterns.
+- **[User Interface Guide (`docs/ui_guide.md`)](docs/ui_guide.md)** — Interactive 3D viewport tools, multi-plate workflow, orientation hint authoring, VDB field inspection, calibration utilities, and toolpath preview controls.
+- **[Command-Line Interface Reference (`docs/cli.md`)](docs/cli.md)** — Complete syntax and examples for `manifold-frontend slice`, `manifold-frontend calibrate`, and `manifold-frontend profile` verbs.
 - **[Profile Variables Reference (`docs/profile_variables.md`)](docs/profile_variables.md)** — Exhaustive catalog of every `SlicerConfig` variable, dotted path, shorthand alias, preset category, unit, default value, and physical behavior.
 - **[Core Mathematical & Geometric Algorithms (`docs/core_algorithms.md`)](docs/core_algorithms.md)** — Mathematical formulations for `NozzleFrame` kinematics, Dual-Grid OpenVDB SDF/overhang/constrained Eikonal solvers, Reeb-graph layer scheduling, geodesic perimeters, 3D TPMS contouring, and viscoelastic polymer rheology.
 - **[Kinematic Invariants (`AGENTS.md`)](AGENTS.md)** — Mandatory multi-axis coordinate frame and bed-coordinate gravity rules.

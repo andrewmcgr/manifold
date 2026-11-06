@@ -5,6 +5,11 @@ use bevy::tasks::{block_on, IoTaskPool};
 use bevy_egui::{egui, EguiContexts};
 
 use crate::bridge::ffi;
+use crate::calibration::{
+    generate_em_calibration_gcode, generate_pa_calibration_gcode,
+    generate_transient_pressure_calibration_gcode, CalibrationUiState, CalibrationUtilityKind,
+    EmCalibrationPass, PaCalibrationMode, TransientCalibrationPass,
+};
 use crate::config::{
     lookup_parameter_doc, BedShape, ClearancePointXZ, ClearanceProfileMode, OrderFieldMode,
     PointNormalHint, SlicerConfig, SolidInfillPattern, SparseInfillPattern, SupportStyle,
@@ -1077,6 +1082,7 @@ pub fn ui_workspace_system(
     mut config: ResMut<SlicerConfig>,
     mut preset_lib: ResMut<PresetLibrary>,
     mut vis_state: ResMut<FieldVisualizationState>,
+    mut calib_state: ResMut<CalibrationUiState>,
     mut object_transforms: Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
     mut camera_query: Query<
         (&Camera, &GlobalTransform, &mut OrbitCamera, &mut Transform),
@@ -1205,16 +1211,21 @@ pub fn ui_workspace_system(
                 false,
                 has_planned && !is_computing && !is_io_busy,
             )
-            .on_hover_text("Export planned non-planar G-code (.gcode) for the selected object")
+            .on_hover_text("Export planned non-planar or calibration G-code (.gcode)")
             .clicked()
             {
-                if let (Some((_, _, ref obj_name, _)), Some(ref planned)) =
-                    (&selected_obj_info, &vis_state.cached_planned_gcode)
-                {
-                    let stem = std::path::Path::new(obj_name)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("manifold2_print");
+                if let Some(ref planned) = vis_state.cached_planned_gcode {
+                    let stem = if let Some((_, _, ref obj_name, _)) = selected_obj_info {
+                        std::path::Path::new(obj_name)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("manifold2_print")
+                            .to_string()
+                    } else if !calib_state.last_generated_filename_stem.is_empty() {
+                        calib_state.last_generated_filename_stem.clone()
+                    } else {
+                        "manifold2_calibration".to_string()
+                    };
                     let default_filename = format!("{stem}.gcode");
                     let gcode_bytes = planned.gcode_text.clone();
                     let total_moves =
@@ -1325,6 +1336,13 @@ pub fn ui_workspace_system(
             }
 
             ui.separator();
+            ui.toggle_value(
+                &mut calib_state.show_window,
+                egui::RichText::new("Calibration Utilities").strong(),
+            )
+            .on_hover_text(
+                "Open Extrusion Multiplier (Orca-style + Die Swell), Pressure Advance (Ellis-style), and Transient Melt-Zone Pressure calibration generators",
+            );
             ui.toggle_value(
                 &mut preset_lib.show_view_panel,
                 egui::RichText::new("View & Inspection Panel").strong(),
@@ -2535,7 +2553,13 @@ pub fn ui_workspace_system(
                             render_tool_config_tab(ui, &mut config, &mut vis_state, is_computing);
                         }
                         PresetCategory::Filament => {
-                            render_filament_config_tab(ui, &mut config, &mut vis_state, is_computing);
+                            render_filament_config_tab(
+                                ui,
+                                &mut config,
+                                &mut vis_state,
+                                &mut calib_state,
+                                is_computing,
+                            );
                         }
                         PresetCategory::Process => {
                             render_process_config_tab(
@@ -2604,7 +2628,7 @@ pub fn ui_workspace_system(
     let show_hud_layers =
         vis_state.show_selected_layers && vis_state.cached_selected_layers.is_some();
     if !preset_lib.show_view_panel
-        && plate.selected_object().is_some()
+        && (plate.selected_object().is_some() || vis_state.cached_planned_gcode.is_some())
         && (show_hud_toolpaths || show_hud_layers)
     {
         egui::Window::new("Viewport Color Legend")
@@ -2632,6 +2656,17 @@ pub fn ui_workspace_system(
                 }
             });
     }
+
+    // 4. Floating Calibration Utilities Window (EM + Die Swell, Ellis PA, Transient Melt-Zone Pressure)
+    render_calibration_utilities_window(
+        ctx,
+        &mut calib_state,
+        &mut config,
+        &mut vis_state,
+        &mut plate,
+        is_io_busy,
+        is_computing,
+    );
 }
 
 /// Renders the `Printer` configuration sub-tab:
@@ -3425,6 +3460,7 @@ fn render_filament_config_tab(
     ui: &mut egui::Ui,
     config: &mut SlicerConfig,
     vis_state: &mut FieldVisualizationState,
+    calib_state: &mut CalibrationUiState,
     is_computing: bool,
 ) {
     let mut dirty_backend = false;
@@ -3548,6 +3584,16 @@ fn render_filament_config_tab(
                         .text("Extrusion Mult"),
                 )
                 .changed();
+            if ui
+                .small_button("Calibrate EM...")
+                .on_hover_text(
+                    "Open Orca-style Extrusion Multiplier & High-Flow Die Swell calibration generator",
+                )
+                .clicked()
+            {
+                calib_state.show_window = true;
+                calib_state.active_kind = CalibrationUtilityKind::ExtrusionMultiplier;
+            }
             param_help_button(ui, "gcode.extrusion_multiplier");
         });
         ui.horizontal(|ui| {
@@ -3651,6 +3697,16 @@ fn render_filament_config_tab(
                         .text("PA Low Flow k_low (s)"),
                 )
                 .changed();
+            if ui
+                .small_button("Calibrate PA...")
+                .on_hover_text(
+                    "Open Ellis-style 90° sharp-corner chevron Pressure Advance calibration generator",
+                )
+                .clicked()
+            {
+                calib_state.show_window = true;
+                calib_state.active_kind = CalibrationUtilityKind::PressureAdvance;
+            }
             param_help_button(ui, "gcode.pa_low_high_s");
         });
         ui.horizontal(|ui| {
@@ -3758,6 +3814,16 @@ fn render_filament_config_tab(
                     "Melt-Zone Transient Pressure Compensation",
                 )
                 .changed();
+            if ui
+                .small_button("Calibrate...")
+                .on_hover_text(
+                    "Open Constant-Speed Flow-Step & Staccato Striation calibration generator for γ and τ_melt",
+                )
+                .clicked()
+            {
+                calib_state.show_window = true;
+                calib_state.active_kind = CalibrationUtilityKind::TransientPressure;
+            }
             param_help_button(ui, "gcode.transient_pressure_comp");
         });
         if gc.enable_transient_pressure_comp {
@@ -3768,6 +3834,15 @@ fn render_filament_config_tab(
                             .speed(0.01)
                             .range(0.05..=1.0)
                             .prefix("Exp γ: "),
+                    )
+                    .changed();
+                gc_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut gc.transient_pressure_tau_s)
+                            .speed(0.01)
+                            .range(0.01..=5.0)
+                            .prefix("τ_melt: ")
+                            .suffix(" s"),
                     )
                     .changed();
                 gc_changed |= ui
@@ -5009,7 +5084,88 @@ fn render_view_and_inspection_panel(
 
     let Some(&(sel_id, _, ref obj_name, obj_rotation)) = selected_obj_info else {
         ui.add_space(8.0);
-        ui.small("Select an object on the build plate to inspect its OpenVDB fields, non-planar layers, and 3D toolpaths.");
+        if vis_state.cached_planned_gcode.is_some() {
+            ui.separator();
+            egui::CollapsingHeader::new(
+                egui::RichText::new("3D Toolpaths & Calibration Preview").strong(),
+            )
+            .id_source("view_standalone_calibration_toolpaths_section")
+            .default_open(true)
+            .show(ui, |ui| {
+                if ui
+                    .checkbox(&mut vis_state.show_toolpaths, "Show 3D Toolpaths")
+                    .changed()
+                {
+                    vis_state.dirty_toolpaths_mesh = true;
+                }
+                if let Some(ref planned) = vis_state.cached_planned_gcode {
+                    let total_layers = planned.layers.len();
+                    if total_layers > 0 {
+                        let max_idx = total_layers - 1;
+                        let min_changed = ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut vis_state.selected_layer_min_idx,
+                                    0..=max_idx,
+                                )
+                                .text("Start Layer"),
+                            )
+                            .changed();
+                        let max_changed = ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut vis_state.selected_layer_max_idx,
+                                    0..=max_idx,
+                                )
+                                .text("End Layer"),
+                            )
+                            .changed();
+                        if min_changed
+                            && vis_state.selected_layer_min_idx > vis_state.selected_layer_max_idx
+                        {
+                            vis_state.selected_layer_max_idx = vis_state.selected_layer_min_idx;
+                        } else if max_changed
+                            && vis_state.selected_layer_max_idx < vis_state.selected_layer_min_idx
+                        {
+                            vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
+                        }
+                        if min_changed || max_changed {
+                            vis_state.dirty_toolpaths_mesh = true;
+                        }
+                    }
+                }
+                if vis_state.show_toolpaths {
+                    ui.horizontal(|ui| {
+                        ui.label("Color By:");
+                        let combo_w = (ui.available_width() - 8.0).clamp(130.0, 220.0);
+                        egui::ComboBox::from_id_source("standalone_toolpath_color_mode_combo")
+                            .selected_text(vis_state.toolpath_color_mode.short_label())
+                            .width(combo_w)
+                            .show_ui(ui, |ui| {
+                                for mode in ToolpathColorMode::ALL {
+                                    if ui
+                                        .selectable_value(
+                                            &mut vis_state.toolpath_color_mode,
+                                            mode,
+                                            mode.label(),
+                                        )
+                                        .changed()
+                                    {
+                                        vis_state.dirty_toolpaths_mesh = true;
+                                    }
+                                }
+                            });
+                    });
+                    if vis_state.toolpath_color_mode != ToolpathColorMode::ByFeatureType {
+                        render_toolpath_color_legend(ui, vis_state, config);
+                        ui.add_space(3.0);
+                    }
+                    render_interactive_toolpath_line_types_legend(ui, vis_state);
+                }
+            });
+        } else {
+            ui.small("Select an object on the build plate (or generate a Calibration pattern) to inspect 3D toolpaths.");
+        }
         return;
     };
 
@@ -5913,4 +6069,823 @@ fn frame_camera_to_plate(
         let eye = compute_orbit_eye(&orbit);
         *transform = Transform::from_translation(eye).looking_at(orbit.focus, Vec3::Z);
     }
+}
+
+/// Renders the floating Calibration Utilities window for:
+/// 1. Orca-style Extrusion Multiplier (Pass 1 Coarse, Pass 2 Fine) & Pass 3 High-Flow Die Swell (`swell_high`),
+/// 2. Ellis-style 90° sharp-corner chevron Pressure Advance (Dual-Band Shear-Thinning `k_low` + `k_high` or Single-Band),
+/// 3. Constant-Speed Flow-Step & Staccato Striation Transient Melt-Zone Pressure (`γ` and `τ_melt`).
+fn render_calibration_utilities_window(
+    ctx: &egui::Context,
+    calib_state: &mut CalibrationUiState,
+    config: &mut SlicerConfig,
+    vis_state: &mut FieldVisualizationState,
+    plate: &mut BuildPlateState,
+    is_io_busy: bool,
+    is_computing: bool,
+) {
+    if !calib_state.show_window {
+        return;
+    }
+
+    let mut open = calib_state.show_window;
+    egui::Window::new("Calibration Utilities — Rheology, Flow & Pressure")
+        .id(egui::Id::new("calibration_utilities_floating_window"))
+        .open(&mut open)
+        .default_width(510.0)
+        .min_width(440.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            // Top utility kind tab strip
+            ui.horizontal_wrapped(|ui| {
+                for kind in CalibrationUtilityKind::ALL {
+                    let is_active = calib_state.active_kind == kind;
+                    if render_delineated_pill_tab(ui, is_active, kind.label()).clicked() {
+                        calib_state.active_kind = kind;
+                    }
+                }
+            });
+            ui.small(
+                egui::RichText::new(
+                    "All patterns respect the active machine's 5/6-axis NozzleFrame and Gravity Vector in bed coordinates.",
+                )
+                .color(egui::Color32::GRAY),
+            );
+            ui.separator();
+
+            let mut request_preview = false;
+            let mut request_export = false;
+            let mut config_modified = false;
+
+            // Calibration Tool / Extruder Selector Bar
+            if config.tools.is_empty() {
+                config.tools.push(ToolConfig::default());
+                config.active_tool_index = 0;
+            }
+            if let Some(sel_idx) = calib_state.selected_tool_index {
+                if sel_idx >= config.tools.len() {
+                    calib_state.selected_tool_index = Some(config.tools.len() - 1);
+                }
+            }
+            let resolved_tool_idx = calib_state
+                .selected_tool_index
+                .unwrap_or(config.active_tool_index)
+                .min(config.tools.len() - 1);
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Calibration Tool:").strong());
+                let selected_tool_label = match calib_state.selected_tool_index {
+                    None => config
+                        .tools
+                        .get(resolved_tool_idx)
+                        .map(|t| {
+                            format!(
+                                "Active Tool: {} ({:.2}mm, {:.0}°C)",
+                                t.name, t.nozzle_diameter_mm, t.temperature_celsius
+                            )
+                        })
+                        .unwrap_or_else(|| "Active Tool".to_string()),
+                    Some(idx) => config
+                        .tools
+                        .get(idx)
+                        .map(|t| {
+                            format!(
+                                "{} (T{}, {:.2}mm, {:.0}°C)",
+                                t.name, t.id, t.nozzle_diameter_mm, t.temperature_celsius
+                            )
+                        })
+                        .unwrap_or_else(|| format!("Tool #{idx}")),
+                };
+                egui::ComboBox::from_id_source("calibration_tool_selector_combo")
+                    .selected_text(selected_tool_label)
+                    .width(235.0)
+                    .show_ui(ui, |ui| {
+                        let active_name = config
+                            .active_tool()
+                            .map(|t| {
+                                format!(
+                                    "Active Tool ({} — {:.2}mm, {:.0}°C)",
+                                    t.name, t.nozzle_diameter_mm, t.temperature_celsius
+                                )
+                            })
+                            .unwrap_or_else(|| "Active Tool".to_string());
+                        ui.selectable_value(
+                            &mut calib_state.selected_tool_index,
+                            None,
+                            active_name,
+                        );
+                        for (idx, tool) in config.tools.iter().enumerate() {
+                            let lbl = format!(
+                                "{} (T{}, {:.2}mm, {:.0}°C)",
+                                tool.name, tool.id, tool.nozzle_diameter_mm, tool.temperature_celsius
+                            );
+                            ui.selectable_value(
+                                &mut calib_state.selected_tool_index,
+                                Some(idx),
+                                lbl,
+                            );
+                        }
+                    });
+
+                if ui
+                    .small_button("+ Tool")
+                    .on_hover_text("Add a new tool/extruder to the Multi-Tool Registry and select it for calibration")
+                    .clicked()
+                {
+                    let next_id = config.tools.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+                    let base_noz = config
+                        .tools
+                        .get(resolved_tool_idx)
+                        .map(|t| t.nozzle_diameter_mm)
+                        .unwrap_or(0.40);
+                    let base_temp = config
+                        .tools
+                        .get(resolved_tool_idx)
+                        .map(|t| t.temperature_celsius)
+                        .unwrap_or(215.0);
+                    config.tools.push(ToolConfig::standard_tool(
+                        next_id,
+                        format!("T{next_id} - {base_noz:.1}mm Extruder"),
+                        base_noz,
+                        base_temp,
+                    ));
+                    calib_state.selected_tool_index = Some(config.tools.len() - 1);
+                    config_modified = true;
+                }
+            });
+
+            if let Some(cal_tool) = config.tools.get_mut(resolved_tool_idx) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.small(
+                        egui::RichText::new(format!("T{} Settings:", cal_tool.id)).strong(),
+                    );
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut cal_tool.nozzle_diameter_mm)
+                                .speed(0.02)
+                                .range(0.15..=2.0)
+                                .prefix("Nozzle: ")
+                                .suffix(" mm"),
+                        )
+                        .changed()
+                    {
+                        config_modified = true;
+                    }
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut cal_tool.temperature_celsius)
+                                .speed(1.0)
+                                .range(150.0..=380.0)
+                                .prefix("Nozzle Temp: ")
+                                .suffix(" °C"),
+                        )
+                        .changed()
+                    {
+                        config_modified = true;
+                    }
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut config.gcode.bed_temperature_celsius)
+                                .speed(1.0)
+                                .range(0.0..=150.0)
+                                .prefix("Bed Temp: ")
+                                .suffix(" °C"),
+                        )
+                        .changed()
+                    {
+                        config_modified = true;
+                    }
+                });
+            }
+            ui.separator();
+
+            match calib_state.active_kind {
+                CalibrationUtilityKind::ExtrusionMultiplier => {
+                    ui.label(
+                        egui::RichText::new(
+                            "Orca-Style Surface Quality Coupon Array & High-Flow Die Swell",
+                        )
+                        .strong(),
+                    );
+                    ui.small(
+                        "Prints numbered coupons with a solid monotonic top surface and an inset inspection frame. Inspect the center region where 45° lines meet without gaps or ridges.",
+                    );
+                    ui.add_space(4.0);
+
+                    let current_em = config.gcode.extrusion_multiplier;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Calibration Pass:");
+                        for pass in EmCalibrationPass::ALL {
+                            let is_sel = calib_state.em.pass == pass;
+                            if ui
+                                .selectable_label(is_sel, pass.short_label())
+                                .on_hover_text(pass.label())
+                                .clicked()
+                                && !is_sel
+                            {
+                                calib_state.em.apply_pass_defaults(pass, current_em);
+                            }
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut calib_state.em.coupon_width_mm)
+                                .speed(0.5)
+                                .range(14.0..=45.0)
+                                .prefix("Coupon W: ")
+                                .suffix(" mm"),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut calib_state.em.coupon_depth_mm)
+                                .speed(0.5)
+                                .range(14.0..=45.0)
+                                .prefix("Coupon D: ")
+                                .suffix(" mm"),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut calib_state.em.top_test_layers)
+                                .speed(0.2)
+                                .range(3..=8)
+                                .prefix("Top Layers: "),
+                        );
+                    });
+
+                    if calib_state.em.pass == EmCalibrationPass::Pass3HighFlowDieSwell {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut calib_state.em.start_swell_high)
+                                    .speed(0.01)
+                                    .range(1.00..=1.50)
+                                    .prefix("Start swell_high: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut calib_state.em.end_swell_high)
+                                    .speed(0.01)
+                                    .range(1.02..=1.80)
+                                    .prefix("End swell_high: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut calib_state.em.step_swell_high)
+                                    .speed(0.005)
+                                    .range(0.01..=0.20)
+                                    .prefix("Step: "),
+                            );
+                        });
+                        ui.small(format!(
+                            "Pass 3 sweeps swell_high from {:.2} to {:.2} (step {:.2}) at high-flow Q_high = {:.1} mm³/s.",
+                            calib_state.em.start_swell_high,
+                            calib_state.em.end_swell_high,
+                            calib_state.em.step_swell_high,
+                            config.gcode.pa_ref_high_flow_mm3s,
+                        ));
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut calib_state.em.start_delta_pct)
+                                    .speed(0.5)
+                                    .range(-25.0..=0.0)
+                                    .prefix("Start Δ: ")
+                                    .suffix("%"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut calib_state.em.end_delta_pct)
+                                    .speed(0.5)
+                                    .range(0.0..=25.0)
+                                    .prefix("End Δ: ")
+                                    .suffix("%"),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut calib_state.em.step_delta_pct)
+                                    .speed(0.25)
+                                    .range(0.25..=10.0)
+                                    .prefix("Step: ")
+                                    .suffix("%"),
+                            );
+                        });
+                        ui.checkbox(
+                            &mut calib_state.em.isolate_die_swell_in_em_passes,
+                            "Neutralize Die-Swell Scaling in Pass 1 & 2 (Isolate Base EM)",
+                        );
+                    }
+
+                    ui.add_space(6.0);
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Result Calculator & One-Click Apply").strong(),
+                            );
+                            if calib_state.em.pass == EmCalibrationPass::Pass3HighFlowDieSwell {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut calib_state.em.selected_winner_value,
+                                        )
+                                        .speed(0.01)
+                                        .range(1.00..=1.80)
+                                        .prefix("Best Coupon swell_high: "),
+                                    );
+                                    let new_swell_high = calib_state
+                                        .em
+                                        .selected_winner_value
+                                        .clamp(config.gcode.swell_low, 2.0);
+                                    ui.label(format!(
+                                        "→ 1/swell_high = {:.3}×",
+                                        1.0 / new_swell_high
+                                    ));
+                                    if ui.button("Apply swell_high").clicked() {
+                                        config.gcode.swell_high = new_swell_high;
+                                        config_modified = true;
+                                        plate.status_message = format!(
+                                            "Applied calibrated swell_high = {new_swell_high:.4} (1/swell = {:.3}×).",
+                                            1.0 / new_swell_high
+                                        );
+                                    }
+                                });
+                            } else {
+                                calib_state.em.base_extrusion_multiplier =
+                                    config.gcode.extrusion_multiplier;
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut calib_state.em.selected_winner_value,
+                                        )
+                                        .speed(0.25)
+                                        .range(-20.0..=20.0)
+                                        .prefix("Best Coupon Label Δ%: ")
+                                        .suffix("%"),
+                                    );
+                                    let new_em = calib_state.em.compute_updated_em();
+                                    ui.label(format!(
+                                        "New EM = {:.4} × (1 {:+.2}%) = {:.4}×",
+                                        config.gcode.extrusion_multiplier,
+                                        calib_state.em.selected_winner_value,
+                                        new_em
+                                    ));
+                                    if ui.button("Apply New EM").clicked() {
+                                        config.gcode.extrusion_multiplier = new_em;
+                                        config_modified = true;
+                                        plate.status_message = format!(
+                                            "Applied calibrated Extrusion Multiplier = {new_em:.4}×."
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                }
+
+                CalibrationUtilityKind::PressureAdvance => {
+                    ui.label(
+                        egui::RichText::new(
+                            "Ellis-Style 90° Sharp-Corner Chevron Pattern (Klipper / RRF PA)",
+                        )
+                        .strong(),
+                    );
+                    ui.small(
+                        "Prints slow→fast→slow 90° chevrons stepping Pressure Advance line-by-line, with vector-stroke PA value labels on the frame. Choose the line with the sharpest, most uniform corner.",
+                    );
+                    ui.add_space(4.0);
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Mode:");
+                        for mode in PaCalibrationMode::ALL {
+                            ui.selectable_value(
+                                &mut calib_state.pa.mode,
+                                mode,
+                                mode.label(),
+                            );
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut calib_state.pa.pa_start_s)
+                                .speed(0.002)
+                                .range(0.0..=0.50)
+                                .prefix("Start PA: ")
+                                .suffix(" s"),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut calib_state.pa.pa_end_s)
+                                .speed(0.002)
+                                .range(0.005..=0.80)
+                                .prefix("End PA: ")
+                                .suffix(" s"),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut calib_state.pa.pa_step_s)
+                                .speed(0.0005)
+                                .range(0.0005..=0.10)
+                                .prefix("Step: ")
+                                .suffix(" s"),
+                        );
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut calib_state.pa.slow_speed_mms)
+                                .speed(1.0)
+                                .range(5.0..=80.0)
+                                .prefix("Slow Speed: ")
+                                .suffix(" mm/s"),
+                        );
+                        if calib_state.pa.mode == PaCalibrationMode::SingleBand {
+                            ui.add(
+                                egui::DragValue::new(&mut calib_state.pa.fast_speed_mms)
+                                    .speed(2.0)
+                                    .range(40.0..=500.0)
+                                    .prefix("Fast Speed: ")
+                                    .suffix(" mm/s"),
+                            );
+                        }
+                        ui.add(
+                            egui::DragValue::new(&mut calib_state.pa.accel_mms2)
+                                .speed(100.0)
+                                .range(500.0..=30000.0)
+                                .prefix("Accel: ")
+                                .suffix(" mm/s²"),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut calib_state.pa.test_layer_count)
+                                .speed(0.2)
+                                .range(2..=6)
+                                .prefix("Layers: "),
+                        );
+                    });
+                    ui.checkbox(
+                        &mut calib_state.pa.include_adhesion_ribbons,
+                        "Print 1-Layer Adhesion Ribbons Under Chevron Vertices & Apexes",
+                    );
+
+                    if calib_state.pa.mode == PaCalibrationMode::DualBandShearThinning {
+                        let cross_section = (config.slicing.outer_wall_width.target_mm
+                            * config.slicing.layer_height.target_mm)
+                            .max(0.04);
+                        let v_low =
+                            (config.gcode.pa_ref_low_flow_mm3s / cross_section).clamp(20.0, 300.0);
+                        let v_high =
+                            (config.gcode.pa_ref_high_flow_mm3s / cross_section).clamp(50.0, 350.0);
+                        ui.small(format!(
+                            "Dual-Band prints Left Bank at Q_low = {:.1} mm³/s ({v_low:.0} mm/s) for k_low and Right Bank at Q_high = {:.1} mm³/s ({v_high:.0} mm/s) for k_high.",
+                            config.gcode.pa_ref_low_flow_mm3s,
+                            config.gcode.pa_ref_high_flow_mm3s,
+                        ));
+                    }
+
+                    ui.add_space(6.0);
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Apply Calibrated Pressure Advance").strong(),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut calib_state.pa.winner_pa_low_s)
+                                        .speed(0.001)
+                                        .range(0.0..=0.50)
+                                        .prefix("Best k_low: ")
+                                        .suffix(" s"),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut calib_state.pa.winner_pa_high_s)
+                                        .speed(0.001)
+                                        .range(0.0..=0.50)
+                                        .prefix("Best k_high: ")
+                                        .suffix(" s"),
+                                );
+                                if ui.button("Apply Dual-Band PA").clicked() {
+                                    config.gcode.pa_low_flow_s = calib_state.pa.winner_pa_low_s;
+                                    config.gcode.pa_high_flow_s = calib_state.pa.winner_pa_high_s;
+                                    config.gcode.enable_dynamic_pa = true;
+                                    config_modified = true;
+                                    plate.status_message = format!(
+                                        "Applied calibrated PA: k_low = {:.4} s, k_high = {:.4} s.",
+                                        config.gcode.pa_low_flow_s, config.gcode.pa_high_flow_s
+                                    );
+                                }
+                                if ui
+                                    .button("Apply as Single PA")
+                                    .on_hover_text("Set both k_low and k_high to Best k_low")
+                                    .clicked()
+                                {
+                                    config.gcode.pa_low_flow_s = calib_state.pa.winner_pa_low_s;
+                                    config.gcode.pa_high_flow_s = calib_state.pa.winner_pa_low_s;
+                                    config_modified = true;
+                                    plate.status_message = format!(
+                                        "Applied single-value PA = {:.4} s to both k_low and k_high.",
+                                        config.gcode.pa_low_flow_s
+                                    );
+                                }
+                            });
+                        });
+                }
+
+                CalibrationUtilityKind::TransientPressure => {
+                    ui.label(
+                        egui::RichText::new(
+                            "Constant-Speed Flow-Step & Staccato Striation Pattern (γ & τ_melt)",
+                        )
+                        .strong(),
+                    );
+                    ui.small(
+                        "Maintains strictly constant toolhead speed (Δv = 0) across an abrupt 3.5:1 cross-section step-down at the X = 0 center tick mark. Firmware PA is 100% inactive, isolating viscoelastic melt-chamber relaxation.",
+                    );
+                    ui.add_space(4.0);
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Calibration Pass:");
+                        for pass in TransientCalibrationPass::ALL {
+                            ui.selectable_value(
+                                &mut calib_state.transient.pass,
+                                pass,
+                                pass.label(),
+                            );
+                        }
+                    });
+
+                    match calib_state.transient.pass {
+                        TransientCalibrationPass::Pass1ExponentGamma => {
+                            calib_state.transient.base_tau_s =
+                                config.gcode.transient_pressure_tau_s;
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut calib_state.transient.start_gamma)
+                                        .speed(0.01)
+                                        .range(0.0..=0.80)
+                                        .prefix("Start γ: "),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut calib_state.transient.end_gamma)
+                                        .speed(0.01)
+                                        .range(0.05..=1.00)
+                                        .prefix("End γ: "),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut calib_state.transient.step_gamma)
+                                        .speed(0.005)
+                                        .range(0.01..=0.25)
+                                        .prefix("Step γ: "),
+                                );
+                            });
+                            ui.small(format!(
+                                "Pass 1 sweeps exponent γ at fixed τ_melt = {:.2} s. Pick the rib where the post-step bulge right after the X = 0 center tick disappears without a necking gap.",
+                                config.gcode.transient_pressure_tau_s
+                            ));
+                        }
+                        TransientCalibrationPass::Pass2RelaxationTau => {
+                            calib_state.transient.base_exponent_gamma =
+                                config.gcode.transient_pressure_exponent;
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut calib_state.transient.start_tau_s)
+                                        .speed(0.01)
+                                        .range(0.02..=2.0)
+                                        .prefix("Start τ_melt: ")
+                                        .suffix(" s"),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut calib_state.transient.end_tau_s)
+                                        .speed(0.01)
+                                        .range(0.05..=5.0)
+                                        .prefix("End τ_melt: ")
+                                        .suffix(" s"),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut calib_state.transient.step_tau_s)
+                                        .speed(0.01)
+                                        .range(0.01..=1.0)
+                                        .prefix("Step τ: ")
+                                        .suffix(" s"),
+                                );
+                            });
+                            ui.small(format!(
+                                "Pass 2 sweeps relaxation time τ_melt at fixed γ = {:.2}. Pick the rib where width stays uniform across the entire decay tail (5–25 mm past X = 0) and across the staccato pulses.",
+                                config.gcode.transient_pressure_exponent
+                            ));
+                        }
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(
+                                &mut calib_state.transient.constant_test_speed_mms,
+                            )
+                            .speed(1.0)
+                            .range(20.0..=200.0)
+                            .prefix("Const Speed (Δv=0): ")
+                            .suffix(" mm/s"),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut calib_state.transient.min_flow_multiplier)
+                                .speed(0.01)
+                                .range(0.40..=1.0)
+                                .prefix("Min Mult: ")
+                                .suffix("×"),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut calib_state.transient.rib_layer_count)
+                                .speed(0.2)
+                                .range(3..=8)
+                                .prefix("Rib Layers: "),
+                        );
+                    });
+
+                    ui.add_space(6.0);
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Apply Calibrated Transient Melt-Zone Parameters",
+                                )
+                                .strong(),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut calib_state.transient.base_exponent_gamma,
+                                    )
+                                    .speed(0.01)
+                                    .range(0.05..=1.0)
+                                    .prefix("Best γ: "),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut calib_state.transient.base_tau_s)
+                                        .speed(0.01)
+                                        .range(0.01..=5.0)
+                                        .prefix("Best τ_melt: ")
+                                        .suffix(" s"),
+                                );
+                                if ui.button("Apply γ & τ_melt").clicked() {
+                                    config.gcode.enable_transient_pressure_comp = true;
+                                    config.gcode.transient_pressure_exponent =
+                                        calib_state.transient.base_exponent_gamma.clamp(0.05, 1.0);
+                                    config.gcode.transient_pressure_tau_s =
+                                        calib_state.transient.base_tau_s.clamp(0.01, 5.0);
+                                    config_modified = true;
+                                    plate.status_message = format!(
+                                        "Applied calibrated Transient Pressure Comp: γ = {:.3}, τ_melt = {:.3} s.",
+                                        config.gcode.transient_pressure_exponent,
+                                        config.gcode.transient_pressure_tau_s,
+                                    );
+                                }
+                            });
+                        });
+                }
+            }
+
+            if config_modified {
+                config.gcode.sanitize();
+                vis_state.dirty_planned_gcode = true;
+            }
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        !is_computing,
+                        egui::Button::new(
+                            egui::RichText::new("Preview in 3D Viewport").strong(),
+                        ),
+                    )
+                    .on_hover_text(
+                        "Generate this calibration pattern and inspect its 3D toolpaths colored by Flow Multiplier, PA, or Melt-Zone Pressure",
+                    )
+                    .clicked()
+                {
+                    request_preview = true;
+                }
+
+                if ui
+                    .add_enabled(
+                        !is_computing && !is_io_busy,
+                        egui::Button::new("Export Calibration G-code..."),
+                    )
+                    .on_hover_text("Generate and save standalone Klipper/Moonraker G-code for this calibration utility")
+                    .clicked()
+                {
+                    request_export = true;
+                }
+            });
+
+            if !calib_state.last_summary_message.is_empty() {
+                ui.add_space(4.0);
+                ui.small(
+                    egui::RichText::new(&calib_state.last_summary_message)
+                        .color(egui::Color32::from_rgb(175, 225, 190)),
+                );
+            }
+
+            if request_preview || request_export {
+                calib_state.em.base_extrusion_multiplier = config.gcode.extrusion_multiplier;
+                calib_state.em.tool_index = calib_state.selected_tool_index;
+                calib_state.pa.tool_index = calib_state.selected_tool_index;
+                calib_state.transient.tool_index = calib_state.selected_tool_index;
+                let tool_id_tag = config
+                    .tools
+                    .get(resolved_tool_idx)
+                    .map(|t| t.id)
+                    .unwrap_or(0);
+                let (res, stem, preferred_color_mode) = match calib_state.active_kind {
+                    CalibrationUtilityKind::ExtrusionMultiplier => {
+                        let pass_tag = match calib_state.em.pass {
+                            EmCalibrationPass::Pass1Coarse => "em_pass1_coarse",
+                            EmCalibrationPass::Pass2Fine => "em_pass2_fine",
+                            EmCalibrationPass::Pass3HighFlowDieSwell => "em_pass3_dieswell",
+                        };
+                        (
+                            generate_em_calibration_gcode(&calib_state.em, config),
+                            format!("calib_t{tool_id_tag}_{pass_tag}"),
+                            ToolpathColorMode::ByExtrusionMultiplier,
+                        )
+                    }
+                    CalibrationUtilityKind::PressureAdvance => {
+                        let mode_tag = match calib_state.pa.mode {
+                            PaCalibrationMode::DualBandShearThinning => "pa_dualband",
+                            PaCalibrationMode::SingleBand => "pa_singleband",
+                        };
+                        (
+                            generate_pa_calibration_gcode(&calib_state.pa, config),
+                            format!("calib_t{tool_id_tag}_{mode_tag}"),
+                            ToolpathColorMode::ByPressureAdvance,
+                        )
+                    }
+                    CalibrationUtilityKind::TransientPressure => {
+                        let pass_tag = match calib_state.transient.pass {
+                            TransientCalibrationPass::Pass1ExponentGamma => "transient_pass1_gamma",
+                            TransientCalibrationPass::Pass2RelaxationTau => "transient_pass2_tau",
+                        };
+                        (
+                            generate_transient_pressure_calibration_gcode(
+                                &calib_state.transient,
+                                config,
+                            ),
+                            format!("calib_t{tool_id_tag}_{pass_tag}"),
+                            ToolpathColorMode::ByExtrusionMultiplier,
+                        )
+                    }
+                };
+
+                let total_sec = res.total_time_s.round() as u64;
+                let mins = total_sec / 60;
+                let secs = total_sec % 60;
+                calib_state.last_generated_filename_stem = stem.clone();
+                calib_state.last_summary_message = format!(
+                    "Generated '{}' — {} layers, {} extruding moves | Est. {:02}m {:02}s | {:.2} m ({:.1} g)",
+                    stem,
+                    res.layers.len(),
+                    res.extruding_move_count,
+                    mins,
+                    secs,
+                    res.total_filament_mm / 1000.0,
+                    res.total_filament_grams,
+                );
+
+                // Always update the 3D viewport preview so the user can inspect the generated calibration pattern
+                let max_layer_idx = res.layers.len().saturating_sub(1);
+                vis_state.selected_layer_min_idx = 0;
+                vis_state.selected_layer_max_idx = max_layer_idx;
+                vis_state.selected_layer_stride = 1;
+                vis_state.show_toolpaths = true;
+                vis_state.toolpath_color_mode = preferred_color_mode;
+                vis_state.cached_planned_gcode = Some(res.clone());
+                vis_state.dirty_planned_gcode = false;
+                vis_state.dirty_toolpaths_mesh = true;
+                plate.status_message = calib_state.last_summary_message.clone();
+
+                if request_export {
+                    let default_filename = format!("{stem}.gcode");
+                    let gcode_bytes = res.gcode_text;
+                    let total_moves = res.extruding_move_count + res.travel_move_count;
+                    plate.status_message =
+                        "Choosing destination for calibration G-code export...".to_string();
+
+                    let save_task = IoTaskPool::get().spawn(async move {
+                        let file_handle = rfd::AsyncFileDialog::new()
+                            .add_filter("G-code (.gcode, .nc)", &["gcode", "nc"])
+                            .set_file_name(&default_filename)
+                            .save_file()
+                            .await?;
+                        let out_path = file_handle.path().to_path_buf();
+                        let kb = gcode_bytes.len() as f64 / 1024.0;
+                        let write_res = std::fs::write(&out_path, gcode_bytes)
+                            .map(|()| {
+                                format!(
+                                    "{} ({:.1} KB, {} moves)",
+                                    out_path.display(),
+                                    kb,
+                                    total_moves
+                                )
+                            })
+                            .map_err(|e| e.to_string());
+                        Some(write_res)
+                    });
+                    plate.pending_save_task = Some(save_task);
+                }
+            }
+        });
+    calib_state.show_window = open;
 }

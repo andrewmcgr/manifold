@@ -1,5 +1,6 @@
 pub mod arrange;
 pub mod bridge;
+pub mod calibration;
 pub mod cli;
 pub mod config;
 pub mod field_vis;
@@ -90,6 +91,7 @@ fn main() {
         .insert_resource(StartupFiles(gui_opts.initial_files))
         .init_resource::<BuildPlateState>()
         .init_resource::<FieldVisualizationState>()
+        .init_resource::<calibration::CalibrationUiState>()
         .init_resource::<surface_ui::SurfaceUiState>()
         .add_systems(Startup, setup_viewport_scene_and_pipeline)
         .add_systems(

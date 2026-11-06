@@ -43,6 +43,7 @@ Located at the very top of the window, the menu bar provides one-click access to
 - **Auto-Arrange Plate**: Runs the Archimedean spiral collision-free packer on all objects on the active build plate around the bed center `(0, 0)`.
 - **Generate Fields & Slice**: Triggers the C++ OpenVDB volumetric solver (`sdf`, `overhang`, `eikonal`), extracts non-planar conformal layers, generates 3D shell/TPMS/support toolpaths, and compiles Klipper G-code.
 - **Export G-code (`.gcode`)**: Writes the generated G-code (including Moonraker thumbnails, `[exclude_object]` polygons, and dynamic PA commands) to disk.
+- **`Calibration ▾`**: Opens the floating **Polymer Rheology & Flow Calibration Utilities** window for generating and previewing Extrusion Multiplier (Pass 1/2/3), Dual-Band Ellis $90^\circ$ Chevron Pressure Advance, and Transient Melt-Zone Pressure ($\gamma$ & $\tau_{\text{melt}}$) calibration prints for any configured toolhead (`T0`, `T1`, …). See the **[Polymer Rheology & Flow Calibration Guide (`docs/calibration_guide.md`)](calibration_guide.md)** for full instructions and visual reading examples.
 
 ### 1.2 Top Presets Bar
 Directly beneath the main menu bar sits the **Four-Category Presets Bar**:

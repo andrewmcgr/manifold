@@ -751,7 +751,7 @@ pub fn sync_field_visualization_system(
         }
     }
 
-    // If no object is selected, hide active field visualization entities
+    // If no object is selected, hide active field visualization entities (except standalone calibration toolpaths)
     let Some(obj_id) = selected_id else {
         if let Some(ent) = vis_state.isosurface_entity {
             if let Ok((_, mut vis)) = iso_query.get_mut(ent) {
@@ -768,9 +768,120 @@ pub fn sync_field_visualization_system(
                 *vis = Visibility::Hidden;
             }
         }
-        if let Some(ent) = vis_state.toolpaths_entity {
-            if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
-                *vis = Visibility::Hidden;
+        if !vis_state.show_toolpaths || vis_state.cached_planned_gcode.is_none() {
+            if let Some(ent) = vis_state.toolpaths_entity {
+                if let Ok((_, mut vis)) = toolpaths_query.get_mut(ent) {
+                    *vis = Visibility::Hidden;
+                }
+            }
+            return;
+        }
+
+        // Render standalone planned G-code toolpaths (e.g., Calibration Patterns) at Transform::IDENTITY
+        if vis_state.dirty_toolpaths_mesh {
+            vis_state.dirty_toolpaths_mesh = false;
+            let stride = vis_state.selected_layer_stride.max(1);
+            let min_idx = vis_state.selected_layer_min_idx;
+            let max_idx = vis_state.selected_layer_max_idx;
+            let highlighted = vis_state.highlighted_selected_layer;
+            let color_mode = vis_state.toolpath_color_mode;
+
+            let mut positions: Vec<[f32; 3]> = Vec::new();
+            let mut normals: Vec<[f32; 3]> = Vec::new();
+            let mut colors: Vec<[f32; 4]> = Vec::new();
+            let mut indices: Vec<u32> = Vec::new();
+
+            if let Some(ref planned) = vis_state.cached_planned_gcode {
+                let total = planned.layers.len();
+                if total > 0 {
+                    let lo = min_idx.min(total - 1);
+                    let hi = max_idx.min(total - 1).max(lo);
+                    for (idx, layer_p) in planned.layers.iter().enumerate() {
+                        let is_hovered = highlighted == Some(idx);
+                        let in_range = idx >= lo && idx <= hi;
+                        let matches_stride =
+                            (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
+                        if !is_hovered && (!in_range || !matches_stride) {
+                            continue;
+                        }
+                        let dim_factor = if is_hovered {
+                            1.15
+                        } else if highlighted.is_some() {
+                            0.55
+                        } else {
+                            1.0
+                        };
+                        for seg in &layer_p.segments {
+                            if !vis_state.is_planned_segment_visible(seg) {
+                                continue;
+                            }
+                            append_planned_segment_bead_mesh(
+                                seg,
+                                planned,
+                                color_mode,
+                                &config,
+                                dim_factor,
+                                &mut positions,
+                                &mut normals,
+                                &mut colors,
+                                &mut indices,
+                            );
+                        }
+                    }
+                }
+            }
+
+            if !positions.is_empty() && !indices.is_empty() {
+                let bevy_mesh = Mesh::new(
+                    PrimitiveTopology::TriangleList,
+                    RenderAssetUsages::default(),
+                )
+                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+                .with_inserted_indices(Indices::U32(indices));
+
+                if let (Some(ent), Some(ref mesh_h), Some(ref mat_h)) = (
+                    vis_state.toolpaths_entity,
+                    &vis_state.toolpaths_mesh_handle,
+                    &vis_state.toolpaths_mat_handle,
+                ) {
+                    meshes.insert(mesh_h, bevy_mesh);
+                    if let Some(mat) = materials.get_mut(mat_h) {
+                        mat.base_color = Color::WHITE;
+                    }
+                    if let Ok((mut tf, mut vis)) = toolpaths_query.get_mut(ent) {
+                        *tf = Transform::IDENTITY;
+                        *vis = Visibility::Inherited;
+                    }
+                } else {
+                    let mesh_h = meshes.add(bevy_mesh);
+                    let mat_h = materials.add(StandardMaterial {
+                        base_color: Color::WHITE,
+                        metallic: 0.0,
+                        perceptual_roughness: 0.56,
+                        reflectance: 0.16,
+                        alpha_mode: AlphaMode::Opaque,
+                        depth_bias: 14.0,
+                        double_sided: true,
+                        cull_mode: None,
+                        ..default()
+                    });
+                    let ent = commands
+                        .spawn((
+                            PbrBundle {
+                                mesh: mesh_h.clone(),
+                                material: mat_h.clone(),
+                                transform: Transform::IDENTITY,
+                                ..default()
+                            },
+                            ToolpathsMeshEntity,
+                        ))
+                        .id();
+                    vis_state.toolpaths_entity = Some(ent);
+                    vis_state.toolpaths_mesh_handle = Some(mesh_h);
+                    vis_state.toolpaths_mat_handle = Some(mat_h);
+                }
             }
         }
         return;

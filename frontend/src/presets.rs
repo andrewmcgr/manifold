@@ -442,6 +442,7 @@ pub struct FilamentPreset {
     pub enable_transient_pressure_comp: bool,
     pub transient_pressure_exponent: f32,
     pub transient_min_flow_multiplier: f32,
+    pub transient_pressure_tau_s: f32,
     pub ooze_relaxation_extra_prime_mm: f32,
     pub ooze_relaxation_tau_s: f32,
 }
@@ -488,6 +489,7 @@ impl FilamentPreset {
             enable_transient_pressure_comp: cfg.gcode.enable_transient_pressure_comp,
             transient_pressure_exponent: cfg.gcode.transient_pressure_exponent,
             transient_min_flow_multiplier: cfg.gcode.transient_min_flow_multiplier,
+            transient_pressure_tau_s: cfg.gcode.transient_pressure_tau_s,
             ooze_relaxation_extra_prime_mm: cfg.gcode.ooze_relaxation_extra_prime_mm,
             ooze_relaxation_tau_s: cfg.gcode.ooze_relaxation_tau_s,
         }
@@ -526,6 +528,7 @@ impl FilamentPreset {
         cfg.gcode.enable_transient_pressure_comp = self.enable_transient_pressure_comp;
         cfg.gcode.transient_pressure_exponent = self.transient_pressure_exponent;
         cfg.gcode.transient_min_flow_multiplier = self.transient_min_flow_multiplier;
+        cfg.gcode.transient_pressure_tau_s = self.transient_pressure_tau_s;
         cfg.gcode.ooze_relaxation_extra_prime_mm = self.ooze_relaxation_extra_prime_mm;
         cfg.gcode.ooze_relaxation_tau_s = self.ooze_relaxation_tau_s;
         cfg.gcode.sanitize();
@@ -583,6 +586,10 @@ impl FilamentPreset {
             && approx_eq(
                 self.transient_min_flow_multiplier,
                 cfg.gcode.transient_min_flow_multiplier,
+            )
+            && approx_eq(
+                self.transient_pressure_tau_s,
+                cfg.gcode.transient_pressure_tau_s,
             )
             && approx_eq(
                 self.ooze_relaxation_extra_prime_mm,

@@ -327,7 +327,7 @@ impl MeltPressureTracker {
     }
 
     /// Advances the melt-zone state across an extruding segment and returns `(flow_multiplier, p_avg_mm3s)`.
-    fn step_extrusion(
+    pub(crate) fn step_extrusion(
         &mut self,
         q_target_mm3s: f32,
         duration_s: f32,
@@ -335,7 +335,7 @@ impl MeltPressureTracker {
         rate_mult: f32,
         cfg: &GcodeProcessConfig,
     ) -> (f32, f32) {
-        let k = tau_pa_s.max(0.005);
+        let k = cfg.transient_pressure_tau_s.max(tau_pa_s).max(0.005);
         let dt = duration_s.max(1.0e-4);
         let x = (dt / k).clamp(0.0, 50.0);
         let i_x = Self::integral_decay_ratio(x);
@@ -373,7 +373,7 @@ impl MeltPressureTracker {
     }
 
     /// Decays melt-zone pressure during non-extruding travel moves.
-    fn step_travel(&mut self, duration_s: f32, tau_pa_s: f32) -> f32 {
+    pub(crate) fn step_travel(&mut self, duration_s: f32, tau_pa_s: f32) -> f32 {
         let k = tau_pa_s.max(0.005);
         let dt = duration_s.max(0.0);
         let x = (dt / k).clamp(0.0, 50.0);
@@ -2632,7 +2632,10 @@ pub fn plan_and_emit_gcode_for_object(
                 last_q_mm3s = seg.volumetric_flow_mm3s;
                 last_pa_s = seg.pressure_advance_s;
             } else {
-                let p_avg = pressure_tracker.step_travel(seg.duration_s, last_pa_s);
+                let p_avg = pressure_tracker.step_travel(
+                    seg.duration_s,
+                    gcfg.transient_pressure_tau_s.max(last_pa_s),
+                );
                 seg.melt_pressure_mm3s = p_avg;
                 seg.pressure_advance_s = last_pa_s;
             }

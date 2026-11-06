@@ -1179,6 +1179,9 @@ pub struct GcodeProcessConfig {
     pub enable_transient_pressure_comp: bool,
     pub transient_pressure_exponent: f32,
     pub transient_min_flow_multiplier: f32,
+    /// Viscoelastic melt-chamber pressure relaxation time constant $\tau_{\text{melt}}$ (seconds)
+    /// governing the exponential decay of stored melt-zone pressure across cross-section / flow step-downs.
+    pub transient_pressure_tau_s: f32,
     pub enable_dynamic_pa: bool,
     pub enable_slicer_pa_subdivision: bool,
     pub pa_low_flow_s: f32,
@@ -1257,6 +1260,7 @@ impl Default for GcodeProcessConfig {
             enable_transient_pressure_comp: true,
             transient_pressure_exponent: 0.35,
             transient_min_flow_multiplier: 0.72,
+            transient_pressure_tau_s: 0.25,
             enable_dynamic_pa: true,
             enable_slicer_pa_subdivision: false,
             pa_low_flow_s: 0.042,
@@ -1346,6 +1350,7 @@ impl GcodeProcessConfig {
         self.corner_flow_comp_ratio = self.corner_flow_comp_ratio.clamp(0.0, 1.0);
         self.transient_pressure_exponent = self.transient_pressure_exponent.clamp(0.05, 1.0);
         self.transient_min_flow_multiplier = self.transient_min_flow_multiplier.clamp(0.40, 1.0);
+        self.transient_pressure_tau_s = self.transient_pressure_tau_s.clamp(0.01, 5.0);
         self.pa_low_flow_s = self.pa_low_flow_s.clamp(0.0, 0.5);
         self.pa_high_flow_s = self.pa_high_flow_s.clamp(0.0, 0.5);
         self.pa_ref_low_flow_mm3s = self.pa_ref_low_flow_mm3s.clamp(0.1, 30.0);
@@ -2372,10 +2377,10 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         key: "gcode.transient_pressure_comp",
         category: "Rheology, Die Swell & Dynamic PA",
         title: "Melt-Zone Transient Pressure Compensation",
-        units: "bool / exp / min×",
-        default_value: "true (exp 0.35, min 0.72×)",
+        units: "bool / exp γ / τ_melt (s) / min×",
+        default_value: "true (exp 0.35, τ 0.25 s, min 0.72×)",
         summary: "First-order lag model of nozzle melt-chamber pressure across variable-width/height segments.",
-        details: "When stepping down from high-flow to low-flow segments, temporarily throttles extrusion (`>= Min Multiplier`) while stored melt-zone pressure discharges.",
+        details: "When stepping down from high-flow to low-flow segments (such as infill-to-wall transitions or non-planar conformal layer pinching), temporarily throttles extrusion (`>= Min Multiplier`) with time constant `τ_melt` (`transient_pressure_tau_s`) and exponent `γ` (`transient_pressure_exponent`) while stored melt-zone pressure discharges.",
     },
 
     // --- Start & End G-code Templates ---

@@ -17,10 +17,11 @@
   manifold-frontend project.3mf
   ```
 - **Run Headless CLI Commands**:
-  Passing `slice`, `profile` (or aliases `preset`, `config`), `--help`, or `--version` runs headlessly in the terminal and exits without opening a window:
+  Passing `slice`, `calibrate` (or alias `calibration`), `profile` (or aliases `preset`, `config`), `--help`, or `--version` runs headlessly in the terminal and exits without opening a window:
   ```bash
   manifold-frontend --help
   manifold-frontend slice --help
+  manifold-frontend calibrate --help
   manifold-frontend profile --help
   ```
 
@@ -93,7 +94,47 @@ manifold-frontend slice --arrange --save-3mf batch_plate.3mf -o batch_plate.gcod
 
 ---
 
-## 3. Profile & Preset Management (`manifold-frontend profile`)
+## 3. Polymer Rheology & Flow Calibration (`manifold-frontend calibrate`)
+
+Generates native, kinematics-aware G-code test patterns for calibrating Extrusion Multiplier (`em`), Shear-Thinning Pressure Advance (`pa`), High-Flow Viscoelastic Die Swell (`em --pass 3`), and Transient Melt-Zone Pressure Compensation (`transient`). For visual reading guides and worked examples, see **[`docs/calibration_guide.md`](calibration_guide.md)**.
+
+### Synopsis
+
+```bash
+manifold-frontend calibrate <em|pa|transient> [OPTIONS]
+```
+
+### Calibration Options
+
+| Option | Description |
+| :--- | :--- |
+| `<em\|pa\|transient>` | Calibration utility to generate:<br>• `em`: Extrusion Multiplier & High-Flow Die Swell coupons<br>• `pa`: Ellis $90^\circ$ Chevron Pressure Advance pattern<br>• `transient`: Constant-speed cross-section step-down ribs for $\gamma$ and $\tau_{\text{melt}}$ |
+| `-o, --output <PATH>` | Output `.gcode` file path (or `-` for `stdout`). Defaults to `calibration_<type>.gcode`. |
+| `-p, --profile <FILE>` | Load base `.json` or `.toml` profile file (repeatable). |
+| `--printer / --tool / --filament / --process <NAME_OR_FILE>` | Apply category preset(s) before generating the calibration pattern. |
+| `-t, --tool-id <ID_OR_NAME>` / `--tool-index <IDX>` | Select which extruder toolhead in `config.tools` to calibrate (e.g. `-t T0`, `-t T1`, `-t 1`, or `--tool-index 1`). Uses that tool's nozzle diameter, hotend temperature, `NozzleFrame`, and `{tool_id}` placeholder. |
+| `-s, --set <KEY=VALUE>` | Override any `SlicerConfig` parameter inline (repeatable). |
+| `--pass <1\|2\|3>` | Pass selection:<br>• For `em`: `1` = Coarse (`-10%..+10%`), `2` = Fine (`-2%..+2%`), `3` = High-Flow Die Swell (`0.86..0.98`)<br>• For `transient`: `1` = Stage 1 Exponent $\gamma$, `2` = Stage 2 Relaxation Time $\tau_{\text{melt}}$ |
+| `--center <FLOAT>` | Center extrusion multiplier for `calibrate em --pass 2` (defaults to `gcode.extrusion_multiplier`). |
+| `--mode <dual\|single>` | Mode for `calibrate pa`: `dual` (default, prints both `LOW Q` and `HIGH Q` chevron banks) or `single` (prints a single bank at `--fast-speed`). |
+| `--start <FLOAT>` / `--end <FLOAT>` / `--step <FLOAT>` | Parameter sweep range and step size (`s` for `pa` and `transient --pass 2`, dimensionless $\gamma$ for `transient --pass 1`). |
+| `--fast-speed <MM_S>` / `--slow-speed <MM_S>` / `--accel <MM_S2>` | Override test speeds and acceleration for `calibrate pa` or `calibrate transient`. |
+| `--adhesion-ribbons` / `--no-adhesion-ribbons` | Enable or disable optional Layer 0 apex stabilization ribbons on `calibrate pa` (disabled by default for maximum corner contrast against the build plate). |
+
+### Calibration Examples
+
+```bash
+# Generate Dual-Band Shear-Thinning PA pattern for Tool T1 (0.6mm High-Flow):
+manifold-frontend calibrate pa -p my_profile.json -t T1 --mode dual -o calib_pa_t1.gcode
+
+# Generate Stage 1 (γ) and Stage 2 (τ_melt) Transient Melt Pressure patterns:
+manifold-frontend calibrate transient -p my_profile.json -t T0 --pass 1 -o calib_transient_gamma.gcode
+manifold-frontend calibrate transient -p my_profile.json -t T0 --pass 2 -s transient_pressure_exponent=0.34 -o calib_transient_tau.gcode
+```
+
+---
+
+## 4. Profile & Preset Management (`manifold-frontend profile`)
 
 The `profile` command (also accessible via aliases `preset`, `presets`, `profiles`, or `config`) provides structured verbs for creating, inspecting, comparing, validating, and editing `.json` and `.toml` profiles as well as user presets stored in `~/.config/manifold2/presets/`.
 

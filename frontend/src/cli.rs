@@ -7,6 +7,11 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::arrange::{auto_arrange_spiral, ArrangeItem};
 use crate::bridge::ffi;
+use crate::calibration::{
+    generate_em_calibration_gcode, generate_pa_calibration_gcode,
+    generate_transient_pressure_calibration_gcode, EmCalibrationPass, EmCalibrationSpec,
+    PaCalibrationMode, PaCalibrationSpec, TransientCalibrationPass, TransientCalibrationSpec,
+};
 use crate::config::{SlicerConfig, PARAMETER_DOCS};
 use crate::gcode::{
     expand_gcode_template, format_exclude_object_define, format_moonraker_estimated_time,
@@ -118,6 +123,13 @@ pub fn run_cli_with_args(args: &[String]) -> CliDispatch {
                 }
             }
         }
+        "calibrate" | "cal" => match cmd_calibrate(&args[1..]) {
+            Ok(()) => CliDispatch::Exit(0),
+            Err(err) => {
+                eprintln!("Error: {err}");
+                CliDispatch::Exit(1)
+            }
+        },
         // Convenience shorthand: if the user passes flags like `-p profile.json -o out.gcode part.stl`
         // directly without the `slice` verb, treat it as `slice` when `-o`/`--output`/`--slice` is present,
         // or launch GUI with the loaded file(s) if only CAD/mesh/3MF paths are given.
@@ -186,6 +198,7 @@ pub fn print_top_level_help() {
             "  manifold-frontend                         Launch interactive 3D GUI\n",
             "  manifold-frontend gui [OPTIONS] [FILES]   Launch GUI with preloaded profile/files\n",
             "  manifold-frontend slice [OPTIONS] <FILES> Slice STEP/STL/3MF objects to G-code\n",
+            "  manifold-frontend calibrate <KIND> [...]  Generate EM/Swell, PA, or Transient calibration G-code\n",
             "  manifold-frontend profile <VERB> [...]    Inspect, create, diff, and edit profiles/presets\n\n",
             "SLICE OPTIONS (`manifold-frontend slice --help` for full details):\n",
             "  -p, --profile <FILE>          Load full or partial profile (.json or .toml; repeatable)\n",
@@ -284,6 +297,45 @@ fn print_profile_help() {
             "  manifold-frontend profile set profile.json gcode.bed_temperature_celsius=80 infill_density_percent=25\n",
             "  manifold-frontend profile diff profile.json\n",
             "  manifold-frontend profile keys --filter overhang\n"
+        )
+    );
+}
+
+fn print_calibrate_help() {
+    println!(
+        concat!(
+            "Manifold Slicer — Rheology & Extrusion Calibration (`manifold-frontend calibrate`)\n\n",
+            "USAGE:\n",
+            "  manifold-frontend calibrate <em|pa|transient> [OPTIONS] [-o <OUT.gcode>]\n\n",
+            "KINDS:\n",
+            "  em | flow | swell             Orca-style surface quality coupon array (9 coupons:\n",
+            "                                Pass 1 Coarse EM, Pass 2 Fine EM, Pass 3 High-Flow Die Swell).\n",
+            "  pa | pressure-advance         Ellis-style 90° sharp-corner chevron pattern\n",
+            "                                (Dual-Band Shear-Thinning k_low + k_high or Single-Band).\n",
+            "  transient | melt-pressure     Constant-Speed Flow-Step & Staccato Striation pattern\n",
+            "                                (Δv = 0 across X = 0 step-down; Pass 1 γ, Pass 2 τ_melt).\n\n",
+            "OPTIONS:\n",
+            "  -p, --profile <FILE>          Load full or partial profile (.json or .toml; repeatable)\n",
+            "      --printer <NAME_OR_FILE>  Select a Printer preset\n",
+            "      --tool <NAME_OR_FILE>     Select a Tool preset\n",
+            "      --filament <NAME_OR_FILE> Select a Filament preset\n",
+            "      --process <NAME_OR_FILE>  Select a Process preset\n",
+            "  -s, --set <KEY=VALUE>         Override any profile parameter (repeatable)\n",
+            "      --pass <1|2|3>            Pass number (`1`, `2`, or `3` for `em`; `1` or `2` for `transient`)\n",
+            "      --mode <dual|single>      PA mode (`dual` for k_low + k_high or `single`)\n",
+            "      --start <VAL>             Sweep start value (PA s, γ, or τ_melt s)\n",
+            "      --end <VAL>               Sweep end value (PA s, γ, or τ_melt s)\n",
+            "      --step <VAL>              Sweep step size (PA s, γ, or τ_melt s)\n",
+            "      --speed <MM_S>            Fast print speed (`pa` single-band) or constant speed (`transient`)\n",
+            "      --accel <MM_S2>           Corner acceleration for `pa` pattern (mm/s²)\n",
+            "  -o, --output <PATH>           Destination `.gcode` file path (or `-` for stdout)\n",
+            "  -q, --quiet                   Suppress summary output on stderr\n\n",
+            "EXAMPLES:\n",
+            "  manifold-frontend calibrate em --pass 1 --filament \"Generic PETG\" -o em_pass1.gcode\n",
+            "  manifold-frontend calibrate em --pass 3 -o em_pass3_swell.gcode\n",
+            "  manifold-frontend calibrate pa --mode dual --start 0.0 --end 0.06 --step 0.005 -o pa_dual.gcode\n",
+            "  manifold-frontend calibrate transient --pass 1 -o transient_gamma.gcode\n",
+            "  manifold-frontend calibrate transient --pass 2 -s transient_pressure_exponent=0.26 -o transient_tau.gcode\n"
         )
     );
 }
@@ -2683,6 +2735,375 @@ fn cmd_profile_validate(args: &[String]) -> Result<(), String> {
 }
 
 // ============================================================================
+// Headless Calibration Pattern Generator (`manifold-frontend calibrate ...`)
+// ============================================================================
+
+pub fn cmd_calibrate(args: &[String]) -> Result<(), String> {
+    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help" || a == "help") {
+        print_calibrate_help();
+        return Ok(());
+    }
+
+    let kind_str = args[0].trim().to_ascii_lowercase();
+    let mut profile_spec = ProfileBuildSpec::default();
+    let mut output_path: Option<PathBuf> = None;
+    let mut tool_selector: Option<String> = None;
+    let mut pass_num: Option<u32> = None;
+    let mut mode_str: Option<String> = None;
+    let mut start_val: Option<f32> = None;
+    let mut end_val: Option<f32> = None;
+    let mut step_val: Option<f32> = None;
+    let mut speed_val: Option<f32> = None;
+    let mut accel_val: Option<f32> = None;
+    let mut quiet = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-p" | "--profile" => {
+                i += 1;
+                profile_spec.base_files.push(PathBuf::from(
+                    args.get(i)
+                        .ok_or_else(|| "Missing file path after `--profile`".to_string())?,
+                ));
+            }
+            "--printer" => {
+                i += 1;
+                profile_spec.printer = Some(
+                    args.get(i)
+                        .ok_or_else(|| "Missing value after `--printer`".to_string())?
+                        .clone(),
+                );
+            }
+            "--tool" => {
+                i += 1;
+                profile_spec.tool = Some(
+                    args.get(i)
+                        .ok_or_else(|| "Missing value after `--tool`".to_string())?
+                        .clone(),
+                );
+            }
+            "-t" | "--tool-id" | "--tool-index" => {
+                i += 1;
+                tool_selector = Some(
+                    args.get(i)
+                        .ok_or_else(|| format!("Missing tool ID/index after `{a}`"))?
+                        .clone(),
+                );
+            }
+            "--filament" => {
+                i += 1;
+                profile_spec.filament = Some(
+                    args.get(i)
+                        .ok_or_else(|| "Missing value after `--filament`".to_string())?
+                        .clone(),
+                );
+            }
+            "--process" => {
+                i += 1;
+                profile_spec.process = Some(
+                    args.get(i)
+                        .ok_or_else(|| "Missing value after `--process`".to_string())?
+                        .clone(),
+                );
+            }
+            "-s" | "--set" | "-D" => {
+                i += 1;
+                let kv = args
+                    .get(i)
+                    .ok_or_else(|| format!("Missing `KEY=VALUE` after `{a}`"))?;
+                profile_spec.overrides.push(parse_key_eq_val(kv)?);
+            }
+            "--pass" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "Missing pass number after `--pass`".to_string())?;
+                pass_num = Some(
+                    v.parse::<u32>()
+                        .map_err(|_| format!("Invalid `--pass` number '{v}'"))?,
+                );
+            }
+            "--mode" => {
+                i += 1;
+                mode_str = Some(
+                    args.get(i)
+                        .ok_or_else(|| "Missing mode after `--mode`".to_string())?
+                        .to_ascii_lowercase(),
+                );
+            }
+            "--start" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "Missing value after `--start`".to_string())?;
+                start_val = Some(
+                    v.parse::<f32>()
+                        .map_err(|_| format!("Invalid `--start` value '{v}'"))?,
+                );
+            }
+            "--end" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "Missing value after `--end`".to_string())?;
+                end_val = Some(
+                    v.parse::<f32>()
+                        .map_err(|_| format!("Invalid `--end` value '{v}'"))?,
+                );
+            }
+            "--step" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "Missing value after `--step`".to_string())?;
+                step_val = Some(
+                    v.parse::<f32>()
+                        .map_err(|_| format!("Invalid `--step` value '{v}'"))?,
+                );
+            }
+            "--speed" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "Missing value after `--speed`".to_string())?;
+                speed_val = Some(
+                    v.parse::<f32>()
+                        .map_err(|_| format!("Invalid `--speed` value '{v}'"))?,
+                );
+            }
+            "--accel" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| "Missing value after `--accel`".to_string())?;
+                accel_val = Some(
+                    v.parse::<f32>()
+                        .map_err(|_| format!("Invalid `--accel` value '{v}'"))?,
+                );
+            }
+            "-o" | "--output" => {
+                i += 1;
+                output_path = Some(PathBuf::from(
+                    args.get(i)
+                        .ok_or_else(|| "Missing path after `--output`".to_string())?,
+                ));
+            }
+            "-q" | "--quiet" => {
+                quiet = true;
+            }
+            other => {
+                return Err(format!(
+                    "Unknown option '{other}' for `calibrate`. Run `manifold-frontend calibrate --help`."
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    let lib = PresetLibrary::default();
+    let mut cfg = SlicerConfig::default();
+    profile_spec.apply_onto(&mut cfg, &lib)?;
+
+    let resolved_tool_index: Option<usize> = if let Some(ref raw_sel) = tool_selector {
+        let trimmed = raw_sel.trim().trim_start_matches(['t', 'T']);
+        let num = trimmed
+            .parse::<u32>()
+            .map_err(|_| format!("Invalid tool selector '{raw_sel}' (expected tool ID like `0`, `1`, `T0`, `T1`)"))?;
+        let idx = cfg
+            .tools
+            .iter()
+            .position(|t| t.id == num)
+            .or_else(|| {
+                let as_usize = num as usize;
+                (as_usize < cfg.tools.len()).then_some(as_usize)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Tool '{raw_sel}' not found in configuration (available tools: {})",
+                    cfg.tools
+                        .iter()
+                        .map(|t| format!("T{} ({})", t.id, t.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        cfg.active_tool_index = idx;
+        Some(idx)
+    } else {
+        None
+    };
+    sync_config_to_backend(&cfg);
+
+    let (planned, default_filename) = match kind_str.as_str() {
+        "em" | "flow" | "swell" | "extrusion-multiplier" => {
+            let mut spec = EmCalibrationSpec::default();
+            spec.tool_index = resolved_tool_index;
+            let pass = match pass_num.unwrap_or(1) {
+                1 => EmCalibrationPass::Pass1Coarse,
+                2 => EmCalibrationPass::Pass2Fine,
+                3 => EmCalibrationPass::Pass3HighFlowDieSwell,
+                other => {
+                    return Err(format!(
+                        "Unsupported `--pass {other}` for `calibrate em` (expected 1, 2, or 3)"
+                    ));
+                }
+            };
+            spec.apply_pass_defaults(pass, cfg.gcode.extrusion_multiplier);
+            if pass == EmCalibrationPass::Pass3HighFlowDieSwell {
+                if let Some(s) = start_val {
+                    spec.start_swell_high = s;
+                }
+                if let Some(e) = end_val {
+                    spec.end_swell_high = e;
+                }
+                if let Some(st) = step_val {
+                    spec.step_swell_high = st;
+                }
+            } else {
+                if let Some(s) = start_val {
+                    spec.start_delta_pct = s;
+                }
+                if let Some(e) = end_val {
+                    spec.end_delta_pct = e;
+                }
+                if let Some(st) = step_val {
+                    spec.step_delta_pct = st;
+                }
+            }
+            let fname = match spec.pass {
+                EmCalibrationPass::Pass1Coarse => "calib_em_pass1_coarse.gcode",
+                EmCalibrationPass::Pass2Fine => "calib_em_pass2_fine.gcode",
+                EmCalibrationPass::Pass3HighFlowDieSwell => "calib_em_pass3_dieswell.gcode",
+            };
+            (generate_em_calibration_gcode(&spec, &cfg), fname)
+        }
+        "pa" | "pressure-advance" => {
+            let mut spec = PaCalibrationSpec::default();
+            spec.tool_index = resolved_tool_index;
+            if let Some(ref m) = mode_str {
+                spec.mode = match m.as_str() {
+                    "dual" | "dual-band" | "dualband" => PaCalibrationMode::DualBandShearThinning,
+                    "single" | "single-band" | "singleband" => PaCalibrationMode::SingleBand,
+                    other => {
+                        return Err(format!(
+                            "Unsupported `--mode {other}` for `calibrate pa` (expected `dual` or `single`)"
+                        ));
+                    }
+                };
+            }
+            if let Some(s) = start_val {
+                spec.pa_start_s = s;
+            }
+            if let Some(e) = end_val {
+                spec.pa_end_s = e;
+            }
+            if let Some(st) = step_val {
+                spec.pa_step_s = st;
+            }
+            if let Some(spd) = speed_val {
+                spec.fast_speed_mms = spd;
+            }
+            if let Some(acc) = accel_val {
+                spec.accel_mms2 = acc;
+            }
+            let fname = match spec.mode {
+                PaCalibrationMode::DualBandShearThinning => "calib_pa_dualband.gcode",
+                PaCalibrationMode::SingleBand => "calib_pa_singleband.gcode",
+            };
+            (generate_pa_calibration_gcode(&spec, &cfg), fname)
+        }
+        "transient" | "melt-pressure" | "transient-pressure" => {
+            let mut spec = TransientCalibrationSpec::default();
+            spec.tool_index = resolved_tool_index;
+            spec.base_exponent_gamma = cfg.gcode.transient_pressure_exponent;
+            spec.base_tau_s = cfg.gcode.transient_pressure_tau_s;
+            spec.min_flow_multiplier = cfg.gcode.transient_min_flow_multiplier;
+            spec.pass = match pass_num.unwrap_or(1) {
+                1 => TransientCalibrationPass::Pass1ExponentGamma,
+                2 => TransientCalibrationPass::Pass2RelaxationTau,
+                other => {
+                    return Err(format!(
+                        "Unsupported `--pass {other}` for `calibrate transient` (expected 1 or 2)"
+                    ));
+                }
+            };
+            match spec.pass {
+                TransientCalibrationPass::Pass1ExponentGamma => {
+                    if let Some(s) = start_val {
+                        spec.start_gamma = s;
+                    }
+                    if let Some(e) = end_val {
+                        spec.end_gamma = e;
+                    }
+                    if let Some(st) = step_val {
+                        spec.step_gamma = st;
+                    }
+                }
+                TransientCalibrationPass::Pass2RelaxationTau => {
+                    if let Some(s) = start_val {
+                        spec.start_tau_s = s;
+                    }
+                    if let Some(e) = end_val {
+                        spec.end_tau_s = e;
+                    }
+                    if let Some(st) = step_val {
+                        spec.step_tau_s = st;
+                    }
+                }
+            }
+            if let Some(spd) = speed_val {
+                spec.constant_test_speed_mms = spd;
+            }
+            let fname = match spec.pass {
+                TransientCalibrationPass::Pass1ExponentGamma => "calib_transient_pass1_gamma.gcode",
+                TransientCalibrationPass::Pass2RelaxationTau => "calib_transient_pass2_tau.gcode",
+            };
+            (
+                generate_transient_pressure_calibration_gcode(&spec, &cfg),
+                fname,
+            )
+        }
+        other => {
+            return Err(format!(
+                "Unknown calibration kind '{other}' (expected `em`, `pa`, or `transient`)"
+            ));
+        }
+    };
+
+    let out_path = output_path.unwrap_or_else(|| PathBuf::from(default_filename));
+    if out_path.as_os_str() == "-" {
+        io::stdout()
+            .write_all(planned.gcode_text.as_bytes())
+            .map_err(|e| e.to_string())?;
+    } else {
+        if let Some(parent) = out_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
+            }
+        }
+        fs::write(&out_path, planned.gcode_text.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {e}", out_path.display()))?;
+    }
+
+    if !quiet {
+        eprintln!(
+            "[Manifold CLI] Generated calibration G-code '{}' ({} layers, {} extruding moves, {:.2} m / {:.1} g, est. {:.0} s)",
+            out_path.display(),
+            planned.layers.len(),
+            planned.extruding_move_count,
+            planned.total_filament_mm / 1000.0,
+            planned.total_filament_grams,
+            planned.total_time_s,
+        );
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Unit Tests for CLI Profile Editing & Headless Slicing
 // ============================================================================
 
@@ -2832,5 +3253,64 @@ mod tests {
 
         let _ = fs::remove_file(&profile_path);
         let _ = fs::remove_file(&gcode_path);
+    }
+
+    #[test]
+    fn test_cli_calibrate_em_pa_and_transient_subcommands() {
+        let tmp_dir = std::env::temp_dir().join("manifold2_cli_calib_test");
+        let _ = fs::create_dir_all(&tmp_dir);
+
+        let em_p3_path = tmp_dir.join("calib_em_p3.gcode");
+        cmd_calibrate(&[
+            "em".to_string(),
+            "--pass".to_string(),
+            "3".to_string(),
+            "-s".to_string(),
+            "bed_tilt_rx_deg=12.0".to_string(),
+            "-q".to_string(),
+            "-o".to_string(),
+            em_p3_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let em_text = fs::read_to_string(&em_p3_path).unwrap();
+        assert!(em_text.contains("Pass 3: High-Flow Die Swell"));
+
+        let pa_dual_path = tmp_dir.join("calib_pa_dual.gcode");
+        cmd_calibrate(&[
+            "pa".to_string(),
+            "--mode".to_string(),
+            "dual".to_string(),
+            "--start".to_string(),
+            "0.0".to_string(),
+            "--end".to_string(),
+            "0.03".to_string(),
+            "--step".to_string(),
+            "0.01".to_string(),
+            "-q".to_string(),
+            "-o".to_string(),
+            pa_dual_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let pa_text = fs::read_to_string(&pa_dual_path).unwrap();
+        assert!(pa_text.contains("SET_PRESSURE_ADVANCE ADVANCE="));
+
+        let trans_p2_path = tmp_dir.join("calib_trans_p2.gcode");
+        cmd_calibrate(&[
+            "transient".to_string(),
+            "--pass".to_string(),
+            "2".to_string(),
+            "-s".to_string(),
+            "transient_pressure_exponent=0.28".to_string(),
+            "-q".to_string(),
+            "-o".to_string(),
+            trans_p2_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let trans_text = fs::read_to_string(&trans_p2_path).unwrap();
+        assert!(trans_text.contains("Calibration_Transient_Melt_Pressure"));
+
+        let _ = fs::remove_file(&em_p3_path);
+        let _ = fs::remove_file(&pa_dual_path);
+        let _ = fs::remove_file(&trans_p2_path);
     }
 }
