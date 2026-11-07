@@ -5675,6 +5675,140 @@ mod tests {
         crate::ui::sync_config_to_backend(&default_cfg);
         let _ = ffi::remove_cad_object(obj.object_id);
     }
+
+    #[test]
+    fn test_benchy_like_hull_infill_never_extends_outside_object() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Construct a Benchy-like overhanging boat hull with a recessed bottom plaque cavity
+        // (`z = 0..1.2 mm`) and flaring bow/chine transition (`z = 0..5.0 mm`) in Dual-Grid mode.
+        // Previously, `pl.sdfClipAllowance` (~0.1125 mm around z = 1.6..1.8 mm) collided with the
+        // `0.45 * fineVoxelSize` outer-boundary filter in `generateShellToolpathsForLayers`,
+        // dropping part of `\Gamma_outer` and causing `SolidInfill` to spill outside the object.
+        let mut stl = String::from("solid benchy_hull\n");
+        let mut add_quad = |p00: [f32; 3], p10: [f32; 3], p11: [f32; 3], p01: [f32; 3]| {
+            stl.push_str(&format!(
+                "  facet normal 0 0 0\n    outer loop\n      vertex {} {} {}\n      vertex {} {} {}\n      vertex {} {} {}\n    endloop\n  endfacet\n",
+                p00[0], p00[1], p00[2], p10[0], p10[1], p10[2], p11[0], p11[1], p11[2]
+            ));
+            stl.push_str(&format!(
+                "  facet normal 0 0 0\n    outer loop\n      vertex {} {} {}\n      vertex {} {} {}\n      vertex {} {} {}\n    endloop\n  endfacet\n",
+                p00[0], p00[1], p00[2], p11[0], p11[1], p11[2], p01[0], p01[1], p01[2]
+            ));
+        };
+        let mut add_box = |x0: f32, x1: f32, y0: f32, y1: f32, z0: f32, z1: f32| {
+            add_quad([x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]);
+            add_quad([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]);
+            add_quad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]);
+            add_quad([x1, y1, z0], [x0, y1, z0], [x0, y1, z1], [x1, y1, z1]);
+            add_quad([x0, y1, z0], [x0, y0, z0], [x0, y0, z1], [x0, y1, z1]);
+            add_quad([x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]);
+        };
+
+        // Lower hull ring surrounding a recessed bottom plaque cavity (`x in [-5, 5], y in [-3, 3], z in [0, 1.2]`)
+        add_box(-12.0, 12.0, -8.0, -3.0, 0.0, 1.2);
+        add_box(-12.0, 12.0, 3.0, 8.0, 0.0, 1.2);
+        add_box(-12.0, -5.0, -3.0, 3.0, 0.0, 1.2);
+        add_box(5.0, 12.0, -3.0, 3.0, 0.0, 1.2);
+        // Internal plaque letter/rib island inside the bottom recess
+        add_box(-2.0, 2.0, -1.2, 1.2, 0.0, 1.2);
+        // Upper hull slab bridging over the plaque recess from z = 1.2 to z = 4.2 mm
+        add_box(-12.0, 12.0, -8.0, 8.0, 1.2, 4.2);
+        stl.push_str("endsolid benchy_hull\n");
+
+        let tmp_path = std::env::temp_dir().join("manifold_test_benchy_hull_infill_bounds.stl");
+        std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write temporary STL");
+        let obj = crate::io::stl::load_stl_file(&tmp_path)
+            .expect("Expected synthetic Benchy hull STL import to succeed");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut cfg = crate::config::SlicerConfig::default();
+        cfg.eikonal.voxel_size_mm = 0.25;
+        cfg.eikonal.enable_multi_resolution_grid = true;
+        cfg.eikonal.coarse_grid_ratio = 4;
+        cfg.slicing.infill_density_percent = 20.0;
+        cfg.slicing.sanitize();
+        crate::ui::sync_config_to_backend(&cfg);
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+        let layers = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        assert!(layers.valid && layers.layers.len() >= 10);
+
+        let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(tp.valid && tp.total_path_count > 0);
+
+        // Verify on every layer that:
+        // 1. All emitted object extrusion points and segment midpoints lie strictly inside the
+        //    [-12, 12] x [-8, 8] outer hull footprint (and below z = 1.2 mm, never inside the
+        //    empty bottom plaque recess cavities).
+        // 2. All infill paths (`GapFill = 2`, `SolidInfill = 3`, `SparseInfill = 4`) stay strictly
+        //    inside the outer wall perimeter on every layer, including the transition layers ~1.2..2.2 mm up.
+        for layer in &tp.layers {
+            for path in &layer.paths {
+                if path.feature_kind == 7 || path.feature_kind == 8 {
+                    continue;
+                }
+                let is_infill = matches!(path.feature_kind, 2 | 3 | 4);
+                let max_x = if is_infill { 11.85 } else { 12.15 };
+                let max_y = if is_infill { 7.85 } else { 8.15 };
+
+                for (idx, pt) in path.points.iter().enumerate() {
+                    assert!(
+                        pt.x.abs() <= max_x && pt.y.abs() <= max_y,
+                        "Layer {} (iso={:.2} mm) feature_kind={} point ({:.3}, {:.3}, {:.3}) extended outside object hull bounds (±{:.2}, ±{:.2})",
+                        layer.layer_index,
+                        layer.isovalue,
+                        path.feature_kind,
+                        pt.x,
+                        pt.y,
+                        pt.z,
+                        max_x,
+                        max_y
+                    );
+                    if idx + 1 < path.points.len() {
+                        let nxt = &path.points[idx + 1];
+                        let mx = 0.5 * (pt.x + nxt.x);
+                        let my = 0.5 * (pt.y + nxt.y);
+                        let mz = 0.5 * (pt.z + nxt.z);
+                        assert!(
+                            mx.abs() <= max_x && my.abs() <= max_y,
+                            "Layer {} (iso={:.2} mm) feature_kind={} segment midpoint ({:.3}, {:.3}, {:.3}) extended outside object hull bounds",
+                            layer.layer_index,
+                            layer.isovalue,
+                            path.feature_kind,
+                            mx,
+                            my,
+                            mz
+                        );
+                        // Below z = 0.95 mm, no solid/sparse infill turnaround may jump across the recessed
+                        // plaque cavity (`x in (-4.6, -2.4)` or `(2.4, 4.6)` with `y in (-2.6, 2.6)`).
+                        if is_infill && mz < 0.95 {
+                            let in_left_void = mx > -4.55 && mx < -2.45 && my.abs() < 2.55;
+                            let in_right_void = mx > 2.45 && mx < 4.55 && my.abs() < 2.55;
+                            assert!(
+                                !in_left_void && !in_right_void,
+                                "Layer {} (iso={:.2} mm) feature_kind={} turnaround midpoint ({:.3}, {:.3}, {:.3}) jumped across bottom plaque recess cavity!",
+                                layer.layer_index,
+                                layer.isovalue,
+                                path.feature_kind,
+                                mx,
+                                my,
+                                mz
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(obj.object_id);
+    }
 }
 
 

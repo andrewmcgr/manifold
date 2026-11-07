@@ -904,16 +904,126 @@ bool finalizeExtrusionPath(
     return true;
 }
 
+/// Sub-chord SDF validation: ensures no segment or turnaround chord of `chain` crosses into the
+/// forbidden shell/exterior domain (`shiftedSdf(p) > maxAllowedSdf`). If a chord crosses outside,
+/// splits the chain at the boundary crossing so all emitted sub-chains remain strictly valid.
+template <typename SdfSamplerFn>
+std::vector<RawChain> reclipAndRefineChainToSdf(
+    const RawChain& chain,
+    float maxAllowedSdf,
+    SdfSamplerFn&& sampleShiftedSdf)
+{
+    std::vector<RawChain> out;
+    if (chain.pts.size() < 2) {
+        return out;
+    }
+
+    std::vector<RawChainPoint> pts = chain.pts;
+    if (chain.isClosed && pts.size() >= 3) {
+        pts.push_back(pts.front());
+    }
+
+    auto lerpChainPt = [](const RawChainPoint& a, const RawChainPoint& b, float t) -> RawChainPoint {
+        RawChainPoint p{};
+        p.pos = lerp3(a.pos, b.pos, t);
+        p.nozzleAxis = normalize3(lerp3(a.nozzleAxis, b.nozzleAxis, t), a.nozzleAxis);
+        p.widthMm = a.widthMm + t * (b.widthMm - a.widthMm);
+        p.heightMm = a.heightMm + t * (b.heightMm - a.heightMm);
+        return p;
+    };
+
+    RawChain active{};
+    active.isClosed = false;
+
+    auto flushActive = [&]() {
+        if (active.pts.size() >= 2) {
+            out.push_back(std::move(active));
+        }
+        active = RawChain{};
+        active.isClosed = false;
+    };
+
+    const float maxStepMm = 0.45f;
+    for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+        const RawChainPoint& a = pts[i];
+        const RawChainPoint& b = pts[i + 1];
+        const float segLen = dist3(a.pos, b.pos);
+        const int nSteps = std::max(1, static_cast<int>(std::ceil(segLen / maxStepMm)));
+
+        RawChainPoint prevPt = a;
+        float prevVal = sampleShiftedSdf(prevPt.pos) - maxAllowedSdf;
+        bool prevIn = (prevVal <= 0.0f);
+
+        if (prevIn && active.pts.empty()) {
+            active.pts.push_back(prevPt);
+        }
+
+        for (int s = 1; s <= nSteps; ++s) {
+            const float t = static_cast<float>(s) / static_cast<float>(nSteps);
+            const RawChainPoint currPt = (s == nSteps) ? b : lerpChainPt(a, b, t);
+            const float currVal = sampleShiftedSdf(currPt.pos) - maxAllowedSdf;
+            const bool currIn = (currVal <= 0.0f);
+
+            if (prevIn && currIn) {
+                if (active.pts.empty()) {
+                    active.pts.push_back(prevPt);
+                }
+                if (s == nSteps || dist3(active.pts.back().pos, currPt.pos) > 0.35f) {
+                    active.pts.push_back(currPt);
+                }
+            } else if (prevIn && !currIn) {
+                const float denom = currVal - prevVal;
+                const float tCross = (std::abs(denom) > 1.0e-8f)
+                    ? std::clamp(-prevVal / denom, 0.0f, 1.0f)
+                    : 0.5f;
+                const RawChainPoint exitPt = lerpChainPt(prevPt, currPt, tCross);
+                if (active.pts.empty()) {
+                    active.pts.push_back(prevPt);
+                }
+                if (dist3(active.pts.back().pos, exitPt.pos) > 1.0e-5f) {
+                    active.pts.push_back(exitPt);
+                }
+                flushActive();
+            } else if (!prevIn && currIn) {
+                const float denom = currVal - prevVal;
+                const float tCross = (std::abs(denom) > 1.0e-8f)
+                    ? std::clamp(-prevVal / denom, 0.0f, 1.0f)
+                    : 0.5f;
+                const RawChainPoint enterPt = lerpChainPt(prevPt, currPt, tCross);
+                active.pts.push_back(enterPt);
+                if (dist3(active.pts.back().pos, currPt.pos) > 1.0e-5f) {
+                    active.pts.push_back(currPt);
+                }
+            }
+
+            prevPt = currPt;
+            prevVal = currVal;
+            prevIn = currIn;
+        }
+    }
+
+    flushActive();
+    if (chain.isClosed && out.size() == 1 && out[0].pts.size() >= 4 &&
+        dist3(out[0].pts.front().pos, out[0].pts.back().pos) <= 1.0e-3f) {
+        out[0].pts.pop_back();
+        out[0].isClosed = true;
+    }
+    return out;
+}
+
 /// Generates `Monotonic` flood-fill paths on a 3D submesh `infillMesh`
 /// using single-pass triangle-to-scanline bucketing.
+template <typename SdfSamplerFn>
 void generateMonotonicInfillOnSubmesh(
     const SurfaceMesh& infillMesh,
     std::uint32_t layerIndex,
     const SanitizedLineWidth& infillWidth,
     float minExtrusionLengthMm,
     ::rust::Vec<ExtrusionPath>& outPaths,
-    float baseAngleDeg = 45.0f,
-    std::uint8_t featureKind = kFeatureSolidInfill)
+    float baseAngleDeg,
+    std::uint8_t featureKind,
+    float maxAllowedSdf,
+    SdfSamplerFn&& sampleShiftedSdf)
 {
     if (infillMesh.tris.empty() || infillMesh.verts.empty()) {
         return;
@@ -1023,11 +1133,13 @@ void generateMonotonicInfillOnSubmesh(
         const Vec3f vAxis = normalize3(cross3(zAxis, uAxis), e2);
 
         std::vector<float> uCoord(islandMesh.verts.size(), 0.0f);
+        std::vector<float> vCoord(islandMesh.verts.size(), 0.0f);
         float uMin = std::numeric_limits<float>::max();
         float uMax = std::numeric_limits<float>::lowest();
         for (std::size_t i = 0; i < islandMesh.verts.size(); ++i) {
             const float u = dot3(islandMesh.verts[i].pos, uAxis);
             uCoord[i] = u;
+            vCoord[i] = dot3(islandMesh.verts[i].pos, vAxis);
             uMin = std::min(uMin, u);
             uMax = std::max(uMax, u);
         }
@@ -1056,6 +1168,8 @@ void generateMonotonicInfillOnSubmesh(
         // Single-pass triangle-to-scanline bucketing: each triangle only tests the scanlines
         // `m` that fall within its `[triUMin, triUMax]` interval!
         std::vector<std::vector<Segment3D>> rawScanSegs(static_cast<std::size_t>(numLines));
+        std::vector<std::vector<std::pair<float, float>>> stripVIntervals(
+            static_cast<std::size_t>(std::max(1, numLines - 1)));
         Segment3D seg{};
 
         for (const auto& tri : islandMesh.tris) {
@@ -1064,6 +1178,8 @@ void generateMonotonicInfillOnSubmesh(
             const float u2 = uCoord[tri[2]];
             const float triUMin = std::min({u0, u1, u2});
             const float triUMax = std::max({u0, u1, u2});
+            const float triVMin = std::min({vCoord[tri[0]], vCoord[tri[1]], vCoord[tri[2]]});
+            const float triVMax = std::max({vCoord[tri[0]], vCoord[tri[1]], vCoord[tri[2]]});
 
             const int mLo = std::max(
                 0,
@@ -1084,6 +1200,18 @@ void generateMonotonicInfillOnSubmesh(
                         constWidth,
                         seg)) {
                     rawScanSegs[static_cast<std::size_t>(m)].push_back(seg);
+                }
+            }
+
+            if (numLines > 1) {
+                const int sLo = std::max(
+                    0,
+                    static_cast<int>(std::floor((triUMin - startU) / lineWidthMm)));
+                const int sHi = std::min(
+                    numLines - 2,
+                    static_cast<int>(std::floor((triUMax - startU) / lineWidthMm)));
+                for (int s = sLo; s <= sHi; ++s) {
+                    stripVIntervals[static_cast<std::size_t>(s)].push_back({triVMin, triVMax});
                 }
             }
         }
@@ -1131,8 +1259,41 @@ void generateMonotonicInfillOnSubmesh(
 
         // Monotonic flood-fill traversal: step strictly from m = 0 to numLines - 1,
         // linking adjacent scanlines into continuous zig-zag flood paths when their
-        // boundary endpoints lie within `maxLinkDist` and preserve monotonic order.
+        // boundary endpoints lie within `maxLinkDist`, stay within `maxAllowedSdf`,
+        // and stay on `islandMesh` without jumping across interior holes or concavities.
         const float maxLinkDist = 2.25f * infillWidth.max_mm;
+        const float stripPadV = 0.45f * lineWidthMm;
+        auto isTurnaroundValid = [&](int stripIdx, const Vec3f& a, const Vec3f& b) -> bool {
+            const float d = dist3(a, b);
+            if (d > maxLinkDist) {
+                return false;
+            }
+            const int steps = std::max(2, static_cast<int>(std::ceil(d / 0.25f)));
+            for (int s = 1; s < steps; ++s) {
+                const float t = static_cast<float>(s) / static_cast<float>(steps);
+                const Vec3f p = lerp3(a, b, t);
+                if (sampleShiftedSdf(p) > maxAllowedSdf) {
+                    return false;
+                }
+                if (stripIdx >= 0 &&
+                    static_cast<std::size_t>(stripIdx) < stripVIntervals.size() &&
+                    !stripVIntervals[static_cast<std::size_t>(stripIdx)].empty()) {
+                    const float vp = dot3(p, vAxis);
+                    bool onMeshStrip = false;
+                    for (const auto& [vLo, vHi] : stripVIntervals[static_cast<std::size_t>(stripIdx)]) {
+                        if (vp >= vLo - stripPadV && vp <= vHi + stripPadV) {
+                            onMeshStrip = true;
+                            break;
+                        }
+                    }
+                    if (!onMeshStrip) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
         std::uint32_t passCounter = 0;
 
         for (int m = 0; m < numLines; ++m) {
@@ -1144,6 +1305,8 @@ void generateMonotonicInfillOnSubmesh(
                 seedSeg.consumed = true;
 
                 RawChain floodChain = seedSeg.chain;
+                float currVStart = seedSeg.vStart;
+                float currVEnd = seedSeg.vEnd;
                 bool forwardAlongV = true;
                 int currLine = m;
 
@@ -1159,11 +1322,17 @@ void generateMonotonicInfillOnSubmesh(
                         if (nextLineSegs[k].consumed) {
                             continue;
                         }
+                        const float overlapLo = std::max(currVStart, nextLineSegs[k].vStart);
+                        const float overlapHi = std::min(currVEnd, nextLineSegs[k].vEnd);
+                        const float vGap = std::max(0.0f, overlapLo - overlapHi);
+                        if (vGap > maxLinkDist) {
+                            continue;
+                        }
                         const Vec3f candidateAttach = forwardAlongV
                             ? nextLineSegs[k].chain.pts.back().pos
                             : nextLineSegs[k].chain.pts.front().pos;
                         const float d = dist3(currEnd, candidateAttach);
-                        if (d < bestDist) {
+                        if (d < bestDist && isTurnaroundValid(currLine, currEnd, candidateAttach)) {
                             bestDist = d;
                             bestNext = k;
                             nextForward = !forwardAlongV;
@@ -1175,6 +1344,8 @@ void generateMonotonicInfillOnSubmesh(
                     }
 
                     nextLineSegs[bestNext].consumed = true;
+                    currVStart = nextLineSegs[bestNext].vStart;
+                    currVEnd = nextLineSegs[bestNext].vEnd;
                     auto nextPts = nextLineSegs[bestNext].chain.pts;
                     if (!nextForward) {
                         std::reverse(nextPts.begin(), nextPts.end());
@@ -1184,15 +1355,21 @@ void generateMonotonicInfillOnSubmesh(
                     ++currLine;
                 }
 
-                ExtrusionPath ep{};
-                if (finalizeExtrusionPath(
-                        floodChain,
-                        featureKind,
-                        passCounter,
-                        minExtrusionLengthMm,
-                        ep)) {
-                    outPaths.push_back(std::move(ep));
-                    ++passCounter;
+                const auto clippedChains = reclipAndRefineChainToSdf(
+                    floodChain,
+                    maxAllowedSdf,
+                    sampleShiftedSdf);
+                for (const auto& cChain : clippedChains) {
+                    ExtrusionPath ep{};
+                    if (finalizeExtrusionPath(
+                            cChain,
+                            featureKind,
+                            passCounter,
+                            minExtrusionLengthMm,
+                            ep)) {
+                        outPaths.push_back(std::move(ep));
+                        ++passCounter;
+                    }
                 }
             }
         }
@@ -1412,113 +1589,6 @@ std::vector<float> computeOnSurfaceBoundaryDistance(
     }
 
     return dBound;
-}
-
-/// Sub-chord SDF validation: ensures no segment or turnaround chord of `chain` crosses into the
-/// forbidden shell/exterior domain (`shiftedSdf(p) > maxAllowedSdf`). If a chord crosses outside,
-/// splits the chain at the boundary crossing so all emitted sub-chains remain strictly valid.
-template <typename SdfSamplerFn>
-std::vector<RawChain> reclipAndRefineChainToSdf(
-    const RawChain& chain,
-    float maxAllowedSdf,
-    SdfSamplerFn&& sampleShiftedSdf)
-{
-    std::vector<RawChain> out;
-    if (chain.pts.size() < 2) {
-        return out;
-    }
-
-    std::vector<RawChainPoint> pts = chain.pts;
-    if (chain.isClosed && pts.size() >= 3) {
-        pts.push_back(pts.front());
-    }
-
-    auto lerpChainPt = [](const RawChainPoint& a, const RawChainPoint& b, float t) -> RawChainPoint {
-        RawChainPoint p{};
-        p.pos = lerp3(a.pos, b.pos, t);
-        p.nozzleAxis = normalize3(lerp3(a.nozzleAxis, b.nozzleAxis, t), a.nozzleAxis);
-        p.widthMm = a.widthMm + t * (b.widthMm - a.widthMm);
-        p.heightMm = a.heightMm + t * (b.heightMm - a.heightMm);
-        return p;
-    };
-
-    RawChain active{};
-    active.isClosed = false;
-
-    auto flushActive = [&]() {
-        if (active.pts.size() >= 2) {
-            out.push_back(std::move(active));
-        }
-        active = RawChain{};
-        active.isClosed = false;
-    };
-
-    const float maxStepMm = 0.45f;
-    for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
-        const RawChainPoint& a = pts[i];
-        const RawChainPoint& b = pts[i + 1];
-        const float segLen = dist3(a.pos, b.pos);
-        const int nSteps = std::max(1, static_cast<int>(std::ceil(segLen / maxStepMm)));
-
-        RawChainPoint prevPt = a;
-        float prevVal = sampleShiftedSdf(prevPt.pos) - maxAllowedSdf;
-        bool prevIn = (prevVal <= 0.0f);
-
-        if (prevIn && active.pts.empty()) {
-            active.pts.push_back(prevPt);
-        }
-
-        for (int s = 1; s <= nSteps; ++s) {
-            const float t = static_cast<float>(s) / static_cast<float>(nSteps);
-            const RawChainPoint currPt = (s == nSteps) ? b : lerpChainPt(a, b, t);
-            const float currVal = sampleShiftedSdf(currPt.pos) - maxAllowedSdf;
-            const bool currIn = (currVal <= 0.0f);
-
-            if (prevIn && currIn) {
-                if (active.pts.empty()) {
-                    active.pts.push_back(prevPt);
-                }
-                if (s == nSteps || dist3(active.pts.back().pos, currPt.pos) > 0.35f) {
-                    active.pts.push_back(currPt);
-                }
-            } else if (prevIn && !currIn) {
-                const float denom = currVal - prevVal;
-                const float tCross = (std::abs(denom) > 1.0e-8f)
-                    ? std::clamp(-prevVal / denom, 0.0f, 1.0f)
-                    : 0.5f;
-                const RawChainPoint exitPt = lerpChainPt(prevPt, currPt, tCross);
-                if (active.pts.empty()) {
-                    active.pts.push_back(prevPt);
-                }
-                if (dist3(active.pts.back().pos, exitPt.pos) > 1.0e-5f) {
-                    active.pts.push_back(exitPt);
-                }
-                flushActive();
-            } else if (!prevIn && currIn) {
-                const float denom = currVal - prevVal;
-                const float tCross = (std::abs(denom) > 1.0e-8f)
-                    ? std::clamp(-prevVal / denom, 0.0f, 1.0f)
-                    : 0.5f;
-                const RawChainPoint enterPt = lerpChainPt(prevPt, currPt, tCross);
-                active.pts.push_back(enterPt);
-                if (dist3(active.pts.back().pos, currPt.pos) > 1.0e-5f) {
-                    active.pts.push_back(currPt);
-                }
-            }
-
-            prevPt = currPt;
-            prevVal = currVal;
-            prevIn = currIn;
-        }
-    }
-
-    flushActive();
-    if (chain.isClosed && out.size() == 1 && out[0].pts.size() >= 4 &&
-        dist3(out[0].pts.front().pos, out[0].pts.back().pos) <= 1.0e-3f) {
-        out[0].pts.pop_back();
-        out[0].isClosed = true;
-    }
-    return out;
 }
 
 /// Orders polylines using greedy nearest-neighbor traversal to minimize non-extruding travel moves.
@@ -1772,7 +1842,14 @@ std::vector<RawChain> generateScanlineFamilyOnIsland(
                 }
                 const float dFront = dist3(cNode.chain.pts.front().pos, nNode.chain.pts.front().pos);
                 const float dBack = dist3(cNode.chain.pts.back().pos, nNode.chain.pts.back().pos);
-                const float minEndDist = std::min(dFront, dBack);
+                const bool validFront = isTurnaroundValid(cNode.chain.pts.front().pos, nNode.chain.pts.front().pos);
+                const bool validBack = isTurnaroundValid(cNode.chain.pts.back().pos, nNode.chain.pts.back().pos);
+                if (!validFront && !validBack) {
+                    continue;
+                }
+                const float minEndDist = std::min(
+                    validFront ? dFront : maxLinkDistMm,
+                    validBack ? dBack : maxLinkDistMm);
                 if (minEndDist < bestScore) {
                     bestScore = minEndDist;
                     bestNext = nId;
@@ -1981,15 +2058,21 @@ void generateSparseInfillForLayer(
                         constWidth);
                     const auto chains = stitchSegmentsIntoChains(segs, stitchSnap, closeLoopTol);
                     for (const auto& ch : chains) {
-                        ExtrusionPath ep{};
-                        if (finalizeExtrusionPath(
-                                ch,
-                                kFeatureSolidInfill,
-                                passIdx,
-                                minExtrusionLengthMm,
-                                ep)) {
-                            outPaths.push_back(std::move(ep));
-                            ++passIdx;
+                        const auto gatedChains = reclipAndRefineChainToSdf(
+                            ch,
+                            maxAllowedSdf,
+                            sampleShiftedSdf);
+                        for (const auto& gch : gatedChains) {
+                            ExtrusionPath ep{};
+                            if (finalizeExtrusionPath(
+                                    gch,
+                                    kFeatureSolidInfill,
+                                    passIdx,
+                                    minExtrusionLengthMm,
+                                    ep)) {
+                                outPaths.push_back(std::move(ep));
+                                ++passIdx;
+                            }
                         }
                     }
                 }
@@ -2001,7 +2084,9 @@ void generateSparseInfillForLayer(
                     minExtrusionLengthMm,
                     outPaths,
                     infillAngleDeg,
-                    kFeatureSolidInfill);
+                    kFeatureSolidInfill,
+                    maxAllowedSdf,
+                    sampleShiftedSdf);
             }
             continue;
         }
@@ -2237,7 +2322,9 @@ void generateSparseInfillForLayer(
                 minExtrusionLengthMm,
                 outPaths,
                 infillAngleDeg,
-                kFeatureSparseInfill);
+                kFeatureSparseInfill,
+                maxAllowedSdf,
+                sampleShiftedSdf);
         }
     }
 }
@@ -2578,11 +2665,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 for (const auto& [ek, count] : edgeTriCounts) {
                     if (count == 1) {
                         const float edgeSdf = 0.5f * (baseMesh.verts[ek.a].sdf + baseMesh.verts[ek.b].sdf);
-                        // Only classify an open mesh boundary edge as the physical outer surface
-                        // \Gamma_outer if its SDF is within the narrow clip-allowance band around
-                        // \phi_sdf = 0 (`[-0.85 * \Delta x, +0.45 * \Delta x]`), never if it is an
-                        // unclipped exterior air border where \phi_sdf > 0.45 * \Delta x.
-                        if (edgeSdf >= -0.85f * voxelSize && edgeSdf <= 0.45f * voxelSize) {
+                        // Classify any open mesh boundary edge of already-clipped S_k as the physical
+                        // outer surface \Gamma_outer unless it is an internal branch cut deep inside
+                        // the solid (\phi_sdf < -0.85 * \Delta x_coarse) or an unclipped exterior sheet.
+                        if (edgeSdf >= -0.85f * coarseVoxelSize && edgeSdf <= 1.25f * coarseVoxelSize) {
                             baseMesh.verts[ek.a].onOuterBoundary = true;
                             baseMesh.verts[ek.b].onOuterBoundary = true;
                             maxBoundarySdf = std::max({
@@ -2611,7 +2697,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
                 // Normalize vertex SDF relative to the outer boundary contour so \phi_sdf = 0 on \Gamma_outer
                 const float sdfZeroShift = std::isfinite(maxBoundarySdf)
-                    ? std::clamp(maxBoundarySdf, 0.0f, 0.35f * voxelSize)
+                    ? std::clamp(maxBoundarySdf, 0.0f, 0.45f * coarseVoxelSize)
                     : 0.0f;
                 for (auto& v : baseMesh.verts) {
                     if (v.onOuterBoundary) {
@@ -2897,6 +2983,30 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             closestOuterNormal[v] = closestOuterNormal[u];
                             pq.push({dOuter[v], v});
                         }
+                    }
+                }
+
+                // If `shellMesh` contains an isolated interior bottom-skin / ceiling island that is
+                // disconnected from the outer perimeter strip and beyond the 3x3x3 spatial grid,
+                // compute its exact distance and normal to `outerSegments` so `dOuter[i]` is never `kInf`.
+                for (std::size_t i = 0; i < nV; ++i) {
+                    if (dOuter[i] >= kInf * 0.5f) {
+                        const Vec3f p = shellMesh.verts[i].pos;
+                        float bestDist = kInf;
+                        Vec3f bestNormal{1.0f, 0.0f, 0.0f};
+                        for (const auto& seg : outerSegments) {
+                            const float tProj = (seg.abLenSq > 1.0e-12f)
+                                ? std::clamp(dot3(p - seg.a, seg.ab) / seg.abLenSq, 0.0f, 1.0f)
+                                : 0.5f;
+                            const Vec3f foot = seg.a + seg.ab * tProj;
+                            const float d = dist3(p, foot);
+                            if (d < bestDist) {
+                                bestDist = d;
+                                bestNormal = seg.inwardNormal;
+                            }
+                        }
+                        dOuter[i] = (bestDist < kInf * 0.5f) ? bestDist : shellThicknessMm;
+                        closestOuterNormal[i] = bestNormal;
                     }
                 }
 
@@ -3788,9 +3898,13 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             : 1.0f;
                         waveRho[i] = rho;
 
-                        const float totSpan = std::max(
-                            dFromSupported[i] + dOuter[i],
-                            outerW.min_mm);
+                        const float remToBound = hasInnerShellBoundary
+                            ? std::min(dOuter[i], dInner[i])
+                            : dOuter[i];
+                        const float totSpan = std::clamp(
+                            dFromSupported[i] + remToBound,
+                            outerW.min_mm,
+                            8.0f * shellThicknessMm);
                         waveTotalSpan[i] = totSpan;
                         waveDomainValidity[i] = totSpan;
 
@@ -3894,6 +4008,11 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // ------------------------------------------------------------
                 // 6. Shell Gap Fill & Solid Infill (`Monotonic` or `Concentric`)
                 // ------------------------------------------------------------
+                auto sampleShiftedSdfForShell = [&](const Vec3f& p) -> float {
+                    return sampleSdf(p) - sdfZeroShift;
+                };
+                const float maxSolidInfillSdf = -(0.5f * outerW.min_mm);
+
                 std::vector<float> negDRem(nV, 0.0f);
                 std::vector<float> remOneSidedSpan(nV, 0.0f);
                 for (std::size_t i = 0; i < nV; ++i) {
@@ -3942,15 +4061,21 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
                     std::uint32_t gapIdx = 0;
                     for (const auto& ch : gapChains) {
-                        ExtrusionPath ep{};
-                        if (finalizeExtrusionPath(
-                                ch,
-                                kFeatureGapFill,
-                                gapIdx,
-                                minExtrusionLengthMm,
-                                ep)) {
-                            layerOut.paths.push_back(std::move(ep));
-                            ++gapIdx;
+                        const auto gatedChains = reclipAndRefineChainToSdf(
+                            ch,
+                            maxSolidInfillSdf,
+                            sampleShiftedSdfForShell);
+                        for (const auto& gch : gatedChains) {
+                            ExtrusionPath ep{};
+                            if (finalizeExtrusionPath(
+                                    gch,
+                                    kFeatureGapFill,
+                                    gapIdx,
+                                    minExtrusionLengthMm,
+                                    ep)) {
+                                layerOut.paths.push_back(std::move(ep));
+                                ++gapIdx;
+                            }
                         }
                     }
                 }
@@ -4036,15 +4161,21 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 stitchSegmentsIntoChains(passSegs, stitchSnap, closeLoopTol);
 
                             for (const auto& ch : passChains) {
-                                ExtrusionPath ep{};
-                                if (finalizeExtrusionPath(
-                                        ch,
-                                        kFeatureSolidInfill,
-                                        passIdx,
-                                        minExtrusionLengthMm,
-                                        ep)) {
-                                    layerOut.paths.push_back(std::move(ep));
-                                    ++passIdx;
+                                const auto gatedChains = reclipAndRefineChainToSdf(
+                                    ch,
+                                    maxSolidInfillSdf,
+                                    sampleShiftedSdfForShell);
+                                for (const auto& gch : gatedChains) {
+                                    ExtrusionPath ep{};
+                                    if (finalizeExtrusionPath(
+                                            gch,
+                                            kFeatureSolidInfill,
+                                            passIdx,
+                                            minExtrusionLengthMm,
+                                            ep)) {
+                                        layerOut.paths.push_back(std::move(ep));
+                                        ++passIdx;
+                                    }
                                 }
                             }
                         }
@@ -4056,7 +4187,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             minExtrusionLengthMm,
                             layerOut.paths,
                             infillAngleDeg,
-                            kFeatureSolidInfill);
+                            kFeatureSolidInfill,
+                            maxSolidInfillSdf,
+                            sampleShiftedSdfForShell);
                     }
                 }
 

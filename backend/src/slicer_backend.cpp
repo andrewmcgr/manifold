@@ -2987,10 +2987,11 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
 
     // Project exact CAD mesh vertices and triangle centroids onto their containing/nearest
     // interior voxel so sharp 3D corners of the CAD mesh are captured to sub-voxel accuracy.
+    auto fineSdfAccMain = fineSdfGrid.getConstAccessor();
     openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
         eikSurfaceSampler(eikAccMain, eikGrid.transform());
     openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
-        sdfSurfaceSampler(sdfAccMain, sdfGrid.transform());
+        sdfSurfaceSampler(fineSdfAccMain, fineSdfGrid.transform());
 
     auto registerSurfacePoint = [&](double wx, double wy, double wz) {
         const openvdb::Vec3d wp(wx, wy, wz);
@@ -3026,7 +3027,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             if (std::isfinite(sdfAtPt) && sdfAtPt > 0.0f) {
                 vx.cornerSdfAllowance = std::max(
                     vx.cornerSdfAllowance,
-                    std::clamp(sdfAtPt, 0.0f, 0.75f * voxelSize));
+                    std::clamp(sdfAtPt, 0.0f, 0.75f * fineVoxelSize));
             }
             globalTauMin = std::min(globalTauMin, tauSurf);
             globalTauMax = std::max(globalTauMax, tauSurf);
@@ -4952,7 +4953,13 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         }
                     };
 
-                    clipAgainstSdfThreshold(pl.sdfClipAllowance);
+                    // Always clip against the exact physical surface (\phi_sdf <= 0.0) first so
+                    // cross-sections with valid interior geometry are never inflated outward.
+                    clipAgainstSdfThreshold(0.0f);
+
+                    if (info.indices.empty() && pl.sdfClipAllowance > 0.0f) {
+                        clipAgainstSdfThreshold(pl.sdfClipAllowance);
+                    }
 
                     // If trilinear SDF rounding at a sharp 3D corner still left this layer empty,
                     // find the minimum SDF on the branch's isosurface sheet and clip with a small margin.
