@@ -6026,7 +6026,7 @@ mod tests {
             "Expected manual ConformalSurfaceSkin hint with skin_layer_count=4 to extract exactly 4 conformal SDF skin layers"
         );
 
-        // Verify that full 3D toolpaths (`OuterWall = 0`, `InnerWall = 1`, `SolidInfill = 3`) are generated
+        // Verify that full 3D toolpaths (`OuterWall = 0`, `InnerWall = 1`, `SolidInfill = 2`) are generated
         // on the conformal SDF skin layers and never extend outside the object footprint.
         let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
         assert!(tp.valid && tp.total_path_count > 0);
@@ -6046,7 +6046,7 @@ mod tests {
                         if p.feature_kind == 0 {
                             skin_has_outer_wall = true;
                         }
-                        if p.feature_kind == 3 {
+                        if p.feature_kind == 2 {
                             skin_has_solid_infill = true;
                         }
                         for pt in &p.points {
@@ -6228,6 +6228,189 @@ mod tests {
             transition_layer.isovalue,
             max_solid_x
         );
+
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(obj.object_id);
+    }
+
+    #[test]
+    fn test_conformal_surface_skin_3d_tool_clearance_collision_prevention_on_recessed_bow_deck() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Construct a Benchy-like recessed sloped bow deck (`x in [-2.0, 9.0], y in [-5.5, 5.5]`):
+        // - Sloped bow deck: `z_deck(x) = 3.2 + 0.16 * (x + 2.0)` (from `z = 3.2 mm` at the cabin
+        //   bulkhead `x = -2.0 mm` up to `z = 4.96 mm` at the bow `x = 9.0 mm`).
+        // - Tall aft cabin block (`x in [-9.0, -2.0], y in [-5.5, 5.5], z in [0.0, 9.5 mm]`) rising
+        //   directly above the bottom edge of the sloped deck (`x = -2.0 mm`).
+        // - Port (`y in [-7.5, -5.5]`) and Starboard (`y in [5.5, 7.5]`) raised hull gunwale walls
+        //   (`x in [-9.0, 9.0]`) rising `2.4 mm` above `z_deck(x)` (`z_gunwale(x) = z_deck(x) + 2.4`).
+        //
+        // When the conformal skin patch on the sloped bow deck is printed at `tau_completion` (~4.96 mm),
+        // the cabin wall and both hull gunwale walls have ALREADY been printed up to `z = tau_completion`.
+        // Reaching down to the bottom edge of the sloped deck (`x ~ -2.0 mm, z ~ 2.6..3.2 mm`) or close
+        // to the port/starboard hull walls (`|y| ~ 5.5 mm`) would cause the nozzle/heater-block cone to
+        // collide with the cabin and hull sides unless pruned by the 3D Tool Clearance Envelope check.
+        let mut stl = String::from("solid benchy_recessed_bow_deck\n");
+        let mut add_tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+            stl.push_str(&format!(
+                "  facet normal 0 0 0\n    outer loop\n      vertex {} {} {}\n      vertex {} {} {}\n      vertex {} {} {}\n    endloop\n  endfacet\n",
+                a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]
+            ));
+        };
+        let mut add_quad = |p00: [f32; 3], p10: [f32; 3], p11: [f32; 3], p01: [f32; 3]| {
+            add_tri(p00, p10, p11);
+            add_tri(p00, p11, p01);
+        };
+        let mut add_sloped_box =
+            |xa: f32, xb: f32, ya: f32, yb: f32, za0: f32, zb0: f32, za1: f32, zb1: f32| {
+                add_quad([xa, ya, za0], [xa, yb, za0], [xb, yb, zb0], [xb, ya, zb0]); // bottom
+                add_quad([xa, ya, za1], [xb, ya, zb1], [xb, yb, zb1], [xa, yb, za1]); // top
+                add_quad([xa, ya, za0], [xb, ya, zb0], [xb, ya, zb1], [xa, ya, za1]); // -Y
+                add_quad([xb, yb, zb0], [xa, yb, za0], [xa, yb, za1], [xb, yb, zb1]); // +Y
+                add_quad([xa, yb, za0], [xa, ya, za0], [xa, ya, za1], [xa, yb, za1]); // -X
+                add_quad([xb, ya, zb0], [xb, yb, zb0], [xb, yb, zb1], [xb, ya, zb1]); // +X
+            };
+
+        let z_deck = |x: f32| -> f32 { 3.2 + 0.16 * (x + 2.0) };
+        // 1. Recessed sloped bow deck block (`x in [-2, 9], y in [-5.5, 5.5], z in [0, z_deck(x)]`)
+        add_sloped_box(-2.0, 9.0, -5.5, 5.5, 0.0, 0.0, z_deck(-2.0), z_deck(9.0));
+        // 2. Tall aft cabin block (`x in [-9, -2], y in [-5.5, 5.5], z in [0, 9.5]`)
+        add_sloped_box(-9.0, -2.0, -5.5, 5.5, 0.0, 0.0, 9.5, 9.5);
+        // 3. Port hull gunwale wall (`x in [-9, 9], y in [-7.5, -5.5], z in [0, z_deck(x) + 2.4]`)
+        add_sloped_box(
+            -9.0,
+            9.0,
+            -7.5,
+            -5.5,
+            0.0,
+            0.0,
+            z_deck(-9.0) + 2.4,
+            z_deck(9.0) + 2.4,
+        );
+        // 4. Starboard hull gunwale wall (`x in [-9, 9], y in [5.5, 7.5], z in [0, z_deck(x) + 2.4]`)
+        add_sloped_box(
+            -9.0,
+            9.0,
+            5.5,
+            7.5,
+            0.0,
+            0.0,
+            z_deck(-9.0) + 2.4,
+            z_deck(9.0) + 2.4,
+        );
+        stl.push_str("endsolid benchy_recessed_bow_deck\n");
+
+        let tmp_path =
+            std::env::temp_dir().join("manifold_test_benchy_recessed_bow_deck_clearance.stl");
+        std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write temporary STL");
+        let obj = crate::io::stl::load_stl_file(&tmp_path)
+            .expect("Expected synthetic Benchy recessed bow deck STL import to succeed");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut cfg = crate::config::SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.eikonal.voxel_size_mm = 0.28;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.25;
+        cfg.slicing.layer_height.min_mm = 0.15;
+        cfg.slicing.layer_height.max_mm = 0.30;
+        cfg.slicing.layer_height.first_layer_mm = 0.25;
+        cfg.slicing.layer_height.top_layer_mm = 0.20;
+        cfg.slicing.enable_auto_conformal_skin = true;
+        cfg.slicing.conformal_skin_layers = 3;
+        cfg.slicing.conformal_skin_min_oblique_deg = 6.0;
+        cfg.slicing.conformal_skin_max_slope_deg = 60.0;
+        cfg.slicing.sanitize();
+        crate::ui::sync_config_to_backend(&cfg);
+        ffi::set_spatial_orientation_hints(&[]);
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        let selected = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        assert!(selected.valid && !selected.layers.is_empty());
+
+        // Find conformal SDF skin layers located on the recessed bow deck (`x > -2.0, |y| < 5.5, z < 5.2`)
+        let bow_deck_skin_layers: Vec<&ffi::SelectedLayerInfo> = selected
+            .layers
+            .iter()
+            .filter(|l| {
+                l.is_top_layer
+                    && (l.max_thickness_mm - l.min_thickness_mm).abs() < 1.0e-5
+                    && (l.mean_thickness_mm - cfg.slicing.layer_height.top_layer_mm).abs() < 1.0e-4
+                    && l.vertices
+                        .iter()
+                        .any(|v| v.x > -1.5 && v.y.abs() < 4.5 && v.z < 5.1)
+            })
+            .collect();
+        assert!(
+            bow_deck_skin_layers.len() >= 3,
+            "Expected at least 3 conformal SDF skin layers on the safe center of the sloped bow deck, got {}",
+            bow_deck_skin_layers.len()
+        );
+
+        // Verify that every vertex on the recessed bow deck conformal skin layers stands off from:
+        // 1. The aft cabin wall at `x = -2.0 mm` (which is already printed up to `tau_completion ~ 4.96 mm`,
+        //    towering ~1.7..2.3 mm above the bottom edge of the deck where the tool clearance radius is >= 2.0 mm), and
+        // 2. The port and starboard hull gunwale walls at `|y| = 5.5 mm` (which rise up to `min(z_deck(x)+2.4, tau_completion)`
+        //    above the recessed deck).
+        for layer in &bow_deck_skin_layers {
+            for v in &layer.vertices {
+                if v.y.abs() < 5.2 && v.z < 5.1 {
+                    let dist_to_cabin_wall = v.x - (-2.0);
+                    let dist_to_hull_gunwale = 5.5 - v.y.abs();
+                    assert!(
+                        dist_to_cabin_wall >= 1.65,
+                        "Bow deck conformal skin vertex ({:.2}, {:.2}, {:.2}) approached within {:.2} mm of the tall cabin wall (x=-2.0), risking nozzle/cone collision!",
+                        v.x,
+                        v.y,
+                        v.z,
+                        dist_to_cabin_wall
+                    );
+                    assert!(
+                        dist_to_hull_gunwale >= 1.25,
+                        "Bow deck conformal skin vertex ({:.2}, {:.2}, {:.2}) approached within {:.2} mm of the raised hull gunwale wall (|y|=5.5), risking nozzle/cone collision!",
+                        v.x,
+                        v.y,
+                        v.z,
+                        dist_to_hull_gunwale
+                    );
+                }
+            }
+        }
+
+        // Also generate full 3D shell toolpaths and verify zero conformal skin toolpath points collide
+        let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(tp.valid && tp.total_path_count > 0);
+        for layer in &bow_deck_skin_layers {
+            if let Some(tp_layer) = tp
+                .layers
+                .iter()
+                .find(|tl| tl.layer_index == layer.layer_index)
+            {
+                for path in &tp_layer.paths {
+                    for pt in &path.points {
+                        if pt.y.abs() < 5.2 && pt.z < 5.1 {
+                            let dist_to_cabin_wall = pt.x - (-2.0);
+                            let dist_to_hull_gunwale = 5.5 - pt.y.abs();
+                            assert!(
+                                dist_to_cabin_wall >= 1.65 && dist_to_hull_gunwale >= 1.25,
+                                "Bow deck conformal skin toolpath point ({:.2}, {:.2}, {:.2}) violated 3D nozzle clearance from cabin (dx={:.2}) or hull sides (dy={:.2})!",
+                                pt.x,
+                                pt.y,
+                                pt.z,
+                                dist_to_cabin_wall,
+                                dist_to_hull_gunwale
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let default_cfg = crate::config::SlicerConfig::default();
         crate::ui::sync_config_to_backend(&default_cfg);
