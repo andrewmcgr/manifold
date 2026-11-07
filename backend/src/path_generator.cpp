@@ -2633,7 +2633,15 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     ? static_cast<float>(static_cast<double>(cntLayerGrad) / sumLayerInvGrad)
                     : 1.0f;
 
+                const bool isUniformThicknessLayer =
+                    (std::abs(layerInfo.max_thickness_mm - layerInfo.min_thickness_mm) <= 1.0e-4f);
+                const bool isConformalSkinLayer =
+                    isUniformThicknessLayer && layerInfo.is_top_layer && !layerInfo.is_first_layer;
+
                 auto sampleLocalLayerHeight = [&](const Vec3f& p) -> float {
+                    if (isUniformThicknessLayer) {
+                        return meanLayerH;
+                    }
                     const float gradNorm = sampleEikGradNorm(p);
                     if (gradNorm > 0.20f) {
                         return std::clamp(
@@ -2645,13 +2653,18 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 };
 
                 for (std::size_t i = 0; i < baseMesh.verts.size(); ++i) {
-                    const float g = baseVertGrads[i];
-                    baseMesh.verts[i].layerHeightMm = (g > 0.20f)
-                        ? std::clamp(meanLayerH * (layerMeanGrad / g), layerMinH, layerMaxH)
-                        : meanLayerH;
+                    if (isUniformThicknessLayer) {
+                        baseMesh.verts[i].layerHeightMm = meanLayerH;
+                    } else {
+                        const float g = baseVertGrads[i];
+                        baseMesh.verts[i].layerHeightMm = (g > 0.20f)
+                            ? std::clamp(meanLayerH * (layerMeanGrad / g), layerMinH, layerMaxH)
+                            : meanLayerH;
+                    }
                 }
 
-                // Identify outer boundary edges of S_k (where S_k intersects the outer surface \phi_sdf = 0)
+                // Identify outer boundary edges of S_k (where S_k intersects the outer surface \phi_sdf = 0
+                // or the eroded conformal-skin boundary)
                 std::unordered_map<EdgeKey, std::uint32_t, EdgeKeyHash> edgeTriCounts;
                 edgeTriCounts.reserve(baseMesh.tris.size() * 3);
                 for (const auto& tri : baseMesh.tris) {
@@ -2661,18 +2674,21 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 }
 
                 float maxBoundarySdf = -std::numeric_limits<float>::max();
+                float minBoundarySdf = std::numeric_limits<float>::max();
                 bool anyOuterBoundary = false;
                 for (const auto& [ek, count] : edgeTriCounts) {
                     if (count == 1) {
                         const float edgeSdf = 0.5f * (baseMesh.verts[ek.a].sdf + baseMesh.verts[ek.b].sdf);
-                        // Classify any open mesh boundary edge of already-clipped S_k as the physical
-                        // outer surface \Gamma_outer unless it is an internal branch cut deep inside
-                        // the solid (\phi_sdf < -0.85 * \Delta x_coarse) or an unclipped exterior sheet.
-                        if (edgeSdf >= -0.85f * coarseVoxelSize && edgeSdf <= 1.25f * coarseVoxelSize) {
+                        if (edgeSdf <= 1.25f * coarseVoxelSize) {
                             baseMesh.verts[ek.a].onOuterBoundary = true;
                             baseMesh.verts[ek.b].onOuterBoundary = true;
                             maxBoundarySdf = std::max({
                                 maxBoundarySdf,
+                                baseMesh.verts[ek.a].sdf,
+                                baseMesh.verts[ek.b].sdf,
+                            });
+                            minBoundarySdf = std::min({
+                                minBoundarySdf,
                                 baseMesh.verts[ek.a].sdf,
                                 baseMesh.verts[ek.b].sdf,
                             });
@@ -2688,6 +2704,11 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             baseMesh.verts[ek.b].onOuterBoundary = true;
                             maxBoundarySdf = std::max({
                                 maxBoundarySdf,
+                                baseMesh.verts[ek.a].sdf,
+                                baseMesh.verts[ek.b].sdf,
+                            });
+                            minBoundarySdf = std::min({
+                                minBoundarySdf,
                                 baseMesh.verts[ek.a].sdf,
                                 baseMesh.verts[ek.b].sdf,
                             });
@@ -2707,6 +2728,18 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                 }
 
+                // If part of this core layer's boundary was eroded deep inside the part by a conformal
+                // surface skin patch (`minBoundarySdf < -0.35 * shellThicknessMm`), measure on-surface
+                // distance from the clipped boundary so `shellMesh` retains a continuous perimeter band.
+                std::vector<float> dFromClipBoundary;
+                if (!isConformalSkinLayer &&
+                    std::isfinite(minBoundarySdf) &&
+                    minBoundarySdf < -0.35f * shellThicknessMm) {
+                    dFromClipBoundary = computeOnSurfaceBoundaryDistance(
+                        baseMesh,
+                        shellThicknessMm + 0.5f * outerW.target_mm);
+                }
+
                 // ------------------------------------------------------------
                 // 2. Clip S_k to the Outer Shell Domain (-T_shell <= \phi_sdf <= 0)
                 //    BEFORE subdividing or sampling nozzleAxis / eikGradNorm!
@@ -2716,12 +2749,19 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 std::vector<float> sdfDepth(baseMesh.verts.size(), 0.0f);
                 for (std::size_t i = 0; i < baseMesh.verts.size(); ++i) {
                     float d = std::max(0.0f, -baseMesh.verts[i].sdf);
-                    if (!layerInfo.is_first_layer && d > shellThicknessMm) {
-                        const float hStep = std::max(1.20f * baseMesh.verts[i].layerHeightMm, 1.15f * meanLayerH);
-                        const Vec3f p = baseMesh.verts[i].pos;
-                        const float sdfDownGrav = sampleSdf(p + (gravityDirBed * hStep)) - sdfZeroShift;
-                        if (sdfDownGrav > -0.20f * outerW.min_mm) {
-                            d = std::min(d, 0.5f * shellThicknessMm);
+                    if (isConformalSkinLayer) {
+                        d = std::min(d, 0.5f * shellThicknessMm);
+                    } else {
+                        if (!dFromClipBoundary.empty()) {
+                            d = std::min(d, dFromClipBoundary[i]);
+                        }
+                        if (!layerInfo.is_first_layer && d > shellThicknessMm) {
+                            const float hStep = std::max(1.20f * baseMesh.verts[i].layerHeightMm, 1.15f * meanLayerH);
+                            const Vec3f p = baseMesh.verts[i].pos;
+                            const float sdfDownGrav = sampleSdf(p + (gravityDirBed * hStep)) - sdfZeroShift;
+                            if (sdfDownGrav > -0.20f * outerW.min_mm) {
+                                d = std::min(d, 0.5f * shellThicknessMm);
+                            }
                         }
                     }
                     sdfDepth[i] = d;
@@ -2755,7 +2795,12 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     });
 
                 // Sample 5/6-axis nozzle orientation and local layer height only on the surviving shell vertices
-                {
+                if (isUniformThicknessLayer) {
+                    for (std::size_t i = 0; i < shellMesh.verts.size(); ++i) {
+                        shellMesh.verts[i].nozzleAxis = sampleNozzleAxis(shellMesh.verts[i].pos);
+                        shellMesh.verts[i].layerHeightMm = meanLayerH;
+                    }
+                } else {
                     std::vector<float> shellGrads(shellMesh.verts.size(), 1.0f);
                     double sumShellInvGrad = 0.0;
                     std::size_t cntShellGrad = 0;

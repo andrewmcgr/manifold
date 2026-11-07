@@ -152,8 +152,8 @@ pub mod ffi {
         pub layers: Vec<SelectedLayerInfo>,
     }
 
-    /// Spatial/surface orientation hint (`kind`: 0 = Tangency, 1 = Orthogonality)
-    /// guiding the iterative constrained Eikonal & tool-orientation solver.
+    /// Spatial/surface orientation hint (`kind`: 0 = Tangency, 1 = Orthogonality, 2 = ConformalSurfaceSkin)
+    /// guiding the iterative constrained Eikonal & tool-orientation solver and conformal SDF surface skin slicer.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct SpatialOrientationHint {
         pub kind: u8,
@@ -162,6 +162,16 @@ pub mod ffi {
         pub influence_radius_mm: f32,
         pub weight: f32,
         pub apply_on_surface_only: bool,
+        pub skin_layer_count: u32,
+    }
+
+    /// Automatic & manual conformal SDF surface skin slicing parameters shared across FFI.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct ConformalSkinSpec {
+        pub auto_enabled: bool,
+        pub default_skin_layers: u32,
+        pub min_oblique_angle_deg: f32,
+        pub max_slope_angle_deg: f32,
     }
 
     /// Overhang-driven conformal vs. orthogonal Eikonal surface orientation bias parameters
@@ -460,6 +470,12 @@ pub mod ffi {
         /// Retrieves the current overhang-driven conformal/orthogonal surface orientation bias parameters.
         pub fn get_overhang_orientation_bias_spec() -> OverhangBiasSpec;
 
+        /// Sets the automatic & manual conformal SDF surface skin slicing parameters (`ConformalSkinSpec`).
+        pub fn set_conformal_skin_spec(spec: ConformalSkinSpec);
+
+        /// Retrieves the current conformal SDF surface skin slicing parameters (`ConformalSkinSpec`).
+        pub fn get_conformal_skin_spec() -> ConformalSkinSpec;
+
         /// Selects the non-planar slicing isosurfaces for `object_id` using a bidirectional
         /// branch-aware relaxation algorithm honoring `min_mm`, `max_mm`, `target_mm`,
         /// `first_layer_mm`, and `top_layer_mm`, and extracts their interior-clipped 3D
@@ -702,6 +718,7 @@ mod tests {
             influence_radius_mm: 15.0,
             weight: 1.0,
             apply_on_surface_only: false,
+            skin_layer_count: 0,
         }]);
 
         assert!(ffi::recompute_object_fields(info.object_id, 1.5, 4.0));

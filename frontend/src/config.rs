@@ -742,6 +742,19 @@ pub struct SlicingProcessConfig {
     /// Number of concentric perimeter walls (`1..=4`, default `2`) printed for hollow `NonPlanarTree`
     /// branches and trunks.
     pub tree_branch_wall_count: u32,
+    /// Automatically detect oblique exit/top surfaces (where Eikonal layers arrive at an angle
+    /// exceeding `conformal_skin_min_oblique_deg`) and slice `conformal_skin_layers` conformal
+    /// SDF surface skin layers parallel to $\phi_{\text{sdf}} = 0$.
+    pub enable_auto_conformal_skin: bool,
+    /// Default number of conformal SDF surface skin layers ($N \in [1, 12]$, default `3`) sliced
+    /// parallel to $\phi_{\text{sdf}} = 0$ on automatic or manually selected conformal skin surfaces.
+    pub conformal_skin_layers: u32,
+    /// Minimum angle (degrees, `2.0..=60.0`, default `12.0`) between $\nabla \tau$ and $\nabla \phi_{\text{sdf}}$
+    /// required to trigger automatic conformal skin slicing on an exit surface.
+    pub conformal_skin_min_oblique_deg: f32,
+    /// Maximum surface slope angle relative to the local nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$
+    /// (degrees, `10.0..=85.0`, default `60.0`) eligible for automatic conformal skin slicing.
+    pub conformal_skin_max_slope_deg: f32,
 }
 
 impl Default for SlicingProcessConfig {
@@ -781,6 +794,10 @@ impl Default for SlicingProcessConfig {
             tree_tip_diameter_mm: 2.40,
             tree_trunk_max_diameter_mm: 12.00,
             tree_branch_wall_count: 2,
+            enable_auto_conformal_skin: false,
+            conformal_skin_layers: 3,
+            conformal_skin_min_oblique_deg: 12.0,
+            conformal_skin_max_slope_deg: 60.0,
         }
     }
 }
@@ -816,6 +833,9 @@ impl SlicingProcessConfig {
             .tree_trunk_max_diameter_mm
             .clamp(self.tree_tip_diameter_mm.max(2.0), 30.0);
         self.tree_branch_wall_count = self.tree_branch_wall_count.clamp(1, 4);
+        self.conformal_skin_layers = self.conformal_skin_layers.clamp(1, 12);
+        self.conformal_skin_min_oblique_deg = self.conformal_skin_min_oblique_deg.clamp(2.0, 60.0);
+        self.conformal_skin_max_slope_deg = self.conformal_skin_max_slope_deg.clamp(10.0, 85.0);
     }
 }
 
@@ -829,6 +849,11 @@ pub enum SurfaceHintMode {
     /// Suggests isosurface normal $\nabla \tau$ tangent to the selected face
     /// ($\nabla \tau \perp \hat{\mathbf{n}}_{\text{face}}$), making layers meet the surface orthogonally ($90^\circ$).
     NormalTangentToSurface,
+    /// Erodes $N$ top/surface layers of thickness $N \cdot h_{\text{top}}$ from the underlying core
+    /// Eikonal layers and slices that surface patch separately into $N$ conformal SDF skin layers
+    /// ($\phi_{\text{sdf}}(\mathbf{x}) = -(N - m + 0.15)\,h_{\text{top}}$), with automatic stand-off
+    /// around rising protrusions. Setting `skin_layer_count = 0` explicitly excludes the patch in auto mode.
+    ConformalSurfaceSkin,
 }
 
 impl SurfaceHintMode {
@@ -836,6 +861,7 @@ impl SurfaceHintMode {
         match self {
             Self::NormalOrthogonalToSurface => "Normal ⊥ Surface (Conformal Layers)",
             Self::NormalTangentToSurface => "Normal ∥ Surface (⊥ Layers)",
+            Self::ConformalSurfaceSkin => "Conformal Surface Skin (SDF Layers)",
         }
     }
 
@@ -843,8 +869,13 @@ impl SurfaceHintMode {
         match self {
             Self::NormalOrthogonalToSurface => "⊥ Normal",
             Self::NormalTangentToSurface => "∥ Normal",
+            Self::ConformalSurfaceSkin => "Conformal Skin",
         }
     }
+}
+
+const fn default_skin_layer_count() -> u32 {
+    3
 }
 
 /// A soft orientation hint assigned to a selectable `SurfacePatch` on an object.
@@ -855,6 +886,10 @@ pub struct SurfaceFaceHint {
     pub mode: SurfaceHintMode,
     pub influence_depth_mm: f32,
     pub weight: f32,
+    /// Number of conformal SDF skin layers ($N$) for `SurfaceHintMode::ConformalSurfaceSkin`
+    /// (`0` explicitly excludes this surface patch when automatic conformal skin mode is active).
+    #[serde(default = "default_skin_layer_count")]
+    pub skin_layer_count: u32,
 }
 
 /// A soft orientation hint placed at a 3D point in space (stored in object-local coordinates

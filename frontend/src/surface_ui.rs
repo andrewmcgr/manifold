@@ -55,6 +55,8 @@ pub enum UiIcon {
     SurfaceHintOrthogonal,
     /// Surface baseline with parallel tangent arrow (`Hint: Face ∥ Normal (⊥ Layers)`).
     SurfaceHintTangent,
+    /// Stacked conformal SDF offset layers with normal arrow (`Hint: Conformal Skin (SDF Layers)`).
+    SurfaceHintConformalSkin,
     /// 3D point sphere with normal vector arrow (`Hint: 3D Point Normal`).
     PointHint3d,
     /// Tray with incoming downward arrow (`Import CAD / Mesh / 3MF...`).
@@ -67,7 +69,7 @@ pub enum UiIcon {
 
 impl UiIcon {
     /// All icon variants (used for exhaustive testing).
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::SelectCursor,
         Self::MoveObject,
         Self::RotateObject,
@@ -83,6 +85,7 @@ impl UiIcon {
         Self::AddPlate,
         Self::SurfaceHintOrthogonal,
         Self::SurfaceHintTangent,
+        Self::SurfaceHintConformalSkin,
         Self::PointHint3d,
         Self::ImportFile,
         Self::SaveProject,
@@ -98,6 +101,7 @@ impl UiIcon {
             ToolMode::PlaceOnFace => Self::LayOnFace,
             ToolMode::SurfaceHintOrthogonal => Self::SurfaceHintOrthogonal,
             ToolMode::SurfaceHintTangent => Self::SurfaceHintTangent,
+            ToolMode::SurfaceHintConformalSkin => Self::SurfaceHintConformalSkin,
             ToolMode::PointHint => Self::PointHint3d,
         }
     }
@@ -379,6 +383,26 @@ pub fn build_icon_shapes(
             shapes.push(egui::Shape::line_segment([map(3.5, 9.8), map(20.2, 9.8)], stroke));
             shapes.push(egui::Shape::line(
                 vec![map(15.8, 6.0), map(20.2, 9.8), map(15.8, 13.6)],
+                stroke,
+            ));
+        }
+        UiIcon::SurfaceHintConformalSkin => {
+            // Three stacked conformal SDF offset curves + upward normal arrow
+            shapes.push(egui::Shape::line(
+                vec![map(3.0, 19.6), map(8.5, 18.0), map(15.5, 18.0), map(21.0, 19.6)],
+                stroke,
+            ));
+            shapes.push(egui::Shape::line(
+                vec![map(3.5, 15.6), map(8.5, 14.0), map(15.5, 14.0), map(20.5, 15.6)],
+                thin_stroke,
+            ));
+            shapes.push(egui::Shape::line(
+                vec![map(4.0, 11.6), map(8.5, 10.0), map(15.5, 10.0), map(20.0, 11.6)],
+                thin_stroke,
+            ));
+            shapes.push(egui::Shape::line_segment([map(12.0, 10.0), map(12.0, 3.2)], stroke));
+            shapes.push(egui::Shape::line(
+                vec![map(8.8, 6.4), map(12.0, 3.2), map(15.2, 6.4)],
                 stroke,
             ));
         }
@@ -1214,6 +1238,10 @@ fn build_surface_hint_widget_panel(
             UiIcon::SurfaceHintTangent,
             format!("Patch #{patch_id}: ∥ Tang"),
         ),
+        SurfaceHintMode::ConformalSurfaceSkin => (
+            UiIcon::SurfaceHintConformalSkin,
+            format!("Patch #{patch_id}: Skin"),
+        ),
     };
     let mode_text_size = ctx.fonts(|f| {
         f.layout_no_wrap(mode_text.clone(), font_id.clone(), egui::Color32::WHITE)
@@ -1246,16 +1274,19 @@ fn build_surface_hint_widget_panel(
         egui::vec2(inner_w, slider_h),
     );
 
-    let is_orth = mode == SurfaceHintMode::NormalOrthogonalToSurface;
-    let mode_fill = if is_orth {
-        egui::Color32::from_rgba_unmultiplied(18, 62, 82, 235)
-    } else {
-        egui::Color32::from_rgba_unmultiplied(78, 48, 16, 235)
-    };
-    let mode_border = if is_orth {
-        egui::Color32::from_rgb(56, 218, 255)
-    } else {
-        egui::Color32::from_rgb(255, 178, 46)
+    let (mode_fill, mode_border) = match mode {
+        SurfaceHintMode::NormalOrthogonalToSurface => (
+            egui::Color32::from_rgba_unmultiplied(18, 62, 82, 235),
+            egui::Color32::from_rgb(56, 218, 255),
+        ),
+        SurfaceHintMode::NormalTangentToSurface => (
+            egui::Color32::from_rgba_unmultiplied(78, 48, 16, 235),
+            egui::Color32::from_rgb(255, 178, 46),
+        ),
+        SurfaceHintMode::ConformalSurfaceSkin => (
+            egui::Color32::from_rgba_unmultiplied(16, 68, 42, 235),
+            egui::Color32::from_rgb(38, 247, 136),
+        ),
     };
 
     let mut local_frame =
@@ -2053,9 +2084,14 @@ fn apply_surface_click_action(
                         SurfaceHintMode::NormalTangentToSurface
                     }
                     SurfaceHintMode::NormalTangentToSurface => {
+                        SurfaceHintMode::ConformalSurfaceSkin
+                    }
+                    SurfaceHintMode::ConformalSurfaceSkin => {
                         SurfaceHintMode::NormalOrthogonalToSurface
                     }
                 };
+                vis_state.dirty_selected_layers = true;
+                vis_state.dirty_toolpaths = true;
                 plate.status_message = format!(
                     "Switched patch #{patch_id} hint to '{}' via 3D surface widget.",
                     h.mode.label()
@@ -2073,6 +2109,8 @@ fn apply_surface_click_action(
             if plate.selected_surface_hint_patch == Some(patch_id) {
                 plate.selected_surface_hint_patch = None;
             }
+            vis_state.dirty_selected_layers = true;
+            vis_state.dirty_toolpaths = true;
             plate.status_message =
                 format!("Removed surface orientation hint on patch #{patch_id}.");
         }

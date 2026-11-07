@@ -2113,6 +2113,7 @@ pub fn ui_workspace_system(
                                     for mode in [
                                         ToolMode::SurfaceHintOrthogonal,
                                         ToolMode::SurfaceHintTangent,
+                                        ToolMode::SurfaceHintConformalSkin,
                                         ToolMode::PointHint,
                                     ] {
                                         let active = plate.tool_mode == mode;
@@ -2141,6 +2142,7 @@ pub fn ui_workspace_system(
                                 .id_source("surface_face_hints_list")
                                 .default_open(true)
                                 .show(ui, |ui| {
+                                    let mut surf_hints_dirty = false;
                                     if surface_hint_count > 0
                                         && render_icon_button(
                                             ui,
@@ -2156,11 +2158,12 @@ pub fn ui_workspace_system(
                                             .surface_hints
                                             .retain(|h| h.object_id != sel_id);
                                         plate.selected_surface_hint_patch = None;
+                                        surf_hints_dirty = true;
                                     }
 
                                     if surface_hint_count == 0 {
                                         ui.small(
-                                            "Click faces in the viewport using 'Surface Hint: Normal ⊥ Surface' (gold) or 'Normal ∥ Surface' (cyan).",
+                                            "Click faces in the viewport using 'Hint: Face ⊥ Normal' (cyan), 'Hint: Face ∥ Normal' (gold), or 'Hint: Conformal Skin (SDF Layers)' (emerald).",
                                         );
                                     } else {
                                         let mut remove_surf_idx: Option<usize> = None;
@@ -2201,6 +2204,9 @@ pub fn ui_workspace_system(
                                                     SurfaceHintMode::NormalTangentToSurface => {
                                                         UiIcon::SurfaceHintTangent
                                                     }
+                                                    SurfaceHintMode::ConformalSurfaceSkin => {
+                                                        UiIcon::SurfaceHintConformalSkin
+                                                    }
                                                 };
                                                 if render_icon_button(
                                                     ui,
@@ -2209,7 +2215,7 @@ pub fn ui_workspace_system(
                                                     true,
                                                     true,
                                                 )
-                                                .on_hover_text("Click to toggle between Normal ⊥ Surface and Normal ∥ Surface")
+                                                .on_hover_text("Click to cycle between Normal ⊥ Surface, Normal ∥ Surface, and Conformal Skin (SDF Layers)")
                                                 .clicked()
                                                 {
                                                     sh.mode = match sh.mode {
@@ -2217,22 +2223,53 @@ pub fn ui_workspace_system(
                                                             SurfaceHintMode::NormalTangentToSurface
                                                         }
                                                         SurfaceHintMode::NormalTangentToSurface => {
+                                                            SurfaceHintMode::ConformalSurfaceSkin
+                                                        }
+                                                        SurfaceHintMode::ConformalSurfaceSkin => {
                                                             SurfaceHintMode::NormalOrthogonalToSurface
                                                         }
                                                     };
+                                                    surf_hints_dirty = true;
                                                 }
-                                                ui.add(
-                                                    egui::DragValue::new(&mut sh.influence_depth_mm)
-                                                        .speed(0.2)
-                                                        .range(0.5..=50.0)
-                                                        .prefix("d="),
-                                                );
-                                                ui.add(
-                                                    egui::DragValue::new(&mut sh.weight)
-                                                        .speed(0.02)
-                                                        .range(0.05..=1.0)
-                                                        .prefix("w="),
-                                                );
+                                                if sh.mode == SurfaceHintMode::ConformalSurfaceSkin {
+                                                    if ui
+                                                        .add(
+                                                            egui::DragValue::new(
+                                                                &mut sh.skin_layer_count,
+                                                            )
+                                                            .speed(0.2)
+                                                            .range(0..=12)
+                                                            .prefix("Layers: "),
+                                                        )
+                                                        .on_hover_text("Number of conformal SDF skin layers to erode and slice along this surface (set to 0 to exclude this patch from automatic conformal skin)")
+                                                        .changed()
+                                                    {
+                                                        surf_hints_dirty = true;
+                                                    }
+                                                } else {
+                                                    if ui
+                                                        .add(
+                                                            egui::DragValue::new(&mut sh.influence_depth_mm)
+                                                                .speed(0.2)
+                                                                .range(0.5..=50.0)
+                                                                .prefix("d="),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        surf_hints_dirty = true;
+                                                    }
+                                                    if ui
+                                                        .add(
+                                                            egui::DragValue::new(&mut sh.weight)
+                                                                .speed(0.02)
+                                                                .range(0.05..=1.0)
+                                                                .prefix("w="),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        surf_hints_dirty = true;
+                                                    }
+                                                }
                                                 if render_icon_button(
                                                     ui,
                                                     UiIcon::DeleteObject,
@@ -2262,7 +2299,13 @@ pub fn ui_workspace_system(
                                             {
                                                 plate.selected_surface_hint_patch = None;
                                             }
+                                            surf_hints_dirty = true;
                                         }
+                                    }
+                                    if surf_hints_dirty {
+                                        sync_object_hints_to_backend(&config, &plate, sel_id);
+                                        vis_state.dirty_selected_layers = true;
+                                        vis_state.dirty_toolpaths = true;
                                     }
                                 });
 
@@ -3977,8 +4020,52 @@ fn render_process_config_tab(
             param_help_button(ui, "slicing.max_nonplanar_slope_deg");
         });
 
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            lh_changed |= ui
+                .checkbox(
+                    &mut config.slicing.enable_auto_conformal_skin,
+                    "Auto Conformal SDF Top Skin",
+                )
+                .on_hover_text(
+                    "Automatically erode N layers of top/exit surfaces where the order field arrives at an oblique angle and slice them conformally along SDF level sets (standing off around rising protrusions).",
+                )
+                .changed();
+            lh_changed |= ui
+                .add(
+                    egui::DragValue::new(&mut config.slicing.conformal_skin_layers)
+                        .speed(0.2)
+                        .range(1..=12)
+                        .prefix("Skin Layers: "),
+                )
+                .on_hover_text("Default number of conformal SDF skin layers (N) for auto-detected or newly hinted conformal skin surfaces.")
+                .changed();
+            if config.slicing.enable_auto_conformal_skin {
+                lh_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.slicing.conformal_skin_min_oblique_deg)
+                            .speed(0.5)
+                            .range(2.0..=75.0)
+                            .prefix("Min Oblique: ")
+                            .suffix("°"),
+                    )
+                    .on_hover_text("Minimum angle between the order field gradient (∇τ) and the outward surface normal (∇φ) required to trigger automatic conformal skinning.")
+                    .changed();
+                lh_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.slicing.conformal_skin_max_slope_deg)
+                            .speed(0.5)
+                            .range(5.0..=85.0)
+                            .prefix("Max Slope: ")
+                            .suffix("°"),
+                    )
+                    .on_hover_text("Maximum surface slope relative to the local nozzle axis (ẑ_nozzle) eligible for automatic conformal skinning.")
+                    .changed();
+            }
+        });
+
         if lh_changed {
-            config.slicing.layer_height.sanitize();
+            config.slicing.sanitize();
             if config.eikonal.auto_voxel_size {
                 config.sync_auto_voxel_size();
             }
@@ -5770,6 +5857,12 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         tree_trunk_max_diameter_mm: config.slicing.tree_trunk_max_diameter_mm,
         tree_branch_wall_count: config.slicing.tree_branch_wall_count,
     });
+    ffi::set_conformal_skin_spec(ffi::ConformalSkinSpec {
+        auto_enabled: config.slicing.enable_auto_conformal_skin,
+        default_skin_layers: config.slicing.conformal_skin_layers,
+        min_oblique_angle_deg: config.slicing.conformal_skin_min_oblique_deg,
+        max_slope_angle_deg: config.slicing.conformal_skin_max_slope_deg,
+    });
 }
 
 /// Compiles all active surface-face hints and 3D point hints for `object_id` into
@@ -5793,6 +5886,7 @@ pub fn sync_object_hints_to_backend(
                 let kind = match sh.mode {
                     SurfaceHintMode::NormalOrthogonalToSurface => 1u8, // HintKind::Orthogonality
                     SurfaceHintMode::NormalTangentToSurface => 0u8,    // HintKind::Tangency
+                    SurfaceHintMode::ConformalSurfaceSkin => 2u8,      // Conformal SDF Surface Skin
                 };
                 let sample_count = patch.sample_points.len().max(1) as f32;
                 let sample_spacing = (patch.area / sample_count).sqrt();
@@ -5806,6 +5900,7 @@ pub fn sync_object_hints_to_backend(
                         influence_radius_mm: effective_radius,
                         weight: sh.weight,
                         apply_on_surface_only: true,
+                        skin_layer_count: sh.skin_layer_count,
                     });
                 }
             }
@@ -5825,6 +5920,7 @@ pub fn sync_object_hints_to_backend(
             influence_radius_mm: ph.influence_radius_mm,
             weight: ph.weight,
             apply_on_surface_only: false,
+            skin_layer_count: 0,
         });
     }
 

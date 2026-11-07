@@ -564,12 +564,19 @@ impl FieldVisualizationState {
             tree_trunk_max_diameter_mm: s.tree_trunk_max_diameter_mm,
             tree_branch_wall_count: s.tree_branch_wall_count,
         };
+        let skin_spec = ffi::ConformalSkinSpec {
+            auto_enabled: s.enable_auto_conformal_skin,
+            default_skin_layers: s.conformal_skin_layers,
+            min_oblique_angle_deg: s.conformal_skin_min_oblique_deg,
+            max_slope_angle_deg: s.conformal_skin_max_slope_deg,
+        };
         let adaptivity = self.adaptivity;
 
         let task = IoTaskPool::get().spawn(async move {
             ffi::set_slice_layer_height(lh_spec);
             ffi::set_shell_path_spec(shell_spec);
             ffi::set_support_spec(support_spec);
+            ffi::set_conformal_skin_spec(skin_spec);
 
             let layers_res = if need_layers {
                 Some(ffi::select_slicing_isosurfaces(object_id, adaptivity))
@@ -2687,6 +2694,7 @@ mod tests {
                 influence_radius_mm: 14.0,
                 weight: 1.0,
                 apply_on_surface_only: false,
+                skin_layer_count: 0,
             },
             ffi::SpatialOrientationHint {
                 kind: 0, // Surface tangency hint on +X wall
@@ -2695,6 +2703,7 @@ mod tests {
                 influence_radius_mm: 8.0,
                 weight: 0.9,
                 apply_on_surface_only: true,
+                skin_layer_count: 0,
             },
         ];
         ffi::set_spatial_orientation_hints(&hints);
@@ -2930,6 +2939,7 @@ mod tests {
             influence_radius_mm: 25.0,
             weight: 1.0,
             apply_on_surface_only: false,
+            skin_layer_count: 0,
         }];
         ffi::set_spatial_orientation_hints(&hints);
         assert!(ffi::recompute_object_fields(part.object_id, 0.6, 4.0));
@@ -3183,6 +3193,7 @@ mod tests {
             influence_radius_mm: 20.0,
             weight: 1.0,
             apply_on_surface_only: false,
+            skin_layer_count: 0,
         }];
         ffi::set_spatial_orientation_hints(&hints);
         assert!(ffi::recompute_object_fields(part.object_id, 0.5, 4.0));
@@ -3389,6 +3400,7 @@ mod tests {
             influence_radius_mm: 40.0,
             weight: 0.9,
             apply_on_surface_only: false,
+            skin_layer_count: 0,
         }];
         ffi::set_spatial_orientation_hints(&hints);
         assert!(ffi::recompute_object_fields(
@@ -4463,6 +4475,7 @@ mod tests {
             influence_radius_mm: 30.0,
             weight: 1.0,
             apply_on_surface_only: false,
+            skin_layer_count: 0,
         }];
         ffi::set_spatial_orientation_hints(&hints);
         ffi::set_slice_layer_height(ffi::LayerHeightSpec {
@@ -5076,6 +5089,7 @@ mod tests {
             influence_radius_mm: 25.0,
             weight: 1.0,
             apply_on_surface_only: false,
+            skin_layer_count: 0,
         }];
         ffi::set_spatial_orientation_hints(&hints);
         assert!(ffi::recompute_object_fields(part.object_id, 0.8, 3.0));
@@ -5141,6 +5155,7 @@ mod tests {
             influence_radius_mm: 25.0,
             weight: 1.0,
             apply_on_surface_only: false,
+            skin_layer_count: 0,
         }];
         ffi::set_spatial_orientation_hints(&hints);
         assert!(ffi::recompute_object_fields(part.object_id, 0.8, 3.0));
@@ -5805,6 +5820,251 @@ mod tests {
             }
         }
 
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(obj.object_id);
+    }
+
+    #[test]
+    fn test_conformal_surface_skin_sloped_deck_with_protrusion_auto_and_manual() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Construct a Benchy-like sloped deck (`x in [-10, 10], y in [-6, 6]`, top deck sloped at ~18 deg:
+        // `z_deck(x) = 3.0 + 0.15 * (x + 10.0)` from `z = 3.0 mm` at `x = -10` to `z = 6.0 mm` at `x = +10`)
+        // with a central cabin/coaming protrusion (`x in [-2.5, 2.5], y in [-2.5, 2.5]`) rising up to `z = 9.0 mm`.
+        // Under planar or weakly-tilted order fields, the isosurfaces arrive at the 18° sloped deck at an
+        // oblique angle (producing stair-stepping unless conformal SDF skinning is active).
+        let mut stl = String::from("solid sloped_deck_with_cabin\n");
+        let mut add_tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+            stl.push_str(&format!(
+                "  facet normal 0 0 0\n    outer loop\n      vertex {} {} {}\n      vertex {} {} {}\n      vertex {} {} {}\n    endloop\n  endfacet\n",
+                a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]
+            ));
+        };
+        let mut add_quad = |p00: [f32; 3], p10: [f32; 3], p11: [f32; 3], p01: [f32; 3]| {
+            add_tri(p00, p10, p11);
+            add_tri(p00, p11, p01);
+        };
+
+        let z_deck = |x: f32| -> f32 { 3.0 + 0.15 * (x + 10.0) };
+        let x0 = -10.0_f32;
+        let x1 = 10.0_f32;
+        let y0 = -6.0_f32;
+        let y1 = 6.0_f32;
+        let z00 = z_deck(x0);
+        let z10 = z_deck(x1);
+
+        // Sloped hull block (`[-10, 10] x [-6, 6]`, bottom `z = 0`, sloped top `z = z_deck(x)`)
+        add_quad([x0, y0, 0.0], [x0, y1, 0.0], [x1, y1, 0.0], [x1, y0, 0.0]); // bottom
+        add_quad([x0, y0, z00], [x1, y0, z10], [x1, y1, z10], [x0, y1, z00]); // sloped deck
+        add_quad([x0, y0, 0.0], [x1, y0, 0.0], [x1, y0, z10], [x0, y0, z00]); // front (-Y)
+        add_quad([x1, y1, 0.0], [x0, y1, 0.0], [x0, y1, z00], [x1, y1, z10]); // back (+Y)
+        add_quad([x0, y1, 0.0], [x0, y0, 0.0], [x0, y0, z00], [x0, y1, z00]); // left (-X)
+        add_quad([x1, y0, 0.0], [x1, y1, 0.0], [x1, y1, z10], [x1, y0, z10]); // right (+X)
+
+        // Central cabin protrusion (`[-2.5, 2.5] x [-2.5, 2.5]`, `z = 0..9.0 mm`)
+        let cx0 = -2.5_f32;
+        let cx1 = 2.5_f32;
+        let cy0 = -2.5_f32;
+        let cy1 = 2.5_f32;
+        let cz1 = 9.0_f32;
+        add_quad([cx0, cy0, 0.0], [cx0, cy1, 0.0], [cx1, cy1, 0.0], [cx1, cy0, 0.0]);
+        add_quad([cx0, cy0, cz1], [cx1, cy0, cz1], [cx1, cy1, cz1], [cx0, cy1, cz1]);
+        add_quad([cx0, cy0, 0.0], [cx1, cy0, 0.0], [cx1, cy0, cz1], [cx0, cy0, cz1]);
+        add_quad([cx1, cy1, 0.0], [cx0, cy1, 0.0], [cx0, cy1, cz1], [cx1, cy1, cz1]);
+        add_quad([cx0, cy1, 0.0], [cx0, cy0, 0.0], [cx0, cy0, cz1], [cx0, cy1, cz1]);
+        add_quad([cx1, cy0, 0.0], [cx1, cy1, 0.0], [cx1, cy1, cz1], [cx1, cy0, cz1]);
+        stl.push_str("endsolid sloped_deck_with_cabin\n");
+
+        let tmp_path = std::env::temp_dir().join("manifold_test_conformal_skin_deck_cabin.stl");
+        std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write temporary STL");
+        let obj = crate::io::stl::load_stl_file(&tmp_path)
+            .expect("Expected synthetic sloped deck + cabin STL import to succeed");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut cfg = crate::config::SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.eikonal.voxel_size_mm = 0.25;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.25;
+        cfg.slicing.layer_height.min_mm = 0.15;
+        cfg.slicing.layer_height.max_mm = 0.30;
+        cfg.slicing.layer_height.first_layer_mm = 0.25;
+        cfg.slicing.layer_height.top_layer_mm = 0.20;
+        cfg.slicing.enable_auto_conformal_skin = false;
+        cfg.slicing.conformal_skin_layers = 3;
+        cfg.slicing.sanitize();
+        crate::ui::sync_config_to_backend(&cfg);
+        ffi::set_spatial_orientation_hints(&[]);
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        // 1. Baseline without conformal skin
+        let base_layers = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        assert!(base_layers.valid && !base_layers.layers.is_empty());
+
+        // 2. Automatic Conformal SDF Skin mode (`enable_auto_conformal_skin = true`, 3 skin layers)
+        cfg.slicing.enable_auto_conformal_skin = true;
+        cfg.slicing.conformal_skin_layers = 3;
+        cfg.slicing.conformal_skin_min_oblique_deg = 8.0;
+        cfg.slicing.conformal_skin_max_slope_deg = 60.0;
+        crate::ui::sync_config_to_backend(&cfg);
+
+        let auto_layers = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        assert!(
+            auto_layers.valid && auto_layers.layers.len() >= base_layers.layers.len() + 3,
+            "Expected automatic conformal skin mode to append at least 3 conformal SDF skin layers (base={}, auto={})",
+            base_layers.layers.len(),
+            auto_layers.layers.len()
+        );
+
+        // Identify the extracted conformal skin layers (`is_top_layer && min_thickness_mm == max_thickness_mm == top_layer_mm`)
+        let skin_layers: Vec<&ffi::SelectedLayerInfo> = auto_layers
+            .layers
+            .iter()
+            .filter(|l| {
+                l.is_top_layer
+                    && (l.max_thickness_mm - l.min_thickness_mm).abs() < 1.0e-5
+                    && (l.mean_thickness_mm - cfg.slicing.layer_height.top_layer_mm).abs() < 1.0e-4
+            })
+            .collect();
+        assert!(
+            skin_layers.len() >= 3,
+            "Expected at least 3 uniform-thickness conformal SDF skin layers, got {}",
+            skin_layers.len()
+        );
+
+        // Verify that the sloped deck conformal skin layers are tilted (spanning z ~ 3.0..6.0 mm)
+        // AND stand off around the central cabin protrusion (`|x| < 2.2 && |y| < 2.2` below `z = 7.0 mm`),
+        // AND are scheduled causally BEFORE the upper cabin layers (`z > 7.5 mm`).
+        let deck_skin_layer = skin_layers
+            .iter()
+            .copied()
+            .find(|l| {
+                let mut z_min = f32::INFINITY;
+                let mut z_max = f32::NEG_INFINITY;
+                for v in &l.vertices {
+                    z_min = z_min.min(v.z);
+                    z_max = z_max.max(v.z);
+                }
+                (z_max - z_min) > 1.2 && z_max < 7.0
+            })
+            .expect("Expected a sloped conformal skin layer spanning the 18° deck");
+
+        for v in &deck_skin_layer.vertices {
+            assert!(
+                !(v.x.abs() < 2.2 && v.y.abs() < 2.2),
+                "Expected sloped deck conformal skin layer to stand off around the rising cabin protrusion base, but found vertex at ({:.2}, {:.2}, {:.2})",
+                v.x,
+                v.y,
+                v.z
+            );
+        }
+
+        let upper_cabin_layer = auto_layers
+            .layers
+            .iter()
+            .find(|l| {
+                !l.vertices.is_empty()
+                    && l.vertices.iter().all(|v| v.z > 7.2)
+            })
+            .expect("Expected upper cabin layers above z = 7.2 mm");
+        assert!(
+            deck_skin_layer.layer_index < upper_cabin_layer.layer_index,
+            "Expected sloped deck conformal skin layer (#{}, iso={:.2}) to be scheduled causally BEFORE upper cabin protrusion layer (#{}, iso={:.2})",
+            deck_skin_layer.layer_index,
+            deck_skin_layer.isovalue,
+            upper_cabin_layer.layer_index,
+            upper_cabin_layer.isovalue
+        );
+
+        // 3. Manual ConformalSurfaceSkin hint (`kind = 2`, `skin_layer_count = 4`) with auto mode disabled
+        cfg.slicing.enable_auto_conformal_skin = false;
+        crate::ui::sync_config_to_backend(&cfg);
+        let deck_normal = Vec3::new(-0.15, 0.0, 1.0).normalize();
+        let manual_hints = vec![
+            ffi::SpatialOrientationHint {
+                kind: 2, // ConformalSurfaceSkin
+                position_bed: [-6.0, 0.0, z_deck(-6.0)],
+                direction_bed: [deck_normal.x, deck_normal.y, deck_normal.z],
+                influence_radius_mm: 8.0,
+                weight: 1.0,
+                apply_on_surface_only: true,
+                skin_layer_count: 4,
+            },
+            ffi::SpatialOrientationHint {
+                kind: 2, // ConformalSurfaceSkin
+                position_bed: [6.0, 0.0, z_deck(6.0)],
+                direction_bed: [deck_normal.x, deck_normal.y, deck_normal.z],
+                influence_radius_mm: 8.0,
+                weight: 1.0,
+                apply_on_surface_only: true,
+                skin_layer_count: 4,
+            },
+        ];
+        ffi::set_spatial_orientation_hints(&manual_hints);
+
+        let manual_layers = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        let manual_skin_count = manual_layers
+            .layers
+            .iter()
+            .filter(|l| {
+                l.is_top_layer
+                    && (l.max_thickness_mm - l.min_thickness_mm).abs() < 1.0e-5
+                    && (l.mean_thickness_mm - cfg.slicing.layer_height.top_layer_mm).abs() < 1.0e-4
+            })
+            .count();
+        assert_eq!(
+            manual_skin_count, 4,
+            "Expected manual ConformalSurfaceSkin hint with skin_layer_count=4 to extract exactly 4 conformal SDF skin layers"
+        );
+
+        // Verify that full 3D toolpaths (`OuterWall = 0`, `InnerWall = 1`, `SolidInfill = 3`) are generated
+        // on the conformal SDF skin layers and never extend outside the object footprint.
+        let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(tp.valid && tp.total_path_count > 0);
+        let mut skin_has_outer_wall = false;
+        let mut skin_has_solid_infill = false;
+        for l_mesh in &manual_layers.layers {
+            let is_skin = l_mesh.is_top_layer
+                && (l_mesh.max_thickness_mm - l_mesh.min_thickness_mm).abs() < 1.0e-5
+                && (l_mesh.mean_thickness_mm - cfg.slicing.layer_height.top_layer_mm).abs() < 1.0e-4;
+            if is_skin {
+                if let Some(tp_layer) = tp
+                    .layers
+                    .iter()
+                    .find(|tl| tl.layer_index == l_mesh.layer_index)
+                {
+                    for p in &tp_layer.paths {
+                        if p.feature_kind == 0 {
+                            skin_has_outer_wall = true;
+                        }
+                        if p.feature_kind == 3 {
+                            skin_has_solid_infill = true;
+                        }
+                        for pt in &p.points {
+                            assert!(
+                                pt.x.abs() <= 10.2 && pt.y.abs() <= 6.2,
+                                "Conformal skin toolpath point ({:.2}, {:.2}, {:.2}) exceeded deck footprint",
+                                pt.x,
+                                pt.y,
+                                pt.z
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            skin_has_outer_wall && skin_has_solid_infill,
+            "Expected conformal SDF skin layers to produce both OuterWall and SolidInfill toolpaths"
+        );
+
+        ffi::set_spatial_orientation_hints(&[]);
         let default_cfg = crate::config::SlicerConfig::default();
         crate::ui::sync_config_to_backend(&default_cfg);
         let _ = ffi::remove_cad_object(obj.object_id);

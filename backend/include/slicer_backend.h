@@ -26,6 +26,7 @@ struct OverhangBiasSpec;
 struct FieldComputeProgress;
 struct LineWidthSpec;
 struct SupportSpec;
+struct ConformalSkinSpec;
 struct ShellPathSpec;
 struct ToolpathPoint;
 struct ExtrusionPath;
@@ -186,6 +187,12 @@ public:
     /// Returns the current overhang-driven conformal/orthogonal surface orientation bias parameters.
     OverhangBiasSpec overhangOrientationBiasSpec() const noexcept;
 
+    /// Sets the automatic & manual conformal SDF surface skin slicing parameters (`ConformalSkinSpec`).
+    void setConformalSkinSpec(const ConformalSkinSpec& spec) noexcept;
+
+    /// Returns the current conformal SDF surface skin slicing parameters (`ConformalSkinSpec`).
+    ConformalSkinSpec conformalSkinSpec() const noexcept;
+
     /// Selects the non-planar slicing isosurfaces for `objectId` using a bidirectional
     /// branch-aware relaxation algorithm honoring `min_mm`, `max_mm`, `target_mm`,
     /// `first_layer_mm`, and `top_layer_mm`, and extracts their interior-clipped 3D
@@ -281,6 +288,8 @@ void set_multi_resolution_grid_config(bool enabled, std::uint32_t coarse_ratio);
 void set_spatial_orientation_hints(rust::Slice<const SpatialOrientationHint> hints);
 void set_overhang_orientation_bias_spec(OverhangBiasSpec spec);
 OverhangBiasSpec get_overhang_orientation_bias_spec();
+void set_conformal_skin_spec(ConformalSkinSpec spec);
+ConformalSkinSpec get_conformal_skin_spec();
 SelectedIsosurfacesResult select_slicing_isosurfaces(std::uint64_t object_id, float adaptivity);
 void set_shell_path_spec(ShellPathSpec spec);
 ShellPathSpec get_shell_path_spec();

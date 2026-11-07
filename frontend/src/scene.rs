@@ -32,6 +32,9 @@ pub enum ToolMode {
     SurfaceHintOrthogonal,
     /// Select STEP B-Rep faces or contiguous planar mesh patches to suggest $\nabla \tau \perp \hat{\mathbf{n}}_{\text{face}}$ (isosurfaces orthogonal to the face).
     SurfaceHintTangent,
+    /// Select STEP B-Rep faces or contiguous planar mesh patches to erode $N$ layers of the core
+    /// and slice $N$ conformal SDF skin layers parallel to $\phi_{\text{sdf}} = 0$.
+    SurfaceHintConformalSkin,
     /// Place & orient 3D point normal hints in space (on the active 2D slice plane or object surface).
     PointHint,
 }
@@ -45,6 +48,7 @@ impl ToolMode {
             Self::PlaceOnFace => "Place on Face (Hull)",
             Self::SurfaceHintOrthogonal => "Hint: Face ⊥ Normal (Conformal)",
             Self::SurfaceHintTangent => "Hint: Face ∥ Normal (⊥ Layers)",
+            Self::SurfaceHintConformalSkin => "Hint: Conformal Skin (SDF Layers)",
             Self::PointHint => "Hint: 3D Point Normal",
         }
     }
@@ -1047,7 +1051,7 @@ pub fn viewport_interaction_system(
     mut mouse_wheel: EventReader<MouseWheel>,
     mut plate: ResMut<BuildPlateState>,
     mut config: ResMut<SlicerConfig>,
-    vis_state: Res<crate::field_vis::FieldVisualizationState>,
+    mut vis_state: ResMut<crate::field_vis::FieldVisualizationState>,
     surface_ui: Res<crate::surface_ui::SurfaceUiState>,
     mut camera_query: Query<(&Camera, &GlobalTransform, &mut OrbitCamera, &mut Transform), Without<CadObjectEntity>>,
     mut object_transforms: Query<&mut Transform, With<CadObjectEntity>>,
@@ -1098,7 +1102,9 @@ pub fn viewport_interaction_system(
                             plate.hovered_hull_face = Some(face_idx);
                         }
                     }
-                    ToolMode::SurfaceHintOrthogonal | ToolMode::SurfaceHintTangent => {
+                    ToolMode::SurfaceHintOrthogonal
+                    | ToolMode::SurfaceHintTangent
+                    | ToolMode::SurfaceHintConformalSkin => {
                         if let Some((patch_id, _, _, _)) = obj.raycast_surface_patch(obj_tf, ray) {
                             plate.hovered_surface_patch = Some(patch_id);
                         }
@@ -1150,17 +1156,25 @@ pub fn viewport_interaction_system(
                     }
                 }
             }
-            ToolMode::SurfaceHintOrthogonal | ToolMode::SurfaceHintTangent => {
+            ToolMode::SurfaceHintOrthogonal
+            | ToolMode::SurfaceHintTangent
+            | ToolMode::SurfaceHintConformalSkin => {
                 if let (Some(patch_id), Some(sel_id)) =
                     (plate.hovered_surface_patch, plate.selected_object_id)
                 {
-                    let target_mode = if plate.tool_mode == ToolMode::SurfaceHintOrthogonal {
-                        SurfaceHintMode::NormalOrthogonalToSurface
-                    } else {
-                        SurfaceHintMode::NormalTangentToSurface
+                    let target_mode = match plate.tool_mode {
+                        ToolMode::SurfaceHintOrthogonal => {
+                            SurfaceHintMode::NormalOrthogonalToSurface
+                        }
+                        ToolMode::SurfaceHintTangent => SurfaceHintMode::NormalTangentToSurface,
+                        ToolMode::SurfaceHintConformalSkin => {
+                            SurfaceHintMode::ConformalSurfaceSkin
+                        }
+                        _ => SurfaceHintMode::NormalOrthogonalToSurface,
                     };
                     let depth_mm = config.eikonal.default_surface_hint_depth_mm;
                     let weight = config.eikonal.default_hint_weight;
+                    let default_skin_layers = config.slicing.conformal_skin_layers.clamp(1, 12);
 
                     if let Some(existing_pos) = config
                         .eikonal
@@ -1178,6 +1192,12 @@ pub fn viewport_interaction_system(
                             );
                         } else {
                             config.eikonal.surface_hints[existing_pos].mode = target_mode;
+                            if target_mode == SurfaceHintMode::ConformalSurfaceSkin
+                                && config.eikonal.surface_hints[existing_pos].skin_layer_count == 0
+                            {
+                                config.eikonal.surface_hints[existing_pos].skin_layer_count =
+                                    default_skin_layers;
+                            }
                             plate.selected_surface_hint_patch = Some(patch_id);
                             plate.status_message = format!(
                                 "Switched patch #{patch_id} hint to '{}'.",
@@ -1191,6 +1211,7 @@ pub fn viewport_interaction_system(
                             mode: target_mode,
                             influence_depth_mm: depth_mm,
                             weight,
+                            skin_layer_count: default_skin_layers,
                         });
                         plate.selected_surface_hint_patch = Some(patch_id);
                         plate.status_message = format!(
@@ -1199,6 +1220,9 @@ pub fn viewport_interaction_system(
                             depth_mm
                         );
                     }
+                    crate::ui::sync_object_hints_to_backend(&config, &plate, sel_id);
+                    vis_state.dirty_selected_layers = true;
+                    vis_state.dirty_toolpaths = true;
                     mouse_motion.clear();
                     return;
                 }
@@ -1933,7 +1957,9 @@ pub fn draw_viewport_gizmos_system(
             let is_ui_hovered = plate.ui_hovered_surface_hint_patch == Some(sh.patch_id);
             let is_vp_hovered = matches!(
                 plate.tool_mode,
-                ToolMode::SurfaceHintOrthogonal | ToolMode::SurfaceHintTangent
+                ToolMode::SurfaceHintOrthogonal
+                    | ToolMode::SurfaceHintTangent
+                    | ToolMode::SurfaceHintConformalSkin
             ) && plate.hovered_surface_patch == Some(sh.patch_id);
             let show_arrows = is_selected || is_ui_hovered || is_vp_hovered;
 
@@ -1943,6 +1969,7 @@ pub fn draw_viewport_gizmos_system(
                 match sh.mode {
                     SurfaceHintMode::NormalOrthogonalToSurface => Color::srgb(0.15, 0.95, 0.98),
                     SurfaceHintMode::NormalTangentToSurface => Color::srgb(1.0, 0.42, 0.85),
+                    SurfaceHintMode::ConformalSurfaceSkin => Color::srgb(0.15, 0.98, 0.55),
                 }
             } else {
                 match sh.mode {
@@ -1950,6 +1977,7 @@ pub fn draw_viewport_gizmos_system(
                         Color::srgba(0.15, 0.95, 0.98, 0.55)
                     }
                     SurfaceHintMode::NormalTangentToSurface => Color::srgba(1.0, 0.42, 0.85, 0.55),
+                    SurfaceHintMode::ConformalSurfaceSkin => Color::srgba(0.15, 0.98, 0.55, 0.60),
                 }
             };
 
@@ -1969,14 +1997,17 @@ pub fn draw_viewport_gizmos_system(
 
     if matches!(
         plate.tool_mode,
-        ToolMode::SurfaceHintOrthogonal | ToolMode::SurfaceHintTangent
+        ToolMode::SurfaceHintOrthogonal
+            | ToolMode::SurfaceHintTangent
+            | ToolMode::SurfaceHintConformalSkin
     ) {
         if let Some(hovered_pid) = plate.hovered_surface_patch {
             if let Some(patch) = obj.surface_patches.get(hovered_pid as usize) {
-                let preview_mode = if plate.tool_mode == ToolMode::SurfaceHintOrthogonal {
-                    SurfaceHintMode::NormalOrthogonalToSurface
-                } else {
-                    SurfaceHintMode::NormalTangentToSurface
+                let preview_mode = match plate.tool_mode {
+                    ToolMode::SurfaceHintOrthogonal => SurfaceHintMode::NormalOrthogonalToSurface,
+                    ToolMode::SurfaceHintTangent => SurfaceHintMode::NormalTangentToSurface,
+                    ToolMode::SurfaceHintConformalSkin => SurfaceHintMode::ConformalSurfaceSkin,
+                    _ => SurfaceHintMode::NormalOrthogonalToSurface,
                 };
                 draw_surface_patch_gizmo(
                     &mut gizmos,
@@ -2079,6 +2110,18 @@ fn draw_surface_patch_gizmo(
             let t2 = w_normal.cross(t1).normalize_or_zero();
             gizmos.arrow(w_center - t1 * 8.0, w_center + t1 * 8.0, color);
             gizmos.arrow(w_center - t2 * 8.0, w_center + t2 * 8.0, color);
+        }
+        Some(SurfaceHintMode::ConformalSurfaceSkin) => {
+            // Stacked parallel offset bars + inward normal arrow indicating N conformal SDF skin layers
+            let up = if w_normal.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
+            let t1 = w_normal.cross(up).normalize_or_zero();
+            let t2 = w_normal.cross(t1).normalize_or_zero();
+            for step in 0..3 {
+                let offset = w_normal * (step as f32 * 2.2);
+                gizmos.line(w_center + offset - t1 * 7.0, w_center + offset + t1 * 7.0, color);
+                gizmos.line(w_center + offset - t2 * 7.0, w_center + offset + t2 * 7.0, color);
+            }
+            gizmos.arrow(w_center + w_normal * 6.6, w_center + w_normal * 14.0, color);
         }
         None => {}
     }

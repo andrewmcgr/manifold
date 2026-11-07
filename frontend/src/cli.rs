@@ -1603,6 +1603,7 @@ fn slice_single_loaded_object(
             let kind = match sh.mode {
                 crate::config::SurfaceHintMode::NormalOrthogonalToSurface => 1u8,
                 crate::config::SurfaceHintMode::NormalTangentToSurface => 0u8,
+                crate::config::SurfaceHintMode::ConformalSurfaceSkin => 2u8,
             };
             let sample_count = patch.sample_points.len().max(1) as f32;
             let sample_spacing = (patch.area / sample_count).sqrt();
@@ -1615,6 +1616,7 @@ fn slice_single_loaded_object(
                     influence_radius_mm: effective_radius,
                     weight: sh.weight,
                     apply_on_surface_only: true,
+                    skin_layer_count: sh.skin_layer_count,
                 });
             }
         }
@@ -1632,6 +1634,7 @@ fn slice_single_loaded_object(
             influence_radius_mm: ph.influence_radius_mm,
             weight: ph.weight,
             apply_on_surface_only: false,
+            skin_layer_count: 0,
         });
     }
     ffi::set_spatial_orientation_hints(&ffi_hints);
