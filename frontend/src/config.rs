@@ -1768,6 +1768,42 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         summary: "Maximum allowed angle between the isosurface normal (∇τ) and the nozzle axis.",
         details: "Clamps the Eikonal gradient cone so conformal layers never tilt steeper than your nozzle/fan shroud clearance allows.",
     },
+    ParameterDoc {
+        key: "slicing.enable_auto_conformal_skin",
+        category: "Non-Planar Layer Slicing",
+        title: "Auto Conformal SDF Surface Skin",
+        units: "bool",
+        default_value: "false",
+        summary: "Automatically detects upward-facing exit surfaces where the order field arrives obliquely and slices N conformal SDF skin layers parallel to φ_sdf = 0.",
+        details: "Erodes the underlying core SDF by D_erode = N * h_top across qualifying surface patches (filtered by two-stage 3D tool-clearance collision checks against rising protrusions and already-printed core geometry) so core layers terminate early, then schedules N constant-thickness conformal SDF offset layers at τ_completion(P) + m * 1e-3.",
+    },
+    ParameterDoc {
+        key: "slicing.conformal_skin_layers",
+        category: "Non-Planar Layer Slicing",
+        title: "Conformal SDF Surface Skin Layers (N)",
+        units: "layers",
+        default_value: "3",
+        summary: "Default number of conformal SDF offset skin layers (1..12) sliced parallel to φ_sdf = 0 on automatic or manually selected conformal skin surfaces.",
+        details: "Each skin layer m ∈ {1..N} is extracted from the eroded SDF level set φ_sdf(x) = -(N - m + 0.15) * h_top and printed with dense perimeter + solid infill toolpaths.",
+    },
+    ParameterDoc {
+        key: "slicing.conformal_skin_min_oblique_deg",
+        category: "Non-Planar Layer Slicing",
+        title: "Conformal Skin Minimum Obliqueness Angle",
+        units: "deg (°)",
+        default_value: "12.0°",
+        summary: "Minimum angle between the order-field gradient (∇τ) and the outward surface normal (∇φ_sdf) required to trigger automatic conformal skinning.",
+        details: "Prevents flat horizontal roofs that are already parallel to the slicing layers from being redundantly re-sliced as conformal skin patches.",
+    },
+    ParameterDoc {
+        key: "slicing.conformal_skin_max_slope_deg",
+        category: "Non-Planar Layer Slicing",
+        title: "Conformal Skin Maximum Surface Slope",
+        units: "deg (°)",
+        default_value: "60.0°",
+        summary: "Maximum surface slope relative to the local nozzle axis (z_nozzle) eligible for automatic conformal skinning.",
+        details: "Restricts automatic conformal skin detection to upward-facing sloped decks, roofs, and domes within the toolhead's printable slope envelope.",
+    },
 
     // --- Shell & Toolpath Generation ---
     ParameterDoc {
@@ -2635,6 +2671,10 @@ mod tests {
         assert!(lookup_parameter_doc("eikonal.auto_voxel_size").is_some());
         assert!(lookup_parameter_doc("eikonal.enable_multi_resolution_grid").is_some());
         assert!(lookup_parameter_doc("eikonal.coarse_grid_ratio").is_some());
+        assert!(lookup_parameter_doc("slicing.enable_auto_conformal_skin").is_some());
+        assert!(lookup_parameter_doc("slicing.conformal_skin_layers").is_some());
+        assert!(lookup_parameter_doc("slicing.conformal_skin_min_oblique_deg").is_some());
+        assert!(lookup_parameter_doc("slicing.conformal_skin_max_slope_deg").is_some());
         let md = generate_parameter_docs_markdown();
         assert!(md.starts_with("# Manifold2 Parameter Reference"));
         assert!(md.contains("gcode.swell_multipliers"));

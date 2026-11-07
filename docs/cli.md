@@ -90,6 +90,14 @@ manifold-frontend slice "Test Objects/Iron heart MOD (deepergrain).3mf" --plate 
 
 # 4. Auto-arrange multiple STL files onto one plate, save the 3MF project, and slice to G-code:
 manifold-frontend slice --arrange --save-3mf batch_plate.3mf -o batch_plate.gcode part_a.stl part_b.stl part_c.stl
+
+# 5. Slice with Auto Conformal SDF Surface Skins and Obstacle-Avoiding Non-Planar Tree Supports:
+manifold-frontend slice \
+  -s slicing.enable_auto_conformal_skin=true \
+  -s slicing.conformal_skin_layers=3 \
+  -s slicing.support_style=tree \
+  -s slicing.support_on_bed_only=true \
+  benchy.stl -o benchy_conformal.gcode
 ```
 
 ---

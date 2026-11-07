@@ -22,10 +22,12 @@ $$\hat{\mathbf{g}}_{\text{bed}} = R_{\text{bed}}^{-1} \begin{bmatrix} 0 \\ 0 \\ 
 
 All overhang fields, bridge checks, and support column projections query $\hat{\mathbf{g}}_{\text{bed}}$ rather than reading the raw $Z$ coordinate.
 
-### 1.3 Piecewise-Linear Nozzle Clearance Envelope
-Each toolhead defines a revolved clearance profile $\{(r_i, z_i)\}_{i=0}^{m-1}$ in the local nozzle frame ($z_i \ge 0$ along $\hat{\mathbf{z}}_{\text{nozzle}}$, $r_i \ge 0$ perpendicular to $\hat{\mathbf{z}}_{\text{nozzle}}$). The maximum collision-free surface slope angle $\theta_{\text{clear}}$ relative to the plane orthogonal to $\hat{\mathbf{z}}_{\text{nozzle}}$ is bounded by the tightest secant cone from the nozzle tip flat $(r_0, 0)$:
-
-$$\theta_{\text{clear}} = \min_{i \ge 1} \arctan\!\left(\frac{z_i}{r_i - r_0}\right), \qquad \theta_{\max} = \min\!\left(\theta_{\text{user\_max}},\; \theta_{\text{clear}} - 2^\circ\right)$$
+### 1.3 Nozzle Clearance Envelopes (`PiecewiseXZ`, `ParametricCone`, `RectilinearCone`)
+Each toolhead defines a 3D collision clearance envelope in the local nozzle frame ($\hat{\mathbf{x}}_{\text{nozzle}}, \hat{\mathbf{y}}_{\text{nozzle}}, \hat{\mathbf{z}}_{\text{nozzle}}$) with axial height $z \ge 0$ measured along $\hat{\mathbf{z}}_{\text{nozzle}}$:
+1. **`PiecewiseXZ`**: Multi-point revolved profile $\{(r_i, z_i)\}_{i=0}^{m-1}$ ($r_i \ge 0$ perpendicular to $\hat{\mathbf{z}}_{\text{nozzle}}$). The maximum collision-free surface slope angle $\theta_{\text{clear}}$ relative to the plane orthogonal to $\hat{\mathbf{z}}_{\text{nozzle}}$ is bounded by the tightest secant cone from the nozzle tip flat $(r_0, 0)$:
+   $$\theta_{\text{clear}} = \min_{i \ge 1} \arctan\!\left(\frac{z_i}{r_i - r_0}\right), \qquad \theta_{\max} = \min\!\left(\theta_{\text{user\_max}},\; \theta_{\text{clear}} - 2^\circ\right)$$
+2. **`ParametricCone`**: Straight-sided circular cone defined by tip radius $r_0$, cone half-angle $\theta_{\text{cone}}$ from $\hat{\mathbf{z}}_{\text{nozzle}}$, and axial height $H_{\text{cone}}$, with radius $r(z) = r_0 + z\tan\theta_{\text{cone}}$ and $\theta_{\text{clear}} = 90^\circ - \theta_{\text{cone}}$.
+3. **`RectilinearCone`**: Anisotropic 4-sided rectangular pyramid defined by tip half-widths $(w_{x0}, w_{y0})$ along $(\hat{\mathbf{x}}_{\text{nozzle}}, \hat{\mathbf{y}}_{\text{nozzle}})$ and independent half-angles $(\theta_X, \theta_Y)$ in the local $XZ$ and $YZ$ planes, yielding directional half-widths $w_x(z) = w_{x0} + z\tan\theta_X$, $w_y(z) = w_{y0} + z\tan\theta_Y$ and directional slope bounds $(\theta_{\text{clear},X}, \theta_{\text{clear},Y}) = (90^\circ - \theta_X,\, 90^\circ - \theta_Y)$.
 
 ---
 
@@ -96,14 +98,16 @@ Before solving the Eikonal PDE, Manifold Slicer constructs a smooth target layer
 4. **Laplacian Director Regularization & 5/6-Axis Tool Orientation Field**:
    The blended director field $\hat{\mathbf{d}}(\mathbf{x})$ is smoothed over `solver_iterations` passes with weight `curvature_regularization`. For 5/6-axis tools (`has_rotational_axes = true`), the spatially varying tool axis $\hat{\mathbf{z}}_{\text{nozzle}}(\mathbf{x})$ rotates toward $\hat{\mathbf{d}}(\mathbf{x})$ clamped within `max_angle_from_bed_normal_deg` of $+Z_{\text{bed}}$.
 
-### 3.4 Constrained Anisotropic Eikonal Solver ($\tau(\mathbf{x})$)
-The non-planar arrival-time / order field $\tau(\mathbf{x}) \ge 0$ satisfies the constrained Eikonal problem:
+### 3.4 Constrained Anisotropic Eikonal Solver ($\tau(\mathbf{x})$) & Height-Only Planar Mode
+Manifold Slicer supports two order-field formulations (`eikonal.order_field_mode`):
+- **`HeightOnlyPlanar`**: Evaluates the linear height field $\tau(\mathbf{x}) = \max\bigl(0,\, (\mathbf{x} - \mathbf{x}_{\min,\text{bed}}) \cdot \hat{\mathbf{z}}_{\text{nozzle}}(\mathbf{x})\bigr)$ along the queried local nozzle axis with $0^\circ$ tool tilt, producing flat planar layers perpendicular to $\hat{\mathbf{z}}_{\text{nozzle}}$ while retaining 3D SDF shell classification, variable layer heights, bridging, and gravity-aware support detection.
+- **`ConstrainedNonPlanar` (Default)**: The non-planar arrival-time / order field $\tau(\mathbf{x}) \ge 0$ satisfies the constrained Eikonal problem:
 
 $$\|\nabla\tau(\mathbf{x})\| = \frac{1}{F(\mathbf{x})}, \qquad \text{subject to} \quad \frac{\nabla\tau(\mathbf{x})}{\|\nabla\tau(\mathbf{x})\|} \cdot \hat{\mathbf{z}}_{\text{nozzle}}(\mathbf{x}) \ge \cos\theta_{\max}$$
 
 1. **Boundary Seeding**: Voxels contacting the build plate ($z \le z_{\min} + 1.5\Delta x$) are locked at $\tau(\mathbf{x}) = 0$. When `seed_order_field_from_supports` is enabled, unreachable overhang minima supported by support columns are seeded at their causal anti-gravity height $\tau_{\text{seed}} = (\mathbf{x} - \mathbf{x}_{\min}) \cdot (-\hat{\mathbf{g}}_{\text{bed}})$.
 2. **8-Octant Gauss-Seidel Fast Sweeping & Gradient-Cone Clamping**:
-   In each iteration, the solver sweeps through all 8 octant index orderings $(\pm i, \pm j, \pm k)$, solving the 3D Godunov upwind quadratic update from smaller neighbor values $(\tau_x, \tau_y, \tau_z)$ modulated by the anisotropic alignment speed $F(\mathbf{x}) = \max\bigl(0.25,\; \hat{\mathbf{g}}_{\text{upwind}} \cdot \hat{\mathbf{d}}(\mathbf{x})\bigr)$, and projects $\nabla\tau$ onto the allowable toolhead clearance cone $\cos\theta_{\max}$ so no isosurface ever exceeds `max_nonplanar_slope_deg` or collides with the toolhead XZ clearance profile.
+   In each iteration, the solver sweeps through all 8 octant index orderings $(\pm i, \pm j, \pm k)$, solving the 3D Godunov upwind quadratic update from smaller neighbor values $(\tau_x, \tau_y, \tau_z)$ modulated by the anisotropic alignment speed $F(\mathbf{x}) = \max\bigl(0.25,\; \hat{\mathbf{g}}_{\text{upwind}} \cdot \hat{\mathbf{d}}(\mathbf{x})\bigr)$, and projects $\nabla\tau$ onto the allowable toolhead clearance cone $\cos\theta_{\max}$ (or elliptical cone $(\theta_{\max,X}, \theta_{\max,Y})$ for `RectilinearCone`) so no isosurface ever exceeds `max_nonplanar_slope_deg` or collides with the toolhead clearance envelope.
 3. **Coarse-to-Fine Prolongation**: On Dual-Grid runs, the converged coarse arrival-time field $\tau_{\text{coarse}}$ is tricubically interpolated onto the fine shell narrow band and relaxed with fine-grid Gauss-Seidel passes so $\tau(\mathbf{x})$ is $C^1$-continuous across the shell-core interface.
 
 ---
@@ -124,6 +128,27 @@ For each scheduled isovalue $\tau_k$:
 1. An initial non-planar layer surface $\mathcal{M}_k$ is extracted from the interior level set $\psi_k(\mathbf{x}) = \tau(\mathbf{x}) - \tau_k = 0$ clipped to the part interior $\phi_{\text{sdf}}(\mathbf{x}) \le 0$ via `openvdb::tools::volumeToMesh`.
 2. **Conformal Boundary Shell Mesh Subdivision**: Every triangle in $\mathcal{M}_k$ that overlaps or approaches the fine outer shell ($\min_v \phi_{\text{sdf}}(v) \ge -T_{\text{shell}} - 2\Delta x_{\text{fine}}$) is recursively split ($1 \to 4$ mid-edge refinement) down to edge length $\le \Delta x_{\text{fine}}$, and its new vertices are projected onto the exact $\tau(\mathbf{x}) = \tau_k$ manifold while sampling the **fine-grid** signed distance $\phi_{\text{sdf}}^{\text{fine}}(\mathbf{x})$ and overhang $o^{\text{fine}}(\mathbf{x})$. This guarantees razor-sharp perimeters while keeping the deep core mesh lightweight.
 
+### 4.3 Conformal SDF Surface Skin Slicing & 3D Tool-Clearance Collision Prevention
+On sloped upward-facing decks, roofs, and domes where the order field $\tau(\mathbf{x})$ arrives at an oblique angle ($\nabla\tau \not\parallel \nabla\phi_{\text{sdf}}$), standard order-field isosurfaces terminate in stair-steps across the exterior surface. Manifold Slicer eliminates these stair-steps via **Conformal SDF Surface Skin Slicing**:
+
+1. **Candidate Surface Selection (Automatic & Manual Hints)**:
+   - **Manual `ConformalSurfaceSkin` (`Skin`) Hints**: Any B-Rep face or mesh patch tagged with `SurfaceHintMode::ConformalSurfaceSkin` is assigned its custom `skin_layer_count` ($N_p \in [1, 12]$), or explicitly excluded from automatic detection when `skin_layer_count = 0`.
+   - **Automatic Obliqueness Detection (`enable_auto_conformal_skin`)**: Upward-facing exit voxels near $\phi_{\text{sdf}}(\mathbf{x}) = 0$ where $\hat{\mathbf{n}}_{\text{sdf}} \cdot \hat{\mathbf{z}}_{\text{nozzle}} \ge \cos(\theta_{\text{max,slope}})$ and the obliqueness angle between $\nabla\tau$ and $\hat{\mathbf{n}}_{\text{sdf}} = \nabla\phi_{\text{sdf}}$ exceeds `conformal_skin_min_oblique_deg` are selected as candidate skin voxels with $N_p = \text{conformal\_skin\_layers}$.
+2. **Two-Stage 3D Tool-Clearance Collision Pruning**:
+   - Because conformal skin layers are printed *after* the underlying eroded core of patch $P$ completes at $\tau_{\text{completion}}(P) = \max_{\mathbf{x} \in P} \tau(\mathbf{x})$, reaching down onto the lower edge of a recessed or obstructed sloped deck (such as the sloped bow deck of a 3DBenchy flanked by raised hull bulwarks and cabin walls) could cause the nozzle tip, heater block, or fan shroud to collide with surrounding geometry.
+   - For any candidate skin point $\mathbf{x}$ with inward erosion depth $D_{\text{erode}} = N_p \cdot h_{\text{top}}$, Manifold Slicer places the virtual nozzle tip at the deepest skin layer $\mathbf{p}_{\text{tip}} = \mathbf{x} - D_{\text{erode}}\,\hat{\mathbf{n}}_{\text{sdf}}(\mathbf{x})$, queries the local orthonormal `NozzleFrame` $(\hat{\mathbf{x}}_{\text{nozzle}}, \hat{\mathbf{y}}_{\text{nozzle}}, \hat{\mathbf{z}}_{\text{nozzle}})$, and sweeps the active tool's 3D clearance envelope (`PiecewiseXZ`, `ParametricCone`, or anisotropic `RectilinearCone`) upward along $+\hat{\mathbf{z}}_{\text{nozzle}}$ up to `maxClearanceHeight`:
+     - **Stage 1 (Pre-Cluster Protrusion Stand-Off)**: Rejects any voxel where the 3D tool clearance envelope intersects solid geometry rising above the local tangent plane $(\mathbf{y} - \mathbf{x})\cdot\hat{\mathbf{n}}_{\text{sdf}}(\mathbf{x}) > \epsilon_{\text{curv}}$.
+     - **Coplanar Step-Bounded 26-Connected Clustering**: Groups surviving voxels into contiguous patches while refusing to merge across sharp normal creases ($\hat{\mathbf{n}}_a \cdot \hat{\mathbf{n}}_b < \cos 22^\circ$) or vertical step discontinuities ($|(\mathbf{x}_b - \mathbf{x}_a)\cdot\hat{\mathbf{n}}| > 1.25\,\Delta x_{\text{fine}}$), preventing a lower deck and an upper roof from merging into a single patch.
+     - **Stage 2 (Iterative Causal $\tau_{\text{completion}}(P)$ Pruning)**: Computes $\tau_{\text{completion}}(P) = \max_{\mathbf{x} \in P} \tau(\mathbf{x})$ for each cluster $P$ and prunes any voxel whose 3D tool clearance cone intersects **any** part voxel $\mathbf{y}$ that has already been printed at or before $\tau_{\text{completion}}(P)$ ($\tau(\mathbf{y}) \le \tau_{\text{completion}}(P) + \epsilon_\tau$). Iterates up to 4 passes as $\tau_{\text{completion}}(P)$ decreases when high-$\tau$ obstructed edges are trimmed.
+   - **Coarse Brick Acceleration & Multi-Core Execution**: Both 3D clearance sweeps use a flat dense 3D coarse brick acceleration grid (`brickMinTau`, $4^3$ fine voxels per brick) storing the minimum $\tau$ inside each brick to skip empty exterior air and unprinted upper bricks in $O(1)$ array lookups without touching the OpenVDB `RootNode` map, parallelized across CPU cores via `tbb::parallel_for`.
+3. **Core SDF Erosion & Conformal Skin Layer Extraction**:
+   - The underlying core SDF is eroded strictly within the collision-free patch footprint via a non-dilating narrow-band field:
+     $$\phi_{\text{core}}(\mathbf{x}) = \phi_{\text{sdf}}(\mathbf{x}) + D_{\text{erode}}(\mathbf{x})$$
+     causing standard order-field layers to terminate cleanly beneath the skin at $\phi_{\text{core}}(\mathbf{x}) = 0$.
+   - For each patch $P$ and skin layer $m \in \{1, \dots, N_p\}$, Manifold Slicer extracts the conformal SDF offset isosurface:
+     $$\phi_{\text{sdf}}(\mathbf{x}) = -\bigl(N_p - m + 0.15\bigr)\,h_{\text{top}}$$
+     trimmed to patch $P$'s tangent footprint and scheduled causally at $\tau_{\text{layer}} = \tau_{\text{completion}}(P) + m \cdot 10^{-3}$ with `is_conformal_skin_layer = true` so the toolpath generator fills the entire skin surface with dense concentric walls and solid infill.
+
 ---
 
 ## 5. 3D Conformal Toolpaths, Arachne Variable Widths & TPMS Infill
@@ -142,6 +167,10 @@ Because $d(\mathbf{x})$ is the 3D Euclidean distance to the nearest part surface
 $$w(\mathbf{x}) = \text{clamp}\!\left(\frac{D_{\text{ridge}}(\mathbf{x})}{2\,N_{\text{walls}}},\; w_{\min},\; w_{\max}\right)$$
 
 3. **Medial-Axis Gap Fill**: Residual shell pockets narrower than $2\,w_{\text{solid,target}}$ around local maxima of $d(\mathbf{x})$ are extracted as single-pass variable-width `GapFill` traces.
+4. **Sub-Skin Boundary Anchor Contours & Rib-Anchored Solid Infill Over Sparse Infill**:
+   - When an isolated solid roof, sloped deck, or internal floor begins over sparse core infill on layer $k$, its internal boundary ($\phi_{\text{sdf}} = -T_{\text{shell}}$) hangs over empty sparse infill cells rather than resting on a lower perimeter wall. Without anchoring, infill turnaround loops or concentric rings would drop into the cavities between sparse infill ribs and curl upward.
+   - **1-Layer Lookahead Sub-Skin Boundary Anchor Contours**: While generating layer $k-1$, Manifold Slicer projects layer $k$'s $\phi_{\text{sdf}}^{\text{next}}(\mathbf{x}) = -T_{\text{shell}}$ contour onto layer $k-1$. Any segment that lies inside layer $k-1$'s sparse core ($\phi_{\text{sdf}}^{\text{curr}}(\mathbf{x}) < -T_{\text{shell}} - 0.15\,w$) is emitted on layer $k-1$ as a continuous `SolidInfill` anchor perimeter bridging directly across the sparse infill ribs to form a solid landing shelf for layer $k$.
+   - **Automatic Over-Sparse `Concentric` Promotion & Rib Extension**: Any solid infill region on layer $k$ whose centroid lies over sparse core on layer $k-1$ automatically promotes `Concentric` solid infill to rib-anchored `Monotonic` scanlines, and extends each scanline endpoint that terminates on the internal $\phi_{\text{sdf}} = -T_{\text{shell}}$ boundary outward into the sparse core (up to $1.35\times$ the sparse infill pitch) until it intersects and welds onto an actual layer $k-1$ sparse infill rib or perimeter.
 
 ### 5.3 Analytical 3D TPMS & Space-Diagonal Core Infill
 Inside the core region ($d(\mathbf{x}) > T_{\text{shell}}$), Manifold Slicer evaluates analytical 3D scalar fields directly at the 3D coordinates $\mathbf{x} = (x, y, z)$ of the curved layer mesh (rotated in XY by `infill_angle_deg`) with spatial wavevector $k = 2\pi / L(\rho)$ scaled by `infill_density_percent` $\rho$:
@@ -152,14 +181,17 @@ Inside the core region ($d(\mathbf{x}) > T_{\text{shell}}$), Manifold Slicer eva
 - **Schwarz-P (Primitive) TPMS**:
   $$f_{\text{primitive}}(\mathbf{x}) = \cos(kx) + \cos(ky) + \cos(kz) = 0$$
 
-Extracting the $f(\mathbf{x}) = 0$ contour directly on each curved triangle mesh $\mathcal{M}_k$ produces continuous, smoothly curving 3D minimal-surface infill ribs that never suffer from planar staircase misalignment.
+Extracting the $f(\mathbf{x}) = 0$ contour directly on each curved triangle mesh $\mathcal{M}_k$ produces continuous, smoothly curving 3D minimal-surface infill ribs that never suffer from planar staircase misalignment. To prevent infill scanlines or turnaround connectors from cutting across concave hull recesses (such as a Benchy bow or multi-resolution coarse-to-fine shell boundaries), boundary contours are projected onto the exact fine-grid $\phi_{\text{sdf}} = 0$ zero-crossing, valley-spanning mesh edges are split when their midpoint SDF exceeds the endpoint SDFs, and infill turnaround connectors are rejected whenever their 3D midpoint falls outside the core shell boundary.
 
 ### 5.4 Gravity-Aware Bridging, Inside-Out Wave Overhangs & Causal Supports
 1. **Unsupported Overhang Identification**: An extrusion vertex $\mathbf{x}$ with overhang $o(\mathbf{x}) > \sin(\theta_{\text{ovh\_thresh}})$ is checked against the spatial hash of the preceding layer ($k - 1$) along $+\hat{\mathbf{g}}_{\text{bed}}$. If no supporting extrusion or support interface lies within $1.75\,h_{\text{layer}}$, it is flagged as an unsupported overhang.
 2. **Circular Bridging vs. Wave Overhangs**:
    - If a contiguous unsupported segment is anchored at both ends on supported regions with 3D span length $L_{\text{span}} \le L_{\text{max\_bridge}}$, it is replaced by a straight two-pier **`Bridge`** path extruded with a free-air circular cross-section $A_{\text{bridge}} = \pi (d_{\text{nozzle}}/2)^2$.
    - Otherwise, it is classified as **`WaveOverhang`** and re-ordered **strictly inside-out** (from deepest supported contour outward to the outer perimeter), shifting its 3D centerline inward along the local layer tangent plane so it overlaps the adjacent inner bead by $\Delta w_{\text{ov}} = \alpha_{\text{ov}}\,w_{\text{std}}$, with compensated cross-sectional area $A_{\text{wave}} = (w - \Delta w_{\text{ov}})\,h$.
-3. **Causal Support Columns**: Downward-hanging local minima of $\tau(\mathbf{x})$ and overhangs exceeding the Eikonal slope cone are projected along $+\hat{\mathbf{g}}_{\text{bed}}$ onto a 2D anti-gravity support grid, generating coarse `Support` base rasters (`support_base_spacing_mm`) and dense orthogonal `SupportInterface` roofs (`support_interface_spacing_mm`) offset by `support_z_gap_mm` and `support_xy_gap_mm`.
+3. **Causal Support Columns & Obstacle-Avoiding Non-Planar Tree Supports (`ColumnarGrid` & `NonPlanarTree`)**:
+   - Downward-hanging local minima of $\tau(\mathbf{x})$ and overhangs exceeding the Eikonal slope cone are collected into support contact masks.
+   - In **`ColumnarGrid`** mode, support volumes are projected along $+\hat{\mathbf{g}}_{\text{bed}}$ onto a 2D anti-gravity support grid, generating coarse `Support` base rasters (`support_base_spacing_mm`) and dense orthogonal `SupportInterface` roofs (`support_interface_spacing_mm`, where `0.0 mm` yields a 100% solid zero-gap soluble roof) offset by `support_z_gap_mm` and `support_xy_gap_mm`.
+   - In **`NonPlanarTree`** mode, overhang contact tips (`tree_tip_diameter_mm`) propagate step-by-step downward along $+\hat{\mathbf{g}}_{\text{bed}}$, steering laterally outward along $+\nabla\phi_{\text{sdf}}(\mathbf{x})$ within `tree_branch_angle_deg` to route around model geometry (and anchoring exclusively on the build plate when `support_on_bed_only = true`), coalescing into tapered multi-wall hollow trunks (`tree_trunk_max_diameter_mm`, `tree_branch_wall_count`) with internal structural ribs. On 5/6-axis hardware (`has_rotational_axes`), the nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$ tilts to align with the 3D branch centerline tangent so leaning tree branches print self-supportingly. Supports can also be assigned to a dedicated toolhead via `support_tool_index`.
 
 ---
 
@@ -191,13 +223,15 @@ At a corner with turn angle $\theta \in (5^\circ, 165^\circ)$, two physical effe
 2. **Klipper SCV Centripetal Corner Rounding**: Klipper rounds the corner along an arc of effective radius $R_{\text{eff}} = v_{\text{junction}}^2 / a$, shortening the toolhead's true path length relative to the sharp vertex by:
    $$\Delta L_{\text{scv}} = 2\,R_{\text{eff}}\!\left(\tan\frac{\theta}{2} - \frac{\theta}{2}\right)$$
 
-Manifold Slicer deducts `corner_flow_comp_ratio` $\times \bigl(V_{\text{diamond}} + \Delta L_{\text{scv}}\,w h\bigr)$ symmetrically from the segments immediately entering and exiting the corner.
+Manifold Slicer deducts `corner_flow_comp_ratio` $\times \bigl(V_{\text{diamond}} + \Delta L_{\text{scv}}\,w h\bigr)$ symmetrically from the segments immediately entering and exiting the corner. On short segments ($L_{\text{seg}} \le 2.5\,w$), the deduction is scaled by $\min\bigl(1,\, L_{\text{seg}} / (2.5\,w)\bigr)$ and clamped to at most $35\%$ of the segment's nominal volume so rapid micro-zigzags or finely tessellated curved contours never suffer flow starvation.
 
-### 6.4 Melt-Chamber Transient Pressure Lag, Flat-Nozzle Slope Clearance & 3D Scarf Seams
-1. **First-Order Melt-Chamber Pressure Lag**: Tracks normalized nozzle pressure $P_{\text{state}}(t)$ with relaxation time $\tau_p \approx k(Q)$ across segments:
-   $$P_{\text{state},i} = P_{\text{target},i} + \bigl(P_{\text{state},i-1} - P_{\text{target},i}\bigr)\,e^{-\Delta t_i / \tau_p}$$
+### 6.4 Melt-Chamber Transient Pressure Lag, Flat-Nozzle Slope Clearance, 3D Scarf Seams & Error-Diffused Precision
+1. **First-Order Melt-Chamber Pressure Lag**: Tracks normalized nozzle pressure $P_{\text{state}}(t)$ with relaxation time $\tau_{\text{melt}} = \text{transient\_pressure\_tau\_s}$ across segments:
+   $$P_{\text{state},i} = P_{\text{target},i} + \bigl(P_{\text{state},i-1} - P_{\text{target},i}\bigr)\,e^{-\Delta t_i / \tau_{\text{melt}}}$$
    When stepping down from high-flow infill to a slow wall ($P_{\text{state},i-1} > P_{\text{target},i}$), segment flow is throttled by $(P_{\text{target}} / P_{\text{state}})^{\gamma} \ge m_{\min}$ while stored melt-zone pressure bleeds off.
 2. **Flat-Nozzle Annular Slope Clearance**: On a conformal layer tilted by angle $\alpha = \arccos(\hat{\mathbf{n}}_{\text{layer}} \cdot \hat{\mathbf{z}}_{\text{nozzle}})$ relative to the nozzle axis, the nozzle tip is elevated along $+\hat{\mathbf{z}}_{\text{nozzle}}$ by:
    $$\Delta z_{\text{flat}}(\alpha) = R_{\text{flat}}\,\sin\alpha\,(1 - \cos\alpha)$$
    preventing the brass nozzle flat land ($R_{\text{flat}} = d_{\text{nozzle}}$) from scraping the uphill slope.
 3. **3D Helical Scarf Joints**: On closed perimeter loops, the first $L_{\text{scarf}}$ millimeters ramp height along $\hat{\mathbf{z}}_{\text{nozzle}}$ and volumetric flow linearly from $r_0 \in [0.02, 0.50]$ up to $1.0$, while the final $L_{\text{scarf}}$ millimeters ramp height and flow from $(1 - r_0)$ down to $0$, forming a flush lap joint with constant total wall height.
+4. **High-Precision Coordinate Emission & E-Axis Rounding Error Diffusion**:
+   Because curved non-planar meshes and conformal scarf joints contain dense sub-millimeter micro-segments ($0.05\text{--}0.20\text{ mm}$), 3-decimal coordinate quantization can introduce up to $5^\circ$ of artificial tangent jitter, while truncating relative `M83` `E` increments to 4 decimal places can lose $1\text{--}5\%$ of total extrusion volume. Manifold Slicer emits `X`/`Y`/`Z` coordinates at **4 decimal places** ($0.1\,\mu\text{m}$ resolution), `E` increments at **5 decimal places** ($0.01\,\mu\text{m}$ resolution), and diffuses rounding residuals across consecutive `G1` moves via an accumulator (`e_rounding_residual_mm`) so cumulative extrusion error stays $< 10^{-5}\text{ mm}$.

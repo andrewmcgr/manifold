@@ -4031,6 +4031,7 @@ fn render_process_config_tab(
                     "Automatically erode N layers of top/exit surfaces where the order field arrives at an oblique angle and slice them conformally along SDF level sets (standing off around rising protrusions).",
                 )
                 .changed();
+            param_help_button(ui, "slicing.enable_auto_conformal_skin");
             lh_changed |= ui
                 .add(
                     egui::DragValue::new(&mut config.slicing.conformal_skin_layers)
@@ -4040,6 +4041,7 @@ fn render_process_config_tab(
                 )
                 .on_hover_text("Default number of conformal SDF skin layers (N) for auto-detected or newly hinted conformal skin surfaces.")
                 .changed();
+            param_help_button(ui, "slicing.conformal_skin_layers");
             if config.slicing.enable_auto_conformal_skin {
                 lh_changed |= ui
                     .add(
@@ -4051,6 +4053,7 @@ fn render_process_config_tab(
                     )
                     .on_hover_text("Minimum angle between the order field gradient (∇τ) and the outward surface normal (∇φ) required to trigger automatic conformal skinning.")
                     .changed();
+                param_help_button(ui, "slicing.conformal_skin_min_oblique_deg");
                 lh_changed |= ui
                     .add(
                         egui::DragValue::new(&mut config.slicing.conformal_skin_max_slope_deg)
@@ -4061,6 +4064,7 @@ fn render_process_config_tab(
                     )
                     .on_hover_text("Maximum surface slope relative to the local nozzle axis (ẑ_nozzle) eligible for automatic conformal skinning.")
                     .changed();
+                param_help_button(ui, "slicing.conformal_skin_max_slope_deg");
             }
         });
 

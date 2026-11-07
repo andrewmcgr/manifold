@@ -67,7 +67,7 @@ Manifold Slicer supports multi-plate workflows natively and imports multi-plate 
 - **Plate Name Editor**: Rename the active build plate; its name is preserved inside `.3mf` project files and used when exporting multi-plate G-code.
 
 ### 2.2 Interactive Viewport Tools
-Five modal tools control how mouse clicks interact with geometry in the 3D viewport:
+Six modal tools control how mouse clicks interact with geometry in the 3D viewport:
 
 | Tool Button | Purpose & Interaction |
 | :--- | :--- |
@@ -75,6 +75,7 @@ Five modal tools control how mouse clicks interact with geometry in the 3D viewp
 | **Place on Face** | Displays all candidate planar support facets of the selected object's 3D convex hull. Hover over any hull facet to preview it in bright highlight, and **left-click** to rotate the object so that facet lies flush on the build plate (`z = 0`). |
 | **Surface Normal ⊥ (Conformal)** | Highlights selectable CAD B-Rep faces (or contiguous planar mesh patches) under the cursor. **Left-click** a face to attach a soft orientation hint requesting that slicing layers run **conformal/tangent** to that face ($\nabla\tau \parallel \pm\hat{\mathbf{n}}_{\text{face}}$). **Right-click** an existing hint face to remove it. |
 | **Surface Normal ∥ (⊥ Layers)** | Highlights selectable surface patches under the cursor. **Left-click** a face to attach a soft orientation hint requesting that slicing layers meet that face **orthogonally at $90^\circ$** ($\nabla\tau \perp \hat{\mathbf{n}}_{\text{face}}$)—ideal for vertical mating walls or overhang faces. |
+| **Conformal Skin (`Skin`)** | Highlights selectable surface patches under the cursor. **Left-click** a sloped roof, deck, or dome patch to attach a **`ConformalSurfaceSkin`** hint that erodes the underlying core SDF by $N_p \cdot h_{\text{top}}$ and slices $N_p$ constant-thickness conformal SDF skin layers parallel to $\phi_{\text{sdf}} = 0$ (with automatic 3D tool-clearance stand-off around rising protrusions and printed walls). Setting `Layers = 0` on a patch explicitly excludes it from `Auto Conformal SDF Top Skin`. |
 | **3D Point Hint** | Places a localized 3D vector orientation hint in space with a spherical Wendland $C^2$ radial influence zone, allowing fine steering of the Eikonal layer normal inside bulky interiors. |
 
 ### 2.3 Objects on Active Plate & Transform Controls
@@ -148,7 +149,7 @@ Once fields or toolpaths have been generated, the **View & Inspection** section 
 ### 4.2 Collapsible Configuration Sections
 Beneath **View & Inspection**, all profile variables are organized into collapsible sections matching the preset hierarchy:
 - **Print Bed & Auto-Arrangement**: Bed shape, $X/Y/Z$ dimensions, grid spacing, G-code origin placement, part clearance, and bed edge margin.
-- **Machine Tools & 5/6-Axis Kinematics**: Multi-tool selector (`Add Tool`, `Remove Tool`), nozzle diameter, hotend temperature, rotational axis toggle, maximum tilt angle, interactive XZ clearance profile editor, and 5-axis bed tilt (`Rx`, `Ry`).
-- **Volumetric Fields & Eikonal Solver**: Auto fine voxel size toggle, Dual-Grid multi-resolution settings, solver iterations, curvature regularization, automatic overhang conformal/orthogonal surface bias, and a live list of all placed surface/point orientation hints.
-- **Non-Planar Layer Slicing & Shells**: Variable layer height (`Target`, `Min`, `Max`, `First Layer`, `Top Layer`), max non-planar slope, 3D shell thickness, inner wall count, Arachne variable line widths (`Target`, `Min`, `Max`), solid/sparse infill patterns (`Gyroid`, `Schwarz-D`, `Schwarz-P`, `Cubic`, `Monotonic`, `Concentric`, `All Walls`), circular bridging, wave overhangs, and causal supports.
+- **Machine Tools & 5/6-Axis Kinematics**: Multi-tool selector (`Add Tool`, `Remove Tool`), nozzle diameter, hotend temperature, rotational axis toggle, maximum tilt angle, 3D tool clearance envelope mode (`Piecewise XZ`, `Circular Cone`, or `Rectilinear Cone (XY)`), and 5-axis bed tilt (`Rx`, `Ry`).
+- **Volumetric Fields & Eikonal Solver**: Order field mode (`Constrained Non-Planar` vs. `Height-Only Planar`), auto fine voxel size toggle, Dual-Grid multi-resolution settings, solver iterations, curvature regularization, automatic overhang conformal/orthogonal surface bias, and a live list of all placed surface/point orientation hints (`⊥`, `∥`, and `Skin`).
+- **Non-Planar Layer Slicing & Shells**: Variable layer height (`Target`, `Min`, `Max`, `First Layer`, `Top Layer`), max non-planar slope, **Auto Conformal SDF Top Skin** (`Skin Layers`, `Min Oblique`, `Max Slope`), 3D shell thickness, inner wall count, Arachne variable line widths (`Target`, `Min`, `Max`), solid/sparse infill patterns (`Gyroid`, `Schwarz-D`, `Schwarz-P`, `Cubic`, `Monotonic`, `Concentric`, `All Walls`) with automatic rib-anchored solid-over-sparse infill, circular bridging, wave overhangs, and causal supports (`Columnar Grid` vs. obstacle-avoiding `Non-Planar Tree` supports and dedicated `Support Tool` selection).
 - **G-code, Speeds, Seams & Rheology**: Wall print order (`In-Out-In` vs. `Outside-In`), Klipper `EXCLUDE_OBJECT` and Moonraker thumbnail toggles, feature speeds and accelerations, Klipper SCV/cruise ratio, stepper back-EMF dynamics, 3D scarf joints, retractions/wipes, thermal ooze relaxation, flat-nozzle slope clearance, shear-thinning Pressure Advance ($k_{\text{low}}, k_{\text{high}}$), viscoelastic die-swell multipliers, corner flow compensation, transient melt-chamber pressure lag, cooling fan speeds, and Start/End G-code templates.
