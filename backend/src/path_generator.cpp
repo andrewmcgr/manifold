@@ -1127,7 +1127,131 @@ std::vector<RawChain> reclipAndRefineChainToSdf(
 
 /// Generates `Monotonic` flood-fill paths on a 3D submesh `infillMesh`
 /// using single-pass triangle-to-scanline bucketing.
-template <typename SdfSamplerFn>
+struct DefaultNoopEndpointAnchor {
+    void operator()(RawChain&, const Vec3f&) const {}
+};
+
+/// Evaluates the analytical 3D distance from point `p` (with local nozzle axis `zAxis` and
+/// shifted SDF `shiftedSdf <= -effectiveShellDepth`) to the nearest sparse infill rib of
+/// `targetLayerIndex` (at isovalue `targetIsovalue`).
+/// For `kSparsePatternMonotonic`, if `monoHasBounds` is true, uses the exact island centered
+/// scanline grid `(monoStartU, monoPitchMm, monoNumLines)`; otherwise uses phase-0 spacing.
+float evaluateDistanceToSparseRib(
+    const Vec3f& p,
+    const Vec3f& zAxis,
+    float shiftedSdf,
+    float effectiveShellDepth,
+    std::uint32_t targetLayerIndex,
+    float targetIsovalue,
+    float sparseDensity,
+    float sparseWidthMm,
+    std::uint8_t sparsePattern,
+    float infillAngleDeg,
+    bool monoHasBounds = false,
+    float monoStartU = 0.0f,
+    float monoPitchMm = 1.0f,
+    int monoNumLines = 0)
+{
+    if (sparseDensity <= 1.0e-4f || sparseWidthMm <= 1.0e-4f) {
+        return 1.0e9f;
+    }
+    constexpr float kPi = 3.14159265358979323846f;
+    const Vec3f refAxis = (std::abs(zAxis.x) < 0.9f)
+        ? Vec3f{1.0f, 0.0f, 0.0f}
+        : Vec3f{0.0f, 1.0f, 0.0f};
+    const Vec3f e1 = normalize3(refAxis - (zAxis * dot3(refAxis, zAxis)), {1.0f, 0.0f, 0.0f});
+    const Vec3f e2 = normalize3(cross3(zAxis, e1), {0.0f, 1.0f, 0.0f});
+
+    if (sparsePattern == kSparsePatternMonotonic) {
+        const float pitchMm = (monoHasBounds && monoPitchMm > 1.0e-4f)
+            ? monoPitchMm
+            : std::max(sparseWidthMm, sparseWidthMm / std::max(0.01f, sparseDensity));
+        const float angleRad = (infillAngleDeg * (kPi / 180.0f)) +
+            ((targetLayerIndex % 2 == 0) ? 0.0f : (0.5f * kPi));
+        const Vec3f uAxis = normalize3(
+            (e1 * std::cos(angleRad)) + (e2 * std::sin(angleRad)),
+            e1);
+        const float u = dot3(p, uAxis);
+        if (monoHasBounds && monoNumLines > 0) {
+            const float relIdx = std::clamp(
+                std::round((u - monoStartU) / pitchMm),
+                0.0f,
+                static_cast<float>(monoNumLines - 1));
+            const float lineU = monoStartU + relIdx * pitchMm;
+            return std::abs(u - lineU);
+        }
+        const float nearestU = std::round(u / pitchMm) * pitchMm;
+        return std::abs(u - nearestU);
+    }
+
+    if (sparsePattern == kSparsePatternCubic) {
+        const float dCubic = std::max(
+            sparseWidthMm,
+            (2.0f * sparseWidthMm) / std::max(0.01f, sparseDensity));
+        const float baseRad = infillAngleDeg * (kPi / 180.0f);
+        const float phaseShift = 1.41421356237f * targetIsovalue;
+
+        const float angA = baseRad + 0.25f * kPi;
+        const Vec3f uAxisA = normalize3((e1 * std::cos(angA)) + (e2 * std::sin(angA)), e1);
+        const float uA = dot3(p, uAxisA) - phaseShift;
+        const float distA = std::abs(uA - std::round(uA / dCubic) * dCubic);
+
+        const float angB = baseRad - 0.25f * kPi;
+        const Vec3f uAxisB = normalize3((e1 * std::cos(angB)) + (e2 * std::sin(angB)), e1);
+        const float uB = dot3(p, uAxisB) + phaseShift;
+        const float distB = std::abs(uB - std::round(uB / dCubic) * dCubic);
+
+        return std::min(distA, distB);
+    }
+
+    if (sparsePattern == kSparsePatternGyroid ||
+        sparsePattern == kSparsePatternSchwarzD ||
+        sparsePattern == kSparsePatternSchwarzP) {
+        const float wavelengthMm = std::clamp(
+            (2.0f * kPi * sparseWidthMm) / std::max(0.01f, sparseDensity),
+            2.0f * sparseWidthMm,
+            50.0f);
+        const float waveK = (2.0f * kPi) / wavelengthMm;
+        auto evalPsi = [&](const Vec3f& q) -> float {
+            const float kx = waveK * q.x;
+            const float ky = waveK * q.y;
+            const float kz = waveK * q.z;
+            if (sparsePattern == kSparsePatternGyroid) {
+                return std::sin(kx) * std::cos(ky) +
+                    std::sin(ky) * std::cos(kz) +
+                    std::sin(kz) * std::cos(kx);
+            }
+            if (sparsePattern == kSparsePatternSchwarzD) {
+                return std::sin(kx) * std::sin(ky) * std::sin(kz) +
+                    std::sin(kx) * std::cos(ky) * std::cos(kz) +
+                    std::cos(kx) * std::sin(ky) * std::cos(kz) +
+                    std::cos(kx) * std::cos(ky) * std::sin(kz);
+            }
+            return std::cos(kx) + std::cos(ky) + std::cos(kz);
+        };
+        const float psi0 = evalPsi(p);
+        const float eps = 0.05f * wavelengthMm;
+        const float gx = (evalPsi({p.x + eps, p.y, p.z}) - evalPsi({p.x - eps, p.y, p.z})) / (2.0f * eps);
+        const float gy = (evalPsi({p.x, p.y + eps, p.z}) - evalPsi({p.x, p.y - eps, p.z})) / (2.0f * eps);
+        const float gz = (evalPsi({p.x, p.y, p.z + eps}) - evalPsi({p.x, p.y, p.z - eps})) / (2.0f * eps);
+        const float gradMag = std::max(0.35f * waveK, std::sqrt(gx * gx + gy * gy + gz * gz));
+        return std::abs(psi0) / gradMag;
+    }
+
+    // Concentric (5) or AllWalls (6)
+    const float ringPitchMm = (sparsePattern == kSparsePatternAllWalls)
+        ? sparseWidthMm
+        : std::max(sparseWidthMm, sparseWidthMm / std::max(0.01f, sparseDensity));
+    const float dInCore = std::max(0.0f, -shiftedSdf - effectiveShellDepth);
+    const float firstOffset = 0.5f * sparseWidthMm;
+    if (dInCore <= firstOffset) {
+        return firstOffset - dInCore;
+    }
+    const float rel = dInCore - firstOffset;
+    return std::abs(rel - std::round(rel / ringPitchMm) * ringPitchMm);
+}
+
+template <typename SdfSamplerFn, typename EndpointAnchorFn = DefaultNoopEndpointAnchor>
 void generateMonotonicInfillOnSubmesh(
     const SurfaceMesh& infillMesh,
     std::uint32_t layerIndex,
@@ -1137,7 +1261,8 @@ void generateMonotonicInfillOnSubmesh(
     float baseAngleDeg,
     std::uint8_t featureKind,
     float maxAllowedSdf,
-    SdfSamplerFn&& sampleShiftedSdf)
+    SdfSamplerFn&& sampleShiftedSdf,
+    EndpointAnchorFn&& anchorChainEndpoints = DefaultNoopEndpointAnchor{})
 {
     if (infillMesh.tris.empty() || infillMesh.verts.empty()) {
         return;
@@ -1355,6 +1480,23 @@ void generateMonotonicInfillOnSubmesh(
                 if (v0 > v1) {
                     std::reverse(ch.pts.begin(), ch.pts.end());
                     std::swap(v0, v1);
+                }
+                const float origV0 = v0;
+                const float origV1 = v1;
+                anchorChainEndpoints(ch, vAxis);
+                v0 = dot3(ch.pts.front().pos, vAxis);
+                v1 = dot3(ch.pts.back().pos, vAxis);
+                if (v0 > v1) {
+                    std::reverse(ch.pts.begin(), ch.pts.end());
+                    std::swap(v0, v1);
+                }
+                if (numLines > 1 && (v0 < origV0 - 1.0e-4f || v1 > origV1 + 1.0e-4f)) {
+                    if (m > 0) {
+                        stripVIntervals[static_cast<std::size_t>(m - 1)].push_back({v0, v1});
+                    }
+                    if (m + 1 < numLines) {
+                        stripVIntervals[static_cast<std::size_t>(m)].push_back({v0, v1});
+                    }
                 }
                 scanlines[static_cast<std::size_t>(m)].push_back(ScanSegment{
                     std::move(ch),
@@ -2404,6 +2546,95 @@ void generateSparseInfillForLayer(
                     std::make_move_iterator(ringChains.end()));
             }
             orderChainsGreedyNearestNeighbor(rawSparseChains);
+        }
+
+        // 1-Layer Sub-Skin Boundary Anchor Contour:
+        // If stepping 1 layer up along +z_nozzle from `islandMesh` transitions from the sparse core
+        // into an upcoming solid top skin / deck / pocket floor (`phiUp >= -effectiveShellDepth` with
+        // upward surface slope `upSlope >= 0.45`), emit a continuous sub-skin boundary anchor contour
+        // along the footprint of that upcoming solid region (tied into `rawSparseChains`) so Layer k+1's
+        // solid skin perimeter and scanline turnarounds have a continuous printed shelf beneath them.
+        {
+            const std::size_t nIslV = islandMesh.verts.size();
+            std::vector<float> psiSubskin(nIslV, -sparseW.target_mm);
+            bool anyUpcomingSolid = false;
+            bool anyRemainingSparse = false;
+
+            for (std::size_t i = 0; i < nIslV; ++i) {
+                const auto& sv = islandMesh.verts[i];
+                const float hUp = std::max(1.35f * sv.layerHeightMm, 0.20f);
+                const Vec3f pUp = sv.pos + (sv.nozzleAxis * hUp);
+                const float phiUp = sampleShiftedSdf(pUp);
+                const float upSlope = (phiUp - sv.sdf) / hUp;
+                if (upSlope >= 0.35f) {
+                    const float psi = phiUp + effectiveShellDepth;
+                    psiSubskin[i] = psi;
+                    if (psi >= 0.0f && upSlope >= 0.45f && !sv.onInnerShellBoundary) {
+                        anyUpcomingSolid = true;
+                    } else if (psi < 0.0f) {
+                        anyRemainingSparse = true;
+                    }
+                } else {
+                    anyRemainingSparse = true;
+                }
+                if (sv.onInnerShellBoundary) {
+                    psiSubskin[i] = std::min(psiSubskin[i], -0.15f * sparseW.target_mm);
+                    anyRemainingSparse = true;
+                }
+            }
+
+            if (anyUpcomingSolid && anyRemainingSparse) {
+                const std::vector<float> allValid(nIslV, 1.0f);
+                const std::vector<float> constWidth(nIslV, sparseW.target_mm);
+                const auto subSkinSegs = extractIsoContourSegments(
+                    islandMesh,
+                    psiSubskin,
+                    0.0f,
+                    allValid,
+                    0.0f,
+                    constWidth);
+                auto subSkinChains = stitchSegmentsIntoChains(subSkinSegs, stitchSnap, closeLoopTol);
+
+                const float maxTieDist = std::max(
+                    1.5f * sparseW.target_mm,
+                    1.25f * (sparseW.target_mm / std::max(0.05f, sparseDensity)));
+                auto tieEndpointToSparseRib = [&](RawChainPoint& endPt, bool isFront) -> std::optional<RawChainPoint> {
+                    float bestDist = maxTieDist;
+                    std::optional<RawChainPoint> bestAnchor;
+                    for (const auto& rCh : rawSparseChains) {
+                        for (const auto& rPt : rCh.pts) {
+                            const float d = dist3(endPt.pos, rPt.pos);
+                            if (d <= 0.55f * sparseW.target_mm) {
+                                return std::nullopt; // Already anchored on a rib
+                            }
+                            if (d < bestDist) {
+                                const Vec3f mid = lerp3(endPt.pos, rPt.pos, 0.5f);
+                                if (sampleShiftedSdf(mid) <= maxAllowedSdf) {
+                                    bestDist = d;
+                                    bestAnchor = rPt;
+                                }
+                            }
+                        }
+                    }
+                    (void)isFront;
+                    return bestAnchor;
+                };
+
+                for (auto& sCh : subSkinChains) {
+                    if (sCh.pts.size() < 2) {
+                        continue;
+                    }
+                    if (!sCh.isClosed && !rawSparseChains.empty()) {
+                        if (auto anchorFront = tieEndpointToSparseRib(sCh.pts.front(), true)) {
+                            sCh.pts.insert(sCh.pts.begin(), *anchorFront);
+                        }
+                        if (auto anchorBack = tieEndpointToSparseRib(sCh.pts.back(), false)) {
+                            sCh.pts.push_back(*anchorBack);
+                        }
+                    }
+                    rawSparseChains.push_back(std::move(sCh));
+                }
+            }
         }
 
         // Sub-chord SDF gating and finalization
@@ -3473,6 +3704,241 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 }
 
                 // ------------------------------------------------------------
+                // 5.1. Isolated Solid Layer Over Sparse Infill Detection & Planning:
+                //      Identify vertices `isOverSparseCore[i]` on `shellMesh` where the current
+                //      layer is solid (`!onOuterBoundary`), while stepping 1 layer down along
+                //      `-z_nozzle` lands in the sparse infill core of Layer k-1.
+                //      - Suppress unanchored floating `InnerWall` loops over empty sparse cells.
+                //      - If a transition component is strongly curved in 3D such that straight
+                //        bridge scanlines between sparse ribs would deviate from the curved layer
+                //        surface by > 0.45 * h_layer, promote it to Rib-Seeded `WaveOverhang`
+                //        (seeded from both the supported shell and Layer k-1's sparse ribs).
+                //      - Otherwise, keep it in `infillSubmesh` and extend its scanline endpoints
+                //        and turnarounds onto the underlying sparse infill ribs.
+                // ------------------------------------------------------------
+                std::vector<bool> isOverSparseCore(nV, false);
+                std::vector<bool> isOverSparseWave(nV, false);
+                std::vector<float> sparseRibSeedDist(nV, kInf);
+                bool anyOverSparseCore = false;
+
+                bool prevMonoHasBounds = false;
+                float prevMonoStartU = 0.0f;
+                float prevMonoPitchMm = std::max(
+                    sparseW.target_mm,
+                    sparseW.target_mm / std::max(0.01f, sparseDensity));
+                int prevMonoNumLines = 0;
+
+                bool currMonoHasBounds = false;
+                float currMonoStartU = 0.0f;
+                float currMonoPitchMm = prevMonoPitchMm;
+                int currMonoNumLines = 0;
+
+                const bool checkOverSparse =
+                    !layerInfo.is_first_layer &&
+                    sparseDensity > 1.0e-4f &&
+                    (!isConformalSkinLayer || layerInfo.branch_layer_index == 0);
+
+                if (checkOverSparse) {
+                    if (sparsePattern == kSparsePatternMonotonic && layerInfo.layer_index > 0) {
+                        constexpr float kPi = 3.14159265358979323846f;
+                        const Vec3f zMean = fallbackNozzle;
+                        const Vec3f refAx = (std::abs(zMean.x) < 0.9f)
+                            ? Vec3f{1.0f, 0.0f, 0.0f}
+                            : Vec3f{0.0f, 1.0f, 0.0f};
+                        const Vec3f e1 = normalize3(refAx - (zMean * dot3(refAx, zMean)), {1.0f, 0.0f, 0.0f});
+                        const Vec3f e2 = normalize3(cross3(zMean, e1), {0.0f, 1.0f, 0.0f});
+
+                        const float prevAng = (infillAngleDeg * (kPi / 180.0f)) +
+                            (((layerInfo.layer_index - 1) % 2 == 0) ? 0.0f : (0.5f * kPi));
+                        const Vec3f prevUAxis = normalize3(
+                            (e1 * std::cos(prevAng)) + (e2 * std::sin(prevAng)),
+                            e1);
+
+                        const float currAng = (infillAngleDeg * (kPi / 180.0f)) +
+                            ((layerInfo.layer_index % 2 == 0) ? 0.0f : (0.5f * kPi));
+                        const Vec3f currUAxis = normalize3(
+                            (e1 * std::cos(currAng)) + (e2 * std::sin(currAng)),
+                            e1);
+
+                        const float coreSdfCut =
+                            -(effectiveShellDepth + kInfillEndpointInsetFactor * sparseW.target_mm);
+                        float uMinPrev = std::numeric_limits<float>::max();
+                        float uMaxPrev = std::numeric_limits<float>::lowest();
+                        float uMinCurr = std::numeric_limits<float>::max();
+                        float uMaxCurr = std::numeric_limits<float>::lowest();
+
+                        for (const auto& bv : baseMesh.verts) {
+                            const Vec3f zNoz = sampleNozzleAxis(bv.pos);
+                            const float hStep = std::max(1.20f * bv.layerHeightMm, 1.15f * meanLayerH);
+                            const Vec3f pDown = bv.pos - (zNoz * hStep);
+                            const float phiDown = sampleSdf(pDown) - sdfZeroShift;
+                            if (phiDown <= coreSdfCut) {
+                                const float uP = dot3(pDown, prevUAxis);
+                                uMinPrev = std::min(uMinPrev, uP);
+                                uMaxPrev = std::max(uMaxPrev, uP);
+                            }
+                            if (bv.sdf <= coreSdfCut) {
+                                const float uC = dot3(bv.pos, currUAxis);
+                                uMinCurr = std::min(uMinCurr, uC);
+                                uMaxCurr = std::max(uMaxCurr, uC);
+                            }
+                        }
+
+                        if (uMaxPrev > uMinPrev + 1.0e-4f) {
+                            const float uSpan = uMaxPrev - uMinPrev;
+                            prevMonoNumLines = std::max(1, static_cast<int>(std::floor(uSpan / prevMonoPitchMm)) + 1);
+                            while (prevMonoNumLines > 1 &&
+                                   static_cast<float>(prevMonoNumLines - 1) * prevMonoPitchMm > uSpan - 1.0e-4f) {
+                                --prevMonoNumLines;
+                            }
+                            prevMonoStartU =
+                                uMinPrev + 0.5f * (uSpan - static_cast<float>(prevMonoNumLines - 1) * prevMonoPitchMm);
+                            prevMonoHasBounds = true;
+                        }
+                        if (uMaxCurr > uMinCurr + 1.0e-4f) {
+                            const float uSpan = uMaxCurr - uMinCurr;
+                            currMonoNumLines = std::max(1, static_cast<int>(std::floor(uSpan / currMonoPitchMm)) + 1);
+                            while (currMonoNumLines > 1 &&
+                                   static_cast<float>(currMonoNumLines - 1) * currMonoPitchMm > uSpan - 1.0e-4f) {
+                                --currMonoNumLines;
+                            }
+                            currMonoStartU =
+                                uMinCurr + 0.5f * (uSpan - static_cast<float>(currMonoNumLines - 1) * currMonoPitchMm);
+                            currMonoHasBounds = true;
+                        }
+                    }
+
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (isUnsupported[i] || dOuter[i] <= 0.90f * localOuterWidth[i]) {
+                            continue;
+                        }
+                        const Vec3f p = shellMesh.verts[i].pos;
+                        const Vec3f zNoz = shellMesh.verts[i].nozzleAxis;
+                        const float hStep = std::max(1.20f * shellMesh.verts[i].layerHeightMm, 1.15f * meanLayerH);
+                        const Vec3f pDown = p - (zNoz * hStep);
+                        const float phiCurr = sampleSdf(p) - sdfZeroShift;
+                        const float phiDown = sampleSdf(pDown) - sdfZeroShift;
+                        const float upSlope = (phiCurr - phiDown) / std::max(hStep, 1.0e-4f);
+
+                        const float sparseCoreSdfThresh =
+                            -(effectiveShellDepth - 0.08f * meanLayerH);
+                        if (phiDown < sparseCoreSdfThresh &&
+                            (isConformalSkinLayer || upSlope >= 0.45f)) {
+                            isOverSparseCore[i] = true;
+                            anyOverSparseCore = true;
+
+                            // Suppress unanchored inner walls that would float over empty sparse cells
+                            if (!isConformalSkinLayer &&
+                                totalWallSpan[i] > localOuterWidth[i]) {
+                                activeInnerCount[i] = 0;
+                                totalWallSpan[i] = localOuterWidth[i];
+                            }
+                        }
+                    }
+
+                    // Curvature-Aware Wave Overhang Selection over Sparse Infill:
+                    // Check connected components of `isOverSparseCore` to see if any component is
+                    // a strongly curved 3D non-planar surface where straight bridge chords across
+                    // a sparse cell would deviate from the curved surface by > 0.45 * meanLayerH.
+                    if (anyOverSparseCore) {
+                        std::vector<Vec3f> vertSurfNormal(nV, {0.0f, 0.0f, 0.0f});
+                        for (const auto& tri : shellMesh.tris) {
+                            const Vec3f& p0 = shellMesh.verts[tri[0]].pos;
+                            const Vec3f& p1 = shellMesh.verts[tri[1]].pos;
+                            const Vec3f& p2 = shellMesh.verts[tri[2]].pos;
+                            Vec3f tn = cross3(p1 - p0, p2 - p0);
+                            if (dot3(tn, shellMesh.verts[tri[0]].nozzleAxis) < 0.0f) {
+                                tn = tn * -1.0f;
+                            }
+                            vertSurfNormal[tri[0]] = vertSurfNormal[tri[0]] + tn;
+                            vertSurfNormal[tri[1]] = vertSurfNormal[tri[1]] + tn;
+                            vertSurfNormal[tri[2]] = vertSurfNormal[tri[2]] + tn;
+                        }
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            vertSurfNormal[i] = normalize3(vertSurfNormal[i], shellMesh.verts[i].nozzleAxis);
+                        }
+
+                        const float sparseCellSpanMm =
+                            sparseW.target_mm / std::max(0.02f, sparseDensity);
+                        std::vector<int> sparseCompVis(nV, 0);
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            if (!isOverSparseCore[i] || sparseCompVis[i] != 0) {
+                                continue;
+                            }
+                            std::vector<std::uint32_t> compVerts;
+                            std::queue<std::uint32_t> q;
+                            q.push(static_cast<std::uint32_t>(i));
+                            sparseCompVis[i] = 1;
+                            Vec3f bMin = shellMesh.verts[i].pos;
+                            Vec3f bMax = shellMesh.verts[i].pos;
+                            Vec3f sumNorm{0.0f, 0.0f, 0.0f};
+
+                            while (!q.empty()) {
+                                const std::uint32_t u = q.front();
+                                q.pop();
+                                compVerts.push_back(u);
+                                const Vec3f& pu = shellMesh.verts[u].pos;
+                                bMin = {std::min(bMin.x, pu.x), std::min(bMin.y, pu.y), std::min(bMin.z, pu.z)};
+                                bMax = {std::max(bMax.x, pu.x), std::max(bMax.y, pu.y), std::max(bMax.z, pu.z)};
+                                sumNorm = sumNorm + vertSurfNormal[u];
+                                for (std::uint32_t nb : adj[u]) {
+                                    if (isOverSparseCore[nb] && sparseCompVis[nb] == 0) {
+                                        sparseCompVis[nb] = 1;
+                                        q.push(nb);
+                                    }
+                                }
+                            }
+
+                            if (compVerts.size() < 6) {
+                                continue;
+                            }
+                            const float compDiag = dist3(bMin, bMax);
+                            const Vec3f meanNorm = normalize3(sumNorm, fallbackNozzle);
+                            float minCosTheta = 1.0f;
+                            for (std::uint32_t u : compVerts) {
+                                minCosTheta = std::min(minCosTheta, std::abs(dot3(vertSurfNormal[u], meanNorm)));
+                            }
+                            const float sinThetaMax = std::sqrt(std::max(0.0f, 1.0f - minCosTheta * minCosTheta));
+                            const float effCellSpan = std::min(compDiag, sparseCellSpanMm);
+                            const float estChordSagMm = 0.25f * effCellSpan * sinThetaMax;
+
+                            if (minCosTheta < 0.94f && estChordSagMm > 0.45f * meanLayerH) {
+                                const std::uint32_t prevLayerIdx = (layerInfo.layer_index > 0)
+                                    ? (layerInfo.layer_index - 1)
+                                    : 0;
+                                const float prevIso = std::max(0.0f, layerInfo.isovalue - meanLayerH);
+                                for (std::uint32_t u : compVerts) {
+                                    const Vec3f p = shellMesh.verts[u].pos;
+                                    const Vec3f zNoz = shellMesh.verts[u].nozzleAxis;
+                                    const float hStep = std::max(1.20f * shellMesh.verts[u].layerHeightMm, 1.15f * meanLayerH);
+                                    const Vec3f pDown = p - (zNoz * hStep);
+                                    const float phiDown = sampleSdf(pDown) - sdfZeroShift;
+                                    const float dRib = evaluateDistanceToSparseRib(
+                                        pDown,
+                                        zNoz,
+                                        phiDown,
+                                        effectiveShellDepth,
+                                        prevLayerIdx,
+                                        prevIso,
+                                        sparseDensity,
+                                        sparseW.target_mm,
+                                        sparsePattern,
+                                        infillAngleDeg,
+                                        prevMonoHasBounds,
+                                        prevMonoStartU,
+                                        prevMonoPitchMm,
+                                        prevMonoNumLines);
+                                    sparseRibSeedDist[u] = dRib;
+                                    isOverSparseWave[u] = true;
+                                    isUnsupported[u] = true;
+                                    anyUnsupported = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------
                 // 5a. Bridging (`kFeatureBridge = 5`):
                 //     Span unsupported gaps roughly orthogonal to the supported gap boundary edges
                 //     if an accessible supported extrusion exists on the opposite side within
@@ -3492,7 +3958,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     std::vector<float> unsupClipField(nV, 1.0f);
                     for (std::size_t i = 0; i < nV; ++i) {
                         shellForUnsup.verts[i].onInnerShellBoundary = false;
-                        unsupClipField[i] = isUnsupported[i] ? -1.0f : 1.0f;
+                        unsupClipField[i] = (isUnsupported[i] && !isOverSparseWave[i]) ? -1.0f : 1.0f;
                     }
                     SurfaceMesh unsupMesh = clipSurfaceMeshByScalar(
                         shellForUnsup,
@@ -3959,17 +4425,21 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     const float minSpanForWallJ =
                         outerW.min_mm + static_cast<float>(j) * innerW.min_mm;
                     std::vector<float> innerLevel(nV, 0.0f);
+                    std::vector<float> innerValidity(nV, 0.0f);
                     for (std::size_t i = 0; i < nV; ++i) {
                         const float centerOffset =
                             localOuterWidth[i] + (static_cast<float>(j) - 0.5f) * localInnerWidth[i];
                         innerLevel[i] = dOuter[i] - centerOffset;
+                        innerValidity[i] = (activeInnerCount[i] >= j)
+                            ? supportedWallValidity[i]
+                            : (-0.25f * innerW.target_mm);
                     }
 
                     const auto innerSegs = extractIsoContourSegments(
                         shellMesh,
                         innerLevel,
                         0.0f,
-                        supportedWallValidity,
+                        innerValidity,
                         minSpanForWallJ,
                         localInnerWidth);
                     const auto innerChains =
@@ -3998,7 +4468,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // ------------------------------------------------------------
                 if (anyWaveOverhang) {
                     // Multi-source Dijkstra distance `dFromSupported` starting at 0 on the boundary
-                    // of the supported region (`!isWaveOverhang`) and growing outward toward \Gamma_outer.
+                    // of the supported region (`!isWaveOverhang`) and on underlying sparse infill
+                    // rib loci (`sparseRibSeedDist <= 0.45 * w_sparse`), growing outward.
                     std::vector<float> dFromSupported(nV, kInf);
                     std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> wavePq;
 
@@ -4006,6 +4477,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         if (!isWaveOverhang[i]) {
                             dFromSupported[i] = 0.0f;
                             wavePq.push({0.0f, static_cast<std::uint32_t>(i)});
+                        } else if (isOverSparseWave[i] &&
+                                   sparseRibSeedDist[i] <= 0.45f * sparseW.target_mm) {
+                            dFromSupported[i] = sparseRibSeedDist[i];
+                            wavePq.push({sparseRibSeedDist[i], static_cast<std::uint32_t>(i)});
                         }
                     }
 
@@ -4312,17 +4787,18 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     if ((isMedialLimited && fullRemWidth <= infillW.max_mm) ||
                         fullRemWidth < infillW.min_mm) {
                         negDRem[i] = 1.0f;
-                    } else if (infillPattern != kPatternConcentric) {
+                    } else if (infillPattern != kPatternConcentric || anyOverSparseCore) {
                         // Inset Monotonic solid infill scanline endpoints by `(0.5 - eta) * w_solid`
                         // (`0.35 * w_solid`) from the physical inner edge of the walls (and from
-                        // \Gamma_inner when `hasInnerShellBoundary` is true) so semicircular nozzle
-                        // caps overlap the adjacent perimeter by `eta = 0.15` without over-extruding.
+                        // \Gamma_inner when `hasInnerShellBoundary` is true and not over the sparse core)
+                        // so semicircular nozzle caps overlap the adjacent perimeter by `eta = 0.15`.
                         const float endpointInset = std::min(
                             kInfillEndpointInsetFactor * infillW.target_mm,
                             0.25f * fullRemWidth);
                         const float dRemFromWalls = (dOuter[i] - totalWallSpan[i]) - endpointInset;
+                        const float innerInset = isOverSparseCore[i] ? 0.0f : endpointInset;
                         const float dRemBoth = hasInnerShellBoundary
-                            ? std::min(dRemFromWalls, dInner[i] - endpointInset)
+                            ? std::min(dRemFromWalls, dInner[i] - innerInset)
                             : dRemFromWalls;
                         negDRem[i] = -dRemBoth;
                     }
@@ -4335,7 +4811,157 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     false);
 
                 if (!infillSubmesh.tris.empty() && !infillSubmesh.verts.empty()) {
-                    if (infillPattern == kPatternConcentric) {
+                    const float sparsePitchMm = std::max(
+                        sparseW.target_mm,
+                        sparseW.target_mm / std::max(0.01f, sparseDensity));
+                    const float maxAnchorExtendMm = 1.25f * sparsePitchMm;
+                    const float marchStepMm = std::max(0.08f, 0.20f * sparseW.target_mm);
+                    const std::uint32_t prevLayerIdx = (layerInfo.layer_index > 0)
+                        ? (layerInfo.layer_index - 1)
+                        : 0;
+                    const float prevIso = std::max(0.0f, layerInfo.isovalue - meanLayerH);
+
+                    auto anchorSolidEndpointsToSparseRibs = [&](RawChain& ch, const Vec3f& vAxis) {
+                        if (!anyOverSparseCore || ch.pts.size() < 2) {
+                            return;
+                        }
+                        auto extendOneEnd = [&](bool isFront) {
+                            const RawChainPoint endPt = isFront ? ch.pts.front() : ch.pts.back();
+                            const Vec3f rayDir = isFront ? (vAxis * -1.0f) : vAxis;
+                            const Vec3f zNoz = normalize3(endPt.nozzleAxis, fallbackNozzle);
+                            const float hStep = std::max(1.20f * endPt.heightMm, 1.15f * meanLayerH);
+                            const Vec3f pDown0 = endPt.pos - (zNoz * hStep);
+                            const float phiCurr0 = sampleShiftedSdfForShell(endPt.pos);
+                            const float phiDown0 = sampleShiftedSdfForShell(pDown0);
+                            const float sparseCoreSdfThresh =
+                                -(effectiveShellDepth - 0.08f * meanLayerH);
+                            const Vec3f pProbe =
+                                endPt.pos + (rayDir * std::max(0.15f, 0.45f * infillW.target_mm));
+                            const float phiProbe = sampleShiftedSdfForShell(pProbe);
+                            const float phiDownProbe =
+                                sampleShiftedSdfForShell(pProbe - (zNoz * hStep));
+
+                            // Only extend endpoints that march into/over the sparse core, never through outer walls
+                            const bool overOrEnteringSparse =
+                                (phiDown0 < sparseCoreSdfThresh) ||
+                                (phiDownProbe < sparseCoreSdfThresh) ||
+                                (phiProbe <= sparseCoreSdfThresh);
+                            const bool marchingTowardOuterWall =
+                                (phiProbe > maxSolidInfillSdf) ||
+                                (-phiDownProbe < wTargetSumConfig && phiDownProbe > phiDown0 + 0.02f);
+                            if (!overOrEnteringSparse || marchingTowardOuterWall) {
+                                return;
+                            }
+
+                            auto evalMinRibDist = [&](const Vec3f& pTest, const Vec3f& zTest, float phiTest) -> float {
+                                const Vec3f pDown = pTest - (zTest * hStep);
+                                const float phiDown = sampleShiftedSdfForShell(pDown);
+                                float dRib = evaluateDistanceToSparseRib(
+                                    pDown,
+                                    zTest,
+                                    phiDown,
+                                    effectiveShellDepth,
+                                    prevLayerIdx,
+                                    prevIso,
+                                    sparseDensity,
+                                    sparseW.target_mm,
+                                    sparsePattern,
+                                    infillAngleDeg,
+                                    prevMonoHasBounds,
+                                    prevMonoStartU,
+                                    prevMonoPitchMm,
+                                    prevMonoNumLines);
+                                if (-phiTest >= effectiveShellDepth) {
+                                    const float dCurrRib = evaluateDistanceToSparseRib(
+                                        pTest,
+                                        zTest,
+                                        phiTest,
+                                        effectiveShellDepth,
+                                        layerInfo.layer_index,
+                                        layerInfo.isovalue,
+                                        sparseDensity,
+                                        sparseW.target_mm,
+                                        sparsePattern,
+                                        infillAngleDeg,
+                                        currMonoHasBounds,
+                                        currMonoStartU,
+                                        currMonoPitchMm,
+                                        currMonoNumLines);
+                                    dRib = std::min(dRib, dCurrRib);
+                                }
+                                return dRib;
+                            };
+
+                            const float dRib0 = evalMinRibDist(endPt.pos, zNoz, phiCurr0);
+                            if (dRib0 <= 0.25f * sparseW.target_mm) {
+                                return; // Already sitting on a sparse infill rib
+                            }
+
+                            const int maxSteps = std::clamp(
+                                static_cast<int>(std::ceil(maxAnchorExtendMm / marchStepMm)),
+                                2,
+                                96);
+                            float bestDist = dRib0;
+                            std::optional<Vec3f> anchoredPos;
+
+                            for (int s = 1; s <= maxSteps; ++s) {
+                                const float dist = static_cast<float>(s) * marchStepMm;
+                                Vec3f pCand = endPt.pos + (rayDir * dist);
+                                if (!isConformalSkinLayer) {
+                                    const float tauCand = eikSampler.wsSample(
+                                        openvdb::Vec3d(pCand.x, pCand.y, pCand.z));
+                                    const float gCand = std::max(0.25f, sampleEikGradNorm(pCand));
+                                    const float dTau = std::clamp(
+                                        (layerInfo.isovalue - tauCand) / gCand,
+                                        -0.35f * meanLayerH,
+                                        0.35f * meanLayerH);
+                                    pCand = pCand + (zNoz * dTau);
+                                }
+
+                                const float phiCand = sampleShiftedSdfForShell(pCand);
+                                if (phiCand > maxSolidInfillSdf) {
+                                    break;
+                                }
+                                const float phiDownCand =
+                                    sampleShiftedSdfForShell(pCand - (zNoz * hStep));
+                                // If marching reaches an opposing outer/inner perimeter wall band, anchor onto the wall
+                                if (-phiDownCand <= wTargetSumConfig + 0.35f * infillW.target_mm &&
+                                    phiDownCand > phiDown0 + 0.05f) {
+                                    anchoredPos = pCand;
+                                    break;
+                                }
+
+                                const float dRib = evalMinRibDist(pCand, zNoz, phiCand);
+                                if (dRib < bestDist) {
+                                    bestDist = dRib;
+                                    if (dRib <= 0.25f * sparseW.target_mm) {
+                                        anchoredPos = pCand;
+                                        break;
+                                    }
+                                } else if (bestDist <= 0.35f * sparseW.target_mm) {
+                                    // Local minimum passed on a sparse infill rib
+                                    anchoredPos = pCand - (rayDir * marchStepMm);
+                                    break;
+                                }
+                            }
+
+                            if (anchoredPos.has_value()) {
+                                RawChainPoint newPt = endPt;
+                                newPt.pos = *anchoredPos;
+                                newPt.nozzleAxis = sampleNozzleAxis(newPt.pos);
+                                if (isFront) {
+                                    ch.pts.insert(ch.pts.begin(), newPt);
+                                } else {
+                                    ch.pts.push_back(newPt);
+                                }
+                            }
+                        };
+
+                        extendOneEnd(true);
+                        extendOneEnd(false);
+                    };
+
+                    if (infillPattern == kPatternConcentric && !anyOverSparseCore) {
                         const std::size_t nInfV = infillSubmesh.verts.size();
                         std::vector<float> infDepth(nInfV, 0.0f);
                         std::vector<float> infSpan(nInfV, 0.0f);
@@ -4412,7 +5038,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             infillAngleDeg,
                             kFeatureSolidInfill,
                             maxSolidInfillSdf,
-                            sampleShiftedSdfForShell);
+                            sampleShiftedSdfForShell,
+                            anchorSolidEndpointsToSparseRibs);
                     }
                 }
 

@@ -4378,6 +4378,9 @@ mod tests {
 
     #[test]
     fn test_bridge_and_wave_overhang_generation_from_overhang_field() {
+        let _guard = TEST_BACKEND_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Construct a watertight 3D bridge-arch + cantilever mesh:
         // - Left pillar:  X in [-10.0, -4.0], Y in [-4.0, 4.0], Z in [0.0, 6.0]
         // - Right pillar: X in [  4.0, 10.0], Y in [-4.0, 4.0], Z in [0.0, 6.0]
@@ -6065,6 +6068,167 @@ mod tests {
         );
 
         ffi::set_spatial_orientation_hints(&[]);
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(obj.object_id);
+    }
+
+    #[test]
+    fn test_isolated_solid_layer_over_sparse_infill_anchoring_and_subskin_contour() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Construct a stepped block (`[-10, 10] x [-8, 8]`):
+        // - Left deck (`x in [-10, 2]`): horizontal top roof at `z = 4.0 mm`
+        // - Right tower (`x in [2, 10]`): continues up to `z = 8.0 mm`
+        // With `shell_thickness_mm = 0.84` and `layer_height = 0.40 mm`:
+        // - At `z ~ 2.0 mm`: pure sparse infill across `[-9.16, 9.16] x [-7.16, 7.16]`
+        // - At `z ~ 2.8 mm` (1 layer beneath the `z = 3.2 mm` solid deck shell):
+        //   Part 1 emits a Sub-Skin Boundary Anchor Contour in the sparse core beneath the upcoming deck.
+        // - At `z ~ 3.2..3.6 mm` (first solid layer of the left deck over sparse infill, meeting the
+        //   right tower's sparse core across the internal boundary at `x ~ 2.0 mm`):
+        //   Part 2 suppresses floating inner loops and extends solid infill scanline endpoints across
+        //   the internal solid/sparse boundary `x ~ 2.0 mm` to anchor onto underlying sparse infill ribs.
+        let mut stl = String::from("solid stepped_deck_sparse_anchor\n");
+        let mut add_tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+            stl.push_str(&format!(
+                "  facet normal 0 0 0\n    outer loop\n      vertex {} {} {}\n      vertex {} {} {}\n      vertex {} {} {}\n    endloop\n  endfacet\n",
+                a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]
+            ));
+        };
+        let mut add_quad = |p00: [f32; 3], p10: [f32; 3], p11: [f32; 3], p01: [f32; 3]| {
+            add_tri(p00, p10, p11);
+            add_tri(p00, p11, p01);
+        };
+
+        // Watertight stepped block `[-10, 10] x [-8, 8]` split at `x = 2.0, z = 4.0` (zero T-junctions)
+        // Bottom faces (z = 0)
+        add_quad([-10.0, -8.0, 0.0], [-10.0, 8.0, 0.0], [2.0, 8.0, 0.0], [2.0, -8.0, 0.0]);
+        add_quad([2.0, -8.0, 0.0], [2.0, 8.0, 0.0], [10.0, 8.0, 0.0], [10.0, -8.0, 0.0]);
+        // Left deck top face (z = 4, x in [-10, 2]) and right tower top face (z = 8, x in [2, 10])
+        add_quad([-10.0, -8.0, 4.0], [2.0, -8.0, 4.0], [2.0, 8.0, 4.0], [-10.0, 8.0, 4.0]);
+        add_quad([2.0, -8.0, 8.0], [10.0, -8.0, 8.0], [10.0, 8.0, 8.0], [2.0, 8.0, 8.0]);
+        // Front (-Y = -8) and Back (+Y = +8) faces
+        add_quad([-10.0, -8.0, 0.0], [2.0, -8.0, 0.0], [2.0, -8.0, 4.0], [-10.0, -8.0, 4.0]);
+        add_quad([2.0, -8.0, 0.0], [10.0, -8.0, 0.0], [10.0, -8.0, 4.0], [2.0, -8.0, 4.0]);
+        add_quad([2.0, -8.0, 4.0], [10.0, -8.0, 4.0], [10.0, -8.0, 8.0], [2.0, -8.0, 8.0]);
+        add_quad([2.0, 8.0, 0.0], [-10.0, 8.0, 0.0], [-10.0, 8.0, 4.0], [2.0, 8.0, 4.0]);
+        add_quad([10.0, 8.0, 0.0], [2.0, 8.0, 0.0], [2.0, 8.0, 4.0], [10.0, 8.0, 4.0]);
+        add_quad([10.0, 8.0, 4.0], [2.0, 8.0, 4.0], [2.0, 8.0, 8.0], [10.0, 8.0, 8.0]);
+        // Left (-X = -10), Step Riser (X = 2, z in [4, 8]), and Right (+X = 10) faces
+        add_quad([-10.0, 8.0, 0.0], [-10.0, -8.0, 0.0], [-10.0, -8.0, 4.0], [-10.0, 8.0, 4.0]);
+        add_quad([2.0, 8.0, 4.0], [2.0, -8.0, 4.0], [2.0, -8.0, 8.0], [2.0, 8.0, 8.0]);
+        add_quad([10.0, -8.0, 0.0], [10.0, 8.0, 0.0], [10.0, 8.0, 4.0], [10.0, -8.0, 4.0]);
+        add_quad([10.0, -8.0, 4.0], [10.0, 8.0, 4.0], [10.0, 8.0, 8.0], [10.0, -8.0, 8.0]);
+        stl.push_str("endsolid stepped_deck_sparse_anchor\n");
+
+        let tmp_path = std::env::temp_dir().join("manifold_test_stepped_deck_sparse_anchor.stl");
+        std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write temporary STL");
+        let obj = crate::io::stl::load_stl_file(&tmp_path)
+            .expect("Expected synthetic stepped deck STL import to succeed");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut cfg = crate::config::SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.eikonal.voxel_size_mm = 0.35;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.40;
+        cfg.slicing.layer_height.min_mm = 0.25;
+        cfg.slicing.layer_height.max_mm = 0.50;
+        cfg.slicing.layer_height.first_layer_mm = 0.40;
+        cfg.slicing.layer_height.top_layer_mm = 0.40;
+        cfg.slicing.enable_auto_conformal_skin = false;
+        cfg.slicing.shell_thickness_mm = 0.84;
+        cfg.slicing.inner_wall_count = 1;
+        cfg.slicing.infill_density_percent = 20.0;
+        cfg.slicing.sparse_infill_pattern = crate::config::SparseInfillPattern::Monotonic;
+        cfg.slicing.solid_infill_pattern = crate::config::SolidInfillPattern::Concentric;
+        cfg.slicing.infill_angle_deg = 0.0; // Scanlines along X/Y so deck scanlines cross x = 2.0 boundary
+        cfg.slicing.sanitize();
+        crate::ui::sync_config_to_backend(&cfg);
+        ffi::set_spatial_orientation_hints(&[]);
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        let selected = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        assert!(selected.valid && !selected.layers.is_empty());
+
+        let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(tp.valid && tp.total_path_count > 0);
+
+        // 1. Verify that on the layer immediately beneath the `z = 3.2 mm` solid deck shell
+        //    (`z ~ 2.6..3.0 mm`), the 1-layer sub-skin boundary anchor contour increases total
+        //    sparse infill extrusion length compared to the lower pure-sparse layer (`z ~ 1.6..2.0 mm`).
+        let mid_sparse_layer = tp
+            .layers
+            .iter()
+            .find(|l| (l.isovalue - 1.8).abs() < 0.25)
+            .expect("Expected pure sparse layer near z = 1.8 mm");
+        let sub_skin_layer = tp
+            .layers
+            .iter()
+            .rev()
+            .find(|l| l.isovalue <= 3.15 && l.isovalue >= 2.65)
+            .expect("Expected sub-skin sparse layer immediately beneath z = 3.16 mm");
+
+        let mid_sparse_len: f32 = mid_sparse_layer
+            .paths
+            .iter()
+            .filter(|p| p.feature_kind == 4)
+            .map(|p| p.total_length_mm)
+            .sum();
+        let sub_skin_sparse_len: f32 = sub_skin_layer
+            .paths
+            .iter()
+            .filter(|p| p.feature_kind == 4)
+            .map(|p| p.total_length_mm)
+            .sum();
+        assert!(
+            sub_skin_sparse_len > mid_sparse_len + 4.0,
+            "Expected 1-layer sub-skin boundary anchor contour to add sparse anchor length on sub-skin layer (mid={:.2} mm, sub_skin={:.2} mm)",
+            mid_sparse_len,
+            sub_skin_sparse_len
+        );
+
+        // 2. Verify that on the first solid deck transition layer (`z ~ 3.2..3.7 mm`), even though
+        //    `Concentric` solid infill was configured, the over-sparse deck region uses open
+        //    scanlines (`!p.is_closed`) rather than floating concentric loops in mid-air, and
+        //    extends scanline endpoints across the inner shell boundary (`x = 2.0 - 0.84 = 1.16 mm`)
+        //    into the right tower's sparse core to anchor onto underlying sparse infill ribs!
+        let transition_layer = tp
+            .layers
+            .iter()
+            .find(|l| {
+                l.isovalue >= 3.15
+                    && l.isovalue <= 3.75
+                    && l.paths.iter().any(|p| p.feature_kind == 2)
+            })
+            .expect("Expected first solid deck transition layer with SolidInfill in z = 3.15..3.75 mm");
+        let deck_solid_paths: Vec<_> = transition_layer
+            .paths
+            .iter()
+            .filter(|p| p.feature_kind == 2)
+            .collect();
+        assert!(
+            deck_solid_paths.iter().all(|p| !p.is_closed),
+            "Expected solid infill over sparse infill on transition layer (iso={:.2}) to use open anchored scanlines instead of floating closed concentric loops",
+            transition_layer.isovalue
+        );
+        let max_solid_x = deck_solid_paths
+            .iter()
+            .flat_map(|p| p.points.iter())
+            .map(|pt| pt.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            max_solid_x > 1.20,
+            "Expected deck solid infill scanlines on transition layer (iso={:.2}) to extend across the unanchored x=1.16 mm inner boundary to anchor on sparse ribs, got max_solid_x={:.2} mm",
+            transition_layer.isovalue,
+            max_solid_x
+        );
+
         let default_cfg = crate::config::SlicerConfig::default();
         crate::ui::sync_config_to_backend(&default_cfg);
         let _ = ffi::remove_cad_object(obj.object_id);
