@@ -342,23 +342,17 @@ impl MeltPressureTracker {
         let p_avg = q_target_mm3s + (self.pressure_mm3s - q_target_mm3s) * i_x;
 
         let mut mult = 1.0f32;
-        if cfg.enable_transient_pressure_comp && q_target_mm3s > 1.0e-3 {
-            if p_avg > q_target_mm3s {
-                let ratio = (q_target_mm3s / p_avg).clamp(0.05, 1.0);
-                let min_m = cfg.transient_min_flow_multiplier.clamp(0.1, 1.0);
-                mult = ratio
-                    .powf(cfg.transient_pressure_exponent.clamp(0.05, 1.0))
-                    .clamp(min_m, 1.0);
-            }
-            if dt < 0.25 * k {
-                self.short_move_streak = (self.short_move_streak + 1).min(8);
-                let streak_t = (self.short_move_streak as f32 / 4.0).clamp(0.0, 1.0);
-                let m_short = 1.0 - (1.0 - cfg.transient_min_flow_multiplier) * 0.5 * streak_t;
-                mult = mult.min(m_short);
-            } else {
-                self.short_move_streak = 0;
-            }
+        if cfg.enable_transient_pressure_comp && q_target_mm3s > 1.0e-3 && p_avg > q_target_mm3s {
+            // Apply only a gentle viscous excess-pressure trim (`>= 0.95`) so slicer-side
+            // flow scaling never starves corners or fights Klipper firmware Pressure Advance,
+            // and never penalizes smooth curved walls tessellated into short chords.
+            let ratio = (q_target_mm3s / p_avg).clamp(0.05, 1.0);
+            let min_m = cfg.transient_min_flow_multiplier.clamp(0.95, 1.0);
+            mult = ratio
+                .powf((cfg.transient_pressure_exponent * 0.35).clamp(0.05, 0.5))
+                .clamp(min_m, 1.0);
         }
+        self.short_move_streak = 0;
 
         let q_comp = mult * q_target_mm3s;
         let mut p_end = q_comp + (self.pressure_mm3s - q_comp) * (-x).exp();
@@ -494,27 +488,46 @@ fn compensate_wall_geometry(
     }
 
     let r_flat = nozzle_diam_mm; // Flat annular land radius R_flat = 0.5 * (2 * D_nozzle)
+    let _ = nominal_outer_w;
     let is_outer = chain.base_kind == PlannedMoveKind::OuterWall;
     let is_closed = chain.is_closed;
 
+    let max_step = 4usize.min(n - 1);
     let mut shifts = vec![Vec3::ZERO; n];
     for i in 0..n {
         let curr = &chain.pts[i];
-        // Safe tangent calculation: wrap around ONLY when `is_closed == true`!
-        let p_prev = if i > 0 {
-            chain.pts[i - 1].pos_bed
-        } else if is_closed {
-            chain.pts[n - 1].pos_bed
-        } else {
-            curr.pos_bed
-        };
-        let p_next = if i + 1 < n {
-            chain.pts[i + 1].pos_bed
-        } else if is_closed {
-            chain.pts[0].pos_bed
-        } else {
-            curr.pos_bed
-        };
+        // Compute a smoothed tangent over at least `0.35 mm` chord span (wrap around ONLY when `is_closed == true`)
+        // so short triangle crossings never cause normal jitter or fold adjacent segments.
+        let mut p_prev = curr.pos_bed;
+        for step in 1..=max_step {
+            let idx = if i >= step {
+                i - step
+            } else if is_closed {
+                (i + n - (step % n)) % n
+            } else {
+                0
+            };
+            p_prev = chain.pts[idx].pos_bed;
+            if (curr.pos_bed - p_prev).length_squared() >= 0.35 * 0.35 || (!is_closed && idx == 0) {
+                break;
+            }
+        }
+        let mut p_next = curr.pos_bed;
+        for step in 1..=max_step {
+            let idx = if i + step < n {
+                i + step
+            } else if is_closed {
+                (i + step) % n
+            } else {
+                n - 1
+            };
+            p_next = chain.pts[idx].pos_bed;
+            if (p_next - curr.pos_bed).length_squared() >= 0.35 * 0.35
+                || (!is_closed && idx == n - 1)
+            {
+                break;
+            }
+        }
 
         let tangent = (p_next - p_prev).try_normalize().unwrap_or(Vec3::X);
         let z_nozzle = curr.nozzle_bed.try_normalize().unwrap_or(up_bed);
@@ -528,17 +541,14 @@ fn compensate_wall_geometry(
             delta += z_nozzle * dz_slope;
         }
 
-        // 2. Outer wall centerline pinning for variable bead width + viscoelastic die swell inset
+        // 2. Viscoelastic die-swell inset (note: `path_generator.cpp` already extracts `OuterWall`
+        //    at `d_outer = 0.5 * local_outer_width`, so only die-swell inset is applied here).
         if is_outer {
-            // Right-handed inward normal in the layer tangent plane (left of travel tangent)
             let inward_dir = z_nozzle.cross(tangent).try_normalize().unwrap_or(Vec3::Y);
-            let max_pin = (0.4 * nominal_outer_w).max(0.0);
-            let width_pin_shift =
-                (0.5 * (curr.width_mm - nominal_outer_w)).clamp(-max_pin, max_pin);
             let est_q = curr.width_mm * curr.height_mm * nominal_speed_mms;
             let swell_ratio = fluid.die_swell_ratio(est_q);
             let swell_inset = 0.5 * (swell_ratio - 1.0) * curr.height_mm;
-            delta += inward_dir * (width_pin_shift + swell_inset);
+            delta += inward_dir * swell_inset;
         }
 
         shifts[i] = delta;
@@ -854,11 +864,12 @@ fn finalize_chain_seam_and_wipe(chain: &WorkingChain, cfg: &GcodeProcessConfig) 
         total_len += (chain.pts.first().unwrap().pos_bed - chain.pts.last().unwrap().pos_bed).length();
     }
 
-    // 1. Closed wall loop with 3D Scarf Joint Seam Ramping (strictly gated on `is_closed`)
+    // 1. Closed outer wall loop with 3D Scarf Joint Seam Ramping (strictly gated on `is_closed`,
+    //    `OuterWall`, and perimeter >= 20 mm so internal walls and small pillars are not plowed)
     if chain.is_closed
-        && chain.base_kind.is_wall()
+        && chain.base_kind == PlannedMoveKind::OuterWall
         && cfg.enable_scarf_joint
-        && total_len >= 2.5 * cfg.scarf_length_mm
+        && total_len >= (4.0 * cfg.scarf_length_mm).max(20.0)
     {
         let l_scarf = cfg.scarf_length_mm.min(0.35 * total_len).max(1.0);
         let k_steps = ((l_scarf / 0.40).ceil() as usize).clamp(4, 32);
@@ -949,10 +960,13 @@ fn finalize_chain_seam_and_wipe(chain: &WorkingChain, cfg: &GcodeProcessConfig) 
     //    Apply optional pre-retract taper near the tail, and wipe BACKWARD along the tail
     //    so the nozzle never protrudes past the open endpoint!
     let mut out = chain.pts.clone();
-    if cfg.pre_retract_taper_mm > 1.0e-3 && total_len >= 2.0 * cfg.pre_retract_taper_mm {
+    if !chain.base_kind.is_wall()
+        && cfg.pre_retract_taper_mm > 1.0e-3
+        && total_len >= 2.0 * cfg.pre_retract_taper_mm
+    {
         let n = out.len();
         let last_idx = n - 1;
-        out[last_idx].flow_rate_mult = 0.65;
+        out[last_idx].flow_rate_mult = 0.90;
     }
 
     if cfg.wipe_length_mm > 1.0e-3 && chain.base_kind.is_wall() && out.len() >= 2 {
@@ -1217,22 +1231,22 @@ fn subdivide_segments_for_slicer_pa(
     fluid: &FluidDynamicsModel,
     cfg: &GcodeProcessConfig,
 ) -> Vec<PlannedSegment> {
-    if !cfg.enable_slicer_pa_subdivision {
+    if !cfg.enable_slicer_pa_subdivision || !cfg.enable_dynamic_pa {
         return segments;
     }
 
-    let mut out = Vec::with_capacity(segments.len() * 2);
+    let mut out = Vec::with_capacity(segments.len());
     for seg in segments {
         if !seg.kind.is_extruding()
             || seg.delta_e_mm <= 1.0e-5
-            || seg.length_mm < 1.2
-            || (seg.cruise_speed_mms - seg.entry_speed_mms.min(seg.exit_speed_mms)) < 8.0
+            || seg.length_mm < 3.0
+            || (seg.cruise_speed_mms - seg.entry_speed_mms.min(seg.exit_speed_mms)) < 40.0
         {
             out.push(seg);
             continue;
         }
 
-        let n_sub = ((seg.length_mm / 0.8).ceil() as usize).clamp(2, 6);
+        let n_sub = ((seg.length_mm / 1.5).ceil() as usize).clamp(2, 3);
         let inv_n = 1.0 / (n_sub as f32);
         for k in 0..n_sub {
             let t0 = (k as f32) * inv_n;
@@ -1253,7 +1267,7 @@ fn subdivide_segments_for_slicer_pa(
             sub.p1_bed = seg.p0_bed.lerp(seg.p1_bed, t1);
             sub.length_mm = sub_len;
             sub.entry_speed_mms = v0;
-            sub.cruise_speed_mms = v_mid;
+            sub.cruise_speed_mms = seg.cruise_speed_mms;
             sub.exit_speed_mms = v1;
             sub.duration_s = sub_dt;
             sub.delta_e_mm = base_de;
@@ -2192,6 +2206,19 @@ pub fn plan_and_emit_gcode_for_object(
 
             // 2. Emit segments of this chain with base extrusion & volumetric speed capping
             let chain_seg_start = layer_segments.len();
+            let chain_arc_len: f32 = vertices
+                .windows(2)
+                .map(|w| (w[1].pos_bed - w[0].pos_bed).length())
+                .sum();
+            // Smoothly slow down small closed wall perimeters (< 18 mm, e.g. chimney, pillars, small holes)
+            // down to 50% speed at <= 6 mm perimeter, matching OrcaSlicer small_perimeter_speed behavior.
+            let small_perim_speed_mult =
+                if chain.is_closed && chain.base_kind.is_wall() && chain_arc_len < 18.0 {
+                    0.50 + 0.50 * ((chain_arc_len - 6.0) / 12.0).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+
             for w in vertices.windows(2) {
                 let a = &w[0];
                 let b = &w[1];
@@ -2211,12 +2238,14 @@ pub fn plan_and_emit_gcode_for_object(
                 let rate_mult = b.flow_rate_mult;
 
                 let (base_spd, base_accel) = match kind {
-                    PlannedMoveKind::OuterWall | PlannedMoveKind::ScarfSeam => {
-                        (gcfg.outer_wall_speed_mms, gcfg.outer_wall_accel_mms2)
-                    }
-                    PlannedMoveKind::InnerWall => {
-                        (gcfg.inner_wall_speed_mms, gcfg.inner_wall_accel_mms2)
-                    }
+                    PlannedMoveKind::OuterWall | PlannedMoveKind::ScarfSeam => (
+                        gcfg.outer_wall_speed_mms * small_perim_speed_mult,
+                        gcfg.outer_wall_accel_mms2,
+                    ),
+                    PlannedMoveKind::InnerWall => (
+                        gcfg.inner_wall_speed_mms * small_perim_speed_mult,
+                        gcfg.inner_wall_accel_mms2,
+                    ),
                     PlannedMoveKind::SolidInfill => {
                         (gcfg.solid_infill_speed_mms, gcfg.infill_accel_mms2)
                     }
@@ -2296,15 +2325,9 @@ pub fn plan_and_emit_gcode_for_object(
                         c_surf.min(c_traj).clamp(0.25, 1.0)
                     };
 
-                    // Directional downhill squeeze multiplier
-                    let s_climb = seg_dir.dot(up_bed);
-                    let m_dir = if kind == PlannedMoveKind::Bridge {
-                        1.0
-                    } else if s_climb < 0.0 {
-                        (1.0 - 0.12 * (-s_climb).clamp(0.0, 1.0)).max(0.75)
-                    } else {
-                        1.0
-                    };
+                    // Keep uphill and downhill sides of non-planar loops symmetric (`m_dir = 1.0`)
+                    // since `c_slope` already accounts for the nozzle-frame geometric projection.
+                    let m_dir = 1.0f32;
 
                     // Dedicated feature flow multiplier for Bridges and Wave Overhangs (in addition
                     // to global extrusion_multiplier, die swell, corner, and PA/transient multipliers)
@@ -2401,8 +2424,8 @@ pub fn plan_and_emit_gcode_for_object(
             }
 
             // 3. Apply Corner Overlap & Klipper SCV Shortcut Arc Flow Compensation
-            //    Strictly on interior junctions of this chain (`chain_seg_start .. layer_segments.len()`),
-            //    NEVER wrapping around open paths!
+            //    Strictly on interior junctions of this chain (`chain_seg_start .. layer_segments.len()`)
+            //    at genuine macroscopic corners (\alpha >= 25 deg), NEVER on smooth tessellated curves!
             if gcfg.enable_corner_flow_comp && layer_segments.len() >= chain_seg_start + 2 {
                 let end_idx = layer_segments.len();
                 let mut deductions_mm3 = vec![0.0f32; end_idx - chain_seg_start];
@@ -2415,6 +2438,12 @@ pub fn plan_and_emit_gcode_for_object(
                         || s_in.delta_e_mm <= 0.0
                         || s_out.delta_e_mm <= 0.0
                     {
+                        continue;
+                    }
+
+                    let w_avg = 0.5 * (s_in.width_mm + s_out.width_mm);
+                    let h_avg = 0.5 * (s_in.height_mm + s_out.height_mm);
+                    if s_in.length_mm < 0.5 * w_avg || s_out.length_mm < 0.5 * w_avg {
                         continue;
                     }
 
@@ -2434,17 +2463,15 @@ pub fn plan_and_emit_gcode_for_object(
                         .unwrap_or(raw_out);
 
                     let cos_alpha = u_in.dot(u_out).clamp(-1.0, 1.0);
-                    if cos_alpha >= 0.9995 {
+                    // Ignore shallow curve tessellation facets (\alpha < ~25 deg, cos(25 deg) = 0.9063)
+                    if cos_alpha >= 0.9063 {
                         continue;
                     }
 
                     let alpha = cos_alpha.acos();
                     let sin_half = (0.5 * (1.0 - cos_alpha)).max(0.0).sqrt();
                     let cos_half = (0.5 * (1.0 + cos_alpha)).max(0.125).sqrt();
-                    let tan_half = (sin_half / cos_half).min(4.0);
-
-                    let w_avg = 0.5 * (s_in.width_mm + s_out.width_mm);
-                    let h_avg = 0.5 * (s_in.height_mm + s_out.height_mm);
+                    let tan_half = (sin_half / cos_half).min(2.5);
 
                     // Geometric inner-corner diamond overlap volume
                     let dv_geom = 0.25 * w_avg * w_avg * h_avg * tan_half;
@@ -2475,10 +2502,10 @@ pub fn plan_and_emit_gcode_for_object(
                     }
                     let seg = &mut layer_segments[chain_seg_start + rel_i];
                     let nom_vol = seg.delta_e_mm * filament_area_mm2;
-                    let max_ded = 0.35 * nom_vol;
+                    let max_ded = 0.15 * nom_vol;
                     let actual_ded = ded_v.min(max_ded);
                     if nom_vol > 1.0e-5 {
-                        let factor = ((nom_vol - actual_ded) / nom_vol).clamp(0.65, 1.0);
+                        let factor = ((nom_vol - actual_ded) / nom_vol).clamp(0.85, 1.0);
                         seg.delta_e_mm *= factor;
                         seg.extrusion_multiplier *= factor;
                     }
@@ -2733,13 +2760,14 @@ pub fn plan_and_emit_gcode_for_object(
             ));
         }
     }
-    if gcfg.enable_slicer_pa_subdivision {
-        gcode.push_str("SET_PRESSURE_ADVANCE ADVANCE=0.00000 ; Slicer-side PA active\n");
-    }
+    let init_pa_s = gcfg.pa_low_flow_s.max(0.0);
+    gcode.push_str(&format!(
+        "SET_PRESSURE_ADVANCE ADVANCE={init_pa_s:.5} ; Initial Pressure Advance\n"
+    ));
 
     let mut emitted_accel = -1.0f32;
     let mut emitted_feed_mm_min = -1.0f32;
-    let mut emitted_pa = -1.0f32;
+    let mut emitted_pa = init_pa_s;
     let mut emitted_fan_pwm: Option<u8> = None;
     let mut last_emitted_kind: Option<PlannedMoveKind> = None;
     let mut emitted_tool_id = tool_id;
@@ -2922,11 +2950,10 @@ pub fn plan_and_emit_gcode_for_object(
                 min_h = min_h.min(seg.height_mm);
                 max_h = max_h.max(seg.height_mm);
 
-                // Emit dynamic firmware PA update when outside 8% deadband
-                if !gcfg.enable_slicer_pa_subdivision
-                    && gcfg.enable_dynamic_pa
-                    && (emitted_pa < 0.0
-                        || (seg.pressure_advance_s - emitted_pa).abs()
+                // Emit firmware PA update after toolchange or when dynamic PA shifts outside 8% deadband
+                if emitted_pa < 0.0
+                    || (gcfg.enable_dynamic_pa
+                        && (seg.pressure_advance_s - emitted_pa).abs()
                             / emitted_pa.max(0.005)
                             >= 0.08)
                 {
@@ -2942,7 +2969,10 @@ pub fn plan_and_emit_gcode_for_object(
                 let e_emitted = ((e_desired * 1_000_000.0).round() * 1.0e-6).max(0.0);
                 e_rounding_residual_mm = e_desired - e_emitted;
 
-                let feed_mm_min = (seg.cruise_speed_mms * 60.0).max(30.0);
+                // Emit the feature's nominal target speed (`seg.nominal_speed_mms * 60.0`) so Klipper's
+                // native motion planner handles corner deceleration/acceleration smoothly without
+                // facet-by-facet feedrate stuttering.
+                let feed_mm_min = (seg.nominal_speed_mms * 60.0).max(30.0);
                 let emit_f = kind_changed
                     || emitted_feed_mm_min <= 0.0
                     || ((feed_mm_min - emitted_feed_mm_min).abs() / emitted_feed_mm_min.max(1.0))
@@ -2962,7 +2992,7 @@ pub fn plan_and_emit_gcode_for_object(
                 }
             } else {
                 travel_move_count += 1;
-                let feed_mm_min = (seg.cruise_speed_mms * 60.0).max(60.0);
+                let feed_mm_min = (seg.nominal_speed_mms * 60.0).max(60.0);
                 let emit_f = kind_changed
                     || emitted_feed_mm_min <= 0.0
                     || ((feed_mm_min - emitted_feed_mm_min).abs() / emitted_feed_mm_min.max(1.0))

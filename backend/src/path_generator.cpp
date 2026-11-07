@@ -832,17 +832,131 @@ bool finalizeExtrusionPath(
         return false;
     }
 
+    // 1. Pre-filter micro-segments shorter than `minVertexSpacingMm` caused by
+    //    iso-contours grazing mesh triangle vertices.
+    const bool isWall = (featureKind == kFeatureOuterWall || featureKind == kFeatureInnerWall);
+    const float minVertexSpacingMm = isWall ? 0.06f : 0.03f;
+    std::vector<RawChainPoint> workPts;
+    workPts.reserve(raw.pts.size());
+    workPts.push_back(raw.pts.front());
+
+    for (std::size_t i = 1; i + 1 < raw.pts.size(); ++i) {
+        if (dist3(workPts.back().pos, raw.pts[i].pos) >= minVertexSpacingMm) {
+            workPts.push_back(raw.pts[i]);
+        }
+    }
+    if (raw.isClosed) {
+        const auto& lastPt = raw.pts.back();
+        if (dist3(workPts.back().pos, lastPt.pos) >= minVertexSpacingMm &&
+            dist3(lastPt.pos, workPts.front().pos) >= minVertexSpacingMm) {
+            workPts.push_back(lastPt);
+        } else if (workPts.size() > 3 &&
+                   dist3(workPts.back().pos, workPts.front().pos) < minVertexSpacingMm) {
+            workPts.pop_back();
+        }
+    } else {
+        const auto& lastPt = raw.pts.back();
+        if (workPts.size() >= 2 && dist3(workPts.back().pos, lastPt.pos) < minVertexSpacingMm) {
+            workPts.back() = lastPt;
+        } else if (dist3(workPts.back().pos, lastPt.pos) > 1.0e-5f) {
+            workPts.push_back(lastPt);
+        }
+    }
+
+    if (workPts.size() < 2 || (raw.isClosed && workPts.size() < 3)) {
+        return false;
+    }
+
+    // 2. For outer and inner walls, apply conservative corner-preserving tangent-plane
+    //    smoothing to eliminate marching-cubes voxel staircase jitter and micro-zigzags
+    //    while preserving sharp CAD corners and exact local `nozzleAxis`.
+    if (isWall && workPts.size() >= 4) {
+        const std::size_t n = workPts.size();
+        std::vector<Vec3f> origPos(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            origPos[i] = workPts[i].pos;
+        }
+
+        const float maxDisplacementMm = 0.035f;
+        for (int pass = 0; pass < 2; ++pass) {
+            std::vector<RawChainPoint> nextPts = workPts;
+            const std::size_t iStart = raw.isClosed ? 0 : 1;
+            const std::size_t iEnd = raw.isClosed ? n : (n - 1);
+
+            for (std::size_t i = iStart; i < iEnd; ++i) {
+                const std::size_t iPrev = (i + n - 1) % n;
+                const std::size_t iNext = (i + 1) % n;
+                const Vec3f& pPrev = workPts[iPrev].pos;
+                const Vec3f& pCurr = workPts[i].pos;
+                const Vec3f& pNext = workPts[iNext].pos;
+
+                const Vec3f vIn = pCurr - pPrev;
+                const Vec3f vOut = pNext - pCurr;
+                const float lenIn = length3(vIn);
+                const float lenOut = length3(vOut);
+
+                // Smooth bead width and layer height along the contour
+                nextPts[i].widthMm =
+                    0.25f * workPts[iPrev].widthMm +
+                    0.50f * workPts[i].widthMm +
+                    0.25f * workPts[iNext].widthMm;
+                nextPts[i].heightMm =
+                    0.25f * workPts[iPrev].heightMm +
+                    0.50f * workPts[i].heightMm +
+                    0.25f * workPts[iNext].heightMm;
+
+                if (lenIn <= 1.0e-5f || lenOut <= 1.0e-5f || lenIn > 0.85f || lenOut > 0.85f) {
+                    continue;
+                }
+
+                const Vec3f dIn = vIn * (1.0f / lenIn);
+                const Vec3f dOut = vOut * (1.0f / lenOut);
+                const float cosTurn = dot3(dIn, dOut);
+
+                // Smooth shallow voxel facet ripples (`cosTurn > 0.75`, turn < ~41 deg) OR
+                // artificial micro-hairpin zigzags (`cosTurn < -0.10` on short segments < 0.35 mm),
+                // while leaving genuine macroscopic CAD corners (41..96 deg) crisp.
+                const bool isMicroHairpin =
+                    (cosTurn < -0.10f) && (std::min(lenIn, lenOut) < 0.35f);
+                const bool isVoxelRipple = (cosTurn > 0.75f);
+                if (!isMicroHairpin && !isVoxelRipple) {
+                    continue;
+                }
+
+                const float alpha = isMicroHairpin ? 0.45f : 0.30f;
+                const Vec3f mid = lerp3(pPrev, pNext, 0.5f);
+                Vec3f delta = (mid - pCurr) * alpha;
+
+                // Project displacement onto the local layer tangent plane (\perp nozzleAxis)
+                // so smoothing never perturbs conformal surface height along the nozzle axis.
+                const Vec3f zNoz = normalize3(workPts[i].nozzleAxis, {0.0f, 0.0f, 1.0f});
+                delta = delta - (zNoz * dot3(delta, zNoz));
+
+                Vec3f candPos = pCurr + delta;
+                if (!isMicroHairpin) {
+                    const Vec3f totDisp = candPos - origPos[i];
+                    const float totLen = length3(totDisp);
+                    if (totLen > maxDisplacementMm) {
+                        candPos = origPos[i] + totDisp * (maxDisplacementMm / totLen);
+                    }
+                }
+                nextPts[i].pos = candPos;
+            }
+            workPts = std::move(nextPts);
+        }
+    }
+
     float totalLength = 0.0f;
     float weightedWidthSum = 0.0f;
-    for (std::size_t i = 0; i + 1 < raw.pts.size(); ++i) {
-        const float segLen = dist3(raw.pts[i].pos, raw.pts[i + 1].pos);
+    for (std::size_t i = 0; i + 1 < workPts.size(); ++i) {
+        const float segLen = dist3(workPts[i].pos, workPts[i + 1].pos);
         totalLength += segLen;
-        weightedWidthSum += segLen * 0.5f * (raw.pts[i].widthMm + raw.pts[i + 1].widthMm);
+        weightedWidthSum += segLen * 0.5f * (workPts[i].widthMm + workPts[i + 1].widthMm);
     }
-    if (raw.isClosed && raw.pts.size() >= 3) {
-        const float closeLen = dist3(raw.pts.back().pos, raw.pts.front().pos);
+    if (raw.isClosed && workPts.size() >= 3) {
+        const float closeLen = dist3(workPts.back().pos, workPts.front().pos);
         totalLength += closeLen;
-        weightedWidthSum += closeLen * 0.5f * (raw.pts.back().widthMm + raw.pts.front().widthMm);
+        weightedWidthSum += closeLen * 0.5f * (workPts.back().widthMm + workPts.front().widthMm);
     }
 
     if (totalLength < minExtrusionLengthMm || totalLength <= 1.0e-5f) {
@@ -855,7 +969,7 @@ bool finalizeExtrusionPath(
     outPath.total_length_mm = totalLength;
     outPath.mean_width_mm = weightedWidthSum / totalLength;
     outPath.points.clear();
-    outPath.points.reserve(raw.pts.size());
+    outPath.points.reserve(workPts.size());
 
     auto toToolpathPoint = [](const RawChainPoint& pt) -> ToolpathPoint {
         const Vec3f zNozzle = normalize3(pt.nozzleAxis, {0.0f, 0.0f, 1.0f});
@@ -872,12 +986,12 @@ bool finalizeExtrusionPath(
     };
 
     const float maxMergedSegLen = 0.55f;
-    outPath.points.push_back(toToolpathPoint(raw.pts.front()));
-    RawChainPoint lastKept = raw.pts.front();
+    outPath.points.push_back(toToolpathPoint(workPts.front()));
+    RawChainPoint lastKept = workPts.front();
 
-    for (std::size_t i = 1; i + 1 < raw.pts.size(); ++i) {
-        const RawChainPoint& curr = raw.pts[i];
-        const RawChainPoint& next = raw.pts[i + 1];
+    for (std::size_t i = 1; i + 1 < workPts.size(); ++i) {
+        const RawChainPoint& curr = workPts[i];
+        const RawChainPoint& next = workPts[i + 1];
 
         const float spanLen = dist3(lastKept.pos, next.pos);
         bool keep = (spanLen > maxMergedSegLen) ||
@@ -900,7 +1014,7 @@ bool finalizeExtrusionPath(
         }
     }
 
-    outPath.points.push_back(toToolpathPoint(raw.pts.back()));
+    outPath.points.push_back(toToolpathPoint(workPts.back()));
     return true;
 }
 
@@ -3152,9 +3266,21 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         continue;
                     }
 
+                    if (B < outerW.target_mm) {
+                        // Ultra-thin fin (< 2 * outerW.target_mm): only outer wall fits, narrowed smoothly
+                        localOuterWidth[i] = std::clamp(B, outerW.min_mm, outerW.target_mm);
+                        localInnerWidth[i] = innerW.min_mm;
+                        activeInnerCount[i] = 0;
+                        totalWallSpan[i] = localOuterWidth[i];
+                        continue;
+                    }
+
+                    // Keep the visible outer wall at its constant target width whenever `B >= outerW.target_mm`
+                    // so inner wall count transitions (`mFit`) never cause step-jumps on the outer wall!
                     std::uint32_t mFit = 0;
                     for (std::uint32_t m = 1; m <= numInnerWalls; ++m) {
-                        const float wMinSum = outerW.min_mm + static_cast<float>(m) * innerW.min_mm;
+                        const float wMinSum =
+                            outerW.target_mm + static_cast<float>(m) * innerW.min_mm;
                         if (B >= wMinSum) {
                             mFit = m;
                         } else {
@@ -3163,37 +3289,70 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                     activeInnerCount[i] = mFit;
 
-                    const float wMinSum = outerW.min_mm + static_cast<float>(mFit) * innerW.min_mm;
-                    const float wTargetSum =
-                        outerW.target_mm + static_cast<float>(mFit) * innerW.target_mm;
-                    const float wMaxSum = outerW.max_mm + static_cast<float>(mFit) * innerW.max_mm;
-
-                    if (B < wTargetSum) {
-                        const float denom = std::max(1.0e-5f, wTargetSum - wMinSum);
-                        const float t = std::clamp((B - wMinSum) / denom, 0.0f, 1.0f);
-                        localOuterWidth[i] =
-                            outerW.min_mm + t * (outerW.target_mm - outerW.min_mm);
-                        localInnerWidth[i] =
-                            innerW.min_mm + t * (innerW.target_mm - innerW.min_mm);
-                    } else {
+                    localOuterWidth[i] = outerW.target_mm;
+                    if (mFit == 0) {
                         const float remGap = (rMedial[i] <= spanShell[i])
-                            ? 2.0f * (rMedial[i] - wTargetSum)
-                            : (B - wTargetSum);
-                        if (remGap > 0.0f && remGap < infillW.min_mm && B <= wMaxSum) {
-                            const float denom = std::max(1.0e-5f, wMaxSum - wTargetSum);
-                            const float t = std::clamp((B - wTargetSum) / denom, 0.0f, 1.0f);
-                            localOuterWidth[i] =
-                                outerW.target_mm + t * (outerW.max_mm - outerW.target_mm);
+                            ? 2.0f * (rMedial[i] - outerW.target_mm)
+                            : (B - outerW.target_mm);
+                        if (remGap > 0.0f && remGap < infillW.min_mm && B <= outerW.max_mm) {
+                            localOuterWidth[i] = std::clamp(B, outerW.target_mm, outerW.max_mm);
+                        }
+                        localInnerWidth[i] = innerW.target_mm;
+                    } else {
+                        const float wMinSum =
+                            outerW.target_mm + static_cast<float>(mFit) * innerW.min_mm;
+                        const float wTargetSum =
+                            outerW.target_mm + static_cast<float>(mFit) * innerW.target_mm;
+                        const float wMaxSum =
+                            outerW.target_mm + static_cast<float>(mFit) * innerW.max_mm;
+
+                        if (B < wTargetSum) {
+                            const float denom = std::max(1.0e-5f, wTargetSum - wMinSum);
+                            const float t = std::clamp((B - wMinSum) / denom, 0.0f, 1.0f);
                             localInnerWidth[i] =
-                                innerW.target_mm + t * (innerW.max_mm - innerW.target_mm);
+                                innerW.min_mm + t * (innerW.target_mm - innerW.min_mm);
                         } else {
-                            localOuterWidth[i] = outerW.target_mm;
-                            localInnerWidth[i] = innerW.target_mm;
+                            const float remGap = (rMedial[i] <= spanShell[i])
+                                ? 2.0f * (rMedial[i] - wTargetSum)
+                                : (B - wTargetSum);
+                            if (remGap > 0.0f && remGap < infillW.min_mm && B <= wMaxSum) {
+                                const float denom = std::max(1.0e-5f, wMaxSum - wTargetSum);
+                                const float t = std::clamp((B - wTargetSum) / denom, 0.0f, 1.0f);
+                                localInnerWidth[i] =
+                                    innerW.target_mm + t * (innerW.max_mm - innerW.target_mm);
+                            } else {
+                                localInnerWidth[i] = innerW.target_mm;
+                            }
                         }
                     }
 
                     totalWallSpan[i] =
                         localOuterWidth[i] + static_cast<float>(mFit) * localInnerWidth[i];
+                }
+
+                // Smooth `localOuterWidth` and `localInnerWidth` across 1-ring neighborhoods
+                // so width allocations vary smoothly across mesh triangles.
+                {
+                    std::vector<float> nextOuter = localOuterWidth;
+                    std::vector<float> nextInner = localInnerWidth;
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (adj[i].empty()) {
+                            continue;
+                        }
+                        float sumO = localOuterWidth[i];
+                        float sumI = localInnerWidth[i];
+                        for (std::uint32_t nb : adj[i]) {
+                            sumO += localOuterWidth[nb];
+                            sumI += localInnerWidth[nb];
+                        }
+                        const float invDeg = 1.0f / static_cast<float>(adj[i].size() + 1);
+                        nextOuter[i] = sumO * invDeg;
+                        nextInner[i] = sumI * invDeg;
+                        totalWallSpan[i] = nextOuter[i] +
+                            static_cast<float>(activeInnerCount[i]) * nextInner[i];
+                    }
+                    localOuterWidth = std::move(nextOuter);
+                    localInnerWidth = std::move(nextInner);
                 }
 
                 // ------------------------------------------------------------
@@ -3223,28 +3382,32 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         const bool exceedsOverhangAngle =
                             (ov <= -sinOverhangThresh) || (downwardSlope >= sinOverhangThresh);
 
-                        // 1. Free-air ceiling / cantilevered shelf where stepping one layer down exits the part
+                        // A vertex is only carved out for free-air Bridging / WaveOverhang if stepping
+                        // one layer down genuinely exits the part into free air beyond the support of
+                        // the previous layer's perimeter bead (never chopping normal 45..60 deg sloped walls!).
                         const bool isFreeAirCeiling =
-                            (phiBelow > -0.15f * outerW.min_mm) && exceedsOverhangAngle;
+                            (dOuter[i] > 0.55f * localOuterWidth[i]) &&
+                            (phiBelow > -0.05f * outerW.min_mm) &&
+                            exceedsOverhangAngle;
 
-                        // 2. Steeply overhanging outer perimeter band where overhang exceeds threshold
-                        const bool isOverhangPerimeter =
+                        const bool isCantileverPerimeter =
                             (dOuter[i] <= 1.05f * localOuterWidth[i]) &&
                             exceedsOverhangAngle &&
-                            (phiBelow > -0.65f * localOuterWidth[i]);
+                            (phiBelow > 0.55f * localOuterWidth[i]);
 
                         // Keep interior vertices that sit solidly above the previous layer as supported anchors
                         const bool isSolidlySupportedAnchor =
                             (phiBelow <= -0.35f * outerW.min_mm) &&
                             (dOuter[i] >= 0.95f * localOuterWidth[i]);
 
-                        if ((isFreeAirCeiling || isOverhangPerimeter) && !isSolidlySupportedAnchor) {
+                        if ((isFreeAirCeiling || isCantileverPerimeter) && !isSolidlySupportedAnchor) {
                             rawUnsupported[i] = true;
                         }
                     }
 
                     // Remove isolated single-vertex speckles and ensure each unsupported component
-                    // touches at least one supported vertex on the layer.
+                    // touches at least one supported vertex on the layer AND spans a genuine
+                    // multi-bead overhang shelf rather than a tiny voxel-noise blip on a sloped wall.
                     for (std::size_t i = 0; i < nV; ++i) {
                         if (!rawUnsupported[i]) {
                             continue;
@@ -3262,6 +3425,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
 
                     std::vector<int> compVis(nV, 0);
+                    const float minUnsupSpanSq =
+                        std::max(1.8f * 1.8f, (2.5f * outerW.target_mm) * (2.5f * outerW.target_mm));
                     for (std::size_t i = 0; i < nV; ++i) {
                         if (!isUnsupported[i] || compVis[i] != 0) {
                             continue;
@@ -3271,10 +3436,19 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         q.push(static_cast<std::uint32_t>(i));
                         compVis[i] = 1;
                         bool touchesSupported = false;
+                        bool hasInteriorCeilingVert = false;
+                        Vec3f bMin = shellMesh.verts[i].pos;
+                        Vec3f bMax = shellMesh.verts[i].pos;
                         while (!q.empty()) {
                             const std::uint32_t u = q.front();
                             q.pop();
                             compVerts.push_back(u);
+                            const Vec3f& pu = shellMesh.verts[u].pos;
+                            bMin = {std::min(bMin.x, pu.x), std::min(bMin.y, pu.y), std::min(bMin.z, pu.z)};
+                            bMax = {std::max(bMax.x, pu.x), std::max(bMax.y, pu.y), std::max(bMax.z, pu.z)};
+                            if (dOuter[u] > 0.55f * localOuterWidth[u]) {
+                                hasInteriorCeilingVert = true;
+                            }
                             for (std::uint32_t nb : adj[u]) {
                                 if (!isUnsupported[nb]) {
                                     touchesSupported = true;
@@ -3284,7 +3458,11 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 }
                             }
                         }
-                        if (!touchesSupported) {
+                        const float spanSq = lengthSq3(bMax - bMin);
+                        if (!touchesSupported ||
+                            !hasInteriorCeilingVert ||
+                            compVerts.size() < 4 ||
+                            spanSq < minUnsupSpanSq) {
                             for (std::uint32_t u : compVerts) {
                                 isUnsupported[u] = false;
                             }
