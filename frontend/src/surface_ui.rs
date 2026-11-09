@@ -1013,10 +1013,10 @@ fn build_object_plate_label_panel(
     let span_y = (max_y - min_y).max(12.0);
     let footprint_span = span_x.max(span_y);
 
-    // Lay out text at 22pt in egui so glyphs in the font atlas are high-resolution,
-    // and map points to millimeters on the build plate (clamped so labels remain legible
-    // on both small and large parts).
-    let font_pt = 20.0_f32;
+    // Lay out text at 19.5pt in egui (matching `SurfaceWidgetKind::Button` tessellation) so glyphs
+    // in the font atlas are high-resolution, and map points to millimeters on the build plate
+    // (clamped so labels remain legible on both small and large parts).
+    let font_pt = 19.5_f32;
     let mm_per_point = (footprint_span * 0.0038).clamp(0.16, 0.28);
     let font_id = egui::FontId::monospace(font_pt);
 
@@ -1598,7 +1598,7 @@ fn tessellate_surface_panel_to_bevy_mesh(
         }
     }
 
-    let primitives = ctx.tessellate(clipped_shapes, 2.0);
+    let ppp = ctx.pixels_per_point();
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
@@ -1607,32 +1607,37 @@ fn tessellate_surface_panel_to_bevy_mesh(
 
     let n_arr = world_frame.normal.to_array();
 
-    for (prim_idx, clipped_prim) in primitives.into_iter().enumerate() {
-        let egui::epaint::Primitive::Mesh(emesh) = clipped_prim.primitive else {
-            continue;
-        };
-        // Step each primitive layer by 1.5 microns along the surface normal so Painter's-order
-        // strokes and font glyphs never z-fight with the panel's background rectangle.
-        let layer_offset_mm = (prim_idx as f32) * 0.0015;
-        let base_v = positions.len() as u32;
+    // Tessellate each ClippedShape individually so epaint does not merge backgrounds, borders,
+    // icons, and text galleys into a single coplanar primitive (`prim_idx == 0`), and step each
+    // shape layer by 4 microns along the surface normal so font glyphs never z-fight with the
+    // button background rectangle.
+    for (shape_idx, clipped_shape) in clipped_shapes.into_iter().enumerate() {
+        let layer_offset_mm = (shape_idx as f32) * 0.004;
+        let primitives = ctx.tessellate(vec![clipped_shape], ppp);
+        for clipped_prim in primitives {
+            let egui::epaint::Primitive::Mesh(emesh) = clipped_prim.primitive else {
+                continue;
+            };
+            let base_v = positions.len() as u32;
 
-        for v in &emesh.vertices {
-            let uv_mm = panel.panel_pt_to_uv_mm(v.pos);
-            let world_p = world_frame.local_to_world(uv_mm.x, uv_mm.y, layer_offset_mm);
-            positions.push(world_p.to_array());
-            normals.push(n_arr);
-            uvs.push([v.uv.x, v.uv.y]);
-            let [r, g, b, a] = v.color.to_srgba_unmultiplied();
-            colors.push(srgba_to_linear_rgba([
-                r as f32 / 255.0,
-                g as f32 / 255.0,
-                b as f32 / 255.0,
-                a as f32 / 255.0,
-            ]));
-        }
+            for v in &emesh.vertices {
+                let uv_mm = panel.panel_pt_to_uv_mm(v.pos);
+                let world_p = world_frame.local_to_world(uv_mm.x, uv_mm.y, layer_offset_mm);
+                positions.push(world_p.to_array());
+                normals.push(n_arr);
+                uvs.push([v.uv.x, v.uv.y]);
+                let [r, g, b, a] = v.color.to_srgba_unmultiplied();
+                colors.push(srgba_to_linear_rgba([
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    a as f32 / 255.0,
+                ]));
+            }
 
-        for idx in emesh.indices {
-            indices.push(base_v + idx);
+            for idx in emesh.indices {
+                indices.push(base_v + idx);
+            }
         }
     }
 
@@ -1647,6 +1652,87 @@ fn tessellate_surface_panel_to_bevy_mesh(
     .with_inserted_indices(Indices::U32(indices))
 }
 
+/// Pre-warms all glyphs used by `panels` in `ctx.fonts` before any panel is tessellated or the
+/// font atlas texture is synced. This ensures:
+/// 1. Every character glyph is rasterized into `f.image()` before `sync_egui_font_atlas_material` uploads it.
+/// 2. Any font atlas height doubling (`resize_to_min_height`) happens before `ctx.tessellate` normalizes
+///    glyph vertex UVs by `1.0 / font_tex_size`.
+fn prewarm_panel_glyphs_in_font_atlas(ctx: &egui::Context, panels: &[SurfacePanel3d]) {
+    ctx.fonts(|f| {
+        for panel in panels {
+            for widget in &panel.widgets {
+                match &widget.kind {
+                    SurfaceWidgetKind::Label {
+                        text,
+                        color,
+                        monospace,
+                    } => {
+                        let font_id = if *monospace {
+                            egui::FontId::monospace(18.0)
+                        } else {
+                            egui::FontId::proportional(18.0)
+                        };
+                        let _ = f.layout_no_wrap(text.clone(), font_id, *color);
+                    }
+                    SurfaceWidgetKind::Button {
+                        text, text_color, ..
+                    } => {
+                        if !text.is_empty() {
+                            let _ = f.layout_no_wrap(
+                                text.clone(),
+                                egui::FontId::monospace(19.5),
+                                *text_color,
+                            );
+                        }
+                    }
+                    SurfaceWidgetKind::Toggle { label, value, .. } => {
+                        let txt = format!("{} {}", if *value { "[✓]" } else { "[ ]" }, label);
+                        let _ = f.layout_no_wrap(
+                            txt,
+                            egui::FontId::proportional(17.0),
+                            egui::Color32::from_gray(240),
+                        );
+                    }
+                    SurfaceWidgetKind::Slider {
+                        label,
+                        value,
+                        suffix,
+                        ..
+                    } => {
+                        let txt = format!("{label}: {value:.2}{suffix}");
+                        let _ = f.layout_no_wrap(
+                            txt,
+                            egui::FontId::monospace(15.5),
+                            egui::Color32::from_rgb(245, 248, 255),
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Computes a full-coverage signature `(width, height, checksum)` of the `egui` font atlas image.
+/// Unlike sparse strided sampling (which misses individual newly rasterized glyphs in an existing
+/// atlas row), this hashes the index and value of every non-zero texel in `f.image().pixels`.
+fn compute_egui_font_atlas_signature(ctx: &egui::Context) -> (usize, usize, u64) {
+    ctx.fonts(|f| {
+        let img = f.image();
+        let w = img.width();
+        let h = img.height();
+        let mut hash = ((w as u64) << 32) ^ (h as u64) ^ 0x9E37_79B9_7F4A_7C15;
+        for (idx, &px) in img.pixels.iter().enumerate() {
+            let bits = px.to_bits();
+            if bits != 0 {
+                hash = hash.rotate_left(5).wrapping_add(
+                    (idx as u64).wrapping_mul(0x517C_C1B7_2722_0A95) ^ (bits as u64),
+                );
+            }
+        }
+        (w, h, hash)
+    })
+}
+
 /// Ensures the shared `egui` font atlas `Image` and `StandardMaterial` are up to date in Bevy.
 fn sync_egui_font_atlas_material(
     ctx: &egui::Context,
@@ -1654,17 +1740,7 @@ fn sync_egui_font_atlas_material(
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
 ) -> Handle<StandardMaterial> {
-    let (w, h, checksum) = ctx.fonts(|f| {
-        let img = f.image();
-        let w = img.width();
-        let h = img.height();
-        let stride = (img.pixels.len() / 64).max(1);
-        let mut hash = (img.pixels.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        for &px in img.pixels.iter().step_by(stride) {
-            hash = hash.rotate_left(5) ^ (px.to_bits() as u64);
-        }
-        (w, h, hash)
-    });
+    let (w, h, checksum) = compute_egui_font_atlas_signature(ctx);
 
     let needs_update = surface_ui.font_atlas_material.is_none()
         || surface_ui.font_atlas_signature != (w, h, checksum);
@@ -1690,19 +1766,29 @@ fn sync_egui_font_atlas_material(
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::default(),
         );
-        let new_img_h = images.add(bevy_img);
-        if let Some(old_img_h) = surface_ui.font_atlas_image.replace(new_img_h.clone()) {
-            images.remove(&old_img_h);
-        }
+        let img_h = if let Some(ref existing_h) = surface_ui.font_atlas_image {
+            if let Some(existing_img) = images.get_mut(existing_h) {
+                *existing_img = bevy_img;
+                existing_h.clone()
+            } else {
+                let h = images.add(bevy_img);
+                surface_ui.font_atlas_image = Some(h.clone());
+                h
+            }
+        } else {
+            let h = images.add(bevy_img);
+            surface_ui.font_atlas_image = Some(h.clone());
+            h
+        };
 
         if let Some(ref mat_h) = surface_ui.font_atlas_material {
             if let Some(mat) = materials.get_mut(mat_h) {
-                mat.base_color_texture = Some(new_img_h);
+                mat.base_color_texture = Some(img_h);
             }
         } else {
             let mat_h = materials.add(StandardMaterial {
                 base_color: Color::WHITE,
-                base_color_texture: Some(new_img_h),
+                base_color_texture: Some(img_h),
                 unlit: true,
                 alpha_mode: AlphaMode::Blend,
                 depth_bias: 12.0,
@@ -1934,7 +2020,10 @@ pub fn sync_and_interact_surface_ui_system(
         }
     }
 
-    // 3. Synchronize 3D Bevy meshes for all active panels and despawn stale ones
+    // 3. Pre-warm all panel glyphs into the egui font atlas, synchronize 3D Bevy meshes for all
+    //    active panels, and upload the updated font atlas texture so newly added characters are
+    //    never missing from 3D object labels.
+    prewarm_panel_glyphs_in_font_atlas(ctx, &panels);
     let mat_handle =
         sync_egui_font_atlas_material(ctx, &mut surface_ui, &mut images, &mut materials);
     let hovered_pair = surface_ui.hovered_widget;
@@ -1972,6 +2061,8 @@ pub fn sync_and_interact_surface_ui_system(
             );
         }
     }
+    // Re-sync in case tessellation itself touched the font atlas
+    let _ = sync_egui_font_atlas_material(ctx, &mut surface_ui, &mut images, &mut materials);
 
     let stale_ids: Vec<u64> = surface_ui
         .panel_gpu_cache
@@ -2234,5 +2325,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_object_label_font_atlas_sync_never_drops_characters() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_ctx| {});
+
+        let mut surface_ui = SurfaceUiState::default();
+        let mut images = Assets::<Image>::default();
+        let mut materials = Assets::<StandardMaterial>::default();
+        let poly = [[-15.0, -15.0], [15.0, -15.0], [15.0, 15.0], [-15.0, 15.0]];
+        let world_frame = SurfaceFrame3d::build_plate_at(Vec2::new(0.0, -25.0));
+
+        // Frame 1: Initial object label with a minimal character set
+        let panel1 = build_object_plate_label_panel(
+            &ctx,
+            1,
+            "A".to_string(),
+            &poly,
+            [0.0, 0.0],
+            false,
+            ToolMode::Select,
+        );
+        prewarm_panel_glyphs_in_font_atlas(&ctx, std::slice::from_ref(&panel1));
+        let _ = sync_egui_font_atlas_material(&ctx, &mut surface_ui, &mut images, &mut materials);
+        let _mesh1 = tessellate_surface_panel_to_bevy_mesh(&ctx, &panel1, &world_frame, None);
+        let sig1 = surface_ui.font_atlas_signature;
+
+        // Frame 2: Add an object label with many new characters (which rasterize into the existing
+        // font atlas row without resizing the atlas)
+        let label_str = "Manifold_M_Cube_FullSlope_#2".to_string();
+        let panel2 = build_object_plate_label_panel(
+            &ctx,
+            2,
+            label_str.clone(),
+            &poly,
+            [0.0, 0.0],
+            true,
+            ToolMode::MoveOnBed,
+        );
+        prewarm_panel_glyphs_in_font_atlas(&ctx, std::slice::from_ref(&panel2));
+        let _ = sync_egui_font_atlas_material(&ctx, &mut surface_ui, &mut images, &mut materials);
+        let mesh2 = tessellate_surface_panel_to_bevy_mesh(&ctx, &panel2, &world_frame, None);
+        let sig2 = surface_ui.font_atlas_signature;
+
+        assert_ne!(
+            sig1, sig2,
+            "Font atlas signature must update whenever new label characters are rasterized"
+        );
+
+        let img_h = surface_ui.font_atlas_image.as_ref().unwrap();
+        let bevy_img = images.get(img_h).unwrap();
+        let w = bevy_img.width() as usize;
+        let h = bevy_img.height() as usize;
+
+        // Verify that every single textured triangle (glyphs and anti-aliased discs outside the
+        // (0, 0) solid-color white pixel) in the tessellated 3D label mesh maps to non-empty
+        // (non-zero alpha) texels in the synced Bevy Image, and sits above the background layer.
+        let Some(bevy::render::mesh::VertexAttributeValues::Float32x3(positions)) =
+            mesh2.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("Missing POSITION attribute on tessellated 3D label mesh");
+        };
+        let Some(bevy::render::mesh::VertexAttributeValues::Float32x2(uvs)) =
+            mesh2.attribute(Mesh::ATTRIBUTE_UV_0)
+        else {
+            panic!("Missing UV_0 attribute on tessellated 3D label mesh");
+        };
+        let Some(Indices::U32(indices)) = mesh2.indices() else {
+            panic!("Missing U32 indices on tessellated 3D label mesh");
+        };
+
+        let bg_z = positions[0][2];
+        let mut textured_tri_count = 0usize;
+        let mut elevated_glyph_tri_count = 0usize;
+        for tri in indices.chunks_exact(3) {
+            let mut min_u = 1.0_f32;
+            let mut max_u = 0.0_f32;
+            let mut min_v = 1.0_f32;
+            let mut max_v = 0.0_f32;
+            let mut tri_z = 0.0_f32;
+            for &vi in tri {
+                let [u, v] = uvs[vi as usize];
+                min_u = min_u.min(u);
+                max_u = max_u.max(u);
+                min_v = min_v.min(v);
+                max_v = max_v.max(v);
+                tri_z = positions[vi as usize][2];
+            }
+            if (max_u - min_u) > 1.0e-4 && (max_v - min_v) > 1.0e-4 && max_u > (2.0 / w as f32) {
+                textured_tri_count += 1;
+                if tri_z > bg_z + 1.0e-3 {
+                    elevated_glyph_tri_count += 1;
+                }
+                let x0 = ((min_u * w as f32).floor() as usize).min(w - 1);
+                let x1 = ((max_u * w as f32).ceil() as usize).min(w);
+                let y0 = ((min_v * h as f32).floor() as usize).min(h - 1);
+                let y1 = ((max_v * h as f32).ceil() as usize).min(h);
+                let mut max_alpha = 0u8;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let a = bevy_img.data[(y * w + x) * 4 + 3];
+                        max_alpha = max_alpha.max(a);
+                    }
+                }
+                assert!(
+                    max_alpha > 0,
+                    "Textured triangle #{textured_tri_count} at UV [{min_u:.4}..{max_u:.4}, {min_v:.4}..{max_v:.4}] had zero alpha in synced Bevy texture!"
+                );
+            }
+        }
+
+        let expected_visible_chars = label_str.chars().filter(|c| !c.is_whitespace()).count();
+        assert!(
+            elevated_glyph_tri_count >= expected_visible_chars * 2,
+            "Expected at least {} elevated glyph triangles above background z={bg_z:.4}, got {elevated_glyph_tri_count}",
+            expected_visible_chars * 2
+        );
     }
 }
