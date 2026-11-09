@@ -1,10 +1,10 @@
 class Manifold < Formula
   desc "Multi-axis, non-planar additive manufacturing slicer powered by OpenVDB and OpenCASCADE"
-  homepage "https://github.com/manifold-slicer/manifold2"
-  url "https://github.com/manifold-slicer/manifold2/archive/refs/tags/v0.1.0.tar.gz"
+  homepage "https://github.com/andrewmcgr/manifold"
+  url "https://github.com/andrewmcgr/manifold/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
-  head "https://github.com/manifold-slicer/manifold2.git", branch: "main"
+  head "https://github.com/andrewmcgr/manifold.git", branch: "main"
 
   depends_on "cmake" => :build
   depends_on "pkg-config" => :build
