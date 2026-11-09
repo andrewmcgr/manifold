@@ -6,11 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Append standard Unix and macOS Homebrew/system search paths
+# Append standard Unix, Linuxbrew, and macOS Homebrew/system search paths
 list(APPEND CMAKE_PREFIX_PATH
     "/usr/local"
     "/usr"
     "/opt/homebrew"
+    "/home/linuxbrew/.linuxbrew"
     "/opt/local"
 )
 
@@ -22,7 +23,10 @@ message(STATUS "Found OpenCASCADE ${OpenCASCADE_VERSION} at ${OpenCASCADE_INCLUD
 list(APPEND CMAKE_MODULE_PATH
     "/usr/local/lib/cmake/OpenVDB"
     "/usr/lib/cmake/OpenVDB"
+    "/usr/lib/x86_64-linux-gnu/cmake/OpenVDB"
+    "/usr/lib/aarch64-linux-gnu/cmake/OpenVDB"
     "/opt/homebrew/lib/cmake/OpenVDB"
+    "/home/linuxbrew/.linuxbrew/lib/cmake/OpenVDB"
 )
 find_package(OpenVDB REQUIRED)
 find_package(TBB REQUIRED)

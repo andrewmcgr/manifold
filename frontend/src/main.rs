@@ -94,7 +94,13 @@ fn main() {
         .init_resource::<FieldVisualizationState>()
         .init_resource::<calibration::CalibrationUiState>()
         .init_resource::<surface_ui::SurfaceUiState>()
-        .add_systems(Startup, setup_viewport_scene_and_pipeline)
+        .add_systems(
+            Startup,
+            (
+                setup_viewport_scene_and_pipeline,
+                set_window_icon_startup_system,
+            ),
+        )
         .add_systems(
             Update,
             (
@@ -120,6 +126,18 @@ fn configure_egui_symbol_fonts(ctx: &egui::Context) {
         (
             "arial_unicode",
             "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ),
+        (
+            "dejavu_sans",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ),
+        (
+            "noto_symbols2",
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        ),
+        (
+            "noto_math",
+            "/usr/share/fonts/opentype/noto/NotoSansMath-Regular.ttf",
         ),
     ];
 
@@ -245,5 +263,103 @@ fn setup_viewport_scene_and_pipeline(
         });
 
         plate.render_pipeline = Some(pipeline);
+    }
+}
+
+const EMBEDDED_APP_ICON_PNG: &[u8] = include_bytes!("../assets/app_icon.png");
+
+/// Decodes the embedded 256×256 RGBA application icon PNG.
+pub fn decode_embedded_app_icon_rgba() -> Option<(u32, u32, Vec<u8>)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(EMBEDDED_APP_ICON_PNG));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let bytes = &buf[..info.buffer_size()];
+
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => bytes.to_vec(),
+        png::ColorType::Rgb => {
+            let mut out = Vec::with_capacity((info.width * info.height * 4) as usize);
+            for chunk in bytes.chunks_exact(3) {
+                out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+            out
+        }
+        _ => return None,
+    };
+    Some((info.width, info.height, rgba))
+}
+
+fn set_window_icon_startup_system(_winit_windows: NonSend<bevy::winit::WinitWindows>) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::{c_char, c_void};
+        #[link(name = "objc")]
+        extern "C" {
+            fn objc_getClass(name: *const c_char) -> *mut c_void;
+            fn sel_registerName(name: *const c_char) -> *mut c_void;
+            fn objc_msgSend();
+        }
+        unsafe {
+            let msg_id_sel: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                std::mem::transmute(objc_msgSend as *const ());
+            let msg_data: unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *const u8,
+                usize,
+            ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+            let msg_id_arg: unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+            ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+            let msg_set_icon: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+                std::mem::transmute(objc_msgSend as *const ());
+
+            let ns_data_cls = objc_getClass(c"NSData".as_ptr());
+            let ns_image_cls = objc_getClass(c"NSImage".as_ptr());
+            let ns_app_cls = objc_getClass(c"NSApplication".as_ptr());
+            if !ns_data_cls.is_null() && !ns_image_cls.is_null() && !ns_app_cls.is_null() {
+                let data_sel = sel_registerName(c"dataWithBytes:length:".as_ptr());
+                let alloc_sel = sel_registerName(c"alloc".as_ptr());
+                let init_data_sel = sel_registerName(c"initWithData:".as_ptr());
+                let shared_app_sel = sel_registerName(c"sharedApplication".as_ptr());
+                let set_icon_sel = sel_registerName(c"setApplicationIconImage:".as_ptr());
+
+                let ns_data = msg_data(
+                    ns_data_cls,
+                    data_sel,
+                    EMBEDDED_APP_ICON_PNG.as_ptr(),
+                    EMBEDDED_APP_ICON_PNG.len(),
+                );
+                if !ns_data.is_null() {
+                    let img_alloc = msg_id_sel(ns_image_cls, alloc_sel);
+                    let ns_image = msg_id_arg(img_alloc, init_data_sel, ns_data);
+                    let ns_app = msg_id_sel(ns_app_cls, shared_app_sel);
+                    if !ns_image.is_null() && !ns_app.is_null() {
+                        msg_set_icon(ns_app, set_icon_sel, ns_image);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_embedded_app_icon_decodes_cleanly() {
+        let (w, h, rgba) =
+            decode_embedded_app_icon_rgba().expect("Embedded app_icon.png should decode");
+        assert_eq!(w, 256);
+        assert_eq!(h, 256);
+        assert_eq!(rgba.len(), (256 * 256 * 4) as usize);
+        // Verify outer corner (0, 0) is transparent and center (128, 128) is opaque
+        assert_eq!(rgba[3], 0);
+        assert_eq!(rgba[(128 * 256 + 128) * 4 + 3], 255);
     }
 }
