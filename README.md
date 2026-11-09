@@ -41,30 +41,93 @@ Unlike conventional 2.5D planar slicers that intersect triangle meshes with flat
 
 ---
 
+## Installation
+
+### macOS (Homebrew or `.app` Bundle)
+
+Install via **Homebrew** (builds `manifold` / `manifold-frontend` and bundles `Manifold.app`):
+```bash
+brew install --HEAD https://raw.githubusercontent.com/andrewmcgr/manifold/main/Formula/manifold.rb
+# Optionally link Manifold.app into /Applications:
+ln -sf "$(brew --prefix manifold)/Manifold.app" /Applications/Manifold.app
+```
+
+Or download `Manifold-macos-arm64.zip` from the latest GitHub Release / Actions artifact, unzip it, and drag **`Manifold.app`** to `/Applications`.
+
+### Linux (Linuxbrew or Portable Release Archive)
+
+Install via **Linuxbrew / Homebrew on Linux**:
+```bash
+brew install --HEAD https://raw.githubusercontent.com/andrewmcgr/manifold/main/Formula/manifold.rb
+```
+
+Or install from the **`Manifold-linux-x86_64.tar.gz`** release archive (on Ubuntu/Debian, ensure runtime libraries are installed first):
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  libocct-data-exchange-dev libocct-foundation-dev \
+  libocct-modeling-algorithms-dev libocct-modeling-data-dev \
+  libopenvdb-dev libtbb-dev libimath-dev libvulkan1 libwayland-client0 libxkbcommon0
+
+tar -xzf Manifold-linux-x86_64.tar.gz
+sudo cp -r manifold-linux/* /usr/local/
+```
+
+### Windows (Scoop or Portable `.zip` Bundle)
+
+Install via **[Scoop](https://scoop.sh/)** (creates `manifold` and `manifold-frontend` CLI shims plus a **Manifold Slicer** Start Menu shortcut, with all required OpenCASCADE/OpenVDB/TBB DLLs bundled):
+```powershell
+scoop install https://raw.githubusercontent.com/andrewmcgr/manifold/main/scoop/manifold.json
+```
+
+Or download `Manifold-windows-x86_64.zip` from the latest GitHub Release / Actions artifact, extract it to any folder, and run `manifold-frontend.exe`.
+
+---
+
 ## Building from Source
 
 ### Prerequisites
 - **Rust** (stable toolchain, 2021 edition)
 - **C++20 compiler** (`clang++` or `g++`) and **CMake** ($\ge 3.20$)
-- **OpenCASCADE Technology (OCCT)** ($\ge 7.7$)
+- **OpenCASCADE Technology (OCCT)** ($\ge 7.6$)
 - **OpenVDB** ($\ge 10.0$) and **Intel TBB** (`onetbb`)
 
 On **macOS (Homebrew)**:
 ```bash
-brew install opencascade openvdb tbb cmake
+brew install opencascade openvdb tbb cmake pkg-config
 ```
 
 On **Ubuntu / Debian**:
 ```bash
-sudo apt-get install libocct-data-exchange-dev libocct-foundation-dev \
+sudo apt-get install build-essential cmake pkg-config \
+  libocct-data-exchange-dev libocct-foundation-dev \
   libocct-modeling-algorithms-dev libocct-modeling-data-dev \
-  libopenvdb-dev libtbb-dev cmake build-essential
+  libopenvdb-dev libtbb-dev libimath-dev \
+  libasound2-dev libudev-dev libx11-dev libxcursor-dev libxi-dev \
+  libxrandr-dev libwayland-dev libxkbcommon-dev libvulkan-dev \
+  libfontconfig1-dev libgtk-3-dev
 ```
 
-### Compile & Run
+On **Windows (MSYS2 UCRT64)**:
+```bash
+pacman -S --needed \
+  mingw-w64-ucrt-x86_64-toolchain \
+  mingw-w64-ucrt-x86_64-cmake \
+  mingw-w64-ucrt-x86_64-pkgconf \
+  mingw-w64-ucrt-x86_64-opencascade \
+  mingw-w64-ucrt-x86_64-openvdb \
+  mingw-w64-ucrt-x86_64-tbb \
+  mingw-w64-ucrt-x86_64-imath
+```
+
+### Compile, Run & Package
 ```bash
 # Build and launch the interactive 3D GUI in release mode
 cargo run --release --package manifold-frontend
+
+# Build platform packages:
+./scripts/bundle_macos.sh --release       # macOS: target/release/bundle/osx/Manifold.app
+./scripts/package_linux.sh --release      # Linux: target/release/package/manifold-linux.tar.gz
+pwsh ./scripts/package_windows.ps1        # Windows: target/release/package/manifold-windows-x86_64.zip
 ```
 
 ---
