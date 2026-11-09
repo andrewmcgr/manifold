@@ -20,7 +20,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -149,12 +149,13 @@ jobs:
         shell: msys2 {0}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up MSYS2 UCRT64 with OpenCASCADE, OpenVDB, TBB, and GCC
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
+          path-type: inherit
           update: true
           install: >-
             mingw-w64-ucrt-x86_64-toolchain
@@ -186,6 +187,7 @@ jobs:
         env:
           MANIFOLD_DISABLE_GPU: "1"
         run: |
+          export PATH="$HOME/.cargo/bin:/c/Users/runneradmin/.cargo/bin:$PATH"
           cargo test --manifest-path frontend/Cargo.toml
 
       - name: Build and package Windows Scoop bundle
