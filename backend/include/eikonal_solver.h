@@ -111,6 +111,10 @@ struct ActiveVolumeDomain {
 
     /// 4 diagonal hyperplane schedules (L = +-i +- j + k) for lock-free TBB 8-octant fast sweeping.
     std::array<WavefrontSchedule, 4> octantWavefronts;
+    /// Flattened 32-bit CSR octant wavefront tables cached for zero-copy GPU (`wgpu`) dispatch.
+    std::vector<std::uint32_t> gpuWfIndices;
+    std::vector<std::uint32_t> gpuWfLevelOffsets;
+    std::array<std::uint32_t, 5> gpuWfOctantBounds{0u, 0u, 0u, 0u, 0u};
     /// Z-slice Red-Black schedule for parallel upward clearance cone enforcement.
     WavefrontSchedule zParityWavefront;
 

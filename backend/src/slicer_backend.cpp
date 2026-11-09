@@ -4848,22 +4848,6 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         localMainEikAcc,
                         localMainEikSampler);
 
-                    // Stage-1 3D Nozzle Clearance Check at the voxel's own minimum print time
-                    bool nearClearanceBoundary = false;
-                    const bool selfCollides = hasNozzleClearanceCollision(
-                        xSurf,
-                        nSdf,
-                        skinDepthMm,
-                        surfTau + skinDepthMm,
-                        localSdfAcc,
-                        localSdfSampler,
-                        localFineSdfSampler,
-                        localFineEikAcc,
-                        localFineEikSampler,
-                        localMainEikAcc,
-                        localMainEikSampler,
-                        &nearClearanceBoundary);
-
                     const openvdb::Coord cBranch =
                         branchGrid.transform().worldToIndexCellCentered(wpTauSample);
                     int vBranch = localBAcc.getValue(cBranch);
@@ -4884,10 +4868,10 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     sv.surfNormal = nSdf;
                     sv.tau = surfTau;
                     sv.requestedLayers = requestedLayers;
-                    sv.weight = selfCollides ? 0.0f : (nearClearanceBoundary ? 0.55f : 1.0f);
+                    sv.weight = 1.0f;
                     sv.isManual = isManual;
                     sv.branchId = std::max(0, vBranch);
-                    sv.patchId = selfCollides ? -2 : -1;
+                    sv.patchId = -1;
                     candidateSlots[idx] = sv;
                     candidateValid[idx] = 1;
                 }
@@ -4905,6 +4889,300 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             const auto svIdx = static_cast<std::int32_t>(surfVoxels.size());
             surfIdxAcc.setValue(candidateSlots[idx].ijk, svIdx);
             surfVoxels.push_back(candidateSlots[idx]);
+        }
+
+        // Lazy GPU dense `(sdf, tau)` narrow-band volume cache + batch clearance dispatcher
+        bool denseGpuGridReady = false;
+        bool denseGpuGridFailed = false;
+        int denseNx = 0;
+        int denseNy = 0;
+        int denseNz = 0;
+        float denseOriginX = solidBBoxMinX;
+        float denseOriginY = solidBBoxMinY;
+        float denseOriginZ = solidBBoxMinZ;
+        float invDenseStep = 1.0f / std::max(fineVoxelSize, 1.0e-3f);
+        std::vector<float> denseSdfTau;
+        std::vector<std::int32_t> gpuClearanceIntParams;
+        std::vector<float> gpuClearanceFloatParams;
+        std::vector<float> gpuProfileXzFlat;
+
+        auto ensureDenseGpuGrid = [&]() -> bool {
+            if (denseGpuGridReady) {
+                return true;
+            }
+            if (denseGpuGridFailed || !gpu_is_available()) {
+                denseGpuGridFailed = true;
+                return false;
+            }
+            float stepMm = fineVoxelSize;
+            const float spanX = std::max(voxelSize, solidBBoxMaxX - solidBBoxMinX);
+            const float spanY = std::max(voxelSize, solidBBoxMaxY - solidBBoxMinY);
+            const float spanZ = std::max(voxelSize, solidBBoxMaxZ - solidBBoxMinZ);
+            const double estFineCells =
+                (static_cast<double>(spanX) / stepMm + 2.0) *
+                (static_cast<double>(spanY) / stepMm + 2.0) *
+                (static_cast<double>(spanZ) / stepMm + 2.0);
+            if (estFineCells > 4.5e6) {
+                stepMm = voxelSize;
+            }
+            invDenseStep = 1.0f / std::max(stepMm, 1.0e-3f);
+            denseNx = std::max(2, static_cast<int>(std::ceil(spanX * invDenseStep)) + 2);
+            denseNy = std::max(2, static_cast<int>(std::ceil(spanY * invDenseStep)) + 2);
+            denseNz = std::max(2, static_cast<int>(std::ceil(spanZ * invDenseStep)) + 2);
+            const std::size_t totalCells =
+                static_cast<std::size_t>(denseNx) *
+                static_cast<std::size_t>(denseNy) *
+                static_cast<std::size_t>(denseNz);
+            if (totalCells > 8'000'000u) {
+                denseGpuGridFailed = true;
+                return false;
+            }
+
+            denseSdfTau.assign(totalCells * 2u, 0.0f);
+            const std::size_t strideY = static_cast<std::size_t>(denseNx);
+            const std::size_t strideZ = strideY * static_cast<std::size_t>(denseNy);
+
+            tbb::parallel_for(
+                tbb::blocked_range<int>(0, denseNz, 4),
+                [&](const tbb::blocked_range<int>& rz) {
+                    auto localSdfAcc = sdfGrid.getConstAccessor();
+                    openvdb::tools::GridSampler<
+                        openvdb::FloatGrid::ConstAccessor,
+                        openvdb::tools::BoxSampler>
+                        localSdfSampler(localSdfAcc, sdfGrid.transform());
+                    auto localFineSdfAcc = fineSdfGrid.getConstAccessor();
+                    openvdb::tools::GridSampler<
+                        openvdb::FloatGrid::ConstAccessor,
+                        openvdb::tools::BoxSampler>
+                        localFineSdfSampler(localFineSdfAcc, fineSdfGrid.transform());
+                    auto localFineEikAcc = fineEikGrid.getConstAccessor();
+                    openvdb::tools::GridSampler<
+                        openvdb::FloatGrid::ConstAccessor,
+                        openvdb::tools::BoxSampler>
+                        localFineEikSampler(localFineEikAcc, fineEikGrid.transform());
+                    auto localMainEikAcc = eikGrid.getConstAccessor();
+                    openvdb::tools::GridSampler<
+                        openvdb::FloatGrid::ConstAccessor,
+                        openvdb::tools::BoxSampler>
+                        localMainEikSampler(localMainEikAcc, eikGrid.transform());
+
+                    for (int iz = rz.begin(); iz != rz.end(); ++iz) {
+                        const float wz = denseOriginZ + static_cast<float>(iz) * stepMm;
+                        for (int iy = 0; iy < denseNy; ++iy) {
+                            const float wy = denseOriginY + static_cast<float>(iy) * stepMm;
+                            for (int ix = 0; ix < denseNx; ++ix) {
+                                const float wx = denseOriginX + static_cast<float>(ix) * stepMm;
+                                const std::size_t cIdx =
+                                    static_cast<std::size_t>(iz) * strideZ +
+                                    static_cast<std::size_t>(iy) * strideY +
+                                    static_cast<std::size_t>(ix);
+                                const openvdb::Vec3d wp(wx, wy, wz);
+                                const float sVal = sampleAnySdfWith(
+                                    wp, localSdfAcc, localSdfSampler, localFineSdfSampler);
+                                float tVal = -1.0f;
+                                if (sVal <= 0.65f * voxelSize) {
+                                    tVal = sampleTauAtWith(
+                                        wp,
+                                        localFineEikAcc,
+                                        localFineEikSampler,
+                                        localMainEikAcc,
+                                        localMainEikSampler);
+                                }
+                                denseSdfTau[cIdx * 2u + 0u] = sVal;
+                                denseSdfTau[cIdx * 2u + 1u] = tVal;
+                            }
+                        }
+                    }
+                });
+
+            const NozzleBasis refNb = queryNozzleFrame(
+                {rec.minX, rec.minY, rec.minZ},
+                {1.0f, 0.0f, 0.0f});
+            const int cMode = (activeToolPtr != nullptr)
+                ? static_cast<int>(activeToolPtr->clearance_mode)
+                : 0;
+            float coneTipR = tipRadiusMm;
+            float coneSlope = 0.65f;
+            float rectHx = tipRadiusMm;
+            float rectHy = tipRadiusMm;
+            float rectSlopeX = 0.65f;
+            float rectSlopeY = 0.65f;
+            float profEndSlope = 0.0f;
+            gpuProfileXzFlat.clear();
+            if (activeToolPtr != nullptr) {
+                const auto& tool = *activeToolPtr;
+                coneTipR = tool.cone_tip_radius_mm;
+                coneSlope = std::tan(
+                    std::clamp(tool.cone_half_angle_deg, 1.0f, 85.0f) * kDegToRad);
+                rectHx = tool.rect_tip_half_width_x_mm;
+                rectHy = tool.rect_tip_half_width_y_mm;
+                rectSlopeX = std::tan(
+                    std::clamp(tool.rect_half_angle_x_deg, 1.0f, 85.0f) * kDegToRad);
+                rectSlopeY = std::tan(
+                    std::clamp(tool.rect_half_angle_y_deg, 1.0f, 85.0f) * kDegToRad);
+                const auto& prof = tool.clearance_profile_xz;
+                for (const auto& pt : prof) {
+                    gpuProfileXzFlat.push_back(pt.x_radius_mm);
+                    gpuProfileXzFlat.push_back(pt.z_height_mm);
+                }
+                if (prof.size() >= 2) {
+                    const float dz =
+                        prof.back().z_height_mm - prof[prof.size() - 2].z_height_mm;
+                    const float dr =
+                        prof.back().x_radius_mm - prof[prof.size() - 2].x_radius_mm;
+                    profEndSlope = (dz > 1.0e-4f) ? std::max(0.0f, dr / dz) : 0.0f;
+                }
+            }
+            const float radialStep =
+                std::max({0.75f * fineVoxelSize, 0.50f * voxelSize, 0.45f});
+
+            gpuClearanceIntParams = {
+                cMode,
+                brickNx,
+                brickNy,
+                brickNz,
+                denseNx,
+                denseNy,
+                denseNz,
+                1};
+            gpuClearanceFloatParams = {
+                refNb.nozzle_axis[0], refNb.nozzle_axis[1], refNb.nozzle_axis[2], 0.0f,
+                refNb.travel_axis[0], refNb.travel_axis[1], refNb.travel_axis[2], 0.0f,
+                refNb.lateral_axis[0], refNb.lateral_axis[1], refNb.lateral_axis[2], 0.0f,
+                solidBBoxMinX, solidBBoxMinY, solidBBoxMinZ, 0.0f,
+                solidBBoxMaxX, solidBBoxMaxY, solidBBoxMaxZ, 0.0f,
+                brickOriginX, brickOriginY, brickOriginZ, invBrickSize,
+                denseOriginX, denseOriginY, denseOriginZ, invDenseStep,
+                tipRadiusMm, wallHalfWidthMm, fineVoxelSize, hTop,
+                maxToolClearanceHeightMm, maxPlausibleTau, voxelSize, radialStep,
+                coneTipR, coneSlope, rectHx, rectHy,
+                rectSlopeX, rectSlopeY, profEndSlope, 0.0f};
+            denseGpuGridReady = true;
+            return true;
+        };
+
+        auto evaluateBatchNozzleClearance = [&](
+            const std::vector<int>& voxelIndices,
+            float overrideSkinDepthMm,
+            float overridePrintTau,
+            std::vector<std::uint32_t>& outFlags) {
+            const std::size_t count = voxelIndices.size();
+            outFlags.assign(count, 0u);
+            if (count == 0) {
+                return;
+            }
+            if (count >= 128 && ensureDenseGpuGrid()) {
+                std::vector<float> candPosDepth(count * 4u);
+                std::vector<float> candNormTau(count * 4u);
+                for (std::size_t k = 0; k < count; ++k) {
+                    const auto& sv = surfVoxels[static_cast<std::size_t>(voxelIndices[k])];
+                    const float depthMm = (overrideSkinDepthMm > 0.0f)
+                        ? overrideSkinDepthMm
+                        : (static_cast<float>(sv.requestedLayers) * hTop);
+                    const float pTau = (overridePrintTau > 0.0f)
+                        ? overridePrintTau
+                        : (sv.tau + depthMm);
+                    candPosDepth[k * 4u + 0u] = sv.surfPos.x();
+                    candPosDepth[k * 4u + 1u] = sv.surfPos.y();
+                    candPosDepth[k * 4u + 2u] = sv.surfPos.z();
+                    candPosDepth[k * 4u + 3u] = depthMm;
+                    candNormTau[k * 4u + 0u] = sv.surfNormal.x();
+                    candNormTau[k * 4u + 1u] = sv.surfNormal.y();
+                    candNormTau[k * 4u + 2u] = sv.surfNormal.z();
+                    candNormTau[k * 4u + 3u] = pTau;
+                }
+                const rust::Slice<const float> posSlice(candPosDepth.data(), candPosDepth.size());
+                const rust::Slice<const float> normSlice(candNormTau.data(), candNormTau.size());
+                const rust::Slice<const float> brickSlice(brickMinTau.data(), brickMinTau.size());
+                const rust::Slice<const float> denseSlice(denseSdfTau.data(), denseSdfTau.size());
+                const rust::Slice<const std::int32_t> intSlice(
+                    gpuClearanceIntParams.data(), gpuClearanceIntParams.size());
+                const rust::Slice<const float> floatSlice(
+                    gpuClearanceFloatParams.data(), gpuClearanceFloatParams.size());
+                const rust::Slice<const float> profSlice(
+                    gpuProfileXzFlat.data(), gpuProfileXzFlat.size());
+                rust::Slice<std::uint32_t> flagsSlice(outFlags.data(), outFlags.size());
+                if (gpu_sweep_tool_clearance(
+                        posSlice,
+                        normSlice,
+                        brickSlice,
+                        denseSlice,
+                        intSlice,
+                        floatSlice,
+                        profSlice,
+                        flagsSlice)) {
+                    return;
+                }
+            }
+
+            // Multi-threaded TBB CPU fallback
+            tbb::parallel_for(
+                tbb::blocked_range<std::size_t>(0, count, 64),
+                [&](const tbb::blocked_range<std::size_t>& r) {
+                    auto localSdfAcc = sdfGrid.getConstAccessor();
+                    openvdb::tools::GridSampler<
+                        openvdb::FloatGrid::ConstAccessor,
+                        openvdb::tools::BoxSampler>
+                        localSdfSampler(localSdfAcc, sdfGrid.transform());
+                    auto localFineSdfAcc = fineSdfGrid.getConstAccessor();
+                    openvdb::tools::GridSampler<
+                        openvdb::FloatGrid::ConstAccessor,
+                        openvdb::tools::BoxSampler>
+                        localFineSdfSampler(localFineSdfAcc, fineSdfGrid.transform());
+                    auto localFineEikAcc = fineEikGrid.getConstAccessor();
+                    openvdb::tools::GridSampler<
+                        openvdb::FloatGrid::ConstAccessor,
+                        openvdb::tools::BoxSampler>
+                        localFineEikSampler(localFineEikAcc, fineEikGrid.transform());
+                    auto localMainEikAcc = eikGrid.getConstAccessor();
+                    openvdb::tools::GridSampler<
+                        openvdb::FloatGrid::ConstAccessor,
+                        openvdb::tools::BoxSampler>
+                        localMainEikSampler(localMainEikAcc, eikGrid.transform());
+
+                    for (std::size_t k = r.begin(); k != r.end(); ++k) {
+                        const auto& sv = surfVoxels[static_cast<std::size_t>(voxelIndices[k])];
+                        const float depthMm = (overrideSkinDepthMm > 0.0f)
+                            ? overrideSkinDepthMm
+                            : (static_cast<float>(sv.requestedLayers) * hTop);
+                        const float pTau = (overridePrintTau > 0.0f)
+                            ? overridePrintTau
+                            : (sv.tau + depthMm);
+                        bool nearMargin = false;
+                        if (hasNozzleClearanceCollision(
+                                sv.surfPos,
+                                sv.surfNormal,
+                                depthMm,
+                                pTau,
+                                localSdfAcc,
+                                localSdfSampler,
+                                localFineSdfSampler,
+                                localFineEikAcc,
+                                localFineEikSampler,
+                                localMainEikAcc,
+                                localMainEikSampler,
+                                &nearMargin)) {
+                            outFlags[k] = 1u;
+                        } else if (nearMargin) {
+                            outFlags[k] = 2u;
+                        }
+                    }
+                });
+        };
+
+        if (!surfVoxels.empty()) {
+            std::vector<int> allSurfIndices(surfVoxels.size());
+            std::iota(allSurfIndices.begin(), allSurfIndices.end(), 0);
+            std::vector<std::uint32_t> stage1Flags;
+            evaluateBatchNozzleClearance(allSurfIndices, -1.0f, -1.0f, stage1Flags);
+            for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
+                if ((stage1Flags[k] & 1u) != 0u) {
+                    surfVoxels[k].patchId = -2;
+                    surfVoxels[k].weight = 0.0f;
+                } else if ((stage1Flags[k] & 2u) != 0u) {
+                    surfVoxels[k].weight = 0.55f;
+                }
+            }
         }
 
         // Connected-component clustering of conformal skin surface voxels into causal patches,
@@ -5007,56 +5285,12 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     tauMin = patchTaus.front();
                     tauCompletion = patchTaus.back();
 
-                    std::vector<std::uint8_t> prunedFlags(surviving.size(), 0);
-                    std::vector<std::uint8_t> marginFlags(surviving.size(), 0);
-
-                    tbb::parallel_for(
-                        tbb::blocked_range<std::size_t>(0, surviving.size(), 64),
-                        [&](const tbb::blocked_range<std::size_t>& r) {
-                            auto localSdfAcc = sdfGrid.getConstAccessor();
-                            openvdb::tools::GridSampler<
-                                openvdb::FloatGrid::ConstAccessor,
-                                openvdb::tools::BoxSampler>
-                                localSdfSampler(localSdfAcc, sdfGrid.transform());
-                            auto localFineSdfAcc = fineSdfGrid.getConstAccessor();
-                            openvdb::tools::GridSampler<
-                                openvdb::FloatGrid::ConstAccessor,
-                                openvdb::tools::BoxSampler>
-                                localFineSdfSampler(localFineSdfAcc, fineSdfGrid.transform());
-                            auto localFineEikAcc = fineEikGrid.getConstAccessor();
-                            openvdb::tools::GridSampler<
-                                openvdb::FloatGrid::ConstAccessor,
-                                openvdb::tools::BoxSampler>
-                                localFineEikSampler(localFineEikAcc, fineEikGrid.transform());
-                            auto localMainEikAcc = eikGrid.getConstAccessor();
-                            openvdb::tools::GridSampler<
-                                openvdb::FloatGrid::ConstAccessor,
-                                openvdb::tools::BoxSampler>
-                                localMainEikSampler(localMainEikAcc, eikGrid.transform());
-
-                            for (std::size_t k = r.begin(); k != r.end(); ++k) {
-                                const auto& sv =
-                                    surfVoxels[static_cast<std::size_t>(surviving[k])];
-                                bool nearMargin = false;
-                                if (hasNozzleClearanceCollision(
-                                        sv.surfPos,
-                                        sv.surfNormal,
-                                        patchSkinThicknessMm,
-                                        tauCompletion,
-                                        localSdfAcc,
-                                        localSdfSampler,
-                                        localFineSdfSampler,
-                                        localFineEikAcc,
-                                        localFineEikSampler,
-                                        localMainEikAcc,
-                                        localMainEikSampler,
-                                        &nearMargin)) {
-                                    prunedFlags[k] = 1;
-                                } else if (nearMargin) {
-                                    marginFlags[k] = 1;
-                                }
-                            }
-                        });
+                    std::vector<std::uint32_t> stage2Flags;
+                    evaluateBatchNozzleClearance(
+                        surviving,
+                        patchSkinThicknessMm,
+                        tauCompletion,
+                        stage2Flags);
 
                     std::vector<int> nextSurviving;
                     nextSurviving.reserve(surviving.size());
@@ -5064,12 +5298,12 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     for (std::size_t k = 0; k < surviving.size(); ++k) {
                         const int idx = surviving[k];
                         auto& sv = surfVoxels[static_cast<std::size_t>(idx)];
-                        if (prunedFlags[k]) {
+                        if ((stage2Flags[k] & 1u) != 0u) {
                             sv.patchId = -2;
                             sv.weight = 0.0f;
                             anyPruned = true;
                         } else {
-                            if (marginFlags[k]) {
+                            if ((stage2Flags[k] & 2u) != 0u) {
                                 sv.weight = std::min(sv.weight, 0.55f);
                             }
                             nextSurviving.push_back(idx);
@@ -6372,36 +6606,6 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     //     and Schedule Causally at Each Patch's Completion Isovalue \tau_completion
     // ------------------------------------------------------------------------
     if (!conformalSkinPatches.empty()) {
-        auto fineSdfAcc = fineSdfGrid.getConstAccessor();
-        openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
-            fineSdfSampler(fineSdfAcc, fineSdfGrid.transform());
-        auto skinErodeAcc = skinErodeDepthGrid.getConstAccessor();
-        openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
-            skinErodeSampler(skinErodeAcc, skinErodeDepthGrid.transform());
-        auto skinPatchIdAcc = skinPatchIdGrid.getConstAccessor();
-        auto skinPatchNormAcc = skinPatchNormalGrid.getConstAccessor();
-        openvdb::tools::GridSampler<openvdb::Vec3SGrid::ConstAccessor, openvdb::tools::BoxSampler>
-            skinPatchNormSampler(skinPatchNormAcc, skinPatchNormalGrid.transform());
-
-        auto sampleFineSdfGradUnit = [&](const openvdb::Vec3d& wp, openvdb::Vec3f& outNormal) -> bool {
-            const double h = 0.5 * static_cast<double>(fineVoxelSize);
-            const float gx =
-                fineSdfSampler.wsSample(wp + openvdb::Vec3d(h, 0.0, 0.0)) -
-                fineSdfSampler.wsSample(wp - openvdb::Vec3d(h, 0.0, 0.0));
-            const float gy =
-                fineSdfSampler.wsSample(wp + openvdb::Vec3d(0.0, h, 0.0)) -
-                fineSdfSampler.wsSample(wp - openvdb::Vec3d(0.0, h, 0.0));
-            const float gz =
-                fineSdfSampler.wsSample(wp + openvdb::Vec3d(0.0, 0.0, h)) -
-                fineSdfSampler.wsSample(wp - openvdb::Vec3d(0.0, 0.0, h));
-            const float len = std::sqrt(gx * gx + gy * gy + gz * gz);
-            if (len < 1.0e-5f) {
-                return false;
-            }
-            outNormal = openvdb::Vec3f(gx / len, gy / len, gz / len);
-            return true;
-        };
-
         auto lerpSkinVertex = [](const RenderVertex& a, const RenderVertex& b, float t) -> RenderVertex {
             RenderVertex rv{};
             rv.x = a.x + t * (b.x - a.x);
@@ -6421,16 +6625,23 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             return rv;
         };
 
-        std::vector<SelectedLayerInfo> conformalSkinLayers;
-        for (const auto& patch : conformalSkinPatches) {
-            // Collect fineSdfGrid leaf nodes in the neighborhood of this patch
-            using SdfTreeType = openvdb::FloatGrid::TreeType;
-            using SdfLeafType = SdfTreeType::LeafNodeType;
-            constexpr int kLeafDim = static_cast<int>(SdfLeafType::DIM);
+        using SdfTreeType = openvdb::FloatGrid::TreeType;
+        using SdfLeafType = SdfTreeType::LeafNodeType;
+        constexpr int kLeafDim = static_cast<int>(SdfLeafType::DIM);
 
-            openvdb::FloatGrid patchSdfGrid(fineSdfGrid.background());
-            patchSdfGrid.setTransform(fineSdfGrid.transform().copy());
-            auto& patchTree = patchSdfGrid.tree();
+        std::vector<openvdb::FloatGrid::Ptr> patchSdfGrids(conformalSkinPatches.size());
+        struct SkinLayerExtractionJob {
+            std::size_t patchIdx;
+            int m;
+        };
+        std::vector<SkinLayerExtractionJob> skinJobs;
+
+        for (std::size_t pIdx = 0; pIdx < conformalSkinPatches.size(); ++pIdx) {
+            const auto& patch = conformalSkinPatches[pIdx];
+            openvdb::FloatGrid::Ptr patchSdfGrid =
+                openvdb::FloatGrid::create(fineSdfGrid.background());
+            patchSdfGrid->setTransform(fineSdfGrid.transform().copy());
+            auto& patchTree = patchSdfGrid->tree();
             openvdb::Int32Grid addedLeafGrid(0);
             auto addedLeafAcc = addedLeafGrid.getAccessor();
 
@@ -6463,244 +6674,309 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             if (patchTree.leafCount() == 0) {
                 continue;
             }
-
+            patchSdfGrids[pIdx] = patchSdfGrid;
             for (int m = 1; m <= patch.skinLayers; ++m) {
-                // Target SDF level set from innermost (m = 1) to outermost (m = N_p):
-                // \phi_m = -(N_p - m + 0.15) * hTop
-                const float targetDepthMm =
-                    (static_cast<float>(patch.skinLayers - m) + 0.15f) * hTop;
-                const float phiTarget = -targetDepthMm;
-                const float requiredErodeMm =
-                    (static_cast<float>(patch.skinLayers - m) + 0.25f) * hTop;
+                skinJobs.push_back(SkinLayerExtractionJob{pIdx, m});
+            }
+        }
 
-                std::vector<openvdb::Vec3s> points;
-                std::vector<openvdb::Vec3I> triangles;
-                std::vector<openvdb::Vec4I> quads;
-                openvdb::tools::volumeToMesh(
-                    patchSdfGrid,
-                    points,
-                    triangles,
-                    quads,
-                    static_cast<double>(phiTarget),
-                    0.0,
-                    true);
+        std::vector<SelectedLayerInfo> skinJobResults(skinJobs.size());
+        std::vector<std::uint8_t> skinJobValid(skinJobs.size(), 0);
 
-                if (points.empty() || (triangles.empty() && quads.empty())) {
-                    continue;
-                }
+        tbb::parallel_for(
+            tbb::blocked_range<std::size_t>(0, skinJobs.size()),
+            [&](const tbb::blocked_range<std::size_t>& r) {
+                auto fineSdfAcc = fineSdfGrid.getConstAccessor();
+                openvdb::tools::GridSampler<
+                    openvdb::FloatGrid::ConstAccessor,
+                    openvdb::tools::BoxSampler>
+                    fineSdfSampler(fineSdfAcc, fineSdfGrid.transform());
+                auto skinErodeAcc = skinErodeDepthGrid.getConstAccessor();
+                openvdb::tools::GridSampler<
+                    openvdb::FloatGrid::ConstAccessor,
+                    openvdb::tools::BoxSampler>
+                    skinErodeSampler(skinErodeAcc, skinErodeDepthGrid.transform());
+                auto skinPatchIdAcc = skinPatchIdGrid.getConstAccessor();
+                auto skinPatchNormAcc = skinPatchNormalGrid.getConstAccessor();
+                openvdb::tools::GridSampler<
+                    openvdb::Vec3SGrid::ConstAccessor,
+                    openvdb::tools::BoxSampler>
+                    skinPatchNormSampler(skinPatchNormAcc, skinPatchNormalGrid.transform());
 
-                std::vector<RenderVertex> verts(points.size());
-                std::vector<float> clipDist(points.size(), 1.0f);
-                for (std::size_t i = 0; i < points.size(); ++i) {
-                    openvdb::Vec3d wp(points[i].x(), points[i].y(), points[i].z());
-                    openvdb::Vec3f nSdf = patch.meanNormal;
-                    sampleFineSdfGradUnit(wp, nSdf);
+                auto sampleFineSdfGradUnit = [&](
+                    const openvdb::Vec3d& wp,
+                    openvdb::Vec3f& outNormal) -> bool {
+                    const double h = 0.5 * static_cast<double>(fineVoxelSize);
+                    const float gx =
+                        fineSdfSampler.wsSample(wp + openvdb::Vec3d(h, 0.0, 0.0)) -
+                        fineSdfSampler.wsSample(wp - openvdb::Vec3d(h, 0.0, 0.0));
+                    const float gy =
+                        fineSdfSampler.wsSample(wp + openvdb::Vec3d(0.0, h, 0.0)) -
+                        fineSdfSampler.wsSample(wp - openvdb::Vec3d(0.0, h, 0.0));
+                    const float gz =
+                        fineSdfSampler.wsSample(wp + openvdb::Vec3d(0.0, 0.0, h)) -
+                        fineSdfSampler.wsSample(wp - openvdb::Vec3d(0.0, 0.0, h));
+                    const float len = std::sqrt(gx * gx + gy * gy + gz * gz);
+                    if (len < 1.0e-5f) {
+                        return false;
+                    }
+                    outNormal = openvdb::Vec3f(gx / len, gy / len, gz / len);
+                    return true;
+                };
 
-                    // 1 Newton projection step onto exact \phi_sdf(x) = phiTarget
-                    const float curSdf = fineSdfSampler.wsSample(wp);
-                    const float err = curSdf - phiTarget;
-                    const float step = std::clamp(err, -0.35f * fineVoxelSize, 0.35f * fineVoxelSize);
-                    wp -= openvdb::Vec3d(step * nSdf.x(), step * nSdf.y(), step * nSdf.z());
-                    sampleFineSdfGradUnit(wp, nSdf);
+                for (std::size_t jIdx = r.begin(); jIdx != r.end(); ++jIdx) {
+                    const auto& job = skinJobs[jIdx];
+                    const auto& patch = conformalSkinPatches[job.patchIdx];
+                    const int m = job.m;
+                    const auto& patchSdfGrid = *patchSdfGrids[job.patchIdx];
 
-                    verts[i].x = static_cast<float>(wp.x());
-                    verts[i].y = static_cast<float>(wp.y());
-                    verts[i].z = static_cast<float>(wp.z());
-                    verts[i].nx = nSdf.x();
-                    verts[i].ny = nSdf.y();
-                    verts[i].nz = nSdf.z();
+                    // Target SDF level set from innermost (m = 1) to outermost (m = N_p):
+                    // \phi_m = -(N_p - m + 0.15) * hTop
+                    const float targetDepthMm =
+                        (static_cast<float>(patch.skinLayers - m) + 0.15f) * hTop;
+                    const float phiTarget = -targetDepthMm;
+                    const float requiredErodeMm =
+                        (static_cast<float>(patch.skinLayers - m) + 0.25f) * hTop;
 
-                    // Check patch membership and normal alignment with the generating surface
-                    const openvdb::Coord cFine =
-                        fineSdfGrid.transform().worldToIndexCellCentered(wp);
-                    int pId = skinPatchIdAcc.getValue(cFine);
-                    if (pId != patch.patchId) {
-                        for (int dz = -1; dz <= 1 && pId != patch.patchId; ++dz) {
-                            for (int dy = -1; dy <= 1 && pId != patch.patchId; ++dy) {
-                                for (int dx = -1; dx <= 1 && pId != patch.patchId; ++dx) {
-                                    const int nbP = skinPatchIdAcc.getValue(
-                                        cFine + openvdb::Coord(dx, dy, dz));
-                                    if (nbP == patch.patchId) {
-                                        pId = nbP;
+                    std::vector<openvdb::Vec3s> points;
+                    std::vector<openvdb::Vec3I> triangles;
+                    std::vector<openvdb::Vec4I> quads;
+                    openvdb::tools::volumeToMesh(
+                        patchSdfGrid,
+                        points,
+                        triangles,
+                        quads,
+                        static_cast<double>(phiTarget),
+                        0.0,
+                        true);
+
+                    if (points.empty() || (triangles.empty() && quads.empty())) {
+                        continue;
+                    }
+
+                    std::vector<RenderVertex> verts(points.size());
+                    std::vector<float> clipDist(points.size(), 1.0f);
+                    for (std::size_t i = 0; i < points.size(); ++i) {
+                        openvdb::Vec3d wp(points[i].x(), points[i].y(), points[i].z());
+                        openvdb::Vec3f nSdf = patch.meanNormal;
+                        sampleFineSdfGradUnit(wp, nSdf);
+
+                        // 1 Newton projection step onto exact \phi_sdf(x) = phiTarget
+                        const float curSdf = fineSdfSampler.wsSample(wp);
+                        const float err = curSdf - phiTarget;
+                        const float step =
+                            std::clamp(err, -0.35f * fineVoxelSize, 0.35f * fineVoxelSize);
+                        wp -= openvdb::Vec3d(
+                            step * nSdf.x(), step * nSdf.y(), step * nSdf.z());
+                        sampleFineSdfGradUnit(wp, nSdf);
+
+                        verts[i].x = static_cast<float>(wp.x());
+                        verts[i].y = static_cast<float>(wp.y());
+                        verts[i].z = static_cast<float>(wp.z());
+                        verts[i].nx = nSdf.x();
+                        verts[i].ny = nSdf.y();
+                        verts[i].nz = nSdf.z();
+
+                        // Check patch membership and normal alignment with the generating surface
+                        const openvdb::Coord cFine =
+                            fineSdfGrid.transform().worldToIndexCellCentered(wp);
+                        int pId = skinPatchIdAcc.getValue(cFine);
+                        if (pId != patch.patchId) {
+                            for (int dz = -1; dz <= 1 && pId != patch.patchId; ++dz) {
+                                for (int dy = -1; dy <= 1 && pId != patch.patchId; ++dy) {
+                                    for (int dx = -1; dx <= 1 && pId != patch.patchId; ++dx) {
+                                        const int nbP = skinPatchIdAcc.getValue(
+                                            cFine + openvdb::Coord(dx, dy, dz));
+                                        if (nbP == patch.patchId) {
+                                            pId = nbP;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    if (pId == patch.patchId) {
-                        const openvdb::Vec3s pNormS = skinPatchNormSampler.wsSample(wp);
-                        openvdb::Vec3f pNorm(pNormS.x(), pNormS.y(), pNormS.z());
-                        const float pNormLen = pNorm.length();
-                        if (pNormLen > 1.0e-4f) {
-                            pNorm /= pNormLen;
+                        if (pId == patch.patchId) {
+                            const openvdb::Vec3s pNormS = skinPatchNormSampler.wsSample(wp);
+                            openvdb::Vec3f pNorm(pNormS.x(), pNormS.y(), pNormS.z());
+                            const float pNormLen = pNorm.length();
+                            if (pNormLen > 1.0e-4f) {
+                                pNorm /= pNormLen;
+                            } else {
+                                pNorm = patch.meanNormal;
+                            }
+                            const float alignFactor =
+                                std::clamp((nSdf.dot(pNorm) - 0.50f) / 0.25f, 0.0f, 1.0f);
+                            const float effErode = skinErodeSampler.wsSample(wp) * alignFactor;
+                            clipDist[i] = requiredErodeMm - effErode;
                         } else {
-                            pNorm = patch.meanNormal;
+                            clipDist[i] = requiredErodeMm;
                         }
-                        const float alignFactor =
-                            std::clamp((nSdf.dot(pNorm) - 0.50f) / 0.25f, 0.0f, 1.0f);
-                        const float effErode = skinErodeSampler.wsSample(wp) * alignFactor;
-                        clipDist[i] = requiredErodeMm - effErode;
-                    } else {
-                        clipDist[i] = requiredErodeMm;
+                    }
+
+                    std::vector<std::uint32_t> inds;
+                    inds.reserve(triangles.size() * 3 + quads.size() * 6);
+                    auto pushOrientedTri = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+                        const openvdb::Vec3f pa(verts[a].x, verts[a].y, verts[a].z);
+                        const openvdb::Vec3f pb(verts[b].x, verts[b].y, verts[b].z);
+                        const openvdb::Vec3f pc(verts[c].x, verts[c].y, verts[c].z);
+                        const openvdb::Vec3f triN = (pb - pa).cross(pc - pa);
+                        const openvdb::Vec3f avgN(
+                            verts[a].nx + verts[b].nx + verts[c].nx,
+                            verts[a].ny + verts[b].ny + verts[c].ny,
+                            verts[a].nz + verts[b].nz + verts[c].nz);
+                        if (triN.dot(avgN) >= 0.0f) {
+                            inds.push_back(a);
+                            inds.push_back(b);
+                            inds.push_back(c);
+                        } else {
+                            inds.push_back(a);
+                            inds.push_back(c);
+                            inds.push_back(b);
+                        }
+                    };
+                    for (const auto& tri : triangles) {
+                        pushOrientedTri(tri[0], tri[2], tri[1]);
+                    }
+                    for (const auto& q : quads) {
+                        pushOrientedTri(q[0], q[2], q[1]);
+                        pushOrientedTri(q[0], q[3], q[2]);
+                    }
+
+                    SelectedLayerInfo skinInfo{};
+                    skinInfo.branch_id = patch.branchId;
+                    skinInfo.parent_branch_id = patch.parentBranchId;
+                    skinInfo.branch_layer_index = static_cast<std::uint32_t>(m - 1);
+                    skinInfo.branch_layer_count = static_cast<std::uint32_t>(patch.skinLayers);
+                    skinInfo.isovalue =
+                        patch.tauCompletion + static_cast<float>(m) * 1.0e-3f;
+                    skinInfo.mean_thickness_mm = hTop;
+                    skinInfo.min_thickness_mm = hTop;
+                    skinInfo.max_thickness_mm = hTop;
+                    skinInfo.is_first_layer = false;
+                    skinInfo.is_top_layer = true;
+
+                    std::vector<std::int32_t> vertexRemap(verts.size(), -1);
+                    std::unordered_map<std::uint64_t, std::uint32_t> edgeCutRemap;
+                    auto emitSkinVertex = [&](std::uint32_t oldIdx) -> std::uint32_t {
+                        if (vertexRemap[oldIdx] >= 0) {
+                            return static_cast<std::uint32_t>(vertexRemap[oldIdx]);
+                        }
+                        const auto newIdx = static_cast<std::uint32_t>(skinInfo.vertices.size());
+                        skinInfo.vertices.push_back(verts[oldIdx]);
+                        vertexRemap[oldIdx] = static_cast<std::int32_t>(newIdx);
+                        return newIdx;
+                    };
+                    auto emitSkinCutVertex =
+                        [&](std::uint32_t u, std::uint32_t v, float dU, float dV) -> std::uint32_t {
+                        const std::uint32_t lo = std::min(u, v);
+                        const std::uint32_t hi = std::max(u, v);
+                        const std::uint64_t key =
+                            (static_cast<std::uint64_t>(lo) << 32) | static_cast<std::uint64_t>(hi);
+                        const auto it = edgeCutRemap.find(key);
+                        if (it != edgeCutRemap.end()) {
+                            return it->second;
+                        }
+                        const float dLo = (u == lo) ? dU : dV;
+                        const float dHi = (u == lo) ? dV : dU;
+                        const float denom = dHi - dLo;
+                        const float t = (std::abs(denom) > 1.0e-8f)
+                            ? std::clamp(-dLo / denom, 0.0f, 1.0f)
+                            : 0.5f;
+                        RenderVertex cv = lerpSkinVertex(verts[lo], verts[hi], t);
+                        // Ensure cut rim vertex stays strictly inside \phi_sdf <= 0
+                        const openvdb::Vec3d wpC(cv.x, cv.y, cv.z);
+                        const float cSdf = fineSdfSampler.wsSample(wpC);
+                        if (cSdf > -0.02f * hTop) {
+                            const float pushIn = cSdf + 0.05f * hTop;
+                            cv.x -= pushIn * cv.nx;
+                            cv.y -= pushIn * cv.ny;
+                            cv.z -= pushIn * cv.nz;
+                        }
+                        const auto newIdx = static_cast<std::uint32_t>(skinInfo.vertices.size());
+                        skinInfo.vertices.push_back(cv);
+                        edgeCutRemap.emplace(key, newIdx);
+                        return newIdx;
+                    };
+
+                    for (std::size_t t = 0; t + 2 < inds.size(); t += 3) {
+                        const std::uint32_t i0 = inds[t + 0];
+                        const std::uint32_t i1 = inds[t + 1];
+                        const std::uint32_t i2 = inds[t + 2];
+
+                        const float d0 = clipDist[i0];
+                        const float d1 = clipDist[i1];
+                        const float d2 = clipDist[i2];
+
+                        const bool in0 = (d0 <= 0.0f);
+                        const bool in1 = (d1 <= 0.0f);
+                        const bool in2 = (d2 <= 0.0f);
+                        if (!in0 && !in1 && !in2) {
+                            continue;
+                        }
+
+                        if (in0 && in1 && in2) {
+                            const std::uint32_t n0 = emitSkinVertex(i0);
+                            const std::uint32_t n1 = emitSkinVertex(i1);
+                            const std::uint32_t n2 = emitSkinVertex(i2);
+                            skinInfo.indices.push_back(n0);
+                            skinInfo.indices.push_back(n1);
+                            skinInfo.indices.push_back(n2);
+                            continue;
+                        }
+
+                        std::uint32_t idxA = i0, idxB = i1, idxC = i2;
+                        float dA = d0, dB = d1, dC = d2;
+                        bool soloInside = in0;
+                        if (in0 == in1) {
+                            idxA = i2; idxB = i0; idxC = i1;
+                            dA = d2;   dB = d0;   dC = d1;
+                            soloInside = in2;
+                        } else if (in0 == in2) {
+                            idxA = i1; idxB = i2; idxC = i0;
+                            dA = d1;   dB = d2;   dC = d0;
+                            soloInside = in1;
+                        }
+
+                        const std::uint32_t vAB = emitSkinCutVertex(idxA, idxB, dA, dB);
+                        const std::uint32_t vAC = emitSkinCutVertex(idxA, idxC, dA, dC);
+                        const auto& p0 = skinInfo.vertices[vAB];
+                        const auto& p1 = skinInfo.vertices[vAC];
+                        skinInfo.contour_segments.push_back(p0.x);
+                        skinInfo.contour_segments.push_back(p0.y);
+                        skinInfo.contour_segments.push_back(p0.z);
+                        skinInfo.contour_segments.push_back(p1.x);
+                        skinInfo.contour_segments.push_back(p1.y);
+                        skinInfo.contour_segments.push_back(p1.z);
+
+                        if (soloInside) {
+                            const std::uint32_t nA = emitSkinVertex(idxA);
+                            skinInfo.indices.push_back(nA);
+                            skinInfo.indices.push_back(vAB);
+                            skinInfo.indices.push_back(vAC);
+                        } else {
+                            const std::uint32_t nB = emitSkinVertex(idxB);
+                            const std::uint32_t nC = emitSkinVertex(idxC);
+                            skinInfo.indices.push_back(vAB);
+                            skinInfo.indices.push_back(nB);
+                            skinInfo.indices.push_back(nC);
+                            skinInfo.indices.push_back(vAB);
+                            skinInfo.indices.push_back(nC);
+                            skinInfo.indices.push_back(vAC);
+                        }
+                    }
+
+                    if (!skinInfo.vertices.empty() && skinInfo.indices.size() >= 3) {
+                        skinJobResults[jIdx] = std::move(skinInfo);
+                        skinJobValid[jIdx] = 1;
                     }
                 }
+            });
 
-                std::vector<std::uint32_t> inds;
-                inds.reserve(triangles.size() * 3 + quads.size() * 6);
-                auto pushOrientedTri = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
-                    const openvdb::Vec3f pa(verts[a].x, verts[a].y, verts[a].z);
-                    const openvdb::Vec3f pb(verts[b].x, verts[b].y, verts[b].z);
-                    const openvdb::Vec3f pc(verts[c].x, verts[c].y, verts[c].z);
-                    const openvdb::Vec3f triN = (pb - pa).cross(pc - pa);
-                    const openvdb::Vec3f avgN(
-                        verts[a].nx + verts[b].nx + verts[c].nx,
-                        verts[a].ny + verts[b].ny + verts[c].ny,
-                        verts[a].nz + verts[b].nz + verts[c].nz);
-                    if (triN.dot(avgN) >= 0.0f) {
-                        inds.push_back(a);
-                        inds.push_back(b);
-                        inds.push_back(c);
-                    } else {
-                        inds.push_back(a);
-                        inds.push_back(c);
-                        inds.push_back(b);
-                    }
-                };
-                for (const auto& tri : triangles) {
-                    pushOrientedTri(tri[0], tri[2], tri[1]);
-                }
-                for (const auto& q : quads) {
-                    pushOrientedTri(q[0], q[2], q[1]);
-                    pushOrientedTri(q[0], q[3], q[2]);
-                }
-
-                SelectedLayerInfo skinInfo{};
-                skinInfo.branch_id = patch.branchId;
-                skinInfo.parent_branch_id = patch.parentBranchId;
-                skinInfo.branch_layer_index = static_cast<std::uint32_t>(m - 1);
-                skinInfo.branch_layer_count = static_cast<std::uint32_t>(patch.skinLayers);
-                skinInfo.isovalue =
-                    patch.tauCompletion + static_cast<float>(m) * 1.0e-3f;
-                skinInfo.mean_thickness_mm = hTop;
-                skinInfo.min_thickness_mm = hTop;
-                skinInfo.max_thickness_mm = hTop;
-                skinInfo.is_first_layer = false;
-                skinInfo.is_top_layer = true;
-
-                std::vector<std::int32_t> vertexRemap(verts.size(), -1);
-                std::unordered_map<std::uint64_t, std::uint32_t> edgeCutRemap;
-                auto emitSkinVertex = [&](std::uint32_t oldIdx) -> std::uint32_t {
-                    if (vertexRemap[oldIdx] >= 0) {
-                        return static_cast<std::uint32_t>(vertexRemap[oldIdx]);
-                    }
-                    const auto newIdx = static_cast<std::uint32_t>(skinInfo.vertices.size());
-                    skinInfo.vertices.push_back(verts[oldIdx]);
-                    vertexRemap[oldIdx] = static_cast<std::int32_t>(newIdx);
-                    return newIdx;
-                };
-                auto emitSkinCutVertex =
-                    [&](std::uint32_t u, std::uint32_t v, float dU, float dV) -> std::uint32_t {
-                    const std::uint32_t lo = std::min(u, v);
-                    const std::uint32_t hi = std::max(u, v);
-                    const std::uint64_t key =
-                        (static_cast<std::uint64_t>(lo) << 32) | static_cast<std::uint64_t>(hi);
-                    const auto it = edgeCutRemap.find(key);
-                    if (it != edgeCutRemap.end()) {
-                        return it->second;
-                    }
-                    const float dLo = (u == lo) ? dU : dV;
-                    const float dHi = (u == lo) ? dV : dU;
-                    const float denom = dHi - dLo;
-                    const float t = (std::abs(denom) > 1.0e-8f)
-                        ? std::clamp(-dLo / denom, 0.0f, 1.0f)
-                        : 0.5f;
-                    RenderVertex cv = lerpSkinVertex(verts[lo], verts[hi], t);
-                    // Ensure cut rim vertex stays strictly inside \phi_sdf <= 0
-                    const openvdb::Vec3d wpC(cv.x, cv.y, cv.z);
-                    const float cSdf = fineSdfSampler.wsSample(wpC);
-                    if (cSdf > -0.02f * hTop) {
-                        const float pushIn = cSdf + 0.05f * hTop;
-                        cv.x -= pushIn * cv.nx;
-                        cv.y -= pushIn * cv.ny;
-                        cv.z -= pushIn * cv.nz;
-                    }
-                    const auto newIdx = static_cast<std::uint32_t>(skinInfo.vertices.size());
-                    skinInfo.vertices.push_back(cv);
-                    edgeCutRemap.emplace(key, newIdx);
-                    return newIdx;
-                };
-
-                for (std::size_t t = 0; t + 2 < inds.size(); t += 3) {
-                    const std::uint32_t i0 = inds[t + 0];
-                    const std::uint32_t i1 = inds[t + 1];
-                    const std::uint32_t i2 = inds[t + 2];
-
-                    const float d0 = clipDist[i0];
-                    const float d1 = clipDist[i1];
-                    const float d2 = clipDist[i2];
-
-                    const bool in0 = (d0 <= 0.0f);
-                    const bool in1 = (d1 <= 0.0f);
-                    const bool in2 = (d2 <= 0.0f);
-                    if (!in0 && !in1 && !in2) {
-                        continue;
-                    }
-
-                    if (in0 && in1 && in2) {
-                        const std::uint32_t n0 = emitSkinVertex(i0);
-                        const std::uint32_t n1 = emitSkinVertex(i1);
-                        const std::uint32_t n2 = emitSkinVertex(i2);
-                        skinInfo.indices.push_back(n0);
-                        skinInfo.indices.push_back(n1);
-                        skinInfo.indices.push_back(n2);
-                        continue;
-                    }
-
-                    std::uint32_t idxA = i0, idxB = i1, idxC = i2;
-                    float dA = d0, dB = d1, dC = d2;
-                    bool soloInside = in0;
-                    if (in0 == in1) {
-                        idxA = i2; idxB = i0; idxC = i1;
-                        dA = d2;   dB = d0;   dC = d1;
-                        soloInside = in2;
-                    } else if (in0 == in2) {
-                        idxA = i1; idxB = i2; idxC = i0;
-                        dA = d1;   dB = d2;   dC = d0;
-                        soloInside = in1;
-                    }
-
-                    const std::uint32_t vAB = emitSkinCutVertex(idxA, idxB, dA, dB);
-                    const std::uint32_t vAC = emitSkinCutVertex(idxA, idxC, dA, dC);
-                    const auto& p0 = skinInfo.vertices[vAB];
-                    const auto& p1 = skinInfo.vertices[vAC];
-                    skinInfo.contour_segments.push_back(p0.x);
-                    skinInfo.contour_segments.push_back(p0.y);
-                    skinInfo.contour_segments.push_back(p0.z);
-                    skinInfo.contour_segments.push_back(p1.x);
-                    skinInfo.contour_segments.push_back(p1.y);
-                    skinInfo.contour_segments.push_back(p1.z);
-
-                    if (soloInside) {
-                        const std::uint32_t nA = emitSkinVertex(idxA);
-                        skinInfo.indices.push_back(nA);
-                        skinInfo.indices.push_back(vAB);
-                        skinInfo.indices.push_back(vAC);
-                    } else {
-                        const std::uint32_t nB = emitSkinVertex(idxB);
-                        const std::uint32_t nC = emitSkinVertex(idxC);
-                        skinInfo.indices.push_back(vAB);
-                        skinInfo.indices.push_back(nB);
-                        skinInfo.indices.push_back(nC);
-                        skinInfo.indices.push_back(vAB);
-                        skinInfo.indices.push_back(nC);
-                        skinInfo.indices.push_back(vAC);
-                    }
-                }
-
-                if (!skinInfo.vertices.empty() && skinInfo.indices.size() >= 3) {
-                    conformalSkinLayers.push_back(std::move(skinInfo));
-                }
+        std::vector<SelectedLayerInfo> conformalSkinLayers;
+        conformalSkinLayers.reserve(skinJobs.size());
+        for (std::size_t jIdx = 0; jIdx < skinJobs.size(); ++jIdx) {
+            if (skinJobValid[jIdx]) {
+                conformalSkinLayers.push_back(std::move(skinJobResults[jIdx]));
             }
         }
 

@@ -1,3 +1,7 @@
+use crate::gpu_compute::{
+    gpu_evaluate_tpms_batch, gpu_is_available, gpu_smooth_and_clamp_tool_axes,
+    gpu_solve_eikonal_wavefronts, gpu_sweep_tool_clearance,
+};
 use bytemuck::{Pod, Zeroable};
 
 #[cxx::bridge(namespace = "manifold")]
@@ -504,6 +508,60 @@ pub mod ffi {
             object_id: u64,
             adaptivity: f32,
         ) -> ObjectToolpathsResult;
+    }
+
+    extern "Rust" {
+        /// Returns `true` if a hardware `wgpu` compute adapter and pre-compiled WGSL pipelines are active.
+        pub fn gpu_is_available() -> bool;
+
+        /// Executes 8-octant hyperplane wavefront Eikonal sweeps on the GPU (`wgpu` WGSL compute).
+        /// Returns `false` if no hardware GPU compute engine is available or if problem size is below threshold.
+        pub fn gpu_solve_eikonal_wavefronts(
+            neighbors6: &[i32],
+            voxel_flags: &[u32],
+            slowness: &[f32],
+            target_dir: &[f32],
+            wf_indices: &[u32],
+            wf_level_offsets: &[u32],
+            wf_octant_bounds: &[u32],
+            dx: f32,
+            num_sweep_rounds: u32,
+            use_directional_guidance: bool,
+            tau_io: &mut [f32],
+        ) -> bool;
+
+        /// Evaluates 3D tool-clearance collision cones (`PiecewiseXZ`, `ParametricCone`, `RectilinearCone`)
+        /// in the local `NozzleFrame` across candidate surface voxels on the GPU.
+        pub fn gpu_sweep_tool_clearance(
+            candidate_pos_depth: &[f32],
+            candidate_norm_tau: &[f32],
+            brick_min_tau: &[f32],
+            dense_sdf_tau: &[f32],
+            int_params: &[i32],
+            float_params: &[f32],
+            profile_xz_flat: &[f32],
+            out_flags: &mut [u32],
+        ) -> bool;
+
+        /// Evaluates 3D TPMS implicit functions (`Gyroid = 2`, `SchwarzD = 3`, `SchwarzP = 4`)
+        /// at a batch of 3D vertex positions (`positions_xyz`, length `3 * N`) on the GPU.
+        pub fn gpu_evaluate_tpms_batch(
+            positions_xyz: &[f32],
+            pattern_kind: u8,
+            wave_k: f32,
+            out_psi: &mut [f32],
+        ) -> bool;
+
+        /// Runs `num_passes` Jacobi Laplacian smoothing + spherical cone-clamping passes
+        /// over the 5/6-axis tool orientation field `axes_io` (`3 * N` floats) on the GPU.
+        pub fn gpu_smooth_and_clamp_tool_axes(
+            neighbors6: &[i32],
+            bed_normal_xyz: &[f32],
+            local_max_tilt_rad: &[f32],
+            num_passes: u32,
+            axes_io: &mut [f32],
+            out_tilt_deg: &mut [f32],
+        ) -> bool;
     }
 }
 

@@ -799,43 +799,20 @@ pub fn sync_field_visualization_system(
             let mut indices: Vec<u32> = Vec::new();
 
             if let Some(ref planned) = vis_state.cached_planned_gcode {
-                let total = planned.layers.len();
-                if total > 0 {
-                    let lo = min_idx.min(total - 1);
-                    let hi = max_idx.min(total - 1).max(lo);
-                    for (idx, layer_p) in planned.layers.iter().enumerate() {
-                        let is_hovered = highlighted == Some(idx);
-                        let in_range = idx >= lo && idx <= hi;
-                        let matches_stride =
-                            (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
-                        if !is_hovered && (!in_range || !matches_stride) {
-                            continue;
-                        }
-                        let dim_factor = if is_hovered {
-                            1.15
-                        } else if highlighted.is_some() {
-                            0.55
-                        } else {
-                            1.0
-                        };
-                        for seg in &layer_p.segments {
-                            if !vis_state.is_planned_segment_visible(seg) {
-                                continue;
-                            }
-                            append_planned_segment_bead_mesh(
-                                seg,
-                                planned,
-                                color_mode,
-                                &config,
-                                dim_factor,
-                                &mut positions,
-                                &mut normals,
-                                &mut colors,
-                                &mut indices,
-                            );
-                        }
-                    }
-                }
+                build_planned_toolpaths_bead_mesh_parallel(
+                    planned,
+                    &vis_state,
+                    &config,
+                    min_idx,
+                    max_idx,
+                    stride,
+                    highlighted,
+                    color_mode,
+                    &mut positions,
+                    &mut normals,
+                    &mut colors,
+                    &mut indices,
+                );
             }
 
             if !positions.is_empty() && !indices.is_empty() {
@@ -1154,6 +1131,25 @@ pub fn sync_field_visualization_system(
             let lo = min_idx.min(total.saturating_sub(1));
             let hi = max_idx.min(total.saturating_sub(1)).max(lo);
 
+            let mut total_verts = 0usize;
+            let mut total_inds = 0usize;
+            for (idx, layer) in res.layers.iter().enumerate() {
+                let is_hovered = highlighted == Some(idx);
+                let in_range = idx >= lo && idx <= hi;
+                let matches_stride = (idx.saturating_sub(lo) % stride == 0)
+                    || layer.is_first_layer
+                    || layer.is_top_layer;
+                if !is_hovered && (!in_range || !matches_stride) {
+                    continue;
+                }
+                total_verts += layer.vertices.len();
+                total_inds += layer.indices.len();
+            }
+            positions.reserve(total_verts);
+            normals.reserve(total_verts);
+            colors.reserve(total_verts);
+            indices.reserve(total_inds);
+
             for (idx, layer) in res.layers.iter().enumerate() {
                 let is_hovered = highlighted == Some(idx);
                 let in_range = idx >= lo && idx <= hi;
@@ -1342,107 +1338,35 @@ pub fn sync_field_visualization_system(
         let mut indices: Vec<u32> = Vec::new();
 
         if let Some(ref planned) = vis_state.cached_planned_gcode {
-            let total = planned.layers.len();
-            if total > 0 {
-                let lo = min_idx.min(total - 1);
-                let hi = max_idx.min(total - 1).max(lo);
-
-                let mut est_segs = 0usize;
-                for (idx, layer_p) in planned.layers.iter().enumerate() {
-                    let is_hovered = highlighted == Some(idx);
-                    let in_range = idx >= lo && idx <= hi;
-                    let matches_stride =
-                        (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
-                    if !is_hovered && (!in_range || !matches_stride) {
-                        continue;
-                    }
-                    for seg in &layer_p.segments {
-                        if vis_state.is_planned_segment_visible(seg) {
-                            est_segs += 1;
-                        }
-                    }
-                }
-                positions.reserve(est_segs * 8);
-                normals.reserve(est_segs * 8);
-                colors.reserve(est_segs * 8);
-                indices.reserve(est_segs * 36);
-
-                for (idx, layer_p) in planned.layers.iter().enumerate() {
-                    let is_hovered = highlighted == Some(idx);
-                    let in_range = idx >= lo && idx <= hi;
-                    let matches_stride =
-                        (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
-                    if !is_hovered && (!in_range || !matches_stride) {
-                        continue;
-                    }
-
-                    let dim_factor = if is_hovered {
-                        1.15
-                    } else if highlighted.is_some() {
-                        0.55
-                    } else {
-                        1.0
-                    };
-
-                    for seg in &layer_p.segments {
-                        if !vis_state.is_planned_segment_visible(seg) {
-                            continue;
-                        }
-                        append_planned_segment_bead_mesh(
-                            seg,
-                            planned,
-                            color_mode,
-                            &config,
-                            dim_factor,
-                            &mut positions,
-                            &mut normals,
-                            &mut colors,
-                            &mut indices,
-                        );
-                    }
-                }
-            }
+            build_planned_toolpaths_bead_mesh_parallel(
+                planned,
+                &vis_state,
+                &config,
+                min_idx,
+                max_idx,
+                stride,
+                highlighted,
+                color_mode,
+                &mut positions,
+                &mut normals,
+                &mut colors,
+                &mut indices,
+            );
         } else if let Some(ref tp_res) = vis_state.cached_toolpaths {
-            let total = tp_res.layers.len();
-            if total > 0 {
-                let lo = min_idx.min(total - 1);
-                let hi = max_idx.min(total - 1).max(lo);
-
-                for (idx, layer_tp) in tp_res.layers.iter().enumerate() {
-                    let is_hovered = highlighted == Some(idx);
-                    let in_range = idx >= lo && idx <= hi;
-                    let matches_stride =
-                        (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
-                    if !is_hovered && (!in_range || !matches_stride) {
-                        continue;
-                    }
-
-                    let dim_factor = if is_hovered {
-                        1.15
-                    } else if highlighted.is_some() {
-                        0.55
-                    } else {
-                        1.0
-                    };
-
-                    for path in &layer_tp.paths {
-                        let visible = vis_state.is_raw_path_visible(path.feature_kind);
-                        if !visible || path.points.len() < 2 {
-                            continue;
-                        }
-                        append_extrusion_path_bead_mesh(
-                            path,
-                            color_mode,
-                            &config,
-                            dim_factor,
-                            &mut positions,
-                            &mut normals,
-                            &mut colors,
-                            &mut indices,
-                        );
-                    }
-                }
-            }
+            build_raw_toolpaths_bead_mesh_parallel(
+                tp_res,
+                &vis_state,
+                &config,
+                min_idx,
+                max_idx,
+                stride,
+                highlighted,
+                color_mode,
+                &mut positions,
+                &mut normals,
+                &mut colors,
+                &mut indices,
+            );
         }
 
         if !positions.is_empty() && !indices.is_empty() {
@@ -1777,6 +1701,292 @@ impl FieldVisualizationState {
             8 => self.show_support_interface,
             _ => self.show_solid_infill,
         }
+    }
+}
+
+/// Builds 3D oriented bead prism geometry across visible layers of a `PlannedGcodeResult`
+/// in parallel across CPU worker threads using `std::thread::scope`.
+#[allow(clippy::too_many_arguments)]
+fn build_planned_toolpaths_bead_mesh_parallel(
+    planned: &crate::gcode::PlannedGcodeResult,
+    vis_state: &FieldVisualizationState,
+    config: &SlicerConfig,
+    min_idx: usize,
+    max_idx: usize,
+    stride: usize,
+    highlighted: Option<usize>,
+    color_mode: ToolpathColorMode,
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+) {
+    let total = planned.layers.len();
+    if total == 0 {
+        return;
+    }
+    let lo = min_idx.min(total - 1);
+    let hi = max_idx.min(total - 1).max(lo);
+
+    let mut visible_layers: Vec<(usize, f32, usize)> = Vec::new();
+    let mut total_est_segs = 0usize;
+    for (idx, layer_p) in planned.layers.iter().enumerate() {
+        let is_hovered = highlighted == Some(idx);
+        let in_range = idx >= lo && idx <= hi;
+        let matches_stride =
+            (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
+        if !is_hovered && (!in_range || !matches_stride) {
+            continue;
+        }
+        let dim_factor = if is_hovered {
+            1.15
+        } else if highlighted.is_some() {
+            0.55
+        } else {
+            1.0
+        };
+        let mut layer_segs = 0usize;
+        for seg in &layer_p.segments {
+            if vis_state.is_planned_segment_visible(seg) {
+                layer_segs += 1;
+            }
+        }
+        if layer_segs > 0 {
+            visible_layers.push((idx, dim_factor, layer_segs));
+            total_est_segs += layer_segs;
+        }
+    }
+
+    if visible_layers.is_empty() {
+        return;
+    }
+
+    positions.reserve(total_est_segs * 8);
+    normals.reserve(total_est_segs * 8);
+    colors.reserve(total_est_segs * 8);
+    indices.reserve(total_est_segs * 36);
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(visible_layers.len());
+
+    if num_threads <= 1 || total_est_segs < 256 {
+        for &(idx, dim_factor, _) in &visible_layers {
+            for seg in &planned.layers[idx].segments {
+                if !vis_state.is_planned_segment_visible(seg) {
+                    continue;
+                }
+                append_planned_segment_bead_mesh(
+                    seg,
+                    planned,
+                    color_mode,
+                    config,
+                    dim_factor,
+                    positions,
+                    normals,
+                    colors,
+                    indices,
+                );
+            }
+        }
+        return;
+    }
+
+    let chunk_size = visible_layers.len().div_ceil(num_threads);
+    let chunk_results: Vec<(
+        Vec<[f32; 3]>,
+        Vec<[f32; 3]>,
+        Vec<[f32; 4]>,
+        Vec<u32>,
+    )> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for chunk in visible_layers.chunks(chunk_size) {
+            handles.push(s.spawn(move || {
+                let est: usize = chunk.iter().map(|c| c.2).sum();
+                let mut c_pos = Vec::with_capacity(est * 8);
+                let mut c_nrm = Vec::with_capacity(est * 8);
+                let mut c_col = Vec::with_capacity(est * 8);
+                let mut c_ind = Vec::with_capacity(est * 36);
+                for &(idx, dim_factor, _) in chunk {
+                    for seg in &planned.layers[idx].segments {
+                        if !vis_state.is_planned_segment_visible(seg) {
+                            continue;
+                        }
+                        append_planned_segment_bead_mesh(
+                            seg,
+                            planned,
+                            color_mode,
+                            config,
+                            dim_factor,
+                            &mut c_pos,
+                            &mut c_nrm,
+                            &mut c_col,
+                            &mut c_ind,
+                        );
+                    }
+                }
+                (c_pos, c_nrm, c_col, c_ind)
+            }));
+        }
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .collect()
+    });
+
+    for (c_pos, c_nrm, c_col, c_ind) in chunk_results {
+        if c_pos.is_empty() {
+            continue;
+        }
+        let base_v = positions.len() as u32;
+        positions.extend(c_pos);
+        normals.extend(c_nrm);
+        colors.extend(c_col);
+        indices.extend(c_ind.into_iter().map(|i| i + base_v));
+    }
+}
+
+/// Builds 3D oriented bead tube geometry across visible layers of an `ObjectToolpathsResult`
+/// in parallel across CPU worker threads using `std::thread::scope`.
+#[allow(clippy::too_many_arguments)]
+fn build_raw_toolpaths_bead_mesh_parallel(
+    tp_res: &ObjectToolpathsResult,
+    vis_state: &FieldVisualizationState,
+    config: &SlicerConfig,
+    min_idx: usize,
+    max_idx: usize,
+    stride: usize,
+    highlighted: Option<usize>,
+    color_mode: ToolpathColorMode,
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+) {
+    let total = tp_res.layers.len();
+    if total == 0 {
+        return;
+    }
+    let lo = min_idx.min(total - 1);
+    let hi = max_idx.min(total - 1).max(lo);
+
+    let mut visible_layers: Vec<(usize, f32, usize)> = Vec::new();
+    let mut total_est_pts = 0usize;
+    for (idx, layer_tp) in tp_res.layers.iter().enumerate() {
+        let is_hovered = highlighted == Some(idx);
+        let in_range = idx >= lo && idx <= hi;
+        let matches_stride =
+            (idx.saturating_sub(lo) % stride == 0) || idx == 0 || idx + 1 == total;
+        if !is_hovered && (!in_range || !matches_stride) {
+            continue;
+        }
+        let dim_factor = if is_hovered {
+            1.15
+        } else if highlighted.is_some() {
+            0.55
+        } else {
+            1.0
+        };
+        let mut layer_pts = 0usize;
+        for path in &layer_tp.paths {
+            if vis_state.is_raw_path_visible(path.feature_kind) && path.points.len() >= 2 {
+                layer_pts += path.points.len();
+            }
+        }
+        if layer_pts > 0 {
+            visible_layers.push((idx, dim_factor, layer_pts));
+            total_est_pts += layer_pts;
+        }
+    }
+
+    if visible_layers.is_empty() {
+        return;
+    }
+
+    positions.reserve(total_est_pts * 4);
+    normals.reserve(total_est_pts * 4);
+    colors.reserve(total_est_pts * 4);
+    indices.reserve(total_est_pts * 24);
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(visible_layers.len());
+
+    if num_threads <= 1 || total_est_pts < 256 {
+        for &(idx, dim_factor, _) in &visible_layers {
+            for path in &tp_res.layers[idx].paths {
+                if !vis_state.is_raw_path_visible(path.feature_kind) || path.points.len() < 2 {
+                    continue;
+                }
+                append_extrusion_path_bead_mesh(
+                    path,
+                    color_mode,
+                    config,
+                    dim_factor,
+                    positions,
+                    normals,
+                    colors,
+                    indices,
+                );
+            }
+        }
+        return;
+    }
+
+    let chunk_size = visible_layers.len().div_ceil(num_threads);
+    let chunk_results: Vec<(
+        Vec<[f32; 3]>,
+        Vec<[f32; 3]>,
+        Vec<[f32; 4]>,
+        Vec<u32>,
+    )> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for chunk in visible_layers.chunks(chunk_size) {
+            handles.push(s.spawn(move || {
+                let est: usize = chunk.iter().map(|c| c.2).sum();
+                let mut c_pos = Vec::with_capacity(est * 4);
+                let mut c_nrm = Vec::with_capacity(est * 4);
+                let mut c_col = Vec::with_capacity(est * 4);
+                let mut c_ind = Vec::with_capacity(est * 24);
+                for &(idx, dim_factor, _) in chunk {
+                    for path in &tp_res.layers[idx].paths {
+                        if !vis_state.is_raw_path_visible(path.feature_kind)
+                            || path.points.len() < 2
+                        {
+                            continue;
+                        }
+                        append_extrusion_path_bead_mesh(
+                            path,
+                            color_mode,
+                            config,
+                            dim_factor,
+                            &mut c_pos,
+                            &mut c_nrm,
+                            &mut c_col,
+                            &mut c_ind,
+                        );
+                    }
+                }
+                (c_pos, c_nrm, c_col, c_ind)
+            }));
+        }
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .collect()
+    });
+
+    for (c_pos, c_nrm, c_col, c_ind) in chunk_results {
+        if c_pos.is_empty() {
+            continue;
+        }
+        let base_v = positions.len() as u32;
+        positions.extend(c_pos);
+        normals.extend(c_nrm);
+        colors.extend(c_col);
+        indices.extend(c_ind.into_iter().map(|i| i + base_v));
     }
 }
 

@@ -2467,22 +2467,40 @@ void generateSparseInfillForLayer(
             }
 
             std::vector<float> psiField(tpmsMesh.verts.size(), 0.0f);
-            for (std::size_t i = 0; i < tpmsMesh.verts.size(); ++i) {
-                const Vec3f& p = tpmsMesh.verts[i].pos;
-                const float kx = waveK * p.x;
-                const float ky = waveK * p.y;
-                const float kz = waveK * p.z;
-                if (sparsePattern == kSparsePatternGyroid) {
-                    psiField[i] = std::sin(kx) * std::cos(ky) +
-                        std::sin(ky) * std::cos(kz) +
-                        std::sin(kz) * std::cos(kx);
-                } else if (sparsePattern == kSparsePatternSchwarzD) {
-                    psiField[i] = std::sin(kx) * std::sin(ky) * std::sin(kz) +
-                        std::sin(kx) * std::cos(ky) * std::cos(kz) +
-                        std::cos(kx) * std::sin(ky) * std::cos(kz) +
-                        std::cos(kx) * std::cos(ky) * std::sin(kz);
-                } else {
-                    psiField[i] = std::cos(kx) + std::cos(ky) + std::cos(kz);
+            bool evaluatedOnGpu = false;
+            if (tpmsMesh.verts.size() >= 512 && gpu_is_available()) {
+                std::vector<float> posXyz(tpmsMesh.verts.size() * 3);
+                for (std::size_t i = 0; i < tpmsMesh.verts.size(); ++i) {
+                    posXyz[i * 3 + 0] = tpmsMesh.verts[i].pos.x;
+                    posXyz[i * 3 + 1] = tpmsMesh.verts[i].pos.y;
+                    posXyz[i * 3 + 2] = tpmsMesh.verts[i].pos.z;
+                }
+                const rust::Slice<const float> posSlice(posXyz.data(), posXyz.size());
+                rust::Slice<float> psiSlice(psiField.data(), psiField.size());
+                evaluatedOnGpu = gpu_evaluate_tpms_batch(
+                    posSlice,
+                    static_cast<std::uint8_t>(sparsePattern),
+                    waveK,
+                    psiSlice);
+            }
+            if (!evaluatedOnGpu) {
+                for (std::size_t i = 0; i < tpmsMesh.verts.size(); ++i) {
+                    const Vec3f& p = tpmsMesh.verts[i].pos;
+                    const float kx = waveK * p.x;
+                    const float ky = waveK * p.y;
+                    const float kz = waveK * p.z;
+                    if (sparsePattern == kSparsePatternGyroid) {
+                        psiField[i] = std::sin(kx) * std::cos(ky) +
+                            std::sin(ky) * std::cos(kz) +
+                            std::sin(kz) * std::cos(kx);
+                    } else if (sparsePattern == kSparsePatternSchwarzD) {
+                        psiField[i] = std::sin(kx) * std::sin(ky) * std::sin(kz) +
+                            std::sin(kx) * std::cos(ky) * std::cos(kz) +
+                            std::cos(kx) * std::sin(ky) * std::cos(kz) +
+                            std::cos(kx) * std::cos(ky) * std::sin(kz);
+                    } else {
+                        psiField[i] = std::cos(kx) + std::cos(ky) + std::cos(kz);
+                    }
                 }
             }
 

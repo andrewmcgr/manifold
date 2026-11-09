@@ -375,6 +375,55 @@ void runInteriorFastSweeping(
     std::uint32_t numSweepRounds,
     bool useDirectionalGuidance)
 {
+    const std::size_t n = domain.coords.size();
+    if (n >= 2048 && !domain.gpuWfIndices.empty() && !domain.neighbors6.empty() &&
+        gpu_is_available()) {
+        std::vector<std::uint32_t> voxelFlags(n, 0u);
+        for (std::size_t i = 0; i < n; ++i) {
+            voxelFlags[i] =
+                (domain.isInterior[i] ? 1u : 0u) |
+                (domain.isSeed[i] ? 2u : 0u) |
+                (domain.isPinnedSeed[i] ? 4u : 0u);
+        }
+        const rust::Slice<const std::int32_t> nb6Slice(
+            domain.neighbors6[0].data(),
+            n * 6);
+        const rust::Slice<const std::uint32_t> flagsSlice(
+            voxelFlags.data(),
+            voxelFlags.size());
+        const rust::Slice<const float> slownessSlice(
+            domain.slowness.data(),
+            domain.slowness.size());
+        const rust::Slice<const float> targetDirSlice(
+            domain.targetDir[0].data(),
+            n * 3);
+        const rust::Slice<const std::uint32_t> wfIndSlice(
+            domain.gpuWfIndices.data(),
+            domain.gpuWfIndices.size());
+        const rust::Slice<const std::uint32_t> wfLvlSlice(
+            domain.gpuWfLevelOffsets.data(),
+            domain.gpuWfLevelOffsets.size());
+        const rust::Slice<const std::uint32_t> wfBoundsSlice(
+            domain.gpuWfOctantBounds.data(),
+            domain.gpuWfOctantBounds.size());
+        rust::Slice<float> tauSlice(domain.tau.data(), domain.tau.size());
+
+        if (gpu_solve_eikonal_wavefronts(
+                nb6Slice,
+                flagsSlice,
+                slownessSlice,
+                targetDirSlice,
+                wfIndSlice,
+                wfLvlSlice,
+                wfBoundsSlice,
+                static_cast<float>(domain.voxelSize),
+                numSweepRounds,
+                useDirectionalGuidance,
+                tauSlice)) {
+            return;
+        }
+    }
+
     auto sweepWavefrontSlice = [&](const WavefrontSchedule& wf, std::size_t lvl) {
         const std::size_t beginOff = wf.levelOffsets[lvl];
         const std::size_t endOff = wf.levelOffsets[lvl + 1];
@@ -708,6 +757,9 @@ void ActiveVolumeDomain::buildWavefrontSchedules() {
             wf.indices.clear();
             wf.levelOffsets.clear();
         }
+        gpuWfIndices.clear();
+        gpuWfLevelOffsets.clear();
+        gpuWfOctantBounds.fill(0u);
         zParityWavefront.indices.clear();
         zParityWavefront.levelOffsets.clear();
         return;
@@ -720,6 +772,11 @@ void ActiveVolumeDomain::buildWavefrontSchedules() {
         {1, -1},
         {-1, -1},
     }};
+
+    gpuWfIndices.clear();
+    gpuWfIndices.reserve(m * 4);
+    gpuWfLevelOffsets.clear();
+    gpuWfOctantBounds.fill(0u);
 
     for (std::size_t q = 0; q < 4; ++q) {
         const int sx = signs[q].first;
@@ -756,7 +813,17 @@ void ActiveVolumeDomain::buildWavefrontSchedules() {
             const std::size_t b = static_cast<std::size_t>((sx * c.x() + sy * c.y() + c.z()) - minL);
             wf.indices[writeCursor[b]++] = idx;
         }
+
+        gpuWfOctantBounds[q] = static_cast<std::uint32_t>(gpuWfLevelOffsets.size());
+        const auto idxBase = static_cast<std::uint32_t>(gpuWfIndices.size());
+        for (const std::size_t off : wf.levelOffsets) {
+            gpuWfLevelOffsets.push_back(idxBase + static_cast<std::uint32_t>(off));
+        }
+        for (const std::size_t vIdx : wf.indices) {
+            gpuWfIndices.push_back(static_cast<std::uint32_t>(vIdx));
+        }
     }
+    gpuWfOctantBounds[4] = static_cast<std::uint32_t>(gpuWfLevelOffsets.size());
 
     // 2. Build the Z-slice Red-Black schedule in O(m) counting-sort time
     const std::size_t numZParityBuckets = static_cast<std::size_t>((maxK - minK + 1) * 2);
@@ -891,6 +958,36 @@ void ToolOrientationStrategy::updateToolOrientations(
                 clampedAxes[i] = clampUnitVectorToCone(desiredAxis, bedNormal, gammaMaxRad);
             }
         });
+
+    if (n >= 1024 && !domain.neighbors6.empty() && gpu_is_available()) {
+        const NozzleBasis refFrame =
+            ctx.backend.queryNozzleFrame(domain.posBed[0], {1.0f, 0.0f, 0.0f});
+        const rust::Slice<const std::int32_t> nb6Slice(
+            domain.neighbors6[0].data(),
+            n * 6);
+        const rust::Slice<const float> bedNrmSlice(
+            refFrame.nozzle_axis.data(),
+            3);
+        const rust::Slice<const float> maxTiltSlice(
+            localMaxTiltRad.data(),
+            n);
+        rust::Slice<float> axesSlice(
+            clampedAxes[0].data(),
+            n * 3);
+        rust::Slice<float> tiltDegSlice(
+            domain.toolTiltDeg.data(),
+            n);
+        if (gpu_smooth_and_clamp_tool_axes(
+                nb6Slice,
+                bedNrmSlice,
+                maxTiltSlice,
+                2u,
+                axesSlice,
+                tiltDegSlice)) {
+            domain.toolAxis = std::move(clampedAxes);
+            return;
+        }
+    }
 
     std::vector<std::array<float, 3>> smoothedAxes = clampedAxes;
     for (int pass = 0; pass < 2; ++pass) {

@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod field_vis;
 pub mod gcode;
+pub mod gpu_compute;
 pub mod hull;
 pub mod io;
 pub mod presets;
