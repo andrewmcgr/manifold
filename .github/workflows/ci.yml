@@ -216,3 +216,62 @@ jobs:
         with:
           name: Manifold-windows-x86_64
           path: target/release/package/manifold-windows-x86_64.zip
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [macos, linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: Manifold-macos-arm64
+          path: release-assets/macos
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: Manifold-linux-x86_64
+          path: release-assets/linux
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: Manifold-windows-x86_64
+          path: release-assets/windows
+
+      - name: Stage release archives and compute SHA256SUMS.txt
+        run: |
+          mkdir -p dist
+          cp release-assets/macos/Manifold-macos-arm64.zip dist/Manifold-macos-arm64.zip
+          cp release-assets/linux/manifold-linux.tar.gz dist/Manifold-linux-x86_64.tar.gz
+          cp release-assets/windows/manifold-windows-x86_64.zip dist/Manifold-windows-x86_64.zip
+          (cd dist && sha256sum Manifold-macos-arm64.zip Manifold-linux-x86_64.tar.gz Manifold-windows-x86_64.zip > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" \
+              dist/Manifold-macos-arm64.zip \
+              dist/Manifold-linux-x86_64.tar.gz \
+              dist/Manifold-windows-x86_64.zip \
+              dist/SHA256SUMS.txt \
+              --clobber \
+              --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${TAG_NAME}" \
+              dist/Manifold-macos-arm64.zip \
+              dist/Manifold-linux-x86_64.tar.gz \
+              dist/Manifold-windows-x86_64.zip \
+              dist/SHA256SUMS.txt \
+              --title "Manifold ${TAG_NAME}" \
+              --generate-notes \
+              --repo "${GITHUB_REPOSITORY}"
+          fi

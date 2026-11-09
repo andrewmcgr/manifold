@@ -25,7 +25,10 @@
     "autoupdate": {
         "architecture": {
             "64bit": {
-                "url": "https://github.com/andrewmcgr/manifold/releases/download/v$version/Manifold-windows-x86_64.zip"
+                "url": "https://github.com/andrewmcgr/manifold/releases/download/v$version/Manifold-windows-x86_64.zip",
+                "hash": {
+                    "url": "https://github.com/andrewmcgr/manifold/releases/download/v$version/SHA256SUMS.txt"
+                }
             }
         }
     }
