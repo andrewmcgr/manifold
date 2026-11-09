@@ -139,6 +139,9 @@ fn configure_egui_symbol_fonts(ctx: &egui::Context) {
             "noto_math",
             "/usr/share/fonts/opentype/noto/NotoSansMath-Regular.ttf",
         ),
+        ("segoe_ui_symbol", "C:/Windows/Fonts/seguisym.ttf"),
+        ("cambria_math", "C:/Windows/Fonts/cambria.ttc"),
+        ("arial_win", "C:/Windows/Fonts/arial.ttf"),
     ];
 
     let mut loaded_any = false;

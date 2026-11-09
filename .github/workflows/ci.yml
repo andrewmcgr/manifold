@@ -140,3 +140,77 @@ jobs:
         with:
           name: Manifold-linux-x86_64
           path: target/release/package/manifold-linux.tar.gz
+
+  windows:
+    name: Windows (x86_64 Build, Test & Scoop Bundle)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 UCRT64 with OpenCASCADE, OpenVDB, TBB, and GCC
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-opencascade
+            mingw-w64-ucrt-x86_64-openvdb
+            mingw-w64-ucrt-x86_64-tbb
+            mingw-w64-ucrt-x86_64-imath
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-blosc
+
+      - name: Install Rust toolchain (x86_64-pc-windows-gnu)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Configure Cargo to default to x86_64-pc-windows-gnu
+        run: |
+          mkdir -p .cargo
+          printf '[build]\ntarget = "x86_64-pc-windows-gnu"\n' > .cargo/config.toml
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Run unit and integration test suite
+        env:
+          MANIFOLD_DISABLE_GPU: "1"
+        run: |
+          cargo test --manifest-path frontend/Cargo.toml
+
+      - name: Build and package Windows Scoop bundle
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
+          $env:MINGW_PREFIX = "C:\msys64\ucrt64"
+          ./scripts/package_windows.ps1 -Profile release -BinDir "target\x86_64-pc-windows-gnu\release"
+
+      - name: Verify self-contained Windows bundle and headless slicing
+        shell: pwsh
+        env:
+          MANIFOLD_DISABLE_GPU: "1"
+        run: |
+          $StageDir = "target\release\package\manifold-windows-x86_64"
+          if (-not (Test-Path "$StageDir\manifold-frontend.exe")) { throw "Missing manifold-frontend.exe" }
+          if (-not (Test-Path "$StageDir\manifold.exe")) { throw "Missing manifold.exe" }
+          & "$StageDir\manifold-frontend.exe" --help
+          if ($LASTEXITCODE -ne 0) { throw "--help failed" }
+          & "$StageDir\manifold-frontend.exe" slice "Test Objects\Manifold_M_Cube.3mf" -o "$env:TEMP\manifold_win_ci.gcode"
+          if ($LASTEXITCODE -ne 0) { throw "Headless slice failed" }
+          if ((Get-Item "$env:TEMP\manifold_win_ci.gcode").Length -eq 0) { throw "Empty G-code output" }
+
+      - name: Upload Windows Scoop zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Manifold-windows-x86_64
+          path: target/release/package/manifold-windows-x86_64.zip
