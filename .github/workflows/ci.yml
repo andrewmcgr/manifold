@@ -62,7 +62,7 @@ jobs:
             target/release/bundle/osx/Manifold-macos-arm64.zip
 
       - name: Upload macOS Manifold.app artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Manifold-macos-arm64
           path: target/release/bundle/osx/Manifold-macos-arm64.zip
@@ -136,7 +136,7 @@ jobs:
           test -s /tmp/manifold_linux_ci.gcode
 
       - name: Upload Linux release tarball artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Manifold-linux-x86_64
           path: target/release/package/manifold-linux.tar.gz
@@ -212,7 +212,7 @@ jobs:
           if ((Get-Item "$env:TEMP\manifold_win_ci.gcode").Length -eq 0) { throw "Empty G-code output" }
 
       - name: Upload Windows Scoop zip artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Manifold-windows-x86_64
           path: target/release/package/manifold-windows-x86_64.zip

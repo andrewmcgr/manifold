@@ -7711,7 +7711,13 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                     rawCells.begin(),
                     rawCells.end(),
                     [](const RawRoofCell& a, const RawRoofCell& b) {
-                        return a.roofH > b.roofH;
+                        if (std::abs(a.roofH - b.roofH) > 1.0e-5f) {
+                            return a.roofH > b.roofH;
+                        }
+                        if (a.iu != b.iu) {
+                            return a.iu < b.iu;
+                        }
+                        return a.iv < b.iv;
                     });
 
                 struct TipSeed {
@@ -8103,98 +8109,22 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             continue;
                         }
 
+                        const float startU = node.u;
+                        const float startV = node.v;
                         node.u = bestU;
                         node.v = bestV;
 
-                        // Step 2b: Mutual attraction toward nearby active branches within merge horizon.
-                        // Prioritize the closest merge partner within `2.5 * (r_node + r_other)` so pairs
-                        // of branches converge all the way to a shared center (`dist <= maxLatStep`) without
-                        // stalling between opposing pulls from more distant branches.
-                        bool hasCloseMergePartner = false;
-                        const float remBudget = std::max(0.0f, maxLatStep - usedLatStep);
-                        if (remBudget > 1.0e-3f && !inRoofZone) {
-                            std::size_t bestPartnerIdx = activeNodes.size();
-                            float bestPartnerDist = std::numeric_limits<float>::max();
-                            float attractU = 0.0f;
-                            float attractV = 0.0f;
-                            float attractWeight = 0.0f;
+                        const bool groundsToBed = onBedOnly || (node.floorH <= 1.0e-3f);
+                        const float hLook =
+                            groundsToBed
+                                ? std::max(0.30f, hNext - std::min(4.5f, 0.65f * hNext))
+                                : hNext;
 
-                            for (std::size_t otherIdx = 0; otherIdx < activeNodes.size(); ++otherIdx) {
-                                const auto& other = activeNodes[otherIdx];
-                                if (!other.alive || other.branchIdx == node.branchIdx) {
-                                    continue;
-                                }
-                                const float du = other.u - node.u;
-                                const float dv = other.v - node.v;
-                                const float dist = std::sqrt(du * du + dv * dv);
-                                const float closePartnerHorizon = 2.5f * (node.radius + other.radius);
-                                if (dist <= closePartnerHorizon && dist < bestPartnerDist &&
-                                    (other.roofH - hNext) > topAnchorBandMm) {
-                                    bestPartnerDist = dist;
-                                    bestPartnerIdx = otherIdx;
-                                }
-                                const float horizon =
-                                    std::max(8.0f, 3.8f * (node.radius + other.radius));
-                                if (dist > 1.0e-3f && dist <= horizon) {
-                                    const float w = (other.radius * other.radius) / (dist + 0.5f);
-                                    attractU += w * (du / dist);
-                                    attractV += w * (dv / dist);
-                                    attractWeight += w;
-                                }
-                            }
-
-                            float dirU = 0.0f;
-                            float dirV = 0.0f;
-                            float maxNudge = 0.0f;
-                            if (bestPartnerIdx < activeNodes.size()) {
-                                hasCloseMergePartner = true;
-                                const auto& partner = activeNodes[bestPartnerIdx];
-                                const float du = partner.u - node.u;
-                                const float dv = partner.v - node.v;
-                                const float dist = std::sqrt(du * du + dv * dv);
-                                if (dist <= node.radius + partner.radius) {
-                                    node.targetRadius = std::max(
-                                        node.targetRadius,
-                                        std::min(maxTrunkRadiusMm, partner.radius));
-                                }
-                                if (dist > 1.0e-4f) {
-                                    dirU = du / dist;
-                                    dirV = dv / dist;
-                                    const float maxClose =
-                                        (bestPartnerIdx < nodeIdx) ? dist : (0.60f * dist);
-                                    maxNudge = std::min(remBudget, maxClose);
-                                }
-                            } else if (attractWeight > 0.0f) {
-                                const float aNorm =
-                                    std::sqrt(attractU * attractU + attractV * attractV);
-                                if (aNorm > 1.0e-5f) {
-                                    dirU = attractU / aNorm;
-                                    dirV = attractV / aNorm;
-                                    maxNudge = 0.75f * remBudget;
-                                }
-                            }
-
-                            if (maxNudge > 1.0e-4f) {
-                                const float candU = node.u + maxNudge * dirU;
-                                const float candV = node.v + maxNudge * dirV;
-                                const float candScore =
-                                    evaluateLookaheadScore(candU, candV, hNext, node.radius, node.roofH);
-                                if ((candScore >= 0.25f || candScore >= straightScore - 0.25f) &&
-                                    hasSupportClearanceAtUVH(candU, candV, hNext, 0.0f, false)) {
-                                    node.u = candU;
-                                    node.v = candV;
-                                    usedLatStep += maxNudge;
-                                }
-                            }
-                        }
-
-                        // Step 2b.5: Trunk radius expansion toward the build plate (conical trunk
-                        // taper plus basal root flare in the bottom 10 mm for bed adhesion), with
-                        // perimeter-based wall push-away (including downward lookahead) and clearance
-                        // clamping so narrow-band SDF saturation never prevents trunks from expanding
-                        // up to `maxTrunkRadiusMm`.
+                        // Step 2b: Trunk radius target growth and perimeter-based wall push-away
+                        // before mutual attraction so trunks adjacent to vertical walls move out
+                        // into open space where they can expand toward `maxTrunkRadiusMm`.
+                        float desiredR = node.radius;
                         if (!inRoofZone) {
-                            const bool groundsToBed = onBedOnly || (node.floorH <= 1.0e-3f);
                             const float basalFlareZoneMm = 10.0f;
                             float flareSlope = 0.0f;
                             if (groundsToBed && hNext < basalFlareZoneMm) {
@@ -8208,19 +8138,15 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 std::max(node.targetRadius, node.radius + dTargetR));
 
                             const float maxDrStep = 0.42f * maxLatStep;
-                            const float desiredR = std::min(
+                            desiredR = std::min(
                                 maxTrunkRadiusMm,
                                 std::min(node.targetRadius, node.radius + maxDrStep));
 
                             const float remSteer = std::max(0.0f, maxLatStep - usedLatStep);
-                            if (remSteer > 1.0e-4f && !hasCloseMergePartner) {
+                            if (remSteer > 1.0e-4f) {
                                 const float rProbe = std::min(
                                     maxTrunkRadiusMm,
                                     std::max(node.targetRadius + 0.5f, node.radius + 1.2f));
-                                const float hLook =
-                                    groundsToBed
-                                        ? std::max(0.30f, hNext - std::min(4.5f, 0.65f * hNext))
-                                        : hNext;
                                 float pushU = 0.0f;
                                 float pushV = 0.0f;
                                 int blockedCount = 0;
@@ -8240,18 +8166,135 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 }
                                 const float pushNorm = std::hypot(pushU, pushV);
                                 if (blockedCount > 0 && blockedCount < 14 && pushNorm > 1.0e-4f) {
-                                    const float nudgeDist = 0.85f * remSteer;
+                                    const bool radiusConstrained =
+                                        !isTrunkPerimeterClear(node.u, node.v, hNext, desiredR, false);
+                                    const float nudgeFrac = radiusConstrained ? 0.70f : 0.50f;
+                                    const float nudgeDist = nudgeFrac * remSteer;
                                     const float nudgeU = node.u + nudgeDist * (pushU / pushNorm);
                                     const float nudgeV = node.v + nudgeDist * (pushV / pushNorm);
-                                    if (hasSupportClearanceAtUVH(nudgeU, nudgeV, hNext, 0.0f, false) &&
+                                    if (nudgeDist > 1.0e-4f &&
+                                        hasSupportClearanceAtUVH(nudgeU, nudgeV, hNext, 0.0f, false) &&
                                         isTrunkPerimeterClear(nudgeU, nudgeV, hNext, node.radius, false)) {
                                         node.u = nudgeU;
                                         node.v = nudgeV;
-                                        usedLatStep += nudgeDist;
+                                        usedLatStep = std::hypot(node.u - startU, node.v - startV);
                                     }
                                 }
                             }
+                        }
 
+                        // Step 2b.5: Mutual attraction toward nearby active branches within merge horizon.
+                        // Ignore branches separated by solid part geometry so trunks on opposite sides of
+                        // a part never pull each other into the part walls.
+                        const float remBudget = std::max(0.0f, maxLatStep - usedLatStep);
+                        if (remBudget > 1.0e-3f && !inRoofZone) {
+                            std::size_t bestPartnerIdx = activeNodes.size();
+                            float bestPartnerDist = std::numeric_limits<float>::max();
+                            float attractU = 0.0f;
+                            float attractV = 0.0f;
+                            float attractWeight = 0.0f;
+
+                            auto isMergeLineClear = [&](float uOther, float vOther) -> bool {
+                                for (const float t : {0.30f, 0.50f, 0.70f}) {
+                                    const float uM = node.u + t * (uOther - node.u);
+                                    const float vM = node.v + t * (vOther - node.v);
+                                    if (!hasSupportClearanceAtUVH(uM, vM, hNext, 0.0f, false) ||
+                                        !hasSupportClearanceAtUVH(uM, vM, hLook, 0.0f, false)) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            };
+
+                            for (std::size_t otherIdx = 0; otherIdx < activeNodes.size(); ++otherIdx) {
+                                const auto& other = activeNodes[otherIdx];
+                                if (!other.alive || other.branchIdx == node.branchIdx) {
+                                    continue;
+                                }
+                                const float du = other.u - node.u;
+                                const float dv = other.v - node.v;
+                                const float dist = std::sqrt(du * du + dv * dv);
+                                const float horizon =
+                                    std::max(8.0f, 3.8f * (node.radius + other.radius));
+                                if (dist <= 1.0e-3f || dist > horizon) {
+                                    continue;
+                                }
+                                if (!isMergeLineClear(other.u, other.v)) {
+                                    continue;
+                                }
+                                const float closePartnerHorizon = 2.5f * (node.radius + other.radius);
+                                if (dist <= closePartnerHorizon && dist < bestPartnerDist &&
+                                    (other.roofH - hNext) > topAnchorBandMm) {
+                                    bestPartnerDist = dist;
+                                    bestPartnerIdx = otherIdx;
+                                }
+                                const float w = (other.radius * other.radius) / (dist + 0.5f);
+                                attractU += w * (du / dist);
+                                attractV += w * (dv / dist);
+                                attractWeight += w;
+                            }
+
+                            float dirU = 0.0f;
+                            float dirV = 0.0f;
+                            float maxNudge = 0.0f;
+                            if (bestPartnerIdx < activeNodes.size()) {
+                                const auto& partner = activeNodes[bestPartnerIdx];
+                                const float du = partner.u - node.u;
+                                const float dv = partner.v - node.v;
+                                const float dist = std::sqrt(du * du + dv * dv);
+                                if (dist <= node.radius + partner.radius) {
+                                    node.targetRadius = std::max(
+                                        node.targetRadius,
+                                        std::min(maxTrunkRadiusMm, partner.radius));
+                                }
+                                if (dist > 1.0e-4f) {
+                                    dirU = du / dist;
+                                    dirV = dv / dist;
+                                    const float maxClose =
+                                        (bestPartnerIdx < nodeIdx) ? dist : (0.60f * dist);
+                                    maxNudge = std::min(maxLatStep, maxClose);
+                                }
+                            } else if (attractWeight > 0.0f) {
+                                const float aNorm =
+                                    std::sqrt(attractU * attractU + attractV * attractV);
+                                if (aNorm > 1.0e-5f) {
+                                    dirU = attractU / aNorm;
+                                    dirV = attractV / aNorm;
+                                    maxNudge = 0.75f * remBudget;
+                                }
+                            }
+
+                            if (maxNudge > 1.0e-4f) {
+                                float candU = node.u + maxNudge * dirU;
+                                float candV = node.v + maxNudge * dirV;
+                                const float totalStep = std::hypot(candU - startU, candV - startV);
+                                if (totalStep > maxLatStep && totalStep > 1.0e-5f) {
+                                    const float scale = maxLatStep / totalStep;
+                                    candU = startU + (candU - startU) * scale;
+                                    candV = startV + (candV - startV) * scale;
+                                }
+                                const float candScore =
+                                    evaluateLookaheadScore(candU, candV, hNext, node.radius, node.roofH);
+                                const float sdfBefore = std::min(
+                                    sampleSdfAtUVH(node.u, node.v, hNext),
+                                    sampleSdfAtUVH(node.u, node.v, hLook));
+                                const float sdfAfter = std::min(
+                                    sampleSdfAtUVH(candU, candV, hNext),
+                                    sampleSdfAtUVH(candU, candV, hLook));
+                                const float minWallClear = xyGapMm + desiredR + 0.15f;
+                                const bool wallSafe =
+                                    (sdfAfter >= minWallClear) || (sdfAfter >= sdfBefore - 0.02f);
+                                if (wallSafe &&
+                                    (candScore >= 0.25f || candScore >= straightScore - 0.25f) &&
+                                    hasSupportClearanceAtUVH(candU, candV, hNext, 0.0f, false)) {
+                                    node.u = candU;
+                                    node.v = candV;
+                                    usedLatStep = std::hypot(node.u - startU, node.v - startV);
+                                }
+                            }
+                        }
+
+                        if (!inRoofZone) {
                             if (isTrunkPerimeterClear(node.u, node.v, hNext, desiredR, false)) {
                                 node.radius = desiredR;
                             } else {
