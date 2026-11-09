@@ -102,6 +102,7 @@ fn main() {
         "/usr/local",
         "/usr",
         "C:/msys64/ucrt64",
+        "D:/a/_temp/msys64/ucrt64",
         "C:/msys64/mingw64",
         "C:/vcpkg/installed/x64-windows",
     ] {

@@ -188,14 +188,14 @@ jobs:
           MANIFOLD_DISABLE_GPU: "1"
         run: |
           export PATH="$HOME/.cargo/bin:/c/Users/runneradmin/.cargo/bin:$PATH"
+          export MANIFOLD_DEPS_PREFIX="$(cygpath -w "$MINGW_PREFIX")"
           cargo test --manifest-path frontend/Cargo.toml
 
       - name: Build and package Windows Scoop bundle
-        shell: pwsh
         run: |
-          $env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
-          $env:MINGW_PREFIX = "C:\msys64\ucrt64"
-          ./scripts/package_windows.ps1 -Profile release -BinDir "target\x86_64-pc-windows-gnu\release"
+          export PATH="$HOME/.cargo/bin:/c/Users/runneradmin/.cargo/bin:$PATH"
+          export MANIFOLD_DEPS_PREFIX="$(cygpath -w "$MINGW_PREFIX")"
+          pwsh -NoProfile -File scripts/package_windows.ps1 -Profile release -BinDir "target/x86_64-pc-windows-gnu/release"
 
       - name: Verify self-contained Windows bundle and headless slicing
         shell: pwsh

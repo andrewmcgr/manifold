@@ -79,14 +79,40 @@ if (-not [string]::IsNullOrEmpty($env:VCPKG_ROOT)) {
         $CandidateDllDirs += $VcpkgBin
     }
 }
-foreach ($FallbackBin in @("C:\msys64\ucrt64\bin", "C:\msys64\mingw64\bin", "C:\vcpkg\installed\x64-windows\bin")) {
+foreach ($FallbackBin in @("D:\a\_temp\msys64\ucrt64\bin", "C:\msys64\ucrt64\bin", "C:\msys64\mingw64\bin", "C:\vcpkg\installed\x64-windows\bin")) {
     if ((Test-Path $FallbackBin) -and ($CandidateDllDirs -notcontains $FallbackBin)) {
         $CandidateDllDirs += $FallbackBin
     }
 }
 
-# Use objdump / dumpbin recursively if available, otherwise copy matching runtime DLL patterns
+# Use objdump recursively when available to capture all transitive non-system DLL dependencies,
+# then also scan fallback glob patterns.
 $CopiedDlls = @{}
+$Objdump = Get-Command "objdump.exe" -ErrorAction SilentlyContinue
+if ($Objdump -and $CandidateDllDirs.Count -gt 0) {
+    $Queue = [System.Collections.Generic.Queue[string]]::new()
+    $Queue.Enqueue((Join-Path $StageDir "manifold-frontend.exe"))
+    while ($Queue.Count -gt 0) {
+        $CurrentBin = $Queue.Dequeue()
+        $Lines = & $Objdump.Source -p $CurrentBin 2>$null | Select-String "DLL Name:\s+(\S+)"
+        foreach ($Match in $Lines) {
+            $DllName = $Match.Matches[0].Groups[1].Value
+            if (-not $CopiedDlls.ContainsKey($DllName)) {
+                foreach ($DllDir in $CandidateDllDirs) {
+                    $CandidatePath = Join-Path $DllDir $DllName
+                    if (Test-Path $CandidatePath) {
+                        $DestPath = Join-Path $StageDir $DllName
+                        Copy-Item $CandidatePath $DestPath -Force
+                        $CopiedDlls[$DllName] = $true
+                        $Queue.Enqueue($DestPath)
+                        break
+                    }
+                }
+            }
+        }
+    }
+}
+
 foreach ($DllDir in $CandidateDllDirs) {
     $Patterns = @(
         "libTK*.dll", "TK*.dll",
