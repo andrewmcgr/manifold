@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS (Apple Silicon & App Bundle)
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install Homebrew dependencies
+        run: |
+          brew update
+          brew install opencascade openvdb tbb cmake pkg-config
+
+      - name: Run unit and integration test suite
+        run: |
+          cargo test --manifest-path frontend/Cargo.toml
+
+      - name: Build macOS application bundle (Manifold.app)
+        run: |
+          chmod +x scripts/bundle_macos.sh
+          ./scripts/bundle_macos.sh --release
+
+      - name: Verify Manifold.app structure and headless slicing
+        run: |
+          APP_BUNDLE="target/release/bundle/osx/Manifold.app"
+          test -d "${APP_BUNDLE}"
+          test -x "${APP_BUNDLE}/Contents/MacOS/manifold-frontend"
+          test -f "${APP_BUNDLE}/Contents/Resources/Manifold.icns"
+          test -f "${APP_BUNDLE}/Contents/Info.plist"
+          "${APP_BUNDLE}/Contents/MacOS/manifold-frontend" --help
+          "${APP_BUNDLE}/Contents/MacOS/manifold-frontend" slice "Test Objects/Manifold_M_Cube.3mf" -o /tmp/manifold_macos_ci.gcode
+          test -s /tmp/manifold_macos_ci.gcode
+
+      - name: Package Manifold.app zip artifact
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            target/release/bundle/osx/Manifold.app \
+            target/release/bundle/osx/Manifold-macos-arm64.zip
+
+      - name: Upload macOS Manifold.app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Manifold-macos-arm64
+          path: target/release/bundle/osx/Manifold-macos-arm64.zip
+
+  linux:
+    name: Linux (Ubuntu 24.04 Build, Test & Package)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install system CAD, OpenVDB, and GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            libocct-foundation-dev \
+            libocct-modeling-data-dev \
+            libocct-modeling-algorithms-dev \
+            libocct-data-exchange-dev \
+            libopenvdb-dev \
+            libtbb-dev \
+            libimath-dev \
+            libboost-iostreams-dev \
+            libboost-system-dev \
+            libblosc-dev \
+            libasound2-dev \
+            libudev-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libvulkan-dev \
+            libfontconfig1-dev \
+            libgtk-3-dev
+
+      - name: Run unit and integration test suite
+        env:
+          MANIFOLD_DISABLE_GPU: "1"
+        run: |
+          cargo test --manifest-path frontend/Cargo.toml
+
+      - name: Build and package Linux release
+        run: |
+          chmod +x scripts/package_linux.sh
+          ./scripts/package_linux.sh --release
+
+      - name: Verify Linux package and headless slicing
+        env:
+          MANIFOLD_DISABLE_GPU: "1"
+        run: |
+          STAGE_DIR="target/release/package/manifold-linux"
+          test -x "${STAGE_DIR}/bin/manifold-frontend"
+          test -L "${STAGE_DIR}/bin/manifold"
+          test -f "${STAGE_DIR}/share/applications/manifold.desktop"
+          test -f "${STAGE_DIR}/share/icons/hicolor/256x256/apps/manifold.png"
+          "${STAGE_DIR}/bin/manifold-frontend" --help
+          "${STAGE_DIR}/bin/manifold-frontend" slice "Test Objects/Manifold_M_Cube.3mf" -o /tmp/manifold_linux_ci.gcode
+          test -s /tmp/manifold_linux_ci.gcode
+
+      - name: Upload Linux release tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Manifold-linux-x86_64
+          path: target/release/package/manifold-linux.tar.gz

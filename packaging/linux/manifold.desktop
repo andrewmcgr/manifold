@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Manifold Slicer
+GenericName=Multi-Axis 3D Printing Slicer
+Comment=Multi-axis non-planar additive manufacturing slicer powered by OpenVDB and OpenCASCADE
+Exec=manifold-frontend %F
+TryExec=manifold-frontend
+Icon=manifold
+Terminal=false
+Categories=Graphics;3DGraphics;Engineering;Science;
+MimeType=model/3mf;model/stl;model/step;application/sla;
+Keywords=3D;Printing;Slicer;Non-Planar;Multi-Axis;CAD;OpenVDB;GCode;
+StartupNotify=true
+StartupWMClass=manifold-frontend

@@ -25,3 +25,12 @@ png.workspace = true
 [build-dependencies]
 cxx-build.workspace = true
 cmake.workspace = true
+
+[package.metadata.bundle]
+name = "Manifold"
+identifier = "io.manifold.slicer"
+icon = ["assets/Manifold.icns", "assets/app_icon_1024.png", "assets/app_icon.png"]
+short_description = "Multi-axis non-planar 3D printing slicer"
+long_description = "Manifold2 is a multi-axis, non-planar additive manufacturing slicer powered by OpenVDB and OpenCASCADE."
+osx_minimum_system_version = "13.0"
+
