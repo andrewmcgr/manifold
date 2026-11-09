@@ -4837,6 +4837,7 @@ mod tests {
     #[test]
     fn test_overhang_field_conformal_and_orthogonal_surface_bias() {
         let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::ui::sync_config_to_backend(&crate::config::SlicerConfig::default());
         ffi::set_spatial_orientation_hints(&[]);
 
         // 1. Verify default configuration & FFI round-trip
@@ -5573,7 +5574,7 @@ mod tests {
             .layers
             .iter()
             .skip(1)
-            .take(3)
+            .take(5)
             .flat_map(|l| l.paths.iter())
             .filter(|p| p.feature_kind == 7)
             .map(&ring_radius)

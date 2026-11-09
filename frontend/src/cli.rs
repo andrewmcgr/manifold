@@ -3113,6 +3113,7 @@ pub fn cmd_calibrate(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::TEST_BACKEND_LOCK;
 
     #[test]
     fn test_profile_json_and_toml_roundtrip_and_partial_merge() {
@@ -3188,6 +3189,7 @@ mod tests {
 
     #[test]
     fn test_cli_headless_slice_with_profile_json() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_dir = std::env::temp_dir().join("manifold2_cli_test");
         let _ = fs::create_dir_all(&tmp_dir);
         let profile_path = tmp_dir.join("test_cli_profile.json");
@@ -3260,6 +3262,7 @@ mod tests {
 
     #[test]
     fn test_cli_calibrate_em_pa_and_transient_subcommands() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_dir = std::env::temp_dir().join("manifold2_cli_calib_test");
         let _ = fs::create_dir_all(&tmp_dir);
 
