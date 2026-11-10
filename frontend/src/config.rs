@@ -1652,6 +1652,68 @@ impl GcodeProcessConfig {
     }
 }
 
+/// Network printing & status monitoring configuration for Moonraker / Klipper printers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MoonrakerNetworkConfig {
+    /// Base URL of the Moonraker HTTP/HTTPS API (e.g., "http://voron.local:7125" or "https://printer.lan").
+    pub printer_uri: String,
+    /// Optional override URL for launching the printer's Web UI (Mainsail / Fluidd) in the system browser.
+    /// When empty, defaults to `printer_uri` (with `:7125` stripped to standard HTTP/HTTPS port).
+    pub web_ui_uri: String,
+    /// Optional Moonraker API key sent in the `X-Api-Key` HTTP header.
+    pub api_key: String,
+    /// Optional path to a custom PEM-encoded CA certificate bundle for verifying HTTPS connections.
+    pub ca_cert_pem_path: String,
+    /// Optional path to a PEM-encoded client certificate for mTLS authentication.
+    pub client_cert_pem_path: String,
+    /// Optional path to a PEM-encoded client private key for mTLS authentication.
+    pub client_key_pem_path: String,
+    /// Enable automatic background status polling when `printer_uri` is configured.
+    pub enable_status_polling: bool,
+    /// Poll interval in seconds (clamped to `1.0 ..= 30.0`, default `2.5`).
+    pub poll_interval_s: f32,
+}
+
+impl Default for MoonrakerNetworkConfig {
+    fn default() -> Self {
+        Self {
+            printer_uri: String::new(),
+            web_ui_uri: String::new(),
+            api_key: String::new(),
+            ca_cert_pem_path: String::new(),
+            client_cert_pem_path: String::new(),
+            client_key_pem_path: String::new(),
+            enable_status_polling: true,
+            poll_interval_s: 2.5,
+        }
+    }
+}
+
+impl MoonrakerNetworkConfig {
+    pub fn sanitize(&mut self) {
+        self.printer_uri = self.printer_uri.trim().to_string();
+        self.web_ui_uri = self.web_ui_uri.trim().to_string();
+        self.api_key = self.api_key.trim().to_string();
+        self.ca_cert_pem_path = self.ca_cert_pem_path.trim().to_string();
+        self.client_cert_pem_path = self.client_cert_pem_path.trim().to_string();
+        self.client_key_pem_path = self.client_key_pem_path.trim().to_string();
+        if !self.poll_interval_s.is_finite() {
+            self.poll_interval_s = 2.5;
+        }
+        self.poll_interval_s = self.poll_interval_s.clamp(1.0, 30.0);
+    }
+
+    pub fn is_configured(&self) -> bool {
+        let trimmed = self.printer_uri.trim().trim_end_matches('/');
+        let host_part = trimmed
+            .strip_prefix("http://")
+            .or_else(|| trimmed.strip_prefix("https://"))
+            .unwrap_or(trimmed);
+        !host_part.trim().is_empty() && !host_part.ends_with(':')
+    }
+}
+
 /// Top-level extensible slicer configuration stored as a Bevy resource and
 /// persisted inside `.3mf` project files under `/Metadata/manifold2_config.toml`.
 #[derive(Resource, Clone, Debug, Serialize, Deserialize)]
@@ -1663,6 +1725,7 @@ pub struct SlicerConfig {
     pub gcode: GcodeProcessConfig,
     pub eikonal: EikonalFieldConfig,
     pub machine: MachineKinematicsConfig,
+    pub network: MoonrakerNetworkConfig,
     pub tools: Vec<ToolConfig>,
     pub active_tool_index: usize,
     pub printer_preset_name: String,
@@ -1680,6 +1743,7 @@ impl Default for SlicerConfig {
             gcode: GcodeProcessConfig::default(),
             eikonal: EikonalFieldConfig::default(),
             machine: MachineKinematicsConfig::default(),
+            network: MoonrakerNetworkConfig::default(),
             tools: vec![
                 ToolConfig::standard_tool(0, "T0 - 0.4mm Standard", 0.40, 215.0),
                 ToolConfig::standard_tool(1, "T1 - 0.6mm High-Flow", 0.60, 230.0),
@@ -2823,6 +2887,35 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         default_value: "4.0 mm clearance / 5.0 mm margin",
         summary: "Minimum XY gap between parts and safety margin from the build plate edge during spiral auto-arrangement.",
         details: "Increase `Part Clearance` when printing tall non-planar parts sequentially or when using wide toolhead shrouds.",
+    },
+
+    // --- Network Printing (Moonraker / Klipper) ---
+    ParameterDoc {
+        key: "network.printer_uri",
+        category: "Network Printing (Moonraker / Klipper)",
+        title: "Moonraker Printer URI & Web UI URI",
+        units: "URL",
+        default_value: "http://printer.local:7125",
+        summary: "Base HTTP/HTTPS endpoint for Moonraker API calls, status polling, and G-code uploads, plus optional Web UI URL override.",
+        details: "Point `Printer URI` to your Moonraker server (e.g. `http://192.168.1.50:7125` or `https://voron.example.com`). Clicking `Open Web UI` launches `Web UI URI` (or `Printer URI` with `:7125` stripped to standard HTTP/HTTPS port) in your system browser.",
+    },
+    ParameterDoc {
+        key: "network.api_key",
+        category: "Network Printing (Moonraker / Klipper)",
+        title: "Moonraker API Key",
+        units: "token",
+        default_value: "(optional)",
+        summary: "Optional Moonraker API key sent in the `X-Api-Key` HTTP header.",
+        details: "Required when Moonraker `[authorization]` requires API key authentication for untrusted subnets or remote reverse proxies.",
+    },
+    ParameterDoc {
+        key: "network.tls_certs",
+        category: "Network Printing (Moonraker / Klipper)",
+        title: "Custom CA Certificate & mTLS Client Certificate (PEM)",
+        units: "PEM file paths",
+        default_value: "(optional)",
+        summary: "Optional custom Root/CA certificate PEM for verifying private HTTPS servers and Client Certificate + Key PEMs for mutual TLS (mTLS).",
+        details: "Allows connecting securely to Moonraker instances behind an HTTPS reverse proxy requiring client certificate authentication (mTLS) or signed by a private Certificate Authority.",
     },
 ];
 

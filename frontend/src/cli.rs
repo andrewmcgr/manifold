@@ -412,6 +412,7 @@ pub fn sanitize_and_sync_config(cfg: &mut SlicerConfig) {
     cfg.eikonal.sanitize();
     cfg.slicing.sanitize();
     cfg.gcode.sanitize();
+    cfg.network.sanitize();
     cfg.sync_auto_voxel_size();
 }
 

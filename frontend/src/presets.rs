@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     BedShape, ClearancePointXZ, ClearanceProfileMode, FiveAxisKinematicsMode, GcodeDialect,
-    LayerHeightConfig, LineWidthConfig, OrderFieldMode, SlicerConfig, SolidInfillPattern,
-    SparseInfillPattern, SupportStyle, ToolConfig, WallPrintOrder,
+    LayerHeightConfig, LineWidthConfig, MoonrakerNetworkConfig, OrderFieldMode, SlicerConfig,
+    SolidInfillPattern, SparseInfillPattern, SupportStyle, ToolConfig, WallPrintOrder,
 };
 
 /// Top-level tab in the left workspace panel (`Project Setup` vs. `Configuration`).
@@ -137,6 +137,9 @@ pub struct PrinterPreset {
     pub emit_thumbnails: bool,
     pub start_gcode_template: String,
     pub end_gcode_template: String,
+
+    // Network Printing (Moonraker / Klipper)
+    pub network: MoonrakerNetworkConfig,
 }
 
 impl Default for PrinterPreset {
@@ -193,6 +196,7 @@ impl PrinterPreset {
             emit_thumbnails: cfg.gcode.emit_thumbnails,
             start_gcode_template: cfg.gcode.start_gcode_template.clone(),
             end_gcode_template: cfg.gcode.end_gcode_template.clone(),
+            network: cfg.network.clone(),
         }
     }
 
@@ -237,8 +241,10 @@ impl PrinterPreset {
         cfg.gcode.emit_thumbnails = self.emit_thumbnails;
         cfg.gcode.start_gcode_template = self.start_gcode_template.clone();
         cfg.gcode.end_gcode_template = self.end_gcode_template.clone();
+        cfg.network = self.network.clone();
         cfg.machine.sanitize();
         cfg.gcode.sanitize();
+        cfg.network.sanitize();
     }
 
     pub fn matches_config(&self, cfg: &SlicerConfig) -> bool {
@@ -287,6 +293,14 @@ impl PrinterPreset {
             && self.emit_thumbnails == cfg.gcode.emit_thumbnails
             && self.start_gcode_template == cfg.gcode.start_gcode_template
             && self.end_gcode_template == cfg.gcode.end_gcode_template
+            && self.network.printer_uri == cfg.network.printer_uri
+            && self.network.web_ui_uri == cfg.network.web_ui_uri
+            && self.network.api_key == cfg.network.api_key
+            && self.network.ca_cert_pem_path == cfg.network.ca_cert_pem_path
+            && self.network.client_cert_pem_path == cfg.network.client_cert_pem_path
+            && self.network.client_key_pem_path == cfg.network.client_key_pem_path
+            && self.network.enable_status_polling == cfg.network.enable_status_polling
+            && approx_eq(self.network.poll_interval_s, cfg.network.poll_interval_s)
     }
 }
 

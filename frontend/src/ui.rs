@@ -23,6 +23,10 @@ use crate::field_vis::{
 use crate::hull::rotation_to_place_face_on_bed;
 use crate::io::threemf::{save_project_to_3mf, ExportableObject};
 use crate::io::load_files_into_backend;
+use crate::moonraker::{
+    open_printer_web_ui_in_browser, query_moonraker_print_status, resolve_printer_web_ui_url,
+    test_moonraker_connection, upload_gcode_to_moonraker, CertPickKind, MoonrakerUiState,
+};
 use crate::presets::{LeftPanelTab, PresetCategory, PresetLibrary};
 use crate::scene::{
     clone_object_on_plate, compute_orbit_eye, remove_object_from_plate, run_auto_arrange_on_plate,
@@ -1083,6 +1087,7 @@ pub fn ui_workspace_system(
     mut preset_lib: ResMut<PresetLibrary>,
     mut vis_state: ResMut<FieldVisualizationState>,
     mut calib_state: ResMut<CalibrationUiState>,
+    mut moonraker_state: ResMut<MoonrakerUiState>,
     mut object_transforms: Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
     mut camera_query: Query<
         (&Camera, &GlobalTransform, &mut OrbitCamera, &mut Transform),
@@ -1254,6 +1259,88 @@ pub fn ui_workspace_system(
                         Some(res)
                     });
                     plate.pending_save_task = Some(save_task);
+                }
+            }
+
+            if config.network.is_configured() {
+                let is_uploading = moonraker_state.pending_upload_task.is_some();
+                let can_upload =
+                    has_planned && !is_computing && !is_io_busy && !is_uploading;
+                let mut trigger_upload: Option<bool> = None;
+
+                if ui
+                    .add_enabled(
+                        can_upload,
+                        egui::Button::new(if is_uploading {
+                            "Uploading..."
+                        } else {
+                            "Upload G-code"
+                        }),
+                    )
+                    .on_hover_text(format!(
+                        "Upload planned G-code to Moonraker ({}) without starting a print",
+                        config.network.printer_uri.trim()
+                    ))
+                    .clicked()
+                {
+                    trigger_upload = Some(false);
+                }
+
+                if ui
+                    .add_enabled(
+                        can_upload,
+                        egui::Button::new(
+                            egui::RichText::new("Upload & Print")
+                                .strong()
+                                .color(egui::Color32::from_rgb(130, 230, 165)),
+                        ),
+                    )
+                    .on_hover_text(format!(
+                        "Upload planned G-code to Moonraker ({}) and immediately start printing",
+                        config.network.printer_uri.trim()
+                    ))
+                    .clicked()
+                {
+                    trigger_upload = Some(true);
+                }
+
+                if let Some(start_print) = trigger_upload {
+                    if let Some(ref planned) = vis_state.cached_planned_gcode {
+                        let stem = if let Some((_, _, ref obj_name, _)) = selected_obj_info {
+                            std::path::Path::new(obj_name)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("manifold2_print")
+                                .to_string()
+                        } else if !calib_state.last_generated_filename_stem.is_empty() {
+                            calib_state.last_generated_filename_stem.clone()
+                        } else {
+                            "manifold2_calibration".to_string()
+                        };
+                        let upload_filename = format!("{stem}.gcode");
+                        let gcode_bytes = planned.gcode_text.clone();
+                        let net_cfg = config.network.clone();
+                        plate.status_message = if start_print {
+                            format!(
+                                "Uploading '{upload_filename}' to {} and starting print...",
+                                net_cfg.printer_uri.trim()
+                            )
+                        } else {
+                            format!(
+                                "Uploading '{upload_filename}' to {}...",
+                                net_cfg.printer_uri.trim()
+                            )
+                        };
+                        let task = IoTaskPool::get().spawn(async move {
+                            upload_gcode_to_moonraker(
+                                &net_cfg,
+                                &upload_filename,
+                                gcode_bytes,
+                                start_print,
+                            )
+                        });
+                        moonraker_state.pending_upload_task = Some(task);
+                    }
                 }
             }
 
@@ -1491,6 +1578,16 @@ pub fn ui_workspace_system(
                 }
             } else {
                 ui.small("Import and select a 3D object to compute fields, slice non-planar layers, and generate G-code.");
+            }
+
+            if config.network.is_configured() {
+                ui.separator();
+                render_moonraker_toolbar_status_strip(
+                    ui,
+                    &config,
+                    &mut moonraker_state,
+                    &mut plate.status_message,
+                );
             }
         });
     });
@@ -2590,7 +2687,14 @@ pub fn ui_workspace_system(
                     // ================================================================
                     match preset_lib.config_subtab {
                         PresetCategory::Printer => {
-                            render_printer_config_tab(ui, &mut config, &mut vis_state, is_computing);
+                            render_printer_config_tab(
+                                ui,
+                                &mut config,
+                                &mut vis_state,
+                                &mut moonraker_state,
+                                &mut plate.status_message,
+                                is_computing,
+                            );
                         }
                         PresetCategory::Tool => {
                             render_tool_config_tab(ui, &mut config, &mut vis_state, is_computing);
@@ -2707,18 +2811,138 @@ pub fn ui_workspace_system(
         &mut config,
         &mut vis_state,
         &mut plate,
+        &mut moonraker_state,
         is_io_busy,
         is_computing,
     );
 }
 
+/// Renders a compact Moonraker printer status monitor (state badge, active filename, progress bar,
+/// elapsed/ETA, refresh button, and "Web UI ↗" browser launcher) in the top workflow bar.
+fn render_moonraker_toolbar_status_strip(
+    ui: &mut egui::Ui,
+    config: &SlicerConfig,
+    moonraker_state: &mut MoonrakerUiState,
+    status_message: &mut String,
+) {
+    ui.label(egui::RichText::new("Printer:").strong());
+    match moonraker_state.last_status {
+        Some(Ok(ref st)) => {
+            let state_lower = st.state.to_ascii_lowercase();
+            let (badge_text, badge_color) = match state_lower.as_str() {
+                "printing" => ("Printing", egui::Color32::from_rgb(95, 225, 145)),
+                "paused" => ("Paused", egui::Color32::from_rgb(245, 195, 85)),
+                "complete" => ("Complete", egui::Color32::from_rgb(110, 215, 235)),
+                "standby" | "ready" => ("Standby", egui::Color32::from_rgb(175, 195, 215)),
+                "cancelled" => ("Cancelled", egui::Color32::from_rgb(230, 155, 110)),
+                "error" => ("Error", egui::Color32::from_rgb(245, 105, 105)),
+                _ => (st.state.as_str(), egui::Color32::from_rgb(185, 195, 210)),
+            };
+            let hover_msg = if st.message.is_empty() {
+                format!("Moonraker printer state: {}", st.state)
+            } else {
+                format!("Moonraker printer state: {} — {}", st.state, st.message)
+            };
+            ui.label(
+                egui::RichText::new(format!("[{badge_text}]"))
+                    .strong()
+                    .color(badge_color),
+            )
+            .on_hover_text(hover_msg);
+
+            if !st.filename.is_empty() {
+                ui.small(
+                    egui::RichText::new(&st.filename)
+                        .monospace()
+                        .color(egui::Color32::from_gray(225)),
+                )
+                .on_hover_text("Current G-code file loaded on Moonraker");
+            }
+
+            if st.is_printing_or_paused()
+                || state_lower == "complete"
+                || st.progress > 0.001
+            {
+                let pct_text = if let Some(eta_str) = st.formatted_eta() {
+                    format!("{:.0}% (ETA {eta_str})", (st.progress * 100.0).clamp(0.0, 100.0))
+                } else {
+                    format!("{:.0}%", (st.progress * 100.0).clamp(0.0, 100.0))
+                };
+                ui.add(
+                    egui::ProgressBar::new(st.progress.clamp(0.0, 1.0))
+                        .desired_width(145.0)
+                        .text(pct_text),
+                )
+                .on_hover_text(format!(
+                    "Elapsed: {} | Progress: {:.1}%",
+                    st.formatted_elapsed(),
+                    st.progress * 100.0
+                ));
+            }
+        }
+        Some(Err(ref err)) => {
+            ui.label(
+                egui::RichText::new("[Offline]")
+                    .strong()
+                    .color(egui::Color32::from_rgb(235, 115, 115)),
+            )
+            .on_hover_text(err);
+        }
+        None => {
+            if moonraker_state.pending_status_task.is_some() {
+                ui.small(egui::RichText::new("Polling...").color(egui::Color32::GRAY));
+            } else {
+                ui.small(egui::RichText::new("Idle").color(egui::Color32::GRAY));
+            }
+        }
+    }
+
+    if ui
+        .add_enabled(
+            moonraker_state.pending_status_task.is_none(),
+            egui::Button::new("↻").small(),
+        )
+        .on_hover_text("Refresh Moonraker printer status now")
+        .clicked()
+    {
+        let net_cfg = config.network.clone();
+        let cached_meta = moonraker_state.cached_metadata_estimate.clone();
+        moonraker_state.last_poll_instant = Some(std::time::Instant::now());
+        moonraker_state.pending_status_task = Some(IoTaskPool::get().spawn(async move {
+            query_moonraker_print_status(&net_cfg, cached_meta)
+        }));
+    }
+
+    let resolved_web_url = resolve_printer_web_ui_url(&config.network)
+        .unwrap_or_else(|_| config.network.printer_uri.clone());
+    if ui
+        .small_button("Web UI ↗")
+        .on_hover_text(format!(
+            "Open printer Web UI ({resolved_web_url}) in your system browser"
+        ))
+        .clicked()
+    {
+        match open_printer_web_ui_in_browser(&config.network) {
+            Ok(url) => {
+                *status_message = format!("Opened printer Web UI ({url}) in system browser.");
+            }
+            Err(err) => {
+                *status_message = err;
+            }
+        }
+    }
+}
+
 /// Renders the `Printer` configuration sub-tab:
 /// Print Bed Geometry & Origin, 5/6-Axis Machine Kinematics & Bed Tilt (`NozzleFrame` & `Gravity Vector`),
-/// Motion Limits & Stepper Dynamics, Klipper/Moonraker Output, and Start/End G-code Templates.
+/// Motion Limits & Stepper Dynamics, Klipper/Moonraker Output, Start/End G-code Templates,
+/// and Network Printing (Moonraker / Klipper).
 fn render_printer_config_tab(
     ui: &mut egui::Ui,
     config: &mut SlicerConfig,
     vis_state: &mut FieldVisualizationState,
+    moonraker_state: &mut MoonrakerUiState,
+    status_message: &mut String,
     is_computing: bool,
 ) {
     let mut dirty_backend = false;
@@ -3161,6 +3385,270 @@ fn render_printer_config_tab(
                     .desired_rows(4),
             )
             .changed();
+    });
+
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Network Printing (Moonraker / Klipper)").strong(),
+    )
+    .id_source("printer_network_moonraker_section")
+    .default_open(true)
+    .show(ui, |ui| {
+        let mut net_changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Printer URI:");
+            net_changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut config.network.printer_uri)
+                        .hint_text("http://printer.local:7125")
+                        .desired_width(210.0),
+                )
+                .changed();
+            param_help_button(ui, "network.printer_uri");
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Web UI URI:");
+            net_changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut config.network.web_ui_uri)
+                        .hint_text("Auto (Printer URI without :7125)")
+                        .desired_width(175.0),
+                )
+                .changed();
+            let can_open_ui = config.network.is_configured();
+            let web_hover = resolve_printer_web_ui_url(&config.network)
+                .unwrap_or_else(|_| "Enter a Printer URI above first".to_string());
+            if ui
+                .add_enabled(can_open_ui, egui::Button::new("Open Web UI ↗"))
+                .on_hover_text(format!("Launch {web_hover} in your system browser"))
+                .clicked()
+            {
+                match open_printer_web_ui_in_browser(&config.network) {
+                    Ok(url) => {
+                        *status_message =
+                            format!("Opened printer Web UI ({url}) in system browser.");
+                    }
+                    Err(err) => {
+                        *status_message = err;
+                    }
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("API Key:");
+            net_changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut config.network.api_key)
+                        .password(!moonraker_state.show_api_key)
+                        .hint_text("Optional X-Api-Key")
+                        .desired_width(175.0),
+                )
+                .changed();
+            ui.checkbox(&mut moonraker_state.show_api_key, "Show");
+            param_help_button(ui, "network.api_key");
+        });
+
+        egui::CollapsingHeader::new("TLS / mTLS Certificates (Optional)")
+            .id_source("printer_network_tls_certs_subsection")
+            .default_open(false)
+            .show(ui, |ui| {
+                let pick_busy = moonraker_state.pending_cert_pick_task.is_some();
+                ui.horizontal(|ui| {
+                    ui.small("CA Cert (PEM):");
+                    net_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut config.network.ca_cert_pem_path)
+                                .hint_text("/path/to/ca.pem")
+                                .desired_width(145.0),
+                        )
+                        .changed();
+                    if ui
+                        .add_enabled(!pick_busy, egui::Button::new("Browse...").small())
+                        .clicked()
+                    {
+                        let task = IoTaskPool::get().spawn(async move {
+                            let handle = rfd::AsyncFileDialog::new()
+                                .add_filter("PEM Certificate", &["pem", "crt", "cer"])
+                                .pick_file()
+                                .await?;
+                            Some(handle.path().to_string_lossy().into_owned())
+                        });
+                        moonraker_state.pending_cert_pick_task =
+                            Some((CertPickKind::CaCert, task));
+                    }
+                    if !config.network.ca_cert_pem_path.is_empty()
+                        && ui.small_button("✕").on_hover_text("Clear path").clicked()
+                    {
+                        config.network.ca_cert_pem_path.clear();
+                        net_changed = true;
+                    }
+                    param_help_button(ui, "network.tls_certs");
+                });
+
+                ui.horizontal(|ui| {
+                    ui.small("Client Cert:");
+                    net_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut config.network.client_cert_pem_path)
+                                .hint_text("/path/to/client.pem")
+                                .desired_width(155.0),
+                        )
+                        .changed();
+                    if ui
+                        .add_enabled(!pick_busy, egui::Button::new("Browse...").small())
+                        .clicked()
+                    {
+                        let task = IoTaskPool::get().spawn(async move {
+                            let handle = rfd::AsyncFileDialog::new()
+                                .add_filter("PEM Certificate", &["pem", "crt", "cer"])
+                                .pick_file()
+                                .await?;
+                            Some(handle.path().to_string_lossy().into_owned())
+                        });
+                        moonraker_state.pending_cert_pick_task =
+                            Some((CertPickKind::ClientCert, task));
+                    }
+                    if !config.network.client_cert_pem_path.is_empty()
+                        && ui.small_button("✕").on_hover_text("Clear path").clicked()
+                    {
+                        config.network.client_cert_pem_path.clear();
+                        net_changed = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.small("Client Key:");
+                    net_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut config.network.client_key_pem_path)
+                                .hint_text("/path/to/client.key")
+                                .desired_width(155.0),
+                        )
+                        .changed();
+                    if ui
+                        .add_enabled(!pick_busy, egui::Button::new("Browse...").small())
+                        .clicked()
+                    {
+                        let task = IoTaskPool::get().spawn(async move {
+                            let handle = rfd::AsyncFileDialog::new()
+                                .add_filter("PEM Private Key", &["pem", "key"])
+                                .pick_file()
+                                .await?;
+                            Some(handle.path().to_string_lossy().into_owned())
+                        });
+                        moonraker_state.pending_cert_pick_task =
+                            Some((CertPickKind::ClientKey, task));
+                    }
+                    if !config.network.client_key_pem_path.is_empty()
+                        && ui.small_button("✕").on_hover_text("Clear path").clicked()
+                    {
+                        config.network.client_key_pem_path.clear();
+                        net_changed = true;
+                    }
+                });
+            });
+
+        ui.horizontal(|ui| {
+            net_changed |= ui
+                .checkbox(
+                    &mut config.network.enable_status_polling,
+                    "Monitor Printer Status",
+                )
+                .changed();
+            net_changed |= ui
+                .add_enabled(
+                    config.network.enable_status_polling,
+                    egui::DragValue::new(&mut config.network.poll_interval_s)
+                        .speed(0.5)
+                        .range(1.0..=30.0)
+                        .prefix("Every ")
+                        .suffix(" s"),
+                )
+                .changed();
+        });
+
+        if net_changed {
+            config.network.sanitize();
+            moonraker_state.last_poll_instant = Some(std::time::Instant::now());
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            let is_testing = moonraker_state.pending_test_task.is_some();
+            let can_test = config.network.is_configured() && !is_testing;
+            if ui
+                .add_enabled(
+                    can_test,
+                    egui::Button::new(if is_testing {
+                        "Testing Connection..."
+                    } else {
+                        "Test Connection"
+                    }),
+                )
+                .on_hover_text(
+                    "Verify connectivity, authentication, and TLS certificates against Moonraker (/server/info & /printer/info) without printing anything",
+                )
+                .clicked()
+            {
+                let net_cfg = config.network.clone();
+                *status_message = format!(
+                    "Testing connection to Moonraker at {}...",
+                    net_cfg.printer_uri.trim()
+                );
+                let test_cfg = net_cfg.clone();
+                moonraker_state.pending_test_task = Some(IoTaskPool::get().spawn(async move {
+                    test_moonraker_connection(&test_cfg)
+                }));
+                if moonraker_state.pending_status_task.is_none() {
+                    let cached_meta = moonraker_state.cached_metadata_estimate.clone();
+                    moonraker_state.last_poll_instant = Some(std::time::Instant::now());
+                    moonraker_state.pending_status_task =
+                        Some(IoTaskPool::get().spawn(async move {
+                            query_moonraker_print_status(&net_cfg, cached_meta)
+                        }));
+                }
+            }
+        });
+
+        if let Some(ref test_res) = moonraker_state.last_test_result {
+            match test_res {
+                Ok(report) => {
+                    ui.small(
+                        egui::RichText::new(format!("✓ {}", report.summary_line()))
+                            .color(egui::Color32::from_rgb(130, 230, 165)),
+                    );
+                }
+                Err(err) => {
+                    ui.small(
+                        egui::RichText::new(format!("✗ {err}"))
+                            .color(egui::Color32::from_rgb(245, 115, 115)),
+                    );
+                }
+            }
+        } else if let Some(Err(ref poll_err)) = moonraker_state.last_status {
+            ui.small(
+                egui::RichText::new(format!("✗ {poll_err}"))
+                    .color(egui::Color32::from_rgb(245, 115, 115)),
+            );
+        }
+
+        if let Some(ref up_res) = moonraker_state.last_upload_result {
+            match up_res {
+                Ok(report) => {
+                    ui.small(
+                        egui::RichText::new(format!("↑ {}", report.summary_line()))
+                            .color(egui::Color32::from_rgb(145, 215, 245)),
+                    );
+                }
+                Err(err) => {
+                    ui.small(
+                        egui::RichText::new(format!("↑ Upload error: {err}"))
+                            .color(egui::Color32::from_rgb(245, 115, 115)),
+                    );
+                }
+            }
+        }
     });
 
     if dirty_backend && !is_computing {
@@ -6119,6 +6607,7 @@ pub fn poll_io_tasks_system(
     mut config: ResMut<SlicerConfig>,
     mut preset_lib: ResMut<PresetLibrary>,
     mut vis_state: ResMut<FieldVisualizationState>,
+    mut moonraker_state: ResMut<MoonrakerUiState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut object_transforms: Query<(&mut Transform, &mut Visibility), With<CadObjectEntity>>,
@@ -6292,6 +6781,77 @@ pub fn poll_io_tasks_system(
             }
         }
     }
+
+    // 5. Poll pending Moonraker certificate file picker task
+    if let Some((kind, ref mut task)) = moonraker_state.pending_cert_pick_task {
+        if let Some(picked_opt) = block_on(future::poll_once(task)) {
+            moonraker_state.pending_cert_pick_task = None;
+            if let Some(path_str) = picked_opt {
+                match kind {
+                    CertPickKind::CaCert => config.network.ca_cert_pem_path = path_str,
+                    CertPickKind::ClientCert => config.network.client_cert_pem_path = path_str,
+                    CertPickKind::ClientKey => config.network.client_key_pem_path = path_str,
+                }
+                config.network.sanitize();
+            }
+        }
+    }
+
+    // 6. Poll pending Moonraker connection test task
+    if let Some(ref mut task) = moonraker_state.pending_test_task {
+        if let Some(res) = block_on(future::poll_once(task)) {
+            moonraker_state.pending_test_task = None;
+            match &res {
+                Ok(report) => {
+                    plate.status_message = report.summary_line();
+                }
+                Err(err) => {
+                    plate.status_message = format!("Moonraker connection test failed: {err}");
+                }
+            }
+            moonraker_state.last_test_result = Some(res);
+        }
+    }
+
+    // 7. Poll pending Moonraker G-code upload / upload-and-print task
+    if let Some(ref mut task) = moonraker_state.pending_upload_task {
+        if let Some(res) = block_on(future::poll_once(task)) {
+            moonraker_state.pending_upload_task = None;
+            match &res {
+                Ok(report) => {
+                    plate.status_message = report.summary_line();
+                    // Force an immediate status refresh after upload / print start
+                    moonraker_state.last_poll_instant = None;
+                }
+                Err(err) => {
+                    plate.status_message = format!("Moonraker upload failed: {err}");
+                }
+            }
+            moonraker_state.last_upload_result = Some(res);
+        }
+    }
+
+    // 8. Poll pending Moonraker live status task & schedule periodic status polling
+    if let Some(ref mut task) = moonraker_state.pending_status_task {
+        if let Some((status_res, updated_cache)) = block_on(future::poll_once(task)) {
+            moonraker_state.pending_status_task = None;
+            moonraker_state.cached_metadata_estimate = updated_cache;
+            moonraker_state.last_status = Some(status_res);
+        }
+    } else if config.network.is_configured() && config.network.enable_status_polling {
+        let interval = std::time::Duration::from_secs_f32(config.network.poll_interval_s.max(1.0));
+        let due = moonraker_state
+            .last_poll_instant
+            .is_none_or(|t| t.elapsed() >= interval);
+        if due {
+            let net_cfg = config.network.clone();
+            let cached_meta = moonraker_state.cached_metadata_estimate.clone();
+            moonraker_state.last_poll_instant = Some(std::time::Instant::now());
+            moonraker_state.pending_status_task = Some(IoTaskPool::get().spawn(async move {
+                query_moonraker_print_status(&net_cfg, cached_meta)
+            }));
+        }
+    }
 }
 
 fn frame_camera_to_plate(
@@ -6325,6 +6885,7 @@ fn render_calibration_utilities_window(
     config: &mut SlicerConfig,
     vis_state: &mut FieldVisualizationState,
     plate: &mut BuildPlateState,
+    moonraker_state: &mut MoonrakerUiState,
     is_io_busy: bool,
     is_computing: bool,
 ) {
@@ -6359,6 +6920,7 @@ fn render_calibration_utilities_window(
 
             let mut request_preview = false;
             let mut request_export = false;
+            let mut request_upload: Option<bool> = None;
             let mut config_modified = false;
 
             // Calibration Tool / Extruder Selector Bar
@@ -7013,6 +7575,45 @@ fn render_calibration_utilities_window(
                 {
                     request_export = true;
                 }
+
+                if config.network.is_configured() {
+                    let is_uploading = moonraker_state.pending_upload_task.is_some();
+                    let can_upload = !is_computing && !is_io_busy && !is_uploading;
+                    if ui
+                        .add_enabled(
+                            can_upload,
+                            egui::Button::new(if is_uploading {
+                                "Uploading..."
+                            } else {
+                                "Upload to Printer"
+                            }),
+                        )
+                        .on_hover_text(format!(
+                            "Generate and upload calibration G-code to Moonraker ({}) without starting a print",
+                            config.network.printer_uri.trim()
+                        ))
+                        .clicked()
+                    {
+                        request_upload = Some(false);
+                    }
+                    if ui
+                        .add_enabled(
+                            can_upload,
+                            egui::Button::new(
+                                egui::RichText::new("Upload & Print")
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(130, 230, 165)),
+                            ),
+                        )
+                        .on_hover_text(format!(
+                            "Generate, upload calibration G-code to Moonraker ({}), and immediately start printing",
+                            config.network.printer_uri.trim()
+                        ))
+                        .clicked()
+                    {
+                        request_upload = Some(true);
+                    }
+                }
             });
 
             if !calib_state.last_summary_message.is_empty() {
@@ -7023,7 +7624,7 @@ fn render_calibration_utilities_window(
                 );
             }
 
-            if request_preview || request_export {
+            if request_preview || request_export || request_upload.is_some() {
                 calib_state.em.base_extrusion_multiplier = config.gcode.extrusion_multiplier;
                 calib_state.em.tool_index = calib_state.selected_tool_index;
                 calib_state.pa.tool_index = calib_state.selected_tool_index;
@@ -7128,6 +7729,30 @@ fn render_calibration_utilities_window(
                         Some(write_res)
                     });
                     plate.pending_save_task = Some(save_task);
+                } else if let Some(start_print) = request_upload {
+                    let upload_filename = format!("{stem}.gcode");
+                    let gcode_bytes = res.gcode_text;
+                    let net_cfg = config.network.clone();
+                    plate.status_message = if start_print {
+                        format!(
+                            "Uploading '{upload_filename}' to {} and starting print...",
+                            net_cfg.printer_uri.trim()
+                        )
+                    } else {
+                        format!(
+                            "Uploading '{upload_filename}' to {}...",
+                            net_cfg.printer_uri.trim()
+                        )
+                    };
+                    let task = IoTaskPool::get().spawn(async move {
+                        upload_gcode_to_moonraker(
+                            &net_cfg,
+                            &upload_filename,
+                            gcode_bytes,
+                            start_print,
+                        )
+                    });
+                    moonraker_state.pending_upload_task = Some(task);
                 }
             }
         });

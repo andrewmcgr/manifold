@@ -8,6 +8,7 @@ pub mod gcode;
 pub mod gpu_compute;
 pub mod hull;
 pub mod io;
+pub mod moonraker;
 pub mod presets;
 pub mod scene;
 pub mod surface_ui;
@@ -93,6 +94,7 @@ fn main() {
         .init_resource::<BuildPlateState>()
         .init_resource::<FieldVisualizationState>()
         .init_resource::<calibration::CalibrationUiState>()
+        .init_resource::<moonraker::MoonrakerUiState>()
         .init_resource::<surface_ui::SurfaceUiState>()
         .add_systems(
             Startup,
