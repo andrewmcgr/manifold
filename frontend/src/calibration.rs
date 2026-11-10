@@ -1,11 +1,12 @@
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{NozzleFrame, SlicerConfig};
+use crate::config::{FiveAxisKinematicsMode, GcodeDialect, NozzleFrame, SlicerConfig};
 use crate::gcode::{
-    compute_exclude_object_polygon_2d, expand_gcode_template, format_exclude_object_define,
-    format_moonraker_estimated_time, render_toolpath_preview_thumbnails, sanitize_exclude_object_name,
-    PlannedGcodeResult, PlannedLayerGcode, PlannedMoveKind, PlannedSegment,
+    compute_exclude_object_polygon_2d, expand_gcode_template, format_accel_limit_cmd,
+    format_exclude_object_define, format_moonraker_estimated_time, format_pressure_advance_cmd,
+    render_toolpath_preview_thumbnails, sanitize_exclude_object_name, PlannedGcodeResult,
+    PlannedLayerGcode, PlannedMoveKind, PlannedSegment,
 };
 
 /// Top-level calibration utility category.
@@ -624,6 +625,12 @@ impl<'a> LayerSegmentBuilder<'a> {
         };
 
         let z_axis = self.basis.frame.nozzle_axis;
+        let (b_deg, c_deg, _) = self.config.machine.nozzle_axis_to_bc_deg(
+            z_axis,
+            0.0,
+            self.config.machine.c_zero_offset_deg,
+            90.0,
+        );
         if use_zhop {
             let hop = gcfg.z_hop_mm;
             let p_lift = prev_bed + z_axis * hop;
@@ -643,6 +650,10 @@ impl<'a> LayerSegmentBuilder<'a> {
                 nozzle_local_1: z_axis,
                 nozzle_bed_0: z_axis,
                 nozzle_bed_1: z_axis,
+                b0_deg: b_deg,
+                c0_deg: c_deg,
+                b1_deg: b_deg,
+                c1_deg: c_deg,
                 kind: PlannedMoveKind::ZHop,
                 tool_id: self.basis.tool_id,
                 wall_index: 0,
@@ -674,6 +685,10 @@ impl<'a> LayerSegmentBuilder<'a> {
                 nozzle_local_1: z_axis,
                 nozzle_bed_0: z_axis,
                 nozzle_bed_1: z_axis,
+                b0_deg: b_deg,
+                c0_deg: c_deg,
+                b1_deg: b_deg,
+                c1_deg: c_deg,
                 kind: PlannedMoveKind::Travel,
                 tool_id: self.basis.tool_id,
                 wall_index: 0,
@@ -704,6 +719,10 @@ impl<'a> LayerSegmentBuilder<'a> {
                 nozzle_local_1: z_axis,
                 nozzle_bed_0: z_axis,
                 nozzle_bed_1: z_axis,
+                b0_deg: b_deg,
+                c0_deg: c_deg,
+                b1_deg: b_deg,
+                c1_deg: c_deg,
                 kind: PlannedMoveKind::ZHop,
                 tool_id: self.basis.tool_id,
                 wall_index: 0,
@@ -736,6 +755,10 @@ impl<'a> LayerSegmentBuilder<'a> {
                 nozzle_local_1: z_axis,
                 nozzle_bed_0: z_axis,
                 nozzle_bed_1: z_axis,
+                b0_deg: b_deg,
+                c0_deg: c_deg,
+                b1_deg: b_deg,
+                c1_deg: c_deg,
                 kind: PlannedMoveKind::Travel,
                 tool_id: self.basis.tool_id,
                 wall_index: 0,
@@ -805,6 +828,12 @@ impl<'a> LayerSegmentBuilder<'a> {
         let z_nozzle = self
             .basis
             .query_nozzle_axis_for_segment(p0_bed, p1_bed, self.config);
+        let (b_deg, c_deg, _) = self.config.machine.nozzle_axis_to_bc_deg(
+            z_nozzle,
+            0.0,
+            self.config.machine.c_zero_offset_deg,
+            90.0,
+        );
 
         self.segments.push(PlannedSegment {
             p0_local: p0_bed - self.basis.scene_to_gcode_offset,
@@ -815,6 +844,10 @@ impl<'a> LayerSegmentBuilder<'a> {
             nozzle_local_1: z_nozzle,
             nozzle_bed_0: z_nozzle,
             nozzle_bed_1: z_nozzle,
+            b0_deg: b_deg,
+            c0_deg: c_deg,
+            b1_deg: b_deg,
+            c1_deg: c_deg,
             kind,
             tool_id: self.basis.tool_id,
             wall_index,
@@ -1092,12 +1125,19 @@ fn finalize_calibration_gcode_result(
         ));
     }
     if gcfg.emit_exclude_object {
-        gcode.push_str(&format_exclude_object_define(
-            &exclude_object_name,
-            exclude_object_center_bed,
-            &exclude_object_polygon_bed,
-        ));
-        gcode.push('\n');
+        match gcfg.gcode_dialect {
+            GcodeDialect::Klipper => {
+                gcode.push_str(&format_exclude_object_define(
+                    &exclude_object_name,
+                    exclude_object_center_bed,
+                    &exclude_object_polygon_bed,
+                ));
+                gcode.push('\n');
+            }
+            GcodeDialect::RepRapFirmware => {
+                gcode.push_str("M486 T1 ; RepRapFirmware object cancellation count\n");
+            }
+        }
     }
 
     let start_expanded = expand_gcode_template(
@@ -1115,18 +1155,34 @@ fn finalize_calibration_gcode_result(
         gcode.push('\n');
     }
     if !gcfg.start_gcode_template.contains("{tool_id}") {
-        gcode.push_str(&format!(
-            "M104 S{:.0} T{} ; Set calibration tool temperature\nT{} ; Select calibration tool ({})\nM109 S{:.0} T{} ; Wait for calibration tool temperature\n",
-            basis.nozzle_temp_c,
-            basis.tool_id,
-            basis.tool_id,
-            basis.tool_name,
-            basis.nozzle_temp_c,
-            basis.tool_id,
-        ));
+        match gcfg.gcode_dialect {
+            GcodeDialect::Klipper => {
+                gcode.push_str(&format!(
+                    "M104 S{:.0} T{} ; Set calibration tool temperature\nT{} ; Select calibration tool ({})\nM109 S{:.0} T{} ; Wait for calibration tool temperature\n",
+                    basis.nozzle_temp_c,
+                    basis.tool_id,
+                    basis.tool_id,
+                    basis.tool_name,
+                    basis.nozzle_temp_c,
+                    basis.tool_id,
+                ));
+            }
+            GcodeDialect::RepRapFirmware => {
+                gcode.push_str(&format!(
+                    "M568 P{} S{:.0} R{:.0} A2 ; Set calibration tool temperature\nT{} ; Select calibration tool ({})\nM116 P{} ; Wait for calibration tool temperature\n",
+                    basis.tool_id,
+                    basis.nozzle_temp_c,
+                    basis.nozzle_temp_c,
+                    basis.tool_id,
+                    basis.tool_name,
+                    basis.tool_id,
+                ));
+            }
+        }
     }
     gcode.push_str("M83 ; Ensure relative extrusion\n");
 
+    let is_five_axis = config.machine.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC;
     let mut emitted_accel = -1.0f32;
     let mut emitted_feed_mm_min = -1.0f32;
     let mut emitted_pa = -1.0f32;
@@ -1160,7 +1216,14 @@ fn finalize_calibration_gcode_result(
             layer.layer_index, layer.isovalue, layer_max_z, layer_mean_h
         ));
         if gcfg.emit_exclude_object {
-            gcode.push_str(&format!("EXCLUDE_OBJECT_START NAME={exclude_object_name}\n"));
+            match gcfg.gcode_dialect {
+                GcodeDialect::Klipper => {
+                    gcode.push_str(&format!("EXCLUDE_OBJECT_START NAME={exclude_object_name}\n"));
+                }
+                GcodeDialect::RepRapFirmware => {
+                    gcode.push_str(&format!("M486 S0 A\"{exclude_object_name}\"\n"));
+                }
+            }
         }
 
         let layer_base_fan_pct = if (layer_ord as u32) < gcfg.disable_fan_first_layers {
@@ -1211,10 +1274,12 @@ fn finalize_calibration_gcode_result(
                 || emitted_accel <= 0.0
                 || ((seg.accel_mms2 - emitted_accel).abs() / emitted_accel.max(1.0)) >= 0.05
             {
-                gcode.push_str(&format!(
-                    "SET_VELOCITY_LIMIT ACCEL={:.0}\n",
-                    seg.accel_mms2
+                gcode.push_str(&format_accel_limit_cmd(
+                    gcfg.gcode_dialect,
+                    seg.accel_mms2,
+                    gcfg.travel_accel_mms2,
                 ));
+                gcode.push('\n');
                 emitted_accel = seg.accel_mms2;
             }
 
@@ -1245,10 +1310,12 @@ fn finalize_calibration_gcode_result(
                     0.002
                 };
                 if emitted_pa < 0.0 || (seg.pressure_advance_s - emitted_pa).abs() >= pa_tol {
-                    gcode.push_str(&format!(
-                        "SET_PRESSURE_ADVANCE ADVANCE={:.5}\n",
-                        seg.pressure_advance_s
+                    gcode.push_str(&format_pressure_advance_cmd(
+                        gcfg.gcode_dialect,
+                        basis.tool_id,
+                        seg.pressure_advance_s,
                     ));
+                    gcode.push('\n');
                     emitted_pa = seg.pressure_advance_s;
                 }
 
@@ -1257,10 +1324,34 @@ fn finalize_calibration_gcode_result(
                 e_rounding_residual_mm = e_desired - e_emitted;
 
                 let feed_mm_min = (seg.cruise_speed_mms * 60.0).max(30.0);
-                if kind_changed
+                let emit_f = kind_changed
                     || emitted_feed_mm_min <= 0.0
-                    || (feed_mm_min - emitted_feed_mm_min).abs() >= 6.0
-                {
+                    || (feed_mm_min - emitted_feed_mm_min).abs() >= 6.0;
+                if is_five_axis {
+                    if emit_f {
+                        gcode.push_str(&format!(
+                            "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6} F{:.1}\n",
+                            seg.p1_bed.x,
+                            seg.p1_bed.y,
+                            seg.p1_bed.z,
+                            seg.b1_deg,
+                            seg.c1_deg,
+                            e_emitted,
+                            feed_mm_min
+                        ));
+                        emitted_feed_mm_min = feed_mm_min;
+                    } else {
+                        gcode.push_str(&format!(
+                            "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6}\n",
+                            seg.p1_bed.x,
+                            seg.p1_bed.y,
+                            seg.p1_bed.z,
+                            seg.b1_deg,
+                            seg.c1_deg,
+                            e_emitted
+                        ));
+                    }
+                } else if emit_f {
                     gcode.push_str(&format!(
                         "G1 X{:.4} Y{:.4} Z{:.4} E{:.6} F{:.1}\n",
                         seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, e_emitted, feed_mm_min
@@ -1275,17 +1366,36 @@ fn finalize_calibration_gcode_result(
             } else {
                 travel_move_count += 1;
                 let feed_mm_min = (seg.cruise_speed_mms * 60.0).max(60.0);
-                gcode.push_str(&format!(
-                    "G0 X{:.4} Y{:.4} Z{:.4} F{:.1}\n",
-                    seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, feed_mm_min
-                ));
+                if is_five_axis {
+                    gcode.push_str(&format!(
+                        "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} F{:.1}\n",
+                        seg.p1_bed.x,
+                        seg.p1_bed.y,
+                        seg.p1_bed.z,
+                        seg.b1_deg,
+                        seg.c1_deg,
+                        feed_mm_min
+                    ));
+                } else {
+                    gcode.push_str(&format!(
+                        "G0 X{:.4} Y{:.4} Z{:.4} F{:.1}\n",
+                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, feed_mm_min
+                    ));
+                }
                 emitted_feed_mm_min = feed_mm_min;
             }
             last_emitted_kind = Some(seg.kind);
         }
 
         if gcfg.emit_exclude_object {
-            gcode.push_str(&format!("EXCLUDE_OBJECT_END NAME={exclude_object_name}\n"));
+            match gcfg.gcode_dialect {
+                GcodeDialect::Klipper => {
+                    gcode.push_str(&format!("EXCLUDE_OBJECT_END NAME={exclude_object_name}\n"));
+                }
+                GcodeDialect::RepRapFirmware => {
+                    gcode.push_str("M486 S-1\n");
+                }
+            }
         }
     }
 

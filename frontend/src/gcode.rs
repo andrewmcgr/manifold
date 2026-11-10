@@ -1,7 +1,34 @@
 use bevy::prelude::*;
 
 use crate::bridge::ffi::ObjectToolpathsResult;
-use crate::config::{GcodeProcessConfig, SlicerConfig, WallPrintOrder};
+use crate::config::{
+    FiveAxisKinematicsMode, GcodeDialect, GcodeProcessConfig, MachineKinematicsConfig,
+    SlicerConfig, WallPrintOrder,
+};
+
+/// Formats a firmware-specific dynamic Pressure Advance command for `dialect`.
+#[inline]
+pub fn format_pressure_advance_cmd(dialect: GcodeDialect, tool_id: u32, pa_s: f32) -> String {
+    match dialect {
+        GcodeDialect::Klipper => format!("SET_PRESSURE_ADVANCE ADVANCE={pa_s:.5}\n"),
+        GcodeDialect::RepRapFirmware => format!("M572 D{tool_id} S{pa_s:.4}\n"),
+    }
+}
+
+/// Formats a firmware-specific acceleration limit command for `dialect`.
+#[inline]
+pub fn format_accel_limit_cmd(
+    dialect: GcodeDialect,
+    print_accel_mms2: f32,
+    travel_accel_mms2: f32,
+) -> String {
+    match dialect {
+        GcodeDialect::Klipper => format!("SET_VELOCITY_LIMIT ACCEL={print_accel_mms2:.0}\n"),
+        GcodeDialect::RepRapFirmware => {
+            format!("M204 P{print_accel_mms2:.0} T{travel_accel_mms2:.0}\n")
+        }
+    }
+}
 
 /// Classification of each planned G-code segment for kinematics, emission, and 3D visualization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +127,11 @@ pub struct PlannedSegment {
     /// Local nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$ in bed coordinates at endpoints.
     pub nozzle_bed_0: Vec3,
     pub nozzle_bed_1: Vec3,
+    /// Start and end 5-axis polar tilt `B` and azimuthal rotation `C` angles (degrees).
+    pub b0_deg: f32,
+    pub c0_deg: f32,
+    pub b1_deg: f32,
+    pub c1_deg: f32,
     pub kind: PlannedMoveKind,
     /// Extruder tool ID (`T{tool_id}`, e.g. `0` for `T0`, `1` for `T1`) assigned to this segment.
     pub tool_id: u32,
@@ -468,6 +500,100 @@ fn simplify_working_chain(chain: &mut WorkingChain, tol_mm: f32) {
         }
     } else {
         chain.pts = rdp_simplify_open(&chain.pts, tol_sq);
+    }
+}
+
+/// Smooths per-vertex nozzle orientation vectors (`nozzle_bed`) along a `WorkingChain` using
+/// a triangular arc-length kernel over `window_mm`, and clamps the polar tilt from `up_bed`
+/// to `max_tilt_deg`. Prevents mesh-facet normal noise from causing 5-axis `B`/`C` jitter.
+fn smooth_chain_nozzle_orientations(
+    chain: &mut WorkingChain,
+    window_mm: f32,
+    max_tilt_deg: f32,
+    up_bed: Vec3,
+) {
+    let n = chain.pts.len();
+    if n == 0 {
+        return;
+    }
+    let up = up_bed.try_normalize().unwrap_or(Vec3::Z);
+    let max_tilt_rad = max_tilt_deg.clamp(0.0, 120.0).to_radians();
+
+    let clamp_to_cone = |raw_dir: Vec3| -> Vec3 {
+        let dir = raw_dir.try_normalize().unwrap_or(up);
+        let cos_theta = dir.dot(up).clamp(-1.0, 1.0);
+        let theta = cos_theta.acos();
+        if theta <= max_tilt_rad {
+            dir
+        } else if max_tilt_rad <= 1.0e-5 {
+            up
+        } else {
+            let perp = (dir - up * cos_theta).try_normalize().unwrap_or(Vec3::X);
+            (up * max_tilt_rad.cos() + perp * max_tilt_rad.sin())
+                .try_normalize()
+                .unwrap_or(up)
+        }
+    };
+
+    if n < 3 || window_mm <= 1.0e-3 {
+        for pt in &mut chain.pts {
+            pt.nozzle_bed = clamp_to_cone(pt.nozzle_bed);
+        }
+        return;
+    }
+
+    let is_closed = chain.is_closed;
+    let mut smoothed = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut accum = chain.pts[i].nozzle_bed.try_normalize().unwrap_or(up);
+
+        // Walk backward along the chain up to `window_mm`
+        let mut dist_back = 0.0f32;
+        let mut curr_idx = i;
+        for _ in 0..n.saturating_sub(1) {
+            let prev_idx = if curr_idx > 0 {
+                curr_idx - 1
+            } else if is_closed {
+                n - 1
+            } else {
+                break;
+            };
+            let step_len = (chain.pts[curr_idx].pos_bed - chain.pts[prev_idx].pos_bed).length();
+            dist_back += step_len;
+            if dist_back >= window_mm {
+                break;
+            }
+            let w = (1.0 - dist_back / window_mm).max(0.0);
+            accum += chain.pts[prev_idx].nozzle_bed.try_normalize().unwrap_or(up) * w;
+            curr_idx = prev_idx;
+        }
+
+        // Walk forward along the chain up to `window_mm`
+        let mut dist_fwd = 0.0f32;
+        curr_idx = i;
+        for _ in 0..n.saturating_sub(1) {
+            let next_idx = if curr_idx + 1 < n {
+                curr_idx + 1
+            } else if is_closed {
+                0
+            } else {
+                break;
+            };
+            let step_len = (chain.pts[next_idx].pos_bed - chain.pts[curr_idx].pos_bed).length();
+            dist_fwd += step_len;
+            if dist_fwd >= window_mm {
+                break;
+            }
+            let w = (1.0 - dist_fwd / window_mm).max(0.0);
+            accum += chain.pts[next_idx].nozzle_bed.try_normalize().unwrap_or(up) * w;
+            curr_idx = next_idx;
+        }
+
+        smoothed.push(clamp_to_cone(accum));
+    }
+
+    for (pt, dir) in chain.pts.iter_mut().zip(smoothed.into_iter()) {
+        pt.nozzle_bed = dir;
     }
 }
 
@@ -987,8 +1113,9 @@ fn finalize_chain_seam_and_wipe(chain: &WorkingChain, cfg: &GcodeProcessConfig) 
     out
 }
 
-/// Subdivides long non-planar segments (> 2.5 mm) where nozzle orientation or Z changes,
-/// ensuring downstream flow and inclination math accurately tracks curved surfaces.
+/// Subdivides long non-planar segments (> 2.5 mm, or > 0.6 mm when nozzle axis rotates > ~2°)
+/// where nozzle orientation or Z changes, ensuring downstream 5-axis `(B, C)` IK, flow, and
+/// inclination math accurately track curved conformal surfaces.
 fn subdivide_long_segments(pts: Vec<WorkingVertex>) -> Vec<WorkingVertex> {
     if pts.len() < 2 {
         return pts;
@@ -1000,11 +1127,16 @@ fn subdivide_long_segments(pts: Vec<WorkingVertex>) -> Vec<WorkingVertex> {
         let a = &w[0];
         let b = &w[1];
         let len = (b.pos_bed - a.pos_bed).length();
-        let n_dot = a.nozzle_bed.dot(b.nozzle_bed);
+        let n_dot = a.nozzle_bed.dot(b.nozzle_bed).clamp(-1.0, 1.0);
         let h_diff = (b.height_mm - a.height_mm).abs();
+        let angle_deg = n_dot.acos().to_degrees();
 
-        if len > 2.5 && (len > 6.0 || n_dot < 0.998 || h_diff > 0.02) {
-            let steps = ((len / 2.5).ceil() as usize).clamp(2, 16);
+        let needs_subdiv = (len > 2.5 && (len > 6.0 || n_dot < 0.998 || h_diff > 0.02))
+            || (len > 0.6 && angle_deg > 2.0);
+        if needs_subdiv {
+            let steps_len = (len / 2.5).ceil() as usize;
+            let steps_ang = (angle_deg / 2.0).ceil() as usize;
+            let steps = steps_len.max(steps_ang).clamp(2, 16);
             for s in 1..steps {
                 let t = (s as f32) / (steps as f32);
                 out.push(WorkingVertex {
@@ -1020,6 +1152,146 @@ fn subdivide_long_segments(pts: Vec<WorkingVertex>) -> Vec<WorkingVertex> {
         out.push(b.clone());
     }
     out
+}
+
+/// Assigns continuous 5-axis `(B, C)` rotary postures (`b0_deg`, `c0_deg`, `b1_deg`, `c1_deg`)
+/// to each `PlannedSegment` and couples rotary speed/acceleration limits into `nominal_speed_mms`
+/// and `accel_mms2` when `FiveAxisKinematicsMode::FiveAxisBC` is active.
+///
+/// Includes **zenith azimuth lookahead pre-positioning**: when traveling at $B \approx 0^\circ$
+/// before a tilted extrusion path, `C` rotates to the upcoming path's entry azimuth during the
+/// non-extruding `Travel` move so `C` is already aligned when the nozzle touches down.
+pub(crate) fn assign_five_axis_bc_postures_and_rotary_limits(
+    segments: &mut [PlannedSegment],
+    machine: &MachineKinematicsConfig,
+    max_tool_tilt_deg: f32,
+    curr_b_deg: &mut f32,
+    curr_c_deg: &mut f32,
+) {
+    let n = segments.len();
+    if n == 0 {
+        return;
+    }
+    let is_five_axis = machine.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC;
+    let max_b_spd = machine.max_b_speed_deg_s.max(1.0);
+    let max_c_spd = machine.max_c_speed_deg_s.max(1.0);
+    let max_b_acc = machine.b_accel_deg_s2.max(10.0);
+    let max_c_acc = machine.c_accel_deg_s2.max(10.0);
+
+    for i in 0..n {
+        let mut solved_by_lookahead = false;
+        // Zenith azimuth lookahead pre-positioning during non-extruding Travel moves:
+        // If we are on a Travel move and the nozzle is vertical (B ~ 0), look ahead to the
+        // first tilted extruding segment and pre-align C during the Travel move.
+        if segments[i].kind == PlannedMoveKind::Travel {
+            let (b_start_check, _, _) = machine.nozzle_axis_to_bc_deg(
+                segments[i].nozzle_bed_0,
+                *curr_b_deg,
+                *curr_c_deg,
+                max_tool_tilt_deg,
+            );
+            if b_start_check.abs() < 0.25 {
+                for future in &segments[(i + 1)..n] {
+                    if future.kind.is_extruding() {
+                        let (b_fut0, c_fut0, _) = machine.nozzle_axis_to_bc_deg(
+                            future.nozzle_bed_0,
+                            *curr_b_deg,
+                            *curr_c_deg,
+                            max_tool_tilt_deg,
+                        );
+                        if b_fut0.abs() >= 0.25 {
+                            let b0 = *curr_b_deg;
+                            let c0 = *curr_c_deg;
+                            let (b1, _, _) = machine.nozzle_axis_to_bc_deg(
+                                segments[i].nozzle_bed_1,
+                                b0,
+                                c_fut0,
+                                max_tool_tilt_deg,
+                            );
+                            let c1 = c_fut0;
+                            segments[i].b0_deg = b0;
+                            segments[i].c0_deg = c0;
+                            segments[i].b1_deg = b1;
+                            segments[i].c1_deg = c1;
+                            *curr_b_deg = b1;
+                            *curr_c_deg = c1;
+                            solved_by_lookahead = true;
+                            break;
+                        }
+                        let (b_fut1, c_fut1, _) = machine.nozzle_axis_to_bc_deg(
+                            future.nozzle_bed_1,
+                            *curr_b_deg,
+                            *curr_c_deg,
+                            max_tool_tilt_deg,
+                        );
+                        if b_fut1.abs() >= 0.25 {
+                            let b0 = *curr_b_deg;
+                            let c0 = *curr_c_deg;
+                            let (b1, _, _) = machine.nozzle_axis_to_bc_deg(
+                                segments[i].nozzle_bed_1,
+                                b0,
+                                c_fut1,
+                                max_tool_tilt_deg,
+                            );
+                            let c1 = c_fut1;
+                            segments[i].b0_deg = b0;
+                            segments[i].c0_deg = c0;
+                            segments[i].b1_deg = b1;
+                            segments[i].c1_deg = c1;
+                            *curr_b_deg = b1;
+                            *curr_c_deg = c1;
+                            solved_by_lookahead = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Standard endpoint IK if not already populated by zenith lookahead above
+        if !solved_by_lookahead {
+            let b0 = *curr_b_deg;
+            let c0 = *curr_c_deg;
+            let (b1, c1, _) = machine.nozzle_axis_to_bc_deg(
+                segments[i].nozzle_bed_1,
+                b0,
+                c0,
+                max_tool_tilt_deg,
+            );
+            segments[i].b0_deg = b0;
+            segments[i].c0_deg = c0;
+            segments[i].b1_deg = b1;
+            segments[i].c1_deg = c1;
+            *curr_b_deg = b1;
+            *curr_c_deg = c1;
+        }
+
+        if is_five_axis {
+            let seg = &mut segments[i];
+            let db = (seg.b1_deg - seg.b0_deg).abs();
+            let dc = (seg.c1_deg - seg.c0_deg).abs();
+            if db > 1.0e-4 || dc > 1.0e-4 {
+                let t_rot_spd = (db / max_b_spd).max(dc / max_c_spd);
+                if t_rot_spd > 1.0e-5 {
+                    let v_rot_cap = (seg.length_mm / t_rot_spd).max(0.5);
+                    seg.nominal_speed_mms = seg.nominal_speed_mms.min(v_rot_cap);
+                    seg.cruise_speed_mms = seg.cruise_speed_mms.min(seg.nominal_speed_mms);
+                    seg.duration_s = seg
+                        .duration_s
+                        .max(t_rot_spd)
+                        .max((seg.length_mm / seg.nominal_speed_mms.max(0.5)).max(1.0e-4));
+                }
+                if db > 0.05 {
+                    let a_b_lin = (max_b_acc * (seg.length_mm / db)).max(50.0);
+                    seg.accel_mms2 = seg.accel_mms2.min(a_b_lin);
+                }
+                if dc > 0.05 {
+                    let a_c_lin = (max_c_acc * (seg.length_mm / dc)).max(50.0);
+                    seg.accel_mms2 = seg.accel_mms2.min(a_c_lin);
+                }
+            }
+        }
+    }
 }
 
 /// Computes Klipper's Square Corner Velocity junction speed $v_{\text{corner}}$ ($\text{mm/s}$)
@@ -1265,6 +1537,10 @@ fn subdivide_segments_for_slicer_pa(
             sub.p1_local = seg.p0_local.lerp(seg.p1_local, t1);
             sub.p0_bed = seg.p0_bed.lerp(seg.p1_bed, t0);
             sub.p1_bed = seg.p0_bed.lerp(seg.p1_bed, t1);
+            sub.b0_deg = seg.b0_deg + t0 * (seg.b1_deg - seg.b0_deg);
+            sub.b1_deg = seg.b0_deg + t1 * (seg.b1_deg - seg.b0_deg);
+            sub.c0_deg = seg.c0_deg + t0 * (seg.c1_deg - seg.c0_deg);
+            sub.c1_deg = seg.c0_deg + t1 * (seg.c1_deg - seg.c0_deg);
             sub.length_mm = sub_len;
             sub.entry_speed_mms = v0;
             sub.cruise_speed_mms = seg.cruise_speed_mms;
@@ -1876,6 +2152,8 @@ pub fn plan_and_emit_gcode_for_object(
 ) -> PlannedGcodeResult {
     let mut gcfg = config.gcode.clone();
     gcfg.sanitize();
+    let mut mcfg = config.machine.clone();
+    mcfg.sanitize();
 
     let active_tool = config.active_tool();
     let tool_id = active_tool.map(|t| t.id).unwrap_or(0);
@@ -1886,6 +2164,19 @@ pub fn plan_and_emit_gcode_for_object(
     let nozzle_temp_c = active_tool
         .map(|t| t.temperature_celsius)
         .unwrap_or(215.0);
+    let is_five_axis_bc = mcfg.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC;
+    let max_bs_bound = mcfg.b_min_deg.abs().max(mcfg.b_max_deg.abs());
+    let max_tool_tilt_deg = active_tool
+        .map(|t| {
+            if t.has_rotational_axes {
+                t.max_angle_from_bed_normal_deg
+            } else if is_five_axis_bc {
+                max_bs_bound
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(if is_five_axis_bc { max_bs_bound } else { 45.0 });
 
     let support_tool = config.support_tool();
     let support_tool_id = support_tool.map(|t| t.id).unwrap_or(tool_id);
@@ -1896,6 +2187,17 @@ pub fn plan_and_emit_gcode_for_object(
     let support_nozzle_temp_c = support_tool
         .map(|t| t.temperature_celsius)
         .unwrap_or(nozzle_temp_c);
+    let support_max_tool_tilt_deg = support_tool
+        .map(|t| {
+            if t.has_rotational_axes {
+                t.max_angle_from_bed_normal_deg
+            } else if is_five_axis_bc {
+                max_bs_bound
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(max_tool_tilt_deg);
 
     // Query gravity direction in bed coordinates (AGENTS.md Rule 2: never hardcode -Z!)
     let gravity_bed = config.query_gravity_bed(Vec3::ZERO);
@@ -1925,6 +2227,8 @@ pub fn plan_and_emit_gcode_for_object(
     let mut curr_nozzle_axis_bed = Vec3::from_array(config.machine.nozzle_axis_bed)
         .try_normalize()
         .unwrap_or(up_bed);
+    let mut curr_b_deg = 0.0f32;
+    let mut curr_c_deg = mcfg.c_zero_offset_deg;
     let mut curr_planned_tool_id = tool_id;
     let mut curr_planned_is_support = false;
 
@@ -1975,12 +2279,23 @@ pub fn plan_and_emit_gcode_for_object(
             } else {
                 nozzle_diam_mm
             };
+            let chain_max_tilt_deg = if base_kind.is_support() {
+                support_max_tool_tilt_deg
+            } else {
+                max_tool_tilt_deg
+            };
             let chain_fluid = if base_kind.is_support() {
                 &support_fluid
             } else {
                 &fluid
             };
             simplify_working_chain(&mut wc, 0.04 * chain_nozzle_diam);
+            smooth_chain_nozzle_orientations(
+                &mut wc,
+                mcfg.orientation_smoothing_window_mm,
+                chain_max_tilt_deg,
+                up_bed,
+            );
             let nom_spd = if is_first_layer {
                 gcfg.first_layer_speed_mms
             } else {
@@ -2082,6 +2397,10 @@ pub fn plan_and_emit_gcode_for_object(
                             nozzle_local_1: to_local_dir(curr_nozzle_axis_bed),
                             nozzle_bed_0: curr_nozzle_axis_bed,
                             nozzle_bed_1: curr_nozzle_axis_bed,
+                            b0_deg: 0.0,
+                            c0_deg: 0.0,
+                            b1_deg: 0.0,
+                            c1_deg: 0.0,
                             kind: PlannedMoveKind::ZHop,
                             tool_id: curr_planned_tool_id,
                             wall_index: 0,
@@ -2114,6 +2433,10 @@ pub fn plan_and_emit_gcode_for_object(
                             nozzle_local_1: to_local_dir(chain_start_nozzle),
                             nozzle_bed_0: curr_nozzle_axis_bed,
                             nozzle_bed_1: chain_start_nozzle,
+                            b0_deg: 0.0,
+                            c0_deg: 0.0,
+                            b1_deg: 0.0,
+                            c1_deg: 0.0,
                             kind: PlannedMoveKind::Travel,
                             tool_id: chain_tool_id,
                             wall_index: 0,
@@ -2145,6 +2468,10 @@ pub fn plan_and_emit_gcode_for_object(
                             nozzle_local_1: to_local_dir(chain_start_nozzle),
                             nozzle_bed_0: chain_start_nozzle,
                             nozzle_bed_1: chain_start_nozzle,
+                            b0_deg: 0.0,
+                            c0_deg: 0.0,
+                            b1_deg: 0.0,
+                            c1_deg: 0.0,
                             kind: PlannedMoveKind::ZHop,
                             tool_id: chain_tool_id,
                             wall_index: 0,
@@ -2180,6 +2507,10 @@ pub fn plan_and_emit_gcode_for_object(
                             nozzle_local_1: to_local_dir(chain_start_nozzle),
                             nozzle_bed_0: curr_nozzle_axis_bed,
                             nozzle_bed_1: chain_start_nozzle,
+                            b0_deg: 0.0,
+                            c0_deg: 0.0,
+                            b1_deg: 0.0,
+                            c1_deg: 0.0,
                             kind: PlannedMoveKind::Travel,
                             tool_id: chain_tool_id,
                             wall_index: 0,
@@ -2366,6 +2697,10 @@ pub fn plan_and_emit_gcode_for_object(
                         nozzle_local_1: to_local_dir(b.nozzle_bed),
                         nozzle_bed_0: a.nozzle_bed,
                         nozzle_bed_1: b.nozzle_bed,
+                        b0_deg: 0.0,
+                        c0_deg: 0.0,
+                        b1_deg: 0.0,
+                        c1_deg: 0.0,
                         kind,
                         tool_id: chain_tool_id,
                         wall_index: chain.wall_index,
@@ -2400,6 +2735,10 @@ pub fn plan_and_emit_gcode_for_object(
                         nozzle_local_1: to_local_dir(b.nozzle_bed),
                         nozzle_bed_0: a.nozzle_bed,
                         nozzle_bed_1: b.nozzle_bed,
+                        b0_deg: 0.0,
+                        c0_deg: 0.0,
+                        b1_deg: 0.0,
+                        c1_deg: 0.0,
                         kind: PlannedMoveKind::Wipe,
                         tool_id: chain_tool_id,
                         wall_index: chain.wall_index,
@@ -2520,7 +2859,14 @@ pub fn plan_and_emit_gcode_for_object(
             }
         }
 
-        // 4. Chained Cross-Path Velocity Lookahead on this layer
+        // 4. Solve 5-Axis B/C postures, rotary velocity/accel throttling, and Chained Velocity Lookahead
+        assign_five_axis_bc_postures_and_rotary_limits(
+            &mut layer_segments,
+            &mcfg,
+            max_tool_tilt_deg,
+            &mut curr_b_deg,
+            &mut curr_c_deg,
+        );
         plan_velocity_lookahead(&mut layer_segments, &gcfg);
 
         planned_layers.push(PlannedLayerGcode {
@@ -2559,6 +2905,10 @@ pub fn plan_and_emit_gcode_for_object(
                 nozzle_local_1: last_ext.nozzle_local_1,
                 nozzle_bed_0: last_ext.nozzle_bed_1,
                 nozzle_bed_1: last_ext.nozzle_bed_1,
+                b0_deg: last_ext.b1_deg,
+                c0_deg: last_ext.c1_deg,
+                b1_deg: last_ext.b1_deg,
+                c1_deg: last_ext.c1_deg,
                 kind: PlannedMoveKind::Wipe,
                 tool_id: last_ext.tool_id,
                 wall_index: 0,
@@ -2589,6 +2939,10 @@ pub fn plan_and_emit_gcode_for_object(
                 nozzle_local_1: last_ext.nozzle_local_1,
                 nozzle_bed_0: last_ext.nozzle_bed_1,
                 nozzle_bed_1: last_ext.nozzle_bed_1,
+                b0_deg: last_ext.b1_deg,
+                c0_deg: last_ext.c1_deg,
+                b1_deg: last_ext.b1_deg,
+                c1_deg: last_ext.c1_deg,
                 kind: PlannedMoveKind::ZHop,
                 tool_id: last_ext.tool_id,
                 wall_index: 0,
@@ -2726,12 +3080,19 @@ pub fn plan_and_emit_gcode_for_object(
         ));
     }
     if gcfg.emit_exclude_object {
-        gcode.push_str(&format_exclude_object_define(
-            &exclude_object_name,
-            exclude_object_center_bed,
-            &exclude_object_polygon_bed,
-        ));
-        gcode.push('\n');
+        match gcfg.gcode_dialect {
+            GcodeDialect::Klipper => {
+                gcode.push_str(&format_exclude_object_define(
+                    &exclude_object_name,
+                    exclude_object_center_bed,
+                    &exclude_object_polygon_bed,
+                ));
+                gcode.push('\n');
+            }
+            GcodeDialect::RepRapFirmware => {
+                gcode.push_str("M486 T1 ; RepRapFirmware object cancellation count\n");
+            }
+        }
     }
     let start_expanded = expand_gcode_template(
         &gcfg.start_gcode_template,
@@ -2755,16 +3116,29 @@ pub fn plan_and_emit_gcode_for_object(
                 .any(|s| s.kind.is_support() && s.delta_e_mm > 1.0e-6)
         });
         if has_support_segs {
-            gcode.push_str(&format!(
-                "M104 S{support_nozzle_temp_c:.0} T{support_tool_id} ; Preheat support tool T{support_tool_id}\n"
-            ));
+            match gcfg.gcode_dialect {
+                GcodeDialect::Klipper => {
+                    gcode.push_str(&format!(
+                        "M104 S{support_nozzle_temp_c:.0} T{support_tool_id} ; Preheat support tool T{support_tool_id}\n"
+                    ));
+                }
+                GcodeDialect::RepRapFirmware => {
+                    gcode.push_str(&format!(
+                        "M568 P{support_tool_id} S{support_nozzle_temp_c:.0} R{support_nozzle_temp_c:.0} A2 ; Preheat support tool T{support_tool_id}\n"
+                    ));
+                }
+            }
         }
     }
     let init_pa_s = gcfg.pa_low_flow_s.max(0.0);
     gcode.push_str(&format!(
-        "SET_PRESSURE_ADVANCE ADVANCE={init_pa_s:.5} ; Initial Pressure Advance\n"
+        "{} ; Initial Pressure Advance\n",
+        format_pressure_advance_cmd(gcfg.gcode_dialect, tool_id, init_pa_s)
     ));
 
+    let is_five_axis = mcfg.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC;
+    let use_g93 = is_five_axis && mcfg.use_inverse_time_feedrate_g93;
+    let mut in_g93_mode = false;
     let mut emitted_accel = -1.0f32;
     let mut emitted_feed_mm_min = -1.0f32;
     let mut emitted_pa = init_pa_s;
@@ -2803,7 +3177,15 @@ pub fn plan_and_emit_gcode_for_object(
             layer.layer_index, layer.branch_id, layer.isovalue, layer_max_z, layer_mean_h
         ));
         if gcfg.emit_exclude_object {
-            gcode.push_str(&format!("EXCLUDE_OBJECT_START NAME={exclude_object_name}\n"));
+            match gcfg.gcode_dialect {
+                GcodeDialect::Klipper => {
+                    gcode.push_str(&format!("EXCLUDE_OBJECT_START NAME={exclude_object_name}\n"));
+                }
+                GcodeDialect::RepRapFirmware => {
+                    let obj_idx = object_id.saturating_sub(1);
+                    gcode.push_str(&format!("M486 S{obj_idx} A\"{exclude_object_name}\"\n"));
+                }
+            }
         }
 
         // Base layer part cooling fan duty cycle (`M107` or `M106 S0..255`)
@@ -2854,6 +3236,10 @@ pub fn plan_and_emit_gcode_for_object(
 
             // Emit retraction before non-extruding travel if scheduled
             if seg.retract_before_mm > 1.0e-4 && active_retract_mm <= 1.0e-4 {
+                if in_g93_mode {
+                    gcode.push_str("G94 ; Standard mm/min feedrate for retract\n");
+                    in_g93_mode = false;
+                }
                 let r_len = seg.retract_before_mm;
                 let r_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
                 gcode.push_str(&format!("G1 E-{r_len:.6} F{r_feed:.1} ; Retract\n"));
@@ -2867,6 +3253,10 @@ pub fn plan_and_emit_gcode_for_object(
             // Emit toolchange (`T{id}`) before resuming extrusion if the segment uses a different tool
             if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 && seg.tool_id != emitted_tool_id {
                 if active_retract_mm <= 1.0e-4 && gcfg.retract_length_mm > 1.0e-4 {
+                    if in_g93_mode {
+                        gcode.push_str("G94 ; Standard mm/min feedrate for retract\n");
+                        in_g93_mode = false;
+                    }
                     let r_len = gcfg.retract_length_mm;
                     let r_feed = (gcfg.retract_speed_mms * 60.0).max(60.0);
                     gcode.push_str(&format!(
@@ -2882,12 +3272,24 @@ pub fn plan_and_emit_gcode_for_object(
                 } else {
                     nozzle_temp_c
                 };
-                gcode.push_str(&format!(
-                    "M104 S{target_temp_c:.0} T{}\nT{} ; Switch tool ({})\n",
-                    seg.tool_id,
-                    seg.tool_id,
-                    seg.kind.label()
-                ));
+                match gcfg.gcode_dialect {
+                    GcodeDialect::Klipper => {
+                        gcode.push_str(&format!(
+                            "M104 S{target_temp_c:.0} T{}\nT{} ; Switch tool ({})\n",
+                            seg.tool_id,
+                            seg.tool_id,
+                            seg.kind.label()
+                        ));
+                    }
+                    GcodeDialect::RepRapFirmware => {
+                        gcode.push_str(&format!(
+                            "M568 P{} S{target_temp_c:.0} R{target_temp_c:.0} A2\nT{} ; Switch tool ({})\n",
+                            seg.tool_id,
+                            seg.tool_id,
+                            seg.kind.label()
+                        ));
+                    }
+                }
                 emitted_tool_id = seg.tool_id;
                 emitted_pa = -1.0;
                 emitted_feed_mm_min = -1.0;
@@ -2897,6 +3299,10 @@ pub fn plan_and_emit_gcode_for_object(
             if !seg.kind.is_extruding() || seg.delta_e_mm <= 1.0e-6 {
                 accum_travel_time_s += seg.duration_s;
             } else if active_retract_mm > 1.0e-4 {
+                if in_g93_mode {
+                    gcode.push_str("G94 ; Standard mm/min feedrate for unretract\n");
+                    in_g93_mode = false;
+                }
                 // Unretract before resuming extrusion (with thermal ooze / swell relaxation)
                 let seg_fluid = if seg.kind.is_support() {
                     &support_fluid
@@ -2913,7 +3319,7 @@ pub fn plan_and_emit_gcode_for_object(
                 total_time_s += u_len / gcfg.retract_speed_mms.max(1.0);
             }
 
-            // Deadband-compacted `SET_VELOCITY_LIMIT ACCEL=...`
+            // Deadband-compacted `SET_VELOCITY_LIMIT ACCEL=...` / `M204 P... T...`
             let kind_changed = last_emitted_kind != Some(seg.kind);
             if kind_changed && seg.kind.is_extruding() {
                 gcode.push_str(&format!("; TYPE:{}\n", seg.kind.label()));
@@ -2922,10 +3328,12 @@ pub fn plan_and_emit_gcode_for_object(
                 || emitted_accel <= 0.0
                 || ((seg.accel_mms2 - emitted_accel).abs() / emitted_accel.max(1.0)) >= 0.15
             {
-                gcode.push_str(&format!(
-                    "SET_VELOCITY_LIMIT ACCEL={:.0}\n",
-                    seg.accel_mms2
+                gcode.push_str(&format_accel_limit_cmd(
+                    gcfg.gcode_dialect,
+                    seg.accel_mms2,
+                    gcfg.travel_accel_mms2,
                 ));
+                gcode.push('\n');
                 emitted_accel = seg.accel_mms2;
             }
 
@@ -2957,10 +3365,12 @@ pub fn plan_and_emit_gcode_for_object(
                             / emitted_pa.max(0.005)
                             >= 0.08)
                 {
-                    gcode.push_str(&format!(
-                        "SET_PRESSURE_ADVANCE ADVANCE={:.5}\n",
-                        seg.pressure_advance_s
+                    gcode.push_str(&format_pressure_advance_cmd(
+                        gcfg.gcode_dialect,
+                        emitted_tool_id,
+                        seg.pressure_advance_s,
                     ));
+                    gcode.push('\n');
                     emitted_pa = seg.pressure_advance_s;
                 }
 
@@ -2969,46 +3379,137 @@ pub fn plan_and_emit_gcode_for_object(
                 let e_emitted = ((e_desired * 1_000_000.0).round() * 1.0e-6).max(0.0);
                 e_rounding_residual_mm = e_desired - e_emitted;
 
-                // Emit the feature's nominal target speed (`seg.nominal_speed_mms * 60.0`) so Klipper's
-                // native motion planner handles corner deceleration/acceleration smoothly without
-                // facet-by-facet feedrate stuttering.
-                let feed_mm_min = (seg.nominal_speed_mms * 60.0).max(30.0);
-                let emit_f = kind_changed
-                    || emitted_feed_mm_min <= 0.0
-                    || ((feed_mm_min - emitted_feed_mm_min).abs() / emitted_feed_mm_min.max(1.0))
-                        >= 0.05;
-
-                if emit_f {
+                if use_g93 {
+                    if !in_g93_mode {
+                        gcode.push_str("G93 ; Inverse-time feedrate mode (1/min)\n");
+                        in_g93_mode = true;
+                    }
+                    let inv_time_f = (60.0 / seg.duration_s.max(1.0e-4)).clamp(0.1, 600_000.0);
                     gcode.push_str(&format!(
-                        "G1 X{:.4} Y{:.4} Z{:.4} E{:.6} F{:.1}\n",
-                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, e_emitted, feed_mm_min
+                        "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6} F{:.2}\n",
+                        seg.p1_bed.x,
+                        seg.p1_bed.y,
+                        seg.p1_bed.z,
+                        seg.b1_deg,
+                        seg.c1_deg,
+                        e_emitted,
+                        inv_time_f
                     ));
-                    emitted_feed_mm_min = feed_mm_min;
+                    emitted_feed_mm_min = -1.0;
                 } else {
-                    gcode.push_str(&format!(
-                        "G1 X{:.4} Y{:.4} Z{:.4} E{:.6}\n",
-                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, e_emitted
-                    ));
+                    if in_g93_mode {
+                        gcode.push_str("G94 ; Standard mm/min feedrate mode\n");
+                        in_g93_mode = false;
+                    }
+                    // Emit the feature's nominal target speed (`seg.nominal_speed_mms * 60.0`) so the
+                    // native motion planner handles corner deceleration/acceleration smoothly without
+                    // facet-by-facet feedrate stuttering.
+                    let feed_mm_min = (seg.nominal_speed_mms * 60.0).max(30.0);
+                    let emit_f = kind_changed
+                        || emitted_feed_mm_min <= 0.0
+                        || ((feed_mm_min - emitted_feed_mm_min).abs() / emitted_feed_mm_min.max(1.0))
+                            >= 0.05;
+
+                    if is_five_axis {
+                        if emit_f {
+                            gcode.push_str(&format!(
+                                "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6} F{:.1}\n",
+                                seg.p1_bed.x,
+                                seg.p1_bed.y,
+                                seg.p1_bed.z,
+                                seg.b1_deg,
+                                seg.c1_deg,
+                                e_emitted,
+                                feed_mm_min
+                            ));
+                            emitted_feed_mm_min = feed_mm_min;
+                        } else {
+                            gcode.push_str(&format!(
+                                "G1 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} E{:.6}\n",
+                                seg.p1_bed.x,
+                                seg.p1_bed.y,
+                                seg.p1_bed.z,
+                                seg.b1_deg,
+                                seg.c1_deg,
+                                e_emitted
+                            ));
+                        }
+                    } else if emit_f {
+                        gcode.push_str(&format!(
+                            "G1 X{:.4} Y{:.4} Z{:.4} E{:.6} F{:.1}\n",
+                            seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, e_emitted, feed_mm_min
+                        ));
+                        emitted_feed_mm_min = feed_mm_min;
+                    } else {
+                        gcode.push_str(&format!(
+                            "G1 X{:.4} Y{:.4} Z{:.4} E{:.6}\n",
+                            seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, e_emitted
+                        ));
+                    }
                 }
             } else {
                 travel_move_count += 1;
-                let feed_mm_min = (seg.nominal_speed_mms * 60.0).max(60.0);
-                let emit_f = kind_changed
-                    || emitted_feed_mm_min <= 0.0
-                    || ((feed_mm_min - emitted_feed_mm_min).abs() / emitted_feed_mm_min.max(1.0))
-                        >= 0.05;
-
-                if emit_f {
+                if use_g93 {
+                    if !in_g93_mode {
+                        gcode.push_str("G93 ; Inverse-time feedrate mode (1/min)\n");
+                        in_g93_mode = true;
+                    }
+                    let inv_time_f = (60.0 / seg.duration_s.max(1.0e-4)).clamp(0.1, 600_000.0);
                     gcode.push_str(&format!(
-                        "G0 X{:.4} Y{:.4} Z{:.4} F{:.1}\n",
-                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, feed_mm_min
+                        "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} F{:.2}\n",
+                        seg.p1_bed.x,
+                        seg.p1_bed.y,
+                        seg.p1_bed.z,
+                        seg.b1_deg,
+                        seg.c1_deg,
+                        inv_time_f
                     ));
-                    emitted_feed_mm_min = feed_mm_min;
+                    emitted_feed_mm_min = -1.0;
                 } else {
-                    gcode.push_str(&format!(
-                        "G0 X{:.4} Y{:.4} Z{:.4}\n",
-                        seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z
-                    ));
+                    if in_g93_mode {
+                        gcode.push_str("G94 ; Standard mm/min feedrate mode\n");
+                        in_g93_mode = false;
+                    }
+                    let feed_mm_min = (seg.nominal_speed_mms * 60.0).max(60.0);
+                    let emit_f = kind_changed
+                        || emitted_feed_mm_min <= 0.0
+                        || ((feed_mm_min - emitted_feed_mm_min).abs() / emitted_feed_mm_min.max(1.0))
+                            >= 0.05;
+
+                    if is_five_axis {
+                        if emit_f {
+                            gcode.push_str(&format!(
+                                "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3} F{:.1}\n",
+                                seg.p1_bed.x,
+                                seg.p1_bed.y,
+                                seg.p1_bed.z,
+                                seg.b1_deg,
+                                seg.c1_deg,
+                                feed_mm_min
+                            ));
+                            emitted_feed_mm_min = feed_mm_min;
+                        } else {
+                            gcode.push_str(&format!(
+                                "G0 X{:.4} Y{:.4} Z{:.4} B{:.3} C{:.3}\n",
+                                seg.p1_bed.x,
+                                seg.p1_bed.y,
+                                seg.p1_bed.z,
+                                seg.b1_deg,
+                                seg.c1_deg
+                            ));
+                        }
+                    } else if emit_f {
+                        gcode.push_str(&format!(
+                            "G0 X{:.4} Y{:.4} Z{:.4} F{:.1}\n",
+                            seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z, feed_mm_min
+                        ));
+                        emitted_feed_mm_min = feed_mm_min;
+                    } else {
+                        gcode.push_str(&format!(
+                            "G0 X{:.4} Y{:.4} Z{:.4}\n",
+                            seg.p1_bed.x, seg.p1_bed.y, seg.p1_bed.z
+                        ));
+                    }
                 }
             }
 
@@ -3016,8 +3517,19 @@ pub fn plan_and_emit_gcode_for_object(
         }
 
         if gcfg.emit_exclude_object {
-            gcode.push_str(&format!("EXCLUDE_OBJECT_END NAME={exclude_object_name}\n"));
+            match gcfg.gcode_dialect {
+                GcodeDialect::Klipper => {
+                    gcode.push_str(&format!("EXCLUDE_OBJECT_END NAME={exclude_object_name}\n"));
+                }
+                GcodeDialect::RepRapFirmware => {
+                    gcode.push_str("M486 S-1\n");
+                }
+            }
         }
+    }
+
+    if in_g93_mode {
+        gcode.push_str("G94 ; Restore standard mm/min feedrate mode\n");
     }
 
     gcode.push('\n');
@@ -3720,6 +4232,205 @@ mod tests {
         assert!(
             total_rounding_drift_mm <= 0.55e-6,
             "Expected cumulative E rounding drift <= 0.55e-6 mm with error diffusion, got {total_rounding_drift_mm:.9} mm (emitted={emitted_sum_e:.8}, exact={exact_sum_e:.8})"
+        );
+    }
+
+    #[test]
+    fn test_five_axis_rrf_bc_planning_zenith_lookahead_rotary_throttling_and_g93() {
+        // Construct a 2-path layer on a circular bed:
+        // - Path 0: flat planar path at the center with vertical nozzle (0, 0, 1) -> B = 0
+        // - Path 1: non-planar tilted cone wall where the nozzle tilts to 30 deg at azimuth 90 deg (+Y)
+        //           and then sweeps azimuth around a circle.
+        let flat_path = ExtrusionPath {
+            feature_kind: 1,
+            wall_index: 2, // InnerOuterInner prints wall_index >= 2 first, then outer wall 0
+            is_closed: false,
+            total_length_mm: 10.0,
+            mean_width_mm: 0.42,
+            points: vec![
+                ToolpathPoint {
+                    x: -5.0,
+                    y: -10.0,
+                    z: 0.5,
+                    nx: 0.0,
+                    ny: 0.0,
+                    nz: 1.0,
+                    width_mm: 0.42,
+                    height_mm: 0.20,
+                },
+                ToolpathPoint {
+                    x: 5.0,
+                    y: -10.0,
+                    z: 0.5,
+                    nx: 0.0,
+                    ny: 0.0,
+                    nz: 1.0,
+                    width_mm: 0.42,
+                    height_mm: 0.20,
+                },
+            ],
+        };
+
+        let tilt_rad = 30.0f32.to_radians();
+        let mut cone_pts = Vec::new();
+        for i in 0..=16 {
+            let az = std::f32::consts::FRAC_PI_2 + (i as f32) * std::f32::consts::TAU / 16.0;
+            let r = 20.0f32;
+            cone_pts.push(ToolpathPoint {
+                x: r * az.cos(),
+                y: r * az.sin(),
+                z: 2.0,
+                nx: tilt_rad.sin() * az.cos(),
+                ny: tilt_rad.sin() * az.sin(),
+                nz: tilt_rad.cos(),
+                width_mm: 0.42,
+                height_mm: 0.20,
+            });
+        }
+        let cone_path = ExtrusionPath {
+            feature_kind: 0,
+            wall_index: 0,
+            is_closed: true,
+            total_length_mm: std::f32::consts::TAU * 20.0,
+            mean_width_mm: 0.42,
+            points: cone_pts,
+        };
+
+        let raw = ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 2,
+            outer_wall_count: 1,
+            inner_wall_count: 1,
+            solid_infill_count: 0,
+            sparse_infill_count: 0,
+            bridge_count: 0,
+            wave_overhang_count: 0,
+            support_count: 0,
+            support_interface_count: 0,
+            layers: vec![LayerToolpaths {
+                layer_index: 0,
+                branch_id: 0,
+                isovalue: 0.5,
+                paths: vec![flat_path, cone_path],
+            }],
+        };
+
+        let mut cfg = SlicerConfig::default();
+        cfg.bed.shape = crate::config::BedShape::Circular;
+        cfg.bed.width_x = 220.0;
+        cfg.bed.depth_y = 220.0;
+        cfg.gcode.gcode_origin_at_bed_center = true;
+        cfg.gcode.gcode_dialect = GcodeDialect::RepRapFirmware;
+        cfg.gcode.z_hop_mm = 0.0; // Direct travel between flat_path and cone_path to test Travel C lookahead
+        cfg.gcode.outer_wall_speed_mms = 120.0;
+        cfg.machine.kinematics_mode = FiveAxisKinematicsMode::FiveAxisBC;
+        cfg.machine.b_min_deg = 0.0;
+        cfg.machine.b_max_deg = 65.0;
+        cfg.machine.c_continuous = true;
+        cfg.machine.max_b_speed_deg_s = 30.0;
+        cfg.machine.max_c_speed_deg_s = 45.0; // Deliberately moderate C speed to verify linear speed throttling
+        cfg.machine.orientation_smoothing_window_mm = 1.5;
+
+        let res = plan_and_emit_gcode_for_object(
+            "FiveAxisRrfCone",
+            1,
+            &raw,
+            Transform::IDENTITY,
+            &cfg,
+        );
+
+        let segs = &res.layers[0].segments;
+        // 1. Flat segments at zenith (B ~ 0) must keep B = 0
+        let first_inner = segs
+            .iter()
+            .find(|s| s.kind == PlannedMoveKind::InnerWall)
+            .expect("Expected flat InnerWall segment");
+        assert!(first_inner.b1_deg.abs() < 1.0e-3);
+
+        // 2. Travel move from flat InnerWall to tilted OuterWall must pre-position C toward the upcoming tilted azimuth (~ -67.5 deg at the nearest point on the cone)
+        let travel_to_cone = segs
+            .iter()
+            .find(|s| s.kind == PlannedMoveKind::Travel && s.b1_deg > 10.0)
+            .expect("Expected Travel segment transitioning to tilted cone");
+        assert!(
+            (travel_to_cone.c1_deg - (-67.5)).abs() < 20.0,
+            "Expected Travel move to pre-orient C near -67.5 deg, got C={}",
+            travel_to_cone.c1_deg
+        );
+
+        // 3. OuterWall segments on the cone must have B ~ 30 deg, continuous C > 300 deg by the end of the loop,
+        //    and nominal_speed_mms throttled below 120 mm/s by max_c_speed_deg_s (45 deg/s).
+        let outer_segs: Vec<&PlannedSegment> = segs
+            .iter()
+            .filter(|s| s.kind == PlannedMoveKind::OuterWall)
+            .collect();
+        assert!(!outer_segs.is_empty());
+        let max_c_seen = outer_segs
+            .iter()
+            .map(|s| s.c1_deg)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_c_seen = outer_segs
+            .iter()
+            .map(|s| s.c1_deg)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            (max_c_seen - min_c_seen) > 300.0,
+            "Expected continuous C sweep > 300 deg around closed cone loop, got min={min_c_seen}, max={max_c_seen}"
+        );
+        assert!(
+            outer_segs.iter().any(|s| s.nominal_speed_mms < 100.0),
+            "Expected rotary C speed limit (45 deg/s) to throttle linear nominal_speed_mms below 120 mm/s"
+        );
+
+        // 4. Verify RRF dialect commands and B/C axis coordinates in emitted G-code
+        assert!(
+            res.gcode_text.contains("M486 T1"),
+            "Expected RRF M486 T1 object count header"
+        );
+        assert!(
+            res.gcode_text.contains("M486 S0 A\"FiveAxisRrfCone\""),
+            "Expected RRF M486 S0 object start command"
+        );
+        assert!(
+            res.gcode_text.contains("M572 D0 S"),
+            "Expected RRF M572 D0 S... pressure advance command"
+        );
+        assert!(
+            res.gcode_text.contains("M204 P"),
+            "Expected RRF M204 P... T... acceleration command"
+        );
+        assert!(
+            !res.gcode_text.contains("SET_PRESSURE_ADVANCE")
+                && !res.gcode_text.contains("SET_VELOCITY_LIMIT"),
+            "RRF dialect must not emit Klipper SET_PRESSURE_ADVANCE or SET_VELOCITY_LIMIT macros"
+        );
+        assert!(
+            res.gcode_text
+                .lines()
+                .any(|l| l.starts_with("G1 X") && l.contains(" B") && l.contains(" C") && l.contains(" E")),
+            "Expected 5-axis G1 X... Y... Z... B... C... E... lines"
+        );
+
+        // 5. Verify G93 Inverse-Time Feedrate mode
+        cfg.machine.use_inverse_time_feedrate_g93 = true;
+        let res_g93 = plan_and_emit_gcode_for_object(
+            "FiveAxisRrfConeG93",
+            1,
+            &raw,
+            Transform::IDENTITY,
+            &cfg,
+        );
+        assert!(
+            res_g93
+                .gcode_text
+                .contains("G93 ; Inverse-time feedrate mode (1/min)"),
+            "Expected G93 mode switch when use_inverse_time_feedrate_g93 = true"
+        );
+        assert!(
+            res_g93
+                .gcode_text
+                .contains("G94 ; Restore standard mm/min feedrate mode"),
+            "Expected G94 restore at end of print"
         );
     }
 }

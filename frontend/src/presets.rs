@@ -4,9 +4,9 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    BedShape, ClearancePointXZ, ClearanceProfileMode, LayerHeightConfig, LineWidthConfig,
-    OrderFieldMode, SlicerConfig, SolidInfillPattern, SparseInfillPattern, SupportStyle,
-    ToolConfig, WallPrintOrder,
+    BedShape, ClearancePointXZ, ClearanceProfileMode, FiveAxisKinematicsMode, GcodeDialect,
+    LayerHeightConfig, LineWidthConfig, OrderFieldMode, SlicerConfig, SolidInfillPattern,
+    SparseInfillPattern, SupportStyle, ToolConfig, WallPrintOrder,
 };
 
 /// Top-level tab in the left workspace panel (`Project Setup` vs. `Configuration`).
@@ -99,10 +99,24 @@ pub struct PrinterPreset {
     pub gcode_origin_at_bed_center: bool,
 
     // Multi-Axis Kinematics in Bed Coordinates (Rule 1 & Rule 2)
+    pub kinematics_mode: FiveAxisKinematicsMode,
     pub nozzle_axis_bed: [f32; 3],
     pub gravity_direction_bed: [f32; 3],
     pub bed_tilt_rx_deg: f32,
     pub bed_tilt_ry_deg: f32,
+    pub b_min_deg: f32,
+    pub b_max_deg: f32,
+    pub c_continuous: bool,
+    pub invert_b: bool,
+    pub invert_c: bool,
+    pub c_zero_offset_deg: f32,
+    pub max_b_speed_deg_s: f32,
+    pub max_c_speed_deg_s: f32,
+    pub b_accel_deg_s2: f32,
+    pub c_accel_deg_s2: f32,
+    pub orientation_smoothing_window_mm: f32,
+    pub bed_tilts_with_b: bool,
+    pub use_inverse_time_feedrate_g93: bool,
 
     // Machine Motion Envelope & Stepper Dynamics
     pub travel_speed_mms: f32,
@@ -118,6 +132,7 @@ pub struct PrinterPreset {
     pub z_travel_penalty: f32,
 
     // Firmware Features & Start/End G-code Templates
+    pub gcode_dialect: GcodeDialect,
     pub emit_exclude_object: bool,
     pub emit_thumbnails: bool,
     pub start_gcode_template: String,
@@ -144,10 +159,24 @@ impl PrinterPreset {
             depth_y: cfg.bed.depth_y,
             height_z: cfg.bed.height_z,
             gcode_origin_at_bed_center: cfg.gcode.gcode_origin_at_bed_center,
+            kinematics_mode: cfg.machine.kinematics_mode,
             nozzle_axis_bed: cfg.machine.nozzle_axis_bed,
             gravity_direction_bed: cfg.machine.gravity_direction_bed,
             bed_tilt_rx_deg: cfg.machine.bed_tilt_rx_deg,
             bed_tilt_ry_deg: cfg.machine.bed_tilt_ry_deg,
+            b_min_deg: cfg.machine.b_min_deg,
+            b_max_deg: cfg.machine.b_max_deg,
+            c_continuous: cfg.machine.c_continuous,
+            invert_b: cfg.machine.invert_b,
+            invert_c: cfg.machine.invert_c,
+            c_zero_offset_deg: cfg.machine.c_zero_offset_deg,
+            max_b_speed_deg_s: cfg.machine.max_b_speed_deg_s,
+            max_c_speed_deg_s: cfg.machine.max_c_speed_deg_s,
+            b_accel_deg_s2: cfg.machine.b_accel_deg_s2,
+            c_accel_deg_s2: cfg.machine.c_accel_deg_s2,
+            orientation_smoothing_window_mm: cfg.machine.orientation_smoothing_window_mm,
+            bed_tilts_with_b: cfg.machine.bed_tilts_with_b,
+            use_inverse_time_feedrate_g93: cfg.machine.use_inverse_time_feedrate_g93,
             travel_speed_mms: cfg.gcode.travel_speed_mms,
             z_hop_speed_mms: cfg.gcode.z_hop_speed_mms,
             outer_wall_accel_mms2: cfg.gcode.outer_wall_accel_mms2,
@@ -159,6 +188,7 @@ impl PrinterPreset {
             use_stepper_dynamics: cfg.gcode.use_stepper_dynamics,
             max_stepper_speed_mms: cfg.gcode.max_stepper_speed_mms,
             z_travel_penalty: cfg.gcode.z_travel_penalty,
+            gcode_dialect: cfg.gcode.gcode_dialect,
             emit_exclude_object: cfg.gcode.emit_exclude_object,
             emit_thumbnails: cfg.gcode.emit_thumbnails,
             start_gcode_template: cfg.gcode.start_gcode_template.clone(),
@@ -173,10 +203,24 @@ impl PrinterPreset {
         cfg.bed.depth_y = self.depth_y;
         cfg.bed.height_z = self.height_z;
         cfg.gcode.gcode_origin_at_bed_center = self.gcode_origin_at_bed_center;
+        cfg.machine.kinematics_mode = self.kinematics_mode;
         cfg.machine.nozzle_axis_bed = self.nozzle_axis_bed;
         cfg.machine.gravity_direction_bed = self.gravity_direction_bed;
         cfg.machine.bed_tilt_rx_deg = self.bed_tilt_rx_deg;
         cfg.machine.bed_tilt_ry_deg = self.bed_tilt_ry_deg;
+        cfg.machine.b_min_deg = self.b_min_deg;
+        cfg.machine.b_max_deg = self.b_max_deg;
+        cfg.machine.c_continuous = self.c_continuous;
+        cfg.machine.invert_b = self.invert_b;
+        cfg.machine.invert_c = self.invert_c;
+        cfg.machine.c_zero_offset_deg = self.c_zero_offset_deg;
+        cfg.machine.max_b_speed_deg_s = self.max_b_speed_deg_s;
+        cfg.machine.max_c_speed_deg_s = self.max_c_speed_deg_s;
+        cfg.machine.b_accel_deg_s2 = self.b_accel_deg_s2;
+        cfg.machine.c_accel_deg_s2 = self.c_accel_deg_s2;
+        cfg.machine.orientation_smoothing_window_mm = self.orientation_smoothing_window_mm;
+        cfg.machine.bed_tilts_with_b = self.bed_tilts_with_b;
+        cfg.machine.use_inverse_time_feedrate_g93 = self.use_inverse_time_feedrate_g93;
         cfg.gcode.travel_speed_mms = self.travel_speed_mms;
         cfg.gcode.z_hop_speed_mms = self.z_hop_speed_mms;
         cfg.gcode.outer_wall_accel_mms2 = self.outer_wall_accel_mms2;
@@ -188,10 +232,12 @@ impl PrinterPreset {
         cfg.gcode.use_stepper_dynamics = self.use_stepper_dynamics;
         cfg.gcode.max_stepper_speed_mms = self.max_stepper_speed_mms;
         cfg.gcode.z_travel_penalty = self.z_travel_penalty;
+        cfg.gcode.gcode_dialect = self.gcode_dialect;
         cfg.gcode.emit_exclude_object = self.emit_exclude_object;
         cfg.gcode.emit_thumbnails = self.emit_thumbnails;
         cfg.gcode.start_gcode_template = self.start_gcode_template.clone();
         cfg.gcode.end_gcode_template = self.end_gcode_template.clone();
+        cfg.machine.sanitize();
         cfg.gcode.sanitize();
     }
 
@@ -201,10 +247,27 @@ impl PrinterPreset {
             && approx_eq(self.depth_y, cfg.bed.depth_y)
             && approx_eq(self.height_z, cfg.bed.height_z)
             && self.gcode_origin_at_bed_center == cfg.gcode.gcode_origin_at_bed_center
+            && self.kinematics_mode == cfg.machine.kinematics_mode
             && approx_eq_vec3(self.nozzle_axis_bed, cfg.machine.nozzle_axis_bed)
             && approx_eq_vec3(self.gravity_direction_bed, cfg.machine.gravity_direction_bed)
             && approx_eq(self.bed_tilt_rx_deg, cfg.machine.bed_tilt_rx_deg)
             && approx_eq(self.bed_tilt_ry_deg, cfg.machine.bed_tilt_ry_deg)
+            && approx_eq(self.b_min_deg, cfg.machine.b_min_deg)
+            && approx_eq(self.b_max_deg, cfg.machine.b_max_deg)
+            && self.c_continuous == cfg.machine.c_continuous
+            && self.invert_b == cfg.machine.invert_b
+            && self.invert_c == cfg.machine.invert_c
+            && approx_eq(self.c_zero_offset_deg, cfg.machine.c_zero_offset_deg)
+            && approx_eq(self.max_b_speed_deg_s, cfg.machine.max_b_speed_deg_s)
+            && approx_eq(self.max_c_speed_deg_s, cfg.machine.max_c_speed_deg_s)
+            && approx_eq(self.b_accel_deg_s2, cfg.machine.b_accel_deg_s2)
+            && approx_eq(self.c_accel_deg_s2, cfg.machine.c_accel_deg_s2)
+            && approx_eq(
+                self.orientation_smoothing_window_mm,
+                cfg.machine.orientation_smoothing_window_mm,
+            )
+            && self.bed_tilts_with_b == cfg.machine.bed_tilts_with_b
+            && self.use_inverse_time_feedrate_g93 == cfg.machine.use_inverse_time_feedrate_g93
             && approx_eq(self.travel_speed_mms, cfg.gcode.travel_speed_mms)
             && approx_eq(self.z_hop_speed_mms, cfg.gcode.z_hop_speed_mms)
             && approx_eq(self.outer_wall_accel_mms2, cfg.gcode.outer_wall_accel_mms2)
@@ -219,6 +282,7 @@ impl PrinterPreset {
             && self.use_stepper_dynamics == cfg.gcode.use_stepper_dynamics
             && approx_eq(self.max_stepper_speed_mms, cfg.gcode.max_stepper_speed_mms)
             && approx_eq(self.z_travel_penalty, cfg.gcode.z_travel_penalty)
+            && self.gcode_dialect == cfg.gcode.gcode_dialect
             && self.emit_exclude_object == cfg.gcode.emit_exclude_object
             && self.emit_thumbnails == cfg.gcode.emit_thumbnails
             && self.start_gcode_template == cfg.gcode.start_gcode_template
@@ -1053,6 +1117,55 @@ impl PresetLibrary {
         p_5axis.infill_accel_mms2 = 5000.0;
         p_5axis.travel_accel_mms2 = 7500.0;
 
+        let mut p_rrf_5axis_bc =
+            PrinterPreset::from_config("5-Axis Circular Bed (RRF B/C)", &base_cfg, true);
+        p_rrf_5axis_bc.bed_shape = BedShape::Circular;
+        p_rrf_5axis_bc.width_x = 240.0;
+        p_rrf_5axis_bc.depth_y = 240.0;
+        p_rrf_5axis_bc.height_z = 220.0;
+        p_rrf_5axis_bc.gcode_origin_at_bed_center = true;
+        p_rrf_5axis_bc.gcode_dialect = GcodeDialect::RepRapFirmware;
+        p_rrf_5axis_bc.kinematics_mode = FiveAxisKinematicsMode::FiveAxisBC;
+        p_rrf_5axis_bc.b_min_deg = 0.0;
+        p_rrf_5axis_bc.b_max_deg = 60.0;
+        p_rrf_5axis_bc.c_continuous = true;
+        p_rrf_5axis_bc.max_b_speed_deg_s = 60.0;
+        p_rrf_5axis_bc.max_c_speed_deg_s = 120.0;
+        p_rrf_5axis_bc.b_accel_deg_s2 = 300.0;
+        p_rrf_5axis_bc.c_accel_deg_s2 = 600.0;
+        p_rrf_5axis_bc.orientation_smoothing_window_mm = 2.5;
+        p_rrf_5axis_bc.bed_tilts_with_b = true;
+        p_rrf_5axis_bc.outer_wall_accel_mms2 = 2000.0;
+        p_rrf_5axis_bc.inner_wall_accel_mms2 = 3500.0;
+        p_rrf_5axis_bc.infill_accel_mms2 = 5000.0;
+        p_rrf_5axis_bc.travel_accel_mms2 = 7500.0;
+        p_rrf_5axis_bc.start_gcode_template = concat!(
+            "; --- Manifold2 5-Axis RRF (XYZ + BC) Print Start ---\n",
+            "; Print Bounds: X[{bbox_min_x}..{bbox_max_x}] Y[{bbox_min_y}..{bbox_max_y}] Z[{bbox_min_z}..{bbox_max_z}]\n",
+            "G90 ; Absolute positioning\n",
+            "M83 ; Relative extrusion\n",
+            "M140 S{bed_temp} ; Set bed temperature\n",
+            "M568 P{tool_id} S{nozzle_temp} R{nozzle_temp} A2 ; Set RRF tool temperature\n",
+            "G28 ; Home all axes (X Y Z B C)\n",
+            "T{tool_id} ; Select active tool\n",
+            "M190 S{bed_temp} ; Wait for bed temperature\n",
+            "M116 P{tool_id} ; Wait for tool temperature\n",
+            "G1 X0 Y0 Z15 B0 C0 F3000 ; Move to neutral 5-axis posture above bed center\n",
+            "G92 E0 ; Reset extruder"
+        )
+        .to_string();
+        p_rrf_5axis_bc.end_gcode_template = concat!(
+            "; --- Manifold2 5-Axis RRF (XYZ + BC) Print End ---\n",
+            "M400 ; Wait for moves to finish\n",
+            "G1 B0 C0 F1800 ; Level rotary axes\n",
+            "M568 P{tool_id} S0 R0 A0 ; Turn off tool heater\n",
+            "M140 S0 ; Turn off heated bed\n",
+            "M106 S0 ; Turn off part cooling fan\n",
+            "G28 X Y ; Park linear axes\n",
+            "M84 ; Disable steppers"
+        )
+        .to_string();
+
         let mut p_6axis =
             PrinterPreset::from_config("6-Axis Robot Arm Cell (350³)", &base_cfg, true);
         p_6axis.width_x = 350.0;
@@ -1065,7 +1178,7 @@ impl PresetLibrary {
         p_6axis.infill_accel_mms2 = 3500.0;
         p_6axis.travel_accel_mms2 = 5000.0;
 
-        vec![p_corexy, p_5axis, p_6axis]
+        vec![p_corexy, p_5axis, p_rrf_5axis_bc, p_6axis]
     }
 
     pub fn builtin_tools() -> Vec<ToolPreset> {

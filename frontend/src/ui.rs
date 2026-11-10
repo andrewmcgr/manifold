@@ -11,9 +11,9 @@ use crate::calibration::{
     EmCalibrationPass, PaCalibrationMode, TransientCalibrationPass,
 };
 use crate::config::{
-    lookup_parameter_doc, BedShape, ClearancePointXZ, ClearanceProfileMode, OrderFieldMode,
-    PointNormalHint, SlicerConfig, SolidInfillPattern, SparseInfillPattern, SupportStyle,
-    SurfaceHintMode, ToolConfig, WallPrintOrder,
+    lookup_parameter_doc, BedShape, ClearancePointXZ, ClearanceProfileMode, FiveAxisKinematicsMode,
+    GcodeDialect, OrderFieldMode, PointNormalHint, SlicerConfig, SolidInfillPattern,
+    SparseInfillPattern, SupportStyle, SurfaceHintMode, ToolConfig, WallPrintOrder,
 };
 use crate::field_vis::{
     high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
@@ -2823,6 +2823,137 @@ fn render_printer_config_tab(
             queried_gravity.x, queried_gravity.y, queried_gravity.z
         ));
 
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Kinematics:");
+            for mode in FiveAxisKinematicsMode::ALL {
+                dirty_gcode |= ui
+                    .selectable_value(
+                        &mut config.machine.kinematics_mode,
+                        mode,
+                        mode.short_label(),
+                    )
+                    .on_hover_text(mode.label())
+                    .changed();
+            }
+            param_help_button(ui, "machine.kinematics_mode");
+        });
+
+        if config.machine.kinematics_mode == FiveAxisKinematicsMode::FiveAxisBC {
+            ui.horizontal(|ui| {
+                ui.label("B Tilt Range (°):");
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.b_min_deg)
+                            .speed(0.5)
+                            .range(-90.0..=0.0)
+                            .prefix("Min: ")
+                            .suffix("°"),
+                    )
+                    .changed();
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.b_max_deg)
+                            .speed(0.5)
+                            .range(0.0..=90.0)
+                            .prefix("Max: ")
+                            .suffix("°"),
+                    )
+                    .changed();
+                param_help_button(ui, "machine.five_axis_bc_limits");
+            });
+            ui.horizontal(|ui| {
+                dirty_gcode |= ui
+                    .checkbox(
+                        &mut config.machine.c_continuous,
+                        "Continuous C Rotation (360°+)",
+                    )
+                    .changed();
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.c_zero_offset_deg)
+                            .speed(1.0)
+                            .range(-180.0..=180.0)
+                            .prefix("C Offset: ")
+                            .suffix("°"),
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                dirty_gcode |= ui
+                    .checkbox(&mut config.machine.invert_b, "Invert B")
+                    .changed();
+                dirty_gcode |= ui
+                    .checkbox(&mut config.machine.invert_c, "Invert C")
+                    .changed();
+                dirty_gcode |= ui
+                    .checkbox(
+                        &mut config.machine.bed_tilts_with_b,
+                        "Bed Tilts With B (Gravity Coupling)",
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Max B / C Speed (°/s):");
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.max_b_speed_deg_s)
+                            .speed(1.0)
+                            .range(1.0..=720.0)
+                            .prefix("B: "),
+                    )
+                    .changed();
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.max_c_speed_deg_s)
+                            .speed(1.0)
+                            .range(1.0..=1080.0)
+                            .prefix("C: "),
+                    )
+                    .changed();
+                param_help_button(ui, "machine.five_axis_bc_dynamics");
+            });
+            ui.horizontal(|ui| {
+                ui.label("B / C Accel (°/s²):");
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.b_accel_deg_s2)
+                            .speed(10.0)
+                            .range(10.0..=10000.0)
+                            .prefix("B: "),
+                    )
+                    .changed();
+                dirty_gcode |= ui
+                    .add(
+                        egui::DragValue::new(&mut config.machine.c_accel_deg_s2)
+                            .speed(10.0)
+                            .range(10.0..=10000.0)
+                            .prefix("C: "),
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                dirty_gcode |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut config.machine.orientation_smoothing_window_mm,
+                            0.0..=15.0,
+                        )
+                        .text("Orientation Smoothing Window (mm)"),
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                dirty_gcode |= ui
+                    .checkbox(
+                        &mut config.machine.use_inverse_time_feedrate_g93,
+                        "Use G93 Inverse-Time Feedrate (1/min)",
+                    )
+                    .changed();
+            });
+            ui.separator();
+        }
+
         let mut tilt_changed = false;
         ui.horizontal(|ui| {
             tilt_changed |= ui
@@ -2972,18 +3103,29 @@ fn render_printer_config_tab(
 
     ui.add_space(4.0);
     egui::CollapsingHeader::new(
-        egui::RichText::new("Klipper, Moonraker & G-code Templates").strong(),
+        egui::RichText::new("G-code Dialect, Firmware & Templates").strong(),
     )
     .id_source("printer_gcode_templates_section")
     .default_open(false)
     .show(ui, |ui| {
         let gc = &mut config.gcode;
         ui.horizontal(|ui| {
+            ui.label("Firmware Dialect:");
+            for dialect in GcodeDialect::ALL {
+                dirty_gcode |= ui
+                    .selectable_value(&mut gc.gcode_dialect, dialect, dialect.short_label())
+                    .on_hover_text(dialect.label())
+                    .changed();
+            }
+            param_help_button(ui, "gcode.gcode_dialect");
+        });
+        ui.horizontal(|ui| {
+            let exclude_label = match gc.gcode_dialect {
+                GcodeDialect::Klipper => "Emit Klipper EXCLUDE_OBJECT commands",
+                GcodeDialect::RepRapFirmware => "Emit RepRapFirmware M486 Object Cancellation",
+            };
             dirty_gcode |= ui
-                .checkbox(
-                    &mut gc.emit_exclude_object,
-                    "Emit Klipper EXCLUDE_OBJECT commands",
-                )
+                .checkbox(&mut gc.emit_exclude_object, exclude_label)
                 .changed();
             param_help_button(ui, "gcode.emit_exclude_object");
         });
@@ -3025,6 +3167,7 @@ fn render_printer_config_tab(
         sync_config_to_backend(config);
     }
     if dirty_gcode {
+        config.machine.sanitize();
         config.gcode.sanitize();
         vis_state.dirty_planned_gcode = true;
     }
@@ -3491,6 +3634,7 @@ fn render_tool_config_tab(
         sync_config_to_backend(config);
     }
     if dirty_gcode {
+        config.machine.sanitize();
         config.gcode.sanitize();
         vis_state.dirty_planned_gcode = true;
     }

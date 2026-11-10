@@ -408,6 +408,7 @@ pub fn sanitize_and_sync_config(cfg: &mut SlicerConfig) {
         .unwrap_or(Vec3::NEG_Z);
     cfg.machine.gravity_direction_bed = grav.to_array();
 
+    cfg.machine.sanitize();
     cfg.eikonal.sanitize();
     cfg.slicing.sanitize();
     cfg.gcode.sanitize();
@@ -1791,13 +1792,23 @@ fn combine_planned_objects_into_plate_gcode(
         ));
     }
     if gcfg.emit_exclude_object {
-        for (_, p) in planned_objects {
-            out.push_str(&format_exclude_object_define(
-                &p.exclude_object_name,
-                p.exclude_object_center_bed,
-                &p.exclude_object_polygon_bed,
-            ));
-            out.push('\n');
+        match gcfg.gcode_dialect {
+            crate::config::GcodeDialect::Klipper => {
+                for (_, p) in planned_objects {
+                    out.push_str(&format_exclude_object_define(
+                        &p.exclude_object_name,
+                        p.exclude_object_center_bed,
+                        &p.exclude_object_polygon_bed,
+                    ));
+                    out.push('\n');
+                }
+            }
+            crate::config::GcodeDialect::RepRapFirmware => {
+                out.push_str(&format!(
+                    "M486 T{} ; RepRapFirmware object cancellation count\n",
+                    planned_objects.len()
+                ));
+            }
         }
     }
 
@@ -1831,6 +1842,7 @@ fn combine_planned_objects_into_plate_gcode(
             let body_slice = &p.gcode_text[start_pos..];
             let end_pos = body_slice
                 .find("\n; --- Manifold2 Non-Planar Print End ---")
+                .or_else(|| body_slice.find("\n; --- Manifold2 5-Axis RRF (XYZ + BC) Print End ---"))
                 .or_else(|| body_slice.find("\n; --- Moonraker / PrusaSlicer Metadata Footer ---"))
                 .unwrap_or(body_slice.len());
             out.push_str(&body_slice[..end_pos]);
