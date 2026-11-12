@@ -9248,8 +9248,10 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                 if (hLayer <= 0.0f) {
                     continue;
                 }
-                // Avoid emitting duplicate support columns at identical isovalues across parallel branches
-                if (std::abs(hLayer - lastSupportIso) < 1.0e-3f) {
+                // Avoid emitting duplicate or sub-min-layer-height support slices across interleaved parallel branches
+                const float minSupportStepMm =
+                    std::max(0.04f, 0.75f * impl_->sliceLayerHeight.min_mm);
+                if (lastSupportIso > -1.0e8f && (hLayer - lastSupportIso) < minSupportStepMm) {
                     continue;
                 }
 
@@ -9263,8 +9265,17 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                 }
 
                 float localLayerH = targetLayerH;
-                if (layerIdx < selectedLayers.layers.size() &&
-                    selectedLayers.layers[layerIdx].mean_thickness_mm > 0.01f) {
+                if (lastSupportIso > -1.0e8f) {
+                    const float dhSup = hLayer - lastSupportIso;
+                    if (dhSup >= minSupportStepMm &&
+                        dhSup <= 2.0f * impl_->sliceLayerHeight.max_mm) {
+                        localLayerH = std::clamp(
+                            dhSup,
+                            impl_->sliceLayerHeight.min_mm,
+                            impl_->sliceLayerHeight.max_mm);
+                    }
+                } else if (layerIdx < selectedLayers.layers.size() &&
+                           selectedLayers.layers[layerIdx].mean_thickness_mm > 0.01f) {
                     localLayerH = selectedLayers.layers[layerIdx].mean_thickness_mm;
                 } else if (layerIdx > 0) {
                     const float dh = layer.isovalue - res.layers[layerIdx - 1].isovalue;

@@ -3332,4 +3332,121 @@ mod tests {
         let _ = fs::remove_file(&pa_dual_path);
         let _ = fs::remove_file(&trans_p2_path);
     }
+
+    #[test]
+    fn test_bracket_tilt_nonplanar_toolpaths_stay_on_isosurfaces() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path_3mf = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Test Objects/bracket-tilt.3mf");
+        if !path_3mf.exists() {
+            return;
+        }
+
+        let report = load_files_into_backend(&[path_3mf]);
+        let config = report.restored_config.unwrap();
+        sync_config_to_backend(&config);
+
+        let obj = &report.objects[0];
+        let obj_world_tf = Transform {
+            translation: obj.initial_translation,
+            rotation: obj.initial_rotation,
+            scale: Vec3::ONE,
+        };
+
+        let inv_rot = obj_world_tf.rotation.inverse();
+        let local_nozzle =
+            (inv_rot * Vec3::from_array(config.machine.nozzle_axis_bed)).normalize_or_zero();
+        ffi::set_nozzle_axis_bed(local_nozzle.to_array());
+        let local_gravity =
+            (inv_rot * Vec3::from_array(config.machine.gravity_direction_bed)).normalize_or_zero();
+        ffi::set_gravity_direction_bed(local_gravity.to_array());
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            config.eikonal.voxel_size_mm,
+            config.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        let iso_res = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        let tp_res = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        let planned = plan_and_emit_gcode_for_object(
+            &obj.name,
+            obj.object_id,
+            &tp_res,
+            obj_world_tf,
+            &config,
+        );
+
+        assert_eq!(iso_res.layers.len(), tp_res.layers.len());
+        assert_eq!(tp_res.layers.len(), planned.layers.len());
+
+        // 1. Verify raw non-support toolpath points lie on the selected slicing isosurface meshes
+        let mut max_raw_vs_iso_dist = 0.0f32;
+        for (l_idx, tp_layer) in tp_res.layers.iter().enumerate() {
+            if let Some(iso_layer) = iso_res.layers.get(l_idx) {
+                if iso_layer.vertices.is_empty() {
+                    continue;
+                }
+                for path in &tp_layer.paths {
+                    if path.feature_kind == 7 || path.feature_kind == 8 {
+                        continue;
+                    }
+                    for pt in &path.points {
+                        let p = Vec3::new(pt.x, pt.y, pt.z);
+                        let mut min_d2 = f32::MAX;
+                        for v in &iso_layer.vertices {
+                            let d2 = (p - Vec3::new(v.x, v.y, v.z)).length_squared();
+                            if d2 < min_d2 {
+                                min_d2 = d2;
+                            }
+                        }
+                        max_raw_vs_iso_dist = max_raw_vs_iso_dist.max(min_d2.sqrt());
+                    }
+                }
+            }
+        }
+        assert!(
+            max_raw_vs_iso_dist < 1.0,
+            "Expected all raw non-support toolpaths to lie within 1.0 mm of their slicing isosurface vertices, got {max_raw_vs_iso_dist:.3} mm"
+        );
+
+        // 2. Verify planned extruding segments (`p0_local`, `p1_local`) are never displaced upwards
+        //    off their raw toolpaths on any upper layer (`l_idx > 0`).
+        let mut max_planned_vs_raw_dist = 0.0f32;
+        for (l_idx, pl_layer) in planned.layers.iter().enumerate() {
+            if l_idx == 0 {
+                continue; // Layer 0 includes outward adhesion brim loops
+            }
+            let tp_layer = &tp_res.layers[l_idx];
+            let raw_pts: Vec<Vec3> = tp_layer
+                .paths
+                .iter()
+                .flat_map(|p| p.points.iter().map(|pt| Vec3::new(pt.x, pt.y, pt.z)))
+                .collect();
+            if raw_pts.is_empty() {
+                continue;
+            }
+            for seg in &pl_layer.segments {
+                if !seg.kind.is_extruding() || seg.delta_e_mm <= 1.0e-5 {
+                    continue;
+                }
+                for p in [seg.p0_local, seg.p1_local] {
+                    let mut min_d2 = f32::MAX;
+                    for &rp in &raw_pts {
+                        let d2 = (p - rp).length_squared();
+                        if d2 < min_d2 {
+                            min_d2 = d2;
+                        }
+                    }
+                    max_planned_vs_raw_dist = max_planned_vs_raw_dist.max(min_d2.sqrt());
+                }
+            }
+        }
+        assert!(
+            max_planned_vs_raw_dist < 0.75,
+            "Expected planned extruding toolpaths to remain within 0.75 mm of raw toolpath vertices (no upward heightmap displacement), got {max_planned_vs_raw_dist:.3} mm"
+        );
+    }
 }

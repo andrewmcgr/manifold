@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use crate::bridge::ffi::ObjectToolpathsResult;
 use crate::config::{
     FiveAxisKinematicsMode, GcodeDialect, GcodeProcessConfig, MachineKinematicsConfig,
-    SlicerConfig, ToolConfig, WallPrintOrder,
+    SlicerConfig, WallPrintOrder,
 };
 
 /// Formats a firmware-specific dynamic Pressure Advance command for `dialect`.
@@ -769,19 +769,13 @@ impl BedUpBasis {
 }
 
 /// 2D spatial heightmap of already-printed material in the `BedUpBasis` `(u, v)` plane.
-/// Tracks both completed-layer heights (`prev_layer_max_h`) and all-printed-so-far heights
-/// (`curr_max_h`) at `1.0 mm` cell resolution so travel corridors, non-planar Z-clamping,
-/// and A4T tool clearance cone checks run in $O(1)$ per sample.
+/// Tracks all-printed-so-far heights (`curr_max_h`) at `1.0 mm` cell resolution so
+/// non-extruding travel corridors (`max_corridor_obstacle_h`) lift cleanly over obstacles in $O(1)$ per sample,
+/// without ever displacing extruding vertices off their 3D slicing isosurfaces.
 struct PrintedHeightMap {
     basis: BedUpBasis,
     cell_size_mm: f32,
-    prev_layer_max_h: HashMap<(i32, i32), f32>,
     curr_max_h: HashMap<(i32, i32), f32>,
-    coarse_cell_size_mm: f32,
-    /// `(cx, cy) -> (max_h, u_at_max, v_at_max)` from completed previous layers
-    prev_coarse_max_h: HashMap<(i32, i32), (f32, f32, f32)>,
-    /// `(cx, cy) -> (max_h, u_at_max, v_at_max)` from all extrusions emitted so far
-    curr_coarse_max_h: HashMap<(i32, i32), (f32, f32, f32)>,
 }
 
 impl PrintedHeightMap {
@@ -789,11 +783,7 @@ impl PrintedHeightMap {
         Self {
             basis,
             cell_size_mm: 1.0,
-            prev_layer_max_h: HashMap::new(),
             curr_max_h: HashMap::new(),
-            coarse_cell_size_mm: 2.0,
-            prev_coarse_max_h: HashMap::new(),
-            curr_coarse_max_h: HashMap::new(),
         }
     }
 
@@ -805,31 +795,7 @@ impl PrintedHeightMap {
         )
     }
 
-    #[inline]
-    fn coarse_coords(&self, u: f32, v: f32) -> (i32, i32) {
-        (
-            (u / self.coarse_cell_size_mm).floor() as i32,
-            (v / self.coarse_cell_size_mm).floor() as i32,
-        )
-    }
-
-    /// Commits the current layer's accumulated heights into `prev_layer_max_h` at the end of a layer.
-    fn finish_layer(&mut self) {
-        for (&k, &h) in &self.curr_max_h {
-            let entry = self.prev_layer_max_h.entry(k).or_insert(h);
-            if h > *entry {
-                *entry = h;
-            }
-        }
-        for (&ck, &val) in &self.curr_coarse_max_h {
-            let entry = self.prev_coarse_max_h.entry(ck).or_insert(val);
-            if val.0 > entry.0 {
-                *entry = val;
-            }
-        }
-    }
-
-    /// Records an extruding segment `(p0_bed -> p1_bed)` into `curr_max_h` and `curr_coarse_max_h`.
+    /// Records an extruding segment `(p0_bed -> p1_bed)` into `curr_max_h`.
     fn record_extrusion_segment(&mut self, p0_bed: Vec3, p1_bed: Vec3) {
         let (u0, v0, h0) = self.basis.project_uvh(p0_bed);
         let (u1, v1, h1) = self.basis.project_uvh(p1_bed);
@@ -845,142 +811,16 @@ impl PrintedHeightMap {
             if sh > *entry {
                 *entry = sh;
             }
-            let ckey = self.coarse_coords(su, sv);
-            let centry = self.curr_coarse_max_h.entry(ckey).or_insert((sh, su, sv));
-            if sh > centry.0 {
-                *centry = (sh, su, sv);
-            }
         }
     }
 
-    /// Clamps a finalized sequence of `WorkingVertex` points on `layer_ord > 0` so no extruding vertex:
-    /// 1. Dips more than `0.15 mm` below already-printed material in the same `1.0 mm` `(u, v)` cell
-    ///    from previous layers (eliminating direct Z-plows where support/infill/wall isovalues lag).
-    /// 2. Violates the active tool's local-frame radial clearance cone (`ToolConfig::max_allowed_obstacle_z_at_radius`)
-    ///    against higher already-printed material in the surrounding neighborhood.
-    fn clamp_vertices_monotonic_and_clearance(
-        &self,
-        pts: &mut [WorkingVertex],
-        is_closed: bool,
-        layer_ord: usize,
-        tool: Option<&ToolConfig>,
-    ) {
-        if layer_ord == 0 || pts.is_empty() {
+    /// Ensures trailing non-extruding `Wipe` vertices never dip below the elevation of the
+    /// extruding vertices they wipe across within the same chain, while leaving all extruding
+    /// vertices strictly untouched on their 3D slicing isosurface.
+    fn clamp_wipe_vertices(&self, pts: &mut [WorkingVertex]) {
+        if pts.is_empty() {
             return;
         }
-        let n = pts.len();
-        let mut required_lift = vec![0.0f32; n];
-
-        let query_point_floor = |u: f32, v: f32, h: f32, z_noz: Vec3| -> f32 {
-            let mut min_h_req = h;
-            let (ix, iy) = self.cell_coords(u, v);
-            if let Some(&prev_h) = self.prev_layer_max_h.get(&(ix, iy)) {
-                min_h_req = min_h_req.max(prev_h - 0.08);
-            }
-            if let Some(&curr_h) = self.curr_max_h.get(&(ix, iy)) {
-                min_h_req = min_h_req.max(curr_h - 0.10);
-            }
-            if let Some(tcfg) = tool {
-                let (cx, cy) = self.coarse_coords(u, v);
-                let cos_tilt = z_noz.dot(self.basis.up_bed).abs().clamp(0.5, 1.0);
-                for dcx in -10..=10 {
-                    for dcy in -10..=10 {
-                        if let Some(&(obs_h, obs_u, obs_v)) =
-                            self.curr_coarse_max_h.get(&(cx + dcx, cy + dcy))
-                        {
-                            if obs_h <= min_h_req + 0.50 {
-                                continue;
-                            }
-                            let dr = ((obs_u - u) * (obs_u - u) + (obs_v - v) * (obs_v - v)).sqrt();
-                            let r_eff = ((dr - 0.12).max(0.0)) * cos_tilt;
-                            let max_dz = tcfg.max_allowed_obstacle_z_at_radius(r_eff);
-                            let req_h = obs_h - (max_dz - 0.08).max(0.50);
-                            if req_h > min_h_req {
-                                min_h_req = req_h;
-                            }
-                        }
-                    }
-                }
-            }
-            min_h_req
-        };
-
-        for (i, vtx) in pts.iter().enumerate() {
-            let (u, v, h) = self.basis.project_uvh(vtx.pos_bed);
-            let z_noz = vtx.nozzle_bed.try_normalize().unwrap_or(self.basis.up_bed);
-            let min_h_req = query_point_floor(u, v, h, z_noz);
-            if min_h_req > h {
-                required_lift[i] = required_lift[i].max((min_h_req - h).min(5.0));
-            }
-        }
-
-        // Also check along each segment `[i .. i+1]` every 0.35 mm so intermediate cells crossed
-        // by a 0.6..0.8 mm segment lift both segment endpoints above any interior cell obstacle!
-        for i in 0..n.saturating_sub(1) {
-            let (u0, v0, h0) = self.basis.project_uvh(pts[i].pos_bed);
-            let (u1, v1, h1) = self.basis.project_uvh(pts[i + 1].pos_bed);
-            let dist_uv = ((u1 - u0) * (u1 - u0) + (v1 - v0) * (v1 - v0)).sqrt();
-            if dist_uv <= 0.20 {
-                continue;
-            }
-            let z_noz = (pts[i].nozzle_bed + pts[i + 1].nozzle_bed)
-                .try_normalize()
-                .unwrap_or(self.basis.up_bed);
-            let steps = ((dist_uv / 0.35).ceil() as usize).max(2);
-            let mut seg_extra_lift = 0.0f32;
-            for s in 1..steps {
-                let t = (s as f32) / (steps as f32);
-                let su = u0 + t * (u1 - u0);
-                let sv = v0 + t * (v1 - v0);
-                let sh = h0 + t * (h1 - h0);
-                let req_h = query_point_floor(su, sv, sh, z_noz);
-                if req_h > sh {
-                    seg_extra_lift = seg_extra_lift.max((req_h - sh).min(5.0));
-                }
-            }
-            if seg_extra_lift > 1.0e-4 {
-                required_lift[i] = required_lift[i].max(seg_extra_lift);
-                required_lift[i + 1] = required_lift[i + 1].max(seg_extra_lift);
-            }
-        }
-
-        if required_lift.iter().all(|&dl| dl <= 1.0e-4) {
-            return;
-        }
-
-        // Smooth `required_lift` along the vertex sequence with a 3-pass max-preserving ramp
-        let mut smoothed = required_lift.clone();
-        for _ in 0..3 {
-            let prev = smoothed.clone();
-            for i in 0..n {
-                let l = if i > 0 {
-                    prev[i - 1]
-                } else if is_closed {
-                    prev[n - 1]
-                } else {
-                    prev[i]
-                };
-                let r = if i + 1 < n {
-                    prev[i + 1]
-                } else if is_closed {
-                    prev[0]
-                } else {
-                    prev[i]
-                };
-                let avg = 0.25 * l + 0.50 * prev[i] + 0.25 * r;
-                smoothed[i] = required_lift[i].max(avg);
-            }
-        }
-
-        for (i, vtx) in pts.iter_mut().enumerate() {
-            if smoothed[i] > 1.0e-4 {
-                vtx.pos_bed += self.basis.up_bed * smoothed[i];
-            }
-        }
-
-        // Ensure trailing non-extruding `Wipe` vertices never dip below the peak of the
-        // extruding vertices they wipe across (or below any cell in `curr_max_h`), including
-        // cells newly covered by the preceding extrusions of THIS same chain!
         let mut last_ext_h: Option<f32> = None;
         let mut chain_cell_max_h: HashMap<(i32, i32), f32> = HashMap::new();
         for i in 0..pts.len() {
@@ -1001,22 +841,12 @@ impl PrintedHeightMap {
                     let su = u_prev + t * (u - u_prev);
                     let sv = v_prev + t * (v - v_prev);
                     let cell = self.cell_coords(su, sv);
-                    if let Some(&ch) = self.curr_max_h.get(&cell) {
-                        req_h = req_h.max(ch);
-                    }
                     if let Some(&ch) = chain_cell_max_h.get(&cell) {
                         req_h = req_h.max(ch);
                     }
                 }
                 if req_h > h {
                     pts[i].pos_bed += self.basis.up_bed * (req_h - h);
-                    // Also lift the wipe start vertex `pts[i - 1]` if `req_h` exceeds its height
-                    if i > 0 {
-                        let (_, _, h_prev) = self.basis.project_uvh(pts[i - 1].pos_bed);
-                        if req_h > h_prev {
-                            pts[i - 1].pos_bed += self.basis.up_bed * (req_h - h_prev);
-                        }
-                    }
                 }
                 last_ext_h = Some(req_h.max(h));
             } else {
@@ -3632,11 +3462,6 @@ pub fn plan_and_emit_gcode_for_object(
 
         for chain in &mut ordered_chains {
             let chain_is_support = chain.base_kind.is_support();
-            let chain_tool_cfg = if chain_is_support {
-                support_tool
-            } else {
-                active_tool
-            };
             let chain_tool_id = if chain_is_support {
                 support_tool_id
             } else {
@@ -3662,15 +3487,8 @@ pub fn plan_and_emit_gcode_for_object(
             if vertices.len() < 2 {
                 continue;
             }
-            // Enforce monotonic layer elevation and local-frame toolhead clearance cone against
-            // all already-printed material AFTER `finalize_chain_seam_and_wipe` so scarf-seam
-            // lead-ins and backward wipes never dip below already-printed cells!
-            height_map.clamp_vertices_monotonic_and_clearance(
-                &mut vertices,
-                chain.is_closed,
-                layer_ord,
-                chain_tool_cfg,
-            );
+            // Ensure trailing non-extruding wipe vertices never dip below the chain's own extrusions
+            height_map.clamp_wipe_vertices(&mut vertices);
 
             let chain_start_bed = vertices[0].pos_bed;
             let chain_start_nozzle = vertices[0].nozzle_bed;
@@ -4228,8 +4046,6 @@ pub fn plan_and_emit_gcode_for_object(
                 curr_planned_is_support = chain_is_support;
             }
         }
-
-        height_map.finish_layer();
 
         // 4a. Apply automatic Lever-Arm & Curled-Corner Speed/Acceleration Governor before velocity lookahead
         if let Some(ref fp) = footprint_profile {
