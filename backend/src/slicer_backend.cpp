@@ -1415,7 +1415,7 @@ struct SlicerBackend::Impl {
         45.0f,
         2.40f,
         12.00f,
-        2,
+        1,
     };
 };
 
@@ -7086,7 +7086,7 @@ void SlicerBackend::setSupportSpec(const SupportSpec& spec) noexcept {
         : 12.00f;
     s.tree_branch_wall_count = (s.tree_branch_wall_count >= 1)
         ? std::clamp<std::uint32_t>(s.tree_branch_wall_count, 1, 4)
-        : 2;
+        : 1;
     impl_->supportSpec = s;
 }
 
@@ -9666,9 +9666,8 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 emitRingOnDisk(diskIdx, outerR, 8, true, true);
                             }
                         } else {
-                            // Hollow / ribbed organic tree branch & trunk walls (`feature_kind = 7`)
+                            // Hollow organic tree branch & trunk walls (`feature_kind = 7`)
                             diskEmitted[diskIdx] = true;
-                            float innerCoreR = d.radius;
                             bool outerPerimeterClosed = true;
                             for (std::uint32_t w = 0; w < wallCount; ++w) {
                                 const float rWall =
@@ -9681,16 +9680,6 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 if (w == 0) {
                                     outerPerimeterClosed = ringClosed;
                                 }
-                                innerCoreR = rWall - 0.5f * lineWidthMm;
-                            }
-                            // Internal concentric structural bracing & fork diaphragm rings on the
-                            // exact `c_w = (w + 0.5) * lineWidthMm` union level-set offset lattice
-                            // so all branch walls, expanded trunks, and fork junctions belong to a
-                            // single continuous non-intersecting offset family across all layers.
-                            for (float rInner = innerCoreR - 0.5f * lineWidthMm;
-                                 rInner >= 0.45f * lineWidthMm;
-                                 rInner -= lineWidthMm) {
-                                emitRingOnDisk(diskIdx, rInner, 7, diskVertContact, outerPerimeterClosed);
                             }
                         }
                     }

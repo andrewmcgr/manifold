@@ -819,7 +819,7 @@ pub struct SlicingProcessConfig {
     /// Maximum merged trunk diameter (mm, `2.0..=30.0`, default `12.0`) at the build plate for
     /// `NonPlanarTree` supports.
     pub tree_trunk_max_diameter_mm: f32,
-    /// Number of concentric perimeter walls (`1..=4`, default `2`) printed for hollow `NonPlanarTree`
+    /// Number of concentric perimeter walls (`1..=4`, default `1`) printed for hollow `NonPlanarTree`
     /// branches and trunks.
     pub tree_branch_wall_count: u32,
     /// Automatically detect oblique exit/top surfaces (where Eikonal layers arrive at an angle
@@ -873,7 +873,7 @@ impl Default for SlicingProcessConfig {
             tree_branch_angle_deg: 45.0,
             tree_tip_diameter_mm: 2.40,
             tree_trunk_max_diameter_mm: 12.00,
-            tree_branch_wall_count: 2,
+            tree_branch_wall_count: 1,
             enable_auto_conformal_skin: false,
             conformal_skin_layers: 3,
             conformal_skin_min_oblique_deg: 12.0,
@@ -2364,7 +2364,7 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         category: "Support Generation",
         title: "Non-Planar Tree Support Geometry (Branch Angle, Tip & Trunk Diameter, Walls)",
         units: "deg / mm / walls",
-        default_value: "45° / 2.4 mm tip / 12.0 mm trunk / 2 walls",
+        default_value: "45° / 2.4 mm tip / 12.0 mm trunk / 1 wall",
         summary: "Controls maximum branch lean angle, tip contact diameter, merged trunk diameter, and perimeter wall count for Non-Planar Tree supports.",
         details: "Higher branch angles allow tree branches to reach further laterally around bulky lower part geometry to reach the build plate. On 5/6-axis tools (`has_rotational_axes`), the nozzle tilts along the 3D branch centerline tangent so steep leaning branches print self-supportingly without overhang step-over failure.",
     },

@@ -744,6 +744,9 @@ pub fn resolve_canonical_config_key(cfg_val: &JsonValue, raw_key: &str) -> Resul
         "support_bed_interface" | "support_bottom_interface_layers" => {
             return Ok("slicing.support_bed_interface_layers".to_string());
         }
+        "tree_wall_count" | "support_tree_wall_count" | "support_trunk_walls" => {
+            return Ok("slicing.tree_branch_wall_count".to_string());
+        }
         _ => {}
     }
 

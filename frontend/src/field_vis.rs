@@ -5594,6 +5594,38 @@ mod tests {
             "Expected tree support trunk to expand toward the bed (lower_trunk_max_r={lower_trunk_max_r:.3} mm vs upper_branch_max_r={upper_branch_max_r:.3} mm)"
         );
 
+        // Verify default `tree_branch_wall_count == 1` produces hollow single-wall trunks above a
+        // multi-ring closed bed adhesion base pad (`feature_kind == 8` on layer 0), and that
+        // configuring `tree_branch_wall_count = 2` increases the trunk wall count accordingly:
+        assert_eq!(cfg.slicing.tree_branch_wall_count, 1);
+        let l0_base_pad_rings = tp_tree_bed_only.layers[0]
+            .paths
+            .iter()
+            .filter(|p| p.feature_kind == 8)
+            .count();
+        assert!(
+            l0_base_pad_rings >= 3,
+            "Expected closed multi-ring bed adhesion base pad on layer 0, got {l0_base_pad_rings} rings"
+        );
+        let l2_1wall_rings = tp_tree_bed_only.layers[2]
+            .paths
+            .iter()
+            .filter(|p| p.feature_kind == 7)
+            .count();
+
+        cfg.slicing.tree_branch_wall_count = 2;
+        crate::ui::sync_config_to_backend(&cfg);
+        let tp_tree_2wall = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        let l2_2wall_rings = tp_tree_2wall.layers[2]
+            .paths
+            .iter()
+            .filter(|p| p.feature_kind == 7)
+            .count();
+        assert!(
+            l2_2wall_rings >= 2 * l2_1wall_rings,
+            "Expected 2-wall hollow trunk on layer 2 to emit at least 2x as many wall loops as 1-wall hollow trunk (1-wall={l2_1wall_rings}, 2-wall={l2_2wall_rings})"
+        );
+
         let default_cfg = crate::config::SlicerConfig::default();
         crate::ui::sync_config_to_backend(&default_cfg);
         let _ = ffi::remove_cad_object(part.object_id);
