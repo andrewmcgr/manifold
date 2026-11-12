@@ -9248,9 +9248,21 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                 if (hLayer <= 0.0f) {
                     continue;
                 }
-                // Avoid emitting duplicate or sub-min-layer-height support slices across interleaved parallel branches
-                const float minSupportStepMm =
-                    std::max(0.04f, 0.75f * impl_->sliceLayerHeight.min_mm);
+                float localLayerH = targetLayerH;
+                if (layerIdx < selectedLayers.layers.size() &&
+                    selectedLayers.layers[layerIdx].mean_thickness_mm > 0.01f) {
+                    localLayerH = selectedLayers.layers[layerIdx].mean_thickness_mm;
+                } else if (layerIdx > 0) {
+                    const float dh = layer.isovalue - res.layers[layerIdx - 1].isovalue;
+                    if (dh > 0.02f && dh < 2.0f) {
+                        localLayerH = dh;
+                    }
+                }
+
+                // Avoid emitting duplicate or sub-layer-height support slices across interleaved parallel branches
+                const float minSupportStepMm = std::max(
+                    0.04f,
+                    std::max(0.75f * impl_->sliceLayerHeight.min_mm, 0.65f * localLayerH));
                 if (lastSupportIso > -1.0e8f && (hLayer - lastSupportIso) < minSupportStepMm) {
                     continue;
                 }
@@ -9261,26 +9273,6 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                         bedLayerOrdinal = static_cast<std::uint32_t>(uIdx);
                     } else {
                         break;
-                    }
-                }
-
-                float localLayerH = targetLayerH;
-                if (lastSupportIso > -1.0e8f) {
-                    const float dhSup = hLayer - lastSupportIso;
-                    if (dhSup >= minSupportStepMm &&
-                        dhSup <= 2.0f * impl_->sliceLayerHeight.max_mm) {
-                        localLayerH = std::clamp(
-                            dhSup,
-                            impl_->sliceLayerHeight.min_mm,
-                            impl_->sliceLayerHeight.max_mm);
-                    }
-                } else if (layerIdx < selectedLayers.layers.size() &&
-                           selectedLayers.layers[layerIdx].mean_thickness_mm > 0.01f) {
-                    localLayerH = selectedLayers.layers[layerIdx].mean_thickness_mm;
-                } else if (layerIdx > 0) {
-                    const float dh = layer.isovalue - res.layers[layerIdx - 1].isovalue;
-                    if (dh > 0.02f && dh < 2.0f) {
-                        localLayerH = dh;
                     }
                 }
                 const float effectiveStepH = std::max(
