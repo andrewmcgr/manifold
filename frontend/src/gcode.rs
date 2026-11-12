@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 
 use crate::bridge::ffi::ObjectToolpathsResult;
 use crate::config::{
     FiveAxisKinematicsMode, GcodeDialect, GcodeProcessConfig, MachineKinematicsConfig,
-    SlicerConfig, WallPrintOrder,
+    SlicerConfig, ToolConfig, WallPrintOrder,
 };
 
 /// Formats a firmware-specific dynamic Pressure Advance command for `dialect`.
@@ -724,16 +726,362 @@ fn orient_chain_for_minimal_travel(chain: &mut WorkingChain, from_pos_bed: Vec3,
     }
 }
 
-/// Orders chains on a layer according to `WallPrintOrder` (`InnerOuterInner` or `OutsideIn`)
-/// followed by greedy Z-penalized nearest-neighbor traversal of remaining open/closed paths.
-fn order_layer_chains(
+/// Orthonormal frame in bed coordinates with `up_bed = -gravity_bed` as the vertical axis.
+/// All elevation, heightmap, brim, and lever-arm calculations operate in this frame so
+/// gravity-aware and nozzle-frame invariants hold on tilted-bed and 6-axis machines.
+#[derive(Clone, Copy, Debug)]
+struct BedUpBasis {
+    tangent_u: Vec3,
+    tangent_v: Vec3,
+    up_bed: Vec3,
+}
+
+impl BedUpBasis {
+    fn from_up_bed(up_bed: Vec3) -> Self {
+        let up = up_bed.try_normalize().unwrap_or(Vec3::Z);
+        let ref_x = if up.dot(Vec3::X).abs() < 0.9 {
+            Vec3::X
+        } else {
+            Vec3::Y
+        };
+        let tangent_u = (ref_x - up * ref_x.dot(up)).try_normalize().unwrap_or(Vec3::X);
+        let tangent_v = up.cross(tangent_u).try_normalize().unwrap_or(Vec3::Y);
+        Self {
+            tangent_u,
+            tangent_v,
+            up_bed: up,
+        }
+    }
+
+    #[inline]
+    fn project_uvh(&self, p_bed: Vec3) -> (f32, f32, f32) {
+        (
+            p_bed.dot(self.tangent_u),
+            p_bed.dot(self.tangent_v),
+            p_bed.dot(self.up_bed),
+        )
+    }
+
+    #[inline]
+    fn unproject_uvh(&self, u: f32, v: f32, h: f32) -> Vec3 {
+        self.tangent_u * u + self.tangent_v * v + self.up_bed * h
+    }
+}
+
+/// 2D spatial heightmap of already-printed material in the `BedUpBasis` `(u, v)` plane.
+/// Tracks both completed-layer heights (`prev_layer_max_h`) and all-printed-so-far heights
+/// (`curr_max_h`) at `1.0 mm` cell resolution so travel corridors, non-planar Z-clamping,
+/// and A4T tool clearance cone checks run in $O(1)$ per sample.
+struct PrintedHeightMap {
+    basis: BedUpBasis,
+    cell_size_mm: f32,
+    prev_layer_max_h: HashMap<(i32, i32), f32>,
+    curr_max_h: HashMap<(i32, i32), f32>,
+    coarse_cell_size_mm: f32,
+    /// `(cx, cy) -> (max_h, u_at_max, v_at_max)` from completed previous layers
+    prev_coarse_max_h: HashMap<(i32, i32), (f32, f32, f32)>,
+    /// `(cx, cy) -> (max_h, u_at_max, v_at_max)` from all extrusions emitted so far
+    curr_coarse_max_h: HashMap<(i32, i32), (f32, f32, f32)>,
+}
+
+impl PrintedHeightMap {
+    fn new(basis: BedUpBasis) -> Self {
+        Self {
+            basis,
+            cell_size_mm: 1.0,
+            prev_layer_max_h: HashMap::new(),
+            curr_max_h: HashMap::new(),
+            coarse_cell_size_mm: 2.0,
+            prev_coarse_max_h: HashMap::new(),
+            curr_coarse_max_h: HashMap::new(),
+        }
+    }
+
+    #[inline]
+    fn cell_coords(&self, u: f32, v: f32) -> (i32, i32) {
+        (
+            (u / self.cell_size_mm).floor() as i32,
+            (v / self.cell_size_mm).floor() as i32,
+        )
+    }
+
+    #[inline]
+    fn coarse_coords(&self, u: f32, v: f32) -> (i32, i32) {
+        (
+            (u / self.coarse_cell_size_mm).floor() as i32,
+            (v / self.coarse_cell_size_mm).floor() as i32,
+        )
+    }
+
+    /// Commits the current layer's accumulated heights into `prev_layer_max_h` at the end of a layer.
+    fn finish_layer(&mut self) {
+        for (&k, &h) in &self.curr_max_h {
+            let entry = self.prev_layer_max_h.entry(k).or_insert(h);
+            if h > *entry {
+                *entry = h;
+            }
+        }
+        for (&ck, &val) in &self.curr_coarse_max_h {
+            let entry = self.prev_coarse_max_h.entry(ck).or_insert(val);
+            if val.0 > entry.0 {
+                *entry = val;
+            }
+        }
+    }
+
+    /// Records an extruding segment `(p0_bed -> p1_bed)` into `curr_max_h` and `curr_coarse_max_h`.
+    fn record_extrusion_segment(&mut self, p0_bed: Vec3, p1_bed: Vec3) {
+        let (u0, v0, h0) = self.basis.project_uvh(p0_bed);
+        let (u1, v1, h1) = self.basis.project_uvh(p1_bed);
+        let dist_uv = ((u1 - u0) * (u1 - u0) + (v1 - v0) * (v1 - v0)).sqrt();
+        let steps = ((dist_uv / 0.45).ceil() as usize).max(1);
+        for s in 0..=steps {
+            let t = (s as f32) / (steps as f32);
+            let su = u0 + t * (u1 - u0);
+            let sv = v0 + t * (v1 - v0);
+            let sh = h0 + t * (h1 - h0);
+            let key = self.cell_coords(su, sv);
+            let entry = self.curr_max_h.entry(key).or_insert(sh);
+            if sh > *entry {
+                *entry = sh;
+            }
+            let ckey = self.coarse_coords(su, sv);
+            let centry = self.curr_coarse_max_h.entry(ckey).or_insert((sh, su, sv));
+            if sh > centry.0 {
+                *centry = (sh, su, sv);
+            }
+        }
+    }
+
+    /// Clamps a finalized sequence of `WorkingVertex` points on `layer_ord > 0` so no extruding vertex:
+    /// 1. Dips more than `0.15 mm` below already-printed material in the same `1.0 mm` `(u, v)` cell
+    ///    from previous layers (eliminating direct Z-plows where support/infill/wall isovalues lag).
+    /// 2. Violates the active tool's local-frame radial clearance cone (`ToolConfig::max_allowed_obstacle_z_at_radius`)
+    ///    against higher already-printed material in the surrounding neighborhood.
+    fn clamp_vertices_monotonic_and_clearance(
+        &self,
+        pts: &mut [WorkingVertex],
+        is_closed: bool,
+        layer_ord: usize,
+        tool: Option<&ToolConfig>,
+    ) {
+        if layer_ord == 0 || pts.is_empty() {
+            return;
+        }
+        let n = pts.len();
+        let mut required_lift = vec![0.0f32; n];
+
+        let query_point_floor = |u: f32, v: f32, h: f32, z_noz: Vec3| -> f32 {
+            let mut min_h_req = h;
+            let (ix, iy) = self.cell_coords(u, v);
+            if let Some(&prev_h) = self.prev_layer_max_h.get(&(ix, iy)) {
+                min_h_req = min_h_req.max(prev_h - 0.08);
+            }
+            if let Some(&curr_h) = self.curr_max_h.get(&(ix, iy)) {
+                min_h_req = min_h_req.max(curr_h - 0.10);
+            }
+            if let Some(tcfg) = tool {
+                let (cx, cy) = self.coarse_coords(u, v);
+                let cos_tilt = z_noz.dot(self.basis.up_bed).abs().clamp(0.5, 1.0);
+                for dcx in -10..=10 {
+                    for dcy in -10..=10 {
+                        if let Some(&(obs_h, obs_u, obs_v)) =
+                            self.curr_coarse_max_h.get(&(cx + dcx, cy + dcy))
+                        {
+                            if obs_h <= min_h_req + 0.50 {
+                                continue;
+                            }
+                            let dr = ((obs_u - u) * (obs_u - u) + (obs_v - v) * (obs_v - v)).sqrt();
+                            let r_eff = ((dr - 0.12).max(0.0)) * cos_tilt;
+                            let max_dz = tcfg.max_allowed_obstacle_z_at_radius(r_eff);
+                            let req_h = obs_h - (max_dz - 0.08).max(0.50);
+                            if req_h > min_h_req {
+                                min_h_req = req_h;
+                            }
+                        }
+                    }
+                }
+            }
+            min_h_req
+        };
+
+        for (i, vtx) in pts.iter().enumerate() {
+            let (u, v, h) = self.basis.project_uvh(vtx.pos_bed);
+            let z_noz = vtx.nozzle_bed.try_normalize().unwrap_or(self.basis.up_bed);
+            let min_h_req = query_point_floor(u, v, h, z_noz);
+            if min_h_req > h {
+                required_lift[i] = required_lift[i].max((min_h_req - h).min(5.0));
+            }
+        }
+
+        // Also check along each segment `[i .. i+1]` every 0.35 mm so intermediate cells crossed
+        // by a 0.6..0.8 mm segment lift both segment endpoints above any interior cell obstacle!
+        for i in 0..n.saturating_sub(1) {
+            let (u0, v0, h0) = self.basis.project_uvh(pts[i].pos_bed);
+            let (u1, v1, h1) = self.basis.project_uvh(pts[i + 1].pos_bed);
+            let dist_uv = ((u1 - u0) * (u1 - u0) + (v1 - v0) * (v1 - v0)).sqrt();
+            if dist_uv <= 0.20 {
+                continue;
+            }
+            let z_noz = (pts[i].nozzle_bed + pts[i + 1].nozzle_bed)
+                .try_normalize()
+                .unwrap_or(self.basis.up_bed);
+            let steps = ((dist_uv / 0.35).ceil() as usize).max(2);
+            let mut seg_extra_lift = 0.0f32;
+            for s in 1..steps {
+                let t = (s as f32) / (steps as f32);
+                let su = u0 + t * (u1 - u0);
+                let sv = v0 + t * (v1 - v0);
+                let sh = h0 + t * (h1 - h0);
+                let req_h = query_point_floor(su, sv, sh, z_noz);
+                if req_h > sh {
+                    seg_extra_lift = seg_extra_lift.max((req_h - sh).min(5.0));
+                }
+            }
+            if seg_extra_lift > 1.0e-4 {
+                required_lift[i] = required_lift[i].max(seg_extra_lift);
+                required_lift[i + 1] = required_lift[i + 1].max(seg_extra_lift);
+            }
+        }
+
+        if required_lift.iter().all(|&dl| dl <= 1.0e-4) {
+            return;
+        }
+
+        // Smooth `required_lift` along the vertex sequence with a 3-pass max-preserving ramp
+        let mut smoothed = required_lift.clone();
+        for _ in 0..3 {
+            let prev = smoothed.clone();
+            for i in 0..n {
+                let l = if i > 0 {
+                    prev[i - 1]
+                } else if is_closed {
+                    prev[n - 1]
+                } else {
+                    prev[i]
+                };
+                let r = if i + 1 < n {
+                    prev[i + 1]
+                } else if is_closed {
+                    prev[0]
+                } else {
+                    prev[i]
+                };
+                let avg = 0.25 * l + 0.50 * prev[i] + 0.25 * r;
+                smoothed[i] = required_lift[i].max(avg);
+            }
+        }
+
+        for (i, vtx) in pts.iter_mut().enumerate() {
+            if smoothed[i] > 1.0e-4 {
+                vtx.pos_bed += self.basis.up_bed * smoothed[i];
+            }
+        }
+
+        // Ensure trailing non-extruding `Wipe` vertices never dip below the peak of the
+        // extruding vertices they wipe across (or below any cell in `curr_max_h`), including
+        // cells newly covered by the preceding extrusions of THIS same chain!
+        let mut last_ext_h: Option<f32> = None;
+        let mut chain_cell_max_h: HashMap<(i32, i32), f32> = HashMap::new();
+        for i in 0..pts.len() {
+            let (u, v, h) = self.basis.project_uvh(pts[i].pos_bed);
+            let is_wipe = pts[i].kind_override == Some(PlannedMoveKind::Wipe)
+                || pts[i].flow_rate_mult <= 1.0e-4;
+            if is_wipe {
+                let mut req_h = last_ext_h.unwrap_or(h);
+                let (u_prev, v_prev, _) = if i > 0 {
+                    self.basis.project_uvh(pts[i - 1].pos_bed)
+                } else {
+                    (u, v, h)
+                };
+                let dist_uv = ((u - u_prev) * (u - u_prev) + (v - v_prev) * (v - v_prev)).sqrt();
+                let steps = ((dist_uv / 0.30).ceil() as usize).max(1);
+                for s in 0..=steps {
+                    let t = (s as f32) / (steps as f32);
+                    let su = u_prev + t * (u - u_prev);
+                    let sv = v_prev + t * (v - v_prev);
+                    let cell = self.cell_coords(su, sv);
+                    if let Some(&ch) = self.curr_max_h.get(&cell) {
+                        req_h = req_h.max(ch);
+                    }
+                    if let Some(&ch) = chain_cell_max_h.get(&cell) {
+                        req_h = req_h.max(ch);
+                    }
+                }
+                if req_h > h {
+                    pts[i].pos_bed += self.basis.up_bed * (req_h - h);
+                    // Also lift the wipe start vertex `pts[i - 1]` if `req_h` exceeds its height
+                    if i > 0 {
+                        let (_, _, h_prev) = self.basis.project_uvh(pts[i - 1].pos_bed);
+                        if req_h > h_prev {
+                            pts[i - 1].pos_bed += self.basis.up_bed * (req_h - h_prev);
+                        }
+                    }
+                }
+                last_ext_h = Some(req_h.max(h));
+            } else {
+                if i > 0 {
+                    let (u0, v0, h0) = self.basis.project_uvh(pts[i - 1].pos_bed);
+                    let dist_uv = ((u - u0) * (u - u0) + (v - v0) * (v - v0)).sqrt();
+                    let steps = ((dist_uv / 0.35).ceil() as usize).max(1);
+                    for s in 0..=steps {
+                        let t = (s as f32) / (steps as f32);
+                        let su = u0 + t * (u - u0);
+                        let sv = v0 + t * (v - v0);
+                        let sh = h0 + t * (h - h0);
+                        let cell = self.cell_coords(su, sv);
+                        let entry = chain_cell_max_h.entry(cell).or_insert(sh);
+                        if sh > *entry {
+                            *entry = sh;
+                        }
+                    }
+                } else {
+                    let cell = self.cell_coords(u, v);
+                    chain_cell_max_h.insert(cell, h);
+                }
+                last_ext_h = Some(h);
+            }
+        }
+    }
+
+    /// Queries the maximum already-printed elevation `h` along the 2D travel corridor `(p0_bed -> p1_bed)`
+    /// (including a 1-cell lateral safety margin for the nozzle tip).
+    fn max_corridor_obstacle_h(&self, p0_bed: Vec3, p1_bed: Vec3) -> Option<f32> {
+        let (u0, v0, _) = self.basis.project_uvh(p0_bed);
+        let (u1, v1, _) = self.basis.project_uvh(p1_bed);
+        let dist_uv = ((u1 - u0) * (u1 - u0) + (v1 - v0) * (v1 - v0)).sqrt();
+        if dist_uv <= 1.0e-4 {
+            return None;
+        }
+        let steps = ((dist_uv / 0.35).ceil() as usize).max(1);
+        let mut max_obs_h: Option<f32> = None;
+
+        for s in 0..=steps {
+            let t = (s as f32) / (steps as f32);
+            let su = u0 + t * (u1 - u0);
+            let sv = v0 + t * (v1 - v0);
+            let (ix, iy) = self.cell_coords(su, sv);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    if let Some(&ch) = self.curr_max_h.get(&(ix + dx, iy + dy)) {
+                        max_obs_h = Some(max_obs_h.map_or(ch, |m| m.max(ch)));
+                    }
+                }
+            }
+        }
+        max_obs_h
+    }
+}
+
+/// Orders a single elevation band of chains according to `Supports -> Walls -> WaveOverhangs -> Bridges -> Infill`.
+fn order_chain_band(
     mut chains: Vec<WorkingChain>,
     wall_order: WallPrintOrder,
     start_pos_bed: Vec3,
     z_penalty: f32,
-) -> Vec<WorkingChain> {
+) -> (Vec<WorkingChain>, Vec3) {
     if chains.is_empty() {
-        return chains;
+        return (chains, start_pos_bed);
     }
 
     let mut supports: Vec<WorkingChain> = Vec::new();
@@ -780,7 +1128,7 @@ fn order_layer_chains(
     );
     let mut curr_pos = start_pos_bed;
 
-    // 0. Print Support Base and Support Interface chains first on each layer so overhanging
+    // 0. Print Support Base and Support Interface chains first on each band so overhanging
     //    walls, wave overhangs, and bridges have their support foundation in place.
     let mut used_supports = vec![false; supports.len()];
     for _ in 0..supports.len() {
@@ -944,6 +1292,70 @@ fn order_layer_chains(
         ordered.push(chosen);
     }
 
+    (ordered, curr_pos)
+}
+
+/// Orders chains on a layer according to low-to-high elevation bands along `up_bed`
+/// (preventing high-Z ridges from being printed before adjacent low-Z valleys on the same
+/// non-planar layer), and within each band according to `WallPrintOrder` (`InnerOuterInner`
+/// or `OutsideIn`) followed by greedy Z-penalized nearest-neighbor traversal.
+fn order_layer_chains(
+    chains: Vec<WorkingChain>,
+    wall_order: WallPrintOrder,
+    start_pos_bed: Vec3,
+    z_penalty: f32,
+    up_bed: Vec3,
+) -> Vec<WorkingChain> {
+    if chains.is_empty() {
+        return chains;
+    }
+
+    let up = up_bed.try_normalize().unwrap_or(Vec3::Z);
+    let chain_mean_h = |ch: &WorkingChain| -> f32 {
+        if ch.pts.is_empty() {
+            return 0.0;
+        }
+        let sum: f32 = ch.pts.iter().map(|p| p.pos_bed.dot(up)).sum();
+        sum / (ch.pts.len() as f32)
+    };
+
+    let mut min_h = f32::MAX;
+    let mut max_h = f32::MIN;
+    let mut mean_hs = Vec::with_capacity(chains.len());
+    for ch in &chains {
+        let mh = chain_mean_h(ch);
+        min_h = min_h.min(mh);
+        max_h = max_h.max(mh);
+        mean_hs.push(mh);
+    }
+
+    // When a non-planar layer spans > 0.45 mm in elevation across chains, partition chains
+    // into ascending 0.60 mm elevation bands so low-Z valleys are always printed before
+    // adjacent high-Z peaks on the same layer.
+    let h_span = max_h - min_h;
+    if h_span <= 0.45 {
+        return order_chain_band(chains, wall_order, start_pos_bed, z_penalty).0;
+    }
+
+    let band_step_mm = 0.60f32;
+    let num_bands = ((h_span / band_step_mm).ceil() as usize).clamp(2, 64);
+    let mut bands: Vec<Vec<WorkingChain>> = vec![Vec::new(); num_bands];
+    for (ch, mh) in chains.into_iter().zip(mean_hs.into_iter()) {
+        let b_idx = (((mh - min_h) / band_step_mm).floor() as usize).min(num_bands - 1);
+        bands[b_idx].push(ch);
+    }
+
+    let mut ordered = Vec::new();
+    let mut curr_pos = start_pos_bed;
+    for band in bands {
+        if band.is_empty() {
+            continue;
+        }
+        let (mut band_ordered, next_pos) =
+            order_chain_band(band, wall_order, curr_pos, z_penalty);
+        curr_pos = next_pos;
+        ordered.append(&mut band_ordered);
+    }
     ordered
 }
 
@@ -1042,9 +1454,18 @@ fn finalize_chain_seam_and_wipe(chain: &WorkingChain, cfg: &GcodeProcessConfig) 
             out.push(v);
         }
 
-        // Forward wipe along closed loop
+        // Forward wipe along closed loop (never descending below the scarf lead-out end)
         if cfg.wipe_length_mm > 1.0e-3 {
+            let p_end = out.last().unwrap().pos_bed;
+            let n_end = out
+                .last()
+                .unwrap()
+                .nozzle_bed
+                .try_normalize()
+                .unwrap_or(Vec3::Z);
             let mut w_v = sample_closed_loop_at_arc_length(&chain.pts, l_scarf + cfg.wipe_length_mm);
+            let down_comp = (w_v.pos_bed - p_end).dot(n_end).min(0.0);
+            w_v.pos_bed -= n_end * down_comp;
             w_v.flow_rate_mult = 0.0;
             w_v.kind_override = Some(PlannedMoveKind::Wipe);
             out.push(w_v);
@@ -1072,9 +1493,18 @@ fn finalize_chain_seam_and_wipe(chain: &WorkingChain, cfg: &GcodeProcessConfig) 
         }
         out.push(close_pt);
 
-        // Forward wipe along p0 -> p1 on closed loop
+        // Forward wipe along p0 -> p1 on closed loop (never descending below close_pt)
         if cfg.wipe_length_mm > 1.0e-3 && chain.pts.len() >= 2 {
+            let p_close = out.last().unwrap().pos_bed;
+            let n_close = out
+                .last()
+                .unwrap()
+                .nozzle_bed
+                .try_normalize()
+                .unwrap_or(Vec3::Z);
             let mut w_v = sample_closed_loop_at_arc_length(&chain.pts, cfg.wipe_length_mm);
+            let down_comp = (w_v.pos_bed - p_close).dot(n_close).min(0.0);
+            w_v.pos_bed -= n_close * down_comp;
             w_v.flow_rate_mult = 0.0;
             w_v.kind_override = Some(PlannedMoveKind::Wipe);
             out.push(w_v);
@@ -1098,12 +1528,20 @@ fn finalize_chain_seam_and_wipe(chain: &WorkingChain, cfg: &GcodeProcessConfig) 
     if cfg.wipe_length_mm > 1.0e-3 && chain.base_kind.is_wall() && out.len() >= 2 {
         let p_end = out[out.len() - 1].pos_bed;
         let p_prev = out[out.len() - 2].pos_bed;
+        let n_end = out[out.len() - 1]
+            .nozzle_bed
+            .try_normalize()
+            .unwrap_or(Vec3::Z);
         let seg_vec = p_prev - p_end; // BACKWARD along the last segment!
-        let seg_len = seg_vec.length();
+        // Keep the backward wipe level (or slightly climbing) along `n_end` so retracing a steep
+        // non-planar ramp never descends into the newly extruded peak at `p_end`.
+        let down_comp = seg_vec.dot(n_end).min(0.0);
+        let level_vec = seg_vec - n_end * down_comp;
+        let seg_len = level_vec.length();
         if seg_len > 1.0e-4 {
             let wipe_d = cfg.wipe_length_mm.min(0.85 * seg_len);
             let mut wipe_v = out[out.len() - 1].clone();
-            wipe_v.pos_bed = p_end + (seg_vec / seg_len) * wipe_d;
+            wipe_v.pos_bed = p_end + (level_vec / seg_len) * wipe_d;
             wipe_v.flow_rate_mult = 0.0;
             wipe_v.kind_override = Some(PlannedMoveKind::Wipe);
             out.push(wipe_v);
@@ -2133,6 +2571,846 @@ fn format_moonraker_metadata_footer(
     )
 }
 
+/// First-layer bed contact footprint and overall part height profile used for automatic
+/// brim sizing and lever-arm / cantilevered bending slowdown calculations.
+struct BedFootprintProfile {
+    basis: BedUpBasis,
+    h_base_mm: f32,
+    h_top_mm: f32,
+    w_base_min_mm: f32,
+    part_base_pts_uv: Vec<(f32, f32)>,
+}
+
+impl BedFootprintProfile {
+    fn from_raw_toolpaths(
+        raw_toolpaths: &ObjectToolpathsResult,
+        obj_world_tf: Transform,
+        bed_origin_offset: Vec3,
+        basis: BedUpBasis,
+        layer0_chains: &[WorkingChain],
+    ) -> Self {
+        let mut h_min = f32::MAX;
+        let mut h_max = f32::MIN;
+        for layer in &raw_toolpaths.layers {
+            for path in &layer.paths {
+                for pt in &path.points {
+                    let p_bed =
+                        obj_world_tf.transform_point(Vec3::new(pt.x, pt.y, pt.z)) + bed_origin_offset;
+                    let (_, _, h) = basis.project_uvh(p_bed);
+                    h_min = h_min.min(h);
+                    h_max = h_max.max(h);
+                }
+            }
+        }
+        if !h_min.is_finite() || h_min > h_max {
+            h_min = 0.20;
+            h_max = 0.20;
+        }
+
+        let mut part_pts_uv: Vec<(f32, f32)> = Vec::new();
+        let mut all_pts_uv: Vec<(f32, f32)> = Vec::new();
+        let mut u_min_part = f32::MAX;
+        let mut u_max_part = f32::MIN;
+        let mut v_min_part = f32::MAX;
+        let mut v_max_part = f32::MIN;
+        let mut u_min_all = f32::MAX;
+        let mut u_max_all = f32::MIN;
+        let mut v_min_all = f32::MAX;
+        let mut v_max_all = f32::MIN;
+
+        for ch in layer0_chains {
+            let is_supp = ch.base_kind.is_support();
+            for vtx in &ch.pts {
+                let (u, v, _) = basis.project_uvh(vtx.pos_bed);
+                u_min_all = u_min_all.min(u);
+                u_max_all = u_max_all.max(u);
+                v_min_all = v_min_all.min(v);
+                v_max_all = v_max_all.max(v);
+                all_pts_uv.push((u, v));
+                if !is_supp {
+                    u_min_part = u_min_part.min(u);
+                    u_max_part = u_max_part.max(u);
+                    v_min_part = v_min_part.min(v);
+                    v_max_part = v_max_all.max(v);
+                    part_pts_uv.push((u, v));
+                }
+            }
+        }
+
+        let (base_pts, w_min) = if part_pts_uv.len() >= 3 {
+            let wu = (u_max_part - u_min_part).max(2.0);
+            let wv = (v_max_part - v_min_part).max(2.0);
+            // Subsample to <= 160 points for fast cantilevered distance queries
+            let stride = (part_pts_uv.len() / 160).max(1);
+            let sub: Vec<(f32, f32)> = part_pts_uv.into_iter().step_by(stride).collect();
+            (sub, wu.min(wv))
+        } else if !all_pts_uv.is_empty() {
+            let wu = (u_max_all - u_min_all).max(2.0);
+            let wv = (v_max_all - v_min_all).max(2.0);
+            let stride = (all_pts_uv.len() / 160).max(1);
+            let sub: Vec<(f32, f32)> = all_pts_uv.into_iter().step_by(stride).collect();
+            (sub, wu.min(wv))
+        } else {
+            (vec![(0.0, 0.0)], 20.0)
+        };
+
+        Self {
+            basis,
+            h_base_mm: h_min,
+            h_top_mm: h_max,
+            w_base_min_mm: w_min.max(2.0),
+            part_base_pts_uv: base_pts,
+        }
+    }
+
+    /// Global height-to-narrowest-base lever ratio $\Lambda_{\text{global}} = (H_{\text{top}} - H_{\text{base}}) / W_{\text{base,min}}$.
+    fn global_lever_ratio(&self) -> f32 {
+        ((self.h_top_mm - self.h_base_mm).max(0.0)) / self.w_base_min_mm.max(2.0)
+    }
+
+    /// Lateral cantilevered overhang distance from `(u, v)` to the nearest Layer 0 part contact point.
+    fn lateral_cantilever_dist_mm(&self, u: f32, v: f32) -> f32 {
+        let mut best_d2 = f32::MAX;
+        for &(bu, bv) in &self.part_base_pts_uv {
+            let d2 = (u - bu) * (u - bu) + (v - bv) * (v - bv);
+            if d2 < best_d2 {
+                best_d2 = d2;
+            }
+        }
+        if best_d2 < f32::MAX {
+            best_d2.sqrt()
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Generates outward concentric first-layer brim loops around Layer 0 extrusions when either
+/// `gcfg.brim_width_mm > 0.0` or `gcfg.enable_auto_brim` detects a tall / narrow-base part
+/// ($\Lambda_{\text{global}} > 2.2$ and `total_layers >= 5`).
+fn generate_first_layer_brim_chains(
+    layer0_chains: &[WorkingChain],
+    footprint: &BedFootprintProfile,
+    total_layers: usize,
+    gcfg: &GcodeProcessConfig,
+    line_width_mm: f32,
+    first_layer_height_mm: f32,
+) -> Vec<WorkingChain> {
+    if layer0_chains.is_empty() {
+        return Vec::new();
+    }
+
+    let eff_brim_width_mm = if gcfg.brim_width_mm > 0.05 {
+        gcfg.brim_width_mm
+    } else if gcfg.enable_auto_brim && total_layers >= 5 {
+        let ratio = footprint.global_lever_ratio();
+        if ratio > 2.2 {
+            (1.6 * (ratio - 2.0)).clamp(2.4, 8.0)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    let w_line = line_width_mm.max(0.25);
+    let num_loops = (eff_brim_width_mm / w_line).round() as usize;
+    if num_loops == 0 {
+        return Vec::new();
+    }
+
+    // Collect sampled 2D segments `(u0, v0, u1, v1, h_avg)` from Layer 0 chains
+    let mut u_min = f32::MAX;
+    let mut u_max = f32::MIN;
+    let mut v_min = f32::MAX;
+    let mut v_max = f32::MIN;
+    let mut h_sum = 0.0f32;
+    let mut h_cnt = 0usize;
+    let mut segs_uv: Vec<(f32, f32, f32, f32)> = Vec::new();
+
+    for ch in layer0_chains {
+        if ch.pts.len() < 2 {
+            continue;
+        }
+        for w in ch.pts.windows(2) {
+            let (u0, v0, h0) = footprint.basis.project_uvh(w[0].pos_bed);
+            let (u1, v1, h1) = footprint.basis.project_uvh(w[1].pos_bed);
+            u_min = u_min.min(u0).min(u1);
+            u_max = u_max.max(u0).max(u1);
+            v_min = v_min.min(v0).min(v1);
+            v_max = v_max.max(v0).max(v1);
+            h_sum += 0.5 * (h0 + h1);
+            h_cnt += 1;
+            segs_uv.push((u0, v0, u1, v1));
+        }
+        if ch.is_closed && ch.pts.len() >= 3 {
+            let last = ch.pts.last().unwrap();
+            let first = ch.pts.first().unwrap();
+            let (u0, v0, _) = footprint.basis.project_uvh(last.pos_bed);
+            let (u1, v1, _) = footprint.basis.project_uvh(first.pos_bed);
+            segs_uv.push((u0, v0, u1, v1));
+        }
+    }
+    if segs_uv.is_empty() || u_min > u_max {
+        return Vec::new();
+    }
+
+    let h_brim = if h_cnt > 0 {
+        h_sum / (h_cnt as f32)
+    } else {
+        footprint.h_base_mm
+    };
+    let max_offset = gcfg.brim_gap_mm + (num_loops as f32 + 1.5) * w_line;
+    let step_mm = 0.40f32;
+    let pad_mm = max_offset + 2.0 * step_mm;
+
+    let origin_u = u_min - pad_mm;
+    let origin_v = v_min - pad_mm;
+    let nx = (((u_max - u_min + 2.0 * pad_mm) / step_mm).ceil() as usize).clamp(8, 700);
+    let ny = (((v_max - v_min + 2.0 * pad_mm) / step_mm).ceil() as usize).clamp(8, 700);
+
+    // Compute unsigned distance field on `(nx + 1) x (ny + 1)` grid by rasterizing each segment's
+    // padded bounding box `[min - max_offset .. max + max_offset]`
+    let gw = nx + 1;
+    let gh = ny + 1;
+    let mut dist_grid = vec![max_offset + 2.0; gw * gh];
+    let r_pad = max_offset + step_mm;
+
+    for &(u0, v0, u1, v1) in &segs_uv {
+        let su_min = u0.min(u1) - r_pad;
+        let su_max = u0.max(u1) + r_pad;
+        let sv_min = v0.min(v1) - r_pad;
+        let sv_max = v0.max(v1) + r_pad;
+
+        let ix0 = (((su_min - origin_u) / step_mm).floor() as isize).max(0) as usize;
+        let ix1 = (((su_max - origin_u) / step_mm).ceil() as isize).min(nx as isize) as usize;
+        let iy0 = (((sv_min - origin_v) / step_mm).floor() as isize).max(0) as usize;
+        let iy1 = (((sv_max - origin_v) / step_mm).ceil() as isize).min(ny as isize) as usize;
+
+        let du = u1 - u0;
+        let dv = v1 - v0;
+        let len_sq = du * du + dv * dv;
+
+        for iy in iy0..=iy1 {
+            let gv = origin_v + (iy as f32) * step_mm;
+            let row_off = iy * gw;
+            for ix in ix0..=ix1 {
+                let gu = origin_u + (ix as f32) * step_mm;
+                let t = if len_sq > 1.0e-8 {
+                    (((gu - u0) * du + (gv - v0) * dv) / len_sq).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let cu = u0 + t * du;
+                let cv = v0 + t * dv;
+                let d = ((gu - cu) * (gu - cu) + (gv - cv) * (gv - cv)).sqrt();
+                let cell = &mut dist_grid[row_off + ix];
+                if d < *cell {
+                    *cell = d;
+                }
+            }
+        }
+    }
+
+    // Flood-fill exterior cells (`dist > 0.55 * w_line`) starting from the grid border `(0, 0)`
+    // so internal holes/cavities inside the part footprint are excluded from outward brim loops.
+    let mut is_exterior = vec![false; gw * gh];
+    let mut queue: Vec<(usize, usize)> = Vec::with_capacity(gw * gh / 4);
+    let inner_barrier = (0.45 * w_line).max(0.22);
+    for ix in 0..gw {
+        for &iy in &[0usize, gh - 1] {
+            let idx = iy * gw + ix;
+            if !is_exterior[idx] && dist_grid[idx] > inner_barrier {
+                is_exterior[idx] = true;
+                queue.push((ix, iy));
+            }
+        }
+    }
+    for iy in 0..gh {
+        for &ix in &[0usize, gw - 1] {
+            let idx = iy * gw + ix;
+            if !is_exterior[idx] && dist_grid[idx] > inner_barrier {
+                is_exterior[idx] = true;
+                queue.push((ix, iy));
+            }
+        }
+    }
+    let mut head = 0usize;
+    while head < queue.len() {
+        let (cx, cy) = queue[head];
+        head += 1;
+        let neighbors = [
+            (cx.wrapping_sub(1), cy),
+            (cx + 1, cy),
+            (cx, cy.wrapping_sub(1)),
+            (cx, cy + 1),
+        ];
+        for (nx_i, ny_i) in neighbors {
+            if nx_i < gw && ny_i < gh {
+                let nidx = ny_i * gw + nx_i;
+                if !is_exterior[nidx] && dist_grid[nidx] > inner_barrier {
+                    is_exterior[nidx] = true;
+                    queue.push((nx_i, ny_i));
+                }
+            }
+        }
+    }
+    // Set interior cells to 0.0 so Marching Squares only extracts outward exterior contours
+    for idx in 0..(gw * gh) {
+        if !is_exterior[idx] {
+            dist_grid[idx] = 0.0;
+        }
+    }
+
+    let mut brim_chains: Vec<WorkingChain> = Vec::new();
+    // Emit from outside in (`loop_i = num_loops - 1` down to `0`) so the nozzle primes on the
+    // outermost loop and progressively locks each inner loop against the part base.
+    for loop_i in (0..num_loops).rev() {
+        let iso = gcfg.brim_gap_mm + ((loop_i as f32) + 0.5) * w_line + 0.5 * w_line;
+        let loops_uv = extract_marching_squares_loops(&dist_grid, gw, gh, origin_u, origin_v, step_mm, iso);
+        for loop_pts in loops_uv {
+            if loop_pts.len() < 6 {
+                continue;
+            }
+            let pts: Vec<WorkingVertex> = loop_pts
+                .into_iter()
+                .map(|(u, v)| WorkingVertex {
+                    pos_bed: footprint.basis.unproject_uvh(u, v, h_brim),
+                    nozzle_bed: footprint.basis.up_bed,
+                    width_mm: w_line,
+                    height_mm: first_layer_height_mm.max(0.08),
+                    flow_rate_mult: 1.0,
+                    kind_override: None,
+                })
+                .collect();
+            let mut wc = WorkingChain {
+                pts,
+                base_kind: PlannedMoveKind::OuterWall,
+                wall_index: 0,
+                is_closed: true,
+            };
+            simplify_working_chain(&mut wc, 0.05 * w_line);
+            if wc.pts.len() >= 4 {
+                brim_chains.push(wc);
+            }
+        }
+    }
+
+    brim_chains
+}
+
+/// Extracts closed 2D iso-contours from a scalar grid using Marching Squares + segment stitching.
+fn extract_marching_squares_loops(
+    grid: &[f32],
+    gw: usize,
+    gh: usize,
+    origin_u: f32,
+    origin_v: f32,
+    step_mm: f32,
+    iso: f32,
+) -> Vec<Vec<(f32, f32)>> {
+    let mut raw_segs: Vec<((f32, f32), (f32, f32))> = Vec::new();
+    let interp = |a: f32, b: f32| -> f32 {
+        let denom = b - a;
+        if denom.abs() > 1.0e-6 {
+            ((iso - a) / denom).clamp(0.0, 1.0)
+        } else {
+            0.5
+        }
+    };
+
+    for iy in 0..(gh.saturating_sub(1)) {
+        let v0 = origin_v + (iy as f32) * step_mm;
+        let v1 = v0 + step_mm;
+        for ix in 0..(gw.saturating_sub(1)) {
+            let u0 = origin_u + (ix as f32) * step_mm;
+            let u1 = u0 + step_mm;
+
+            let f00 = grid[iy * gw + ix];
+            let f10 = grid[iy * gw + ix + 1];
+            let f11 = grid[(iy + 1) * gw + ix + 1];
+            let f01 = grid[(iy + 1) * gw + ix];
+
+            let mut mask = 0u8;
+            if f00 >= iso {
+                mask |= 1;
+            }
+            if f10 >= iso {
+                mask |= 2;
+            }
+            if f11 >= iso {
+                mask |= 4;
+            }
+            if f01 >= iso {
+                mask |= 8;
+            }
+            if mask == 0 || mask == 15 {
+                continue;
+            }
+
+            let e_bottom = (u0 + interp(f00, f10) * step_mm, v0);
+            let e_right = (u1, v0 + interp(f10, f11) * step_mm);
+            let e_top = (u0 + interp(f01, f11) * step_mm, v1);
+            let e_left = (u0, v0 + interp(f00, f01) * step_mm);
+
+            match mask {
+                1 | 14 => raw_segs.push((e_left, e_bottom)),
+                2 | 13 => raw_segs.push((e_bottom, e_right)),
+                3 | 12 => raw_segs.push((e_left, e_right)),
+                4 | 11 => raw_segs.push((e_right, e_top)),
+                5 => {
+                    raw_segs.push((e_left, e_top));
+                    raw_segs.push((e_bottom, e_right));
+                }
+                6 | 9 => raw_segs.push((e_bottom, e_top)),
+                7 | 8 => raw_segs.push((e_left, e_top)),
+                10 => {
+                    raw_segs.push((e_left, e_bottom));
+                    raw_segs.push((e_right, e_top));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if raw_segs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut used = vec![false; raw_segs.len()];
+    let mut loops: Vec<Vec<(f32, f32)>> = Vec::new();
+    let tol_sq = (0.15 * step_mm) * (0.15 * step_mm);
+
+    for start_i in 0..raw_segs.len() {
+        if used[start_i] {
+            continue;
+        }
+        used[start_i] = true;
+        let mut chain = vec![raw_segs[start_i].0, raw_segs[start_i].1];
+
+        loop {
+            let tail = *chain.last().unwrap();
+            let mut found_next = None;
+            for (j, &(p0, p1)) in raw_segs.iter().enumerate() {
+                if used[j] {
+                    continue;
+                }
+                let d0 = (p0.0 - tail.0) * (p0.0 - tail.0) + (p0.1 - tail.1) * (p0.1 - tail.1);
+                if d0 <= tol_sq {
+                    found_next = Some((j, p1));
+                    break;
+                }
+                let d1 = (p1.0 - tail.0) * (p1.0 - tail.0) + (p1.1 - tail.1) * (p1.1 - tail.1);
+                if d1 <= tol_sq {
+                    found_next = Some((j, p0));
+                    break;
+                }
+            }
+            if let Some((j, next_pt)) = found_next {
+                used[j] = true;
+                chain.push(next_pt);
+            } else {
+                break;
+            }
+        }
+
+        if chain.len() >= 6 {
+            let head = chain[0];
+            let tail = *chain.last().unwrap();
+            let close_d2 = (head.0 - tail.0) * (head.0 - tail.0) + (head.1 - tail.1) * (head.1 - tail.1);
+            if close_d2 <= 4.0 * step_mm * step_mm {
+                chain.pop();
+                loops.push(chain);
+            }
+        }
+    }
+
+    loops
+}
+
+/// Applies automatic lever-arm and curled-corner speed/acceleration slowdown on upper layers
+/// (`layer_ord > 0` when `gcfg.enable_lever_arm_slowdown` is enabled).
+/// Throttles speeds and accelerations where:
+/// 1. The global bed torque lever ratio $\Lambda_{\text{bed}} = (h + 1.35 \, d_{\text{cant}}) / W_{\text{base,min}}$
+///    or local slender-prong ratio exceeds `lever_arm_reference_ratio`.
+/// 2. Acute corners, overhangs, or steep non-planar climbs are prone to upward thermal corner curl.
+fn apply_lever_arm_and_curl_slowdown(
+    layer_segments: &mut [PlannedSegment],
+    layer_ord: usize,
+    footprint: &BedFootprintProfile,
+    gcfg: &GcodeProcessConfig,
+) {
+    if !gcfg.enable_lever_arm_slowdown || layer_ord == 0 || layer_segments.is_empty() {
+        return;
+    }
+
+    // 1. Measure current layer's part-extrusion horizontal span to detect slender cantilevered prongs
+    let mut u_min_layer = f32::MAX;
+    let mut u_max_layer = f32::MIN;
+    let mut v_min_layer = f32::MAX;
+    let mut v_max_layer = f32::MIN;
+    let mut part_ext_cnt = 0usize;
+
+    for seg in layer_segments.iter() {
+        if seg.kind.is_extruding() && !seg.kind.is_support() && seg.delta_e_mm > 1.0e-6 {
+            let (u, v, _) = footprint.basis.project_uvh(0.5 * (seg.p0_bed + seg.p1_bed));
+            u_min_layer = u_min_layer.min(u);
+            u_max_layer = u_max_layer.max(u);
+            v_min_layer = v_min_layer.min(v);
+            v_max_layer = v_max_layer.max(v);
+            part_ext_cnt += 1;
+        }
+    }
+    let w_layer_min = if part_ext_cnt > 0 && u_min_layer <= u_max_layer {
+        (u_max_layer - u_min_layer)
+            .min(v_max_layer - v_min_layer)
+            .max(2.5)
+    } else {
+        footprint.w_base_min_mm
+    };
+
+    // 2. Compute per-segment raw corner/overhang/climb curl risk `curl_raw[i] \in [0, 1]`
+    let n = layer_segments.len();
+    let mut curl_raw = vec![0.0f32; n];
+    for i in 0..n {
+        let seg = &layer_segments[i];
+        if !seg.kind.is_extruding() || seg.delta_e_mm <= 1.0e-6 {
+            continue;
+        }
+        let d_curr = (seg.p1_bed - seg.p0_bed)
+            .try_normalize()
+            .unwrap_or(footprint.basis.tangent_u);
+        let z_noz = (seg.nozzle_bed_0 + seg.nozzle_bed_1)
+            .try_normalize()
+            .unwrap_or(footprint.basis.up_bed);
+
+        // Turning angle deflection at segment entry and exit
+        let mut max_turn_sin = 0.0f32;
+        if i > 0 && layer_segments[i - 1].kind.is_extruding() {
+            let d_prev = (layer_segments[i - 1].p1_bed - layer_segments[i - 1].p0_bed)
+                .try_normalize()
+                .unwrap_or(d_curr);
+            let cos_a = d_prev.dot(d_curr).clamp(-1.0, 1.0);
+            let sin_half = (0.5 * (1.0 - cos_a)).max(0.0).sqrt();
+            max_turn_sin = max_turn_sin.max(sin_half);
+        }
+        if i + 1 < n && layer_segments[i + 1].kind.is_extruding() {
+            let d_next = (layer_segments[i + 1].p1_bed - layer_segments[i + 1].p0_bed)
+                .try_normalize()
+                .unwrap_or(d_curr);
+            let cos_a = d_curr.dot(d_next).clamp(-1.0, 1.0);
+            let sin_half = (0.5 * (1.0 - cos_a)).max(0.0).sqrt();
+            max_turn_sin = max_turn_sin.max(sin_half);
+        }
+
+        let r_corner = ((max_turn_sin - 0.18) / 0.55).clamp(0.0, 1.0);
+        let climb_sin = d_curr.dot(footprint.basis.up_bed).abs();
+        let tilt_sin = (1.0 - z_noz.dot(footprint.basis.up_bed).abs().clamp(0.0, 1.0)).sqrt();
+        let r_overhang = match seg.kind {
+            PlannedMoveKind::WaveOverhang | PlannedMoveKind::Bridge => 0.85,
+            PlannedMoveKind::OuterWall => (1.5 * climb_sin + 0.9 * tilt_sin).clamp(0.0, 1.0),
+            _ => (1.1 * climb_sin + 0.6 * tilt_sin).clamp(0.0, 1.0),
+        };
+        curl_raw[i] = (0.65 * r_corner + 0.55 * r_overhang).clamp(0.0, 1.0);
+    }
+
+    // 3. Smooth `curl_raw` across a +/- 3.0 mm arc-length neighborhood along contiguous extrusions
+    let mut curl_smooth = curl_raw.clone();
+    for i in 0..n {
+        if !layer_segments[i].kind.is_extruding() {
+            continue;
+        }
+        let mut max_c = curl_raw[i];
+        let mut dist_back = 0.0f32;
+        let mut j = i;
+        while j > 0 && dist_back < 3.0 {
+            j -= 1;
+            if !layer_segments[j].kind.is_extruding() {
+                break;
+            }
+            dist_back += layer_segments[j].length_mm;
+            let w = (1.0 - dist_back / 3.5).clamp(0.0, 1.0);
+            max_c = max_c.max(curl_raw[j] * w);
+        }
+        let mut dist_fwd = 0.0f32;
+        let mut k = i + 1;
+        while k < n && dist_fwd < 3.0 {
+            if !layer_segments[k].kind.is_extruding() {
+                break;
+            }
+            dist_fwd += layer_segments[k].length_mm;
+            let w = (1.0 - dist_fwd / 3.5).clamp(0.0, 1.0);
+            max_c = max_c.max(curl_raw[k] * w);
+            k += 1;
+        }
+        curl_smooth[i] = max_c;
+    }
+
+    let ref_ratio = gcfg.lever_arm_reference_ratio.max(0.5);
+    let min_frac = gcfg.lever_arm_min_speed_fraction.clamp(0.10, 1.0);
+
+    for (i, seg) in layer_segments.iter_mut().enumerate() {
+        if !seg.kind.is_extruding() || seg.delta_e_mm <= 1.0e-6 {
+            continue;
+        }
+        let mid_bed = 0.5 * (seg.p0_bed + seg.p1_bed);
+        let (u, v, h) = footprint.basis.project_uvh(mid_bed);
+        let h_rel = (h - footprint.h_base_mm).max(0.0);
+        if h_rel < 2.0 {
+            continue;
+        }
+
+        let d_cant = footprint.lateral_cantilever_dist_mm(u, v);
+        let lambda_bed = (h_rel + 1.35 * d_cant) / footprint.w_base_min_mm.max(2.0);
+        let lambda_prong = (0.45 * h_rel) / w_layer_min.max(2.5);
+        let lambda_eff = lambda_bed.max(lambda_prong);
+
+        let excess_lever = ((lambda_eff - ref_ratio) / ref_ratio).max(0.0);
+        let c_curl = curl_smooth[i];
+        if excess_lever <= 1.0e-4 && (lambda_eff < 0.65 * ref_ratio || c_curl <= 0.15) {
+            continue;
+        }
+
+        // Base lever slowdown + extra deceleration when traversing curled-corner risk zones at height
+        let height_gate = (lambda_eff / ref_ratio).clamp(0.25, 2.0);
+        let denom = 1.0 + 0.42 * excess_lever + 0.70 * c_curl * height_gate;
+        let speed_scale = (1.0 / denom).clamp(min_frac, 1.0);
+        if speed_scale >= 0.995 {
+            continue;
+        }
+
+        // Scale linear speed and acceleration (even more aggressively on acceleration to cap reaction torque)
+        let accel_scale = (speed_scale * (1.0 - 0.30 * c_curl))
+            .clamp((min_frac * 0.65).max(0.12), 1.0);
+
+        seg.nominal_speed_mms = (seg.nominal_speed_mms * speed_scale).max(5.0);
+        seg.entry_speed_mms = (seg.entry_speed_mms * speed_scale).max(5.0);
+        seg.cruise_speed_mms = (seg.cruise_speed_mms * speed_scale).max(5.0);
+        seg.exit_speed_mms = (seg.exit_speed_mms * speed_scale).max(5.0);
+        seg.accel_mms2 = (seg.accel_mms2 * accel_scale).max(250.0);
+        seg.duration_s = (seg.length_mm / seg.cruise_speed_mms.max(1.0)).max(1.0e-4);
+    }
+}
+
+/// Computes a dynamic per-segment part cooling fan PWM schedule (`0..=255`) for `layer`
+/// matching fan airflow to:
+/// 1. Instantaneous volumetric extrusion rate $Q_i$ (`mm^3/s`),
+/// 2. Cumulative extruded polymer volume $V_{\text{duct}}$ and cooling airflow residence time
+///    $t_{\text{res}}$ within the toolhead's `12.0 mm` cooling duct footprint,
+/// 3. Total layer return time $t_{\text{layer}}$ relative to `target_layer_cooling_time_s`, and
+/// 4. Local corner/overhang curl risk.
+fn compute_layer_fan_pwm_schedule(
+    layer: &PlannedLayerGcode,
+    layer_ord: usize,
+    up_bed: Vec3,
+    gcfg: &GcodeProcessConfig,
+) -> Vec<u8> {
+    let n = layer.segments.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let is_initial_layer = (layer_ord as u32) < gcfg.disable_fan_first_layers;
+    let base_fan_pct = if is_initial_layer {
+        gcfg.first_layer_fan_speed_percent.clamp(0.0, 100.0)
+    } else {
+        gcfg.fan_speed_percent.clamp(0.0, 100.0)
+    };
+    let base_pwm = (base_fan_pct * 2.55).round().clamp(0.0, 255.0) as u8;
+
+    // On initial bed-adhesion layers or when dynamic fan modulation is disabled, preserve
+    // standard static/feature-override fan behavior.
+    if is_initial_layer || !gcfg.enable_dynamic_fan_speed {
+        let mut sched = vec![base_pwm; n];
+        let mut last_pwm = base_pwm;
+        for (i, seg) in layer.segments.iter().enumerate() {
+            if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
+                let pct = match seg.kind {
+                    PlannedMoveKind::Bridge => gcfg.bridge_fan_speed_percent.clamp(0.0, 100.0),
+                    PlannedMoveKind::WaveOverhang => {
+                        gcfg.wave_overhang_fan_speed_percent.clamp(0.0, 100.0)
+                    }
+                    _ => base_fan_pct,
+                };
+                last_pwm = (pct * 2.55).round().clamp(0.0, 255.0) as u8;
+            }
+            sched[i] = last_pwm;
+        }
+        return sched;
+    }
+
+    let min_pct = gcfg.min_fan_speed_percent.clamp(0.0, 100.0);
+    let max_pct = gcfg.max_fan_speed_percent.clamp(min_pct, 100.0);
+    let q_ref = (0.65 * gcfg.max_volumetric_flow_mm3s).max(4.0);
+
+    // Total layer time for layer-return thermal boost
+    let layer_time_s: f32 = layer
+        .segments
+        .iter()
+        .map(|s| s.duration_s)
+        .sum::<f32>()
+        .max(0.05);
+    let u_layer_time = if layer_time_s < gcfg.target_layer_cooling_time_s {
+        ((gcfg.target_layer_cooling_time_s - layer_time_s)
+            / gcfg.target_layer_cooling_time_s.max(1.0))
+        .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    // Cooling duct effective airflow radius around the nozzle tip (12.0 mm)
+    let r_duct_mm = 12.0f32;
+    let r_duct_sq = r_duct_mm * r_duct_mm;
+    let filament_area_mm2 =
+        std::f32::consts::FRAC_PI_4 * gcfg.filament_diameter_mm * gcfg.filament_diameter_mm;
+
+    let mut raw_pct = vec![min_pct; n];
+    for i in 0..n {
+        let seg = &layer.segments[i];
+        if !seg.kind.is_extruding() || seg.delta_e_mm <= 1.0e-6 {
+            raw_pct[i] = if i > 0 { raw_pct[i - 1] } else { min_pct };
+            continue;
+        }
+
+        // Dedicated feature overrides for free-air Bridges and Wave Overhangs
+        if seg.kind == PlannedMoveKind::Bridge {
+            raw_pct[i] = gcfg.bridge_fan_speed_percent.clamp(min_pct, 100.0);
+            continue;
+        }
+        if seg.kind == PlannedMoveKind::WaveOverhang {
+            raw_pct[i] = gcfg.wave_overhang_fan_speed_percent.clamp(min_pct, 100.0);
+            continue;
+        }
+
+        // 1. Instantaneous volumetric extrusion rate factor
+        let u_vol = (seg.volumetric_flow_mm3s / q_ref).clamp(0.0, 1.0);
+
+        // 2. Cooling airflow residence time `t_res` and deposited melt volume `v_duct_mm3`
+        //    within the 12.0 mm cooling duct footprint around `mid_i`
+        let mid_i = 0.5 * (seg.p0_bed + seg.p1_bed);
+        let mut t_res_s = seg.duration_s;
+        let mut v_duct_mm3 = seg.delta_e_mm * filament_area_mm2;
+        let mut dist_linear = 0.0f32;
+
+        let mut j = i;
+        while j > 0 && dist_linear < 36.0 {
+            j -= 1;
+            let sj = &layer.segments[j];
+            dist_linear += sj.length_mm;
+            let mid_j = 0.5 * (sj.p0_bed + sj.p1_bed);
+            if (mid_j - mid_i).length_squared() <= r_duct_sq {
+                t_res_s += sj.duration_s;
+                if sj.kind.is_extruding() && sj.delta_e_mm > 0.0 {
+                    v_duct_mm3 += sj.delta_e_mm * filament_area_mm2;
+                }
+            }
+        }
+        dist_linear = 0.0;
+        let mut k = i + 1;
+        while k < n && dist_linear < 36.0 {
+            let sk = &layer.segments[k];
+            dist_linear += sk.length_mm;
+            let mid_k = 0.5 * (sk.p0_bed + sk.p1_bed);
+            if (mid_k - mid_i).length_squared() <= r_duct_sq {
+                t_res_s += sk.duration_s;
+                if sk.kind.is_extruding() && sk.delta_e_mm > 0.0 {
+                    v_duct_mm3 += sk.delta_e_mm * filament_area_mm2;
+                }
+            }
+            k += 1;
+        }
+
+        // Thermal load inside the cooling duct footprint:
+        // - High extruded volume per unit residence time (`q_duct = v_duct_mm3 / t_res_s`) needs high airflow.
+        // - Short airflow residence time (`t_res_s < 1.2 s`, fast sweeping moves where the nozzle leaves
+        //   the region before the air jet can quench the bead) needs higher fan velocity.
+        // - Long residence time with low volume (`t_res_s > 1.8 s` on a tiny slow feature) still needs
+        //   steady heat removal to prevent heat soak under the hot nozzle block.
+        let q_duct = v_duct_mm3 / t_res_s.max(0.05);
+        let u_duct_q = (q_duct / q_ref).clamp(0.0, 1.0);
+        let u_fast_sweep = (0.45 / t_res_s.max(0.15)).clamp(0.0, 1.0);
+        let u_nozzle_rad_soak = ((t_res_s - 0.8) / 2.2).clamp(0.0, 1.0)
+            * (v_duct_mm3 / 2.5).clamp(0.25, 1.0);
+        let u_residence = u_duct_q.max(0.65 * u_fast_sweep).max(0.80 * u_nozzle_rad_soak);
+
+        // 3. Local corner / overhang / non-planar climb curl demand
+        let seg_dir = (seg.p1_bed - seg.p0_bed).try_normalize().unwrap_or(Vec3::X);
+        let z_noz = (seg.nozzle_bed_0 + seg.nozzle_bed_1)
+            .try_normalize()
+            .unwrap_or(up_bed);
+        let climb_sin = seg_dir.dot(up_bed).abs();
+        let tilt_sin = (1.0 - z_noz.dot(up_bed).abs().clamp(0.0, 1.0)).sqrt();
+        let u_curl = (1.4 * climb_sin + 0.9 * tilt_sin).clamp(0.0, 1.0);
+
+        let demand = (0.42 * u_vol + 0.38 * u_residence + 0.20 * u_curl)
+            .max(0.85 * u_layer_time)
+            .max(0.75 * u_curl)
+            .clamp(0.0, 1.0);
+
+        raw_pct[i] = (min_pct + (max_pct - min_pct) * demand).clamp(min_pct, max_pct);
+    }
+
+    // 4. Apply a 0.35 s forward lookahead pre-spin window (accounting for blower rotor inertia)
+    //    followed by a 0.50 s temporal smoothing window and 3% PWM hysteresis deadband.
+    let mut lead_pct = raw_pct.clone();
+    for i in 0..n {
+        let mut max_upcoming = raw_pct[i];
+        let mut t_ahead = 0.0f32;
+        let mut k = i + 1;
+        while k < n && t_ahead < 0.35 {
+            t_ahead += layer.segments[k].duration_s;
+            max_upcoming = max_upcoming.max(raw_pct[k]);
+            k += 1;
+        }
+        lead_pct[i] = 0.35 * raw_pct[i] + 0.65 * max_upcoming;
+    }
+
+    let mut pwm_schedule = vec![base_pwm; n];
+    let mut active_pwm = (lead_pct[0] * 2.55).round().clamp(0.0, 255.0) as u8;
+    for i in 0..n {
+        let mut w_sum = 0.0f32;
+        let mut p_sum = 0.0f32;
+        let mut t_b = 0.0f32;
+        let mut j = i;
+        loop {
+            let dt = layer.segments[j].duration_s.max(0.005);
+            w_sum += dt;
+            p_sum += dt * lead_pct[j];
+            if j == 0 || t_b >= 0.25 {
+                break;
+            }
+            j -= 1;
+            t_b += dt;
+        }
+        let mut t_f = 0.0f32;
+        let mut k = i + 1;
+        while k < n && t_f < 0.25 {
+            let dt = layer.segments[k].duration_s.max(0.005);
+            w_sum += dt;
+            p_sum += dt * lead_pct[k];
+            t_f += dt;
+            k += 1;
+        }
+        let smoothed_pct = if w_sum > 0.0 {
+            p_sum / w_sum
+        } else {
+            lead_pct[i]
+        };
+        let target_pwm = (smoothed_pct * 2.55).round().clamp(0.0, 255.0) as u8;
+        // Preserve exact PWM for explicit Bridge/WaveOverhang features; otherwise use 7-unit (~2.7%) deadband
+        let is_special = matches!(
+            layer.segments[i].kind,
+            PlannedMoveKind::Bridge | PlannedMoveKind::WaveOverhang
+        );
+        if is_special || target_pwm.abs_diff(active_pwm) >= 7 {
+            active_pwm = target_pwm;
+        }
+        pwm_schedule[i] = active_pwm;
+    }
+
+    pwm_schedule
+}
+
 /// Executes the complete Toolpath-to-Gcode planning & emission pipeline on `raw_toolpaths`.
 pub fn plan_and_emit_gcode(
     raw_toolpaths: &ObjectToolpathsResult,
@@ -2202,6 +3480,9 @@ pub fn plan_and_emit_gcode_for_object(
     // Query gravity direction in bed coordinates (AGENTS.md Rule 2: never hardcode -Z!)
     let gravity_bed = config.query_gravity_bed(Vec3::ZERO);
     let up_bed = (-gravity_bed).try_normalize().unwrap_or(Vec3::Z);
+    let bed_basis = BedUpBasis::from_up_bed(up_bed);
+    let mut height_map = PrintedHeightMap::new(bed_basis);
+    let mut footprint_profile: Option<BedFootprintProfile> = None;
 
     // Viewport scene places (0, 0) at the center of the build plate (`[-width_x/2 .. +width_x/2]`),
     // whereas rectangular printers expect G-code (0, 0) at the front-left corner (`[0 .. width_x]`).
@@ -2313,18 +3594,49 @@ pub fn plan_and_emit_gcode_for_object(
             chains.push(wc);
         }
 
-        let start_ref = curr_nozzle_bed.unwrap_or(bed_origin_offset);
-        let ordered_chains = order_layer_chains(
+            let start_ref = curr_nozzle_bed.unwrap_or(bed_origin_offset);
+        let mut ordered_chains = order_layer_chains(
             chains,
             gcfg.wall_print_order,
             start_ref,
             gcfg.z_travel_penalty,
+            up_bed,
         );
+
+        // On Layer 0, compute the bed contact footprint and prepend outward concentric brim loops
+        // if explicit brim or auto-brim is active.
+        if is_first_layer {
+            let fp = BedFootprintProfile::from_raw_toolpaths(
+                raw_toolpaths,
+                obj_world_tf,
+                bed_origin_offset,
+                bed_basis,
+                &ordered_chains,
+            );
+            let mut brim_chains = generate_first_layer_brim_chains(
+                &ordered_chains,
+                &fp,
+                raw_toolpaths.layers.len(),
+                &gcfg,
+                config.slicing.outer_wall_width.target_mm,
+                config.slicing.layer_height.first_layer_mm,
+            );
+            if !brim_chains.is_empty() {
+                brim_chains.append(&mut ordered_chains);
+                ordered_chains = brim_chains;
+            }
+            footprint_profile = Some(fp);
+        }
 
         let mut layer_segments: Vec<PlannedSegment> = Vec::new();
 
-        for chain in &ordered_chains {
+        for chain in &mut ordered_chains {
             let chain_is_support = chain.base_kind.is_support();
+            let chain_tool_cfg = if chain_is_support {
+                support_tool
+            } else {
+                active_tool
+            };
             let chain_tool_id = if chain_is_support {
                 support_tool_id
             } else {
@@ -2341,7 +3653,7 @@ pub fn plan_and_emit_gcode_for_object(
                 &fluid
             };
 
-            let vertices = if chain.base_kind == PlannedMoveKind::Bridge {
+            let mut vertices = if chain.base_kind == PlannedMoveKind::Bridge {
                 // Keep circular Bridge extrusions as pure un-subdivided straight lines
                 chain.pts.clone()
             } else {
@@ -2350,23 +3662,39 @@ pub fn plan_and_emit_gcode_for_object(
             if vertices.len() < 2 {
                 continue;
             }
+            // Enforce monotonic layer elevation and local-frame toolhead clearance cone against
+            // all already-printed material AFTER `finalize_chain_seam_and_wipe` so scarf-seam
+            // lead-ins and backward wipes never dip below already-printed cells!
+            height_map.clamp_vertices_monotonic_and_clearance(
+                &mut vertices,
+                chain.is_closed,
+                layer_ord,
+                chain_tool_cfg,
+            );
 
             let chain_start_bed = vertices[0].pos_bed;
             let chain_start_nozzle = vertices[0].nozzle_bed;
 
-            // Emit inter-path travel + conditional Z-hop along local nozzle axis (`z_nozzle`).
+            // Emit inter-path travel + obstacle-aware Z-hop along local nozzle axis (`z_nozzle`) / `up_bed`.
             // Always Z-hop when crossing between support and object extrusions, when traveling
-            // between separate support structures, or when switching tools so the nozzle never
-            // drags across support or object walls!
+            // between separate support structures, when switching tools, OR whenever the straight-line
+            // travel corridor passes within 0.20 mm of already-printed material!
             if let Some(prev_bed) = curr_nozzle_bed {
                 let travel_vec = chain_start_bed - prev_bed;
                 let travel_dist = travel_vec.length();
                 let tool_changed = chain_tool_id != curr_planned_tool_id;
                 let support_boundary_crossing = chain_is_support != curr_planned_is_support;
                 if travel_dist > 1.0e-3 || tool_changed {
+                    let (_, _, h_prev) = bed_basis.project_uvh(prev_bed);
+                    let (_, _, h_next) = bed_basis.project_uvh(chain_start_bed);
+                    let corridor_obs_h = height_map.max_corridor_obstacle_h(prev_bed, chain_start_bed);
+                    let corridor_blocked = corridor_obs_h
+                        .is_some_and(|obs_h| obs_h > h_prev.min(h_next) - 0.15);
+
                     let needs_retract = travel_dist > min_retract_travel_mm
                         || tool_changed
-                        || support_boundary_crossing;
+                        || support_boundary_crossing
+                        || corridor_blocked;
                     let is_infill_to_infill = matches!(
                         chain.base_kind,
                         PlannedMoveKind::SolidInfill | PlannedMoveKind::SparseInfill
@@ -2376,16 +3704,50 @@ pub fn plan_and_emit_gcode_for_object(
                             PlannedMoveKind::SolidInfill | PlannedMoveKind::SparseInfill
                         )
                     });
-                    let use_z_hop = gcfg.z_hop_mm > 1.0e-3
-                        && ((needs_retract && !is_infill_to_infill)
-                            || tool_changed
-                            || support_boundary_crossing);
+                    let use_z_hop = corridor_blocked
+                        || (gcfg.z_hop_mm > 1.0e-3
+                            && ((needs_retract && !is_infill_to_infill)
+                                || tool_changed
+                                || support_boundary_crossing));
 
                     if use_z_hop {
-                        let lift_dir = curr_nozzle_axis_bed.try_normalize().unwrap_or(up_bed);
-                        let drop_dir = chain_start_nozzle.try_normalize().unwrap_or(up_bed);
-                        let p_lift = prev_bed + lift_dir * gcfg.z_hop_mm;
-                        let p_above = chain_start_bed + drop_dir * gcfg.z_hop_mm;
+                        let hop_margin = gcfg.z_hop_mm.max(0.30);
+                        // When clearing an obstacle or performing a Z-hop across non-planar terrain,
+                        // lift and drop strictly along `up_bed` when `corridor_blocked` so the Z-hop
+                        // lift/drop legs stay within their start/end `(u, v)` columns and never tilt
+                        // laterally into adjacent steeper walls!
+                        let lift_dir = if corridor_blocked {
+                            up_bed
+                        } else {
+                            curr_nozzle_axis_bed.try_normalize().unwrap_or(up_bed)
+                        };
+                        let drop_dir = if corridor_blocked {
+                            up_bed
+                        } else {
+                            chain_start_nozzle.try_normalize().unwrap_or(up_bed)
+                        };
+
+                        let mut h_peak = h_prev
+                            .max(h_next)
+                            .max(corridor_obs_h.unwrap_or(h_prev.max(h_next)));
+                        let lift_cos = lift_dir.dot(up_bed).max(0.35);
+                        let drop_cos = drop_dir.dot(up_bed).max(0.35);
+
+                        let mut lift_dist = ((h_peak + hop_margin - h_prev).max(hop_margin) / lift_cos).max(hop_margin);
+                        let mut drop_dist = ((h_peak + hop_margin - h_next).max(hop_margin) / drop_cos).max(hop_margin);
+                        let mut p_lift = prev_bed + lift_dir * lift_dist;
+                        let mut p_above = chain_start_bed + drop_dir * drop_dist;
+
+                        if let Some(elev_obs_h) = height_map.max_corridor_obstacle_h(p_lift, p_above) {
+                            if elev_obs_h > h_peak {
+                                h_peak = elev_obs_h;
+                                let h_clear = h_peak + hop_margin;
+                                lift_dist = ((h_clear - h_prev).max(hop_margin) / lift_cos).max(hop_margin);
+                                drop_dist = ((h_clear - h_next).max(hop_margin) / drop_cos).max(hop_margin);
+                                p_lift = prev_bed + lift_dir * lift_dist;
+                                p_above = chain_start_bed + drop_dir * drop_dist;
+                            }
+                        }
 
                         // 1. Z-Hop Lift (carries `retract_before_mm` marker)
                         layer_segments.push(PlannedSegment {
@@ -2405,14 +3767,14 @@ pub fn plan_and_emit_gcode_for_object(
                             tool_id: curr_planned_tool_id,
                             wall_index: 0,
                             width_mm: chain_nozzle_diam * 0.35,
-                            height_mm: gcfg.z_hop_mm,
-                            length_mm: gcfg.z_hop_mm,
+                            height_mm: lift_dist,
+                            length_mm: lift_dist,
                             nominal_speed_mms: gcfg.z_hop_speed_mms,
                             entry_speed_mms: 0.0,
                             cruise_speed_mms: gcfg.z_hop_speed_mms,
                             exit_speed_mms: 0.0,
                             accel_mms2: gcfg.travel_accel_mms2,
-                            duration_s: (gcfg.z_hop_mm / gcfg.z_hop_speed_mms.max(1.0)).max(1.0e-4),
+                            duration_s: (lift_dist / gcfg.z_hop_speed_mms.max(1.0)).max(1.0e-4),
                             delta_e_mm: 0.0,
                             volumetric_flow_mm3s: 0.0,
                             extrusion_multiplier: 0.0,
@@ -2476,14 +3838,14 @@ pub fn plan_and_emit_gcode_for_object(
                             tool_id: chain_tool_id,
                             wall_index: 0,
                             width_mm: chain_nozzle_diam * 0.35,
-                            height_mm: gcfg.z_hop_mm,
-                            length_mm: gcfg.z_hop_mm,
+                            height_mm: drop_dist,
+                            length_mm: drop_dist,
                             nominal_speed_mms: gcfg.z_hop_speed_mms,
                             entry_speed_mms: 0.0,
                             cruise_speed_mms: gcfg.z_hop_speed_mms,
                             exit_speed_mms: 0.0,
                             accel_mms2: gcfg.travel_accel_mms2,
-                            duration_s: (gcfg.z_hop_mm / gcfg.z_hop_speed_mms.max(1.0)).max(1.0e-4),
+                            duration_s: (drop_dist / gcfg.z_hop_speed_mms.max(1.0)).max(1.0e-4),
                             delta_e_mm: 0.0,
                             volumetric_flow_mm3s: 0.0,
                             extrusion_multiplier: 0.0,
@@ -2851,6 +4213,14 @@ pub fn plan_and_emit_gcode_for_object(
                 }
             }
 
+            // Record all extruding segments of this chain into `height_map` so subsequent chains
+            // on this same layer (and future layers) avoid colliding with or plowing through them.
+            for seg in &layer_segments[chain_seg_start..] {
+                if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
+                    height_map.record_extrusion_segment(seg.p0_bed, seg.p1_bed);
+                }
+            }
+
             if let Some(last_v) = vertices.last() {
                 curr_nozzle_bed = Some(last_v.pos_bed);
                 curr_nozzle_axis_bed = last_v.nozzle_bed;
@@ -2859,7 +4229,14 @@ pub fn plan_and_emit_gcode_for_object(
             }
         }
 
-        // 4. Solve 5-Axis B/C postures, rotary velocity/accel throttling, and Chained Velocity Lookahead
+        height_map.finish_layer();
+
+        // 4a. Apply automatic Lever-Arm & Curled-Corner Speed/Acceleration Governor before velocity lookahead
+        if let Some(ref fp) = footprint_profile {
+            apply_lever_arm_and_curl_slowdown(&mut layer_segments, layer_ord, fp, &gcfg);
+        }
+
+        // 4b. Solve 5-Axis B/C postures, rotary velocity/accel throttling, and Chained Velocity Lookahead
         assign_five_axis_bc_postures_and_rotary_limits(
             &mut layer_segments,
             &mcfg,
@@ -3188,46 +4565,37 @@ pub fn plan_and_emit_gcode_for_object(
             }
         }
 
-        // Base layer part cooling fan duty cycle (`M107` or `M106 S0..255`)
-        let layer_base_fan_pct = if (layer_ord as u32) < gcfg.disable_fan_first_layers {
-            gcfg.first_layer_fan_speed_percent.clamp(0.0, 100.0)
-        } else {
-            gcfg.fan_speed_percent.clamp(0.0, 100.0)
-        };
-        let layer_base_fan_pwm = (layer_base_fan_pct * 2.55).round().clamp(0.0, 255.0) as u8;
-        if emitted_fan_pwm != Some(layer_base_fan_pwm) {
-            if layer_base_fan_pwm == 0 {
-                gcode.push_str("M107 ; Part cooling fan off\n");
-            } else {
-                gcode.push_str(&format!(
-                    "M106 S{layer_base_fan_pwm} ; Part cooling fan {:.0}%\n",
-                    layer_base_fan_pct
-                ));
+        // Compute per-segment part cooling fan PWM schedule (`0..=255`) for this layer
+        let fan_pwm_schedule =
+            compute_layer_fan_pwm_schedule(layer, layer_ord, up_bed, &gcfg);
+        if let Some(&first_pwm) = fan_pwm_schedule.first() {
+            if emitted_fan_pwm != Some(first_pwm) {
+                if first_pwm == 0 {
+                    gcode.push_str("M107 ; Part cooling fan off\n");
+                } else {
+                    let pct = (first_pwm as f32) / 2.55;
+                    gcode.push_str(&format!(
+                        "M106 S{first_pwm} ; Part cooling fan {pct:.0}%\n"
+                    ));
+                }
+                emitted_fan_pwm = Some(first_pwm);
             }
-            emitted_fan_pwm = Some(layer_base_fan_pwm);
         }
 
-        for seg in &layer.segments {
+        for (seg_idx, seg) in layer.segments.iter().enumerate() {
             total_time_s += seg.duration_s;
 
-            // Dynamic per-feature cooling fan override for Bridges and Wave Overhangs
+            // Emit dynamic or feature-override cooling fan update when scheduled PWM changes
             if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
-                let seg_fan_pct = match seg.kind {
-                    PlannedMoveKind::Bridge => gcfg.bridge_fan_speed_percent.clamp(0.0, 100.0),
-                    PlannedMoveKind::WaveOverhang => {
-                        gcfg.wave_overhang_fan_speed_percent.clamp(0.0, 100.0)
-                    }
-                    _ => layer_base_fan_pct,
-                };
-                let seg_fan_pwm = (seg_fan_pct * 2.55).round().clamp(0.0, 255.0) as u8;
+                let seg_fan_pwm = fan_pwm_schedule.get(seg_idx).copied().unwrap_or(0);
                 if emitted_fan_pwm != Some(seg_fan_pwm) {
                     if seg_fan_pwm == 0 {
                         gcode.push_str("M107 ; Part cooling fan off\n");
                     } else {
+                        let seg_fan_pct = (seg_fan_pwm as f32) / 2.55;
                         gcode.push_str(&format!(
-                            "M106 S{seg_fan_pwm} ; {} cooling fan {:.0}%\n",
-                            seg.kind.label(),
-                            seg_fan_pct
+                            "M106 S{seg_fan_pwm} ; {} cooling fan {seg_fan_pct:.0}%\n",
+                            seg.kind.label()
                         ));
                     }
                     emitted_fan_pwm = Some(seg_fan_pwm);
@@ -4431,6 +5799,246 @@ mod tests {
                 .gcode_text
                 .contains("G94 ; Restore standard mm/min feedrate mode"),
             "Expected G94 restore at end of print"
+        );
+    }
+
+    #[test]
+    fn test_obstacle_aware_zhop_low_to_high_ordering_auto_brim_lever_slowdown_and_dynamic_fan() {
+        // Construct a tall narrow-base 6-layer non-planar part (base 8x8 mm, top Z = 32 mm -> lever ratio = 4.0 > 2.2):
+        // - Layer 0: 8x8 mm square at Z=0.20 (triggers auto-brim)
+        // - Layer 1: two chains at different Z heights (a high ridge at X=0, Z=3.5 and a low valley at X=6, Z=0.5)
+        //            plus a third chain at X=-6, Z=0.5 so travel between X=-6 and X=+6 crosses the X=0 ridge!
+        // - Layers 2..5: tall square loops climbing up to Z=32.0 mm with sharp 90-deg corners and varying segment speeds.
+        let make_square_loop = |half_w: f32, z: f32, w: f32, h: f32| -> ExtrusionPath {
+            ExtrusionPath {
+                feature_kind: 0,
+                wall_index: 0,
+                is_closed: true,
+                total_length_mm: 8.0 * half_w,
+                mean_width_mm: w,
+                points: vec![
+                    make_pt(-half_w, -half_w, z, w, h),
+                    make_pt(half_w, -half_w, z, w, h),
+                    make_pt(half_w, half_w, z, w, h),
+                    make_pt(-half_w, half_w, z, w, h),
+                ],
+            }
+        };
+
+        // On Layer 1, place the high ridge FIRST in the input `paths` vector to verify
+        // `order_layer_chains` re-orders low-Z valleys before high-Z peaks, and also put
+        // a tall obstacle on Layer 0 at X=0, Z=2.2 mm so travel across X=0 on Layer 1 must Z-hop over it.
+        let obstacle_ridge_l0 = ExtrusionPath {
+            feature_kind: 1,
+            wall_index: 1,
+            is_closed: false,
+            total_length_mm: 8.0,
+            mean_width_mm: 0.42,
+            points: vec![
+                make_pt(0.0, -4.0, 2.2, 0.42, 0.20),
+                make_pt(0.0, 4.0, 2.2, 0.42, 0.20),
+            ],
+        };
+        let high_peak_l1 = ExtrusionPath {
+            feature_kind: 0,
+            wall_index: 0,
+            is_closed: false,
+            total_length_mm: 8.0,
+            mean_width_mm: 0.42,
+            points: vec![
+                make_pt(0.0, -4.0, 3.4, 0.42, 0.20),
+                make_pt(0.0, 4.0, 3.4, 0.42, 0.20),
+            ],
+        };
+        let left_valley_l1 = ExtrusionPath {
+            feature_kind: 0,
+            wall_index: 0,
+            is_closed: false,
+            total_length_mm: 8.0,
+            mean_width_mm: 0.42,
+            points: vec![
+                make_pt(-3.5, -4.0, 0.6, 0.42, 0.20),
+                make_pt(-3.5, 4.0, 0.6, 0.42, 0.20),
+            ],
+        };
+        let right_valley_l1 = ExtrusionPath {
+            feature_kind: 0,
+            wall_index: 0,
+            is_closed: false,
+            total_length_mm: 8.0,
+            mean_width_mm: 0.42,
+            points: vec![
+                make_pt(3.5, -4.0, 0.6, 0.42, 0.20),
+                make_pt(3.5, 4.0, 0.6, 0.42, 0.20),
+            ],
+        };
+
+        let raw = ObjectToolpathsResult {
+            valid: true,
+            total_path_count: 9,
+            outer_wall_count: 8,
+            inner_wall_count: 1,
+            solid_infill_count: 0,
+            sparse_infill_count: 0,
+            bridge_count: 0,
+            wave_overhang_count: 0,
+            support_count: 0,
+            support_interface_count: 0,
+            layers: vec![
+                LayerToolpaths {
+                    layer_index: 0,
+                    branch_id: 0,
+                    isovalue: 0.2,
+                    paths: vec![make_square_loop(4.0, 0.20, 0.42, 0.20), obstacle_ridge_l0],
+                },
+                LayerToolpaths {
+                    layer_index: 1,
+                    branch_id: 0,
+                    isovalue: 1.0,
+                    paths: vec![high_peak_l1, left_valley_l1, right_valley_l1],
+                },
+                LayerToolpaths {
+                    layer_index: 2,
+                    branch_id: 0,
+                    isovalue: 8.0,
+                    paths: vec![make_square_loop(4.0, 8.0, 0.42, 0.20)],
+                },
+                LayerToolpaths {
+                    layer_index: 3,
+                    branch_id: 0,
+                    isovalue: 16.0,
+                    paths: vec![make_square_loop(4.0, 16.0, 0.42, 0.20)],
+                },
+                LayerToolpaths {
+                    layer_index: 4,
+                    branch_id: 0,
+                    isovalue: 24.0,
+                    paths: vec![make_square_loop(4.0, 24.0, 0.42, 0.20)],
+                },
+                LayerToolpaths {
+                    layer_index: 5,
+                    branch_id: 0,
+                    isovalue: 32.0,
+                    paths: vec![
+                        make_square_loop(4.0, 32.0, 0.42, 0.20),
+                        ExtrusionPath {
+                            feature_kind: 4, // SparseInfill (higher speed/flow than OuterWall)
+                            wall_index: 0,
+                            is_closed: false,
+                            total_length_mm: 24.0,
+                            mean_width_mm: 0.48,
+                            points: vec![
+                                make_pt(-3.5, -3.5, 32.0, 0.48, 0.28),
+                                make_pt(3.5, 3.5, 32.0, 0.48, 0.28),
+                                make_pt(-3.5, 3.5, 32.0, 0.48, 0.28),
+                                make_pt(3.5, -3.5, 32.0, 0.48, 0.28),
+                            ],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let mut cfg = SlicerConfig::default();
+        cfg.gcode.outer_wall_speed_mms = 120.0;
+        cfg.gcode.sparse_infill_speed_mms = 200.0;
+        cfg.gcode.enable_auto_brim = true;
+        cfg.gcode.brim_width_mm = 0.0; // Auto-brim should activate because lever_ratio = 32 / 8 = 4.0 > 2.2
+        cfg.gcode.enable_lever_arm_slowdown = true;
+        cfg.gcode.lever_arm_reference_ratio = 1.5;
+        cfg.gcode.lever_arm_min_speed_fraction = 0.30;
+        cfg.gcode.enable_dynamic_fan_speed = true;
+        cfg.gcode.min_fan_speed_percent = 25.0;
+        cfg.gcode.max_fan_speed_percent = 100.0;
+
+        let res = plan_and_emit_gcode_for_object(
+            "TallCantileverTest",
+            1,
+            &raw,
+            Transform::IDENTITY,
+            &cfg,
+        );
+
+        // 1. Verify Auto-Brim expanded Layer 0 footprint outward beyond the 8x8 mm square (`[-4..+4]` -> `> 6.0 mm` half-span)
+        let l0_ext_min_x = res.layers[0]
+            .segments
+            .iter()
+            .filter(|s| s.kind.is_extruding())
+            .map(|s| s.p0_local.x.min(s.p1_local.x))
+            .fold(f32::MAX, f32::min);
+        assert!(
+            l0_ext_min_x < -6.0,
+            "Expected auto-brim on Layer 0 to extend outward past X=-6.0 mm, got min X={l0_ext_min_x}"
+        );
+
+        // 2. Verify Low-to-High intra-layer chain ordering on Layer 1:
+        //    Both Z=0.6 valleys (`X = +/-3.5`) must print BEFORE the Z=3.4 peak (`X = 0.0`)!
+        let l1_ext: Vec<&PlannedSegment> = res.layers[1]
+            .segments
+            .iter()
+            .filter(|s| s.kind.is_extruding() && s.delta_e_mm > 1.0e-5)
+            .collect();
+        assert!(l1_ext.len() >= 3);
+        assert!(
+            l1_ext.first().unwrap().p0_local.z < 1.0,
+            "Expected lowest-elevation valley chain (Z=0.6) to print first on Layer 1, got Z={}",
+            l1_ext.first().unwrap().p0_local.z
+        );
+        assert!(
+            l1_ext.last().unwrap().p1_local.z > 3.0,
+            "Expected highest-elevation peak chain (Z=3.4) to print last on Layer 1, got Z={}",
+            l1_ext.last().unwrap().p1_local.z
+        );
+
+        // 3. Verify Obstacle-Aware Z-Hop on Layer 1:
+        //    Traveling from `left_valley_l1` (Z=0.6, X=-3.5) to `right_valley_l1` (Z=0.6, X=+3.5)
+        //    crosses the Layer 0 ridge at `X=0, Z=2.2`, so the travel segment must lift above Z=2.45 mm!
+        let l1_high_travel = res.layers[1]
+            .segments
+            .iter()
+            .find(|s| s.kind == PlannedMoveKind::Travel && s.p0_local.x * s.p1_local.x < 0.0)
+            .expect("Expected cross-ridge Travel segment on Layer 1");
+        assert!(
+            l1_high_travel.p0_local.z >= 2.45 && l1_high_travel.p1_local.z >= 2.45,
+            "Expected obstacle-aware Z-hop travel across Z=2.2 ridge to clear Z>=2.45 mm, got ({:.2} -> {:.2})",
+            l1_high_travel.p0_local.z,
+            l1_high_travel.p1_local.z
+        );
+
+        // 4. Verify Lever-Arm & Curled-Corner Slowdown progressively throttles nominal speed & accel on upper layers:
+        let l2_max_wall_spd = res.layers[2]
+            .segments
+            .iter()
+            .filter(|s| s.kind == PlannedMoveKind::OuterWall)
+            .map(|s| s.nominal_speed_mms)
+            .fold(0.0f32, f32::max);
+        let l5_max_wall_spd = res.layers[5]
+            .segments
+            .iter()
+            .filter(|s| s.kind == PlannedMoveKind::OuterWall)
+            .map(|s| s.nominal_speed_mms)
+            .fold(0.0f32, f32::max);
+        assert!(
+            l5_max_wall_spd < l2_max_wall_spd && l5_max_wall_spd < 90.0,
+            "Expected top layer (Z=32mm) outer wall speed ({l5_max_wall_spd:.1} mm/s) to be throttled below Layer 2 ({l2_max_wall_spd:.1} mm/s) and < 90 mm/s"
+        );
+
+        // 5. Verify Dynamic Cooling Fan emits multiple distinct M106 S... values across the print
+        let mut m106_values: Vec<u8> = Vec::new();
+        for line in res.gcode_text.lines() {
+            if let Some(rest) = line.strip_prefix("M106 S") {
+                if let Some(num_str) = rest.split_whitespace().next() {
+                    if let Ok(pwm) = num_str.parse::<u8>() {
+                        if !m106_values.contains(&pwm) {
+                            m106_values.push(pwm);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            m106_values.len() >= 2,
+            "Expected dynamic cooling fan to emit at least 2 distinct M106 PWM levels, got {m106_values:?}"
         );
     }
 }

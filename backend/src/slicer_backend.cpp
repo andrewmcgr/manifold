@@ -7244,11 +7244,20 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                 openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler>>(
                 *coarseSdfPtr);
         }
+        const float fineSdfBg = static_cast<float>(sdfGrid.background());
+        const float maxExteriorSdfBg = (coarseSdfPtr != nullptr)
+            ? std::max(fineSdfBg, static_cast<float>(coarseSdfPtr->background()))
+            : fineSdfBg;
         auto samplePartSdf = [&](const openvdb::Vec3d& wp) -> float {
             const float fVal = sdfSampler.wsSample(wp);
-            if (coarseSdfSamplerPtr && rec.fineShellInnerDepthMm > 0.0f &&
-                fVal <= -(rec.fineShellInnerDepthMm - 1.5f * dx)) {
-                return coarseSdfSamplerPtr->wsSample(wp);
+            if (coarseSdfSamplerPtr) {
+                if (rec.fineShellInnerDepthMm > 0.0f &&
+                    fVal <= -(rec.fineShellInnerDepthMm - 1.5f * dx)) {
+                    return coarseSdfSamplerPtr->wsSample(wp);
+                }
+                if (fVal >= 0.82f * fineSdfBg) {
+                    return std::max(fVal, coarseSdfSamplerPtr->wsSample(wp));
+                }
             }
             return fVal;
         };
@@ -7454,14 +7463,16 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
             if (nUp < -0.38f || (!impl_->supportSpec.on_bed_only && nUp > 0.38f)) {
                 // Predominantly vertical contact with overhang ceiling (or allowed floor).
                 // Verify we are not simultaneously within `xyGapMm + 0.5f * lineWidthMm` of a vertical
-                // side wall that extends below `hVal - zGapMm`.
+                // side wall that extends into the support span (`hVal - zGapMm` below a ceiling, or
+                // `hVal + zGapMm` above a floor).
                 const float hNorm = std::sqrt(gu * gu + gv * gv);
                 if (hNorm > 0.35f * gNorm && hVal > zGapMm + 0.10f) {
                     const float wallStep = xyGapMm + 0.5f * lineWidthMm;
                     const float uWall = uVal - wallStep * (gu / hNorm);
                     const float vWall = vVal - wallStep * (gv / hNorm);
-                    const float sWall =
-                        sampleSdfAtUVH(uWall, vWall, std::max(0.05f, hVal - zGapMm));
+                    const float hWallProbe =
+                        (nUp < 0.0f) ? std::max(0.05f, hVal - zGapMm) : (hVal + zGapMm);
+                    const float sWall = sampleSdfAtUVH(uWall, vWall, hWallProbe);
                     if (sWall <= 0.0f) {
                         return false;
                     }
@@ -7773,27 +7784,47 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                 // Evaluate lookahead clearance along the downward gravity ray so branches
                 // start steering around lower part ledges well before colliding with them,
                 // without mistaking the overhang ceiling above `nodeRoofH` for a lateral wall.
+                auto normalizeOpenAirSdf = [&](float rawSdf, float reqClearance) -> float {
+                    if (rawSdf >= 0.82f * maxExteriorSdfBg || rawSdf >= 0.85f * fineSdfBg) {
+                        return std::max(rawSdf, reqClearance + 3.5f);
+                    }
+                    return rawSdf;
+                };
+
+                auto isVerticalContactZoneAtH = [&](float hVal, float roofHVal, float floorHVal) -> bool {
+                    const bool inRoof = (roofHVal - hVal) <= (3.5f * targetLayerH + zGapMm);
+                    const bool inFloor =
+                        !onBedOnly && (floorHVal > 1.0e-3f) &&
+                        ((hVal - floorHVal) <= (3.0f * targetLayerH + zGapMm));
+                    return inRoof || inFloor;
+                };
+
                 auto evaluateLookaheadScore = [&](float uCand,
                                                   float vCand,
                                                   float hCand,
                                                   float rCand,
-                                                  float nodeRoofH) -> float {
-                    const bool inRoofZone =
-                        (nodeRoofH - hCand) <= (3.5f * targetLayerH + zGapMm);
-                    const float sNow = sampleSdfAtUVH(uCand, vCand, hCand);
+                                                  float nodeRoofH,
+                                                  float nodeFloorH) -> float {
+                    const bool inVertContact = isVerticalContactZoneAtH(hCand, nodeRoofH, nodeFloorH);
+                    const float sNowRaw = sampleSdfAtUVH(uCand, vCand, hCand);
                     const float rCenterClear = std::min(rCand, tipRadiusMm);
                     if (!hasSupportClearanceAtUVH(
                             uCand,
                             vCand,
                             hCand,
-                            inRoofZone ? 0.0f : 0.35f * rCenterClear,
-                            inRoofZone)) {
-                        return -1000.0f + sNow;
+                            inVertContact ? 0.0f : 0.35f * rCenterClear,
+                            inVertContact)) {
+                        return -1000.0f + sNowRaw;
                     }
                     const float reqClearance = xyGapMm + 0.65f * rCenterClear;
+                    const float sNow = normalizeOpenAirSdf(sNowRaw, reqClearance);
                     const float roofVertDist = std::max(zGapMm, nodeRoofH - hCand + zGapMm);
+                    const float floorVertDist = (!onBedOnly && nodeFloorH > 1.0e-3f)
+                        ? std::max(zGapMm, hCand - nodeFloorH + zGapMm)
+                        : 1.0e6f;
+                    const float vertDist = std::min(roofVertDist, floorVertDist);
                     const float effNow =
-                        (sNow < reqClearance && sNow >= 0.72f * roofVertDist)
+                        (sNow < reqClearance && sNow >= 0.72f * vertDist)
                             ? reqClearance
                             : sNow;
                     float minLookSdf = effNow;
@@ -7803,24 +7834,43 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                         if (hProbe <= 0.1f) {
                             break;
                         }
-                        if (!onBedOnly && hProbe <= 0.5f * targetLayerH) {
+                        if (!onBedOnly && hProbe <= std::max(0.5f * targetLayerH, nodeFloorH + 0.5f * targetLayerH)) {
                             break;
                         }
-                        const float sLook = sampleSdfAtUVH(uCand, vCand, hProbe);
+                        const float sLookRaw = sampleSdfAtUVH(uCand, vCand, hProbe);
+                        const float sLook = normalizeOpenAirSdf(sLookRaw, reqClearance);
                         const float probeRoofDist =
                             std::max(zGapMm, nodeRoofH - hProbe + zGapMm);
                         if (sLook < 0.80f * probeRoofDist) {
+                            if (!onBedOnly && sLook < reqClearance) {
+                                // When `on_bed_only == false`, an upward-facing horizontal shelf is
+                                // a valid landing floor rather than an obstacle to dodge.
+                                const float epsG = std::max(0.5f * dx, 0.35f);
+                                const float gh =
+                                    sampleSdfAtUVH(uCand, vCand, hProbe + epsG) -
+                                    sampleSdfAtUVH(uCand, vCand, hProbe - epsG);
+                                const float gu =
+                                    sampleSdfAtUVH(uCand + epsG, vCand, hProbe) -
+                                    sampleSdfAtUVH(uCand - epsG, vCand, hProbe);
+                                const float gv =
+                                    sampleSdfAtUVH(uCand, vCand + epsG, hProbe) -
+                                    sampleSdfAtUVH(uCand, vCand - epsG, hProbe);
+                                const float gMag = std::sqrt(gu * gu + gv * gv + gh * gh);
+                                if (gMag > 1.0e-5f && (gh / gMag) > 0.45f) {
+                                    break;
+                                }
+                            }
                             minLookSdf = std::min(minLookSdf, sLook);
                         }
                     }
                     float perimBonus = 0.0f;
-                    if (!inRoofZone) {
+                    if (!inVertContact) {
                         const float rProbe =
                             std::min(maxTrunkRadiusMm, std::max(rCand, tipRadiusMm + 0.8f));
-                        const float sE = sampleSdfAtUVH(uCand + rProbe, vCand, hCand);
-                        const float sW = sampleSdfAtUVH(uCand - rProbe, vCand, hCand);
-                        const float sN = sampleSdfAtUVH(uCand, vCand + rProbe, hCand);
-                        const float sS = sampleSdfAtUVH(uCand, vCand - rProbe, hCand);
+                        const float sE = normalizeOpenAirSdf(sampleSdfAtUVH(uCand + rProbe, vCand, hCand), reqClearance);
+                        const float sW = normalizeOpenAirSdf(sampleSdfAtUVH(uCand - rProbe, vCand, hCand), reqClearance);
+                        const float sN = normalizeOpenAirSdf(sampleSdfAtUVH(uCand, vCand + rProbe, hCand), reqClearance);
+                        const float sS = normalizeOpenAirSdf(sampleSdfAtUVH(uCand, vCand - rProbe, hCand), reqClearance);
                         const float minPerimSdf = std::min({sE, sW, sN, sS});
                         perimBonus = 0.35f * std::clamp(minPerimSdf - xyGapMm, -2.0f, 1.5f);
                     }
@@ -7962,7 +8012,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             hasSupportClearanceAtUVH(node.u, node.v, hNext, 0.0f, true);
 
                         const float straightScore =
-                            evaluateLookaheadScore(node.u, node.v, hNext, node.radius, node.roofH);
+                            evaluateLookaheadScore(node.u, node.v, hNext, node.radius, node.roofH, node.floorH);
                         if (holdTipUnderRoof && straightScore > -500.0f) {
                             usedLatStep = maxLatStep;
                         } else if (straightScore < 0.35f) {
@@ -7980,7 +8030,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
 
                             auto tryCandidate = [&](float cu, float cv, float stepLen) {
                                 const float sc =
-                                    evaluateLookaheadScore(cu, cv, hNext, node.radius, node.roofH);
+                                    evaluateLookaheadScore(cu, cv, hNext, node.radius, node.roofH, node.floorH);
                                 if (sc > bestScore + 1.0e-4f) {
                                     bestScore = sc;
                                     bestU = cu;
@@ -8040,11 +8090,30 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 float hBlocked = -1.0f;
                                 const float reqClear =
                                     xyGapMm + 0.65f * std::min(node.radius, tipRadiusMm);
-                                for (float hProbe = hNext - 0.8f; hProbe >= 0.25f; hProbe -= 0.8f) {
+                                const float hMinProbe =
+                                    onBedOnly ? 0.25f : std::max(0.25f, node.floorH + 0.8f * targetLayerH);
+                                for (float hProbe = hNext - 0.8f; hProbe >= hMinProbe; hProbe -= 0.8f) {
                                     const float probeRoofDist =
                                         std::max(zGapMm, node.roofH - hProbe + zGapMm);
                                     const float sProbe = sampleSdfAtUVH(node.u, node.v, hProbe);
                                     if (sProbe < reqClear && sProbe < 0.80f * probeRoofDist) {
+                                        if (!onBedOnly) {
+                                            const float epsG = std::max(0.5f * dx, 0.35f);
+                                            const float gh =
+                                                sampleSdfAtUVH(node.u, node.v, hProbe + epsG) -
+                                                sampleSdfAtUVH(node.u, node.v, hProbe - epsG);
+                                            const float gu =
+                                                sampleSdfAtUVH(node.u + epsG, node.v, hProbe) -
+                                                sampleSdfAtUVH(node.u - epsG, node.v, hProbe);
+                                            const float gv =
+                                                sampleSdfAtUVH(node.u, node.v + epsG, hProbe) -
+                                                sampleSdfAtUVH(node.u, node.v - epsG, hProbe);
+                                            const float gMag = std::sqrt(gu * gu + gv * gv + gh * gh);
+                                            if (gMag > 1.0e-5f && (gh / gMag) > 0.45f) {
+                                                // Upward-facing landing floor, not an obstacle
+                                                break;
+                                            }
+                                        }
                                         hBlocked = hProbe;
                                         break;
                                     }
@@ -8062,12 +8131,20 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                             const float dirV = std::sin(ang);
                                             const float uEsc = node.u + rSearch * dirU;
                                             const float vEsc = node.v + rSearch * dirV;
-                                            const float sBlock = sampleSdfAtUVH(uEsc, vEsc, hBlocked);
-                                            const float sBed = sampleSdfAtUVH(
+                                            // Verify the ENTIRE vertical corridor from `hNext` down to the
+                                            // build plate (or `hMinProbe`) at `(uEsc, vEsc)` is clear of
+                                            // intermediate overhangs.
+                                            float minCorridor = sampleSdfAtUVH(
                                                 uEsc,
                                                 vEsc,
-                                                std::max(0.25f, 0.5f * targetLayerH));
-                                            const float minCorridor = std::min(sBlock, sBed);
+                                                std::max(hMinProbe, 0.5f * targetLayerH));
+                                            for (float hCheck = hNext; hCheck >= hMinProbe; hCheck -= 1.2f) {
+                                                const float sC = sampleSdfAtUVH(uEsc, vEsc, hCheck);
+                                                minCorridor = std::min(minCorridor, sC);
+                                                if (minCorridor < reqClear) {
+                                                    break;
+                                                }
+                                            }
                                             if (minCorridor >= reqClear && minCorridor > bestCorridorSdf) {
                                                 bestCorridorSdf = minCorridor;
                                                 escDirU = dirU;
@@ -8079,9 +8156,9 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                             const float stepLen = std::min(maxLatStep, rSearch);
                                             const float cu = node.u + stepLen * escDirU;
                                             const float cv = node.v + stepLen * escDirV;
-                                            const bool inRoofZone =
-                                                (node.roofH - hNext) <= (3.5f * targetLayerH + zGapMm);
-                                            if (hasSupportClearanceAtUVH(cu, cv, hNext, 0.0f, inRoofZone)) {
+                                            const bool inVertContact =
+                                                isVerticalContactZoneAtH(hNext, node.roofH, node.floorH);
+                                            if (hasSupportClearanceAtUVH(cu, cv, hNext, 0.0f, inVertContact)) {
                                                 bestU = cu;
                                                 bestV = cv;
                                                 usedLatStep = stepLen;
@@ -8095,7 +8172,9 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                         // Verify directional clearance at `(bestU, bestV, hNext)`
                         const bool inRoofZone =
                             (node.roofH - hNext) <= (3.5f * targetLayerH + zGapMm);
-                        if (!hasSupportClearanceAtUVH(bestU, bestV, hNext, 0.0f, inRoofZone)) {
+                        const bool inVertContact =
+                            isVerticalContactZoneAtH(hNext, node.roofH, node.floorH);
+                        if (!hasSupportClearanceAtUVH(bestU, bestV, hNext, 0.0f, inVertContact)) {
                             // Blocked by part geometry even after lateral steering
                             if (!onBedOnly) {
                                 treeBranches[node.branchIdx].stations.push_back(TreeStation{
@@ -8118,7 +8197,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                         const float hLook =
                             groundsToBed
                                 ? std::max(0.30f, hNext - std::min(4.5f, 0.65f * hNext))
-                                : hNext;
+                                : std::max(node.floorH + 0.5f * targetLayerH, hNext - std::min(2.5f, 0.45f * (hNext - node.floorH)));
 
                         // Step 2b: Trunk radius target growth and perimeter-based wall push-away
                         // before mutual attraction so trunks adjacent to vertical walls move out
@@ -8143,13 +8222,17 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 std::min(node.targetRadius, node.radius + maxDrStep));
 
                             const float remSteer = std::max(0.0f, maxLatStep - usedLatStep);
-                            if (remSteer > 1.0e-4f) {
+                            const bool radiusConstrained =
+                                !isTrunkPerimeterClear(node.u, node.v, hNext, desiredR, inVertContact);
+                            if (remSteer > 1.0e-4f && radiusConstrained) {
                                 const float rProbe = std::min(
                                     maxTrunkRadiusMm,
                                     std::max(node.targetRadius + 0.5f, node.radius + 1.2f));
                                 float pushU = 0.0f;
                                 float pushV = 0.0f;
                                 int blockedCount = 0;
+                                const bool lookVertContact =
+                                    isVerticalContactZoneAtH(hLook, node.roofH, node.floorH);
                                 for (int k = 0; k < 16; ++k) {
                                     const float ang =
                                         static_cast<float>(k) * (2.0f * 3.14159265358979323846f / 16.0f);
@@ -8157,8 +8240,8 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                     const float sa = std::sin(ang);
                                     const float uP = node.u + rProbe * ca;
                                     const float vP = node.v + rProbe * sa;
-                                    if (!hasSupportClearanceAtUVH(uP, vP, hNext, 0.0f, false) ||
-                                        !hasSupportClearanceAtUVH(uP, vP, hLook, 0.0f, false)) {
+                                    if (!hasSupportClearanceAtUVH(uP, vP, hNext, 0.0f, inVertContact) ||
+                                        !hasSupportClearanceAtUVH(uP, vP, hLook, 0.0f, lookVertContact)) {
                                         pushU -= ca;
                                         pushV -= sa;
                                         ++blockedCount;
@@ -8166,15 +8249,16 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 }
                                 const float pushNorm = std::hypot(pushU, pushV);
                                 if (blockedCount > 0 && blockedCount < 14 && pushNorm > 1.0e-4f) {
-                                    const bool radiusConstrained =
-                                        !isTrunkPerimeterClear(node.u, node.v, hNext, desiredR, false);
-                                    const float nudgeFrac = radiusConstrained ? 0.70f : 0.50f;
+                                    const float nudgeFrac = 0.55f;
                                     const float nudgeDist = nudgeFrac * remSteer;
                                     const float nudgeU = node.u + nudgeDist * (pushU / pushNorm);
                                     const float nudgeV = node.v + nudgeDist * (pushV / pushNorm);
+                                    const float nudgeScore =
+                                        evaluateLookaheadScore(nudgeU, nudgeV, hNext, node.radius, node.roofH, node.floorH);
                                     if (nudgeDist > 1.0e-4f &&
-                                        hasSupportClearanceAtUVH(nudgeU, nudgeV, hNext, 0.0f, false) &&
-                                        isTrunkPerimeterClear(nudgeU, nudgeV, hNext, node.radius, false)) {
+                                        nudgeScore >= straightScore - 0.10f &&
+                                        hasSupportClearanceAtUVH(nudgeU, nudgeV, hNext, 0.0f, inVertContact) &&
+                                        isTrunkPerimeterClear(nudgeU, nudgeV, hNext, node.radius, inVertContact)) {
                                         node.u = nudgeU;
                                         node.v = nudgeV;
                                         usedLatStep = std::hypot(node.u - startU, node.v - startV);
@@ -8185,7 +8269,8 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
 
                         // Step 2b.5: Mutual attraction toward nearby active branches within merge horizon.
                         // Ignore branches separated by solid part geometry so trunks on opposite sides of
-                        // a part never pull each other into the part walls.
+                        // a part never pull each other into the part walls, and never pull an established
+                        // dominant trunk sideways toward a newly-spawned smaller tributary branch.
                         const float remBudget = std::max(0.0f, maxLatStep - usedLatStep);
                         if (remBudget > 1.0e-3f && !inRoofZone) {
                             std::size_t bestPartnerIdx = activeNodes.size();
@@ -8193,13 +8278,17 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             float attractU = 0.0f;
                             float attractV = 0.0f;
                             float attractWeight = 0.0f;
+                            const float nodeAgeMm = std::max(0.5f, node.roofH - hNext);
+                            const float nodeDominance = nodeAgeMm * node.radius * node.radius;
 
+                            const bool lookVertContact =
+                                isVerticalContactZoneAtH(hLook, node.roofH, node.floorH);
                             auto isMergeLineClear = [&](float uOther, float vOther) -> bool {
                                 for (const float t : {0.30f, 0.50f, 0.70f}) {
                                     const float uM = node.u + t * (uOther - node.u);
                                     const float vM = node.v + t * (vOther - node.v);
-                                    if (!hasSupportClearanceAtUVH(uM, vM, hNext, 0.0f, false) ||
-                                        !hasSupportClearanceAtUVH(uM, vM, hLook, 0.0f, false)) {
+                                    if (!hasSupportClearanceAtUVH(uM, vM, hNext, 0.0f, inVertContact) ||
+                                        !hasSupportClearanceAtUVH(uM, vM, hLook, 0.0f, lookVertContact)) {
                                         return false;
                                     }
                                 }
@@ -8211,11 +8300,18 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 if (!other.alive || other.branchIdx == node.branchIdx) {
                                     continue;
                                 }
+                                const float otherAgeMm = std::max(0.5f, other.roofH - hNext);
+                                const float otherDominance = otherAgeMm * other.radius * other.radius;
+                                // If `node` is already a much older/larger trunk than `other`, let `other`
+                                // steer into `node` while `node` stays on its straight vertical line!
+                                if (nodeDominance > 1.60f * otherDominance && nodeAgeMm > 3.5f) {
+                                    continue;
+                                }
                                 const float du = other.u - node.u;
                                 const float dv = other.v - node.v;
                                 const float dist = std::sqrt(du * du + dv * dv);
                                 const float horizon =
-                                    std::max(8.0f, 3.8f * (node.radius + other.radius));
+                                    std::min(9.5f, std::max(5.5f, 2.2f * (node.radius + other.radius)));
                                 if (dist <= 1.0e-3f || dist > horizon) {
                                     continue;
                                 }
@@ -8274,7 +8370,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                     candV = startV + (candV - startV) * scale;
                                 }
                                 const float candScore =
-                                    evaluateLookaheadScore(candU, candV, hNext, node.radius, node.roofH);
+                                    evaluateLookaheadScore(candU, candV, hNext, node.radius, node.roofH, node.floorH);
                                 const float sdfBefore = std::min(
                                     sampleSdfAtUVH(node.u, node.v, hNext),
                                     sampleSdfAtUVH(node.u, node.v, hLook));
@@ -8286,7 +8382,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                     (sdfAfter >= minWallClear) || (sdfAfter >= sdfBefore - 0.02f);
                                 if (wallSafe &&
                                     (candScore >= 0.25f || candScore >= straightScore - 0.25f) &&
-                                    hasSupportClearanceAtUVH(candU, candV, hNext, 0.0f, false)) {
+                                    hasSupportClearanceAtUVH(candU, candV, hNext, 0.0f, inVertContact)) {
                                     node.u = candU;
                                     node.v = candV;
                                     usedLatStep = std::hypot(node.u - startU, node.v - startV);
@@ -8295,7 +8391,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                         }
 
                         if (!inRoofZone) {
-                            if (isTrunkPerimeterClear(node.u, node.v, hNext, desiredR, false)) {
+                            if (isTrunkPerimeterClear(node.u, node.v, hNext, desiredR, inVertContact)) {
                                 node.radius = desiredR;
                             } else {
                                 float rLow = tipRadiusMm;
@@ -8303,7 +8399,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 float bestR = rLow;
                                 for (int iter = 0; iter < 5; ++iter) {
                                     const float rMid = 0.5f * (rLow + rHigh);
-                                    if (isTrunkPerimeterClear(node.u, node.v, hNext, rMid, false)) {
+                                    if (isTrunkPerimeterClear(node.u, node.v, hNext, rMid, inVertContact)) {
                                         bestR = rMid;
                                         rLow = rMid;
                                     } else {
@@ -8344,31 +8440,44 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
 
                             const float areaA = a.radius * a.radius;
                             const float areaB = b.radius * b.radius;
-                            const float invArea = 1.0f / std::max(areaA + areaB, 1.0e-4f);
-                            const float mu = (areaA * a.u + areaB * b.u) * invArea;
-                            const float mv = (areaA * a.v + areaB * b.v) * invArea;
+                            const float ageA = std::max(0.5f, a.roofH - hNext);
+                            const float ageB = std::max(0.5f, b.roofH - hNext);
+                            const float wA = areaA * ageA * ageA;
+                            const float wB = areaB * ageB * ageB;
+                            const float invW = 1.0f / std::max(wA + wB, 1.0e-4f);
+                            float mu = (wA * a.u + wB * b.u) * invW;
+                            float mv = (wA * a.v + wB * b.v) * invW;
 
-                            // Ensure neither branch exceeds `1.08 * maxLatStep` from `hCurr` to `hNext`
+                            // Clamp `(mu, mv)` so neither branch exceeds `1.04 * maxLatStep` from `hCurr` to `hNext`
+                            const float maxStepAllowed = 1.04f * maxLatStep;
+                            const float stepB0 = std::hypot(mu - bPrev.u, mv - bPrev.v);
+                            if (stepB0 > maxStepAllowed && stepB0 > 1.0e-5f) {
+                                const float tPull = (stepB0 - maxStepAllowed) / stepB0;
+                                mu += tPull * (bPrev.u - mu);
+                                mv += tPull * (bPrev.v - mv);
+                            }
                             const float stepA = std::hypot(mu - aPrev.u, mv - aPrev.v);
                             const float stepB = std::hypot(mu - bPrev.u, mv - bPrev.v);
                             if (stepA > 1.08f * maxLatStep || stepB > 1.08f * maxLatStep) {
                                 continue;
                             }
 
-                            if (hasSupportClearanceAtUVH(mu, mv, hNext, 0.0f, false)) {
+                            const bool mergeVertContact =
+                                isVerticalContactZoneAtH(hNext, std::max(a.roofH, b.roofH), a.floorH);
+                            if (hasSupportClearanceAtUVH(mu, mv, hNext, 0.0f, mergeVertContact)) {
                                 const float maxDrStep = 0.42f * maxLatStep;
                                 const float rMergedGoal = std::min(
                                     maxTrunkRadiusMm,
                                     std::max(a.radius, b.radius));
                                 float rMerged = tipRadiusMm;
-                                if (isTrunkPerimeterClear(mu, mv, hNext, rMergedGoal, false)) {
+                                if (isTrunkPerimeterClear(mu, mv, hNext, rMergedGoal, mergeVertContact)) {
                                     rMerged = rMergedGoal;
                                 } else {
                                     float rLow = tipRadiusMm;
                                     float rHigh = std::max(tipRadiusMm, rMergedGoal);
                                     for (int iter = 0; iter < 5; ++iter) {
                                         const float rMid = 0.5f * (rLow + rHigh);
-                                        if (isTrunkPerimeterClear(mu, mv, hNext, rMid, false)) {
+                                        if (isTrunkPerimeterClear(mu, mv, hNext, rMid, mergeVertContact)) {
                                             rMerged = rMid;
                                             rLow = rMid;
                                         } else {
@@ -8416,6 +8525,571 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             uUp});
                         if (hNext <= 1.0e-4f) {
                             treeBranches[node.branchIdx].groundedOnBed = true;
+                        }
+                    }
+                }
+
+                // =====================================================================
+                // Step 2d: Constrained Taut-String & Plumb-Vertical Trunk Straightening
+                // =====================================================================
+                // Eliminate greedy step-by-step lateral oscillations/snaking by pulling
+                // every branch centerline taut between its upper roof anchor and its lower
+                // fork or build-plate foot while preserving `tanBranchMax`, part clearance,
+                // child-to-parent fork junctions, and base trunk expansion.
+                if (!treeBranches.empty()) {
+                    auto sampleStationsUVAtH = [&](const std::vector<TreeStation>& stations,
+                                                   float hQuery,
+                                                   float& outU,
+                                                   float& outV) -> bool {
+                        if (stations.empty()) {
+                            return false;
+                        }
+                        if (hQuery >= stations.front().h - 1.0e-4f) {
+                            outU = stations.front().u;
+                            outV = stations.front().v;
+                            return true;
+                        }
+                        if (hQuery <= stations.back().h + 1.0e-4f) {
+                            outU = stations.back().u;
+                            outV = stations.back().v;
+                            return true;
+                        }
+                        for (std::size_t pk = 0; pk + 1 < stations.size(); ++pk) {
+                            const auto& ps0 = stations[pk];
+                            const auto& ps1 = stations[pk + 1];
+                            if (hQuery <= ps0.h + 1.0e-4f && hQuery >= ps1.h - 1.0e-4f) {
+                                const float denom = std::max(1.0e-5f, ps0.h - ps1.h);
+                                const float t = std::clamp((ps0.h - hQuery) / denom, 0.0f, 1.0f);
+                                outU = ps0.u + t * (ps1.u - ps0.u);
+                                outV = ps0.v + t * (ps1.v - ps0.v);
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+
+                    auto firstMovableIdx = [&](const TreeBranch& br) -> std::size_t {
+                        std::size_t kStart = 1;
+                        while (kStart + 1 < br.stations.size() &&
+                               (br.roofH - br.stations[kStart].h) <= topAnchorBandMm + 1.0e-4f) {
+                            ++kStart;
+                        }
+                        return kStart;
+                    };
+
+                    const float minTipExtraR = std::max(0.0f, 0.70f * tipRadiusMm - 0.5f * lineWidthMm);
+                    auto isStraightenedStationClear = [&](float uVal,
+                                                          float vVal,
+                                                          float hVal,
+                                                          float roofHVal,
+                                                          float floorHVal) -> bool {
+                        const bool vertZ = isVerticalContactZoneAtH(hVal, roofHVal, floorHVal);
+                        return hasSupportClearanceAtUVH(
+                            uVal,
+                            vVal,
+                            hVal,
+                            vertZ ? 0.0f : minTipExtraR,
+                            vertZ);
+                    };
+
+                    std::vector<std::vector<std::size_t>> childrenOf(treeBranches.size());
+                    std::vector<float> minChildMergeH(treeBranches.size(), std::numeric_limits<float>::max());
+                    for (std::size_t bIdx = 0; bIdx < treeBranches.size(); ++bIdx) {
+                        const auto& br = treeBranches[bIdx];
+                        if (br.mergedIntoBranch >= 0 &&
+                            static_cast<std::size_t>(br.mergedIntoBranch) < treeBranches.size() &&
+                            !br.stations.empty()) {
+                            const auto pIdx = static_cast<std::size_t>(br.mergedIntoBranch);
+                            childrenOf[pIdx].push_back(bIdx);
+                            minChildMergeH[pIdx] = std::min(minChildMergeH[pIdx], br.stations.back().h);
+                        }
+                    }
+
+                    auto tryBuildStraightChildStrut = [&](std::size_t cIdx,
+                                                          const std::vector<TreeStation>& parentStations,
+                                                          std::vector<TreeStation>& outStations,
+                                                          float& outJoinH) -> bool {
+                        const auto& childBr = treeBranches[cIdx];
+                        if (childBr.stations.size() < 2 || parentStations.size() < 2) {
+                            return false;
+                        }
+                        const std::size_t cStart =
+                            std::min(firstMovableIdx(childBr), childBr.stations.size() - 1);
+                        const float uTop = childBr.stations[cStart].u;
+                        const float vTop = childBr.stations[cStart].v;
+                        const float hTop = childBr.stations[cStart].h;
+                        const float rTop = childBr.stations[cStart].radius;
+
+                        for (std::size_t pk = 0; pk < parentStations.size(); ++pk) {
+                            const float hJoin = parentStations[pk].h;
+                            if (hJoin >= hTop - 0.05f || hJoin > minChildMergeH[cIdx] + 1.0e-4f) {
+                                continue;
+                            }
+                            const float uJoin = parentStations[pk].u;
+                            const float vJoin = parentStations[pk].v;
+                            const float dhStrut = hTop - hJoin;
+                            const float distStrut = std::hypot(uJoin - uTop, vJoin - vTop);
+                            if (distStrut > 0.90f * dhStrut * tanBranchMax + 1.0e-4f) {
+                                continue;
+                            }
+                            const int nSteps =
+                                std::max(1, static_cast<int>(std::ceil(dhStrut / dhStep)));
+                            bool strutClear = true;
+                            for (int s = 1; s < nSteps; ++s) {
+                                const float t =
+                                    static_cast<float>(s) / static_cast<float>(nSteps);
+                                const float hS = hTop - t * dhStrut;
+                                const float uS = uTop + t * (uJoin - uTop);
+                                const float vS = vTop + t * (vJoin - vTop);
+                                if (!isStraightenedStationClear(
+                                        uS,
+                                        vS,
+                                        hS,
+                                        childBr.roofH,
+                                        childBr.floorH)) {
+                                    strutClear = false;
+                                    break;
+                                }
+                            }
+                            if (strutClear) {
+                                outStations.clear();
+                                outStations.reserve(cStart + static_cast<std::size_t>(nSteps) + 1);
+                                for (std::size_t k = 0; k <= cStart; ++k) {
+                                    outStations.push_back(childBr.stations[k]);
+                                }
+                                for (int s = 1; s <= nSteps; ++s) {
+                                    const float t =
+                                        static_cast<float>(s) / static_cast<float>(nSteps);
+                                    const float hS =
+                                        (s == nSteps) ? hJoin : (hTop - t * dhStrut);
+                                    const float uS = uTop + t * (uJoin - uTop);
+                                    const float vS = vTop + t * (vJoin - vTop);
+                                    outStations.push_back(
+                                        TreeStation{hS, uS, vS, rTop, uUp});
+                                }
+                                outJoinH = hJoin;
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+
+                    auto canAcceptParentStations = [&](std::size_t pIdx,
+                                                       const std::vector<TreeStation>& candStations) -> bool {
+                        if (childrenOf[pIdx].empty()) {
+                            return true;
+                        }
+                        std::vector<TreeStation> tmpChildStations;
+                        float tmpJoinH = 0.0f;
+                        for (const std::size_t cIdx : childrenOf[pIdx]) {
+                            const auto& childBr = treeBranches[cIdx];
+                            if (childBr.stations.empty()) {
+                                continue;
+                            }
+                            const auto& forkSt = childBr.stations.back();
+                            float pU = forkSt.u;
+                            float pV = forkSt.v;
+                            if (sampleStationsUVAtH(candStations, forkSt.h, pU, pV) &&
+                                std::hypot(pU - forkSt.u, pV - forkSt.v) <= 0.02f) {
+                                continue;
+                            }
+                            if (!childrenOf[cIdx].empty()) {
+                                return false;
+                            }
+                            if (!tryBuildStraightChildStrut(cIdx, candStations, tmpChildStations, tmpJoinH)) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    };
+
+                    // 1. Straighten all root trunks (`mergedIntoBranch < 0`) across their height
+                    //    from `kStart` down to the build plate (`m - 1`), verifying at every move
+                    //    that all tributary branches remain 100% connected.
+                    for (std::size_t bIdx = 0; bIdx < treeBranches.size(); ++bIdx) {
+                        auto& br = treeBranches[bIdx];
+                        if (br.mergedIntoBranch >= 0 || br.stations.size() < 3) {
+                            continue;
+                        }
+                        br.forkHeights.clear();
+                        const std::size_t m = br.stations.size();
+                        const std::size_t kStart = firstMovableIdx(br);
+                        if (kStart + 1 >= m) {
+                            continue;
+                        }
+
+                        const float uStart = br.stations[kStart].u;
+                        const float vStart = br.stations[kStart].v;
+                        const float hFoot = br.stations.back().h;
+                        const bool footVertContact =
+                            isVerticalContactZoneAtH(hFoot, br.roofH, br.floorH);
+                        const float rBaseReq = std::max(tipRadiusMm, 0.90f * br.stations.back().radius);
+
+                        // 1a. Find the highest station `kClear >= kStart` from which a 100% plumb-vertical
+                        //     column straight down to `hFoot` (`m - 1`) is completely clear of the part
+                        //     and keeps all tributary branches connected.
+                        bool placedPlumbColumn = false;
+                        for (std::size_t kClear = kStart; kClear + 1 < m; ++kClear) {
+                            const float uClear = br.stations[kClear].u;
+                            const float vClear = br.stations[kClear].v;
+                            bool verticalClear =
+                                isTrunkPerimeterClear(uClear, vClear, hFoot, rBaseReq, footVertContact);
+                            for (std::size_t k = kClear; k < m && verticalClear; ++k) {
+                                if (!isStraightenedStationClear(
+                                        uClear,
+                                        vClear,
+                                        br.stations[k].h,
+                                        br.roofH,
+                                        br.floorH)) {
+                                    verticalClear = false;
+                                }
+                            }
+                            if (!verticalClear) {
+                                continue;
+                            }
+
+                            std::vector<TreeStation> candPlumb = br.stations;
+                            for (std::size_t k = kClear; k < m; ++k) {
+                                candPlumb[k].u = uClear;
+                                candPlumb[k].v = vClear;
+                            }
+
+                            if (kClear > kStart) {
+                                const float dhUpper = br.stations[kStart].h - br.stations[kClear].h;
+                                const float distUpper = std::hypot(uClear - uStart, vClear - vStart);
+                                if (dhUpper > 1.0e-4f && distUpper <= 0.94f * dhUpper * tanBranchMax) {
+                                    bool upperChordOk = true;
+                                    for (std::size_t k = kStart + 1; k < kClear; ++k) {
+                                        const float t = (br.stations[kStart].h - br.stations[k].h) / dhUpper;
+                                        const float uC = uStart + t * (uClear - uStart);
+                                        const float vC = vStart + t * (vClear - vStart);
+                                        if (!isStraightenedStationClear(
+                                                uC,
+                                                vC,
+                                                br.stations[k].h,
+                                                br.roofH,
+                                                br.floorH)) {
+                                            upperChordOk = false;
+                                            break;
+                                        }
+                                    }
+                                    if (upperChordOk) {
+                                        std::vector<TreeStation> candChord = candPlumb;
+                                        for (std::size_t k = kStart + 1; k < kClear; ++k) {
+                                            const float t =
+                                                (br.stations[kStart].h - br.stations[k].h) / dhUpper;
+                                            candChord[k].u = uStart + t * (uClear - uStart);
+                                            candChord[k].v = vStart + t * (vClear - vStart);
+                                        }
+                                        if (canAcceptParentStations(bIdx, candChord)) {
+                                            br.stations = std::move(candChord);
+                                            placedPlumbColumn = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (canAcceptParentStations(bIdx, candPlumb)) {
+                                br.stations = std::move(candPlumb);
+                                placedPlumbColumn = true;
+                                break;
+                            }
+                        }
+
+                        if (!placedPlumbColumn) {
+                            // 1b. Try rising plumb-vertical from `(uFoot, vFoot)` up to the highest
+                            //     station `kTurn >= kStart` connected by a single straight chord from `kStart`.
+                            const float uFoot = br.stations.back().u;
+                            const float vFoot = br.stations.back().v;
+                            for (std::size_t kTurn = kStart; kTurn < m; ++kTurn) {
+                                const float dhGlide = br.stations[kStart].h - br.stations[kTurn].h;
+                                const float distGlide = std::hypot(uFoot - uStart, vFoot - vStart);
+                                if (distGlide > 0.90f * dhGlide * tanBranchMax + 1.0e-4f) {
+                                    continue;
+                                }
+                                bool pathClear = true;
+                                std::vector<TreeStation> candGlide = br.stations;
+                                for (std::size_t k = kStart; k < m; ++k) {
+                                    float uCand = uFoot;
+                                    float vCand = vFoot;
+                                    if (k < kTurn && dhGlide > 1.0e-4f) {
+                                        const float t =
+                                            (br.stations[kStart].h - br.stations[k].h) / dhGlide;
+                                        uCand = uStart + t * (uFoot - uStart);
+                                        vCand = vStart + t * (vFoot - vStart);
+                                    }
+                                    if (!isStraightenedStationClear(
+                                            uCand,
+                                            vCand,
+                                            br.stations[k].h,
+                                            br.roofH,
+                                            br.floorH)) {
+                                        pathClear = false;
+                                        break;
+                                    }
+                                    candGlide[k].u = uCand;
+                                    candGlide[k].v = vCand;
+                                }
+                                if (pathClear && canAcceptParentStations(bIdx, candGlide)) {
+                                    br.stations = std::move(candGlide);
+                                    break;
+                                }
+                            }
+                        }
+
+                        // 1c. Multi-pass taut-string relaxation on the root trunk `[kStart .. m-1]`
+                        for (int pass = 0; pass < 60; ++pass) {
+                            for (std::size_t k = kStart; k + 1 < m; ++k) {
+                                const auto& prevSt = br.stations[k - 1];
+                                const auto& currSt = br.stations[k];
+                                const auto& nextSt = br.stations[k + 1];
+                                const float dhSpan = std::max(1.0e-5f, prevSt.h - nextSt.h);
+                                const float t = std::clamp((prevSt.h - currSt.h) / dhSpan, 0.0f, 1.0f);
+                                const float uLine = prevSt.u + t * (nextSt.u - prevSt.u);
+                                const float vLine = prevSt.v + t * (nextSt.v - prevSt.v);
+                                const float candU = currSt.u + 0.70f * (uLine - currSt.u);
+                                const float candV = currSt.v + 0.70f * (vLine - currSt.v);
+
+                                const float dhUp = std::max(1.0e-5f, prevSt.h - currSt.h);
+                                const float dhDn = std::max(1.0e-5f, currSt.h - nextSt.h);
+                                if (std::hypot(candU - prevSt.u, candV - prevSt.v) > 0.98f * dhUp * tanBranchMax ||
+                                    std::hypot(nextSt.u - candU, nextSt.v - candV) > 0.98f * dhDn * tanBranchMax) {
+                                    continue;
+                                }
+                                if (!isStraightenedStationClear(
+                                        candU,
+                                        candV,
+                                        currSt.h,
+                                        br.roofH,
+                                        br.floorH)) {
+                                    continue;
+                                }
+                                const float oldU = br.stations[k].u;
+                                const float oldV = br.stations[k].v;
+                                br.stations[k].u = candU;
+                                br.stations[k].v = candV;
+                                if (!canAcceptParentStations(bIdx, br.stations)) {
+                                    br.stations[k].u = oldU;
+                                    br.stations[k].v = oldV;
+                                }
+                            }
+                            if (m >= 2) {
+                                const auto& aboveSt = br.stations[m - 2];
+                                auto& footSt = br.stations[m - 1];
+                                const float candFootU = footSt.u + 0.50f * (aboveSt.u - footSt.u);
+                                const float candFootV = footSt.v + 0.50f * (aboveSt.v - footSt.v);
+                                if (hasSupportClearanceAtUVH(candFootU, candFootV, footSt.h, 0.0f, footVertContact) &&
+                                    isTrunkPerimeterClear(candFootU, candFootV, footSt.h, rBaseReq, footVertContact)) {
+                                    const float oldFootU = footSt.u;
+                                    const float oldFootV = footSt.v;
+                                    footSt.u = candFootU;
+                                    footSt.v = candFootV;
+                                    if (!canAcceptParentStations(bIdx, br.stations)) {
+                                        footSt.u = oldFootU;
+                                        footSt.v = oldFootV;
+                                    }
+                                }
+                            }
+                        }
+
+                        // 1d. Greedy long-chord shortcutting along the root trunk `[kStart .. m-1]`
+                        std::size_t kAnchor = kStart;
+                        while (kAnchor + 2 < m) {
+                            std::size_t bestTarget = kAnchor + 1;
+                            for (std::size_t kEnd = m - 1; kEnd > kAnchor + 1; --kEnd) {
+                                const float dhChord = br.stations[kAnchor].h - br.stations[kEnd].h;
+                                const float distChord = std::hypot(
+                                    br.stations[kEnd].u - br.stations[kAnchor].u,
+                                    br.stations[kEnd].v - br.stations[kAnchor].v);
+                                if (dhChord <= 1.0e-4f || distChord > 0.94f * dhChord * tanBranchMax) {
+                                    continue;
+                                }
+                                bool chordOk = true;
+                                std::vector<TreeStation> candChord = br.stations;
+                                for (std::size_t k = kAnchor + 1; k < kEnd; ++k) {
+                                    const float t = (br.stations[kAnchor].h - br.stations[k].h) / dhChord;
+                                    const float uC =
+                                        br.stations[kAnchor].u + t * (br.stations[kEnd].u - br.stations[kAnchor].u);
+                                    const float vC =
+                                        br.stations[kAnchor].v + t * (br.stations[kEnd].v - br.stations[kAnchor].v);
+                                    if (!isStraightenedStationClear(
+                                            uC,
+                                            vC,
+                                            br.stations[k].h,
+                                            br.roofH,
+                                            br.floorH)) {
+                                        chordOk = false;
+                                        break;
+                                    }
+                                    candChord[k].u = uC;
+                                    candChord[k].v = vC;
+                                }
+                                if (chordOk && canAcceptParentStations(bIdx, candChord)) {
+                                    br.stations = std::move(candChord);
+                                    bestTarget = kEnd;
+                                    break;
+                                }
+                            }
+                            kAnchor = bestTarget;
+                        }
+                    }
+
+                    // 2. Straighten tributary child branches (`mergedIntoBranch >= 0`) in topological
+                    //    order from parent trunks outward so each tributary connects into its straightened
+                    //    parent trunk via a clean straight diagonal strut without leaving any layer gaps.
+                    std::vector<bool> branchStraightened(treeBranches.size(), false);
+                    for (std::size_t bIdx = 0; bIdx < treeBranches.size(); ++bIdx) {
+                        if (treeBranches[bIdx].mergedIntoBranch < 0) {
+                            branchStraightened[bIdx] = true;
+                        } else {
+                            treeBranches[bIdx].forkHeights.clear();
+                        }
+                    }
+
+                    for (std::size_t depthPass = 0; depthPass < treeBranches.size(); ++depthPass) {
+                        bool anyProgress = false;
+                        for (std::size_t bIdx = 0; bIdx < treeBranches.size(); ++bIdx) {
+                            if (branchStraightened[bIdx]) {
+                                continue;
+                            }
+                            auto& br = treeBranches[bIdx];
+                            const int pIdxSigned = br.mergedIntoBranch;
+                            if (pIdxSigned < 0 ||
+                                static_cast<std::size_t>(pIdxSigned) >= treeBranches.size()) {
+                                branchStraightened[bIdx] = true;
+                                continue;
+                            }
+                            const auto pIdx = static_cast<std::size_t>(pIdxSigned);
+                            if (!branchStraightened[pIdx]) {
+                                continue;
+                            }
+                            anyProgress = true;
+                            branchStraightened[bIdx] = true;
+                            auto& parentBr = treeBranches[pIdx];
+                            if (br.stations.size() < 2 || parentBr.stations.size() < 2) {
+                                continue;
+                            }
+
+                            std::vector<TreeStation> newStations;
+                            float hJoin = br.stations.back().h;
+                            if (tryBuildStraightChildStrut(bIdx, parentBr.stations, newStations, hJoin) &&
+                                canAcceptParentStations(bIdx, newStations)) {
+                                br.stations = std::move(newStations);
+                                parentBr.forkHeights.push_back(hJoin);
+                            } else {
+                                // `canAcceptParentStations` guaranteed that `parentBr` stayed pinned at
+                                // `br.stations.back().h` when a straight strut was not valid.
+                                const float hMerge = br.stations.back().h;
+                                float pU = br.stations.back().u;
+                                float pV = br.stations.back().v;
+                                if (sampleStationsUVAtH(parentBr.stations, hMerge, pU, pV)) {
+                                    br.stations.back().u = pU;
+                                    br.stations.back().v = pV;
+                                }
+                                parentBr.forkHeights.push_back(hMerge);
+
+                                const std::size_t cStart =
+                                    std::min(firstMovableIdx(br), br.stations.size() - 1);
+                                const std::size_t m = br.stations.size();
+                                for (int pass = 0; pass < 45; ++pass) {
+                                    for (std::size_t k = cStart; k + 1 < m; ++k) {
+                                        const auto& prevSt = br.stations[k - 1];
+                                        const auto& currSt = br.stations[k];
+                                        const auto& nextSt = br.stations[k + 1];
+                                        const float dhSpan = std::max(1.0e-5f, prevSt.h - nextSt.h);
+                                        const float t =
+                                            std::clamp((prevSt.h - currSt.h) / dhSpan, 0.0f, 1.0f);
+                                        const float uLine = prevSt.u + t * (nextSt.u - prevSt.u);
+                                        const float vLine = prevSt.v + t * (nextSt.v - prevSt.v);
+                                        const float candU = currSt.u + 0.65f * (uLine - currSt.u);
+                                        const float candV = currSt.v + 0.65f * (vLine - currSt.v);
+
+                                        const float dhUp = std::max(1.0e-5f, prevSt.h - currSt.h);
+                                        const float dhDn = std::max(1.0e-5f, currSt.h - nextSt.h);
+                                        if (std::hypot(candU - prevSt.u, candV - prevSt.v) >
+                                                0.98f * dhUp * tanBranchMax ||
+                                            std::hypot(nextSt.u - candU, nextSt.v - candV) >
+                                                0.98f * dhDn * tanBranchMax) {
+                                           continue;
+                                        }
+                                        if (!isStraightenedStationClear(
+                                                candU,
+                                                candV,
+                                                currSt.h,
+                                                br.roofH,
+                                                br.floorH)) {
+                                            continue;
+                                        }
+                                        const float oldU = br.stations[k].u;
+                                        const float oldV = br.stations[k].v;
+                                        br.stations[k].u = candU;
+                                        br.stations[k].v = candV;
+                                        if (!canAcceptParentStations(bIdx, br.stations)) {
+                                            br.stations[k].u = oldU;
+                                            br.stations[k].v = oldV;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (!anyProgress) {
+                            break;
+                        }
+                    }
+
+                    // 3. Re-evaluate maximum clear trunk radius along the straightened centerlines
+                    //    so straightened trunks expand smoothly toward `maxTrunkRadiusMm` near the bed.
+                    for (auto& br : treeBranches) {
+                        const std::size_t m = br.stations.size();
+                        if (m < 2) {
+                            continue;
+                        }
+                        const bool groundsToBed = onBedOnly || (br.floorH <= 1.0e-3f);
+                        float runningTargetR = br.stations.front().radius;
+                        for (std::size_t k = 1; k < m; ++k) {
+                            auto& st = br.stations[k];
+                            const float dhSeg = std::max(0.0f, br.stations[k - 1].h - st.h);
+                            const bool inRoofZone =
+                                (br.roofH - st.h) <= (3.5f * targetLayerH + zGapMm);
+                            if (inRoofZone) {
+                                continue;
+                            }
+                            const float basalFlareZoneMm = 10.0f;
+                            float flareSlope = 0.0f;
+                            if (groundsToBed && st.h < basalFlareZoneMm) {
+                                const float flareFrac =
+                                    std::clamp(1.0f - (st.h / basalFlareZoneMm), 0.0f, 1.0f);
+                                flareSlope = 0.30f * (0.35f + 0.65f * flareFrac);
+                            }
+                            runningTargetR = std::min(
+                                maxTrunkRadiusMm,
+                                std::max(runningTargetR, st.radius + (0.18f + flareSlope) * dhSeg));
+                            const float maxDrStep = 0.42f * dhSeg * tanBranchMax;
+                            const float desiredR = std::min(
+                                maxTrunkRadiusMm,
+                                std::min(runningTargetR, br.stations[k - 1].radius + maxDrStep));
+                            if (desiredR > st.radius) {
+                                const bool vertZ =
+                                    isVerticalContactZoneAtH(st.h, br.roofH, br.floorH);
+                                if (isTrunkPerimeterClear(st.u, st.v, st.h, desiredR, vertZ)) {
+                                    st.radius = desiredR;
+                                } else {
+                                    float rLow = st.radius;
+                                    float rHigh = desiredR;
+                                    float bestR = rLow;
+                                    for (int iter = 0; iter < 5; ++iter) {
+                                        const float rMid = 0.5f * (rLow + rHigh);
+                                        if (isTrunkPerimeterClear(st.u, st.v, st.h, rMid, vertZ)) {
+                                            bestR = rMid;
+                                            rLow = rMid;
+                                        } else {
+                                            rHigh = rMid;
+                                        }
+                                    }
+                                    st.radius = bestR;
+                                }
+                            }
                         }
                     }
                 }
@@ -8863,9 +9537,10 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                     auto emitRingOnDisk = [&](std::size_t diskIdx,
                                               float ringRadius,
                                               std::uint8_t featureKind,
-                                              bool isRoofContactZone) {
+                                              bool isRoofContactZone,
+                                              bool allowClosed = true) -> bool {
                         if (ringRadius < 0.35f * lineWidthMm) {
-                            return;
+                            return false;
                         }
                         const auto& d = uniqueDisks[diskIdx];
                         const float cOffset = std::max(0.0f, diskOuterR[diskIdx] - ringRadius);
@@ -8945,8 +9620,9 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             }
                         }
                         if (currentArc.size() >= 2) {
-                            pushSupportPath(featureKind, allValid, std::move(currentArc));
+                            pushSupportPath(featureKind, allValid && allowClosed, std::move(currentArc));
                         }
+                        return allValid;
                     };
 
                     // 1. Emit branch / trunk disks at `hLayer`
@@ -8954,6 +9630,10 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                         const auto& d = uniqueDisks[diskIdx];
                         const bool isBedIntf = diskIsBedIntf[diskIdx];
                         const bool isRoofIntf = diskIsRoofIntf[diskIdx];
+                        const bool diskVertContact =
+                            ((d.roofH - hLayer) <= (3.5f * targetLayerH + zGapMm)) ||
+                            (!impl_->supportSpec.on_bed_only && (d.floorH > 1.0e-3f) &&
+                             ((hLayer - d.floorH) <= (3.0f * targetLayerH + zGapMm)));
 
                         if (isBedIntf) {
                             // Dense flanged bed adhesion floor pad (`feature_kind = 8`), clipped to boolean union
@@ -8962,7 +9642,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             for (float rRing = flangeR - 0.5f * lineWidthMm;
                                  rRing >= 0.45f * lineWidthMm;
                                  rRing -= interfaceSpacingMm) {
-                                emitRingOnDisk(diskIdx, rRing, 8, false);
+                                emitRingOnDisk(diskIdx, rRing, 8, false, true);
                             }
                         } else if (isRoofIntf) {
                             // When `treeCanopyCells` is empty, emit outer framing ring on roof interface;
@@ -8972,19 +9652,24 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 diskEmitted[diskIdx] = true;
                                 const float outerR =
                                     std::max(0.5f * lineWidthMm, d.radius - 0.25f * lineWidthMm);
-                                emitRingOnDisk(diskIdx, outerR, 8, true);
+                                emitRingOnDisk(diskIdx, outerR, 8, true, true);
                             }
                         } else {
                             // Hollow / ribbed organic tree branch & trunk walls (`feature_kind = 7`)
                             diskEmitted[diskIdx] = true;
                             float innerCoreR = d.radius;
+                            bool outerPerimeterClosed = true;
                             for (std::uint32_t w = 0; w < wallCount; ++w) {
                                 const float rWall =
                                     d.radius - (static_cast<float>(w) + 0.5f) * lineWidthMm;
                                 if (rWall < 0.40f * lineWidthMm) {
                                     break;
                                 }
-                                emitRingOnDisk(diskIdx, rWall, 7, false);
+                                const bool ringClosed =
+                                    emitRingOnDisk(diskIdx, rWall, 7, diskVertContact, outerPerimeterClosed);
+                                if (w == 0) {
+                                    outerPerimeterClosed = ringClosed;
+                                }
                                 innerCoreR = rWall - 0.5f * lineWidthMm;
                             }
                             // Internal concentric structural bracing & fork diaphragm rings on the
@@ -8994,7 +9679,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             for (float rInner = innerCoreR - 0.5f * lineWidthMm;
                                  rInner >= 0.45f * lineWidthMm;
                                  rInner -= lineWidthMm) {
-                                emitRingOnDisk(diskIdx, rInner, 7, false);
+                                emitRingOnDisk(diskIdx, rInner, 7, diskVertContact, outerPerimeterClosed);
                             }
                         }
                     }

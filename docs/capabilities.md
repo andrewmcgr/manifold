@@ -115,8 +115,11 @@ Manifold Slicer includes a physics-driven G-code compiler tailored for **Klipper
 6. **Flat-Nozzle Annular Slope Clearance**:
    - Elevates the nozzle tip along $\hat{\mathbf{z}}_{\text{nozzle}}$ on tilted outer walls by $\Delta z = R_{\text{flat}}\sin\alpha\,(1 - \cos\alpha)$ so the brass nozzle flat never gouges the uphill side of a conformal layer.
 7. **3D Helical Scarf Joints & Viscoelastic Ooze-Relaxation Retractions**:
-   - Replaces abrupt perimeter seams with a 3D helical height-and-flow ramp along $\hat{\mathbf{z}}_{\text{nozzle}}$, pairs retractions with forward/backward wipes and local-frame clearance hops, and scales unretract prime length using an exponential thermal ooze relaxation model $1 - e^{-t_{\text{travel}} / \tau_{\text{ooze}}}$.
-8. **Klipper `[exclude_object]`, High-Precision Error-Diffused Extrusion & Embedded Moonraker 3D Thumbnails**:
+   - Replaces abrupt perimeter seams with a 3D helical height-and-flow ramp along $\hat{\mathbf{z}}_{\text{nozzle}}$, pairs retractions with forward/backward wipes and obstacle-aware local-frame clearance hops across the gravity-aligned `PrintedHeightMap`, and scales unretract prime length using an exponential thermal ooze relaxation model $1 - e^{-t_{\text{travel}} / \tau_{\text{ooze}}}$.
+8. **Non-Planar Collision Avoidance, Automatic Brim, Lever-Arm Slowdown & Dynamic Cooling Fan Matching**:
+   - Enforces low-to-high elevation-banded chain ordering, monotonic layer Z clamping, and 3D toolhead clearance-cone clamping (`PiecewiseXZ`, `ParametricCone`, `RectilinearCone`) across every extrusion and post-seam wipe move.
+   - Automatically generates outward concentric first-layer brim loops when a part's height-to-base lever ratio $\Lambda_{\text{global}} > 2.2$ (`enable_auto_brim`), throttles speed and acceleration as a function of bed-detachment/slender-prong lever arm and curled-corner risk (`enable_lever_arm_slowdown`), and dynamically modulates `M106` cooling fan speed based on volumetric flow, residence time inside the `12 mm` cooling airflow footprint, layer return time, and rotor spin-up lead time (`enable_dynamic_fan_speed`).
+9. **Klipper `[exclude_object]`, High-Precision Error-Diffused Extrusion & Embedded Moonraker 3D Thumbnails**:
    - Emits 4-decimal `X`/`Y`/`Z` coordinates ($0.1\,\mu\text{m}$) and 5-decimal relative `E` increments ($0.01\,\mu\text{m}$) with residual rounding error diffusion (`e_rounding_residual_mm`) so sub-millimeter non-planar micro-segments never lose extrusion volume or introduce tangent jitter.
    - Emits `EXCLUDE_OBJECT_DEFINE` convex-hull polygons and embeds software-rasterized `32x32` and `300x300` isometric 3D toolpath PNG thumbnails directly in the `.gcode` header.
 

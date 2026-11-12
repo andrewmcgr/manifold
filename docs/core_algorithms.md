@@ -235,3 +235,44 @@ Manifold Slicer deducts `corner_flow_comp_ratio` $\times \bigl(V_{\text{diamond}
 3. **3D Helical Scarf Joints**: On closed perimeter loops, the first $L_{\text{scarf}}$ millimeters ramp height along $\hat{\mathbf{z}}_{\text{nozzle}}$ and volumetric flow linearly from $r_0 \in [0.02, 0.50]$ up to $1.0$, while the final $L_{\text{scarf}}$ millimeters ramp height and flow from $(1 - r_0)$ down to $0$, forming a flush lap joint with constant total wall height.
 4. **High-Precision Coordinate Emission & E-Axis Rounding Error Diffusion**:
    Because curved non-planar meshes and conformal scarf joints contain dense sub-millimeter micro-segments ($0.05\text{--}0.20\text{ mm}$), 3-decimal coordinate quantization can introduce up to $5^\circ$ of artificial tangent jitter, while truncating relative `M83` `E` increments to 4 decimal places can lose $1\text{--}5\%$ of total extrusion volume. Manifold Slicer emits `X`/`Y`/`Z` coordinates at **4 decimal places** ($0.1\,\mu\text{m}$ resolution), `E` increments at **5 decimal places** ($0.01\,\mu\text{m}$ resolution), and diffuses rounding residuals across consecutive `G1` moves via an accumulator (`e_rounding_residual_mm`) so cumulative extrusion error stays $< 10^{-5}\text{ mm}$.
+
+### 6.5 Gravity-Aligned Height Maps, Monotonic Layer Z, 3D Toolhead Clearance Clamping & Obstacle-Aware Z-Hop
+To guarantee collision-free non-planar G-code on parts with steep elevation swings, cantilevers, or narrow clip prongs:
+1. **Gravity-Aligned Printed Height Map (`PrintedHeightMap`)**:
+   Constructs a right-handed orthonormal basis $(\hat{\mathbf{e}}_1, \hat{\mathbf{e}}_2, \hat{\mathbf{u}}_{\text{bed}})$ aligned with anti-gravity $\hat{\mathbf{u}}_{\text{bed}} = -\hat{\mathbf{g}}_{\text{bed}}$ and tracks both a fine `0.5 mm` height grid (`prev_layer_max_h`, `curr_max_h`) and a `2.0 mm` coarse clearance grid (`curr_coarse_max_h`).
+2. **Low-to-High Elevation-Banded Chain Ordering**:
+   When a non-planar layer spans $\Delta h > 0.45\text{ mm}$ along $\hat{\mathbf{u}}_{\text{bed}}$, toolpath chains within each priority tier are partitioned into ascending `0.60 mm` elevation bands so valleys are always printed before neighboring peaks.
+3. **Monotonic Layer Z & 3D Toolhead Clearance Cone Clamping**:
+   After seam/wipe generation and segment subdivision, every vertex and `0.35 mm` interior segment sample $\mathbf{p}$ is checked against `prev_layer_max_h` (so no extrusion ever plows below the preceding layer's solidified top surface) and against `curr_coarse_max_h` within the active tool's maximum clearance radius $R_{\text{clear}}$:
+   $$h_{\min,\text{clear}}(\mathbf{p}) = \max_{\|\mathbf{q}_{2\text{D}} - \mathbf{p}_{2\text{D}}\| \le R_{\text{clear}}} \bigl(h_{\text{printed}}(\mathbf{q}) - Z_{\text{clear}}(\|\mathbf{q}_{2\text{D}} - \mathbf{p}_{2\text{D}}\|)\bigr)$$
+   where $Z_{\text{clear}}(r)$ is evaluated from the active tool's `PiecewiseXZ`, `ParametricCone`, or `RectilinearCone` envelope along $\hat{\mathbf{z}}_{\text{nozzle}}$. Post-seam `Wipe` moves are additionally clamped above `curr_max_h` and the chain's own deposited peak so wipes never dive back into newly extruded ridges.
+4. **Obstacle-Aware Non-Planar Z-Hop**:
+   Every retracted travel move from $\mathbf{p}_{\text{start}}$ to $\mathbf{p}_{\text{end}}$ sweeps a `2.0 mm` corridor across `PrintedHeightMap` to find the highest printed obstacle $h_{\text{obs}}$ along the travel path, lifting along $\hat{\mathbf{z}}_{\text{nozzle}}$ to at least $\max(h_{\text{start}}, h_{\text{end}}, h_{\text{obs}}) + \text{z\_hop\_mm}$.
+
+### 6.6 Automatic First-Layer Brim Generation (`BedFootprintProfile`)
+Before emitting Layer 0, Manifold Slicer analyzes the first-layer footprint $(\hat{\mathbf{e}}_1, \hat{\mathbf{e}}_2)$ and total build height $H_{\text{part}}$ along $\hat{\mathbf{u}}_{\text{bed}}$:
+1. Computes the global height-to-base lever-arm ratio $\Lambda_{\text{global}} = H_{\text{part}} / W_{\text{base,min}}$, where $W_{\text{base,min}}$ is the narrowest horizontal span of the Layer 0 footprint.
+2. When `brim_width_mm > 0.0` or `enable_auto_brim = true` with $\Lambda_{\text{global}} > 2.2$, rasterizes all Layer 0 part and support chains onto a `0.40 mm` 2D grid, runs an exterior breadth-first flood fill from the grid border so internal part holes are never filled, computes the exact 2D Euclidean distance field $d_{2\text{D}}(u, v)$ to the exterior boundary, and extracts outward concentric Marching-Squares brim loops at offsets $d_k = \text{brim\_gap\_mm} + (k + \frac{1}{2})\,w_{\text{brim}}$ printed from outside in before the first-layer walls.
+
+### 6.7 Automatic Lever-Arm & Curled-Corner Speed/Acceleration Governor
+Tall parts with narrow bases and cantilevered overhangs experience amplified bending moments $\tau = F_{\text{drag}}\,h$ from viscous nozzle drag and contact with upward-curled corners. When `enable_lever_arm_slowdown = true`, each extruding segment $i$ at height $h_i$ above the bed is evaluated for:
+1. **Bed-Detachment & Prong-Bending Lever Ratios**:
+   $$\Lambda_{\text{bed},i} = \frac{h_i + 1.35\,d_{\text{cant},i}}{W_{\text{base,min}}}, \qquad \Lambda_{\text{prong},i} = \frac{0.42\,h_i}{W_{\text{layer,min}}(h_i)}, \qquad \Lambda_{\text{eff},i} = \max(\Lambda_{\text{bed},i},\, \Lambda_{\text{prong},i})$$
+   where $d_{\text{cant},i}$ is the horizontal cantilever distance outside the Layer 0 footprint hull and $W_{\text{layer,min}}(h_i)$ is the local layer cross-section width. Above $\Lambda_{\text{ref}} = \text{lever\_arm\_reference\_ratio}$, the baseline lever factor scales as:
+   $$f_{\text{lever},i} = \text{clamp}\!\left(\frac{1}{\sqrt{1 + 0.85\,(\Lambda_{\text{eff},i} / \Lambda_{\text{ref}} - 1)^2}},\; f_{\min},\; 1\right)$$
+2. **Window-Smoothed Curled-Corner Risk ($\mathcal{C}_{\text{curl},i} \in [0, 1]$)**:
+   Combines horizontal corner turning angle $\theta_{xy} = \arccos(\hat{\mathbf{t}}_{\text{prev},xy} \cdot \hat{\mathbf{t}}_{\text{curr},xy})$, non-planar climb slope $|\Delta h / \Delta s|$, and overhang/bridge proximity, smoothed over a `3.0 mm` neighborhood window so speed drops *before* the nozzle reaches a curled corner and stays low until past the apex:
+   $$f_{\text{total},i} = \text{clamp}\!\left(f_{\text{lever},i} \cdot \bigl(1 - \mathcal{C}_{\text{curl},i}\,(1 - f_{\text{cornerFloor}})\bigr),\; 0.60\,f_{\min},\; 1\right)$$
+   Both segment target speed and segment acceleration are scaled by $f_{\text{total},i}$ prior to lookahead velocity planning.
+
+### 6.8 Dynamic Volumetric & Airflow-Residence Cooling Fan Matching
+When `enable_dynamic_fan_speed = true` (after `disable_fan_first_layers`), Manifold Slicer replaces static layer-wide fan speeds with a physics-based per-segment PWM schedule (`compute_layer_fan_pwm_schedule`) bounded by `[min_fan_speed_percent, max_fan_speed_percent]`:
+1. **Instantaneous Volumetric Flow Demand**:
+   $$u_{\text{flow},i} = \text{clamp}\!\left(\frac{Q_i}{0.75\,Q_{\max}},\; 0,\; 1\right), \qquad Q_i = A_i\,v_{\text{avg},i}$$
+2. **Cooling Airflow Footprint Residence & Local Heat Density ($R_{\text{duct}} = 12.0\text{ mm}$)**:
+   Because a part-cooling fan duct blows across a finite patch of radius $R_{\text{duct}} \approx 12\text{ mm}$ around the nozzle tip, a toolpath that zigzags or loops tightly inside a `12 mm` zone deposits concentrated thermal energy into the same patch of polymer while remaining inside the cooling airflow. For each segment $i$, the planner integrates the total extruded volume $V_{\text{duct},i}$ and residence time $\tau_{\text{duct},i}$ of all consecutive moves remaining within $R_{\text{duct}}$ of $\mathbf{p}_i$:
+   $$Q_{\text{duct},i} = \frac{V_{\text{duct},i}}{\tau_{\text{duct},i}}, \qquad u_{\text{duct},i} = \text{clamp}\!\left(\frac{Q_{\text{duct},i}}{0.60\,Q_{\max}} + 0.35\,\text{clamp}\!\left(\frac{3.0\,\text{mm}}{D_{\text{span},i}} - 1,\; 0,\; 1\right),\; 0,\; 1\right)$$
+3. **Layer Return Time & Curled-Corner / Overhang Boost**:
+   When total layer duration $T_{\text{layer}} < T_{\text{target}} = \text{target\_layer\_cooling\_time\_s}$, a layer-time boost $u_{\text{layer}} = \text{clamp}\bigl((T_{\text{target}} - T_{\text{layer}}) / T_{\text{target}},\, 0,\, 1\bigr)$ ramps cooling upward. Acute corners and non-planar overhangs add $u_{\text{curl},i} \in [0, 1]$ so newly deposited corners freeze immediately before upward thermal curling can occur.
+4. **Rotor Spin-Up Lead Compensation & PWM Hysteresis**:
+   Combining the demand terms yields $u_i = \text{clamp}\bigl(0.35\,u_{\text{flow},i} + 0.30\,u_{\text{duct},i} + 0.35\,\max(u_{\text{layer}}, u_{\text{curl},i}),\, 0,\, 1\bigr)$. Because DC blower fans require $\sim 0.35\text{ s}$ to spin up, each segment's target fan duty cycle takes the maximum over a `0.35 s` forward lookahead window (`M106` commands are emitted *before* entering an overhang, bridge, or high-flow burst) and applies a `7 / 255` (`~2.7%`) PWM deadband to avoid G-code chatter.

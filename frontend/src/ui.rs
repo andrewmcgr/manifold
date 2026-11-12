@@ -4355,6 +4355,48 @@ fn render_filament_config_tab(
                 .changed();
             param_help_button(ui, "gcode.disable_fan_first_layers");
         });
+        ui.separator();
+        ui.horizontal(|ui| {
+            gc_changed |= ui
+                .checkbox(
+                    &mut gc.enable_dynamic_fan_speed,
+                    "Dynamic Volumetric & Airflow Cooling Fan",
+                )
+                .changed();
+            param_help_button(ui, "gcode.enable_dynamic_fan_speed");
+        });
+        if gc.enable_dynamic_fan_speed {
+            ui.horizontal(|ui| {
+                ui.label("Dynamic Fan Range:");
+                gc_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut gc.min_fan_speed_percent)
+                            .speed(1.0)
+                            .range(0.0..=100.0)
+                            .prefix("Min: ")
+                            .suffix("%"),
+                    )
+                    .changed();
+                gc_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut gc.max_fan_speed_percent)
+                            .speed(1.0)
+                            .range(0.0..=100.0)
+                            .prefix("Max: ")
+                            .suffix("%"),
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                gc_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut gc.target_layer_cooling_time_s, 1.0..=60.0)
+                            .suffix(" s")
+                            .text("Target Layer Cooling Time"),
+                    )
+                    .changed();
+            });
+        }
     });
 
     ui.add_space(4.0);
@@ -5569,6 +5611,67 @@ fn render_process_config_tab(
                 .changed();
             param_help_button(ui, "gcode.seam_gap_mm");
         });
+
+        ui.separator();
+        ui.small(egui::RichText::new("First-Layer Brim & Lever-Arm Governor:").strong());
+        ui.horizontal(|ui| {
+            gc_changed |= ui
+                .checkbox(
+                    &mut gc.enable_auto_brim,
+                    "Auto Brim for Tall / Narrow Parts",
+                )
+                .changed();
+            param_help_button(ui, "gcode.brim_width_mm");
+        });
+        ui.horizontal(|ui| {
+            gc_changed |= ui
+                .add(
+                    egui::DragValue::new(&mut gc.brim_width_mm)
+                        .speed(0.2)
+                        .range(0.0..=30.0)
+                        .prefix("Brim Width: ")
+                        .suffix(" mm (0 = auto)"),
+                )
+                .changed();
+            gc_changed |= ui
+                .add(
+                    egui::DragValue::new(&mut gc.brim_gap_mm)
+                        .speed(0.01)
+                        .range(0.0..=1.0)
+                        .prefix("Gap: ")
+                        .suffix(" mm"),
+                )
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            gc_changed |= ui
+                .checkbox(
+                    &mut gc.enable_lever_arm_slowdown,
+                    "Lever-Arm & Curled-Corner Slowdown",
+                )
+                .changed();
+            param_help_button(ui, "gcode.enable_lever_arm_slowdown");
+        });
+        if gc.enable_lever_arm_slowdown {
+            ui.horizontal(|ui| {
+                gc_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut gc.lever_arm_reference_ratio)
+                            .speed(0.1)
+                            .range(0.5..=15.0)
+                            .prefix("Ref Ratio H/W: "),
+                    )
+                    .changed();
+                gc_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut gc.lever_arm_min_speed_fraction)
+                            .speed(0.02)
+                            .range(0.10..=1.0)
+                            .prefix("Min Speed Frac: "),
+                    )
+                    .changed();
+            });
+        }
 
         ui.separator();
         ui.small(egui::RichText::new("Feature Print Speeds (mm/s):").strong());

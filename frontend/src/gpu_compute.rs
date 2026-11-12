@@ -756,11 +756,17 @@ impl GpuComputeEngine {
         }))?;
 
         let limits = adapter.limits();
+        if limits.max_storage_buffers_per_shader_stage < 5 {
+            return None;
+        }
         let (device, queue) = bevy::tasks::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("manifold_gpu_compute_device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
+                    max_storage_buffers_per_shader_stage: limits
+                        .max_storage_buffers_per_shader_stage
+                        .max(8),
                     max_storage_buffer_binding_size: limits
                         .max_storage_buffer_binding_size
                         .min(512 * 1024 * 1024),
@@ -975,7 +981,14 @@ impl GpuComputeEngine {
         tau_io: &mut [f32],
     ) -> bool {
         let n = tau_io.len();
+        let max_storage = self.device.limits().max_storage_buffer_binding_size as usize;
+        let max_wg = self
+            .device
+            .limits()
+            .max_compute_workgroups_per_dimension
+            .min(65_535);
         if n < 2048
+            || n.saturating_mul(24) > max_storage
             || neighbors6.len() != n * 6
             || voxel_flags.len() != n
             || slowness.len() != n
@@ -1032,7 +1045,11 @@ impl GpuComputeEngine {
             }
         }
 
-        if dispatches.is_empty() {
+        if dispatches.is_empty()
+            || dispatches
+                .iter()
+                .any(|&(_, count)| count.div_ceil(64) > max_wg)
+        {
             return false;
         }
 
@@ -1182,7 +1199,13 @@ impl GpuComputeEngine {
         out_flags: &mut [u32],
     ) -> bool {
         let n = candidate_pos_depth.len();
+        let max_wg = self
+            .device
+            .limits()
+            .max_compute_workgroups_per_dimension
+            .min(65_535);
         if n == 0
+            || (n as u32).div_ceil(64) > max_wg
             || candidate_norm_tau.len() != n
             || out_flags.len() != n
             || brick_min_tau.is_empty()
@@ -1192,7 +1215,9 @@ impl GpuComputeEngine {
         }
 
         let max_storage = self.device.limits().max_storage_buffer_binding_size as usize;
-        if std::mem::size_of_val(dense_sdf_tau) > max_storage {
+        if std::mem::size_of_val(dense_sdf_tau) > max_storage
+            || n.saturating_mul(16) > max_storage
+        {
             return false;
         }
 
@@ -1312,7 +1337,17 @@ impl GpuComputeEngine {
         out_psi: &mut [f32],
     ) -> bool {
         let n = out_psi.len();
-        if n < 512 || positions_xyz.len() != n * 3 {
+        let max_storage = self.device.limits().max_storage_buffer_binding_size as usize;
+        let max_wg = self
+            .device
+            .limits()
+            .max_compute_workgroups_per_dimension
+            .min(65_535);
+        if n < 512
+            || (n as u32).div_ceil(64) > max_wg
+            || n.saturating_mul(12) > max_storage
+            || positions_xyz.len() != n * 3
+        {
             return false;
         }
 
@@ -1408,7 +1443,15 @@ impl GpuComputeEngine {
         out_tilt_deg: &mut [f32],
     ) -> bool {
         let n = out_tilt_deg.len();
+        let max_storage = self.device.limits().max_storage_buffer_binding_size as usize;
+        let max_wg = self
+            .device
+            .limits()
+            .max_compute_workgroups_per_dimension
+            .min(65_535);
         if n < 1024
+            || (n as u32).div_ceil(64) > max_wg
+            || n.saturating_mul(24) > max_storage
             || neighbors6.len() != n * 6
             || bed_normal_xyz.len() < 3
             || local_max_tilt_rad.len() != n

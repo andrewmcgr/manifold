@@ -505,6 +505,10 @@ pub struct FilamentPreset {
     pub disable_fan_first_layers: u32,
     pub bridge_fan_speed_percent: f32,
     pub wave_overhang_fan_speed_percent: f32,
+    pub enable_dynamic_fan_speed: bool,
+    pub min_fan_speed_percent: f32,
+    pub max_fan_speed_percent: f32,
+    pub target_layer_cooling_time_s: f32,
 
     // Non-Newtonian Rheology, Dynamic Pressure Advance, Die Swell & Ooze Relaxation
     pub enable_dynamic_pa: bool,
@@ -554,6 +558,10 @@ impl FilamentPreset {
             disable_fan_first_layers: cfg.gcode.disable_fan_first_layers,
             bridge_fan_speed_percent: cfg.gcode.bridge_fan_speed_percent,
             wave_overhang_fan_speed_percent: cfg.gcode.wave_overhang_fan_speed_percent,
+            enable_dynamic_fan_speed: cfg.gcode.enable_dynamic_fan_speed,
+            min_fan_speed_percent: cfg.gcode.min_fan_speed_percent,
+            max_fan_speed_percent: cfg.gcode.max_fan_speed_percent,
+            target_layer_cooling_time_s: cfg.gcode.target_layer_cooling_time_s,
             enable_dynamic_pa: cfg.gcode.enable_dynamic_pa,
             enable_slicer_pa_subdivision: cfg.gcode.enable_slicer_pa_subdivision,
             pa_low_flow_s: cfg.gcode.pa_low_flow_s,
@@ -593,6 +601,10 @@ impl FilamentPreset {
         cfg.gcode.disable_fan_first_layers = self.disable_fan_first_layers;
         cfg.gcode.bridge_fan_speed_percent = self.bridge_fan_speed_percent;
         cfg.gcode.wave_overhang_fan_speed_percent = self.wave_overhang_fan_speed_percent;
+        cfg.gcode.enable_dynamic_fan_speed = self.enable_dynamic_fan_speed;
+        cfg.gcode.min_fan_speed_percent = self.min_fan_speed_percent;
+        cfg.gcode.max_fan_speed_percent = self.max_fan_speed_percent;
+        cfg.gcode.target_layer_cooling_time_s = self.target_layer_cooling_time_s;
         cfg.gcode.enable_dynamic_pa = self.enable_dynamic_pa;
         cfg.gcode.enable_slicer_pa_subdivision = self.enable_slicer_pa_subdivision;
         cfg.gcode.pa_low_flow_s = self.pa_low_flow_s;
@@ -645,6 +657,13 @@ impl FilamentPreset {
             && approx_eq(
                 self.wave_overhang_fan_speed_percent,
                 cfg.gcode.wave_overhang_fan_speed_percent,
+            )
+            && self.enable_dynamic_fan_speed == cfg.gcode.enable_dynamic_fan_speed
+            && approx_eq(self.min_fan_speed_percent, cfg.gcode.min_fan_speed_percent)
+            && approx_eq(self.max_fan_speed_percent, cfg.gcode.max_fan_speed_percent)
+            && approx_eq(
+                self.target_layer_cooling_time_s,
+                cfg.gcode.target_layer_cooling_time_s,
             )
             && self.enable_dynamic_pa == cfg.gcode.enable_dynamic_pa
             && self.enable_slicer_pa_subdivision == cfg.gcode.enable_slicer_pa_subdivision
@@ -748,13 +767,16 @@ pub struct ProcessPreset {
     pub tree_trunk_max_diameter_mm: f32,
     pub tree_branch_wall_count: u32,
 
-    // 3D Conformal Scarf Seam
+    // 3D Conformal Scarf Seam & First-Layer Brim
     pub enable_scarf_joint: bool,
     pub scarf_length_mm: f32,
     pub scarf_start_height_ratio: f32,
     pub seam_gap_mm: f32,
+    pub enable_auto_brim: bool,
+    pub brim_width_mm: f32,
+    pub brim_gap_mm: f32,
 
-    // Feature Print Speeds (mm/s)
+    // Feature Print Speeds (mm/s) & Lever-Arm / Curled-Corner Speed Governor
     pub first_layer_speed_mms: f32,
     pub outer_wall_speed_mms: f32,
     pub inner_wall_speed_mms: f32,
@@ -765,6 +787,9 @@ pub struct ProcessPreset {
     pub wave_overhang_speed_mms: f32,
     pub support_speed_mms: f32,
     pub support_interface_speed_mms: f32,
+    pub enable_lever_arm_slowdown: bool,
+    pub lever_arm_reference_ratio: f32,
+    pub lever_arm_min_speed_fraction: f32,
 }
 
 impl Default for ProcessPreset {
@@ -836,6 +861,9 @@ impl ProcessPreset {
             scarf_length_mm: cfg.gcode.scarf_length_mm,
             scarf_start_height_ratio: cfg.gcode.scarf_start_height_ratio,
             seam_gap_mm: cfg.gcode.seam_gap_mm,
+            enable_auto_brim: cfg.gcode.enable_auto_brim,
+            brim_width_mm: cfg.gcode.brim_width_mm,
+            brim_gap_mm: cfg.gcode.brim_gap_mm,
             first_layer_speed_mms: cfg.gcode.first_layer_speed_mms,
             outer_wall_speed_mms: cfg.gcode.outer_wall_speed_mms,
             inner_wall_speed_mms: cfg.gcode.inner_wall_speed_mms,
@@ -846,6 +874,9 @@ impl ProcessPreset {
             wave_overhang_speed_mms: cfg.gcode.wave_overhang_speed_mms,
             support_speed_mms: cfg.gcode.support_speed_mms,
             support_interface_speed_mms: cfg.gcode.support_interface_speed_mms,
+            enable_lever_arm_slowdown: cfg.gcode.enable_lever_arm_slowdown,
+            lever_arm_reference_ratio: cfg.gcode.lever_arm_reference_ratio,
+            lever_arm_min_speed_fraction: cfg.gcode.lever_arm_min_speed_fraction,
         }
     }
 
@@ -908,6 +939,9 @@ impl ProcessPreset {
         cfg.gcode.scarf_length_mm = self.scarf_length_mm;
         cfg.gcode.scarf_start_height_ratio = self.scarf_start_height_ratio;
         cfg.gcode.seam_gap_mm = self.seam_gap_mm;
+        cfg.gcode.enable_auto_brim = self.enable_auto_brim;
+        cfg.gcode.brim_width_mm = self.brim_width_mm;
+        cfg.gcode.brim_gap_mm = self.brim_gap_mm;
         cfg.gcode.first_layer_speed_mms = self.first_layer_speed_mms;
         cfg.gcode.outer_wall_speed_mms = self.outer_wall_speed_mms;
         cfg.gcode.inner_wall_speed_mms = self.inner_wall_speed_mms;
@@ -918,6 +952,9 @@ impl ProcessPreset {
         cfg.gcode.wave_overhang_speed_mms = self.wave_overhang_speed_mms;
         cfg.gcode.support_speed_mms = self.support_speed_mms;
         cfg.gcode.support_interface_speed_mms = self.support_interface_speed_mms;
+        cfg.gcode.enable_lever_arm_slowdown = self.enable_lever_arm_slowdown;
+        cfg.gcode.lever_arm_reference_ratio = self.lever_arm_reference_ratio;
+        cfg.gcode.lever_arm_min_speed_fraction = self.lever_arm_min_speed_fraction;
 
         cfg.eikonal.sanitize();
         cfg.slicing.sanitize();
@@ -1065,6 +1102,18 @@ impl ProcessPreset {
             && approx_eq(
                 self.support_interface_speed_mms,
                 cfg.gcode.support_interface_speed_mms,
+            )
+            && self.enable_auto_brim == cfg.gcode.enable_auto_brim
+            && approx_eq(self.brim_width_mm, cfg.gcode.brim_width_mm)
+            && approx_eq(self.brim_gap_mm, cfg.gcode.brim_gap_mm)
+            && self.enable_lever_arm_slowdown == cfg.gcode.enable_lever_arm_slowdown
+            && approx_eq(
+                self.lever_arm_reference_ratio,
+                cfg.gcode.lever_arm_reference_ratio,
+            )
+            && approx_eq(
+                self.lever_arm_min_speed_fraction,
+                cfg.gcode.lever_arm_min_speed_fraction,
             )
     }
 }
@@ -1252,6 +1301,8 @@ impl PresetLibrary {
         f_petg.nozzle_temperature_celsius = 240.0;
         f_petg.bed_temperature_celsius = 75.0;
         f_petg.fan_speed_percent = 40.0;
+        f_petg.min_fan_speed_percent = 20.0;
+        f_petg.max_fan_speed_percent = 80.0;
         f_petg.bridge_fan_speed_percent = 80.0;
         f_petg.wave_overhang_fan_speed_percent = 70.0;
         f_petg.pa_low_flow_s = 0.055;
@@ -1263,6 +1314,8 @@ impl PresetLibrary {
         f_abs.nozzle_temperature_celsius = 255.0;
         f_abs.bed_temperature_celsius = 100.0;
         f_abs.fan_speed_percent = 20.0;
+        f_abs.min_fan_speed_percent = 10.0;
+        f_abs.max_fan_speed_percent = 50.0;
         f_abs.bridge_fan_speed_percent = 50.0;
         f_abs.wave_overhang_fan_speed_percent = 45.0;
         f_abs.pa_low_flow_s = 0.038;
@@ -1274,6 +1327,8 @@ impl PresetLibrary {
         f_asa.nozzle_temperature_celsius = 260.0;
         f_asa.bed_temperature_celsius = 105.0;
         f_asa.fan_speed_percent = 20.0;
+        f_asa.min_fan_speed_percent = 10.0;
+        f_asa.max_fan_speed_percent = 50.0;
         f_asa.bridge_fan_speed_percent = 50.0;
         f_asa.wave_overhang_fan_speed_percent = 45.0;
 
@@ -1283,6 +1338,8 @@ impl PresetLibrary {
         f_tpu.nozzle_temperature_celsius = 225.0;
         f_tpu.bed_temperature_celsius = 50.0;
         f_tpu.fan_speed_percent = 50.0;
+        f_tpu.min_fan_speed_percent = 25.0;
+        f_tpu.max_fan_speed_percent = 70.0;
         f_tpu.pa_low_flow_s = 0.120;
         f_tpu.pa_high_flow_s = 0.085;
 

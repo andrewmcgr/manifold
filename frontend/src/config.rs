@@ -297,6 +297,86 @@ impl ToolConfig {
             .map(|(wx, wy)| wx.max(wy))
     }
 
+    /// Inverse clearance profile query in the local nozzle frame: given a radial distance
+    /// `radial_dist_mm` ($\ge 0$) perpendicular to `nozzle_axis`, returns the maximum allowable
+    /// obstacle height $Z_{\text{clear}}(r) \ge 0$ above the nozzle tip before colliding with
+    /// the nozzle tip flat, brass cone, or toolhead shroud.
+    pub fn max_allowed_obstacle_z_at_radius(&self, radial_dist_mm: f32) -> f32 {
+        let r = radial_dist_mm.max(0.0);
+        match self.clearance_mode {
+            ClearanceProfileMode::PiecewiseXZ => {
+                if self.clearance_profile_xz.is_empty() {
+                    return r;
+                }
+                let first = self.clearance_profile_xz[0];
+                if r <= first.x_radius_mm {
+                    return 0.0;
+                }
+                for pair in self.clearance_profile_xz.windows(2) {
+                    let a = pair[0];
+                    let b = pair[1];
+                    if r >= a.x_radius_mm && r <= b.x_radius_mm {
+                        let dr = b.x_radius_mm - a.x_radius_mm;
+                        if dr.abs() < 1.0e-6 {
+                            return a.z_height_mm.min(b.z_height_mm);
+                        }
+                        let t = ((r - a.x_radius_mm) / dr).clamp(0.0, 1.0);
+                        return (a.z_height_mm + t * (b.z_height_mm - a.z_height_mm)).max(0.0);
+                    }
+                }
+                if let Some(last) = self.clearance_profile_xz.last() {
+                    if self.clearance_profile_xz.len() >= 2 {
+                        let prev = self.clearance_profile_xz[self.clearance_profile_xz.len() - 2];
+                        let dr = (last.x_radius_mm - prev.x_radius_mm).max(1.0e-3);
+                        let dz = (last.z_height_mm - prev.z_height_mm).max(0.0);
+                        return (last.z_height_mm + (r - last.x_radius_mm).max(0.0) * (dz / dr))
+                            .max(0.0);
+                    }
+                    return last.z_height_mm.max(0.0);
+                }
+                r
+            }
+            ClearanceProfileMode::ParametricCone => {
+                let r0 = self
+                    .cone_tip_radius_mm
+                    .max(0.5 * self.nozzle_diameter_mm)
+                    .max(0.2);
+                if r <= r0 {
+                    return 0.0;
+                }
+                let tan_theta = self
+                    .cone_half_angle_deg
+                    .clamp(5.0, 80.0)
+                    .to_radians()
+                    .tan()
+                    .max(1.0e-3);
+                (r - r0) / tan_theta
+            }
+            ClearanceProfileMode::RectilinearCone => {
+                let r0 = self
+                    .rect_tip_half_width_x_mm
+                    .max(self.rect_tip_half_width_y_mm)
+                    .max(0.5 * self.nozzle_diameter_mm)
+                    .max(0.2);
+                if r <= r0 {
+                    return 0.0;
+                }
+                let tan_x = self
+                    .rect_half_angle_x_deg
+                    .clamp(5.0, 80.0)
+                    .to_radians()
+                    .tan();
+                let tan_y = self
+                    .rect_half_angle_y_deg
+                    .clamp(5.0, 80.0)
+                    .to_radians()
+                    .tan();
+                let tan_max = tan_x.max(tan_y).max(1.0e-3);
+                (r - r0) / tan_max
+            }
+        }
+    }
+
     /// Returns the maximum allowable layer slope angles `(alpha_max_x_deg, alpha_max_y_deg)`
     /// relative to the plane perpendicular to `nozzle_axis` along local X (`travel_axis`) and Y (`lateral_axis`).
     pub fn max_layer_slope_xy_deg(&self) -> (f32, f32) {
@@ -1445,6 +1525,22 @@ pub struct GcodeProcessConfig {
     pub ooze_relaxation_extra_prime_mm: f32,
     pub ooze_relaxation_tau_s: f32,
 
+    // --- Bed Adhesion Brim & Lever-Arm / Curled-Corner Speed Governor ---
+    /// Automatically generate a first-layer brim around narrow-footprint / high-lever-ratio parts
+    /// when `brim_width_mm == 0.0` and $H_{\max} / W_{\text{base}} > 2.2$.
+    pub enable_auto_brim: bool,
+    /// Explicit outward first-layer brim width in mm (`0.0` = use auto-brim when enabled, `> 0.0` = fixed brim width).
+    pub brim_width_mm: f32,
+    /// Separation gap (mm) between the innermost brim loop and the first-layer outer wall for clean peel-off.
+    pub brim_gap_mm: f32,
+    /// Automatically calculate overturning lever arm relative to the bed contact footprint and local island width,
+    /// slowing down speed and acceleration as height/cantilever ratio increases, especially near curled overhang corners.
+    pub enable_lever_arm_slowdown: bool,
+    /// Reference height-to-base-width lever ratio $\Lambda_{\text{ref}}$ above which progressive slowdown begins.
+    pub lever_arm_reference_ratio: f32,
+    /// Minimum speed and acceleration scaling fraction (`0.10..=1.0`) at high lever arm and curled-corner risk.
+    pub lever_arm_min_speed_fraction: f32,
+
     // --- Non-Newtonian Rheology, Pressure Advance, Die Swell & Cooling ---
     pub enable_flat_nozzle_comp: bool,
     pub enable_corner_flow_comp: bool,
@@ -1474,6 +1570,15 @@ pub struct GcodeProcessConfig {
     pub bridge_fan_speed_percent: f32,
     /// Part cooling fan speed (%) specifically for Wave Overhang extrusions.
     pub wave_overhang_fan_speed_percent: f32,
+    /// Dynamically modulate part cooling fan speed around `fan_speed_percent` to match volumetric
+    /// extrusion heat flux, residence time inside the cooling duct airflow, layer return time, and overhang curl risk.
+    pub enable_dynamic_fan_speed: bool,
+    /// Minimum part cooling fan speed (%) on low-flow, well-supported structural segments when dynamic fan is enabled.
+    pub min_fan_speed_percent: f32,
+    /// Maximum part cooling fan speed (%) when boosting airflow for high volumetric heat flux, short duct residence time, short layer time, or curled corners.
+    pub max_fan_speed_percent: f32,
+    /// Target minimum layer cooling return time (seconds) below which dynamic fan duty cycle is progressively boosted.
+    pub target_layer_cooling_time_s: f32,
 
     // --- Start & End G-code Templates ---
     pub start_gcode_template: String,
@@ -1528,6 +1633,12 @@ impl Default for GcodeProcessConfig {
             z_hop_mm: 0.40,
             ooze_relaxation_extra_prime_mm: -0.02,
             ooze_relaxation_tau_s: 1.50,
+            enable_auto_brim: true,
+            brim_width_mm: 0.0,
+            brim_gap_mm: 0.10,
+            enable_lever_arm_slowdown: true,
+            lever_arm_reference_ratio: 2.0,
+            lever_arm_min_speed_fraction: 0.28,
             enable_flat_nozzle_comp: true,
             enable_corner_flow_comp: true,
             corner_flow_comp_ratio: 0.85,
@@ -1550,6 +1661,10 @@ impl Default for GcodeProcessConfig {
             disable_fan_first_layers: 1,
             bridge_fan_speed_percent: 100.0,
             wave_overhang_fan_speed_percent: 100.0,
+            enable_dynamic_fan_speed: true,
+            min_fan_speed_percent: 20.0,
+            max_fan_speed_percent: 100.0,
+            target_layer_cooling_time_s: 10.0,
             start_gcode_template: concat!(
                 "; --- Manifold2 Non-Planar Print Start ---\n",
                 "; Print Bounds: X[{bbox_min_x}..{bbox_max_x}] Y[{bbox_min_y}..{bbox_max_y}] Z[{bbox_min_z}..{bbox_max_z}]\n",
@@ -1621,6 +1736,10 @@ impl GcodeProcessConfig {
         self.ooze_relaxation_extra_prime_mm =
             self.ooze_relaxation_extra_prime_mm.clamp(-0.5, 0.5);
         self.ooze_relaxation_tau_s = self.ooze_relaxation_tau_s.clamp(0.1, 30.0);
+        self.brim_width_mm = self.brim_width_mm.clamp(0.0, 30.0);
+        self.brim_gap_mm = self.brim_gap_mm.clamp(0.0, 1.0);
+        self.lever_arm_reference_ratio = self.lever_arm_reference_ratio.clamp(0.5, 15.0);
+        self.lever_arm_min_speed_fraction = self.lever_arm_min_speed_fraction.clamp(0.10, 1.0);
         self.corner_flow_comp_ratio = self.corner_flow_comp_ratio.clamp(0.0, 1.0);
         self.transient_pressure_exponent = self.transient_pressure_exponent.clamp(0.05, 1.0);
         self.transient_min_flow_multiplier = self.transient_min_flow_multiplier.clamp(0.40, 1.0);
@@ -1640,6 +1759,11 @@ impl GcodeProcessConfig {
         self.disable_fan_first_layers = self.disable_fan_first_layers.min(20);
         self.bridge_fan_speed_percent = self.bridge_fan_speed_percent.clamp(0.0, 100.0);
         self.wave_overhang_fan_speed_percent = self.wave_overhang_fan_speed_percent.clamp(0.0, 100.0);
+        self.min_fan_speed_percent = self.min_fan_speed_percent.clamp(0.0, 100.0);
+        self.max_fan_speed_percent = self
+            .max_fan_speed_percent
+            .clamp(self.min_fan_speed_percent, 100.0);
+        self.target_layer_cooling_time_s = self.target_layer_cooling_time_s.clamp(1.0, 60.0);
     }
 
     /// Effective minimum travel distance before triggering a retraction, accounting for scarf joint length.
@@ -2470,6 +2594,35 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         default_value: "1 layer",
         summary: "Number of initial layers that use `First-Layer Fan Speed` before ramping to `Part Cooling Fan Speed`.",
         details: "Setting to 1-3 layers prevents base-corner lifting before full cooling kicks in.",
+    },
+    ParameterDoc {
+        key: "gcode.enable_dynamic_fan_speed",
+        category: "Filament, Multipliers & Cooling",
+        title: "Dynamic Volumetric & Airflow-Residence Fan Matching",
+        units: "% / s",
+        default_value: "true (20%..100%, τ_layer = 10 s)",
+        summary: "Automatically modulates part cooling fan speed around `Part Cooling Fan Speed` based on volumetric extrusion rate Q, residence time within the nozzle cooling airflow jet, layer return time, and overhang curl risk.",
+        details: "Lowers fan duty cycle toward `Min Fan %` on slow, low-flow internal moves to maximize inter-layer polymer fusion, and boosts fan duty cycle toward `Max Fan %` (with a 0.35 s rotor spin-up lead time) when local volumetric heat flux in the 12 mm duct footprint is high, when layer return time is below `Target Layer Cooling Time`, or around curled overhang corners.",
+    },
+
+    // --- Bed Adhesion Brim & Lever-Arm / Curled-Corner Speed Governor ---
+    ParameterDoc {
+        key: "gcode.brim_width_mm",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "First-Layer Brim & Auto Lever-Arm Brim",
+        units: "mm",
+        default_value: "Auto (0.0 mm explicit, 0.10 mm gap)",
+        summary: "Generates outward concentric first-layer brim loops around the part and support footprints to prevent bed detachment.",
+        details: "When `Brim Width > 0`, generates fixed-width concentric loops separated from the part by `Brim Gap` for easy peel-off. When `Brim Width == 0` and `Auto Brim` is enabled, automatically synthesizes a proportional brim (up to 8 mm) whenever the part's height-to-base-width lever ratio exceeds 2.2.",
+    },
+    ParameterDoc {
+        key: "gcode.enable_lever_arm_slowdown",
+        category: "Speeds, Accelerations & Kinematics",
+        title: "Automatic Lever-Arm & Curled-Corner Speed/Accel Governor",
+        units: "ratio / ×",
+        default_value: "true (Λ_ref = 2.0, min = 0.28×)",
+        summary: "Automatically computes the overturning torque lever arm relative to the bed contact footprint and local island width, slowing down speed and acceleration on tall cantilevers and curled overhang corners.",
+        details: "Evaluates the ratio Λ = (h_up + 1.35 * d_cantilever) / W_base,min and local slender-prong aspect ratio, combined with a 3 mm window-smoothed corner-curl risk detector. Progressively throttles both print speed and toolhead acceleration down to `Min Speed Fraction` so nozzle drag and cornering inertia never snap tall parts off the bed or break slender prongs.",
     },
 
     // --- Speeds, Accelerations & Stepper Kinematics ---
