@@ -835,6 +835,10 @@ pub struct SlicingProcessConfig {
     /// Maximum surface slope angle relative to the local nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$
     /// (degrees, `10.0..=85.0`, default `60.0`) eligible for automatic conformal skin slicing.
     pub conformal_skin_max_slope_deg: f32,
+    /// When true (default), the outermost layer ($m = N_p$) of each conformal skin patch prints only
+    /// a single perimeter (`OuterWall` only, with `InnerWall`s replaced by `SolidInfill`), while
+    /// deeper conformal patch layers ($m < N_p$) retain the configured `inner_wall_count`.
+    pub one_perimeter_on_conformal_patches: bool,
 }
 
 impl Default for SlicingProcessConfig {
@@ -878,6 +882,7 @@ impl Default for SlicingProcessConfig {
             conformal_skin_layers: 3,
             conformal_skin_min_oblique_deg: 12.0,
             conformal_skin_max_slope_deg: 60.0,
+            one_perimeter_on_conformal_patches: true,
         }
     }
 }
@@ -2231,6 +2236,15 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         summary: "Maximum surface slope relative to the local nozzle axis (z_nozzle) eligible for automatic conformal skinning.",
         details: "Restricts automatic conformal skin detection to upward-facing sloped decks, roofs, and domes within the toolhead's printable slope envelope.",
     },
+    ParameterDoc {
+        key: "slicing.one_perimeter_on_conformal_patches",
+        category: "Non-Planar Layer Slicing",
+        title: "One Perimeter on Conformal Patches",
+        units: "bool",
+        default_value: "true",
+        summary: "Prints only a single outer perimeter wall on the outermost layer (m = N) of each conformal patch, replacing inner walls with solid infill.",
+        details: "Eliminates multiple concentric inner-wall rings around cutouts and edges on the visible exterior conformal skin surface while keeping full inner walls on deeper patch layers (m < N).",
+    },
 
     // --- Shell & Toolpath Generation ---
     ParameterDoc {
@@ -3196,6 +3210,7 @@ mod tests {
         assert!(lookup_parameter_doc("slicing.conformal_skin_layers").is_some());
         assert!(lookup_parameter_doc("slicing.conformal_skin_min_oblique_deg").is_some());
         assert!(lookup_parameter_doc("slicing.conformal_skin_max_slope_deg").is_some());
+        assert!(lookup_parameter_doc("slicing.one_perimeter_on_conformal_patches").is_some());
         let md = generate_parameter_docs_markdown();
         assert!(md.starts_with("# Manifold2 Parameter Reference"));
         assert!(md.contains("gcode.swell_multipliers"));

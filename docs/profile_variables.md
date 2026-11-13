@@ -164,6 +164,7 @@ $$h(\mathbf{x}) = \text{clamp}\!\left(\frac{\Delta\tau}{\|\nabla\tau(\mathbf{x})
 | `slicing.conformal_skin_layers` | `u32` (`1..=12`) | `3` | Process | Default number of conformal SDF offset skin layers ($N_p$) sliced parallel to $\phi_{\text{sdf}} = 0$ on automatic or manually selected `ConformalSurfaceSkin` patches. Erodes the underlying core SDF by $D_{\text{erode}} = N_p \cdot h_{\text{top}}$ and extracts $N_p$ skin layers at $\phi_{\text{sdf}}(\mathbf{x}) = -(N_p - m + 0.15)\,h_{\text{top}}$. |
 | `slicing.conformal_skin_min_oblique_deg` | `f32` (deg, `2.0..=75.0`) | `12.0` | Process | Minimum angle between the order-field gradient $\nabla\tau$ and the outward surface normal $\nabla\phi_{\text{sdf}}$ required to trigger automatic conformal skinning on an upward-facing exit surface. |
 | `slicing.conformal_skin_max_slope_deg` | `f32` (deg, `5.0..=85.0`) | `60.0` | Process | Maximum surface slope relative to the local nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$ eligible for automatic conformal skinning. |
+| `slicing.one_perimeter_on_conformal_patches` | `bool` | `true` | Process | Prints only a single outer perimeter wall (`OuterWall`) on the outermost layer ($m = N_p$) of each conformal skin patch, replacing `InnerWall`s with `SolidInfill` while keeping full inner walls on deeper conformal patch layers ($m < N_p$). |
 
 ### 7.2 Conformal 3D Shell, Perimeters & Arachne Variable Line Widths
 

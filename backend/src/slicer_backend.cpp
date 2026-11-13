@@ -1396,6 +1396,7 @@ struct SlicerBackend::Impl {
         45.0f,
         40.0f,
         0.08f,
+        true,
     };
     SupportSpec supportSpec{
         true,

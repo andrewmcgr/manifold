@@ -543,6 +543,7 @@ impl FieldVisualizationState {
             overhang_angle_threshold_deg: s.overhang_angle_threshold_deg,
             max_bridge_length_mm: s.max_bridge_length_mm,
             wave_overhang_overlap_fraction: s.wave_overhang_overlap_fraction,
+            one_perimeter_on_conformal_patches: s.one_perimeter_on_conformal_patches,
         };
         let support_spec = SupportSpec {
             enabled: s.enable_support_generation,
@@ -3270,6 +3271,7 @@ mod tests {
             overhang_angle_threshold_deg: 45.0,
             max_bridge_length_mm: 40.0,
             wave_overhang_overlap_fraction: 0.08,
+            one_perimeter_on_conformal_patches: true,
         };
         ffi::set_shell_path_spec(base_spec.clone());
 
@@ -3448,6 +3450,7 @@ mod tests {
             overhang_angle_threshold_deg: 45.0,
             max_bridge_length_mm: 40.0,
             wave_overhang_overlap_fraction: 0.08,
+            one_perimeter_on_conformal_patches: true,
         });
 
         let res = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -3843,6 +3846,7 @@ mod tests {
             overhang_angle_threshold_deg: 45.0,
             max_bridge_length_mm: 40.0,
             wave_overhang_overlap_fraction: 0.08,
+            one_perimeter_on_conformal_patches: true,
         };
 
         // Test all 7 sparse infill patterns (0..=6: Monotonic, Cubic, Gyroid, SchwarzD, SchwarzP, Concentric, AllWalls)
@@ -4734,6 +4738,7 @@ mod tests {
             overhang_angle_threshold_deg: 45.0,
             max_bridge_length_mm: 40.0,
             wave_overhang_overlap_fraction: 0.08,
+            one_perimeter_on_conformal_patches: true,
         });
 
         let tp_bridge = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -4803,6 +4808,7 @@ mod tests {
             overhang_angle_threshold_deg: 45.0,
             max_bridge_length_mm: 2.0,
             wave_overhang_overlap_fraction: 0.08,
+            one_perimeter_on_conformal_patches: true,
         });
 
         let tp_wave_only = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);

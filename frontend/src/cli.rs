@@ -3524,7 +3524,16 @@ mod tests {
                 let mut tp_pts = 0usize;
                 let mut tp_above = 0usize;
                 let mut tp_max_z = f32::MIN;
+                let mut outer_walls = 0usize;
+                let mut inner_walls = 0usize;
+                let mut solid_infill = 0usize;
                 for p in &tp.layers[i].paths {
+                    match p.feature_kind {
+                        0 => outer_walls += 1,
+                        1 => inner_walls += 1,
+                        2 => solid_infill += 1,
+                        _ => {}
+                    }
                     tp_pts += p.points.len();
                     for pt in &p.points {
                         tp_max_z = tp_max_z.max(pt.z);
@@ -3538,13 +3547,16 @@ mod tests {
                 } else if max_z > 29.5 {
                     top_skin_layers += 1;
                     println!(
-                        "  [{label}] Top Skin Layer #{i}: b_idx={}/{}, z=[{:.2}, {:.2}], verts={}, paths={}, pts={}",
+                        "  [{label}] Top Skin Layer #{i}: b_idx={}/{}, z=[{:.2}, {:.2}], verts={}, paths={} (outer={}, inner={}, infill={}), pts={}",
                         l.branch_layer_index,
                         l.branch_layer_count,
                         min_z,
                         max_z,
                         l.vertices.len(),
                         tp.layers[i].paths.len(),
+                        outer_walls,
+                        inner_walls,
+                        solid_infill,
                         tp_pts
                     );
                     assert!(
@@ -3553,11 +3565,24 @@ mod tests {
                         l.vertices.len()
                     );
                     assert!(
-                        tp.layers[i].paths.len() >= 15 && tp_pts >= 2500,
+                        tp.layers[i].paths.len() >= 6 && tp_pts >= 2500,
                         "[{label}] expected full top conformal skin toolpaths on layer #{i}, got {} paths ({} pts)",
                         tp.layers[i].paths.len(),
                         tp_pts
                     );
+                    assert!(outer_walls > 0 && solid_infill > 0);
+                    let is_outermost = l.branch_layer_index + 1 >= l.branch_layer_count;
+                    if is_outermost {
+                        assert_eq!(
+                            inner_walls, 0,
+                            "[{label}] outermost conformal skin layer should have 0 inner walls when one_perimeter_on_conformal_patches is true"
+                        );
+                    } else {
+                        assert!(
+                            inner_walls > 0,
+                            "[{label}] deeper conformal skin layer (m < N) should retain inner walls"
+                        );
+                    }
                 }
             }
 

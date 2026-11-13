@@ -271,6 +271,9 @@ pub mod ffi {
         pub max_bridge_length_mm: f32,
         /// Lateral overlap fraction of standard line width (`0.08` = 8%) for inside-out wave overhang extrusions.
         pub wave_overhang_overlap_fraction: f32,
+        /// When true, the outermost layer (`m = N`) of each conformal skin patch uses only 1 perimeter
+        /// (Outer Wall only, with Inner Walls replaced by Solid Infill), while deeper patch layers (`m < N`) keep normal Inner Walls.
+        pub one_perimeter_on_conformal_patches: bool,
     }
 
     /// A single 3D vertex along a continuous non-planar extrusion toolpath.

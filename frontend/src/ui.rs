@@ -4716,6 +4716,16 @@ fn render_process_config_tab(
                 .on_hover_text("Default number of conformal SDF skin layers (N) for auto-detected or newly hinted conformal skin surfaces.")
                 .changed();
             param_help_button(ui, "slicing.conformal_skin_layers");
+            lh_changed |= ui
+                .checkbox(
+                    &mut config.slicing.one_perimeter_on_conformal_patches,
+                    "One Perimeter on Conformal Patches",
+                )
+                .on_hover_text(
+                    "Print only the outer wall on the outermost layer (m = N) of each conformal patch, replacing inner walls with solid infill.",
+                )
+                .changed();
+            param_help_button(ui, "slicing.one_perimeter_on_conformal_patches");
             if config.slicing.enable_auto_conformal_skin {
                 lh_changed |= ui
                     .add(
@@ -5019,6 +5029,19 @@ fn render_process_config_tab(
                 tp_cfg_changed = true;
             }
             param_help_button(ui, "slicing.min_extrusion_length_mm");
+        });
+
+        ui.horizontal(|ui| {
+            tp_cfg_changed |= ui
+                .checkbox(
+                    &mut config.slicing.one_perimeter_on_conformal_patches,
+                    "One Perimeter on Conformal Patches",
+                )
+                .on_hover_text(
+                    "Print only the outer wall on the outermost layer (m = N) of each conformal patch, replacing inner walls with solid infill.",
+                )
+                .changed();
+            param_help_button(ui, "slicing.one_perimeter_on_conformal_patches");
         });
 
         ui.horizontal(|ui| {
@@ -6557,6 +6580,7 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         overhang_angle_threshold_deg: config.slicing.overhang_angle_threshold_deg,
         max_bridge_length_mm: config.slicing.max_bridge_length_mm,
         wave_overhang_overlap_fraction: config.slicing.wave_overhang_overlap_fraction,
+        one_perimeter_on_conformal_patches: config.slicing.one_perimeter_on_conformal_patches,
     });
 
     ffi::set_order_field_mode(config.eikonal.order_field_mode.as_u8());

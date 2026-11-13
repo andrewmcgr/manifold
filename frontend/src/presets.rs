@@ -732,6 +732,7 @@ pub struct ProcessPreset {
     // Shells, Line Widths & Infill
     pub shell_thickness_mm: f32,
     pub inner_wall_count: u32,
+    pub one_perimeter_on_conformal_patches: bool,
     pub wall_print_order: WallPrintOrder,
     pub outer_wall_width: LineWidthConfig,
     pub inner_wall_width: LineWidthConfig,
@@ -827,6 +828,7 @@ impl ProcessPreset {
             max_nonplanar_slope_deg: cfg.slicing.max_nonplanar_slope_deg,
             shell_thickness_mm: cfg.slicing.shell_thickness_mm,
             inner_wall_count: cfg.slicing.inner_wall_count,
+            one_perimeter_on_conformal_patches: cfg.slicing.one_perimeter_on_conformal_patches,
             wall_print_order: cfg.gcode.wall_print_order,
             outer_wall_width: cfg.slicing.outer_wall_width,
             inner_wall_width: cfg.slicing.inner_wall_width,
@@ -903,6 +905,7 @@ impl ProcessPreset {
         cfg.slicing.max_nonplanar_slope_deg = self.max_nonplanar_slope_deg;
         cfg.slicing.shell_thickness_mm = self.shell_thickness_mm;
         cfg.slicing.inner_wall_count = self.inner_wall_count;
+        cfg.slicing.one_perimeter_on_conformal_patches = self.one_perimeter_on_conformal_patches;
         cfg.gcode.wall_print_order = self.wall_print_order;
         cfg.slicing.outer_wall_width = self.outer_wall_width;
         cfg.slicing.inner_wall_width = self.inner_wall_width;
@@ -1010,6 +1013,8 @@ impl ProcessPreset {
             )
             && approx_eq(self.shell_thickness_mm, cfg.slicing.shell_thickness_mm)
             && self.inner_wall_count == cfg.slicing.inner_wall_count
+            && self.one_perimeter_on_conformal_patches
+                == cfg.slicing.one_perimeter_on_conformal_patches
             && self.wall_print_order == cfg.gcode.wall_print_order
             && approx_eq_line_width(self.outer_wall_width, cfg.slicing.outer_wall_width)
             && approx_eq_line_width(self.inner_wall_width, cfg.slicing.inner_wall_width)

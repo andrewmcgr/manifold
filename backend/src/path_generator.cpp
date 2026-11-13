@@ -2727,6 +2727,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
     const float shellThicknessMm = std::max(0.05f, spec.shell_thickness_mm);
     const std::uint32_t numInnerWalls = spec.inner_wall_count;
+    const bool onePerimeterOnConformalPatches = spec.one_perimeter_on_conformal_patches;
     const SanitizedLineWidth outerW = sanitizeLineWidth(spec.outer_wall_width);
     const SanitizedLineWidth innerW = sanitizeLineWidth(spec.inner_wall_width);
     const SanitizedLineWidth infillW = sanitizeLineWidth(spec.solid_infill_width);
@@ -3000,6 +3001,14 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     (std::abs(layerInfo.max_thickness_mm - layerInfo.min_thickness_mm) <= 1.0e-4f);
                 const bool isConformalSkinLayer =
                     isUniformThicknessLayer && layerInfo.is_top_layer && !layerInfo.is_first_layer;
+                const bool isOutermostConformalSkinLayer =
+                    isConformalSkinLayer &&
+                    (layerInfo.branch_layer_count == 0 ||
+                     layerInfo.branch_layer_index + 1 >= layerInfo.branch_layer_count);
+                const std::uint32_t layerNumInnerWalls =
+                    (onePerimeterOnConformalPatches && isOutermostConformalSkinLayer)
+                        ? 0u
+                        : numInnerWalls;
 
                 auto sampleLocalLayerHeight = [&](const Vec3f& p) -> float {
                     if (isUniformThicknessLayer) {
@@ -3502,7 +3511,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // ------------------------------------------------------------
                 std::vector<float> localOuterWidth(nV, outerW.target_mm);
                 std::vector<float> localInnerWidth(nV, innerW.target_mm);
-                std::vector<std::uint32_t> activeInnerCount(nV, numInnerWalls);
+                std::vector<std::uint32_t> activeInnerCount(nV, layerNumInnerWalls);
                 std::vector<float> totalWallSpan(nV, 0.0f);
 
                 for (std::size_t i = 0; i < nV; ++i) {
@@ -3527,7 +3536,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     // Keep the visible outer wall at its constant target width whenever `B >= outerW.target_mm`
                     // so inner wall count transitions (`mFit`) never cause step-jumps on the outer wall!
                     std::uint32_t mFit = 0;
-                    for (std::uint32_t m = 1; m <= numInnerWalls; ++m) {
+                    for (std::uint32_t m = 1; m <= layerNumInnerWalls; ++m) {
                         const float wMinSum =
                             outerW.target_mm + static_cast<float>(m) * innerW.min_mm;
                         if (B >= wMinSum) {
@@ -4438,8 +4447,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                 }
 
-                // Inner walls: j = 1 .. numInnerWalls (may be closed loops or open polylines!)
-                for (std::uint32_t j = 1; j <= numInnerWalls; ++j) {
+                // Inner walls: j = 1 .. layerNumInnerWalls (may be closed loops or open polylines!)
+                for (std::uint32_t j = 1; j <= layerNumInnerWalls; ++j) {
                     const float minSpanForWallJ =
                         outerW.min_mm + static_cast<float>(j) * innerW.min_mm;
                     std::vector<float> innerLevel(nV, 0.0f);
@@ -4564,7 +4573,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             if (finalizeExtrusionPath(
                                     ch,
                                     kFeatureInnerWall,
-                                    numInnerWalls + 1,
+                                    layerNumInnerWalls + 1,
                                     minExtrusionLengthMm,
                                     ep)) {
                                 layerOut.paths.push_back(std::move(ep));
