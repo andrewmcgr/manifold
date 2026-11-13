@@ -386,6 +386,7 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
             .as_ref()
             .map_or(false, |m| m.objects.iter().all(|o| o.embedded_step_entry.is_some()))
     {
+        remap_restored_config_hint_object_ids(report, objects_start_idx);
         return;
     }
 
@@ -396,10 +397,12 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
         .or_else(|| model_files.keys().next().cloned());
 
     let Some(root_key) = root_model_key else {
+        remap_restored_config_hint_object_ids(report, objects_start_idx);
         return;
     };
 
     let Some(root_model) = model_files.get(&root_key).cloned() else {
+        remap_restored_config_hint_object_ids(report, objects_start_idx);
         return;
     };
 
@@ -552,6 +555,53 @@ pub fn load_3mf_archive(path: &Path, report: &mut LoadedBatchReport) {
 
             if num_plates > 1 {
                 report.objects[objects_start_idx..].sort_by_key(|o| o.plate_index);
+            }
+        }
+    }
+
+    remap_restored_config_hint_object_ids(report, objects_start_idx);
+}
+
+/// Remaps `object_id` references inside a restored 3MF `SlicerConfig` (`surface_hints` and
+/// `point_hints`) to the runtime `object_id`s assigned to the objects loaded from this archive.
+fn remap_restored_config_hint_object_ids(report: &mut LoadedBatchReport, objects_start_idx: usize) {
+    let loaded_ids: Vec<u64> = report.objects[objects_start_idx..]
+        .iter()
+        .map(|o| o.object_id)
+        .collect();
+    if loaded_ids.is_empty() {
+        return;
+    }
+    let Some(ref mut cfg) = report.restored_config else {
+        return;
+    };
+
+    // Collect distinct saved object IDs referenced by hints in order of appearance
+    let mut saved_ids: Vec<u64> = Vec::new();
+    for h in &cfg.eikonal.surface_hints {
+        if !saved_ids.contains(&h.object_id) {
+            saved_ids.push(h.object_id);
+        }
+    }
+    for h in &cfg.eikonal.point_hints {
+        if !saved_ids.contains(&h.object_id) {
+            saved_ids.push(h.object_id);
+        }
+    }
+
+    // If any saved hint object_id does not match a loaded object_id, remap saved IDs
+    // positionally onto `loaded_ids` (defaulting to `loaded_ids[0]` for single-object projects).
+    if saved_ids.iter().any(|id| !loaded_ids.contains(id)) {
+        for h in &mut cfg.eikonal.surface_hints {
+            if !loaded_ids.contains(&h.object_id) {
+                let ord = saved_ids.iter().position(|&id| id == h.object_id).unwrap_or(0);
+                h.object_id = loaded_ids.get(ord).copied().unwrap_or(loaded_ids[0]);
+            }
+        }
+        for h in &mut cfg.eikonal.point_hints {
+            if !loaded_ids.contains(&h.object_id) {
+                let ord = saved_ids.iter().position(|&id| id == h.object_id).unwrap_or(0);
+                h.object_id = loaded_ids.get(ord).copied().unwrap_or(loaded_ids[0]);
             }
         }
     }

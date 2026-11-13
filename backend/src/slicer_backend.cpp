@@ -4058,6 +4058,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         openvdb::Vec3f surfPos{0.0f, 0.0f, 0.0f};
         openvdb::Vec3f surfNormal{0.0f, 0.0f, 1.0f};
         float tau = 0.0f;
+        float cosOblique = 1.0f;
         int requestedLayers = 0;
         float weight = 1.0f;
         bool isManual = false;
@@ -4080,8 +4081,12 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     std::vector<ConformalSkinPatch> conformalSkinPatches;
     openvdb::FloatGrid skinErodeDepthGrid(0.0f);
     skinErodeDepthGrid.setTransform(fineSdfGrid.transform().copy());
+    openvdb::FloatGrid skinTargetThicknessGrid(0.0f);
+    skinTargetThicknessGrid.setTransform(fineSdfGrid.transform().copy());
     openvdb::Int32Grid skinPatchIdGrid(-1);
     skinPatchIdGrid.setTransform(fineSdfGrid.transform().copy());
+    openvdb::Int32Grid skinCorePatchIdGrid(-1);
+    skinCorePatchIdGrid.setTransform(fineSdfGrid.transform().copy());
     openvdb::Vec3SGrid skinPatchNormalGrid(openvdb::Vec3s(0.0f, 0.0f, 1.0f));
     skinPatchNormalGrid.setTransform(fineSdfGrid.transform().copy());
     float maxConformalSkinDepthMm = 0.0f;
@@ -4720,7 +4725,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             nSdf.z() * ih.direction_bed[2];
                         if (distSq <= rad * rad &&
                             std::abs(normalDist) <= maxNormalOffset &&
-                            dotDir >= 0.80f) {
+                            dotDir >= 0.85f) {
                             const float score = ih.weight * dotDir / (1.0f + distSq / (rad * rad));
                             if (score > bestManualScore) {
                                 bestManualScore = score;
@@ -4731,6 +4736,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         }
                     }
 
+                    float cosObliqueVal = 0.0f;
                     if (!isManual && skinSpec.auto_enabled) {
                         if (cosNozzle < cosMaxSlope) {
                             continue;
@@ -4784,9 +4790,10 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         if (tLen < 1.0e-4f) {
                             continue;
                         }
-                        const float cosOblique =
+                        cosObliqueVal =
                             (tx * nSdf.x() + ty * nSdf.y() + tz * nSdf.z()) / tLen;
-                        if (cosOblique >= 0.087f && cosOblique <= cosMinOblique) {
+                        if (cosObliqueVal >= 0.087f &&
+                            (cosObliqueVal <= cosMinOblique || cosNozzle >= 0.95f)) {
                             requestedLayers = std::clamp<int>(
                                 static_cast<int>(skinSpec.default_skin_layers), 1, 12);
                         }
@@ -4846,7 +4853,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         localFineEikAcc,
                         localFineEikSampler,
                         localMainEikAcc,
-                        localMainEikSampler);
+                        localMainEikSampler) + 0.60f * fineVoxelSize;
 
                     const openvdb::Coord cBranch =
                         branchGrid.transform().worldToIndexCellCentered(wpTauSample);
@@ -4867,6 +4874,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     sv.surfPos = xSurf;
                     sv.surfNormal = nSdf;
                     sv.tau = surfTau;
+                    sv.cosOblique = cosObliqueVal;
                     sv.requestedLayers = requestedLayers;
                     sv.weight = 1.0f;
                     sv.isManual = isManual;
@@ -4889,6 +4897,55 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             const auto svIdx = static_cast<std::int32_t>(surfVoxels.size());
             surfIdxAcc.setValue(candidateSlots[idx].ijk, svIdx);
             surfVoxels.push_back(candidateSlots[idx]);
+        }
+
+        // De-round 90-degree corner-polluted surface normals at coplanar cutout/perimeter rims
+        // (`dzStep <= 0.25 * fineVoxelSize`) so rim voxels join their parent face patch and erode
+        // the underlying core cleanly without pulling sloped chamfer neighbors into the face.
+        std::vector<openvdb::Vec3f> clearanceNormals(surfVoxels.size());
+        if (!surfVoxels.empty()) {
+            for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
+                const auto& sv = surfVoxels[k];
+                const NozzleBasis nb = queryNozzleFrame(
+                    {sv.surfPos.x(), sv.surfPos.y(), sv.surfPos.z()},
+                    {1.0f, 0.0f, 0.0f});
+                const openvdb::Vec3f zAxis(
+                    nb.nozzle_axis[0], nb.nozzle_axis[1], nb.nozzle_axis[2]);
+                openvdb::Vec3f bestN = sv.surfNormal;
+                float bestDotZ = bestN.dot(zAxis);
+                for (int dz = -1; dz <= 1; ++dz) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            if (dx == 0 && dy == 0 && dz == 0) {
+                                continue;
+                            }
+                            const int nbIdx =
+                                surfIdxAcc.getValue(sv.ijk + openvdb::Coord(dx, dy, dz));
+                            if (nbIdx < 0) {
+                                continue;
+                            }
+                            const auto& nbSv = surfVoxels[static_cast<std::size_t>(nbIdx)];
+                            if (sv.surfNormal.dot(nbSv.surfNormal) < 0.82f) {
+                                continue;
+                            }
+                            const float dzStep =
+                                std::abs((nbSv.surfPos - sv.surfPos).dot(nbSv.surfNormal));
+                            if (dzStep > 0.25f * fineVoxelSize) {
+                                continue;
+                            }
+                            const float candDotZ = nbSv.surfNormal.dot(zAxis);
+                            if (candDotZ > bestDotZ + 0.01f) {
+                                bestDotZ = candDotZ;
+                                bestN = nbSv.surfNormal;
+                            }
+                        }
+                    }
+                }
+                clearanceNormals[k] = bestN;
+            }
+            for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
+                surfVoxels[k].surfNormal = clearanceNormals[k];
+            }
         }
 
         // Lazy GPU dense `(sdf, tau)` narrow-band volume cache + batch clearance dispatcher
@@ -5075,7 +5132,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 std::vector<float> candPosDepth(count * 4u);
                 std::vector<float> candNormTau(count * 4u);
                 for (std::size_t k = 0; k < count; ++k) {
-                    const auto& sv = surfVoxels[static_cast<std::size_t>(voxelIndices[k])];
+                    const auto svIdx = static_cast<std::size_t>(voxelIndices[k]);
+                    const auto& sv = surfVoxels[svIdx];
+                    const openvdb::Vec3f& cNorm = clearanceNormals[svIdx];
                     const float depthMm = (overrideSkinDepthMm > 0.0f)
                         ? overrideSkinDepthMm
                         : (static_cast<float>(sv.requestedLayers) * hTop);
@@ -5086,9 +5145,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     candPosDepth[k * 4u + 1u] = sv.surfPos.y();
                     candPosDepth[k * 4u + 2u] = sv.surfPos.z();
                     candPosDepth[k * 4u + 3u] = depthMm;
-                    candNormTau[k * 4u + 0u] = sv.surfNormal.x();
-                    candNormTau[k * 4u + 1u] = sv.surfNormal.y();
-                    candNormTau[k * 4u + 2u] = sv.surfNormal.z();
+                    candNormTau[k * 4u + 0u] = cNorm.x();
+                    candNormTau[k * 4u + 1u] = cNorm.y();
+                    candNormTau[k * 4u + 2u] = cNorm.z();
                     candNormTau[k * 4u + 3u] = pTau;
                 }
                 const rust::Slice<const float> posSlice(candPosDepth.data(), candPosDepth.size());
@@ -5141,7 +5200,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         localMainEikSampler(localMainEikAcc, eikGrid.transform());
 
                     for (std::size_t k = r.begin(); k != r.end(); ++k) {
-                        const auto& sv = surfVoxels[static_cast<std::size_t>(voxelIndices[k])];
+                        const auto svIdx = static_cast<std::size_t>(voxelIndices[k]);
+                        const auto& sv = surfVoxels[svIdx];
+                        const openvdb::Vec3f& cNorm = clearanceNormals[svIdx];
                         const float depthMm = (overrideSkinDepthMm > 0.0f)
                             ? overrideSkinDepthMm
                             : (static_cast<float>(sv.requestedLayers) * hTop);
@@ -5151,7 +5212,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         bool nearMargin = false;
                         if (hasNozzleClearanceCollision(
                                 sv.surfPos,
-                                sv.surfNormal,
+                                cNorm,
                                 depthMm,
                                 pTau,
                                 localSdfAcc,
@@ -5190,7 +5251,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         if (!surfVoxels.empty()) {
             std::vector<int> queue;
             queue.reserve(surfVoxels.size());
-            const float maxStepHeight = 0.95f * fineVoxelSize;
+            const float maxStepHeight = 0.65f * fineVoxelSize;
 
             for (std::size_t i = 0; i < surfVoxels.size(); ++i) {
                 if (surfVoxels[i].patchId != -1) {
@@ -5203,6 +5264,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
 
                 bool hasAnyManual = false;
                 double sumLayers = 0.0;
+                openvdb::Vec3f runningNormalSum(0.0f, 0.0f, 0.0f);
 
                 std::size_t head = 0;
                 while (head < queue.size()) {
@@ -5210,15 +5272,19 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     const auto& cv = surfVoxels[static_cast<std::size_t>(currIdx)];
                     hasAnyManual = hasAnyManual || cv.isManual;
                     sumLayers += static_cast<double>(cv.requestedLayers);
+                    runningNormalSum += cv.surfNormal;
+                    const float rnLen = runningNormalSum.length();
+                    const openvdb::Vec3f patchMeanN =
+                        (rnLen > 1.0e-5f) ? (runningNormalSum / rnLen) : cv.surfNormal;
 
-                    // 26-connected neighborhood with coplanar step rejection so recessed
-                    // surfaces (e.g. Benchy bow deck) never bridge across a vertical step
-                    // onto raised rims (e.g. hull gunwale tops).
+                    // 26-connected neighborhood with coplanar step rejection and mean-normal
+                    // cone check so recessed surfaces never bridge across a vertical step and
+                    // flat top faces never chain-walk onto 45-degree corner chamfers.
                     for (int dz = -1; dz <= 1; ++dz) {
                         for (int dy = -1; dy <= 1; ++dy) {
                             for (int dx = -1; dx <= 1; ++dx) {
                                 if (dx == 0 && dy == 0 && dz == 0) {
-                                    continue;
+                                     continue;
                                 }
                                 const int nbIdx =
                                     surfIdxAcc.getValue(cv.ijk + openvdb::Coord(dx, dy, dz));
@@ -5229,7 +5295,8 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                 if (nb.patchId != -1) {
                                     continue;
                                 }
-                                if (cv.surfNormal.dot(nb.surfNormal) < 0.75f) {
+                                if (cv.surfNormal.dot(nb.surfNormal) < 0.90f ||
+                                    patchMeanN.dot(nb.surfNormal) < 0.90f) {
                                     continue;
                                 }
                                 const openvdb::Vec3f diff = nb.surfPos - cv.surfPos;
@@ -5328,10 +5395,14 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 finalTaus.reserve(surviving.size());
                 openvdb::Vec3f sumNormal(0.0f, 0.0f, 0.0f);
                 std::unordered_map<int, int> branchVotes;
+                std::size_t obliqueVoxelCount = 0;
                 for (int idx : surviving) {
                     const auto& sv = surfVoxels[static_cast<std::size_t>(idx)];
                     if (sv.tau > 0.0f && sv.tau <= maxPlausibleTau) {
                         finalTaus.push_back(sv.tau);
+                    }
+                    if (sv.cosOblique <= cosMinOblique) {
+                        ++obliqueVoxelCount;
                     }
                     sumNormal += sv.surfNormal;
                     branchVotes[sv.branchId] += 1;
@@ -5346,6 +5417,20 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 std::sort(finalTaus.begin(), finalTaus.end());
                 tauMin = finalTaus.front();
                 tauCompletion = finalTaus.back();
+                const float tauP05 = finalTaus[(finalTaus.size() * 5) / 100];
+                const float tauP95 = finalTaus[(finalTaus.size() * 95) / 100];
+                const bool hasObliqueSurface =
+                    obliqueVoxelCount >= std::max<std::size_t>(4u, surviving.size() / 6u);
+                const bool hasStairStepTauSpan =
+                    (tauP95 - tauP05) >= 0.35f * hTop ||
+                    (tauCompletion - tauMin) >= 0.75f * hTop;
+                if (!hasAnyManual && !hasObliqueSurface && !hasStairStepTauSpan) {
+                    for (int idx : surviving) {
+                        surfVoxels[static_cast<std::size_t>(idx)].patchId = -2;
+                        surfVoxels[static_cast<std::size_t>(idx)].weight = 0.0f;
+                    }
+                    continue;
+                }
 
                 int bestBranch = 0;
                 int bestVotes = -1;
@@ -5380,13 +5465,23 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             }
         }
 
-        // Smooth surface weights on each conformal skin patch so the eroded core transitions
-        // smoothly at the patch perimeter and tool-clearance stand-off boundary, then populate
-        // the 3D narrow-band `skinErodeDepthGrid`, `skinPatchIdGrid`, and `skinPatchNormalGrid`
-        // without dilating past rejected collision voxels.
+        // Smooth surface weights on each conformal skin patch:
+        // - `sv.weight` tapers at all patch boundaries (including outer edges and inner cutout
+        //   rims) so Section 5c (`skinTargetThicknessGrid`) clips `volumeToMesh` cleanly at 90-degree
+        //   side-wall corners and keeps each conformal skin layer a flat/conformal sheet.
+        // - `coreWeights` stays at 1.0 up to open outer/cutout edges and only tapers adjacent to
+        //   collision-pruned obstacles (`patchId == -2`) so Section 5b (`skinErodeDepthGrid`) erodes
+        //   underlying core layers completely through the 90-degree perimeter rim.
         if (!conformalSkinPatches.empty()) {
+            std::vector<float> coreWeights(surfVoxels.size(), 0.0f);
+            for (std::size_t i = 0; i < surfVoxels.size(); ++i) {
+                if (surfVoxels[i].patchId >= 0) {
+                    coreWeights[i] = 1.0f;
+                }
+            }
             for (int pass = 0; pass < 2; ++pass) {
                 std::vector<float> nextWeights(surfVoxels.size(), 0.0f);
+                std::vector<float> nextCoreWeights(surfVoxels.size(), 0.0f);
                 for (std::size_t i = 0; i < surfVoxels.size(); ++i) {
                     const auto& sv = surfVoxels[i];
                     if (sv.patchId < 0) {
@@ -5394,6 +5489,8 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     }
                     float sumW = 2.0f * sv.weight;
                     float cntW = 2.0f;
+                    float sumCoreW = 2.0f * coreWeights[i];
+                    float cntCoreW = 2.0f;
                     for (int dz = -1; dz <= 1; ++dz) {
                         for (int dy = -1; dy <= 1; ++dy) {
                             for (int dx = -1; dx <= 1; ++dx) {
@@ -5406,33 +5503,43 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                     surfVoxels[static_cast<std::size_t>(nbIdx)].patchId == sv.patchId) {
                                     sumW += surfVoxels[static_cast<std::size_t>(nbIdx)].weight;
                                     cntW += 1.0f;
+                                    sumCoreW += coreWeights[static_cast<std::size_t>(nbIdx)];
+                                    cntCoreW += 1.0f;
                                 } else {
                                     const float nbSdf = fineSdfAcc.getValue(nbCoord);
                                     if (nbSdf >= -0.85f * fineVoxelSize &&
                                         nbSdf <= 0.55f * fineVoxelSize) {
-                                        // Adjacent non-patch or collision-pruned boundary voxel pulls rim weight toward 0
                                         cntW += 1.0f;
+                                    }
+                                    if (nbIdx >= 0 &&
+                                        surfVoxels[static_cast<std::size_t>(nbIdx)].patchId == -2) {
+                                        cntCoreW += 1.0f;
                                     }
                                 }
                             }
                         }
                     }
                     nextWeights[i] = std::clamp(sumW / cntW, 0.0f, 1.0f);
+                    nextCoreWeights[i] = std::clamp(sumCoreW / cntCoreW, 0.0f, 1.0f);
                 }
                 for (std::size_t i = 0; i < surfVoxels.size(); ++i) {
                     if (surfVoxels[i].patchId >= 0) {
                         surfVoxels[i].weight = nextWeights[i];
+                        coreWeights[i] = nextCoreWeights[i];
                     }
                 }
             }
 
             auto erodeAcc = skinErodeDepthGrid.getAccessor();
+            auto targetThickAcc = skinTargetThicknessGrid.getAccessor();
             auto patchIdAcc = skinPatchIdGrid.getAccessor();
+            auto corePatchIdAcc = skinCorePatchIdGrid.getAccessor();
             auto patchNormAcc = skinPatchNormalGrid.getAccessor();
             const float minBandSdf = -(maxConformalSkinDepthMm + 2.5f * fineVoxelSize);
             const float maxBandSdf = 1.5f * fineVoxelSize;
             const float maxProjDistSq = (2.15f * fineVoxelSize) * (2.15f * fineVoxelSize);
             const float maxNearestSurfDistSq = (1.20f * fineVoxelSize) * (1.20f * fineVoxelSize);
+            const float maxTangDistSq = (2.85f * fineVoxelSize) * (2.85f * fineVoxelSize);
 
             auto sampleSdfGradUnit = [&](
                 const openvdb::Vec3d& wp,
@@ -5457,26 +5564,75 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
 
             // Only visit `fineSdfGrid` narrow-band voxels within the neighborhood of actual
             // conformal skin patches rather than computing gradients across the entire object.
+            // Simultaneously accumulate normal-depth projections along `sv.surfNormal` so
+            // 90-degree top-side perimeter edges (where \nabla\phi_sdf rotates toward the
+            // vertical side wall) are eroded cleanly all the way to the outer wall.
             const int bandRadiusVoxels = std::clamp(
                 static_cast<int>(std::ceil(maxConformalSkinDepthMm / fineVoxelSize)) + 2,
                 2,
                 16);
-            openvdb::BoolGrid nearPatchMaskGrid(false);
-            auto maskAcc = nearPatchMaskGrid.getAccessor();
+            struct TangentialPatchAccum {
+                float sumWeight = 0.0f;
+                float sumInvDist = 0.0f;
+                float sumDn = 0.0f;
+                float nearestTangDistSq = std::numeric_limits<float>::max();
+                int nearestPatchId = -1;
+                openvdb::Vec3f sumNormal{0.0f, 0.0f, 0.0f};
+            };
+            openvdb::Int32Grid nearPatchIdxGrid(-1);
+            auto nearIdxAcc = nearPatchIdxGrid.getAccessor();
             std::vector<openvdb::Coord> nearPatchCoords;
+            std::vector<TangentialPatchAccum> tangAccum;
+
             for (const auto& patch : conformalSkinPatches) {
+                const float maxDn = patch.skinThicknessMm + 1.75f * fineVoxelSize;
                 for (const std::size_t svIdx : patch.surfVoxelIndices) {
-                    const openvdb::Coord c0 = surfVoxels[svIdx].ijk;
+                    const auto& sv = surfVoxels[svIdx];
+                    const openvdb::Coord c0 = sv.ijk;
                     for (int dz = -bandRadiusVoxels; dz <= bandRadiusVoxels; ++dz) {
                         for (int dy = -bandRadiusVoxels; dy <= bandRadiusVoxels; ++dy) {
                             for (int dx = -bandRadiusVoxels; dx <= bandRadiusVoxels; ++dx) {
                                 const openvdb::Coord nb = c0 + openvdb::Coord(dx, dy, dz);
-                                if (!maskAcc.getValue(nb)) {
-                                    maskAcc.setValue(nb, true);
+                                int vIdx = nearIdxAcc.getValue(nb);
+                                if (vIdx == -1) {
                                     const float sdfVal = fineSdfAcc.getValue(nb);
                                     if (sdfVal >= minBandSdf && sdfVal <= maxBandSdf) {
+                                        vIdx = static_cast<int>(nearPatchCoords.size());
+                                        nearIdxAcc.setValue(nb, vIdx);
                                         nearPatchCoords.push_back(nb);
+                                        tangAccum.emplace_back();
+                                    } else {
+                                        nearIdxAcc.setValue(nb, -2);
+                                        continue;
                                     }
+                                } else if (vIdx < 0) {
+                                    continue;
+                                }
+
+                                const openvdb::Vec3d wp = fineSdfGrid.transform().indexToWorld(nb);
+                                const openvdb::Vec3f v(
+                                    sv.surfPos.x() - static_cast<float>(wp.x()),
+                                    sv.surfPos.y() - static_cast<float>(wp.y()),
+                                    sv.surfPos.z() - static_cast<float>(wp.z()));
+                                const openvdb::Vec3f& cNorm = clearanceNormals[svIdx];
+                                const float dn = v.dot(cNorm);
+                                if (dn < -1.0f * fineVoxelSize || dn > maxDn) {
+                                    continue;
+                                }
+                                const float dtSq = std::max(0.0f, v.lengthSqr() - dn * dn);
+                                if (dtSq > maxTangDistSq) {
+                                    continue;
+                                }
+                                const float wTang =
+                                    1.0f / (0.12f * fineVoxelSize * fineVoxelSize + dtSq);
+                                auto& acc = tangAccum[static_cast<std::size_t>(vIdx)];
+                                acc.sumInvDist += wTang;
+                                acc.sumWeight += wTang * coreWeights[svIdx];
+                                acc.sumDn += wTang * dn;
+                                acc.sumNormal += cNorm * wTang;
+                                if (dtSq < acc.nearestTangDistSq) {
+                                    acc.nearestTangDistSq = dtSq;
+                                    acc.nearestPatchId = sv.patchId;
                                 }
                             }
                         }
@@ -5484,82 +5640,187 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 }
             }
 
-            for (const openvdb::Coord& ijk : nearPatchCoords) {
-                const float sdfVal = fineSdfAcc.getValue(ijk);
-                const openvdb::Vec3d wp = fineSdfGrid.transform().indexToWorld(ijk);
-                openvdb::Vec3f nSdf(0.0f, 0.0f, 1.0f);
-                if (!sampleSdfGradUnit(wp, nSdf)) {
+            // Also accumulate rejected collision-boundary surface voxels (`patchId == -2`) into
+            // existing `tangAccum` entries so tangential erosion never dilates into collision zones.
+            const float maxRejectedDn = maxConformalSkinDepthMm + 1.75f * fineVoxelSize;
+            for (const auto& sv : surfVoxels) {
+                if (sv.patchId != -2) {
                     continue;
                 }
-                const openvdb::Vec3f xSurf(
-                    static_cast<float>(wp.x()) - sdfVal * nSdf.x(),
-                    static_cast<float>(wp.y()) - sdfVal * nSdf.y(),
-                    static_cast<float>(wp.z()) - sdfVal * nSdf.z());
-                const openvdb::Coord cSurf =
-                    fineSdfGrid.transform().worldToIndexCellCentered(
-                        openvdb::Vec3d(xSurf.x(), xSurf.y(), xSurf.z()));
-
-                float sumWeight = 0.0f;
-                float sumInvDist = 0.0f;
-                int nearestSurfPatchId = -1;
-                float nearestSurfDistSq = std::numeric_limits<float>::max();
-                openvdb::Vec3f sumSurfNormal(0.0f, 0.0f, 0.0f);
-
-                for (int dz = -2; dz <= 2; ++dz) {
-                    for (int dy = -2; dy <= 2; ++dy) {
-                        for (int dx = -2; dx <= 2; ++dx) {
-                            const int svIdx =
-                                surfIdxAcc.getValue(cSurf + openvdb::Coord(dx, dy, dz));
-                            if (svIdx < 0) {
-                                continue;
-                            }
-                            const auto& sv = surfVoxels[static_cast<std::size_t>(svIdx)];
-                            const float dotN = nSdf.dot(sv.surfNormal);
-                            if (dotN < 0.55f) {
-                                continue;
-                            }
-                            const float dSq = (xSurf - sv.surfPos).lengthSqr();
-                            if (dSq > maxProjDistSq) {
-                                continue;
-                            }
-                            const float wDist = 1.0f / (0.15f * fineVoxelSize * fineVoxelSize + dSq);
-                            // Always accumulate `sumInvDist` for both valid and collision-pruned
-                            // surface voxels so the erosion depth tapers inside the safe patch
-                            // boundary and NEVER dilates outward into rejected collision zones.
-                            sumInvDist += wDist;
-                            if (dSq < nearestSurfDistSq) {
-                                nearestSurfDistSq = dSq;
-                                nearestSurfPatchId = sv.patchId;
-                            }
-                            if (sv.patchId >= 0) {
-                                sumWeight += wDist * sv.weight * dotN;
-                                sumSurfNormal += sv.surfNormal * wDist;
+                bool nearValidPatch = false;
+                for (int dz = -2; dz <= 2 && !nearValidPatch; ++dz) {
+                    for (int dy = -2; dy <= 2 && !nearValidPatch; ++dy) {
+                        for (int dx = -2; dx <= 2 && !nearValidPatch; ++dx) {
+                            const int nbIdx =
+                                surfIdxAcc.getValue(sv.ijk + openvdb::Coord(dx, dy, dz));
+                            if (nbIdx >= 0 &&
+                                surfVoxels[static_cast<std::size_t>(nbIdx)].patchId >= 0) {
+                                nearValidPatch = true;
                             }
                         }
                     }
                 }
-
-                // Require the closest projected surface voxel to belong to a valid conformal patch
-                // (`nearestSurfPatchId >= 0`) and lie within 1.20 fine voxels.
-                if (nearestSurfPatchId >= 0 &&
-                    nearestSurfDistSq <= maxNearestSurfDistSq &&
-                    sumInvDist > 1.0e-6f) {
-                    const float avgW = std::clamp(sumWeight / sumInvDist, 0.0f, 1.0f);
-                    const float erodeDepth =
-                        avgW * conformalSkinPatches[static_cast<std::size_t>(nearestSurfPatchId)].skinThicknessMm;
-                    if (erodeDepth > 1.0e-4f) {
-                        erodeAcc.setValue(ijk, erodeDepth);
-                        patchIdAcc.setValue(ijk, nearestSurfPatchId);
-                        const float snLen = sumSurfNormal.length();
-                        if (snLen > 1.0e-5f) {
-                            patchNormAcc.setValue(
-                                ijk,
-                                openvdb::Vec3s(
-                                    sumSurfNormal.x() / snLen,
-                                    sumSurfNormal.y() / snLen,
-                                    sumSurfNormal.z() / snLen));
+                if (!nearValidPatch) {
+                    continue;
+                }
+                for (int dz = -bandRadiusVoxels; dz <= bandRadiusVoxels; ++dz) {
+                    for (int dy = -bandRadiusVoxels; dy <= bandRadiusVoxels; ++dy) {
+                        for (int dx = -bandRadiusVoxels; dx <= bandRadiusVoxels; ++dx) {
+                            const openvdb::Coord nb = sv.ijk + openvdb::Coord(dx, dy, dz);
+                            const int vIdx = nearIdxAcc.getValue(nb);
+                            if (vIdx < 0) {
+                                continue;
+                            }
+                            const openvdb::Vec3d wp = fineSdfGrid.transform().indexToWorld(nb);
+                            const openvdb::Vec3f v(
+                                sv.surfPos.x() - static_cast<float>(wp.x()),
+                                sv.surfPos.y() - static_cast<float>(wp.y()),
+                                sv.surfPos.z() - static_cast<float>(wp.z()));
+                            const float dn = v.dot(sv.surfNormal);
+                            if (dn < -1.0f * fineVoxelSize || dn > maxRejectedDn) {
+                                continue;
+                            }
+                            const float dtSq = std::max(0.0f, v.lengthSqr() - dn * dn);
+                            if (dtSq > maxTangDistSq) {
+                                continue;
+                            }
+                            const float wTang =
+                                1.0f / (0.12f * fineVoxelSize * fineVoxelSize + dtSq);
+                            auto& acc = tangAccum[static_cast<std::size_t>(vIdx)];
+                            acc.sumInvDist += wTang;
+                            if (dtSq < acc.nearestTangDistSq) {
+                                acc.nearestTangDistSq = dtSq;
+                                acc.nearestPatchId = -2;
+                            }
                         }
                     }
+                }
+            }
+
+            for (std::size_t vIdx = 0; vIdx < nearPatchCoords.size(); ++vIdx) {
+                const openvdb::Coord& ijk = nearPatchCoords[vIdx];
+                const float sdfVal = fineSdfAcc.getValue(ijk);
+                const openvdb::Vec3d wp = fineSdfGrid.transform().indexToWorld(ijk);
+
+                float bestErodeDepth = 0.0f;
+                float bestTargetThick = 0.0f;
+                int bestSkinPatchId = -1;
+                int bestCorePatchId = -1;
+                openvdb::Vec3f bestNormal(0.0f, 0.0f, 1.0f);
+
+                openvdb::Vec3f nSdf(0.0f, 0.0f, 1.0f);
+                if (sampleSdfGradUnit(wp, nSdf)) {
+                    const openvdb::Vec3f xSurf(
+                        static_cast<float>(wp.x()) - sdfVal * nSdf.x(),
+                        static_cast<float>(wp.y()) - sdfVal * nSdf.y(),
+                        static_cast<float>(wp.z()) - sdfVal * nSdf.z());
+                    const openvdb::Coord cSurf =
+                        fineSdfGrid.transform().worldToIndexCellCentered(
+                            openvdb::Vec3d(xSurf.x(), xSurf.y(), xSurf.z()));
+
+                    float sumWeight = 0.0f;
+                    float sumCoreWeight = 0.0f;
+                    float sumInvDist = 0.0f;
+                    int nearestSurfPatchId = -1;
+                    float nearestSurfDistSq = std::numeric_limits<float>::max();
+                    openvdb::Vec3f sumSurfNormal(0.0f, 0.0f, 0.0f);
+
+                    for (int dz = -2; dz <= 2; ++dz) {
+                        for (int dy = -2; dy <= 2; ++dy) {
+                            for (int dx = -2; dx <= 2; ++dx) {
+                                const int svIdx =
+                                    surfIdxAcc.getValue(cSurf + openvdb::Coord(dx, dy, dz));
+                                if (svIdx < 0) {
+                                    continue;
+                                }
+                                const auto& sv = surfVoxels[static_cast<std::size_t>(svIdx)];
+                                const float dotN = nSdf.dot(sv.surfNormal);
+                                if (dotN < 0.55f) {
+                                    continue;
+                                }
+                                const float dSq = (xSurf - sv.surfPos).lengthSqr();
+                                if (dSq > maxProjDistSq) {
+                                    continue;
+                                }
+                                const float wDist =
+                                    1.0f / (0.15f * fineVoxelSize * fineVoxelSize + dSq);
+                                sumInvDist += wDist;
+                                if (dSq < nearestSurfDistSq) {
+                                    nearestSurfDistSq = dSq;
+                                    nearestSurfPatchId = sv.patchId;
+                                }
+                                if (sv.patchId >= 0) {
+                                    sumWeight += wDist * sv.weight * dotN;
+                                    sumCoreWeight +=
+                                        wDist * coreWeights[static_cast<std::size_t>(svIdx)];
+                                    sumSurfNormal += sv.surfNormal * wDist;
+                                }
+                            }
+                        }
+                    }
+
+                    if (nearestSurfPatchId >= 0 &&
+                        nearestSurfDistSq <= maxNearestSurfDistSq &&
+                        sumInvDist > 1.0e-6f) {
+                        const float patchThick =
+                            conformalSkinPatches[static_cast<std::size_t>(nearestSurfPatchId)]
+                                .skinThicknessMm;
+                        const float avgW = std::clamp(sumWeight / sumInvDist, 0.0f, 1.0f);
+                        const float avgCoreW = std::clamp(sumCoreWeight / sumInvDist, 0.0f, 1.0f);
+                        const float tEff = avgW * patchThick;
+                        const float coreTEff = avgCoreW * patchThick;
+                        if (tEff > 1.0e-4f) {
+                            bestTargetThick = tEff;
+                            bestSkinPatchId = nearestSurfPatchId;
+                            const float snLen = sumSurfNormal.length();
+                            if (snLen > 1.0e-5f) {
+                                bestNormal = sumSurfNormal / snLen;
+                            }
+                        }
+                        if (coreTEff > 1.0e-4f) {
+                            bestErodeDepth = coreTEff;
+                            bestCorePatchId = nearestSurfPatchId;
+                        }
+                    }
+                }
+
+                // Combine with tangential `sv.surfNormal` projection for `skinErodeDepthGrid` so
+                // top-side 90-degree edges (where `nSdf` rotates toward the vertical side wall)
+                // are eroded cleanly to `tEff - dn` inside the conformal skin slab without pulling
+                // `skinTargetThicknessGrid` down vertical side walls or eroding below the slab.
+                const auto& acc = tangAccum[vIdx];
+                if (acc.nearestPatchId >= 0 &&
+                    acc.nearestTangDistSq <= maxTangDistSq &&
+                    acc.sumInvDist > 1.0e-6f) {
+                    const float tangAvgW = std::clamp(acc.sumWeight / acc.sumInvDist, 0.0f, 1.0f);
+                    const float tangDn = acc.sumDn / acc.sumInvDist;
+                    const float tangTEff =
+                        tangAvgW *
+                        conformalSkinPatches[static_cast<std::size_t>(acc.nearestPatchId)]
+                            .skinThicknessMm;
+                    const float tangErode = std::max(0.0f, (tangTEff - tangDn) - sdfVal);
+                    if (tangDn <= tangTEff + 0.35f * fineVoxelSize) {
+                        if (tangErode > bestErodeDepth) {
+                            bestErodeDepth = tangErode;
+                            bestCorePatchId = acc.nearestPatchId;
+                        }
+                    } else {
+                        // Below the conformal skin ceiling (`tangDn > tangTEff`), cap `bestErodeDepth`
+                        // at `tangErode` so side walls below the skin slab are never falsely eroded.
+                        bestErodeDepth = std::min(bestErodeDepth, tangErode);
+                    }
+                }
+
+                if (bestCorePatchId >= 0 && bestErodeDepth > 1.0e-4f) {
+                    erodeAcc.setValue(ijk, bestErodeDepth);
+                    corePatchIdAcc.setValue(ijk, bestCorePatchId);
+                }
+                if (bestSkinPatchId >= 0 && bestTargetThick > 1.0e-4f) {
+                    targetThickAcc.setValue(ijk, bestTargetThick);
+                    patchIdAcc.setValue(ijk, bestSkinPatchId);
+                    patchNormAcc.setValue(
+                        ijk,
+                        openvdb::Vec3s(bestNormal.x(), bestNormal.y(), bestNormal.z()));
                 }
             }
         }
@@ -5581,7 +5842,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             auto skinErodeAcc = skinErodeDepthGrid.getConstAccessor();
             openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
                 skinErodeSampler(skinErodeAcc, skinErodeDepthGrid.transform());
-            auto skinPatchIdAcc = skinPatchIdGrid.getConstAccessor();
+            auto skinPatchIdAcc = skinCorePatchIdGrid.getConstAccessor();
 
             const float fineInnerCutoff =
                 -std::max(rec.fineShellInnerDepthMm - 1.75f * fineVoxelSize, 1.5f * fineVoxelSize);
@@ -6087,10 +6348,8 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
 
                     computeMeshNormals(verts, inds);
 
-                    std::vector<float> vertSdf(verts.size(), 0.0f);
                     bool anyErodedByConformalSkin = false;
-                    for (std::size_t i = 0; i < verts.size(); ++i) {
-                        const openvdb::Vec3d wp(verts[i].x, verts[i].y, verts[i].z);
+                    auto sampleErodedCoreSdf = [&](const openvdb::Vec3d& wp) -> float {
                         float s = sampleCompositeSdf(wp);
                         if (!conformalSkinPatches.empty() &&
                             s > -(maxConformalSkinDepthMm + 2.5f * fineVoxelSize) &&
@@ -6117,14 +6376,20 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                     // Erode core layers beneath the conformal skin patch, while leaving
                                     // taller protrusion layers above `patch.tauCompletion` un-eroded.
                                     if (pl.isovalue >= patch.tauMin - patch.skinThicknessMm - 2.0f * hTop &&
-                                        pl.isovalue <= patch.tauCompletion + 1.5f * hTop) {
+                                        pl.isovalue <= patch.tauCompletion + 2.5f * hTop) {
                                         s += erodeDepth;
                                         anyErodedByConformalSkin = true;
                                     }
                                 }
                             }
                         }
-                        vertSdf[i] = s;
+                        return s;
+                    };
+
+                    std::vector<float> vertSdf(verts.size(), 0.0f);
+                    for (std::size_t i = 0; i < verts.size(); ++i) {
+                        const openvdb::Vec3d wp(verts[i].x, verts[i].y, verts[i].z);
+                        vertSdf[i] = sampleErodedCoreSdf(wp);
                     }
 
                     // Conformal Thin-Wall Valley Edge Split:
@@ -6166,7 +6431,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                 verts[lo].x + 0.50f * edx,
                                 verts[lo].y + 0.50f * edy,
                                 verts[lo].z + 0.50f * edz);
-                            const float sMid = sampleCompositeSdf(wpMid);
+                            const float sMid = sampleErodedCoreSdf(wpMid);
                             float bestT = 0.50f;
                             float bestSdf = std::min(minEndpointSdf, sMid);
 
@@ -6178,7 +6443,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                         verts[lo].x + tCand * edx,
                                         verts[lo].y + tCand * edy,
                                         verts[lo].z + tCand * edz);
-                                    const float sCand = sampleCompositeSdf(wpCand);
+                                    const float sCand = sampleErodedCoreSdf(wpCand);
                                     if (sCand < bestSdf) {
                                         bestSdf = sCand;
                                         bestT = tCand;
@@ -6691,11 +6956,11 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     openvdb::FloatGrid::ConstAccessor,
                     openvdb::tools::BoxSampler>
                     fineSdfSampler(fineSdfAcc, fineSdfGrid.transform());
-                auto skinErodeAcc = skinErodeDepthGrid.getConstAccessor();
+                auto skinErodeAcc = skinTargetThicknessGrid.getConstAccessor();
                 openvdb::tools::GridSampler<
                     openvdb::FloatGrid::ConstAccessor,
                     openvdb::tools::BoxSampler>
-                    skinErodeSampler(skinErodeAcc, skinErodeDepthGrid.transform());
+                    skinErodeSampler(skinErodeAcc, skinTargetThicknessGrid.transform());
                 auto skinPatchIdAcc = skinPatchIdGrid.getConstAccessor();
                 auto skinPatchNormAcc = skinPatchNormalGrid.getConstAccessor();
                 openvdb::tools::GridSampler<
@@ -6805,7 +7070,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                 pNorm = patch.meanNormal;
                             }
                             const float alignFactor =
-                                std::clamp((nSdf.dot(pNorm) - 0.50f) / 0.25f, 0.0f, 1.0f);
+                                std::clamp((nSdf.dot(pNorm) - 0.65f) / 0.20f, 0.0f, 1.0f);
                             const float effErode = skinErodeSampler.wsSample(wp) * alignFactor;
                             clipDist[i] = requiredErodeMm - effErode;
                         } else {

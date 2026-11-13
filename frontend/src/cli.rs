@@ -3452,4 +3452,129 @@ mod tests {
             "Expected planned extruding toolpaths to remain within 0.75 mm of raw toolpath vertices (no upward heightmap displacement), got {max_planned_vs_raw_dist:.3} mm"
         );
     }
+
+    #[test]
+    fn test_voron_cube_conformal_skin() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path_3mf = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Test Objects/voron-cube.3mf");
+        if !path_3mf.exists() {
+            return;
+        }
+
+        let report = load_files_into_backend(&[path_3mf]);
+        let config = report.restored_config.unwrap();
+        let obj = &report.objects[0];
+        assert!(!config.eikonal.surface_hints.is_empty());
+        for sh in &config.eikonal.surface_hints {
+            assert_eq!(
+                sh.object_id, obj.object_id,
+                "restored surface hint object_id should be remapped to runtime obj.object_id"
+            );
+        }
+        sync_config_to_backend(&config);
+
+        let mut ffi_hints = Vec::new();
+        for sh in &config.eikonal.surface_hints {
+            if let Some(patch) = obj.surface_patches.get(sh.patch_id as usize) {
+                let sample_count = patch.sample_points.len().max(1) as f32;
+                let sample_spacing = (patch.area / sample_count).sqrt();
+                let effective_radius = sh.influence_depth_mm.max(sample_spacing * 1.35);
+                for &(pos, normal) in &patch.sample_points {
+                    ffi_hints.push(ffi::SpatialOrientationHint {
+                        kind: 2u8,
+                        position_bed: [pos.x, pos.y, pos.z],
+                        direction_bed: [normal.x, normal.y, normal.z],
+                        influence_radius_mm: effective_radius,
+                        weight: sh.weight,
+                        apply_on_surface_only: true,
+                        skin_layer_count: sh.skin_layer_count,
+                    });
+                }
+            }
+        }
+        ffi::set_spatial_orientation_hints(&ffi_hints);
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            config.eikonal.voxel_size_mm,
+            config.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        let verify_mode = |label: &str| {
+            let iso = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+            let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+            assert_eq!(iso.layers.len(), tp.layers.len());
+
+            let mut core_tp_above_2949 = 0usize;
+            let mut top_skin_layers = 0usize;
+
+            for (i, l) in iso.layers.iter().enumerate() {
+                let is_skin = (l.max_thickness_mm - l.min_thickness_mm).abs() <= 1.0e-4
+                    && l.is_top_layer
+                    && !l.is_first_layer;
+                let mut min_z = f32::MAX;
+                let mut max_z = f32::MIN;
+                for v in &l.vertices {
+                    min_z = min_z.min(v.z);
+                    max_z = max_z.max(v.z);
+                }
+                let mut tp_pts = 0usize;
+                let mut tp_above = 0usize;
+                let mut tp_max_z = f32::MIN;
+                for p in &tp.layers[i].paths {
+                    tp_pts += p.points.len();
+                    for pt in &p.points {
+                        tp_max_z = tp_max_z.max(pt.z);
+                        if pt.z > 29.49 {
+                            tp_above += 1;
+                        }
+                    }
+                }
+                if !is_skin {
+                    core_tp_above_2949 += tp_above;
+                } else if max_z > 29.5 {
+                    top_skin_layers += 1;
+                    println!(
+                        "  [{label}] Top Skin Layer #{i}: b_idx={}/{}, z=[{:.2}, {:.2}], verts={}, paths={}, pts={}",
+                        l.branch_layer_index,
+                        l.branch_layer_count,
+                        min_z,
+                        max_z,
+                        l.vertices.len(),
+                        tp.layers[i].paths.len(),
+                        tp_pts
+                    );
+                    assert!(
+                        l.vertices.len() >= 9000,
+                        "[{label}] expected full top conformal skin mesh on layer #{i}, got {} verts",
+                        l.vertices.len()
+                    );
+                    assert!(
+                        tp.layers[i].paths.len() >= 15 && tp_pts >= 2500,
+                        "[{label}] expected full top conformal skin toolpaths on layer #{i}, got {} paths ({} pts)",
+                        tp.layers[i].paths.len(),
+                        tp_pts
+                    );
+                }
+            }
+
+            assert_eq!(
+                core_tp_above_2949, 0,
+                "[{label}] standard core layers should be eroded beneath the top conformal skin (found {core_tp_above_2949} core toolpath points > 29.49 mm)"
+            );
+            assert_eq!(
+                top_skin_layers, 3,
+                "[{label}] expected 3 top conformal skin layers on voron-cube.3mf, got {top_skin_layers}"
+            );
+        };
+
+        verify_mode("WITH HINT");
+
+        // Now test WITHOUT the manual hint (only automatic top surface conformal skin)
+        ffi::set_spatial_orientation_hints(&[]);
+        verify_mode("AUTO ONLY");
+    }
 }

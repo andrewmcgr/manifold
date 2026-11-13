@@ -3080,7 +3080,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 }
 
                 // Normalize vertex SDF relative to the outer boundary contour so \phi_sdf = 0 on \Gamma_outer
-                const float sdfZeroShift = std::isfinite(maxBoundarySdf)
+                const float sdfZeroShift = (!isConformalSkinLayer && std::isfinite(maxBoundarySdf))
                     ? std::clamp(maxBoundarySdf, 0.0f, 0.45f * coarseVoxelSize)
                     : 0.0f;
                 for (auto& v : baseMesh.verts) {
@@ -3091,13 +3091,13 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                 }
 
-                // If part of this core layer's boundary was eroded deep inside the part by a conformal
-                // surface skin patch (`minBoundarySdf < -0.35 * shellThicknessMm`), measure on-surface
+                // If part of this core layer's boundary was eroded inside the part by a conformal
+                // surface skin patch (`minBoundarySdf < -0.50 * hMin`), measure on-surface
                 // distance from the clipped boundary so `shellMesh` retains a continuous perimeter band.
                 std::vector<float> dFromClipBoundary;
                 if (!isConformalSkinLayer &&
                     std::isfinite(minBoundarySdf) &&
-                    minBoundarySdf < -0.35f * shellThicknessMm) {
+                    minBoundarySdf < -0.50f * hMin) {
                     dFromClipBoundary = computeOnSurfaceBoundaryDistance(
                         baseMesh,
                         shellThicknessMm + 0.5f * outerW.target_mm);
@@ -4727,7 +4727,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 auto sampleShiftedSdfForShell = [&](const Vec3f& p) -> float {
                     return sampleSdf(p) - sdfZeroShift;
                 };
-                const float maxSolidInfillSdf = -(0.5f * outerW.min_mm);
+                const float maxSolidInfillSdf = isConformalSkinLayer
+                    ? (-0.04f * meanLayerH)
+                    : -(0.5f * outerW.min_mm);
 
                 std::vector<float> negDRem(nV, 0.0f);
                 std::vector<float> remOneSidedSpan(nV, 0.0f);
@@ -5064,7 +5066,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // ------------------------------------------------------------
                 // 7. Non-Planar Sparse Infill on Interior Core (\phi_sdf <= -effectiveShellDepth)
                 // ------------------------------------------------------------
-                if (sparseDensity > 1.0e-4f) {
+                if (sparseDensity > 1.0e-4f && !isConformalSkinLayer) {
                     generateSparseInfillForLayer(
                         baseMesh,
                         sdfDepth,
