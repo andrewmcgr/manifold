@@ -739,9 +739,14 @@ fn render_layer_and_move_scrub_controls(
                 } else {
                     String::new()
                 };
+                let norm_source = if pose.uses_surface_normal {
+                    "SurfNorm"
+                } else {
+                    "IsoNorm"
+                };
                 ui.small(
                     egui::RichText::new(format!(
-                        "L#{} M{}/{} [{}] T{} | Pos=({:+.1},{:+.1},{:+.1}) | B={:+.1}° C={:+.1}° | g_bed=({:+.2},{:+.2},{:+.2}){}",
+                        "L#{} M{}/{} [{}] T{} | Pos=({:+.1},{:+.1},{:+.1}) | B={:+.1}° C={:+.1}° | θ_iso={:.1}° ({}) | g_bed=({:+.2},{:+.2},{:+.2}){}",
                         pose.layer_index,
                         pose.move_index,
                         pose.total_layer_moves,
@@ -752,6 +757,8 @@ fn render_layer_and_move_scrub_controls(
                         pose.tip_bed.z,
                         pose.b_deg,
                         pose.c_deg,
+                        pose.tool_iso_angle_deg,
+                        norm_source,
                         pose.gravity_bed.x,
                         pose.gravity_bed.y,
                         pose.gravity_bed.z,
@@ -787,6 +794,21 @@ fn render_toolpath_color_legend(
                 ("Gap Fill", [0.98, 0.32, 0.88, 1.0]),
                 ("Scarf Seam", [0.76, 0.44, 0.98, 1.0]),
                 ("Wipe", [0.68, 0.76, 0.86, 1.0]),
+                ("Travel", [0.28, 0.86, 0.98, 1.0]),
+                ("Z-Hop", [0.98, 0.92, 0.22, 1.0]),
+            ],
+        );
+        return;
+    }
+
+    if vis_state.toolpath_color_mode == ToolpathColorMode::BySurfaceNormalUsage {
+        draw_categorical_swatch_legend(
+            ui,
+            "Tool Orientation Source",
+            &[
+                ("Object Surface Normal", [0.14, 0.92, 0.46, 1.0]),
+                ("Isosurface Normal (Outer Fallback)", [0.98, 0.62, 0.16, 1.0]),
+                ("Isosurface Normal (Interior / Other)", [0.24, 0.52, 0.92, 1.0]),
                 ("Travel", [0.28, 0.86, 0.98, 1.0]),
                 ("Z-Hop", [0.98, 0.92, 0.22, 1.0]),
             ],
@@ -852,7 +874,18 @@ fn render_toolpath_color_legend(
                 "mm³/s eq",
                 2,
             ),
-            ToolpathColorMode::ByFeatureType => unreachable!(),
+            ToolpathColorMode::ByToolIsoNormalAngle => (
+                "Tool vs. Isosurface Normal Angle",
+                planned.min_tool_iso_angle_deg,
+                planned
+                    .max_tool_iso_angle_deg
+                    .max(planned.min_tool_iso_angle_deg + 5.0),
+                "°",
+                1,
+            ),
+            ToolpathColorMode::ByFeatureType | ToolpathColorMode::BySurfaceNormalUsage => {
+                unreachable!()
+            }
         };
         draw_continuous_gradient_legend(
             ui,
@@ -861,6 +894,21 @@ fn render_toolpath_color_legend(
             max_v,
             unit,
             decimals,
+            high_contrast_parameter_ramp,
+        );
+    } else if vis_state.toolpath_color_mode == ToolpathColorMode::ByToolIsoNormalAngle {
+        let max_angle_deg = config
+            .active_tool()
+            .map(|t| t.max_angle_from_bed_normal_deg)
+            .unwrap_or(45.0)
+            .max(15.0);
+        draw_continuous_gradient_legend(
+            ui,
+            "Tool vs. Isosurface Normal Angle",
+            0.0,
+            max_angle_deg,
+            "°",
+            1,
             high_contrast_parameter_ramp,
         );
     } else {
@@ -4095,6 +4143,45 @@ fn render_tool_config_tab(
             }
         }
 
+        if config.active_tool().is_some_and(|t| t.has_rotational_axes) {
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(
+                        &mut config.slicing.orient_outer_surfaces_to_normal,
+                        "Orient Outer Surfaces Almost Parallel to Surface Normal",
+                    )
+                    .on_hover_text(
+                        "On outer surfaces, if the tool can be oriented within the 'Almost Parallel' angle of the outward surface normal (subject to tool tilt & bed clearance limits), orient to that; else use the isosurface normal.",
+                    )
+                    .changed()
+                {
+                    dirty_backend = true;
+                }
+                param_help_button(ui, "slicing.orient_outer_surfaces_to_normal");
+            });
+            if config.slicing.orient_outer_surfaces_to_normal {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut config.slicing.outer_surface_parallel_angle_deg,
+                                0.0..=85.0,
+                            )
+                            .suffix("°")
+                            .text("Almost Parallel Angle Threshold"),
+                        )
+                        .on_hover_text(
+                            "Maximum residual angle between the reachable clamped tool axis and the outward surface normal before falling back to the isosurface normal.",
+                        )
+                        .changed()
+                    {
+                        dirty_backend = true;
+                    }
+                    param_help_button(ui, "slicing.outer_surface_parallel_angle_deg");
+                });
+            }
+        }
+
         ui.horizontal(|ui| {
             dirty_gcode |= ui
                 .checkbox(
@@ -5363,6 +5450,37 @@ fn render_process_config_tab(
         });
 
         ui.horizontal(|ui| {
+            tp_cfg_changed |= ui
+                .checkbox(
+                    &mut config.slicing.orient_outer_surfaces_to_normal,
+                    "Orient Tool to Outer Surface Normal (else Isosurface Normal)",
+                )
+                .on_hover_text(
+                    "On multi-axis tools, if the tool can be oriented within the 'Almost Parallel' angle of the outward surface normal on outer surfaces, do that; else use the isosurface normal.",
+                )
+                .changed();
+            param_help_button(ui, "slicing.orient_outer_surfaces_to_normal");
+        });
+        if config.slicing.orient_outer_surfaces_to_normal {
+            ui.horizontal(|ui| {
+                tp_cfg_changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut config.slicing.outer_surface_parallel_angle_deg,
+                            0.0..=85.0,
+                        )
+                        .suffix("°")
+                        .text("Almost Parallel Angle Threshold"),
+                    )
+                    .on_hover_text(
+                        "Maximum angle between the reachable clamped tool axis and the outward surface normal considered 'almost parallel'; surfaces steeper than this fall back to the isosurface normal.",
+                    )
+                    .changed();
+                param_help_button(ui, "slicing.outer_surface_parallel_angle_deg");
+            });
+        }
+
+        ui.horizontal(|ui| {
             ui.label("Wall Order:");
             egui::ComboBox::from_id_source("process_wall_order_combo")
                 .selected_text(config.gcode.wall_print_order.label())
@@ -5495,6 +5613,7 @@ fn render_process_config_tab(
                 sync_config_to_backend(config);
             }
             vis_state.dirty_toolpaths = true;
+            vis_state.dirty_surface_colors = true;
         }
         if gc_changed {
             config.gcode.sanitize();
@@ -6861,6 +6980,8 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         max_bridge_length_mm: config.slicing.max_bridge_length_mm,
         wave_overhang_overlap_fraction: config.slicing.wave_overhang_overlap_fraction,
         one_perimeter_on_conformal_patches: config.slicing.one_perimeter_on_conformal_patches,
+        orient_outer_surfaces_to_normal: config.slicing.orient_outer_surfaces_to_normal,
+        outer_surface_parallel_angle_deg: config.slicing.outer_surface_parallel_angle_deg,
     });
 
     ffi::set_order_field_mode(config.eikonal.order_field_mode.as_u8());

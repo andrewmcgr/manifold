@@ -673,6 +673,8 @@ impl<'a> LayerSegmentBuilder<'a> {
                 melt_pressure_mm3s: 0.0,
                 retract_before_mm: retract_mm,
                 unretract_after_mm: 0.0,
+                tool_iso_angle_deg: 0.0,
+                uses_surface_normal: false,
             });
 
             let mid_len = (p_above - p_lift).length().max(1.0e-4);
@@ -708,6 +710,8 @@ impl<'a> LayerSegmentBuilder<'a> {
                 melt_pressure_mm3s: 0.0,
                 retract_before_mm: 0.0,
                 unretract_after_mm: 0.0,
+                tool_iso_angle_deg: 0.0,
+                uses_surface_normal: false,
             });
 
             self.segments.push(PlannedSegment {
@@ -742,6 +746,8 @@ impl<'a> LayerSegmentBuilder<'a> {
                 melt_pressure_mm3s: 0.0,
                 retract_before_mm: 0.0,
                 unretract_after_mm: retract_mm,
+                tool_iso_angle_deg: 0.0,
+                uses_surface_normal: false,
             });
         } else {
             let p_prev_scene = prev_bed - self.basis.scene_to_gcode_offset;
@@ -778,6 +784,8 @@ impl<'a> LayerSegmentBuilder<'a> {
                 melt_pressure_mm3s: 0.0,
                 retract_before_mm: retract_mm,
                 unretract_after_mm: retract_mm,
+                tool_iso_angle_deg: 0.0,
+                uses_surface_normal: false,
             });
         }
         self.curr_pos_bed = Some(target_bed);
@@ -871,6 +879,8 @@ impl<'a> LayerSegmentBuilder<'a> {
             },
             retract_before_mm: 0.0,
             unretract_after_mm: 0.0,
+            tool_iso_angle_deg: 0.0,
+            uses_surface_normal: false,
         });
         self.curr_pos_bed = Some(p1_bed);
     }
@@ -1519,6 +1529,8 @@ fn finalize_calibration_gcode_result(
         max_width_mm: max_w,
         min_height_mm: min_h,
         max_height_mm: max_h,
+        min_tool_iso_angle_deg: 0.0,
+        max_tool_iso_angle_deg: 0.0,
     }
 }
 

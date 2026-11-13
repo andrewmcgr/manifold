@@ -164,6 +164,7 @@ struct SurfaceVertex {
     float layerHeightMm = 0.20f;
     float dRem = 0.0f;
     float remSpan = 0.0f;
+    float surfaceNormalWeight = 0.0f;
     bool onOuterBoundary = false;
     bool onInnerShellBoundary = false;
 };
@@ -182,6 +183,7 @@ SurfaceVertex lerpSurfaceVertex(const SurfaceVertex& a, const SurfaceVertex& b, 
     out.layerHeightMm = a.layerHeightMm + t * (b.layerHeightMm - a.layerHeightMm);
     out.dRem = a.dRem + t * (b.dRem - a.dRem);
     out.remSpan = a.remSpan + t * (b.remSpan - a.remSpan);
+    out.surfaceNormalWeight = a.surfaceNormalWeight + t * (b.surfaceNormalWeight - a.surfaceNormalWeight);
     out.onOuterBoundary = false;
     out.onInnerShellBoundary = a.onInnerShellBoundary && b.onInnerShellBoundary;
     return out;
@@ -640,6 +642,8 @@ struct RawChainPoint {
     Vec3f nozzleAxis{};
     float widthMm = 0.40f;
     float heightMm = 0.20f;
+    Vec3f isoNormal{};
+    bool usesSurfaceNormal = false;
 };
 
 struct RawChain {
@@ -663,10 +667,24 @@ std::vector<RawChain> stitchSegmentsIntoChains(
     std::vector<bool> used(nSegs, false);
 
     auto makePtA = [](const Segment3D& s) -> RawChainPoint {
-        return {s.a.pos, s.a.nozzleAxis, s.widthA, s.a.layerHeightMm};
+        return {
+            s.a.pos,
+            s.a.nozzleAxis,
+            s.widthA,
+            s.a.layerHeightMm,
+            s.a.normal,
+            s.a.surfaceNormalWeight >= 0.5f,
+        };
     };
     auto makePtB = [](const Segment3D& s) -> RawChainPoint {
-        return {s.b.pos, s.b.nozzleAxis, s.widthB, s.b.layerHeightMm};
+        return {
+            s.b.pos,
+            s.b.nozzleAxis,
+            s.widthB,
+            s.b.layerHeightMm,
+            s.b.normal,
+            s.b.surfaceNormalWeight >= 0.5f,
+        };
     };
 
     const float cellSize = std::max(snapToleranceMm * 1.05f, 1.0e-3f);
@@ -755,6 +773,11 @@ std::vector<RawChain> stitchSegmentsIntoChains(
             chain.back().nozzleAxis = normalize3(
                 chain.back().nozzleAxis + nextStart.nozzleAxis,
                 chain.back().nozzleAxis);
+            chain.back().isoNormal = normalize3(
+                chain.back().isoNormal + nextStart.isoNormal,
+                chain.back().isoNormal);
+            chain.back().usesSurfaceNormal =
+                chain.back().usesSurfaceNormal || nextStart.usesSurfaceNormal;
 
             if (dist3(chain.back().pos, nextEnd.pos) > 1.0e-5f) {
                 chain.push_back(nextEnd);
@@ -782,6 +805,11 @@ std::vector<RawChain> stitchSegmentsIntoChains(
             attachPt.nozzleAxis = normalize3(
                 attachPt.nozzleAxis + prevEnd.nozzleAxis,
                 attachPt.nozzleAxis);
+            attachPt.isoNormal = normalize3(
+                attachPt.isoNormal + prevEnd.isoNormal,
+                attachPt.isoNormal);
+            attachPt.usesSurfaceNormal =
+                attachPt.usesSurfaceNormal || prevEnd.usesSurfaceNormal;
 
             if (dist3(prevStart.pos, attachPt.pos) > 1.0e-5f) {
                 revPrefix.push_back(prevStart);
@@ -973,6 +1001,11 @@ bool finalizeExtrusionPath(
 
     auto toToolpathPoint = [](const RawChainPoint& pt) -> ToolpathPoint {
         const Vec3f zNozzle = normalize3(pt.nozzleAxis, {0.0f, 0.0f, 1.0f});
+        Vec3f nIso = normalize3(pt.isoNormal, zNozzle);
+        if (dot3(nIso, zNozzle) < 0.0f) {
+            nIso = nIso * -1.0f;
+        }
+        const float cosIso = std::clamp(dot3(zNozzle, nIso), -1.0f, 1.0f);
         ToolpathPoint tp{};
         tp.x = pt.pos.x;
         tp.y = pt.pos.y;
@@ -982,6 +1015,8 @@ bool finalizeExtrusionPath(
         tp.nz = zNozzle.z;
         tp.width_mm = pt.widthMm;
         tp.height_mm = pt.heightMm;
+        tp.tool_iso_angle_deg = std::acos(cosIso) * (180.0f / 3.14159265358979323846f);
+        tp.uses_surface_normal = pt.usesSurfaceNormal;
         return tp;
     };
 
@@ -997,7 +1032,9 @@ bool finalizeExtrusionPath(
         bool keep = (spanLen > maxMergedSegLen) ||
             (std::abs(curr.widthMm - lastKept.widthMm) > 0.015f) ||
             (std::abs(curr.heightMm - lastKept.heightMm) > 0.010f) ||
-            (dot3(curr.nozzleAxis, lastKept.nozzleAxis) < 0.9994f);
+            (dot3(curr.nozzleAxis, lastKept.nozzleAxis) < 0.9994f) ||
+            (dot3(curr.isoNormal, lastKept.isoNormal) < 0.9980f) ||
+            (curr.usesSurfaceNormal != lastKept.usesSurfaceNormal);
 
         if (!keep && spanLen > 1.0e-5f) {
             const Vec3f chordDir = (next.pos - lastKept.pos) * (1.0f / spanLen);
@@ -1043,6 +1080,8 @@ std::vector<RawChain> reclipAndRefineChainToSdf(
         p.nozzleAxis = normalize3(lerp3(a.nozzleAxis, b.nozzleAxis, t), a.nozzleAxis);
         p.widthMm = a.widthMm + t * (b.widthMm - a.widthMm);
         p.heightMm = a.heightMm + t * (b.heightMm - a.heightMm);
+        p.isoNormal = normalize3(lerp3(a.isoNormal, b.isoNormal, t), a.isoNormal);
+        p.usesSurfaceNormal = (t < 0.5f) ? a.usesSurfaceNormal : b.usesSurfaceNormal;
         return p;
     };
 
@@ -2250,7 +2289,7 @@ void generateSparseInfillForLayer(
 
     // Sample 5/6-axis nozzle orientation and local layer height on the sparse interior vertices
     for (auto& sv : sparseMesh.verts) {
-        sv.nozzleAxis = sampleNozzleAxis(sv.pos);
+        sv.nozzleAxis = sampleNozzleAxis(sv.pos, sv.normal);
         sv.sdf = sampleShiftedSdf(sv.pos);
         sv.layerHeightMm = sampleLocalLayerHeight(sv.pos);
     }
@@ -2461,7 +2500,7 @@ void generateSparseInfillForLayer(
                 sampleShiftedSdf);
             for (auto& sv : tpmsMesh.verts) {
                 if (lengthSq3(sv.nozzleAxis) <= 1.0e-4f) {
-                    sv.nozzleAxis = sampleNozzleAxis(sv.pos);
+                    sv.nozzleAxis = sampleNozzleAxis(sv.pos, sv.normal);
                 }
                 sv.layerHeightMm = sampleLocalLayerHeight(sv.pos);
             }
@@ -2709,7 +2748,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     float fineShellDepthMm,
     const openvdb::FloatGrid* overhangGrid,
     const openvdb::FloatGrid* coarseOverhangGrid,
-    const std::array<float, 3>& defaultGravityDirectionBed)
+    const std::array<float, 3>& defaultGravityDirectionBed,
+    const ToolSpec* activeTool,
+    float objectMinAxialBed)
 {
     ObjectToolpathsResult result{};
     result.valid = false;
@@ -2728,6 +2769,19 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
     const float shellThicknessMm = std::max(0.05f, spec.shell_thickness_mm);
     const std::uint32_t numInnerWalls = spec.inner_wall_count;
     const bool onePerimeterOnConformalPatches = spec.one_perimeter_on_conformal_patches;
+    const bool orientOuterSurfacesToNormal = spec.orient_outer_surfaces_to_normal;
+    const float outerSurfaceParallelAngleDeg = std::isfinite(spec.outer_surface_parallel_angle_deg)
+        ? std::clamp(spec.outer_surface_parallel_angle_deg, 0.0f, 85.0f)
+        : 15.0f;
+    const float outerSurfaceParallelAngleRad =
+        outerSurfaceParallelAngleDeg * (3.14159265358979323846f / 180.0f);
+    const bool toolHasRotationalAxes =
+        (activeTool != nullptr) && activeTool->has_rotational_axes &&
+        (activeTool->max_angle_from_bed_normal_deg > 1.0e-5f);
+    const float maxToolTiltRad = (activeTool != nullptr)
+        ? (std::clamp(activeTool->max_angle_from_bed_normal_deg, 0.0f, 89.0f) *
+           (3.14159265358979323846f / 180.0f))
+        : 0.0f;
     const SanitizedLineWidth outerW = sanitizeLineWidth(spec.outer_wall_width);
     const SanitizedLineWidth innerW = sanitizeLineWidth(spec.inner_wall_width);
     const SanitizedLineWidth infillW = sanitizeLineWidth(spec.solid_infill_width);
@@ -2885,6 +2939,165 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 return fallbackNozzle;
             };
 
+            auto computeBedSafeMaxTiltRad = [&](const Vec3f& p) -> float {
+                if (!toolHasRotationalAxes || activeTool == nullptr) {
+                    return 0.0f;
+                }
+                constexpr float kPi = 3.14159265358979323846f;
+                constexpr float kDegToRad = kPi / 180.0f;
+                const float hBedMm = std::max(0.0f, dot3(p, fallbackNozzle) - objectMinAxialBed);
+                float gammaMax = maxToolTiltRad;
+                if (activeTool->clearance_mode == 1) {
+                    const float thetaRad =
+                        std::clamp(activeTool->cone_half_angle_deg, 5.0f, 80.0f) * kDegToRad;
+                    const float alphaRad = std::max(0.0f, 0.5f * kPi - thetaRad);
+                    if (hBedMm < 2.0f) {
+                        const float t = std::clamp(hBedMm / 2.0f, 0.0f, 1.0f);
+                        gammaMax = std::min(gammaMax, alphaRad + (gammaMax - alphaRad) * t);
+                    } else {
+                        gammaMax = std::min(gammaMax, alphaRad);
+                    }
+                    return std::max(0.0f, gammaMax);
+                }
+                if (activeTool->clearance_mode == 2) {
+                    const float thetaDeg = std::max(
+                        std::clamp(activeTool->rect_half_angle_x_deg, 5.0f, 80.0f),
+                        std::clamp(activeTool->rect_half_angle_y_deg, 5.0f, 80.0f));
+                    const float alphaRad = std::max(0.0f, (90.0f - thetaDeg) * kDegToRad);
+                    if (hBedMm < 2.0f) {
+                        const float t = std::clamp(hBedMm / 2.0f, 0.0f, 1.0f);
+                        gammaMax = std::min(gammaMax, alphaRad + (gammaMax - alphaRad) * t);
+                    } else {
+                        gammaMax = std::min(gammaMax, alphaRad);
+                    }
+                    return std::max(0.0f, gammaMax);
+                }
+                for (const auto& pt : activeTool->clearance_profile_xz) {
+                    const float r = pt.x_radius_mm;
+                    const float z = pt.z_height_mm;
+                    if (r <= 1.0e-5f && z <= 1.0e-5f) {
+                        continue;
+                    }
+                    const float rho = std::sqrt(r * r + z * z);
+                    if (hBedMm >= rho) {
+                        continue;
+                    }
+                    const float phi = std::atan2(z, std::max(r, 1.0e-6f));
+                    const float ratio = std::clamp(-hBedMm / rho, -1.0f, 1.0f);
+                    const float allowed = std::max(0.0f, std::asin(ratio) + phi);
+                    gammaMax = std::min(gammaMax, allowed);
+                }
+                return std::max(0.0f, gammaMax);
+            };
+
+            auto clampVecToCone = [](const Vec3f& vUnit,
+                                     const Vec3f& coneAxisUnit,
+                                     float maxAngleRad) -> Vec3f {
+                if (maxAngleRad <= 1.0e-6f) {
+                    return coneAxisUnit;
+                }
+                const float cosTheta = std::clamp(dot3(vUnit, coneAxisUnit), -1.0f, 1.0f);
+                const float theta = std::acos(cosTheta);
+                if (theta <= maxAngleRad) {
+                    return vUnit;
+                }
+                const Vec3f perpRaw = vUnit - (coneAxisUnit * cosTheta);
+                const float perpLen = length3(perpRaw);
+                if (perpLen <= 1.0e-6f) {
+                    return coneAxisUnit;
+                }
+                const Vec3f perpUnit = perpRaw * (1.0f / perpLen);
+                const float c = std::cos(maxAngleRad);
+                const float s = std::sin(maxAngleRad);
+                return normalize3((coneAxisUnit * c) + (perpUnit * s), coneAxisUnit);
+            };
+
+            auto sampleOutwardSdfNormal = [&](const Vec3f& p,
+                                              const Vec3f& nIso,
+                                              bool isConformalSkin) -> Vec3f {
+                const float h = 0.65f * voxelSize;
+                auto rawGradAt = [&](const Vec3f& q) -> Vec3f {
+                    const float gx = sampleSdf({q.x + h, q.y, q.z}) - sampleSdf({q.x - h, q.y, q.z});
+                    const float gy = sampleSdf({q.x, q.y + h, q.z}) - sampleSdf({q.x, q.y - h, q.z});
+                    const float gz = sampleSdf({q.x, q.y, q.z + h}) - sampleSdf({q.x, q.y, q.z - h});
+                    return {gx, gy, gz};
+                };
+                const Vec3f n0 = normalize3(rawGradAt(p), nIso);
+                if (isConformalSkin) {
+                    return n0;
+                }
+                // On non-conformal layers near a sharp top/bottom rim crease (e.g. top edge of a
+                // vertical wall where \nabla\phi_sdf above p points to the roof while \nabla\phi_sdf
+                // below p points to the side wall), prefer the side-wall normal that the layer perimeter
+                // actually bounds rather than the 45-degree corner average.
+                const float stepIso = std::max(0.85f * voxelSize, 0.25f);
+                const Vec3f nUp = normalize3(rawGradAt(p + (nIso * stepIso)), n0);
+                const Vec3f nDown = normalize3(rawGradAt(p - (nIso * stepIso)), n0);
+                if (dot3(nUp, nDown) < 0.866f) { // > 30 deg crease between upper and lower face
+                    const float alignUp = std::abs(dot3(nUp, nIso));
+                    const float alignDown = std::abs(dot3(nDown, nIso));
+                    return (alignDown < alignUp) ? nDown : nUp;
+                }
+                return n0;
+            };
+
+            auto computeIsosurfaceNozzleAxis = [&](const Vec3f& p,
+                                                   const Vec3f& meshIsoNormal,
+                                                   bool isConformalSkin) -> Vec3f {
+                if (!toolHasRotationalAxes) {
+                    return sampleNozzleAxis(p);
+                }
+                Vec3f nIso = normalize3(meshIsoNormal, fallbackNozzle);
+                if (dot3(nIso, fallbackNozzle) < 0.0f) {
+                    nIso = nIso * -1.0f;
+                }
+                const float gammaMax = computeBedSafeMaxTiltRad(p);
+                if (isConformalSkin || orientOuterSurfacesToNormal) {
+                    return clampVecToCone(nIso, fallbackNozzle, gammaMax);
+                }
+                return sampleNozzleAxis(p);
+            };
+
+            auto computeOuterSurfaceNozzleAxis = [&](const Vec3f& p,
+                                                     const Vec3f& meshIsoNormal,
+                                                     bool isConformalSkin,
+                                                     bool* outUsedSurfaceNormal = nullptr) -> Vec3f {
+                if (outUsedSurfaceNormal != nullptr) {
+                    *outUsedSurfaceNormal = false;
+                }
+                if (!toolHasRotationalAxes) {
+                    return sampleNozzleAxis(p);
+                }
+                Vec3f nIso = normalize3(meshIsoNormal, fallbackNozzle);
+                if (dot3(nIso, fallbackNozzle) < 0.0f) {
+                    nIso = nIso * -1.0f;
+                }
+                const float gammaMax = computeBedSafeMaxTiltRad(p);
+                const Vec3f isoAxis = clampVecToCone(nIso, fallbackNozzle, gammaMax);
+
+                if (!orientOuterSurfacesToNormal) {
+                    return isConformalSkin ? isoAxis : sampleNozzleAxis(p);
+                }
+
+                const Vec3f nSurf = sampleOutwardSdfNormal(p, nIso, isConformalSkin);
+                const Vec3f surfAxis = clampVecToCone(nSurf, fallbackNozzle, gammaMax);
+                const float cosErr = std::clamp(dot3(surfAxis, nSurf), -1.0f, 1.0f);
+                const float errRad = std::acos(cosErr);
+
+                if (errRad <= outerSurfaceParallelAngleRad + 1.0e-4f) {
+                    const float probe1 = std::max(1.25f * voxelSize, 0.50f);
+                    const float probe2 = std::max(2.50f * voxelSize, 1.00f);
+                    if (sampleSdf(p + (surfAxis * probe1)) > -0.25f * voxelSize &&
+                        sampleSdf(p + (surfAxis * probe2)) > -0.20f * voxelSize) {
+                        if (outUsedSurfaceNormal != nullptr) {
+                            *outUsedSurfaceNormal = true;
+                        }
+                        return surfAxis;
+                    }
+                }
+                return isoAxis;
+            };
+
             auto sampleEikGradNorm = [&](const Vec3f& p) -> float {
                 const openvdb::Vec3d wp(p.x, p.y, p.z);
                 const bool useCoarse =
@@ -2947,9 +3160,13 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     SurfaceVertex sv{};
                     sv.pos = {rv.x, rv.y, rv.z};
                     sv.normal = normalize3({rv.nx, rv.ny, rv.nz}, fallbackNozzle);
+                    if (dot3(sv.normal, fallbackNozzle) < 0.0f) {
+                        sv.normal = sv.normal * -1.0f;
+                    }
                     sv.nozzleAxis = fallbackNozzle;
                     sv.sdf = sampleSdf(sv.pos);
                     sv.layerHeightMm = meanLayerH;
+                    sv.surfaceNormalWeight = 0.0f;
                     sv.onOuterBoundary = false;
                     sv.onInnerShellBoundary = false;
                     baseMesh.verts.push_back(sv);
@@ -3167,9 +3384,25 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     });
 
                 // Sample 5/6-axis nozzle orientation and local layer height only on the surviving shell vertices
+                std::vector<Vec3f> interiorNozzleAxis(shellMesh.verts.size(), fallbackNozzle);
+                std::vector<Vec3f> outerSurfaceNozzleAxis(shellMesh.verts.size(), fallbackNozzle);
+                std::vector<float> outerSurfaceNormalWeight(shellMesh.verts.size(), 0.0f);
                 if (isUniformThicknessLayer) {
                     for (std::size_t i = 0; i < shellMesh.verts.size(); ++i) {
-                        shellMesh.verts[i].nozzleAxis = sampleNozzleAxis(shellMesh.verts[i].pos);
+                        const Vec3f& pos = shellMesh.verts[i].pos;
+                        const Vec3f& nIso = shellMesh.verts[i].normal;
+                        bool usedSurfNormal = false;
+                        interiorNozzleAxis[i] =
+                            computeIsosurfaceNozzleAxis(pos, nIso, isConformalSkinLayer);
+                        outerSurfaceNozzleAxis[i] =
+                            computeOuterSurfaceNozzleAxis(pos, nIso, isConformalSkinLayer, &usedSurfNormal);
+                        outerSurfaceNormalWeight[i] = usedSurfNormal ? 1.0f : 0.0f;
+                        shellMesh.verts[i].nozzleAxis = isOutermostConformalSkinLayer
+                            ? outerSurfaceNozzleAxis[i]
+                            : interiorNozzleAxis[i];
+                        shellMesh.verts[i].surfaceNormalWeight = isOutermostConformalSkinLayer
+                            ? outerSurfaceNormalWeight[i]
+                            : 0.0f;
                         shellMesh.verts[i].layerHeightMm = meanLayerH;
                     }
                 } else {
@@ -3177,8 +3410,21 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     double sumShellInvGrad = 0.0;
                     std::size_t cntShellGrad = 0;
                     for (std::size_t i = 0; i < shellMesh.verts.size(); ++i) {
-                        shellMesh.verts[i].nozzleAxis = sampleNozzleAxis(shellMesh.verts[i].pos);
-                        const float g = sampleEikGradNorm(shellMesh.verts[i].pos);
+                        const Vec3f& pos = shellMesh.verts[i].pos;
+                        const Vec3f& nIso = shellMesh.verts[i].normal;
+                        bool usedSurfNormal = false;
+                        interiorNozzleAxis[i] =
+                            computeIsosurfaceNozzleAxis(pos, nIso, isConformalSkinLayer);
+                        outerSurfaceNozzleAxis[i] =
+                            computeOuterSurfaceNozzleAxis(pos, nIso, isConformalSkinLayer, &usedSurfNormal);
+                        outerSurfaceNormalWeight[i] = usedSurfNormal ? 1.0f : 0.0f;
+                        shellMesh.verts[i].nozzleAxis = isOutermostConformalSkinLayer
+                            ? outerSurfaceNozzleAxis[i]
+                            : interiorNozzleAxis[i];
+                        shellMesh.verts[i].surfaceNormalWeight = isOutermostConformalSkinLayer
+                            ? outerSurfaceNormalWeight[i]
+                            : 0.0f;
+                        const float g = sampleEikGradNorm(pos);
                         shellGrads[i] = g;
                         if (g > 0.20f && g < 4.0f) {
                             sumShellInvGrad += 1.0 / static_cast<double>(g);
@@ -4315,8 +4561,11 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                     }
 
                                     // Alternate scan direction on odd lines for continuous back-and-forth bridging
+                                    Vec3f nIsoStart = normalize3(ch.pts.front().isoNormal, zIsl);
+                                    Vec3f nIsoEnd = normalize3(ch.pts.back().isoNormal, zIsl);
                                     if (lineIdx % 2 == 1) {
                                         std::swap(pStart, pEnd);
+                                        std::swap(nIsoStart, nIsoEnd);
                                     }
 
                                     const Vec3f nozStart = sampleNozzleAxis(pStart);
@@ -4330,6 +4579,12 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                     bridgePath.total_length_mm = finalLen;
                                     bridgePath.mean_width_mm = nozzleDiameterMm;
 
+                                    if (dot3(nIsoStart, nozStart) < 0.0f) {
+                                        nIsoStart = nIsoStart * -1.0f;
+                                    }
+                                    if (dot3(nIsoEnd, nozEnd) < 0.0f) {
+                                        nIsoEnd = nIsoEnd * -1.0f;
+                                    }
                                     ToolpathPoint tp0{};
                                     tp0.x = pStart.x;
                                     tp0.y = pStart.y;
@@ -4339,6 +4594,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                     tp0.nz = nozStart.z;
                                     tp0.width_mm = nozzleDiameterMm;
                                     tp0.height_mm = nozzleDiameterMm; // Circular cross-section!
+                                    tp0.tool_iso_angle_deg =
+                                        std::acos(std::clamp(dot3(nozStart, nIsoStart), -1.0f, 1.0f)) *
+                                        (180.0f / 3.14159265358979323846f);
+                                    tp0.uses_surface_normal = false;
 
                                     ToolpathPoint tp1{};
                                     tp1.x = pEnd.x;
@@ -4349,6 +4608,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                     tp1.nz = nozEnd.z;
                                     tp1.width_mm = nozzleDiameterMm;
                                     tp1.height_mm = nozzleDiameterMm; // Circular cross-section!
+                                    tp1.tool_iso_angle_deg =
+                                        std::acos(std::clamp(dot3(nozEnd, nIsoEnd), -1.0f, 1.0f)) *
+                                        (180.0f / 3.14159265358979323846f);
+                                    tp1.uses_surface_normal = false;
 
                                     bridgePath.points.push_back(tp0);
                                     bridgePath.points.push_back(tp1);
@@ -4414,6 +4677,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 // ------------------------------------------------------------
                 // Outer wall: centerline at d_outer(x) = 0.5 * w_outer(x) (clamped on thin top crests)
                 {
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        shellMesh.verts[i].nozzleAxis = outerSurfaceNozzleAxis[i];
+                        shellMesh.verts[i].surfaceNormalWeight = outerSurfaceNormalWeight[i];
+                    }
                     std::vector<float> outerLevel(nV, 0.0f);
                     for (std::size_t i = 0; i < nV; ++i) {
                         const float stripHalfSpan = std::min(
@@ -4443,6 +4710,13 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 minExtrusionLengthMm,
                                 ep)) {
                             layerOut.paths.push_back(std::move(ep));
+                        }
+                    }
+
+                    if (!isOutermostConformalSkinLayer) {
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            shellMesh.verts[i].nozzleAxis = interiorNozzleAxis[i];
+                            shellMesh.verts[i].surfaceNormalWeight = 0.0f;
                         }
                     }
                 }
@@ -5094,7 +5368,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         stitchSnap,
                         closeLoopTol,
                         sampleSdf,
-                        sampleNozzleAxis,
+                        [&](const Vec3f& p, const Vec3f& nIso) {
+                            return computeIsosurfaceNozzleAxis(p, nIso, isConformalSkinLayer);
+                        },
                         sampleLocalLayerHeight,
                         layerOut.paths);
                 }

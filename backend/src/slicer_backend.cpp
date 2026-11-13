@@ -1397,6 +1397,8 @@ struct SlicerBackend::Impl {
         40.0f,
         0.08f,
         true,
+        true,
+        15.0f,
     };
     SupportSpec supportSpec{
         true,
@@ -1687,6 +1689,121 @@ std::vector<float> SlicerBackend::objectVertexToolAxes(std::uint64_t objectId) c
         }
         return fb;
     };
+    const auto dotVec3 = [](const std::array<float, 3>& a, const std::array<float, 3>& b) -> float {
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    };
+    const auto clampToCone = [&](const std::array<float, 3>& vUnit,
+                                 const std::array<float, 3>& coneAxis,
+                                 float maxAngleRad) -> std::array<float, 3> {
+        if (maxAngleRad <= 1.0e-6f) {
+            return coneAxis;
+        }
+        const float cosTheta = std::clamp(dotVec3(vUnit, coneAxis), -1.0f, 1.0f);
+        const float theta = std::acos(cosTheta);
+        if (theta <= maxAngleRad) {
+            return vUnit;
+        }
+        const float px = vUnit[0] - coneAxis[0] * cosTheta;
+        const float py = vUnit[1] - coneAxis[1] * cosTheta;
+        const float pz = vUnit[2] - coneAxis[2] * cosTheta;
+        const float pLen = std::sqrt(px * px + py * py + pz * pz);
+        if (pLen <= 1.0e-6f) {
+            return coneAxis;
+        }
+        const float c = std::cos(maxAngleRad);
+        const float s = std::sin(maxAngleRad) / pLen;
+        return normalizeVec3(
+            coneAxis[0] * c + px * s,
+            coneAxis[1] * c + py * s,
+            coneAxis[2] * c + pz * s,
+            coneAxis);
+    };
+
+    ToolSpec activeTool{};
+    if (!impl_->tools.empty()) {
+        const std::size_t idx = std::min<std::size_t>(impl_->activeToolIndex, impl_->tools.size() - 1);
+        activeTool = impl_->tools[idx];
+    } else {
+        activeTool.has_rotational_axes = false;
+        activeTool.max_angle_from_bed_normal_deg = 0.0f;
+    }
+    const bool toolRotational =
+        activeTool.has_rotational_axes && activeTool.max_angle_from_bed_normal_deg > 1.0e-5f;
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr float kDegToRad = kPi / 180.0f;
+    const float maxToolTiltRad =
+        std::clamp(activeTool.max_angle_from_bed_normal_deg, 0.0f, 89.0f) * kDegToRad;
+    const bool orientOuterToNormal = impl_->shellPathSpec.orient_outer_surfaces_to_normal;
+    const float parallelAngleRad =
+        std::clamp(impl_->shellPathSpec.outer_surface_parallel_angle_deg, 0.0f, 85.0f) * kDegToRad;
+
+    float minAxialBed = std::numeric_limits<float>::max();
+    for (const auto& v : rec.vertexBuffer) {
+        const float proj = v.x * fallback[0] + v.y * fallback[1] + v.z * fallback[2];
+        minAxialBed = std::min(minAxialBed, proj);
+    }
+    if (!std::isfinite(minAxialBed)) {
+        minAxialBed = 0.0f;
+    }
+
+    auto computeBedSafeMaxTilt = [&](const std::array<float, 3>& pos,
+                                     const std::array<float, 3>& bedNormal) -> float {
+        if (!toolRotational) {
+            return 0.0f;
+        }
+        const float hBedMm = std::max(0.0f, dotVec3(pos, bedNormal) - minAxialBed);
+        float gammaMax = maxToolTiltRad;
+        if (activeTool.clearance_mode == 1) {
+            const float thetaRad =
+                std::clamp(activeTool.cone_half_angle_deg, 5.0f, 80.0f) * kDegToRad;
+            const float alphaRad = std::max(0.0f, 0.5f * kPi - thetaRad);
+            if (hBedMm < 2.0f) {
+                const float t = std::clamp(hBedMm / 2.0f, 0.0f, 1.0f);
+                gammaMax = std::min(gammaMax, alphaRad + (gammaMax - alphaRad) * t);
+            } else {
+                gammaMax = std::min(gammaMax, alphaRad);
+            }
+            return std::max(0.0f, gammaMax);
+        }
+        if (activeTool.clearance_mode == 2) {
+            const float thetaDeg = std::max(
+                std::clamp(activeTool.rect_half_angle_x_deg, 5.0f, 80.0f),
+                std::clamp(activeTool.rect_half_angle_y_deg, 5.0f, 80.0f));
+            const float alphaRad = std::max(0.0f, (90.0f - thetaDeg) * kDegToRad);
+            if (hBedMm < 2.0f) {
+                const float t = std::clamp(hBedMm / 2.0f, 0.0f, 1.0f);
+                gammaMax = std::min(gammaMax, alphaRad + (gammaMax - alphaRad) * t);
+            } else {
+                gammaMax = std::min(gammaMax, alphaRad);
+            }
+            return std::max(0.0f, gammaMax);
+        }
+        for (const auto& pt : activeTool.clearance_profile_xz) {
+            const float r = pt.x_radius_mm;
+            const float z = pt.z_height_mm;
+            if (r <= 1.0e-5f && z <= 1.0e-5f) {
+                continue;
+            }
+            const float rho = std::sqrt(r * r + z * z);
+            if (hBedMm >= rho) {
+                continue;
+            }
+            const float phi = std::atan2(z, std::max(r, 1.0e-6f));
+            const float ratio = std::clamp(-hBedMm / rho, -1.0f, 1.0f);
+            const float allowed = std::max(0.0f, std::asin(ratio) + phi);
+            gammaMax = std::min(gammaMax, allowed);
+        }
+        return std::max(0.0f, gammaMax);
+    };
+
+    const auto sdfIt = rec.scalarFields.find("sdf");
+    std::unique_ptr<openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler>> sdfSampler;
+    if (sdfIt != rec.scalarFields.end() && sdfIt->second) {
+        sdfSampler = std::make_unique<
+            openvdb::tools::GridSampler<openvdb::FloatGrid, openvdb::tools::BoxSampler>>(
+            *sdfIt->second);
+    }
+
     std::vector<float> out(rec.vertexBuffer.size() * 3, 0.0f);
     for (std::size_t i = 0; i < rec.vertexBuffer.size(); ++i) {
         const RenderVertex& v = rec.vertexBuffer[i];
@@ -1707,7 +1824,33 @@ std::vector<float> SlicerBackend::objectVertexToolAxes(std::uint64_t objectId) c
                 sampled = coarseSampler->wsSample(wpIn);
             }
         }
-        const auto unitAxis = normalizeVec3(sampled.x(), sampled.y(), sampled.z(), fallback);
+        std::array<float, 3> unitAxis = normalizeVec3(sampled.x(), sampled.y(), sampled.z(), fallback);
+
+        if (toolRotational && orientOuterToNormal && impl_->orderFieldMode == 0) {
+            const NozzleBasis baseFrame = queryNozzleFrame({v.x, v.y, v.z}, {1.0f, 0.0f, 0.0f});
+            const std::array<float, 3> bedNormal = baseFrame.nozzle_axis;
+            const float gammaMax = computeBedSafeMaxTilt({v.x, v.y, v.z}, bedNormal);
+            const std::array<float, 3> surfAxis = clampToCone(nUnit, bedNormal, gammaMax);
+            const float cosErr = std::clamp(dotVec3(surfAxis, nUnit), -1.0f, 1.0f);
+            const float errRad = std::acos(cosErr);
+            if (errRad <= parallelAngleRad + 1.0e-4f) {
+                bool clear = true;
+                if (sdfSampler) {
+                    const float p1 = std::max(1.25f * voxelSize, 0.50f);
+                    const openvdb::Vec3d wpProbe(
+                        v.x + surfAxis[0] * p1,
+                        v.y + surfAxis[1] * p1,
+                        v.z + surfAxis[2] * p1);
+                    if (sdfSampler->wsSample(wpProbe) <= -0.25f * voxelSize) {
+                        clear = false;
+                    }
+                }
+                if (clear) {
+                    unitAxis = surfAxis;
+                }
+            }
+        }
+
         out[i * 3 + 0] = unitAxis[0];
         out[i * 3 + 1] = unitAxis[1];
         out[i * 3 + 2] = unitAxis[2];
@@ -7416,6 +7559,27 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         }
     }
 
+    ToolSpec activeTool{};
+    if (!impl_->tools.empty()) {
+        const std::size_t idx = std::min<std::size_t>(impl_->activeToolIndex, impl_->tools.size() - 1);
+        activeTool = impl_->tools[idx];
+    } else {
+        activeTool.nozzle_diameter_mm = impl_->shellPathSpec.nozzle_diameter_mm;
+        activeTool.has_rotational_axes = false;
+        activeTool.max_angle_from_bed_normal_deg = 0.0f;
+    }
+
+    float minAxialBed = std::numeric_limits<float>::max();
+    for (const auto& v : rec.vertexBuffer) {
+        const float proj = v.x * impl_->nozzleAxisBed[0] +
+                           v.y * impl_->nozzleAxisBed[1] +
+                           v.z * impl_->nozzleAxisBed[2];
+        minAxialBed = std::min(minAxialBed, proj);
+    }
+    if (!std::isfinite(minAxialBed)) {
+        minAxialBed = rec.minZ;
+    }
+
     ObjectToolpathsResult res = generateShellToolpathsForLayers(
         selectedLayers,
         *sdfIt->second,
@@ -7431,7 +7595,9 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
         rec.fineShellInnerDepthMm,
         overhangPtr,
         coarseOverhangPtr,
-        impl_->gravityDirectionBed);
+        impl_->gravityDirectionBed,
+        &activeTool,
+        minAxialBed);
 
     // Step 2: Generate Support Base (`feature_kind = 7`) and Support Interface (`feature_kind = 8`)
     // toolpaths for unreachable order-field regions projected along gravity `+\hat{g}_{bed}`

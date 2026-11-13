@@ -839,6 +839,13 @@ pub struct SlicingProcessConfig {
     /// a single perimeter (`OuterWall` only, with `InnerWall`s replaced by `SolidInfill`), while
     /// deeper conformal patch layers ($m < N_p$) retain the configured `inner_wall_count`.
     pub one_perimeter_on_conformal_patches: bool,
+    /// When true (default) on multi-axis tools (`has_rotational_axes`), outer surfaces (outer walls
+    /// and outermost conformal skin layers) orient the tool parallel (or within `outer_surface_parallel_angle_deg`)
+    /// to the outward surface normal if reachable; otherwise they fall back to the isosurface normal.
+    pub orient_outer_surfaces_to_normal: bool,
+    /// Maximum angular deviation (degrees, `0.0..=85.0`, default `15.0`) between the reachable clamped
+    /// tool axis and the outward surface normal considered "almost parallel" when `orient_outer_surfaces_to_normal` is enabled.
+    pub outer_surface_parallel_angle_deg: f32,
 }
 
 impl Default for SlicingProcessConfig {
@@ -883,6 +890,8 @@ impl Default for SlicingProcessConfig {
             conformal_skin_min_oblique_deg: 12.0,
             conformal_skin_max_slope_deg: 60.0,
             one_perimeter_on_conformal_patches: true,
+            orient_outer_surfaces_to_normal: true,
+            outer_surface_parallel_angle_deg: 15.0,
         }
     }
 }
@@ -921,6 +930,11 @@ impl SlicingProcessConfig {
         self.conformal_skin_layers = self.conformal_skin_layers.clamp(1, 12);
         self.conformal_skin_min_oblique_deg = self.conformal_skin_min_oblique_deg.clamp(2.0, 60.0);
         self.conformal_skin_max_slope_deg = self.conformal_skin_max_slope_deg.clamp(10.0, 85.0);
+        if !self.outer_surface_parallel_angle_deg.is_finite() {
+            self.outer_surface_parallel_angle_deg = 15.0;
+        }
+        self.outer_surface_parallel_angle_deg =
+            self.outer_surface_parallel_angle_deg.clamp(0.0, 85.0);
     }
 }
 
@@ -2244,6 +2258,24 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         default_value: "true",
         summary: "Prints only a single outer perimeter wall on the outermost layer (m = N) of each conformal patch, replacing inner walls with solid infill.",
         details: "Eliminates multiple concentric inner-wall rings around cutouts and edges on the visible exterior conformal skin surface while keeping full inner walls on deeper patch layers (m < N).",
+    },
+    ParameterDoc {
+        key: "slicing.orient_outer_surfaces_to_normal",
+        category: "Shell & Toolpath Generation",
+        title: "Orient Tool to Outer Surface Normal (Multi-Axis)",
+        units: "bool",
+        default_value: "true",
+        summary: "On multi-axis tools, orients outer surfaces parallel (or almost parallel) to the outward surface normal if reachable; otherwise uses the isosurface normal.",
+        details: "When enabled on a rotational tool (`has_rotational_axes`), outer walls and outermost conformal skin layers check whether clamping the outward surface normal (∇φ_sdf / |∇φ_sdf|) to the bed-safe tool tilt cone leaves a residual angle within `outer_surface_parallel_angle_deg`. If so (and free of self-collision), the tool aligns with that clamped surface normal; otherwise it falls back to the layer's isosurface normal (∇τ / |∇τ|).",
+    },
+    ParameterDoc {
+        key: "slicing.outer_surface_parallel_angle_deg",
+        category: "Shell & Toolpath Generation",
+        title: "Outer Surface Almost-Parallel Angle Threshold",
+        units: "deg (°)",
+        default_value: "15.0°",
+        summary: "Maximum angle between the reachable clamped tool axis and the outward surface normal considered 'almost parallel' on outer surfaces.",
+        details: "If the angle between the outward surface normal n_surf and the closest reachable bed-safe tool axis a_surf is at most this threshold (default 15°), outer surface extrusions orient along a_surf. If n_surf is steeper than the reachable cone by more than this threshold (such as a 90° vertical wall on a 45°-max-tilt machine), the tool falls back to the isosurface normal instead of tilting into the wall.",
     },
 
     // --- Shell & Toolpath Generation ---

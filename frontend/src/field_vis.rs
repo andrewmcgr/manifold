@@ -194,10 +194,14 @@ pub enum ToolpathColorMode {
     ByPressureAdvance,
     /// Colors each segment by its modeled melt-zone pressure $P_{\text{melt}}$ (`MPa` proxy).
     ByMeltZonePressure,
+    /// Colors each segment by the angular deviation $\theta_{\text{tool,iso}} = \arccos(\hat{\mathbf{z}}_{\text{nozzle}} \cdot \hat{\mathbf{n}}_{\text{iso}})$ (degrees) between the tool axis and the local slicing isosurface normal.
+    ByToolIsoNormalAngle,
+    /// Highlights segments where the tool axis is actively oriented using the outward object surface normal $\nabla \phi_{\text{sdf}}$ vs. the slicing isosurface normal $\hat{\mathbf{n}}_{\text{iso}}$.
+    BySurfaceNormalUsage,
 }
 
 impl ToolpathColorMode {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::ByFeatureType,
         Self::ByLineWidth,
         Self::ByLayerHeight,
@@ -207,6 +211,8 @@ impl ToolpathColorMode {
         Self::ByExtrusionMultiplier,
         Self::ByPressureAdvance,
         Self::ByMeltZonePressure,
+        Self::ByToolIsoNormalAngle,
+        Self::BySurfaceNormalUsage,
     ];
 
     pub fn label(self) -> &'static str {
@@ -220,6 +226,8 @@ impl ToolpathColorMode {
             Self::ByExtrusionMultiplier => "Flow Multiplier M (Corner + Transient)",
             Self::ByPressureAdvance => "Dynamic Pressure Advance k_PA (s)",
             Self::ByMeltZonePressure => "Melt-Zone Pressure P_melt (MPa)",
+            Self::ByToolIsoNormalAngle => "Angle: Tool vs. Isosurface Normal (°)",
+            Self::BySurfaceNormalUsage => "Tool Orientation Source (Object Surface vs. Isosurface Normal)",
         }
     }
 
@@ -234,6 +242,8 @@ impl ToolpathColorMode {
             Self::ByExtrusionMultiplier => "Flow Multiplier M (×)",
             Self::ByPressureAdvance => "Dynamic PA k_PA (s)",
             Self::ByMeltZonePressure => "Melt-Zone Pressure P_melt",
+            Self::ByToolIsoNormalAngle => "Tool vs. Isosurface Normal (°)",
+            Self::BySurfaceNormalUsage => "Surface vs. Isosurface Normal",
         }
     }
 }
@@ -284,6 +294,10 @@ pub struct ScrubbedToolheadPose {
     pub speed_mms: f32,
     pub width_mm: f32,
     pub height_mm: f32,
+    /// Angular deviation (degrees) between `nozzle_axis` and the local slicing isosurface normal at the active move.
+    pub tool_iso_angle_deg: f32,
+    /// `true` when the active move's nozzle axis is actively oriented using the outward object surface normal.
+    pub uses_surface_normal: bool,
 }
 
 /// Generic scalar field visualization state resource supporting any named `openvdb::FloatGrid`
@@ -585,6 +599,8 @@ impl FieldVisualizationState {
             max_bridge_length_mm: s.max_bridge_length_mm,
             wave_overhang_overlap_fraction: s.wave_overhang_overlap_fraction,
             one_perimeter_on_conformal_patches: s.one_perimeter_on_conformal_patches,
+            orient_outer_surfaces_to_normal: s.orient_outer_surfaces_to_normal,
+            outer_surface_parallel_angle_deg: s.outer_surface_parallel_angle_deg,
         };
         let support_spec = SupportSpec {
             enabled: s.enable_support_generation,
@@ -1936,6 +1952,8 @@ impl FieldVisualizationState {
                             speed_mms: seg.cruise_speed_mms,
                             width_mm: seg.width_mm,
                             height_mm: seg.height_mm,
+                            tool_iso_angle_deg: seg.tool_iso_angle_deg,
+                            uses_surface_normal: seg.uses_surface_normal,
                         });
                     }
                 }
@@ -2029,6 +2047,8 @@ impl FieldVisualizationState {
                                     speed_mms: 0.0,
                                     width_mm: pt1.width_mm,
                                     height_mm: pt1.height_mm,
+                                    tool_iso_angle_deg: pt1.tool_iso_angle_deg,
+                                    uses_surface_normal: pt1.uses_surface_normal,
                                 });
                             }
                             rem -= seg_count;
@@ -2115,6 +2135,8 @@ impl FieldVisualizationState {
                             speed_mms: 0.0,
                             width_mm: config.slicing.outer_wall_width.target_mm,
                             height_mm: layer.mean_thickness_mm,
+                            tool_iso_angle_deg: 0.0,
+                            uses_surface_normal: false,
                         });
                     }
                 }
@@ -2780,6 +2802,8 @@ fn compute_planned_segment_color(
                 seg.kind as u8,
                 seg.wall_index,
                 seg.width_mm,
+                seg.tool_iso_angle_deg,
+                seg.uses_surface_normal,
                 ToolpathColorMode::ByFeatureType,
                 config,
             ),
@@ -2823,6 +2847,26 @@ fn compute_planned_segment_color(
             let denom = (planned.max_pressure_mm3s - planned.min_pressure_mm3s).max(1.0e-4);
             let t = (seg.melt_pressure_mm3s - planned.min_pressure_mm3s) / denom;
             high_contrast_parameter_ramp(t)
+        }
+        ToolpathColorMode::ByToolIsoNormalAngle => {
+            let lo = planned.min_tool_iso_angle_deg;
+            let hi = planned.max_tool_iso_angle_deg.max(lo + 5.0);
+            let t = ((seg.tool_iso_angle_deg - lo) / (hi - lo)).clamp(0.0, 1.0);
+            high_contrast_parameter_ramp(t)
+        }
+        ToolpathColorMode::BySurfaceNormalUsage => {
+            if seg.uses_surface_normal {
+                [0.14, 0.92, 0.46, 1.0] // Vivid emerald green: Object Surface Normal
+            } else if matches!(
+                seg.kind,
+                crate::gcode::PlannedMoveKind::OuterWall
+                    | crate::gcode::PlannedMoveKind::ScarfSeam
+                    | crate::gcode::PlannedMoveKind::WaveOverhang
+            ) {
+                [0.98, 0.62, 0.16, 1.0] // Warm amber-orange: Isosurface Normal (Outer Fallback)
+            } else {
+                [0.24, 0.52, 0.92, 1.0] // Cool sapphire blue: Isosurface Normal (Interior / Other)
+            }
         }
     }
 }
@@ -2903,6 +2947,8 @@ fn append_extrusion_path_bead_mesh(
             path.feature_kind,
             path.wall_index,
             pt.width_mm,
+            pt.tool_iso_angle_deg,
+            pt.uses_surface_normal,
             color_mode,
             config,
         );
@@ -2957,6 +3003,8 @@ fn compute_toolpath_point_color(
     feature_kind: u8,
     wall_index: u32,
     width_mm: f32,
+    tool_iso_angle_deg: f32,
+    uses_surface_normal: bool,
     mode: ToolpathColorMode,
     config: &SlicerConfig,
 ) -> [f32; 4] {
@@ -2980,6 +3028,24 @@ fn compute_toolpath_point_color(
             8 => [0.12, 0.96, 0.88, 1.0], // Support Interface: bright aquamarine
             _ => [0.98, 0.32, 0.88, 1.0], // Gap Fill: vivid magenta
         },
+        ToolpathColorMode::ByToolIsoNormalAngle => {
+            let max_ang = config
+                .active_tool()
+                .map(|t| t.max_angle_from_bed_normal_deg)
+                .unwrap_or(45.0)
+                .max(15.0);
+            let t = (tool_iso_angle_deg / max_ang).clamp(0.0, 1.0);
+            high_contrast_parameter_ramp(t)
+        }
+        ToolpathColorMode::BySurfaceNormalUsage => {
+            if uses_surface_normal {
+                [0.14, 0.92, 0.46, 1.0] // Vivid emerald green: Object Surface Normal
+            } else if feature_kind == 0 || feature_kind == 6 {
+                [0.98, 0.62, 0.16, 1.0] // Warm amber-orange: Isosurface Normal (Outer Fallback)
+            } else {
+                [0.24, 0.52, 0.92, 1.0] // Cool sapphire blue: Isosurface Normal (Interior / Other)
+            }
+        }
         ToolpathColorMode::ByLineWidth | _ => {
             let spec = match feature_kind {
                 0 | 6 => config.slicing.outer_wall_width,
@@ -3739,6 +3805,8 @@ mod tests {
             max_bridge_length_mm: 40.0,
             wave_overhang_overlap_fraction: 0.08,
             one_perimeter_on_conformal_patches: true,
+            orient_outer_surfaces_to_normal: true,
+            outer_surface_parallel_angle_deg: 15.0,
         };
         ffi::set_shell_path_spec(base_spec.clone());
 
@@ -3918,6 +3986,8 @@ mod tests {
             max_bridge_length_mm: 40.0,
             wave_overhang_overlap_fraction: 0.08,
             one_perimeter_on_conformal_patches: true,
+            orient_outer_surfaces_to_normal: true,
+            outer_surface_parallel_angle_deg: 15.0,
         });
 
         let res = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -4314,6 +4384,8 @@ mod tests {
             max_bridge_length_mm: 40.0,
             wave_overhang_overlap_fraction: 0.08,
             one_perimeter_on_conformal_patches: true,
+            orient_outer_surfaces_to_normal: true,
+            outer_surface_parallel_angle_deg: 15.0,
         };
 
         // Test all 7 sparse infill patterns (0..=6: Monotonic, Cubic, Gyroid, SchwarzD, SchwarzP, Concentric, AllWalls)
@@ -5206,6 +5278,8 @@ mod tests {
             max_bridge_length_mm: 40.0,
             wave_overhang_overlap_fraction: 0.08,
             one_perimeter_on_conformal_patches: true,
+            orient_outer_surfaces_to_normal: true,
+            outer_surface_parallel_angle_deg: 15.0,
         });
 
         let tp_bridge = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -5276,6 +5350,8 @@ mod tests {
             max_bridge_length_mm: 2.0,
             wave_overhang_overlap_fraction: 0.08,
             one_perimeter_on_conformal_patches: true,
+            orient_outer_surfaces_to_normal: true,
+            outer_surface_parallel_angle_deg: 15.0,
         });
 
         let tp_wave_only = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -7173,6 +7249,8 @@ mod tests {
                 melt_pressure_mm3s: 6.7,
                 retract_before_mm: 0.0,
                 unretract_after_mm: 0.0,
+                tool_iso_angle_deg: 0.0,
+                uses_surface_normal: false,
             }
         };
 
@@ -7262,6 +7340,8 @@ mod tests {
             max_pa_s: 0.03,
             min_pressure_mm3s: 6.7,
             max_pressure_mm3s: 6.7,
+            min_tool_iso_angle_deg: 0.0,
+            max_tool_iso_angle_deg: 30.0,
         };
 
         let mut vis = FieldVisualizationState::default();
@@ -7321,6 +7401,165 @@ mod tests {
         assert_eq!(pose_l0.move_index, 2);
         assert!((pose_l0.tip_bed - Vec3::new(10.0, 10.0, 0.2)).length() < 1.0e-4);
         assert!((pose_l0.gravity_bed - (-Vec3::Z)).length() < 1.0e-4);
+    }
+
+    #[test]
+    fn test_orient_outer_surfaces_to_normal_or_isosurface_normal() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Construct an asymmetric prism with:
+        // - +X wall sloped at 40° from bed normal +Z:
+        //   At Z = 0, X = +12.0; at Z = 10.0, X = +12.0 - 10.0 * tan(50°)? Wait:
+        //   Let outward normal on +X wall be tilted by 40° from +Z -> (sin 40°, 0, cos 40°) = (0.6428, 0, 0.7660).
+        //   A face with outward normal (sin 40°, 0, cos 40°) has dx/dz = -cos(40°)/sin(40°) = -1.19175.
+        //   Wait: let's make +X wall have outward normal at 50° from +Z:
+        //   dx = -8.4 mm over dz = 10.0 mm -> outward normal = normalize(10.0, 0, 8.4) = (0.7656, 0, 0.6433),
+        //   which is arccos(0.6433) = 49.96° (~50°) from bed normal +Z!
+        // - -X wall is vertical (outward normal = (-1, 0, 0), 90° from +Z).
+        //
+        // Now configure a 5/6-axis tool with `max_angle_from_bed_normal_deg = 40.0°` (and narrow clearance so bed clearance doesn't restrict at Z >= 4):
+        // - On the +X sloped wall (normal at ~50° from +Z), the closest reachable tool axis `surfAxis`
+        //   clamps to 40° from +Z -> the residual angle between `surfAxis` and `n_surf` is ~10°!
+        //   * When `orient_outer_surfaces_to_normal = true` and `outer_surface_parallel_angle_deg = 15.0°`:
+        //     residual ~10° <= 15.0°, so the +X OuterWall orients to `surfAxis` (~40° tilt toward +X, `nx > 0.50`)!
+        //   * When `outer_surface_parallel_angle_deg = 5.0°`:
+        //     residual ~10° > 5.0°, so the +X OuterWall CANNOT reach within 5° of `n_surf` and falls back
+        //     to the isosurface normal (nearly vertical in HeightOnlyPlanar mode, `nx < 0.15`)!
+        //   * When `orient_outer_surfaces_to_normal = false`:
+        //     toggle is off, so the +X OuterWall uses the isosurface normal (`nx < 0.15`)!
+        // - On the -X vertical wall (normal at 90° from +Z), residual angle is 90° - 40° = 50° > 15°,
+        //   so it ALWAYS falls back to the isosurface normal (`|nx| < 0.15`)!
+        let positions: [f32; 24] = [
+            -10.0, -8.0,  0.0,
+             12.0, -8.0,  0.0,
+             12.0,  8.0,  0.0,
+            -10.0,  8.0,  0.0,
+            -10.0, -8.0, 10.0,
+              3.6, -8.0, 10.0,
+              3.6,  8.0, 10.0,
+            -10.0,  8.0, 10.0,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2, // bottom
+            4, 5, 6, 4, 6, 7, // top
+            0, 1, 5, 0, 5, 4, // -Y
+            1, 2, 6, 1, 6, 5, // +X sloped wall (normal ~50° from +Z)
+            2, 3, 7, 2, 7, 6, // +Y
+            3, 0, 4, 3, 4, 7, // -X vertical wall (normal 90° from +Z)
+        ];
+        let part = ffi::register_triangle_mesh("outer_surf_orient_prism", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        let mut cfg = SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.slicing.enable_support_generation = false;
+        cfg.tools[0].has_rotational_axes = true;
+        cfg.tools[0].max_angle_from_bed_normal_deg = 40.0;
+        cfg.tools[0].clearance_profile_xz = vec![
+            crate::config::ClearancePointXZ {
+                x_radius_mm: 0.4,
+                z_height_mm: 0.0,
+            },
+            crate::config::ClearancePointXZ {
+                x_radius_mm: 1.5,
+                z_height_mm: 3.0,
+            },
+        ];
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.5, 4.0));
+
+        let measure_wall_nx = |orient_enabled: bool, parallel_deg: f32| -> (f32, f32, f32, usize) {
+            let mut c = cfg.clone();
+            c.slicing.orient_outer_surfaces_to_normal = orient_enabled;
+            c.slicing.outer_surface_parallel_angle_deg = parallel_deg;
+            crate::ui::sync_config_to_backend(&c);
+
+            let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+            assert!(tp.valid);
+
+            let mut pos_x_nx_sum = 0.0f32;
+            let mut pos_x_iso_ang_sum = 0.0f32;
+            let mut pos_x_surf_norm_cnt = 0usize;
+            let mut pos_x_cnt = 0usize;
+            let mut neg_x_nx_abs_sum = 0.0f32;
+            let mut neg_x_cnt = 0usize;
+
+            for layer in &tp.layers {
+                for path in &layer.paths {
+                    if path.feature_kind != 0 {
+                        continue; // OuterWall only
+                    }
+                    for pt in &path.points {
+                        if pt.z >= 4.0 && pt.z <= 8.0 && pt.y.abs() <= 4.0 {
+                            if pt.x > 2.0 {
+                                pos_x_nx_sum += pt.nx;
+                                pos_x_iso_ang_sum += pt.tool_iso_angle_deg;
+                                if pt.uses_surface_normal {
+                                    pos_x_surf_norm_cnt += 1;
+                                }
+                                pos_x_cnt += 1;
+                            } else if pt.x < -6.0 {
+                                neg_x_nx_abs_sum += pt.nx.abs();
+                                assert!(
+                                    !pt.uses_surface_normal,
+                                    "Expected -X vertical wall not to report uses_surface_normal"
+                                );
+                                neg_x_cnt += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(pos_x_cnt > 5 && neg_x_cnt > 5);
+            (
+                pos_x_nx_sum / (pos_x_cnt as f32),
+                neg_x_nx_abs_sum / (neg_x_cnt as f32),
+                pos_x_iso_ang_sum / (pos_x_cnt as f32),
+                pos_x_surf_norm_cnt,
+            )
+        };
+
+        // 1. Toggle ON, threshold = 15° (residual angle ~10° <= 15° on +X wall -> tilts to ~40°, sin(40°)=0.643;
+        //    on -X vertical wall, residual angle 50° > 15° -> falls back to isosurface normal +Z, nx ≈ 0)
+        let (nx_on_15, neg_nx_on_15, iso_ang_on_15, surf_cnt_on_15) = measure_wall_nx(true, 15.0);
+        assert!(
+            nx_on_15 > 0.55,
+            "Expected +X sloped wall (within 15° of reachable 40° tilt) to orient almost parallel to surface normal (nx > 0.55), got {nx_on_15:.3}"
+        );
+        assert!(
+            iso_ang_on_15 > 32.0,
+            "Expected +X sloped wall tool_iso_angle_deg > 32° when tilted ~40° from planar isosurface normal, got {iso_ang_on_15:.2}°"
+        );
+        assert!(
+            surf_cnt_on_15 > 5,
+            "Expected +X sloped wall points to set uses_surface_normal == true, got count={surf_cnt_on_15}"
+        );
+        assert!(
+            neg_nx_on_15 < 0.08,
+            "Expected -X vertical wall (50° beyond reachable tilt > 15°) to fall back to isosurface normal (|nx| < 0.08), got {neg_nx_on_15:.3}"
+        );
+
+        // 2. Toggle ON, threshold = 4° (residual angle ~10° > 4° on +X wall -> falls back to isosurface normal!)
+        let (nx_on_4, _, iso_ang_on_4, surf_cnt_on_4) = measure_wall_nx(true, 4.0);
+        assert!(
+            nx_on_4 < 0.08,
+            "Expected +X sloped wall (~10° from reachable 40° tilt) to fall back to isosurface normal when threshold is 4°, got {nx_on_4:.3}"
+        );
+        assert!(
+            iso_ang_on_4 < 4.0 && surf_cnt_on_4 == 0,
+            "Expected fallback to isosurface normal to have tool_iso_angle_deg < 4° and uses_surface_normal == false, got ang={iso_ang_on_4:.2}°, cnt={surf_cnt_on_4}"
+        );
+
+        // 3. Toggle OFF -> always uses isosurface normal even when threshold is 30°
+        let (nx_off, _, iso_ang_off, surf_cnt_off) = measure_wall_nx(false, 30.0);
+        assert!(
+            nx_off < 0.08 && iso_ang_off < 4.0 && surf_cnt_off == 0,
+            "Expected +X sloped wall to use isosurface normal when orient_outer_surfaces_to_normal is false, got {nx_off:.3}"
+        );
+
+        let default_cfg = SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(part.object_id);
     }
 }
 

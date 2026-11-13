@@ -274,6 +274,13 @@ pub mod ffi {
         /// When true, the outermost layer (`m = N`) of each conformal skin patch uses only 1 perimeter
         /// (Outer Wall only, with Inner Walls replaced by Solid Infill), while deeper patch layers (`m < N`) keep normal Inner Walls.
         pub one_perimeter_on_conformal_patches: bool,
+        /// When true on multi-axis tools (`has_rotational_axes`), outer surfaces orient the tool parallel
+        /// (or within `outer_surface_parallel_angle_deg`) to the outward surface normal if reachable;
+        /// otherwise they fall back to the isosurface normal.
+        pub orient_outer_surfaces_to_normal: bool,
+        /// Maximum angular deviation (degrees, `0.0..=85.0`) between the reachable clamped tool axis and
+        /// the outward surface normal considered "almost parallel" when `orient_outer_surfaces_to_normal` is enabled.
+        pub outer_surface_parallel_angle_deg: f32,
     }
 
     /// A single 3D vertex along a continuous non-planar extrusion toolpath.
@@ -290,6 +297,10 @@ pub mod ffi {
         pub width_mm: f32,
         /// Local layer thickness (mm) along $\hat{\mathbf{z}}_{\text{nozzle}}$.
         pub height_mm: f32,
+        /// Angular deviation (degrees) between `nozzle_axis` $\hat{\mathbf{z}}_{\text{nozzle}}$ and the local slicing isosurface normal $\hat{\mathbf{n}}_{\text{iso}}$.
+        pub tool_iso_angle_deg: f32,
+        /// `true` when the nozzle axis at this point was actively oriented using the outward object surface normal $\nabla \phi_{\text{sdf}}$.
+        pub uses_surface_normal: bool,
     }
 
     /// A continuous open or closed extrusion path on a non-planar slicing isosurface.

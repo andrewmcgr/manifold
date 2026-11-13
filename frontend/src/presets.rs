@@ -733,6 +733,8 @@ pub struct ProcessPreset {
     pub shell_thickness_mm: f32,
     pub inner_wall_count: u32,
     pub one_perimeter_on_conformal_patches: bool,
+    pub orient_outer_surfaces_to_normal: bool,
+    pub outer_surface_parallel_angle_deg: f32,
     pub wall_print_order: WallPrintOrder,
     pub outer_wall_width: LineWidthConfig,
     pub inner_wall_width: LineWidthConfig,
@@ -829,6 +831,8 @@ impl ProcessPreset {
             shell_thickness_mm: cfg.slicing.shell_thickness_mm,
             inner_wall_count: cfg.slicing.inner_wall_count,
             one_perimeter_on_conformal_patches: cfg.slicing.one_perimeter_on_conformal_patches,
+            orient_outer_surfaces_to_normal: cfg.slicing.orient_outer_surfaces_to_normal,
+            outer_surface_parallel_angle_deg: cfg.slicing.outer_surface_parallel_angle_deg,
             wall_print_order: cfg.gcode.wall_print_order,
             outer_wall_width: cfg.slicing.outer_wall_width,
             inner_wall_width: cfg.slicing.inner_wall_width,
@@ -906,6 +910,8 @@ impl ProcessPreset {
         cfg.slicing.shell_thickness_mm = self.shell_thickness_mm;
         cfg.slicing.inner_wall_count = self.inner_wall_count;
         cfg.slicing.one_perimeter_on_conformal_patches = self.one_perimeter_on_conformal_patches;
+        cfg.slicing.orient_outer_surfaces_to_normal = self.orient_outer_surfaces_to_normal;
+        cfg.slicing.outer_surface_parallel_angle_deg = self.outer_surface_parallel_angle_deg;
         cfg.gcode.wall_print_order = self.wall_print_order;
         cfg.slicing.outer_wall_width = self.outer_wall_width;
         cfg.slicing.inner_wall_width = self.inner_wall_width;
@@ -1015,6 +1021,12 @@ impl ProcessPreset {
             && self.inner_wall_count == cfg.slicing.inner_wall_count
             && self.one_perimeter_on_conformal_patches
                 == cfg.slicing.one_perimeter_on_conformal_patches
+            && self.orient_outer_surfaces_to_normal
+                == cfg.slicing.orient_outer_surfaces_to_normal
+            && approx_eq(
+                self.outer_surface_parallel_angle_deg,
+                cfg.slicing.outer_surface_parallel_angle_deg,
+            )
             && self.wall_print_order == cfg.gcode.wall_print_order
             && approx_eq_line_width(self.outer_wall_width, cfg.slicing.outer_wall_width)
             && approx_eq_line_width(self.inner_wall_width, cfg.slicing.inner_wall_width)
