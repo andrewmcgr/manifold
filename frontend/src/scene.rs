@@ -1691,26 +1691,69 @@ pub fn draw_viewport_gizmos_system(
         );
     }
 
+    // Resolve the selected object's world Transform for toolpath/layer scrub tracking
+    let selected_obj_tf = plate
+        .selected_object_id
+        .and_then(|sel_id| plate.objects.iter().find(|o| o.object_id == sel_id))
+        .and_then(|obj| object_transforms.get(obj.entity).ok().copied())
+        .unwrap_or(Transform::IDENTITY);
+
+    let scrub_pose = vis_state.compute_active_scrub_pose(&config, selected_obj_tf);
+
+    // Highlight the active scrubbed move segment & nozzle discharge point when scrubbing within a layer
+    // or when the 3D Nozzle / Clearance / Gravity gizmo is active
+    if let Some(pose) = scrub_pose {
+        if vis_state.layer_move_scrub_limit.is_some()
+            || config.machine.show_nozzle_clearance_gizmo
+        {
+            let highlight_col = Color::srgb(1.0, 0.96, 0.28);
+            gizmos.line(pose.seg_start_bed, pose.tip_bed, highlight_col);
+            let ring_r = (0.5 * pose.width_mm).clamp(0.25, 0.80);
+            let mut tip_ring = Vec::with_capacity(17);
+            for k in 0..=16 {
+                let theta = (k as f32 / 16.0) * std::f32::consts::TAU;
+                let local_p = Vec3::new(ring_r * theta.cos(), ring_r * theta.sin(), 0.05);
+                tip_ring.push(pose.frame_bed.nozzle_local_to_bed(pose.tip_bed, local_p));
+            }
+            gizmos.linestrip(tip_ring, highlight_col);
+        }
+    }
+
     // Optional 3D visualization of the queried Nozzle Local Frame, active tool XZ clearance
-    // profile, and Gravity direction vector in bed coordinates
+    // profile, and Gravity direction vector in bed coordinates (tracks active layer & within-layer scrub)
     if config.machine.show_nozzle_clearance_gizmo {
-        let tip_bed = if let Some(sel_id) = plate.selected_object_id {
-            if let Some(obj) = plate.objects.iter().find(|o| o.object_id == sel_id) {
-                if let Ok(obj_tf) = object_transforms.get(obj.entity) {
-                    let (min_p, max_p) = obj.compute_world_aabb(obj_tf);
-                    Vec3::new(0.5 * (min_p.x + max_p.x), 0.5 * (min_p.y + max_p.y), max_p.z + 2.0)
+        let (tip_bed, frame, gravity, tool_opt) = if let Some(pose) = scrub_pose {
+            let tool = config
+                .tools
+                .get(pose.tool_id)
+                .or_else(|| config.active_tool());
+            (pose.tip_bed, pose.frame_bed, pose.gravity_bed, tool)
+        } else {
+            let fallback_tip = if let Some(sel_id) = plate.selected_object_id {
+                if let Some(obj) = plate.objects.iter().find(|o| o.object_id == sel_id) {
+                    if let Ok(obj_tf) = object_transforms.get(obj.entity) {
+                        let (min_p, max_p) = obj.compute_world_aabb(obj_tf);
+                        Vec3::new(
+                            0.5 * (min_p.x + max_p.x),
+                            0.5 * (min_p.y + max_p.y),
+                            max_p.z + 2.0,
+                        )
+                    } else {
+                        Vec3::new(0.0, 0.0, 35.0)
+                    }
                 } else {
                     Vec3::new(0.0, 0.0, 35.0)
                 }
             } else {
                 Vec3::new(0.0, 0.0, 35.0)
-            }
-        } else {
-            Vec3::new(0.0, 0.0, 35.0)
+            };
+            (
+                fallback_tip,
+                config.query_nozzle_frame(fallback_tip, Vec3::X),
+                config.query_gravity_bed(fallback_tip),
+                config.active_tool(),
+            )
         };
-
-        let frame = config.query_nozzle_frame(tip_bed, Vec3::X);
-        let gravity = config.query_gravity_bed(tip_bed);
 
         // Draw Nozzle Local Orthonormal Basis (X_travel = Red, Y_lateral = Green, Z_nozzle = Cyan)
         gizmos.arrow(
@@ -1737,7 +1780,7 @@ pub fn draw_viewport_gizmos_system(
         );
 
         // Draw the active tool's clearance profile in the nozzle's local frame
-        if let Some(tool) = config.active_tool() {
+        if let Some(tool) = tool_opt {
             let profile_color = Color::srgba(1.0, 0.72, 0.18, 0.85);
             match tool.clearance_mode {
                 ClearanceProfileMode::PiecewiseXZ => {

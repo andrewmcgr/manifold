@@ -254,6 +254,38 @@ pub struct SelectedLayersMeshEntity;
 #[derive(Component)]
 pub struct ToolpathsMeshEntity;
 
+/// Snapshot of the toolhead position, local orthonormal `NozzleFrame` (`AGENTS.md` Rule 1),
+/// bed-coordinate gravity direction (`AGENTS.md` Rule 2), and 5-axis rotary angles `(B, C)`
+/// at the active layer and within-layer scrub position.
+#[derive(Clone, Copy, Debug)]
+pub struct ScrubbedToolheadPose {
+    /// Nozzle tip position in 3D bed/scene coordinates (`mm`).
+    pub tip_bed: Vec3,
+    /// Start position of the active scrubbed segment in 3D bed/scene coordinates (`mm`).
+    pub seg_start_bed: Vec3,
+    /// Orthonormal local nozzle frame $(\hat{\mathbf{x}}_{\text{travel}}, \hat{\mathbf{y}}_{\text{lateral}}, \hat{\mathbf{z}}_{\text{nozzle}})$ in bed coordinates.
+    pub frame_bed: NozzleFrame,
+    /// Unit gravity direction vector $\hat{\mathbf{g}}_{\text{bed}}$ in bed coordinates at this posture.
+    pub gravity_bed: Vec3,
+    /// Active extruder tool index (`0` for `T0`, `1` for `T1`, ...).
+    pub tool_id: usize,
+    /// Instantaneous 5-axis polar tilt `B` and azimuthal rotation `C` angles (degrees).
+    pub b_deg: f32,
+    pub c_deg: f32,
+    /// Active 0-based layer index.
+    pub layer_index: usize,
+    /// Active 1-based move index within the visible moves of `layer_index`.
+    pub move_index: usize,
+    /// Total visible moves on `layer_index`.
+    pub total_layer_moves: usize,
+    /// Human-readable feature label of the active move (e.g., `"Outer Wall"`, `"Solid Infill"`).
+    pub move_label: &'static str,
+    /// Planned cruise speed (`mm/s`), line width (`mm`), and layer height (`mm`) of the active move.
+    pub speed_mms: f32,
+    pub width_mm: f32,
+    pub height_mm: f32,
+}
+
 /// Generic scalar field visualization state resource supporting any named `openvdb::FloatGrid`
 /// on the currently selected object (`"sdf"`, `"eikonal"`, `"overhang"`, and future fields),
 /// plus 3D/2D visualization of the selected non-planar slicing isosurfaces and shell toolpaths.
@@ -302,6 +334,12 @@ pub struct FieldVisualizationState {
     pub selected_layer_stride: usize,
     pub selected_layer_min_idx: usize,
     pub selected_layer_max_idx: usize,
+    /// When true, scrubbing the active layer (`selected_layer_max_idx`) locks `selected_layer_min_idx = selected_layer_max_idx`
+    /// so only a single layer/isosurface is shown at a time.
+    pub single_layer_scrub_mode: bool,
+    /// Optional 1-based move limit within the active top layer (`selected_layer_max_idx`).
+    /// When `None`, all moves (`100%`) of the active layer are displayed.
+    pub layer_move_scrub_limit: Option<usize>,
     pub highlighted_selected_layer: Option<usize>,
     pub last_highlighted_selected_layer: Option<usize>,
     pub cached_selected_layers: Option<SelectedIsosurfacesResult>,
@@ -404,6 +442,8 @@ impl Default for FieldVisualizationState {
             selected_layer_stride: 1,
             selected_layer_min_idx: 0,
             selected_layer_max_idx: 0,
+            single_layer_scrub_mode: false,
+            layer_move_scrub_limit: None,
             highlighted_selected_layer: None,
             last_highlighted_selected_layer: None,
             cached_selected_layers: None,
@@ -466,6 +506,7 @@ impl FieldVisualizationState {
         self.cached_selected_layers = None;
         self.cached_toolpaths = None;
         self.cached_planned_gcode = None;
+        self.layer_move_scrub_limit = None;
         self.dirty_isosurface = true;
         self.dirty_selected_layers = true;
         self.dirty_selected_layers_mesh = true;
@@ -605,10 +646,14 @@ impl FieldVisualizationState {
                 let max_idx = res.layers.len() - 1;
                 self.selected_layer_min_idx = 0;
                 self.selected_layer_max_idx = max_idx;
+                self.single_layer_scrub_mode = false;
+                self.layer_move_scrub_limit = None;
                 self.cached_selected_layers = Some(res);
             } else {
                 self.selected_layer_min_idx = 0;
                 self.selected_layer_max_idx = 0;
+                self.single_layer_scrub_mode = false;
+                self.layer_move_scrub_limit = None;
                 self.cached_selected_layers = None;
             }
             self.dirty_selected_layers_mesh = true;
@@ -620,8 +665,10 @@ impl FieldVisualizationState {
                 if self.selected_layer_max_idx == 0 && res.layers.len() > 1 {
                     self.selected_layer_max_idx = res.layers.len() - 1;
                 }
+                self.layer_move_scrub_limit = None;
                 self.cached_toolpaths = Some(res);
             } else {
+                self.layer_move_scrub_limit = None;
                 self.cached_toolpaths = None;
                 self.cached_planned_gcode = None;
             }
@@ -733,6 +780,7 @@ pub fn sync_field_visualization_system(
         vis_state.cached_selected_layers = None;
         vis_state.cached_toolpaths = None;
         vis_state.cached_planned_gcode = None;
+        vis_state.layer_move_scrub_limit = None;
         vis_state.contour_segments_local.clear();
         vis_state.dirty_isosurface = true;
         vis_state.dirty_selected_layers = true;
@@ -1288,8 +1336,14 @@ pub fn sync_field_visualization_system(
                         c
                     };
                     let line_color = Color::srgb(rgba[0], rgba[1], rgba[2]);
+                    let active_scrub_layer = highlighted.unwrap_or(hi);
+                    let max_segs = if !vis_state.show_toolpaths && idx == active_scrub_layer {
+                        vis_state.layer_move_scrub_limit.unwrap_or(usize::MAX)
+                    } else {
+                        usize::MAX
+                    };
 
-                    for seg in layer.contour_segments.chunks_exact(6) {
+                    for seg in layer.contour_segments.chunks_exact(6).take(max_segs) {
                         let p0 = obj_world_tf.transform_point(Vec3::new(seg[0], seg[1], seg[2]));
                         let p1 = obj_world_tf.transform_point(Vec3::new(seg[3], seg[4], seg[5]));
                         gizmos.line(p0, p1, line_color);
@@ -1441,6 +1495,7 @@ pub fn sync_field_visualization_system(
                 let lo = vis_state.selected_layer_min_idx.min(total - 1);
                 let hi = vis_state.selected_layer_max_idx.min(total - 1).max(lo);
                 let highlighted = vis_state.highlighted_selected_layer;
+                let active_scrub_layer = highlighted.unwrap_or(hi);
 
                 for (idx, layer_p) in planned.layers.iter().enumerate() {
                     let is_hovered = highlighted == Some(idx);
@@ -1450,16 +1505,26 @@ pub fn sync_field_visualization_system(
                     if !is_hovered && (!in_range || !matches_stride) {
                         continue;
                     }
+                    let max_vis_moves = if idx == active_scrub_layer {
+                        vis_state.layer_move_scrub_limit.unwrap_or(usize::MAX)
+                    } else {
+                        usize::MAX
+                    };
+                    let mut vis_move_count = 0usize;
                     for seg in &layer_p.segments {
+                        if !vis_state.is_planned_segment_visible(seg) {
+                            continue;
+                        }
+                        vis_move_count += 1;
+                        if vis_move_count > max_vis_moves {
+                            break;
+                        }
                         let is_travel = matches!(
                             seg.kind,
                             crate::gcode::PlannedMoveKind::Travel
                                 | crate::gcode::PlannedMoveKind::ZHop
                         );
                         if !is_travel && !vis_state.show_toolpath_centerlines {
-                            continue;
-                        }
-                        if !vis_state.is_planned_segment_visible(seg) {
                             continue;
                         }
                         let rgba = compute_planned_segment_color(
@@ -1703,6 +1768,361 @@ impl FieldVisualizationState {
             _ => self.show_solid_infill,
         }
     }
+
+    /// Returns the total number of available layers across planned G-code, raw toolpaths, or selected isosurfaces.
+    pub fn total_layer_count(&self) -> usize {
+        if self.show_toolpaths {
+            if let Some(ref planned) = self.cached_planned_gcode {
+                return planned.layers.len();
+            }
+            if let Some(ref tp_res) = self.cached_toolpaths {
+                return tp_res.layers.len();
+            }
+        }
+        if let Some(ref layers_res) = self.cached_selected_layers {
+            if !layers_res.layers.is_empty() {
+                return layers_res.layers.len();
+            }
+        }
+        if let Some(ref planned) = self.cached_planned_gcode {
+            return planned.layers.len();
+        }
+        if let Some(ref tp_res) = self.cached_toolpaths {
+            return tp_res.layers.len();
+        }
+        0
+    }
+
+    /// Returns the currently active/inspected 0-based layer index (`highlighted_selected_layer` or `selected_layer_max_idx`).
+    pub fn active_layer_index(&self) -> Option<usize> {
+        let total = self.total_layer_count();
+        if total == 0 {
+            return None;
+        }
+        Some(
+            self.highlighted_selected_layer
+                .unwrap_or(self.selected_layer_max_idx)
+                .min(total - 1),
+        )
+    }
+
+    /// Returns the total number of visible moves/segments on the currently active layer.
+    pub fn active_layer_total_moves(&self) -> usize {
+        if self.show_toolpaths {
+            if let Some(ref planned) = self.cached_planned_gcode {
+                if planned.layers.is_empty() {
+                    return 0;
+                }
+                let active_idx = self
+                    .highlighted_selected_layer
+                    .unwrap_or(self.selected_layer_max_idx)
+                    .min(planned.layers.len() - 1);
+                return planned.layers[active_idx]
+                    .segments
+                    .iter()
+                    .filter(|s| self.is_planned_segment_visible(s))
+                    .count();
+            }
+            if let Some(ref tp_res) = self.cached_toolpaths {
+                if tp_res.layers.is_empty() {
+                    return 0;
+                }
+                let active_idx = self
+                    .highlighted_selected_layer
+                    .unwrap_or(self.selected_layer_max_idx)
+                    .min(tp_res.layers.len() - 1);
+                return tp_res.layers[active_idx]
+                    .paths
+                    .iter()
+                    .filter(|p| self.is_raw_path_visible(p.feature_kind) && p.points.len() >= 2)
+                    .map(|p| {
+                        if p.is_closed && p.points.len() >= 3 {
+                            p.points.len()
+                        } else {
+                            p.points.len() - 1
+                        }
+                    })
+                    .sum();
+            }
+        }
+        if self.show_selected_layers {
+            if let Some(ref layers_res) = self.cached_selected_layers {
+                if !layers_res.layers.is_empty() {
+                    let active_idx = self
+                        .highlighted_selected_layer
+                        .unwrap_or(self.selected_layer_max_idx)
+                        .min(layers_res.layers.len() - 1);
+                    return layers_res.layers[active_idx].contour_segments.len() / 6;
+                }
+            }
+        }
+        0
+    }
+
+    /// Computes the toolhead position, local `NozzleFrame` (`AGENTS.md` Rule 1), bed-coordinate
+    /// gravity direction (`AGENTS.md` Rule 2), and 5-axis rotary angles `(B, C)` at the active
+    /// layer and within-layer scrub position.
+    pub fn compute_active_scrub_pose(
+        &self,
+        config: &SlicerConfig,
+        obj_world_tf: Transform,
+    ) -> Option<ScrubbedToolheadPose> {
+        // 1. Planned G-code segments when toolpath visualization is enabled
+        if self.show_toolpaths {
+            if let Some(ref planned) = self.cached_planned_gcode {
+                if !planned.layers.is_empty() {
+                    let active_idx = self
+                        .highlighted_selected_layer
+                        .unwrap_or(self.selected_layer_max_idx)
+                        .min(planned.layers.len() - 1);
+                    let layer_p = &planned.layers[active_idx];
+                    let total_vis = layer_p
+                        .segments
+                        .iter()
+                        .filter(|s| self.is_planned_segment_visible(s))
+                        .count();
+
+                    let (seg_opt, move_idx, total_moves) = if total_vis > 0 {
+                        let m_idx = self
+                            .layer_move_scrub_limit
+                            .unwrap_or(total_vis)
+                            .clamp(1, total_vis);
+                        let seg = layer_p
+                            .segments
+                            .iter()
+                            .filter(|s| self.is_planned_segment_visible(s))
+                            .nth(m_idx - 1);
+                        (seg, m_idx, total_vis)
+                    } else {
+                        // Fallback if all visible feature types on this layer were unchecked
+                        let len = layer_p.segments.len();
+                        (layer_p.segments.last(), len.max(1), len.max(1))
+                    };
+
+                    if let Some(seg) = seg_opt {
+                        let seg_start_bed = obj_world_tf.transform_point(seg.p0_local);
+                        let tip_bed = obj_world_tf.transform_point(seg.p1_local);
+                        let travel_dir_bed = (tip_bed - seg_start_bed)
+                            .try_normalize()
+                            .unwrap_or(Vec3::X);
+                        let nozzle_axis_bed = (obj_world_tf.rotation * seg.nozzle_local_1)
+                            .try_normalize()
+                            .or_else(|| seg.nozzle_bed_1.try_normalize())
+                            .unwrap_or_else(|| {
+                                config.query_nozzle_frame(tip_bed, travel_dir_bed).nozzle_axis
+                            });
+                        let frame_bed =
+                            NozzleFrame::from_nozzle_and_travel(nozzle_axis_bed, travel_dir_bed);
+                        let gravity_bed = if config.machine.kinematics_mode
+                            == crate::config::FiveAxisKinematicsMode::FiveAxisBC
+                            && config.machine.bed_tilts_with_b
+                        {
+                            config.machine.gravity_bed_at_bc(seg.b1_deg, seg.c1_deg)
+                        } else {
+                            config.query_gravity_bed(tip_bed)
+                        };
+                        return Some(ScrubbedToolheadPose {
+                            tip_bed,
+                            seg_start_bed,
+                            frame_bed,
+                            gravity_bed,
+                            tool_id: seg.tool_id as usize,
+                            b_deg: seg.b1_deg,
+                            c_deg: seg.c1_deg,
+                            layer_index: active_idx,
+                            move_index: move_idx,
+                            total_layer_moves: total_moves,
+                            move_label: seg.kind.label(),
+                            speed_mms: seg.cruise_speed_mms,
+                            width_mm: seg.width_mm,
+                            height_mm: seg.height_mm,
+                        });
+                    }
+                }
+            }
+
+            // 2. Raw toolpath polylines when planned G-code is not yet available
+            if let Some(ref tp_res) = self.cached_toolpaths {
+                if !tp_res.layers.is_empty() {
+                    let active_idx = self
+                        .highlighted_selected_layer
+                        .unwrap_or(self.selected_layer_max_idx)
+                        .min(tp_res.layers.len() - 1);
+                    let layer_tp = &tp_res.layers[active_idx];
+                    let total_vis: usize = layer_tp
+                        .paths
+                        .iter()
+                        .filter(|p| self.is_raw_path_visible(p.feature_kind) && p.points.len() >= 2)
+                        .map(|p| {
+                            if p.is_closed && p.points.len() >= 3 {
+                                p.points.len()
+                            } else {
+                                p.points.len() - 1
+                            }
+                        })
+                        .sum();
+
+                    if total_vis > 0 {
+                        let m_idx = self
+                            .layer_move_scrub_limit
+                            .unwrap_or(total_vis)
+                            .clamp(1, total_vis);
+                        let mut rem = m_idx - 1;
+                        for path in &layer_tp.paths {
+                            if !self.is_raw_path_visible(path.feature_kind) || path.points.len() < 2
+                            {
+                                continue;
+                            }
+                            let n = path.points.len();
+                            let seg_count = if path.is_closed && n >= 3 { n } else { n - 1 };
+                            if rem < seg_count {
+                                let pt0 = &path.points[rem];
+                                let pt1 = &path.points[(rem + 1) % n];
+                                let seg_start_bed =
+                                    obj_world_tf.transform_point(Vec3::new(pt0.x, pt0.y, pt0.z));
+                                let tip_bed =
+                                    obj_world_tf.transform_point(Vec3::new(pt1.x, pt1.y, pt1.z));
+                                let travel_dir_bed = (tip_bed - seg_start_bed)
+                                    .try_normalize()
+                                    .unwrap_or(Vec3::X);
+                                let nozzle_axis_bed = (obj_world_tf.rotation
+                                    * Vec3::new(pt1.nx, pt1.ny, pt1.nz))
+                                .try_normalize()
+                                .unwrap_or_else(|| {
+                                    config.query_nozzle_frame(tip_bed, travel_dir_bed).nozzle_axis
+                                });
+                                let frame_bed = NozzleFrame::from_nozzle_and_travel(
+                                    nozzle_axis_bed,
+                                    travel_dir_bed,
+                                );
+                                let (b_deg, c_deg, _) = config.machine.nozzle_axis_to_bc_deg(
+                                    nozzle_axis_bed,
+                                    0.0,
+                                    0.0,
+                                    config.slicing.max_nonplanar_slope_deg,
+                                );
+                                let gravity_bed = if config.machine.kinematics_mode
+                                    == crate::config::FiveAxisKinematicsMode::FiveAxisBC
+                                    && config.machine.bed_tilts_with_b
+                                {
+                                    config.machine.gravity_bed_at_bc(b_deg, c_deg)
+                                } else {
+                                    config.query_gravity_bed(tip_bed)
+                                };
+                                let kind_label =
+                                    crate::gcode::PlannedMoveKind::from_feature_kind(
+                                        path.feature_kind,
+                                    )
+                                    .label();
+                                return Some(ScrubbedToolheadPose {
+                                    tip_bed,
+                                    seg_start_bed,
+                                    frame_bed,
+                                    gravity_bed,
+                                    tool_id: config.active_tool_index,
+                                    b_deg,
+                                    c_deg,
+                                    layer_index: active_idx,
+                                    move_index: m_idx,
+                                    total_layer_moves: total_vis,
+                                    move_label: kind_label,
+                                    speed_mms: 0.0,
+                                    width_mm: pt1.width_mm,
+                                    height_mm: pt1.height_mm,
+                                });
+                            }
+                            rem -= seg_count;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Selected slicing isosurfaces when scrubbing layers/contours without toolpaths
+        if self.show_selected_layers {
+            if let Some(ref layers_res) = self.cached_selected_layers {
+                if !layers_res.layers.is_empty() {
+                    let active_idx = self
+                        .highlighted_selected_layer
+                        .unwrap_or(self.selected_layer_max_idx)
+                        .min(layers_res.layers.len() - 1);
+                    let layer = &layers_res.layers[active_idx];
+                    let num_segs = layer.contour_segments.len() / 6;
+                    if num_segs > 0 {
+                        let m_idx = self
+                            .layer_move_scrub_limit
+                            .unwrap_or(num_segs)
+                            .clamp(1, num_segs);
+                        let base = (m_idx - 1) * 6;
+                        let p0_local = Vec3::new(
+                            layer.contour_segments[base],
+                            layer.contour_segments[base + 1],
+                            layer.contour_segments[base + 2],
+                        );
+                        let p1_local = Vec3::new(
+                            layer.contour_segments[base + 3],
+                            layer.contour_segments[base + 4],
+                            layer.contour_segments[base + 5],
+                        );
+                        let mut best_normal_local = Vec3::Z;
+                        let mut best_d2 = f32::MAX;
+                        for v in &layer.vertices {
+                            let vp = Vec3::new(v.x, v.y, v.z);
+                            let d2 = vp.distance_squared(p1_local);
+                            if d2 < best_d2 {
+                                best_d2 = d2;
+                                best_normal_local = Vec3::new(v.nx, v.ny, v.nz);
+                            }
+                        }
+                        let seg_start_bed = obj_world_tf.transform_point(p0_local);
+                        let tip_bed = obj_world_tf.transform_point(p1_local);
+                        let travel_dir_bed = (tip_bed - seg_start_bed)
+                            .try_normalize()
+                            .unwrap_or(Vec3::X);
+                        let nozzle_axis_bed = (obj_world_tf.rotation * best_normal_local)
+                            .try_normalize()
+                            .unwrap_or_else(|| {
+                                config.query_nozzle_frame(tip_bed, travel_dir_bed).nozzle_axis
+                            });
+                        let frame_bed =
+                            NozzleFrame::from_nozzle_and_travel(nozzle_axis_bed, travel_dir_bed);
+                        let (b_deg, c_deg, _) = config.machine.nozzle_axis_to_bc_deg(
+                            nozzle_axis_bed,
+                            0.0,
+                            0.0,
+                            config.slicing.max_nonplanar_slope_deg,
+                        );
+                        let gravity_bed = if config.machine.kinematics_mode
+                            == crate::config::FiveAxisKinematicsMode::FiveAxisBC
+                            && config.machine.bed_tilts_with_b
+                        {
+                            config.machine.gravity_bed_at_bc(b_deg, c_deg)
+                        } else {
+                            config.query_gravity_bed(tip_bed)
+                        };
+                        return Some(ScrubbedToolheadPose {
+                            tip_bed,
+                            seg_start_bed,
+                            frame_bed,
+                            gravity_bed,
+                            tool_id: config.active_tool_index,
+                            b_deg,
+                            c_deg,
+                            layer_index: active_idx,
+                            move_index: m_idx,
+                            total_layer_moves: num_segs,
+                            move_label: "Isosurface Contour",
+                            speed_mms: 0.0,
+                            width_mm: config.slicing.outer_wall_width.target_mm,
+                            height_mm: layer.mean_thickness_mm,
+                        });
+                    }
+                }
+            }
+        }
+
+        None
+    }
 }
 
 /// Builds 3D oriented bead prism geometry across visible layers of a `PlannedGcodeResult`
@@ -1728,6 +2148,7 @@ fn build_planned_toolpaths_bead_mesh_parallel(
     }
     let lo = min_idx.min(total - 1);
     let hi = max_idx.min(total - 1).max(lo);
+    let active_scrub_layer = highlighted.unwrap_or(hi);
 
     let mut visible_layers: Vec<(usize, f32, usize)> = Vec::new();
     let mut total_est_segs = 0usize;
@@ -1752,6 +2173,11 @@ fn build_planned_toolpaths_bead_mesh_parallel(
                 layer_segs += 1;
             }
         }
+        if idx == active_scrub_layer {
+            if let Some(limit) = vis_state.layer_move_scrub_limit {
+                layer_segs = layer_segs.min(limit);
+            }
+        }
         if layer_segs > 0 {
             visible_layers.push((idx, dim_factor, layer_segs));
             total_est_segs += layer_segs;
@@ -1773,11 +2199,16 @@ fn build_planned_toolpaths_bead_mesh_parallel(
         .min(visible_layers.len());
 
     if num_threads <= 1 || total_est_segs < 256 {
-        for &(idx, dim_factor, _) in &visible_layers {
+        for &(idx, dim_factor, max_layer_segs) in &visible_layers {
+            let mut emitted = 0usize;
             for seg in &planned.layers[idx].segments {
                 if !vis_state.is_planned_segment_visible(seg) {
                     continue;
                 }
+                if emitted >= max_layer_segs {
+                    break;
+                }
+                emitted += 1;
                 append_planned_segment_bead_mesh(
                     seg,
                     planned,
@@ -1809,11 +2240,16 @@ fn build_planned_toolpaths_bead_mesh_parallel(
                 let mut c_nrm = Vec::with_capacity(est * 8);
                 let mut c_col = Vec::with_capacity(est * 8);
                 let mut c_ind = Vec::with_capacity(est * 36);
-                for &(idx, dim_factor, _) in chunk {
+                for &(idx, dim_factor, max_layer_segs) in chunk {
+                    let mut emitted = 0usize;
                     for seg in &planned.layers[idx].segments {
                         if !vis_state.is_planned_segment_visible(seg) {
                             continue;
                         }
+                        if emitted >= max_layer_segs {
+                            break;
+                        }
+                        emitted += 1;
                         append_planned_segment_bead_mesh(
                             seg,
                             planned,
@@ -1871,8 +2307,9 @@ fn build_raw_toolpaths_bead_mesh_parallel(
     }
     let lo = min_idx.min(total - 1);
     let hi = max_idx.min(total - 1).max(lo);
+    let active_scrub_layer = highlighted.unwrap_or(hi);
 
-    let mut visible_layers: Vec<(usize, f32, usize)> = Vec::new();
+    let mut visible_layers: Vec<(usize, f32, usize, Option<usize>)> = Vec::new();
     let mut total_est_pts = 0usize;
     for (idx, layer_tp) in tp_res.layers.iter().enumerate() {
         let is_hovered = highlighted == Some(idx);
@@ -1895,8 +2332,13 @@ fn build_raw_toolpaths_bead_mesh_parallel(
                 layer_pts += path.points.len();
             }
         }
-        if layer_pts > 0 {
-            visible_layers.push((idx, dim_factor, layer_pts));
+        let seg_limit = if idx == active_scrub_layer {
+            vis_state.layer_move_scrub_limit
+        } else {
+            None
+        };
+        if layer_pts > 0 && seg_limit != Some(0) {
+            visible_layers.push((idx, dim_factor, layer_pts, seg_limit));
             total_est_pts += layer_pts;
         }
     }
@@ -1916,21 +2358,29 @@ fn build_raw_toolpaths_bead_mesh_parallel(
         .min(visible_layers.len());
 
     if num_threads <= 1 || total_est_pts < 256 {
-        for &(idx, dim_factor, _) in &visible_layers {
+        for &(idx, dim_factor, _, seg_limit_opt) in &visible_layers {
+            let mut rem_segs = seg_limit_opt;
             for path in &tp_res.layers[idx].paths {
                 if !vis_state.is_raw_path_visible(path.feature_kind) || path.points.len() < 2 {
                     continue;
                 }
-                append_extrusion_path_bead_mesh(
+                if rem_segs == Some(0) {
+                    break;
+                }
+                let emitted = append_extrusion_path_bead_mesh(
                     path,
                     color_mode,
                     config,
                     dim_factor,
+                    rem_segs,
                     positions,
                     normals,
                     colors,
                     indices,
                 );
+                if let Some(ref mut rem) = rem_segs {
+                    *rem = rem.saturating_sub(emitted);
+                }
             }
         }
         return;
@@ -1951,23 +2401,31 @@ fn build_raw_toolpaths_bead_mesh_parallel(
                 let mut c_nrm = Vec::with_capacity(est * 4);
                 let mut c_col = Vec::with_capacity(est * 4);
                 let mut c_ind = Vec::with_capacity(est * 24);
-                for &(idx, dim_factor, _) in chunk {
+                for &(idx, dim_factor, _, seg_limit_opt) in chunk {
+                    let mut rem_segs = seg_limit_opt;
                     for path in &tp_res.layers[idx].paths {
                         if !vis_state.is_raw_path_visible(path.feature_kind)
                             || path.points.len() < 2
                         {
                             continue;
                         }
-                        append_extrusion_path_bead_mesh(
+                        if rem_segs == Some(0) {
+                            break;
+                        }
+                        let emitted = append_extrusion_path_bead_mesh(
                             path,
                             color_mode,
                             config,
                             dim_factor,
+                            rem_segs,
                             &mut c_pos,
                             &mut c_nrm,
                             &mut c_col,
                             &mut c_ind,
                         );
+                        if let Some(ref mut rem) = rem_segs {
+                            *rem = rem.saturating_sub(emitted);
+                        }
                     }
                 }
                 (c_pos, c_nrm, c_col, c_ind)
@@ -2377,14 +2835,22 @@ fn append_extrusion_path_bead_mesh(
     color_mode: ToolpathColorMode,
     config: &SlicerConfig,
     brightness_scale: f32,
+    max_segments: Option<usize>,
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
     colors: &mut Vec<[f32; 4]>,
     indices: &mut Vec<u32>,
-) {
+) -> usize {
     let n = path.points.len();
-    if n < 2 {
-        return;
+    if n < 2 || max_segments == Some(0) {
+        return 0;
+    }
+
+    let full_seg_count = if path.is_closed && n >= 3 { n } else { n - 1 };
+    let emit_seg_count = max_segments
+        .map_or(full_seg_count, |lim| lim.min(full_seg_count));
+    if emit_seg_count == 0 {
+        return 0;
     }
 
     let base_ring_start = positions.len() as u32;
@@ -2462,8 +2928,7 @@ fn append_extrusion_path_bead_mesh(
         colors.push(linear_rgba);
     }
 
-    let seg_count = if path.is_closed && n >= 3 { n } else { n - 1 };
-    for s in 0..seg_count {
+    for s in 0..emit_seg_count {
         let r0 = base_ring_start + (s as u32) * 4;
         let r1 = base_ring_start + (((s + 1) % n) as u32) * 4;
         for k in 0..4u32 {
@@ -2476,13 +2941,15 @@ fn append_extrusion_path_bead_mesh(
         }
     }
 
-    // End caps for open extrusion polylines
-    if !path.is_closed {
+    // End caps for open or partially-scrubbed extrusion polylines
+    if !path.is_closed || emit_seg_count < full_seg_count {
         let r_start = base_ring_start;
         indices.extend_from_slice(&[r_start, r_start + 2, r_start + 1, r_start, r_start + 3, r_start + 2]);
-        let r_end = base_ring_start + ((n - 1) as u32) * 4;
+        let r_end = base_ring_start + ((emit_seg_count % n) as u32) * 4;
         indices.extend_from_slice(&[r_end, r_end + 1, r_end + 2, r_end, r_end + 2, r_end + 3]);
     }
+
+    emit_seg_count
 }
 
 /// Computes the RGBA color for a toolpath point according to `ToolpathColorMode`.
@@ -6664,6 +7131,196 @@ mod tests {
         let default_cfg = crate::config::SlicerConfig::default();
         crate::ui::sync_config_to_backend(&default_cfg);
         let _ = ffi::remove_cad_object(obj.object_id);
+    }
+
+    #[test]
+    fn test_layer_and_within_layer_scrub_tracks_tool_and_gravity() {
+        let mut cfg = SlicerConfig::default();
+        cfg.machine.kinematics_mode = crate::config::FiveAxisKinematicsMode::FiveAxisBC;
+        cfg.machine.bed_tilts_with_b = true;
+
+        let tilted_nozzle = Vec3::new(0.5, 0.0, 0.8660254).normalize();
+        let make_seg = |p0: Vec3, p1: Vec3, b_deg: f32, c_deg: f32, noz: Vec3, tool_id: u32| {
+            crate::gcode::PlannedSegment {
+                p0_local: p0,
+                p1_local: p1,
+                p0_bed: p0,
+                p1_bed: p1,
+                nozzle_local_0: noz,
+                nozzle_local_1: noz,
+                nozzle_bed_0: noz,
+                nozzle_bed_1: noz,
+                b0_deg: b_deg,
+                c0_deg: c_deg,
+                b1_deg: b_deg,
+                c1_deg: c_deg,
+                kind: crate::gcode::PlannedMoveKind::OuterWall,
+                tool_id,
+                wall_index: 0,
+                width_mm: 0.42,
+                height_mm: 0.20,
+                length_mm: (p1 - p0).length(),
+                nominal_speed_mms: 80.0,
+                entry_speed_mms: 80.0,
+                cruise_speed_mms: 80.0,
+                exit_speed_mms: 80.0,
+                accel_mms2: 2000.0,
+                duration_s: 0.05,
+                delta_e_mm: 0.10,
+                volumetric_flow_mm3s: 6.7,
+                extrusion_multiplier: 1.0,
+                pressure_advance_s: 0.03,
+                melt_pressure_mm3s: 6.7,
+                retract_before_mm: 0.0,
+                unretract_after_mm: 0.0,
+            }
+        };
+
+        let planned = crate::gcode::PlannedGcodeResult {
+            layers: vec![
+                crate::gcode::PlannedLayerGcode {
+                    layer_index: 0,
+                    branch_id: 0,
+                    isovalue: 0.2,
+                    segments: vec![
+                        make_seg(
+                            Vec3::new(0.0, 0.0, 0.2),
+                            Vec3::new(10.0, 0.0, 0.2),
+                            0.0,
+                            0.0,
+                            Vec3::Z,
+                            0,
+                        ),
+                        make_seg(
+                            Vec3::new(10.0, 0.0, 0.2),
+                            Vec3::new(10.0, 10.0, 0.2),
+                            0.0,
+                            0.0,
+                            Vec3::Z,
+                            0,
+                        ),
+                    ],
+                },
+                crate::gcode::PlannedLayerGcode {
+                    layer_index: 1,
+                    branch_id: 0,
+                    isovalue: 0.4,
+                    segments: vec![
+                        make_seg(
+                            Vec3::new(0.0, 0.0, 0.4),
+                            Vec3::new(5.0, 0.0, 0.4),
+                            0.0,
+                            0.0,
+                            Vec3::Z,
+                            0,
+                        ),
+                        make_seg(
+                            Vec3::new(5.0, 0.0, 0.4),
+                            Vec3::new(12.0, 4.0, 0.8),
+                            30.0,
+                            0.0,
+                            tilted_nozzle,
+                            1,
+                        ),
+                        make_seg(
+                            Vec3::new(12.0, 4.0, 0.8),
+                            Vec3::new(20.0, 4.0, 1.2),
+                            0.0,
+                            0.0,
+                            Vec3::Z,
+                            0,
+                        ),
+                    ],
+                },
+            ],
+            gcode_text: String::new(),
+            total_time_s: 1.0,
+            total_filament_mm: 10.0,
+            total_filament_volume_mm3: 24.0,
+            total_filament_grams: 0.03,
+            bbox_min_bed: Vec3::ZERO,
+            bbox_max_bed: Vec3::splat(20.0),
+            exclude_object_name: "test".to_string(),
+            exclude_object_center_bed: [10.0, 5.0],
+            exclude_object_polygon_bed: Vec::new(),
+            extruding_move_count: 5,
+            travel_move_count: 0,
+            retract_count: 0,
+            min_speed_mms: 80.0,
+            max_speed_mms: 80.0,
+            min_accel_mms2: -2000.0,
+            max_accel_mms2: 2000.0,
+            min_flow_mm3s: 6.7,
+            max_flow_mm3s: 6.7,
+            min_width_mm: 0.42,
+            max_width_mm: 0.42,
+            min_height_mm: 0.20,
+            max_height_mm: 0.20,
+            min_flow_mult: 1.0,
+            max_flow_mult: 1.0,
+            min_pa_s: 0.03,
+            max_pa_s: 0.03,
+            min_pressure_mm3s: 6.7,
+            max_pressure_mm3s: 6.7,
+        };
+
+        let mut vis = FieldVisualizationState::default();
+        vis.show_toolpaths = true;
+        vis.selected_layer_min_idx = 0;
+        vis.selected_layer_max_idx = 1;
+        vis.cached_planned_gcode = Some(planned);
+
+        assert_eq!(vis.total_layer_count(), 2);
+        assert_eq!(vis.active_layer_total_moves(), 3);
+
+        // 1. Scrubbing to move 2 of layer 1 should place the tool at (12, 4, 0.8) with tilted nozzle & tilted gravity
+        vis.layer_move_scrub_limit = Some(2);
+        let pose = vis
+            .compute_active_scrub_pose(&cfg, Transform::IDENTITY)
+            .expect("Expected valid scrub pose");
+        assert_eq!(pose.layer_index, 1);
+        assert_eq!(pose.move_index, 2);
+        assert_eq!(pose.total_layer_moves, 3);
+        assert_eq!(pose.tool_id, 1);
+        assert!((pose.tip_bed - Vec3::new(12.0, 4.0, 0.8)).length() < 1.0e-4);
+        assert!((pose.frame_bed.nozzle_axis - tilted_nozzle).length() < 1.0e-4);
+        assert!(
+            pose.gravity_bed.x.abs() > 0.4,
+            "Expected bed-frame gravity to tilt with B=30 deg on move 2, got {:?}",
+            pose.gravity_bed
+        );
+
+        // 2. Verify that building the 3D bead mesh with `layer_move_scrub_limit = Some(2)` emits 2 moves on layer 0 + 2 moves on layer 1 = 4 prisms (32 vertices)
+        let mut pos = Vec::new();
+        let mut nrm = Vec::new();
+        let mut col = Vec::new();
+        let mut ind = Vec::new();
+        build_planned_toolpaths_bead_mesh_parallel(
+            vis.cached_planned_gcode.as_ref().unwrap(),
+            &vis,
+            &cfg,
+            0,
+            1,
+            1,
+            None,
+            ToolpathColorMode::ByFeatureType,
+            &mut pos,
+            &mut nrm,
+            &mut col,
+            &mut ind,
+        );
+        assert_eq!(pos.len(), 4 * 8);
+
+        // 3. Scrubbing layer slider back to layer 0 (`layer_move_scrub_limit = None`) tracks layer 0's end move
+        vis.selected_layer_max_idx = 0;
+        vis.layer_move_scrub_limit = None;
+        let pose_l0 = vis
+            .compute_active_scrub_pose(&cfg, Transform::IDENTITY)
+            .expect("Expected valid scrub pose on layer 0");
+        assert_eq!(pose_l0.layer_index, 0);
+        assert_eq!(pose_l0.move_index, 2);
+        assert!((pose_l0.tip_bed - Vec3::new(10.0, 10.0, 0.2)).length() < 1.0e-4);
+        assert!((pose_l0.gravity_bed - (-Vec3::Z)).length() < 1.0e-4);
     }
 }
 

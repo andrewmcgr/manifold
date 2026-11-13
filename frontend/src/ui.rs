@@ -460,6 +460,311 @@ fn render_interactive_toolpath_line_types_legend(
         });
 }
 
+/// Renders separate scrub controls for slicing layers (isosurfaces) and within-layer moves,
+/// plus the toggle & live readout for tracking the 3D Nozzle Frame, Tool Clearance Profile,
+/// and Bed-Coordinate Gravity Vector along the scrubbed trajectory.
+fn render_layer_and_move_scrub_controls(
+    ui: &mut egui::Ui,
+    vis_state: &mut FieldVisualizationState,
+    config: &mut SlicerConfig,
+    obj_world_tf: Transform,
+    show_within_layer_scrub: bool,
+    id_prefix: &str,
+) {
+    let total_layers = vis_state.total_layer_count();
+    if total_layers == 0 {
+        return;
+    }
+    let max_idx = total_layers - 1;
+    if vis_state.selected_layer_min_idx > max_idx {
+        vis_state.selected_layer_min_idx = max_idx;
+    }
+    if vis_state.selected_layer_max_idx > max_idx {
+        vis_state.selected_layer_max_idx = max_idx;
+    }
+    if vis_state.single_layer_scrub_mode {
+        vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
+    } else if vis_state.selected_layer_min_idx > vis_state.selected_layer_max_idx {
+        vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
+    }
+
+    ui.push_id(id_prefix, |ui| {
+        let mut layer_changed = false;
+
+        // 1. Layer (Isosurface) Scrub Header & Step Buttons
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Layer Scrub ({}/{}):",
+                    vis_state.selected_layer_max_idx + 1,
+                    total_layers
+                ))
+                .strong(),
+            );
+            if ui
+                .small_button("|<")
+                .on_hover_text("Jump to first layer (isosurface #0)")
+                .clicked()
+                && vis_state.selected_layer_max_idx != 0
+            {
+                vis_state.selected_layer_max_idx = 0;
+                vis_state.selected_layer_min_idx = 0;
+                layer_changed = true;
+            }
+            if ui
+                .small_button("<")
+                .on_hover_text("Previous layer (isosurface)")
+                .clicked()
+                && vis_state.selected_layer_max_idx > 0
+            {
+                vis_state.selected_layer_max_idx -= 1;
+                if vis_state.single_layer_scrub_mode
+                    || vis_state.selected_layer_min_idx > vis_state.selected_layer_max_idx
+                {
+                    vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
+                }
+                layer_changed = true;
+            }
+            if ui
+                .small_button(">")
+                .on_hover_text("Next layer (isosurface)")
+                .clicked()
+                && vis_state.selected_layer_max_idx < max_idx
+            {
+                vis_state.selected_layer_max_idx += 1;
+                if vis_state.single_layer_scrub_mode {
+                    vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
+                }
+                layer_changed = true;
+            }
+            if ui
+                .small_button(">|")
+                .on_hover_text("Show all layers up to the top layer")
+                .clicked()
+                && (vis_state.selected_layer_max_idx != max_idx
+                    || (!vis_state.single_layer_scrub_mode && vis_state.selected_layer_min_idx != 0))
+            {
+                vis_state.selected_layer_max_idx = max_idx;
+                if vis_state.single_layer_scrub_mode {
+                    vis_state.selected_layer_min_idx = max_idx;
+                } else {
+                    vis_state.selected_layer_min_idx = 0;
+                }
+                layer_changed = true;
+            }
+            if ui
+                .checkbox(&mut vis_state.single_layer_scrub_mode, "Single Layer")
+                .on_hover_text(
+                    "Lock Start Layer = End Layer to scrub a single non-planar isosurface / toolpath layer at a time",
+                )
+                .changed()
+            {
+                if vis_state.single_layer_scrub_mode {
+                    vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
+                } else {
+                    vis_state.selected_layer_min_idx = 0;
+                }
+                layer_changed = true;
+            }
+        });
+
+        if vis_state.single_layer_scrub_mode {
+            if ui
+                .add(
+                    egui::Slider::new(&mut vis_state.selected_layer_max_idx, 0..=max_idx)
+                        .text("Active Layer"),
+                )
+                .changed()
+            {
+                vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
+                layer_changed = true;
+            }
+        } else {
+            let max_changed = ui
+                .add(
+                    egui::Slider::new(&mut vis_state.selected_layer_max_idx, 0..=max_idx)
+                        .text("End Layer (Top)"),
+                )
+                .changed();
+            let min_changed = ui
+                .add(
+                    egui::Slider::new(&mut vis_state.selected_layer_min_idx, 0..=max_idx)
+                        .text("Start Layer"),
+                )
+                .changed();
+            if min_changed && vis_state.selected_layer_min_idx > vis_state.selected_layer_max_idx {
+                vis_state.selected_layer_max_idx = vis_state.selected_layer_min_idx;
+            } else if max_changed
+                && vis_state.selected_layer_max_idx < vis_state.selected_layer_min_idx
+            {
+                vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
+            }
+            layer_changed |= min_changed || max_changed;
+
+            if ui
+                .add(
+                    egui::Slider::new(&mut vis_state.selected_layer_stride, 1..=10)
+                        .text("Display Stride"),
+                )
+                .changed()
+            {
+                vis_state.dirty_selected_layers_mesh = true;
+                vis_state.dirty_toolpaths_mesh = true;
+                vis_state.dirty_slice = true;
+            }
+        }
+
+        if layer_changed {
+            vis_state.layer_move_scrub_limit = None;
+            vis_state.dirty_selected_layers_mesh = true;
+            vis_state.dirty_toolpaths_mesh = true;
+            vis_state.dirty_slice = true;
+        }
+
+        // 2. Within-Layer Move Scrubbing (along the active top layer `selected_layer_max_idx`)
+        if show_within_layer_scrub {
+            let total_moves = vis_state.active_layer_total_moves();
+            if total_moves > 0 {
+                let mut curr_move = vis_state
+                    .layer_move_scrub_limit
+                    .unwrap_or(total_moves)
+                    .clamp(1, total_moves);
+                let pct = (curr_move as f32 / total_moves as f32) * 100.0;
+                let mut move_changed = false;
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Within-Layer Move ({curr_move}/{total_moves}, {pct:.0}%):"
+                        ))
+                        .strong(),
+                    );
+                    if ui
+                        .small_button("|<")
+                        .on_hover_text("Jump to first move on the active layer")
+                        .clicked()
+                    {
+                        curr_move = 1;
+                        move_changed = true;
+                    }
+                    if ui
+                        .small_button("<")
+                        .on_hover_text("Step back 1 move (crosses to previous layer at move 1)")
+                        .clicked()
+                    {
+                        if curr_move > 1 {
+                            curr_move -= 1;
+                            move_changed = true;
+                        } else if vis_state.selected_layer_max_idx > 0 {
+                            vis_state.selected_layer_max_idx -= 1;
+                            if vis_state.single_layer_scrub_mode
+                                || vis_state.selected_layer_min_idx
+                                    > vis_state.selected_layer_max_idx
+                            {
+                                vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
+                            }
+                            vis_state.layer_move_scrub_limit = None;
+                            vis_state.dirty_selected_layers_mesh = true;
+                            vis_state.dirty_toolpaths_mesh = true;
+                            vis_state.dirty_slice = true;
+                        }
+                    }
+                    if ui
+                        .small_button(">")
+                        .on_hover_text("Step forward 1 move (crosses to next layer at layer end)")
+                        .clicked()
+                    {
+                        if curr_move < total_moves {
+                            curr_move += 1;
+                            move_changed = true;
+                        } else if vis_state.selected_layer_max_idx < max_idx {
+                            vis_state.selected_layer_max_idx += 1;
+                            if vis_state.single_layer_scrub_mode {
+                                vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
+                            }
+                            vis_state.layer_move_scrub_limit = Some(1);
+                            vis_state.dirty_selected_layers_mesh = true;
+                            vis_state.dirty_toolpaths_mesh = true;
+                            vis_state.dirty_slice = true;
+                        }
+                    }
+                    if ui
+                        .small_button(">|")
+                        .on_hover_text("Show 100% of moves on the active layer")
+                        .clicked()
+                    {
+                        curr_move = total_moves;
+                        move_changed = true;
+                    }
+                });
+
+                if ui
+                    .add(
+                        egui::Slider::new(&mut curr_move, 1..=total_moves)
+                            .text("Move Index"),
+                    )
+                    .changed()
+                {
+                    move_changed = true;
+                }
+
+                if move_changed {
+                    if curr_move >= total_moves {
+                        vis_state.layer_move_scrub_limit = None;
+                    } else {
+                        vis_state.layer_move_scrub_limit = Some(curr_move);
+                    }
+                    vis_state.dirty_toolpaths_mesh = true;
+                }
+            }
+        }
+
+        // 3. Tool Clearance, Nozzle Frame & Gravity Tracking Toggle + Live Pose Readout
+        ui.checkbox(
+            &mut config.machine.show_nozzle_clearance_gizmo,
+            "Show Tool Clearance, Nozzle Frame & Gravity at Scrub Point",
+        )
+        .on_hover_text(
+            "Draw the active tool's 3D clearance profile, orthonormal Nozzle Frame (X_travel, Y_lateral, Z_nozzle), and Bed-Coordinate Gravity Vector tracking the active layer & within-layer scrub position",
+        );
+
+        if config.machine.show_nozzle_clearance_gizmo || vis_state.layer_move_scrub_limit.is_some()
+        {
+            if let Some(pose) = vis_state.compute_active_scrub_pose(config, obj_world_tf) {
+                let speed_info = if pose.speed_mms > 0.0 {
+                    format!(
+                        " | v={:.0} mm/s | W={:.2} H={:.2} mm",
+                        pose.speed_mms, pose.width_mm, pose.height_mm
+                    )
+                } else {
+                    String::new()
+                };
+                ui.small(
+                    egui::RichText::new(format!(
+                        "L#{} M{}/{} [{}] T{} | Pos=({:+.1},{:+.1},{:+.1}) | B={:+.1}° C={:+.1}° | g_bed=({:+.2},{:+.2},{:+.2}){}",
+                        pose.layer_index,
+                        pose.move_index,
+                        pose.total_layer_moves,
+                        pose.move_label,
+                        pose.tool_id,
+                        pose.tip_bed.x,
+                        pose.tip_bed.y,
+                        pose.tip_bed.z,
+                        pose.b_deg,
+                        pose.c_deg,
+                        pose.gravity_bed.x,
+                        pose.gravity_bed.y,
+                        pose.gravity_bed.z,
+                        speed_info,
+                    ))
+                    .monospace()
+                    .color(egui::Color32::from_rgb(195, 220, 245)),
+                );
+            }
+        }
+    });
+}
+
 /// Renders the active toolpath legend (either continuous 5-tick gradient bar or categorical swatches).
 fn render_toolpath_color_legend(
     ui: &mut egui::Ui,
@@ -2801,6 +3106,19 @@ pub fn ui_workspace_system(
                 if show_hud_layers {
                     render_selected_layers_color_legend(ui, &vis_state, &config);
                 }
+                ui.add_space(4.0);
+                ui.separator();
+                let hud_obj_tf = vis_state
+                    .last_surface_color_transform
+                    .unwrap_or(Transform::IDENTITY);
+                render_layer_and_move_scrub_controls(
+                    ui,
+                    &mut vis_state,
+                    &mut config,
+                    hud_obj_tf,
+                    true,
+                    "hud_viewport_scrub",
+                );
             });
     }
 
@@ -5947,42 +6265,14 @@ fn render_view_and_inspection_panel(
                 {
                     vis_state.dirty_toolpaths_mesh = true;
                 }
-                if let Some(ref planned) = vis_state.cached_planned_gcode {
-                    let total_layers = planned.layers.len();
-                    if total_layers > 0 {
-                        let max_idx = total_layers - 1;
-                        let min_changed = ui
-                            .add(
-                                egui::Slider::new(
-                                    &mut vis_state.selected_layer_min_idx,
-                                    0..=max_idx,
-                                )
-                                .text("Start Layer"),
-                            )
-                            .changed();
-                        let max_changed = ui
-                            .add(
-                                egui::Slider::new(
-                                    &mut vis_state.selected_layer_max_idx,
-                                    0..=max_idx,
-                                )
-                                .text("End Layer"),
-                            )
-                            .changed();
-                        if min_changed
-                            && vis_state.selected_layer_min_idx > vis_state.selected_layer_max_idx
-                        {
-                            vis_state.selected_layer_max_idx = vis_state.selected_layer_min_idx;
-                        } else if max_changed
-                            && vis_state.selected_layer_max_idx < vis_state.selected_layer_min_idx
-                        {
-                            vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
-                        }
-                        if min_changed || max_changed {
-                            vis_state.dirty_toolpaths_mesh = true;
-                        }
-                    }
-                }
+                render_layer_and_move_scrub_controls(
+                    ui,
+                    vis_state,
+                    config,
+                    Transform::IDENTITY,
+                    true,
+                    "standalone_calibration_scrub",
+                );
                 if vis_state.show_toolpaths {
                     ui.horizontal(|ui| {
                         ui.label("Color By:");
@@ -6330,44 +6620,21 @@ fn render_view_and_inspection_panel(
             render_selected_layers_color_legend(ui, vis_state, config);
         }
 
+        let obj_world_tf = vis_state
+            .last_surface_color_transform
+            .unwrap_or_else(|| Transform::from_rotation(obj_rotation));
+
         if let Some(ref res) = vis_state.cached_selected_layers.clone() {
             let total_layers = res.layers.len();
             if total_layers > 0 {
-                let max_idx = total_layers - 1;
-                let mut range_changed = false;
-                let min_changed = ui
-                    .add(
-                        egui::Slider::new(&mut vis_state.selected_layer_min_idx, 0..=max_idx)
-                            .text("Start Layer"),
-                    )
-                    .changed();
-                let max_changed = ui
-                    .add(
-                        egui::Slider::new(&mut vis_state.selected_layer_max_idx, 0..=max_idx)
-                            .text("End Layer"),
-                    )
-                    .changed();
-                if min_changed
-                    && vis_state.selected_layer_min_idx > vis_state.selected_layer_max_idx
-                {
-                    vis_state.selected_layer_max_idx = vis_state.selected_layer_min_idx;
-                } else if max_changed
-                    && vis_state.selected_layer_max_idx < vis_state.selected_layer_min_idx
-                {
-                    vis_state.selected_layer_min_idx = vis_state.selected_layer_max_idx;
-                }
-                range_changed |= min_changed || max_changed;
-                range_changed |= ui
-                    .add(
-                        egui::Slider::new(&mut vis_state.selected_layer_stride, 1..=10)
-                            .text("Display Stride"),
-                    )
-                    .changed();
-                if range_changed {
-                    vis_state.dirty_selected_layers_mesh = true;
-                    vis_state.dirty_toolpaths_mesh = true;
-                    vis_state.dirty_slice = true;
-                }
+                render_layer_and_move_scrub_controls(
+                    ui,
+                    vis_state,
+                    config,
+                    obj_world_tf,
+                    !vis_state.show_toolpaths,
+                    "selected_isosurfaces_scrub",
+                );
 
                 let mut global_min_h = f32::MAX;
                 let mut global_max_h = 0.0f32;
@@ -6467,6 +6734,19 @@ fn render_view_and_inspection_panel(
         }
 
         if vis_state.show_toolpaths {
+            let obj_world_tf = vis_state
+                .last_surface_color_transform
+                .unwrap_or_else(|| Transform::from_rotation(obj_rotation));
+            render_layer_and_move_scrub_controls(
+                ui,
+                vis_state,
+                config,
+                obj_world_tf,
+                true,
+                "toolpaths_gcode_preview_scrub",
+            );
+            ui.add_space(3.0);
+
             ui.horizontal(|ui| {
                 ui.label("Color By:");
                 let combo_w = (ui.available_width() - 8.0).clamp(130.0, 220.0);
