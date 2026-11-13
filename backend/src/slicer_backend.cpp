@@ -9242,6 +9242,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
             }
 
             float lastSupportIso = -1.0e9f;
+            std::vector<std::array<float, 2>> prevLayerSupportXY;
             for (std::size_t layerIdx = 0; layerIdx < res.layers.size(); ++layerIdx) {
                 auto& layer = res.layers[layerIdx];
                 const float hLayer = layer.isovalue;
@@ -9339,14 +9340,16 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 d.floorH = br.floorH;
                                 d.groundedOnBed = br.groundedOnBed;
                                 for (const float hFork : br.forkHeights) {
-                                    if (hLayer >= hFork - 2.0f * effectiveStepH - 1.0e-4f &&
+                                    if (hFork > bedInterfaceBandMm + 1.5f * effectiveStepH &&
+                                        hLayer >= hFork - 4.5f * effectiveStepH - 1.0e-4f &&
                                         hLayer <= hFork + 2.0f * effectiveStepH + 1.0e-4f) {
                                         d.hasForkDiaphragm = true;
                                         break;
                                     }
                                 }
                                 if (br.mergedIntoBranch >= 0 &&
-                                    hLayer <= hBot + 1.5f * effectiveStepH + 1.0e-4f) {
+                                    hBot > bedInterfaceBandMm + 1.5f * effectiveStepH &&
+                                    hLayer <= hBot + 2.0f * effectiveStepH + 1.0e-4f) {
                                     d.hasForkDiaphragm = true;
                                 }
                                 d.tangentUp = {
@@ -9526,7 +9529,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             const float distIJ = std::hypot(
                                 uniqueDisks[i].u - uniqueDisks[j].u,
                                 uniqueDisks[i].v - uniqueDisks[j].v);
-                            if (distIJ <= diskOuterR[i] + diskOuterR[j] + 0.25f * lineWidthMm) {
+                            if (distIJ <= diskOuterR[i] + diskOuterR[j] + 1.25f * lineWidthMm) {
                                 uniqueDisks[i].hasForkDiaphragm = true;
                                 uniqueDisks[j].hasForkDiaphragm = true;
                             }
@@ -9541,7 +9544,8 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                               float ringRadius,
                                               std::uint8_t featureKind,
                                               bool isRoofContactZone,
-                                              bool allowClosed = true) -> bool {
+                                              bool allowClosed = true,
+                                              bool isInnerDiaphragm = false) -> bool {
                         if (ringRadius < 0.35f * lineWidthMm) {
                             return false;
                         }
@@ -9612,6 +9616,21 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 -sa * tU[2] + ca * tV[2]};
                             auto [ok, tp] =
                                 makeTreePoint(uPt, vPt, tangDir, d.tangentUp, isRoofContactZone);
+                            if (ok && isInnerDiaphragm && !prevLayerSupportXY.empty()) {
+                                const float maxCorbelStepSq = 0.88f * 0.88f;
+                                bool supportedByPrev = false;
+                                for (const auto& prevPt : prevLayerSupportXY) {
+                                    const float dx = tp.x - prevPt[0];
+                                    const float dy = tp.y - prevPt[1];
+                                    if (dx * dx + dy * dy <= maxCorbelStepSq) {
+                                        supportedByPrev = true;
+                                        break;
+                                    }
+                                }
+                                if (!supportedByPrev) {
+                                    ok = false;
+                                }
+                            }
                             if (ok) {
                                 currentArc.push_back(tp);
                             } else {
@@ -9645,7 +9664,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             for (float rRing = flangeR - 0.5f * lineWidthMm;
                                  rRing >= 0.45f * lineWidthMm;
                                  rRing -= interfaceSpacingMm) {
-                                emitRingOnDisk(diskIdx, rRing, 8, false, true);
+                                emitRingOnDisk(diskIdx, rRing, 8, false, true, false);
                             }
                         } else if (isRoofIntf) {
                             // When `treeCanopyCells` is empty, emit outer framing ring on roof interface;
@@ -9655,11 +9674,12 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 diskEmitted[diskIdx] = true;
                                 const float outerR =
                                     std::max(0.5f * lineWidthMm, d.radius - 0.25f * lineWidthMm);
-                                emitRingOnDisk(diskIdx, outerR, 8, true, true);
+                                emitRingOnDisk(diskIdx, outerR, 8, true, true, false);
                             }
                         } else {
                             // Hollow organic tree branch & trunk walls (`feature_kind = 7`)
                             diskEmitted[diskIdx] = true;
+                            float innerCoreR = d.radius;
                             bool outerPerimeterClosed = true;
                             for (std::uint32_t w = 0; w < wallCount; ++w) {
                                 const float rWall =
@@ -9668,9 +9688,21 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                     break;
                                 }
                                 const bool ringClosed =
-                                    emitRingOnDisk(diskIdx, rWall, 7, diskVertContact, outerPerimeterClosed);
+                                    emitRingOnDisk(diskIdx, rWall, 7, diskVertContact, outerPerimeterClosed, false);
                                 if (w == 0) {
                                     outerPerimeterClosed = ringClosed;
+                                }
+                                innerCoreR = rWall - 0.5f * lineWidthMm;
+                            }
+                            // At branch fork / pinch-off junctions (`d.hasForkDiaphragm`), corbel
+                            // concentric diaphragm rings (`feature_kind = 8`) inward on the
+                            // `c_w = (w + 0.5) * lineWidthMm` union level-set offset lattice so
+                            // splitting child branch walls never print in mid-air over a hollow trunk.
+                            if (d.hasForkDiaphragm) {
+                                for (float rInner = innerCoreR - 0.5f * lineWidthMm;
+                                     rInner >= 0.45f * lineWidthMm;
+                                     rInner -= lineWidthMm) {
+                                    emitRingOnDisk(diskIdx, rInner, 8, diskVertContact, outerPerimeterClosed, true);
                                 }
                             }
                         }
@@ -10089,6 +10121,12 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
 
                 if (!supportPathsForLayer.empty()) {
                     lastSupportIso = hLayer;
+                    prevLayerSupportXY.clear();
+                    for (const auto& sp : supportPathsForLayer) {
+                        for (const auto& pt : sp.points) {
+                            prevLayerSupportXY.push_back({pt.x, pt.y});
+                        }
+                    }
                     // Prepend support paths before object walls on this layer
                     std::vector<ExtrusionPath> combined;
                     combined.reserve(supportPathsForLayer.size() + layer.paths.size());
