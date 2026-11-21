@@ -26,7 +26,8 @@ use crate::io::threemf::{save_project_to_3mf, ExportableObject};
 use crate::io::load_files_into_backend;
 use crate::moonraker::{
     open_printer_web_ui_in_browser, query_moonraker_print_status, resolve_printer_web_ui_url,
-    test_moonraker_connection, upload_gcode_to_moonraker, CertPickKind, MoonrakerUiState,
+    test_moonraker_connection, upload_gcode_to_moonraker_with_progress, CertPickKind,
+    MoonrakerUiState,
 };
 use crate::presets::{LeftPanelTab, PresetCategory, PresetLibrary};
 use crate::scene::{
@@ -2312,15 +2313,13 @@ pub fn ui_workspace_system(
                     has_planned && !is_computing && !is_io_busy && !is_uploading;
                 let mut trigger_upload: Option<bool> = None;
 
+                let upload_btn_label = if is_uploading && !moonraker_state.upload_start_print {
+                    "Uploading..."
+                } else {
+                    "Upload G-code"
+                };
                 if ui
-                    .add_enabled(
-                        can_upload,
-                        egui::Button::new(if is_uploading {
-                            "Uploading..."
-                        } else {
-                            "Upload G-code"
-                        }),
-                    )
+                    .add_enabled(can_upload, egui::Button::new(upload_btn_label))
                     .on_hover_text(format!(
                         "Upload planned G-code to {proto_label} ({}) without starting a print",
                         config.network.printer_uri.trim()
@@ -2330,11 +2329,16 @@ pub fn ui_workspace_system(
                     trigger_upload = Some(false);
                 }
 
+                let upload_print_label = if is_uploading && moonraker_state.upload_start_print {
+                    "Uploading & Printing..."
+                } else {
+                    "Upload & Print"
+                };
                 if ui
                     .add_enabled(
                         can_upload,
                         egui::Button::new(
-                            egui::RichText::new("Upload & Print")
+                            egui::RichText::new(upload_print_label)
                                 .strong()
                                 .color(egui::Color32::from_rgb(130, 230, 165)),
                         ),
@@ -2361,29 +2365,14 @@ pub fn ui_workspace_system(
                         } else {
                             "manifold2_calibration".to_string()
                         };
-                        let upload_filename = format!("{stem}.gcode");
-                        let gcode_bytes = planned.gcode_text.clone();
-                        let net_cfg = config.network.clone();
-                        plate.status_message = if start_print {
-                            format!(
-                                "Uploading '{upload_filename}' to {} and starting print...",
-                                net_cfg.printer_uri.trim()
-                            )
-                        } else {
-                            format!(
-                                "Uploading '{upload_filename}' to {}...",
-                                net_cfg.printer_uri.trim()
-                            )
-                        };
-                        let task = IoTaskPool::get().spawn(async move {
-                            upload_gcode_to_moonraker(
-                                &net_cfg,
-                                &upload_filename,
-                                gcode_bytes,
-                                start_print,
-                            )
-                        });
-                        moonraker_state.pending_upload_task = Some(task);
+                        spawn_network_gcode_upload(
+                            &mut moonraker_state,
+                            config.network.clone(),
+                            format!("{stem}.gcode"),
+                            planned.gcode_text.clone(),
+                            start_print,
+                            &mut plate.status_message,
+                        );
                     }
                 }
             }
@@ -4411,6 +4400,44 @@ pub fn ui_workspace_system(
     );
 }
 
+/// Initializes streaming upload tracking state and spawns a non-blocking network upload task.
+fn spawn_network_gcode_upload(
+    moonraker_state: &mut MoonrakerUiState,
+    net_cfg: crate::config::MoonrakerNetworkConfig,
+    upload_filename: String,
+    gcode_bytes: String,
+    start_print: bool,
+    status_message: &mut String,
+) {
+    *status_message = if start_print {
+        format!(
+            "Uploading '{upload_filename}' to {} and starting print...",
+            net_cfg.printer_uri.trim()
+        )
+    } else {
+        format!(
+            "Uploading '{upload_filename}' to {}...",
+            net_cfg.printer_uri.trim()
+        )
+    };
+    moonraker_state.upload_start_print = start_print;
+    moonraker_state.last_upload_result = None;
+    moonraker_state
+        .upload_progress
+        .reset(gcode_bytes.len() as u64, status_message.as_str());
+    let prog = moonraker_state.upload_progress.clone();
+    let task = IoTaskPool::get().spawn(async move {
+        upload_gcode_to_moonraker_with_progress(
+            &net_cfg,
+            &upload_filename,
+            gcode_bytes,
+            start_print,
+            Some(&prog),
+        )
+    });
+    moonraker_state.pending_upload_task = Some(task);
+}
+
 /// Renders a compact network printer status monitor (state badge, active filename, progress bar,
 /// elapsed/ETA, refresh button, and "Web UI ↗" browser launcher) in the top workflow bar.
 fn render_moonraker_toolbar_status_strip(
@@ -4421,73 +4448,93 @@ fn render_moonraker_toolbar_status_strip(
 ) {
     let proto_label = config.network.protocol.short_label();
     ui.label(egui::RichText::new("Printer:").strong());
-    match moonraker_state.last_status {
-        Some(Ok(ref st)) => {
-            let state_lower = st.state.to_ascii_lowercase();
-            let (badge_text, badge_color) = match state_lower.as_str() {
-                "printing" => ("Printing", egui::Color32::from_rgb(95, 225, 145)),
-                "paused" => ("Paused", egui::Color32::from_rgb(245, 195, 85)),
-                "complete" => ("Complete", egui::Color32::from_rgb(110, 215, 235)),
-                "standby" | "ready" => ("Standby", egui::Color32::from_rgb(175, 195, 215)),
-                "cancelled" => ("Cancelled", egui::Color32::from_rgb(230, 155, 110)),
-                "error" => ("Error", egui::Color32::from_rgb(245, 105, 105)),
-                _ => (st.state.as_str(), egui::Color32::from_rgb(185, 195, 210)),
-            };
-            let hover_msg = if st.message.is_empty() {
-                format!("{proto_label} printer state: {}", st.state)
-            } else {
-                format!("{proto_label} printer state: {} — {}", st.state, st.message)
-            };
-            ui.label(
-                egui::RichText::new(format!("[{badge_text}]"))
-                    .strong()
-                    .color(badge_color),
-            )
-            .on_hover_text(hover_msg);
-
-            if !st.filename.is_empty() {
-                ui.small(
-                    egui::RichText::new(&st.filename)
-                        .monospace()
-                        .color(egui::Color32::from_gray(225)),
-                )
-                .on_hover_text(format!("Current G-code file active on {proto_label}"));
-            }
-
-            if st.is_printing_or_paused()
-                || state_lower == "complete"
-                || st.progress > 0.001
-            {
-                let pct_text = if let Some(eta_str) = st.formatted_eta() {
-                    format!("{:.0}% (ETA {eta_str})", (st.progress * 100.0).clamp(0.0, 100.0))
-                } else {
-                    format!("{:.0}%", (st.progress * 100.0).clamp(0.0, 100.0))
+    if let Some(snap) = moonraker_state.active_upload_progress() {
+        ui.ctx().request_repaint();
+        ui.label(
+            egui::RichText::new("[Uploading]")
+                .strong()
+                .color(egui::Color32::from_rgb(120, 205, 250)),
+        )
+        .on_hover_text(&snap.stage);
+        ui.spinner();
+        ui.add(
+            egui::ProgressBar::new(snap.fraction.clamp(0.0, 1.0))
+                .desired_width(165.0)
+                .animate(true)
+                .text(snap.bar_text()),
+        )
+        .on_hover_text(&snap.stage);
+    } else {
+        match moonraker_state.last_status {
+            Some(Ok(ref st)) => {
+                let state_lower = st.state.to_ascii_lowercase();
+                let (badge_text, badge_color) = match state_lower.as_str() {
+                    "printing" => ("Printing", egui::Color32::from_rgb(95, 225, 145)),
+                    "paused" => ("Paused", egui::Color32::from_rgb(245, 195, 85)),
+                    "complete" => ("Complete", egui::Color32::from_rgb(110, 215, 235)),
+                    "standby" | "ready" => ("Standby", egui::Color32::from_rgb(175, 195, 215)),
+                    "cancelled" => ("Cancelled", egui::Color32::from_rgb(230, 155, 110)),
+                    "error" => ("Error", egui::Color32::from_rgb(245, 105, 105)),
+                    _ => (st.state.as_str(), egui::Color32::from_rgb(185, 195, 210)),
                 };
-                ui.add(
-                    egui::ProgressBar::new(st.progress.clamp(0.0, 1.0))
-                        .desired_width(145.0)
-                        .text(pct_text),
+                let hover_msg = if st.message.is_empty() {
+                    format!("{proto_label} printer state: {}", st.state)
+                } else {
+                    format!("{proto_label} printer state: {} — {}", st.state, st.message)
+                };
+                ui.label(
+                    egui::RichText::new(format!("[{badge_text}]"))
+                        .strong()
+                        .color(badge_color),
                 )
-                .on_hover_text(format!(
-                    "Elapsed: {} | Progress: {:.1}%",
-                    st.formatted_elapsed(),
-                    st.progress * 100.0
-                ));
+                .on_hover_text(hover_msg);
+
+                if !st.filename.is_empty() {
+                    ui.small(
+                        egui::RichText::new(&st.filename)
+                            .monospace()
+                            .color(egui::Color32::from_gray(225)),
+                    )
+                    .on_hover_text(format!("Current G-code file active on {proto_label}"));
+                }
+
+                if st.is_printing_or_paused()
+                    || state_lower == "complete"
+                    || st.progress > 0.001
+                {
+                    let pct_text = if let Some(eta_str) = st.formatted_eta() {
+                        format!("{:.0}% (ETA {eta_str})", (st.progress * 100.0).clamp(0.0, 100.0))
+                    } else {
+                        format!("{:.0}%", (st.progress * 100.0).clamp(0.0, 100.0))
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(st.progress.clamp(0.0, 1.0))
+                            .desired_width(145.0)
+                            .text(pct_text),
+                    )
+                    .on_hover_text(format!(
+                        "Elapsed: {} | Progress: {:.1}%",
+                        st.formatted_elapsed(),
+                        st.progress * 100.0
+                    ));
+                }
             }
-        }
-        Some(Err(ref err)) => {
-            ui.label(
-                egui::RichText::new("[Offline]")
-                    .strong()
-                    .color(egui::Color32::from_rgb(235, 115, 115)),
-            )
-            .on_hover_text(err);
-        }
-        None => {
-            if moonraker_state.pending_status_task.is_some() {
-                ui.small(egui::RichText::new("Polling...").color(egui::Color32::GRAY));
-            } else {
-                ui.small(egui::RichText::new("Idle").color(egui::Color32::GRAY));
+            Some(Err(ref err)) => {
+                ui.label(
+                    egui::RichText::new("[Offline]")
+                        .strong()
+                        .color(egui::Color32::from_rgb(235, 115, 115)),
+                )
+                .on_hover_text(err);
+            }
+            None => {
+                if moonraker_state.pending_status_task.is_some() {
+                    ui.ctx().request_repaint();
+                    ui.spinner();
+                    ui.small(egui::RichText::new("Polling...").color(egui::Color32::GRAY));
+                } else {
+                    ui.small(egui::RichText::new("Idle").color(egui::Color32::GRAY));
+                }
             }
         }
     }
@@ -5536,6 +5583,10 @@ fn render_printer_config_tab(
                         }));
                 }
             }
+            if is_testing {
+                ui.ctx().request_repaint();
+                ui.spinner();
+            }
         });
 
         if let Some(ref test_res) = moonraker_state.last_test_result {
@@ -5560,7 +5611,22 @@ fn render_printer_config_tab(
             );
         }
 
-        if let Some(ref up_res) = moonraker_state.last_upload_result {
+        if let Some(snap) = moonraker_state.active_upload_progress() {
+            ui.ctx().request_repaint();
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.small(
+                    egui::RichText::new(&snap.stage)
+                        .color(egui::Color32::from_rgb(145, 215, 245)),
+                );
+            });
+            ui.add(
+                egui::ProgressBar::new(snap.fraction.clamp(0.0, 1.0))
+                    .desired_width(ui.available_width().clamp(140.0, 320.0))
+                    .animate(true)
+                    .text(snap.bar_text()),
+            );
+        } else if let Some(ref up_res) = moonraker_state.last_upload_result {
             match up_res {
                 Ok(report) => {
                     ui.small(
@@ -10944,6 +11010,11 @@ pub fn poll_io_tasks_system(
                 }
             }
             moonraker_state.last_upload_result = Some(res);
+        } else {
+            let snap = moonraker_state.upload_progress.snapshot();
+            if !snap.stage.is_empty() {
+                plate.status_message = snap.stage;
+            }
         }
     }
 
@@ -11696,15 +11767,13 @@ fn render_calibration_utilities_window(
                     let proto_label = config.network.protocol.short_label();
                     let is_uploading = moonraker_state.pending_upload_task.is_some();
                     let can_upload = !is_computing && !is_io_busy && !is_uploading;
+                    let upload_btn_label = if is_uploading && !moonraker_state.upload_start_print {
+                        "Uploading..."
+                    } else {
+                        "Upload to Printer"
+                    };
                     if ui
-                        .add_enabled(
-                            can_upload,
-                            egui::Button::new(if is_uploading {
-                                "Uploading..."
-                            } else {
-                                "Upload to Printer"
-                            }),
-                        )
+                        .add_enabled(can_upload, egui::Button::new(upload_btn_label))
                         .on_hover_text(format!(
                             "Generate and upload calibration G-code to {proto_label} ({}) without starting a print",
                             config.network.printer_uri.trim()
@@ -11713,11 +11782,16 @@ fn render_calibration_utilities_window(
                     {
                         request_upload = Some(false);
                     }
+                    let upload_print_label = if is_uploading && moonraker_state.upload_start_print {
+                        "Uploading & Printing..."
+                    } else {
+                        "Upload & Print"
+                    };
                     if ui
                         .add_enabled(
                             can_upload,
                             egui::Button::new(
-                                egui::RichText::new("Upload & Print")
+                                egui::RichText::new(upload_print_label)
                                     .strong()
                                     .color(egui::Color32::from_rgb(130, 230, 165)),
                             ),
@@ -11847,29 +11921,14 @@ fn render_calibration_utilities_window(
                     });
                     plate.pending_save_task = Some(save_task);
                 } else if let Some(start_print) = request_upload {
-                    let upload_filename = format!("{stem}.gcode");
-                    let gcode_bytes = res.gcode_text;
-                    let net_cfg = config.network.clone();
-                    plate.status_message = if start_print {
-                        format!(
-                            "Uploading '{upload_filename}' to {} and starting print...",
-                            net_cfg.printer_uri.trim()
-                        )
-                    } else {
-                        format!(
-                            "Uploading '{upload_filename}' to {}...",
-                            net_cfg.printer_uri.trim()
-                        )
-                    };
-                    let task = IoTaskPool::get().spawn(async move {
-                        upload_gcode_to_moonraker(
-                            &net_cfg,
-                            &upload_filename,
-                            gcode_bytes,
-                            start_print,
-                        )
-                    });
-                    moonraker_state.pending_upload_task = Some(task);
+                    spawn_network_gcode_upload(
+                        moonraker_state,
+                        config.network.clone(),
+                        format!("{stem}.gcode"),
+                        res.gcode_text,
+                        start_print,
+                        &mut plate.status_message,
+                    );
                 }
             }
         });

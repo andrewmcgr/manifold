@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::io::{Cursor, Read};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
 use bevy::tasks::Task;
-use reqwest::blocking::{multipart, Client};
+use reqwest::blocking::{multipart, Body, Client};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
 use reqwest::{Certificate, Identity, StatusCode};
 use serde_json::Value;
@@ -116,6 +118,193 @@ impl MoonrakerUploadReport {
     }
 }
 
+/// Formats a byte count cleanly in B, KB, or MB.
+pub fn format_byte_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", (bytes as f64) / 1024.0)
+    } else {
+        format!("{:.2} MB", (bytes as f64) / (1024.0 * 1024.0))
+    }
+}
+
+/// Formats transferred bytes against total bytes (e.g. `"48.0 KB / 128.0 KB"`).
+pub fn format_byte_progress(sent: u64, total: u64) -> String {
+    format!("{} / {}", format_byte_size(sent), format_byte_size(total))
+}
+
+/// Snapshot of an active network printer upload's progress and status stage.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UploadProgressSnapshot {
+    pub fraction: f32,
+    pub bytes_sent: u64,
+    pub total_bytes: u64,
+    pub stage: String,
+}
+
+impl UploadProgressSnapshot {
+    /// Formats concise progress bar overlay text combining percentage, transferred bytes, or stage.
+    pub fn bar_text(&self) -> String {
+        let pct = (self.fraction * 100.0).clamp(0.0, 100.0);
+        if self.total_bytes > 0 && self.bytes_sent > 0 {
+            format!(
+                "{pct:.0}% ({})",
+                format_byte_progress(self.bytes_sent, self.total_bytes)
+            )
+        } else if self.stage.is_empty() {
+            format!("{pct:.0}%")
+        } else {
+            format!("{pct:.0}% — {}", self.stage)
+        }
+    }
+}
+
+#[derive(Default)]
+struct UploadProgressInner {
+    bytes_sent: AtomicU64,
+    total_bytes: AtomicU64,
+    fraction_bits: AtomicU32,
+    stage: Mutex<String>,
+}
+
+/// Thread-safe handle shared between background network upload tasks and the immediate-mode UI.
+#[derive(Clone, Default)]
+pub struct UploadProgressTracker {
+    inner: Arc<UploadProgressInner>,
+}
+
+impl UploadProgressTracker {
+    /// Initializes upload progress state before spawning a background transfer task.
+    pub fn reset(&self, total_bytes: u64, initial_stage: impl Into<String>) {
+        self.inner.bytes_sent.store(0, Ordering::Relaxed);
+        self.inner.total_bytes.store(total_bytes, Ordering::Relaxed);
+        self.inner
+            .fraction_bits
+            .store(0.02f32.to_bits(), Ordering::Relaxed);
+        if let Ok(mut st) = self.inner.stage.lock() {
+            *st = initial_stage.into();
+        }
+    }
+
+    /// Updates the fractional progress and stage text without altering byte counters.
+    pub fn set_stage(&self, fraction: f32, stage: impl Into<String>) {
+        self.inner
+            .fraction_bits
+            .store(fraction.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        if let Ok(mut st) = self.inner.stage.lock() {
+            *st = stage.into();
+        }
+    }
+
+    /// Updates transferred byte counters and maps `[0..total]` across `[frac_start..frac_end]`.
+    pub fn set_bytes_progress(
+        &self,
+        sent: u64,
+        total: u64,
+        frac_start: f32,
+        frac_end: f32,
+        prefix: &str,
+    ) {
+        self.inner.bytes_sent.store(sent, Ordering::Relaxed);
+        self.inner.total_bytes.store(total, Ordering::Relaxed);
+        let ratio = if total > 0 {
+            (sent as f32 / total as f32).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let frac = (frac_start + ratio * (frac_end - frac_start)).clamp(0.0, 1.0);
+        self.inner
+            .fraction_bits
+            .store(frac.to_bits(), Ordering::Relaxed);
+        if let Ok(mut st) = self.inner.stage.lock() {
+            *st = format!("{prefix} ({})...", format_byte_progress(sent, total));
+        }
+    }
+
+    /// Returns a consistent point-in-time snapshot of upload progress.
+    pub fn snapshot(&self) -> UploadProgressSnapshot {
+        let bytes_sent = self.inner.bytes_sent.load(Ordering::Relaxed);
+        let total_bytes = self.inner.total_bytes.load(Ordering::Relaxed);
+        let fraction = f32::from_bits(self.inner.fraction_bits.load(Ordering::Relaxed));
+        let stage = self
+            .inner
+            .stage
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        UploadProgressSnapshot {
+            fraction: if fraction.is_finite() {
+                fraction.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+            bytes_sent,
+            total_bytes,
+            stage,
+        }
+    }
+}
+
+/// Chunked `Read` wrapper reporting HTTP streaming progress cleanly without buffering chunks on retry.
+struct UploadProgressReader {
+    cursor: Cursor<Arc<[u8]>>,
+    total: u64,
+    sent: u64,
+    tracker: Option<UploadProgressTracker>,
+    frac_start: f32,
+    frac_end: f32,
+    prefix: String,
+    waiting_stage: String,
+}
+
+impl UploadProgressReader {
+    fn new(
+        payload: Arc<[u8]>,
+        tracker: Option<&UploadProgressTracker>,
+        frac_start: f32,
+        frac_end: f32,
+        prefix: impl Into<String>,
+        waiting_stage: impl Into<String>,
+    ) -> Self {
+        let total = payload.len() as u64;
+        Self {
+            cursor: Cursor::new(payload),
+            total,
+            sent: 0,
+            tracker: tracker.cloned(),
+            frac_start,
+            frac_end,
+            prefix: prefix.into(),
+            waiting_stage: waiting_stage.into(),
+        }
+    }
+}
+
+impl Read for UploadProgressReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let max_chunk = buf.len().min(16 * 1024);
+        let n = self.cursor.read(&mut buf[..max_chunk])?;
+        if n > 0 {
+            self.sent += n as u64;
+            if let Some(ref tr) = self.tracker {
+                tr.set_bytes_progress(
+                    self.sent,
+                    self.total,
+                    self.frac_start,
+                    self.frac_end,
+                    &self.prefix,
+                );
+            }
+        } else if self.total > 0 {
+            if let Some(ref tr) = self.tracker {
+                tr.set_stage(self.frac_end, self.waiting_stage.clone());
+            }
+        }
+        Ok(n)
+    }
+}
+
 /// Bevy resource holding non-blocking background tasks and latest network printer state for the UI.
 #[derive(Resource, Default)]
 pub struct MoonrakerUiState {
@@ -127,9 +316,20 @@ pub struct MoonrakerUiState {
     pub pending_status_task: Option<Task<(Result<MoonrakerPrintStatus, String>, Option<(String, Option<f64>)>)>>,
     pub pending_test_task: Option<Task<Result<MoonrakerConnectionReport, String>>>,
     pub pending_upload_task: Option<Task<Result<MoonrakerUploadReport, String>>>,
+    pub upload_progress: UploadProgressTracker,
+    pub upload_start_print: bool,
     pub pending_cert_pick_task: Option<(CertPickKind, Task<Option<String>>)>,
     pub last_poll_instant: Option<Instant>,
     pub cached_metadata_estimate: Option<(String, Option<f64>)>,
+}
+
+impl MoonrakerUiState {
+    /// Returns the active upload's progress snapshot when a network upload task is running.
+    pub fn active_upload_progress(&self) -> Option<UploadProgressSnapshot> {
+        self.pending_upload_task
+            .as_ref()
+            .map(|_| self.upload_progress.snapshot())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1672,6 +1872,30 @@ fn select_prusalink_writable_storage(storage_json: &Value) -> String {
     "usb".to_string()
 }
 
+fn build_streaming_multipart_part(
+    payload: Arc<[u8]>,
+    clean_filename: String,
+    tracker: Option<&UploadProgressTracker>,
+    frac_start: f32,
+    frac_end: f32,
+    prefix: String,
+    waiting_stage: String,
+) -> Result<multipart::Part, String> {
+    let total = payload.len() as u64;
+    let reader = UploadProgressReader::new(
+        payload,
+        tracker,
+        frac_start,
+        frac_end,
+        prefix,
+        waiting_stage,
+    );
+    multipart::Part::reader_with_length(reader, total)
+        .file_name(clean_filename)
+        .mime_str("application/octet-stream")
+        .map_err(|e| format!("Failed to construct multipart file payload: {e}"))
+}
+
 /// Uploads G-code to a PrusaLink printer via `PUT /api/v1/files/{storage}/{filename}`
 /// (`Print-After-Upload: ?1` / `?0`, `Overwrite: ?1`), pre-negotiating HTTP Digest auth
 /// via `GET /api/v1/storage` and falling back to legacy `POST /api/files/local` on HTTP 404/405.
@@ -1681,6 +1905,20 @@ pub fn upload_gcode_to_prusalink(
     gcode_text: String,
     start_print: bool,
 ) -> Result<MoonrakerUploadReport, String> {
+    upload_gcode_to_prusalink_with_progress(cfg, filename, gcode_text, start_print, None)
+}
+
+/// Streaming variant of [`upload_gcode_to_prusalink`] that reports transfer progress to `progress`.
+pub fn upload_gcode_to_prusalink_with_progress(
+    cfg: &MoonrakerNetworkConfig,
+    filename: &str,
+    gcode_text: String,
+    start_print: bool,
+    progress: Option<&UploadProgressTracker>,
+) -> Result<MoonrakerUploadReport, String> {
+    if let Some(tr) = progress {
+        tr.set_stage(0.04, "Connecting to PrusaLink...");
+    }
     let base = normalize_moonraker_base_uri(&cfg.printer_uri)?;
     let client = build_moonraker_client(cfg, Duration::from_secs(120))?;
 
@@ -1721,23 +1959,36 @@ pub fn upload_gcode_to_prusalink(
         }
     }
 
-    let gcode_bytes = gcode_text.into_bytes();
-    let bytes_uploaded = gcode_bytes.len();
+    let payload: Arc<[u8]> = gcode_text.into_bytes().into();
+    let bytes_uploaded = payload.len();
     let encoded_name = url_encode_path_segment(&clean_filename);
     let put_url = format!("{base}/api/v1/files/{storage_target}/{encoded_name}");
     let print_after_hdr = if start_print { "?1" } else { "?0" };
+    let upload_prefix = format!("Uploading '{clean_filename}' to PrusaLink");
+    let waiting_stage = "Waiting for PrusaLink confirmation...".to_string();
 
     let put_resp = send_prusalink_request(&client, cfg, &base, "PUT", &put_url, 1, |c, u| {
+        let reader = UploadProgressReader::new(
+            Arc::clone(&payload),
+            progress,
+            0.08,
+            0.95,
+            upload_prefix.clone(),
+            waiting_stage.clone(),
+        );
         c.put(u)
             .header("Content-Type", "text/x.gcode")
             .header("Overwrite", "?1")
             .header("Print-After-Upload", print_after_hdr)
-            .body(gcode_bytes.clone())
+            .body(Body::sized(reader, bytes_uploaded as u64))
     })
     .map_err(|e| format_reqwest_error(&format!("Failed to upload G-code to {put_url}"), &e))?;
 
     let put_status = put_resp.status();
     if put_status.is_success() {
+        if let Some(tr) = progress {
+            tr.set_stage(1.0, "Upload complete.");
+        }
         return Ok(MoonrakerUploadReport {
             protocol: PrinterNetworkProtocol::PrusaLink,
             remote_path: format!("{storage_target}/{clean_filename}"),
@@ -1751,10 +2002,16 @@ pub fn upload_gcode_to_prusalink(
         let legacy_url = format!("{base}/api/files/local");
         let legacy_resp =
             send_prusalink_request(&client, cfg, &base, "POST", &legacy_url, 1, |c, u| {
-                let part = multipart::Part::bytes(gcode_bytes.clone())
-                    .file_name(clean_filename.clone())
-                    .mime_str("application/octet-stream")
-                    .expect("valid mime");
+                let part = build_streaming_multipart_part(
+                    Arc::clone(&payload),
+                    clean_filename.clone(),
+                    progress,
+                    0.08,
+                    0.95,
+                    upload_prefix.clone(),
+                    waiting_stage.clone(),
+                )
+                .expect("valid mime literal");
                 let form = multipart::Form::new()
                     .text("select", "true")
                     .text("print", if start_print { "true" } else { "false" })
@@ -1767,6 +2024,9 @@ pub fn upload_gcode_to_prusalink(
 
         let legacy_status = legacy_resp.status();
         if legacy_status.is_success() {
+            if let Some(tr) = progress {
+                tr.set_stage(1.0, "Upload complete.");
+            }
             return Ok(MoonrakerUploadReport {
                 protocol: PrinterNetworkProtocol::PrusaLink,
                 remote_path: clean_filename,
@@ -1795,13 +2055,32 @@ pub fn upload_gcode_to_moonraker(
     gcode_text: String,
     start_print: bool,
 ) -> Result<MoonrakerUploadReport, String> {
+    upload_gcode_to_moonraker_with_progress(cfg, filename, gcode_text, start_print, None)
+}
+
+/// Streaming variant of [`upload_gcode_to_moonraker`] that updates `progress` across Moonraker,
+/// PrusaLink, and Bambu LAN transfers.
+pub fn upload_gcode_to_moonraker_with_progress(
+    cfg: &MoonrakerNetworkConfig,
+    filename: &str,
+    gcode_text: String,
+    start_print: bool,
+    progress: Option<&UploadProgressTracker>,
+) -> Result<MoonrakerUploadReport, String> {
     if cfg.protocol == PrinterNetworkProtocol::BambuLan {
-        return upload_gcode_to_bambu_lan(cfg, filename, gcode_text, start_print);
+        return upload_gcode_to_bambu_lan_with_progress(
+            cfg, filename, gcode_text, start_print, progress,
+        );
     }
     if cfg.protocol == PrinterNetworkProtocol::PrusaLink {
-        return upload_gcode_to_prusalink(cfg, filename, gcode_text, start_print);
+        return upload_gcode_to_prusalink_with_progress(
+            cfg, filename, gcode_text, start_print, progress,
+        );
     }
 
+    if let Some(tr) = progress {
+        tr.set_stage(0.04, "Connecting to Moonraker...");
+    }
     let base = normalize_moonraker_base_uri(&cfg.printer_uri)?;
     let client = build_moonraker_client(cfg, Duration::from_secs(90))?;
 
@@ -1810,12 +2089,18 @@ pub fn upload_gcode_to_moonraker(
     } else {
         format!("{filename}.gcode")
     };
-    let bytes_uploaded = gcode_text.len();
+    let payload: Arc<[u8]> = gcode_text.into_bytes().into();
+    let bytes_uploaded = payload.len();
 
-    let file_part = multipart::Part::bytes(gcode_text.into_bytes())
-        .file_name(clean_filename.clone())
-        .mime_str("application/octet-stream")
-        .map_err(|e| format!("Failed to construct multipart file payload: {e}"))?;
+    let file_part = build_streaming_multipart_part(
+        payload,
+        clean_filename.clone(),
+        progress,
+        0.06,
+        0.95,
+        format!("Uploading '{clean_filename}' to Moonraker"),
+        "Waiting for Moonraker confirmation...".to_string(),
+    )?;
 
     let form = multipart::Form::new()
         .text("root", "gcodes")
@@ -1852,6 +2137,10 @@ pub fn upload_gcode_to_moonraker(
         })
         .unwrap_or(&clean_filename)
         .to_string();
+
+    if let Some(tr) = progress {
+        tr.set_stage(1.0, "Upload complete.");
+    }
 
     Ok(MoonrakerUploadReport {
         protocol: PrinterNetworkProtocol::Moonraker,
@@ -2082,6 +2371,17 @@ pub fn upload_bytes_to_bambu_ftps(
     remote_filename: &str,
     file_bytes: &[u8],
 ) -> Result<String, String> {
+    upload_bytes_to_bambu_ftps_with_progress(cfg, remote_filename, file_bytes, 0.95, None)
+}
+
+/// Chunked FTPS uploader that reports progress across `[0.16 ..= frac_end]`.
+pub fn upload_bytes_to_bambu_ftps_with_progress(
+    cfg: &MoonrakerNetworkConfig,
+    remote_filename: &str,
+    file_bytes: &[u8],
+    frac_end: f32,
+    progress: Option<&UploadProgressTracker>,
+) -> Result<String, String> {
     use std::io::Write as _;
     let (host, port) = parse_bambu_lan_host_and_port(&cfg.printer_uri, 990)?;
     let access_code = cfg.effective_bambu_access_code();
@@ -2144,9 +2444,21 @@ pub fn upload_bytes_to_bambu_ftps(
     {
         let mut data_stream =
             connect_bambu_tls_stream(&host, data_port, tls_cfg, Duration::from_secs(90))?;
-        data_stream
-            .write_all(file_bytes)
-            .map_err(|e| format!("Bambu FTPS data transfer error: {e}"))?;
+        let total = file_bytes.len() as u64;
+        let mut sent = 0u64;
+        let prefix = format!("Uploading '{clean_name}' via FTPS");
+        for chunk in file_bytes.chunks(16 * 1024) {
+            data_stream
+                .write_all(chunk)
+                .map_err(|e| format!("Bambu FTPS data transfer error: {e}"))?;
+            sent += chunk.len() as u64;
+            if let Some(tr) = progress {
+                tr.set_bytes_progress(sent, total, 0.16, frac_end, &prefix);
+            }
+        }
+        if let Some(tr) = progress {
+            tr.set_stage(frac_end, "Finalizing FTPS transfer...");
+        }
         data_stream
             .flush()
             .map_err(|e| format!("Bambu FTPS data flush error: {e}"))?;
@@ -2600,6 +2912,18 @@ pub fn upload_gcode_to_bambu_lan(
     gcode_text: String,
     start_print: bool,
 ) -> Result<MoonrakerUploadReport, String> {
+    upload_gcode_to_bambu_lan_with_progress(cfg, filename, gcode_text, start_print, None)
+}
+
+/// Streaming variant of [`upload_gcode_to_bambu_lan`] that reports archive packaging,
+/// chunked FTPS progress, and MQTT start command progress to `progress`.
+pub fn upload_gcode_to_bambu_lan_with_progress(
+    cfg: &MoonrakerNetworkConfig,
+    filename: &str,
+    gcode_text: String,
+    start_print: bool,
+    progress: Option<&UploadProgressTracker>,
+) -> Result<MoonrakerUploadReport, String> {
     let basename = filename
         .rsplit(['/', '\\'])
         .next()
@@ -2613,12 +2937,28 @@ pub fn upload_gcode_to_bambu_lan(
         .unwrap_or(basename);
     let remote_3mf_name = format!("{stem}.gcode.3mf");
 
+    if let Some(tr) = progress {
+        tr.set_stage(0.04, "Packaging Bambu .gcode.3mf archive...");
+    }
     let archive_bytes = crate::io::threemf::build_bambu_gcode_3mf_bytes(&gcode_text, None)?;
     let bytes_uploaded = archive_bytes.len();
 
-    let uploaded_path = upload_bytes_to_bambu_ftps(cfg, &remote_3mf_name, &archive_bytes)?;
+    if let Some(tr) = progress {
+        tr.set_stage(0.10, "Connecting to Bambu FTPS (:990)...");
+    }
+    let ftps_end = if start_print { 0.88 } else { 0.95 };
+    let uploaded_path = upload_bytes_to_bambu_ftps_with_progress(
+        cfg,
+        &remote_3mf_name,
+        &archive_bytes,
+        ftps_end,
+        progress,
+    )?;
 
     if start_print {
+        if let Some(tr) = progress {
+            tr.set_stage(0.93, "Starting print via Bambu MQTT (:8883)...");
+        }
         let cmd_json = build_bambu_project_file_command_json(
             &uploaded_path,
             stem,
@@ -2626,6 +2966,10 @@ pub fn upload_gcode_to_bambu_lan(
             cfg.bambu_bed_leveling,
         );
         run_bambu_mqtt_session(cfg, Some(&cmd_json), false)?;
+    }
+
+    if let Some(tr) = progress {
+        tr.set_stage(1.0, "Upload complete.");
     }
 
     Ok(MoonrakerUploadReport {
@@ -3179,5 +3523,240 @@ mod tests {
             .unwrap();
         assert!(slice_info.contains("key=\"prediction\" value=\"750\""));
         assert!(slice_info.contains("key=\"weight\" value=\"4.50\""));
+    }
+
+    fn read_full_http_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut raw = Vec::with_capacity(8192);
+        let mut chunk = [0u8; 8192];
+        let mut hdr_end_opt = None;
+        let mut content_len = 0usize;
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    raw.extend_from_slice(&chunk[..n]);
+                    if hdr_end_opt.is_none() {
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            hdr_end_opt = Some(pos);
+                            let headers_part = String::from_utf8_lossy(&raw[..pos]);
+                            content_len = headers_part
+                                .lines()
+                                .find_map(|l| {
+                                    let lower = l.to_ascii_lowercase();
+                                    lower
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                        }
+                    }
+                    if let Some(hdr_end) = hdr_end_opt {
+                        if raw.len() >= hdr_end + 4 + content_len {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let hdr_end = hdr_end_opt.expect("Valid HTTP request headers");
+        let headers = String::from_utf8_lossy(&raw[..hdr_end]).into_owned();
+        let body = raw[(hdr_end + 4)..].to_vec();
+        (headers, body)
+    }
+
+    #[test]
+    fn test_upload_progress_tracker_and_streaming_http_uploads() {
+        assert_eq!(format_byte_size(512), "512 B");
+        assert_eq!(format_byte_size(2048), "2.0 KB");
+        assert_eq!(format_byte_size(2 * 1024 * 1024), "2.00 MB");
+
+        // 1. Verify chunked UploadProgressReader updates tracker monotonically to completion
+        let payload_48k: Arc<[u8]> = vec![b'G'; 48 * 1024].into();
+        let tracker = UploadProgressTracker::default();
+        tracker.reset(payload_48k.len() as u64, "Starting...");
+        let mut reader = UploadProgressReader::new(
+            Arc::clone(&payload_48k),
+            Some(&tracker),
+            0.10,
+            0.90,
+            "Uploading 'test.gcode' to Mock",
+            "Waiting for confirmation...",
+        );
+        let mut scratch = vec![0u8; 8192];
+        let mut prev_sent = 0u64;
+        let mut prev_frac = 0.0f32;
+        let mut seen_kb_text = false;
+        loop {
+            let n = reader.read(&mut scratch).unwrap();
+            let snap = tracker.snapshot();
+            assert!(snap.bytes_sent >= prev_sent);
+            assert!(snap.fraction >= prev_frac);
+            if n > 0 {
+                assert!(snap.fraction >= 0.10 && snap.fraction <= 0.90 + 1.0e-5);
+                if snap.bar_text().contains("48.0 KB") {
+                    seen_kb_text = true;
+                }
+            } else {
+                assert!((snap.fraction - 0.90).abs() < 1.0e-5);
+                assert_eq!(snap.bytes_sent, (48 * 1024) as u64);
+                break;
+            }
+            prev_sent = snap.bytes_sent;
+            prev_frac = snap.fraction;
+        }
+        assert!(seen_kb_text);
+
+        // 2. Streaming Moonraker multipart POST with a >64 KB payload
+        let gcode_64k: String = (0..3072)
+            .map(|i| format!("G1 X{:.2} Y{:.2} E0.123\n", (i % 100) as f32, i as f32 * 0.01))
+            .collect();
+        assert!(gcode_64k.len() >= 64 * 1024);
+        let expected_len = gcode_64k.len();
+        let expected_body_check = gcode_64k.clone();
+
+        let moon_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let moon_addr = moon_listener.local_addr().unwrap();
+        let moon_server = std::thread::spawn(move || {
+            let (mut stream, _) = moon_listener.accept().unwrap();
+            let (headers, body) = read_full_http_request(&mut stream);
+            assert!(headers.starts_with("POST /server/files/upload "));
+            assert!(
+                headers.to_ascii_lowercase().contains("content-length:"),
+                "Streaming multipart upload must include Content-Length:\n{headers}"
+            );
+            let body_str = String::from_utf8_lossy(&body);
+            assert!(body_str.contains(&expected_body_check));
+            let resp_json = r#"{"item":{"path":"progress_moon.gcode","root":"gcodes"},"print_started":false}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_json.len(),
+                resp_json
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let moon_cfg = MoonrakerNetworkConfig {
+            protocol: PrinterNetworkProtocol::Moonraker,
+            printer_uri: format!("http://{moon_addr}"),
+            ..Default::default()
+        };
+        let moon_tracker = UploadProgressTracker::default();
+        moon_tracker.reset(expected_len as u64, "Starting...");
+        let moon_report = upload_gcode_to_moonraker_with_progress(
+            &moon_cfg,
+            "progress_moon.gcode",
+            gcode_64k.clone(),
+            false,
+            Some(&moon_tracker),
+        )
+        .expect("Streaming Moonraker upload should succeed");
+        assert_eq!(moon_report.bytes_uploaded, expected_len);
+        let moon_snap = moon_tracker.snapshot();
+        assert_eq!(moon_snap.fraction, 1.0);
+        assert_eq!(moon_snap.bytes_sent, expected_len as u64);
+        moon_server.join().unwrap();
+
+        // 3. Streaming PrusaLink PUT forcing an uncached HTTP 401 Digest retry on the PUT itself
+        let prusa_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let prusa_addr = prusa_listener.local_addr().unwrap();
+        let expected_prusa_gcode = gcode_64k.clone();
+        let prusa_server = std::thread::spawn(move || {
+            let realm = "Printer API";
+            let nonce = "retry9876543210";
+            let expected_user = "maker";
+            let expected_pass = "stream-digest-pw";
+
+            // Request 1: GET /api/v1/storage (allowed without 401 so PUT hits an uncached 401)
+            {
+                let (mut stream, _) = prusa_listener.accept().unwrap();
+                let (headers, _) = read_full_http_request(&mut stream);
+                assert!(headers.starts_with("GET /api/v1/storage "));
+                let st_json = r#"{"storage_list":[{"path":"/usb/","name":"usb","type":"USB","read_only":false,"available":true}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    st_json.len(),
+                    st_json
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+
+            // Request 2: Initial unauthenticated PUT -> challenge with 401 Digest
+            {
+                let (mut stream, _) = prusa_listener.accept().unwrap();
+                let (headers, body) = read_full_http_request(&mut stream);
+                assert!(headers.starts_with("PUT /api/v1/files/usb/progress_prusa.gcode "));
+                assert!(headers.to_ascii_lowercase().contains("content-length:"));
+                assert_eq!(body.len(), expected_prusa_gcode.len());
+                let resp = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"{realm}\", nonce=\"{nonce}\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+
+            // Request 3: Retried authenticated PUT -> verify rewound full 64 KB body & Digest auth
+            {
+                let (mut stream, _) = prusa_listener.accept().unwrap();
+                let (headers, body) = read_full_http_request(&mut stream);
+                assert!(headers.starts_with("PUT /api/v1/files/usb/progress_prusa.gcode "));
+                let auth_line = headers
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .expect("Retried PUT must include Authorization: Digest header");
+                let rest = auth_line["authorization:".len()..]
+                    .trim()
+                    .strip_prefix("Digest ")
+                    .unwrap();
+                let params = parse_auth_key_values(rest);
+                let nc_val = params.get("nc").map(String::as_str).unwrap_or("");
+                let cnonce_val = params.get("cnonce").map(String::as_str).unwrap_or("");
+                let resp_val = params.get("response").map(String::as_str).unwrap_or("");
+                let ha1 = md5_hex(format!("{expected_user}:{realm}:{expected_pass}").as_bytes());
+                let ha2 = md5_hex(b"PUT:/api/v1/files/usb/progress_prusa.gcode");
+                let expected_digest = md5_hex(
+                    format!("{ha1}:{nonce}:{nc_val}:{cnonce_val}:auth:{ha2}").as_bytes(),
+                );
+                assert_eq!(resp_val, expected_digest);
+                assert_eq!(body, expected_prusa_gcode.as_bytes());
+
+                let ok_json = r#"{"name":"PROGRESS.GCO","display_name":"progress_prusa.gcode"}"#;
+                let resp = format!(
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    ok_json.len(),
+                    ok_json
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let prusa_cfg = MoonrakerNetworkConfig {
+            protocol: PrinterNetworkProtocol::PrusaLink,
+            printer_uri: format!("http://{prusa_addr}"),
+            password: "stream-digest-pw".to_string(),
+            ..Default::default()
+        };
+        let prusa_tracker = UploadProgressTracker::default();
+        prusa_tracker.reset(expected_len as u64, "Starting...");
+        let prusa_report = upload_gcode_to_moonraker_with_progress(
+            &prusa_cfg,
+            "progress_prusa.gcode",
+            gcode_64k,
+            false,
+            Some(&prusa_tracker),
+        )
+        .expect("Streaming PrusaLink PUT with 401 Digest retry should rewind and succeed");
+        assert_eq!(prusa_report.bytes_uploaded, expected_len);
+        assert_eq!(prusa_report.remote_path, "usb/progress_prusa.gcode");
+        let prusa_snap = prusa_tracker.snapshot();
+        assert_eq!(prusa_snap.fraction, 1.0);
+        assert_eq!(prusa_snap.bytes_sent, expected_len as u64);
+        prusa_server.join().unwrap();
     }
 }
