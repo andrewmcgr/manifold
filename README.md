@@ -53,6 +53,15 @@ brew install --HEAD https://raw.githubusercontent.com/andrewmcgr/manifold/main/F
 ln -sf "$(brew --prefix manifold)/Manifold.app" /Applications/Manifold.app
 ```
 
+Newer versions of Homebrew no longer supports installing a formula straight from a URL (it was disabled for security reasons). It can still be installed from a local file: 
+
+```bash
+brew tap-new $USER/local
+curl -o "$(brew --repository $USER/local)/Formula/manifold.rb" \
+  https://raw.githubusercontent.com/andrewmcgr/manifold/main/Formula/manifold.rb
+brew install $USER/local/manifold
+```
+
 Or download `Manifold-macos-arm64.zip` from the latest GitHub Release / Actions artifact, unzip it, and drag **`Manifold.app`** to `/Applications`.
 
 ### Linux (Linuxbrew or Portable Release Archive)

@@ -1,14 +1,27 @@
 class Manifold < Formula
   desc "Multi-axis, non-planar additive manufacturing slicer powered by OpenVDB and OpenCASCADE"
   homepage "https://github.com/andrewmcgr/manifold"
-  url "https://github.com/andrewmcgr/manifold/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  version "0.15.1"
   license "MIT"
-  head "https://github.com/andrewmcgr/manifold.git", branch: "main"
 
-  depends_on "cmake" => :build
-  depends_on "pkg-config" => :build
-  depends_on "rust" => :build
+  on_macos do
+    on_arm do
+      url "https://github.com/andrewmcgr/manifold/releases/download/v0.15.1/Manifold-macos-arm64.zip", using: :nounzip
+      # Homebrew verifies this checksum, which matches the release's SHA256SUMS.txt
+      sha256 "421e11a26d530c01781227539a8c0162905a7655543eb88bd9bb198557f094c3"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "https://github.com/andrewmcgr/manifold/releases/download/v0.15.1/Manifold-linux-x86_64.tar.gz"
+      sha256 "73da3e8a8a1d9b6b3940d22d9e6340af113cecfda051d4a8fc195c9cbdc7e010"
+    end
+  end
+
+  depends_on arch: :arm64 if OS.mac?
+  depends_on arch: :x86_64 if OS.linux?
+
   depends_on "imath"
   depends_on "opencascade"
   depends_on "openvdb"
@@ -29,22 +42,16 @@ class Manifold < Formula
   end
 
   def install
-    ENV["HOMEBREW_PREFIX"] = HOMEBREW_PREFIX.to_s
-    system "cargo", "install", *std_cargo_args(path: "frontend")
-    bin.install_symlink "manifold-frontend" => "manifold"
-
-    pkgshare.install "Test Objects/Manifold_M_Cube.3mf"
-    pkgshare.install "Test Objects/Manifold_M_Cube_FullSlope.3mf"
-
     if OS.mac?
-      system "./scripts/bundle_macos.sh", "--release", "--skip-build", "--out-dir", prefix.to_s
-      # Point the app bundle binary to the installed bin/manifold-frontend to avoid duplicating binaries
-      rm "#{prefix}/Manifold.app/Contents/MacOS/manifold-frontend"
-      ln_s "#{bin}/manifold-frontend", "#{prefix}/Manifold.app/Contents/MacOS/manifold-frontend"
+      # Homebrew would auto-enter the zip's single top-level Manifold.app dir, so extract manually
+      system "/usr/bin/ditto", "-x", "-k", cached_download, buildpath
+      system "/usr/bin/codesign", "--verify", "--deep", "--strict", "Manifold.app"
+      prefix.install "Manifold.app"
+      bin.install_symlink prefix/"Manifold.app/Contents/MacOS/manifold-frontend"
+      bin.install_symlink prefix/"Manifold.app/Contents/MacOS/manifold-frontend" => "manifold"
+      pkgshare.install_symlink prefix/"Manifold.app/Contents/Resources/Test Objects" => "test-objects"
     else
-      (share/"applications").install "packaging/linux/manifold.desktop"
-      (share/"icons/hicolor/256x256/apps").install "frontend/assets/app_icon.png" => "manifold.png"
-      (share/"icons/hicolor/1024x1024/apps").install "frontend/assets/app_icon_1024.png" => "manifold.png"
+      prefix.install Dir["manifold-linux/*"]
     end
   end
 
@@ -62,9 +69,9 @@ class Manifold < Formula
 
   test do
     ENV["MANIFOLD_DISABLE_GPU"] = "1"
-    assert_match "Usage:", shell_output("#{bin}/manifold-frontend --help")
+    assert_match "USAGE:", shell_output("#{bin}/manifold-frontend --help")
     system "#{bin}/manifold-frontend", "slice",
-           "#{pkgshare}/Manifold_M_Cube.3mf",
+           "#{pkgshare}/test-objects/Manifold_M_Cube.3mf",
            "-o", "#{testpath}/out.gcode"
     assert_predicate testpath/"out.gcode", :exist?
   end
