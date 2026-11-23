@@ -9842,6 +9842,22 @@ mod tests {
         let _ = ffi::remove_cad_object(obj.object_id);
     }
 
+    fn count_benchy_roof_side_bins(
+        verts: &[ffi::RenderVertex],
+        y_lo: f32,
+        y_hi: f32,
+    ) -> usize {
+        (0..17usize)
+            .filter(|&bx| {
+                let x_lo = -7.0_f32 + bx as f32;
+                let x_hi = x_lo + 1.0_f32;
+                verts
+                    .iter()
+                    .any(|v| v.x >= x_lo && v.x < x_hi && v.y >= y_lo && v.y <= y_hi)
+            })
+            .count()
+    }
+
     #[test]
     fn test_conformal_skin_benchy_5axis_roof_smooth_and_smokestack_deferred() {
         let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -9932,18 +9948,539 @@ mod tests {
             .find(|tl| tl.layer_index == outermost_roof.layer_index)
             .unwrap();
         let ow_cnt = tp_roof.paths.iter().filter(|p| p.feature_kind == 0).count();
+
+        let mut x_min = f32::INFINITY;
+        let mut x_max = f32::NEG_INFINITY;
+        let mut y_min = f32::INFINITY;
+        let mut y_max = f32::NEG_INFINITY;
+        let mut has_behind_chimney = false;
+        let mut has_left_of_chimney = false;
+        let mut has_right_of_chimney = false;
+        let mut has_front_of_chimney = false;
+        let mut inside_chimney_bore = 0usize;
+        let mut min_r_to_chimney = f32::INFINITY;
+        for v in &outermost_roof.vertices {
+            x_min = x_min.min(v.x);
+            x_max = x_max.max(v.x);
+            y_min = y_min.min(v.y);
+            y_max = y_max.max(v.y);
+            let r_chim = (v.x + 4.82_f32).hypot(v.y);
+            min_r_to_chimney = min_r_to_chimney.min(r_chim);
+            if r_chim < 2.5_f32 {
+                inside_chimney_bore += 1;
+            }
+            if v.x < -8.0 && v.y.abs() < 4.5 {
+                has_behind_chimney = true;
+            }
+            if (-7.8..=-1.8).contains(&v.x) && (3.3..=5.0).contains(&v.y) {
+                has_left_of_chimney = true;
+            }
+            if (-7.8..=-1.8).contains(&v.x) && (-5.0..=-3.3).contains(&v.y) {
+                has_right_of_chimney = true;
+            }
+            if (-1.4..=0.5).contains(&v.x) && v.y.abs() < 2.5 {
+                has_front_of_chimney = true;
+            }
+        }
         println!(
-            "Benchy 5-axis roof skin: layers={}, max_roof_idx={}, stack_min_idx={}, outermost_roof OW={}",
+            "Benchy 5-axis roof skin: layers={}, max_roof_idx={}, stack_min_idx={}, outermost_roof OW={}, X=[{:.2},{:.2}], Y=[{:.2},{:.2}], min_r_chim={:.2}, bore_verts={}, quadrants(rear={}, L={}, R={}, front={})",
             roof_skins.len(),
             max_roof_idx,
             upper_stack.iter().map(|l| l.layer_index).min().unwrap(),
-            ow_cnt
+            ow_cnt,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            min_r_to_chimney,
+            inside_chimney_bore,
+            has_behind_chimney,
+            has_left_of_chimney,
+            has_right_of_chimney,
+            has_front_of_chimney
         );
+
+        // Log other conformal patches (rear deck, bow deck) for diagnostic inspection
+        for l in &iso.layers {
+            if l.is_top_layer && !l.is_first_layer && (l.mean_thickness_mm - top_h).abs() < 1.0e-3 {
+                let (_, _, zc) = z_stats(l);
+                if !(36.5..=40.8).contains(&zc) && !(46.5..=48.5).contains(&zc) {
+                    let xmin = l.vertices.iter().map(|v| v.x).fold(f32::INFINITY, f32::min);
+                    let xmax = l.vertices.iter().map(|v| v.x).fold(f32::NEG_INFINITY, f32::max);
+                    println!(
+                        "  other skin layer #{} (b={}, m={}/{}): zc={:.2}, X=[{:.2},{:.2}], verts={}",
+                        l.layer_index,
+                        l.branch_id,
+                        l.branch_layer_index + 1,
+                        l.branch_layer_count,
+                        zc,
+                        xmin,
+                        xmax,
+                        l.vertices.len()
+                    );
+                }
+            }
+        }
+
         assert!(
             (1..=4).contains(&ow_cnt),
             "Expected smooth non-fragmented OuterWall loops (1..=4) on Benchy cabin roof skin, got {ow_cnt}"
         );
+        assert!(
+            x_min <= -8.5 && x_max >= 12.0,
+            "Expected full Benchy cabin roof conformal cap spanning [-8.5, 12.0], got [{x_min:.2}, {x_max:.2}]"
+        );
+        assert!(
+            has_behind_chimney && has_left_of_chimney && has_right_of_chimney && has_front_of_chimney,
+            "Expected Benchy cabin roof conformal cap to wrap completely around the chimney (rear={has_behind_chimney}, L={has_left_of_chimney}, R={has_right_of_chimney}, front={has_front_of_chimney})"
+        );
+        assert!(
+            min_r_to_chimney <= 4.15,
+            "Expected Benchy roof conformal cap to reach right up to the r=3.23 mm chimney wall, got min_r={min_r_to_chimney:.2}"
+        );
+        assert_eq!(
+            inside_chimney_bore, 0,
+            "Expected a clean hole for the chimney (zero roof skin vertices inside r < 2.5 mm), got {inside_chimney_bore}"
+        );
 
+        let all_chimney_above_roof: Vec<&ffi::SelectedLayerInfo> = iso
+            .layers
+            .iter()
+            .filter(|l| {
+                !l.vertices.is_empty()
+                    && z_stats(l).0 > 39.2
+                    && l.vertices.iter().all(|v| (v.x + 4.82_f32).hypot(v.y) < 4.3)
+            })
+            .collect();
+        assert!(!all_chimney_above_roof.is_empty());
+        for l in &all_chimney_above_roof {
+            assert!(
+                l.layer_index > max_roof_idx,
+                "Benchy smokestack base/shaft layer #{} (z_min={:.2}) was not deferred after cabin roof skin #{}",
+                l.layer_index,
+                z_stats(l).0,
+                max_roof_idx
+            );
+        }
+
+        let left_bins = count_benchy_roof_side_bins(&outermost_roof.vertices, -8.5, -7.2);
+        let right_bins = count_benchy_roof_side_bins(&outermost_roof.vertices, 7.2, 8.5);
+        assert!(
+            left_bins >= 16 && right_bins >= 16,
+            "Expected >= 16/17 (95%) 1mm X bins covered on both Benchy roof side strips, got L={left_bins}/17, R={right_bins}/17"
+        );
+
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(obj.object_id);
+    }
+
+    #[test]
+    fn test_conformal_skin_benchy_3axis_a4t_full_roof_cap_no_side_notches_or_rear_cutout() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path_3mf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Test Objects/benchy-5axis.3mf");
+        if !path_3mf.exists() {
+            return;
+        }
+
+        let report = crate::io::load_files_into_backend(&[path_3mf]);
+        let mut cfg = report.restored_config.expect("Expected config in benchy-5axis.3mf");
+        let obj = &report.objects[0];
+        cfg.machine.kinematics_mode = crate::config::FiveAxisKinematicsMode::ThreeAxis;
+        cfg.tools[0].has_rotational_axes = false;
+        cfg.tools[0].clearance_mode = crate::config::ClearanceProfileMode::PiecewiseXZ;
+        cfg.tools[0].clearance_profile_xz = vec![
+            crate::config::ClearancePointXZ::new(0.5, 0.0),
+            crate::config::ClearancePointXZ::new(4.0, 1.4),
+            crate::config::ClearancePointXZ::new(9.0, 6.0),
+            crate::config::ClearancePointXZ::new(32.0, 9.0),
+            crate::config::ClearancePointXZ::new(42.0, 40.0),
+        ];
+        cfg.eikonal.auto_voxel_size = false;
+        cfg.eikonal.voxel_size_mm = 0.20;
+        cfg.slicing.enable_auto_conformal_skin = true;
+        cfg.slicing.conformal_skin_layers = 3;
+        cfg.slicing.one_perimeter_on_conformal_patches = true;
+        cfg.slicing.sanitize();
+        crate::ui::sync_config_to_backend(&cfg);
+        ffi::set_spatial_orientation_hints(&[]);
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        let iso = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        assert!(iso.valid && !iso.layers.is_empty());
+        let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(tp.valid && tp.total_path_count > 0);
+        assert_eq!(iso.layers.len(), tp.layers.len());
+
+        let z_min_of = |l: &ffi::SelectedLayerInfo| -> f32 {
+            l.vertices.iter().map(|v| v.z).fold(f32::INFINITY, f32::min)
+        };
+        let z_mean_of = |l: &ffi::SelectedLayerInfo| -> f32 {
+            if l.vertices.is_empty() {
+                0.0
+            } else {
+                l.vertices.iter().map(|v| v.z).sum::<f32>() / l.vertices.len() as f32
+            }
+        };
+
+        let top_h = cfg.slicing.layer_height.top_layer_mm;
+        let mut roof_skins: Vec<&ffi::SelectedLayerInfo> = iso
+            .layers
+            .iter()
+            .filter(|l| {
+                let zc = z_mean_of(l);
+                l.is_top_layer
+                    && !l.is_first_layer
+                    && (l.mean_thickness_mm - top_h).abs() < 1.0e-3
+                    && (36.5..=40.8).contains(&zc)
+            })
+            .collect();
+        assert!(
+            roof_skins.len() >= 3,
+            "Expected >= 3 cabin roof conformal skin layers on 3-axis A4T Benchy, got {}",
+            roof_skins.len()
+        );
+        roof_skins.sort_by_key(|l| (l.branch_layer_index, l.layer_index));
+        let max_roof_idx = roof_skins.iter().map(|l| l.layer_index).max().unwrap();
+
+        let outermost_roof = roof_skins.last().copied().unwrap();
+        let tp_roof = tp
+            .layers
+            .iter()
+            .find(|tl| tl.layer_index == outermost_roof.layer_index)
+            .unwrap();
+        let ow_cnt = tp_roof.paths.iter().filter(|p| p.feature_kind == 0).count();
+        assert!(
+            (1..=4).contains(&ow_cnt),
+            "Expected 1..=4 OuterWall loops on 3-axis Benchy roof skin, got {ow_cnt}"
+        );
+
+        let mut x_min = f32::INFINITY;
+        let mut x_max = f32::NEG_INFINITY;
+        let mut y_min = f32::INFINITY;
+        let mut y_max = f32::NEG_INFINITY;
+        let mut min_r_quad = [f32::INFINITY; 4]; // 0=rear, 1=left(+Y), 2=right(-Y), 3=front
+        let mut has_quad = [false; 4];
+        let mut bore_verts = 0usize;
+
+        for v in &outermost_roof.vertices {
+            x_min = x_min.min(v.x);
+            x_max = x_max.max(v.x);
+            y_min = y_min.min(v.y);
+            y_max = y_max.max(v.y);
+            let r_chim = (v.x + 4.82_f32).hypot(v.y);
+            if r_chim < 2.4 {
+                bore_verts += 1;
+            }
+            if v.x < -8.0 && v.y.abs() < 2.5 {
+                has_quad[0] = true;
+                min_r_quad[0] = min_r_quad[0].min(r_chim);
+            }
+            if (-7.5..=-2.0).contains(&v.x) && (2.9..=4.2).contains(&v.y) {
+                has_quad[1] = true;
+                min_r_quad[1] = min_r_quad[1].min(r_chim);
+            }
+            if (-7.5..=-2.0).contains(&v.x) && (-4.2..=-2.9).contains(&v.y) {
+                has_quad[2] = true;
+                min_r_quad[2] = min_r_quad[2].min(r_chim);
+            }
+            if (-1.6..=0.0).contains(&v.x) && v.y.abs() < 2.5 {
+                has_quad[3] = true;
+                min_r_quad[3] = min_r_quad[3].min(r_chim);
+            }
+        }
+        println!(
+            "Benchy 3-axis A4T roof skin: layers={}, OW={}, X=[{:.2},{:.2}], Y=[{:.2},{:.2}], quad_min_r={:?}, bore_verts={}",
+            roof_skins.len(),
+            ow_cnt,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+            min_r_quad,
+            bore_verts
+        );
+        assert!(
+            x_min <= -8.8 && x_max >= 12.2 && y_min <= -9.0 && y_max >= 9.0,
+            "Expected full 3-axis Benchy roof extents X<=-8.8, X>=12.2, Y<=-9.0, Y>=9.0, got X=[{x_min:.2},{x_max:.2}], Y=[{y_min:.2},{y_max:.2}]"
+        );
+        for (q_idx, q_name) in ["rear", "left", "right", "front"].iter().enumerate() {
+            assert!(
+                has_quad[q_idx] && min_r_quad[q_idx] <= 3.9,
+                "Expected 3-axis Benchy roof skin to wrap tightly around chimney in {q_name} quadrant (min_r <= 3.9), got has={}, min_r={:.2}",
+                has_quad[q_idx],
+                min_r_quad[q_idx]
+            );
+        }
+        assert_eq!(bore_verts, 0, "Expected 0 roof skin vertices inside chimney bore r < 2.4 mm");
+
+        let left_bins = count_benchy_roof_side_bins(&outermost_roof.vertices, -8.5, -7.2);
+        let right_bins = count_benchy_roof_side_bins(&outermost_roof.vertices, 7.2, 8.5);
+        assert!(
+            left_bins >= 16 && right_bins >= 16,
+            "Expected >= 16/17 (95%) 1mm X bins covered on both 3-axis Benchy roof side strips, got L={left_bins}/17, R={right_bins}/17"
+        );
+
+        let all_chimney_above_roof: Vec<&ffi::SelectedLayerInfo> = iso
+            .layers
+            .iter()
+            .filter(|l| {
+                !l.vertices.is_empty()
+                    && z_min_of(l) > 39.2
+                    && l.vertices.iter().all(|v| (v.x + 4.82_f32).hypot(v.y) < 4.3)
+            })
+            .collect();
+        assert!(!all_chimney_above_roof.is_empty());
+        for l in &all_chimney_above_roof {
+            assert!(
+                l.layer_index > max_roof_idx,
+                "3-axis Benchy smokestack layer #{} (z_min={:.2}) was not deferred after cabin roof skin #{}",
+                l.layer_index,
+                z_min_of(l),
+                max_roof_idx
+            );
+        }
+
+        let default_cfg = crate::config::SlicerConfig::default();
+        crate::ui::sync_config_to_backend(&default_cfg);
+        let _ = ffi::remove_cad_object(obj.object_id);
+    }
+
+    #[test]
+    fn test_conformal_skin_flat_surface_with_single_boss_full_cap_and_hole() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Watertight flat deck [-12, 12] x [-12, 12], z in [0, 10] with a central vertical
+        // cylindrical boss (r = 3.5 mm, z in [10, 20]), guaranteeing 1 single Reeb-graph branch.
+        let r_boss = 3.5_f32;
+        let z_deck = 10.0_f32;
+        let z_boss_top = 20.0_f32;
+        let half_xy = 12.0_f32;
+
+        let mut raw_angles = Vec::with_capacity(52);
+        for k in 0..48 {
+            raw_angles.push((k as f32) * (2.0 * std::f32::consts::PI / 48.0));
+        }
+        for &(bx, by) in &[
+            (half_xy, half_xy),
+            (-half_xy, half_xy),
+            (-half_xy, -half_xy),
+            (half_xy, -half_xy),
+        ] {
+            raw_angles.push(by.atan2(bx).rem_euclid(2.0 * std::f32::consts::PI));
+        }
+        raw_angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut thetas = Vec::with_capacity(raw_angles.len());
+        for th in raw_angles {
+            if th < 2.0 * std::f32::consts::PI - 1.0e-4
+                && thetas
+                    .last()
+                    .map_or(true, |&prev: &f32| (th - prev).abs() > 1.0e-4)
+            {
+                thetas.push(th);
+            }
+        }
+        let n_ang = thetas.len();
+        let mut stl = String::from("solid flat_surface_with_single_boss\n");
+        let add_tri = |stl: &mut String, a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+            stl.push_str(&format!(
+                "  facet normal 0 0 0\n    outer loop\n      vertex {} {} {}\n      vertex {} {} {}\n      vertex {} {} {}\n    endloop\n  endfacet\n",
+                a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]
+            ));
+        };
+        let add_quad = |stl: &mut String, p00: [f32; 3], p10: [f32; 3], p11: [f32; 3], p01: [f32; 3]| {
+            add_tri(stl, p00, p10, p11);
+            add_tri(stl, p00, p11, p01);
+        };
+        let box_edge_xy = |theta: f32| -> (f32, f32) {
+            let c = theta.cos();
+            let s = theta.sin();
+            let t = (half_xy / c.abs().max(1.0e-6)).min(half_xy / s.abs().max(1.0e-6));
+            ((c * t).clamp(-half_xy, half_xy), (s * t).clamp(-half_xy, half_xy))
+        };
+
+        for a in 0..n_ang {
+            let th0 = thetas[a];
+            let th1 = thetas[(a + 1) % n_ang];
+            let (bx0, by0) = box_edge_xy(th0);
+            let (bx1, by1) = box_edge_xy(th1);
+            let (rx0, ry0) = (r_boss * th0.cos(), r_boss * th0.sin());
+            let (rx1, ry1) = (r_boss * th1.cos(), r_boss * th1.sin());
+
+            // Bottom disk (z = 0), outer perimeter walls (z = 0..z_deck), and flat top annulus
+            add_tri(&mut stl, [0.0, 0.0, 0.0], [bx1, by1, 0.0], [bx0, by0, 0.0]);
+            add_quad(
+                &mut stl,
+                [bx0, by0, 0.0],
+                [bx1, by1, 0.0],
+                [bx1, by1, z_deck],
+                [bx0, by0, z_deck],
+            );
+            add_quad(
+                &mut stl,
+                [rx0, ry0, z_deck],
+                [bx0, by0, z_deck],
+                [bx1, by1, z_deck],
+                [rx1, ry1, z_deck],
+            );
+            // Cylindrical boss side walls and top cap
+            add_quad(
+                &mut stl,
+                [rx0, ry0, z_deck],
+                [rx1, ry1, z_deck],
+                [rx1, ry1, z_boss_top],
+                [rx0, ry0, z_boss_top],
+            );
+            add_tri(
+                &mut stl,
+                [0.0, 0.0, z_boss_top],
+                [rx0, ry0, z_boss_top],
+                [rx1, ry1, z_boss_top],
+            );
+        }
+        stl.push_str("endsolid flat_surface_with_single_boss\n");
+
+        let tmp_path = std::env::temp_dir().join("manifold_test_flat_surface_single_boss.stl");
+        std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write flat+boss STL");
+        let obj = crate::io::stl::load_stl_file(&tmp_path)
+            .expect("Expected flat+boss STL load to succeed");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut cfg = crate::config::SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::ConstrainedNonPlanar;
+        cfg.eikonal.voxel_size_mm = 0.25;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.20;
+        cfg.slicing.layer_height.min_mm = 0.12;
+        cfg.slicing.layer_height.max_mm = 0.30;
+        cfg.slicing.layer_height.first_layer_mm = 0.20;
+        cfg.slicing.layer_height.top_layer_mm = 0.18;
+        cfg.slicing.enable_auto_conformal_skin = false;
+        cfg.slicing.conformal_skin_layers = 3;
+        cfg.slicing.one_perimeter_on_conformal_patches = true;
+        cfg.tools[0].clearance_mode = crate::config::ClearanceProfileMode::PiecewiseXZ;
+        cfg.tools[0].clearance_profile_xz = vec![
+            crate::config::ClearancePointXZ::new(0.5, 0.0),
+            crate::config::ClearancePointXZ::new(4.0, 1.4),
+            crate::config::ClearancePointXZ::new(9.0, 6.0),
+        ];
+        cfg.slicing.sanitize();
+        crate::ui::sync_config_to_backend(&cfg);
+
+        // Paint manual ConformalSurfaceSkin hints on the flat deck quadrants around the boss
+        let hints: Vec<ffi::SpatialOrientationHint> =
+            [(-6.0_f32, -6.0_f32), (6.0, -6.0), (6.0, 6.0), (-6.0, 6.0)]
+            .into_iter()
+            .map(|(x, y)| ffi::SpatialOrientationHint {
+                kind: 2,
+                position_bed: [x, y, z_deck],
+                direction_bed: [0.0, 0.0, 1.0],
+                influence_radius_mm: 12.0,
+                weight: 1.0,
+                apply_on_surface_only: true,
+                skin_layer_count: 3,
+            })
+            .collect();
+        ffi::set_spatial_orientation_hints(&hints);
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        let iso = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        assert!(iso.valid && !iso.layers.is_empty());
+        assert_eq!(iso.branch_count, 1, "Expected 1 Reeb branch on flat surface + single boss");
+        let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(tp.valid && tp.total_path_count > 0);
+        assert_eq!(iso.layers.len(), tp.layers.len());
+
+        let top_h = cfg.slicing.layer_height.top_layer_mm;
+        let mut cap_skins: Vec<&ffi::SelectedLayerInfo> = iso
+            .layers
+            .iter()
+            .filter(|l| {
+                if !l.is_top_layer || l.is_first_layer || (l.mean_thickness_mm - top_h).abs() >= 1.0e-3 {
+                    return false;
+                }
+                let mean_z = if l.vertices.is_empty() {
+                    0.0
+                } else {
+                    l.vertices.iter().map(|v| v.z).sum::<f32>() / l.vertices.len() as f32
+                };
+                (z_deck - 1.0..=z_deck + 0.5).contains(&mean_z)
+            })
+            .collect();
+        assert!(
+            cap_skins.len() >= 3,
+            "Expected >= 3 conformal cap layers on flat deck around boss, got {}",
+            cap_skins.len()
+        );
+        cap_skins.sort_by_key(|l| (l.branch_layer_index, l.layer_index));
+        let max_cap_idx = cap_skins.iter().map(|l| l.layer_index).max().unwrap();
+
+        let outermost_cap = cap_skins.last().copied().unwrap();
+        let mut octant_min_r = [f32::INFINITY; 8];
+        let mut hole_verts = 0usize;
+        for v in &outermost_cap.vertices {
+            let r = v.x.hypot(v.y);
+            if r < 2.9 {
+                hole_verts += 1;
+            }
+            let ang = v.y.atan2(v.x).rem_euclid(2.0 * std::f32::consts::PI);
+            let oct = ((ang / (std::f32::consts::FRAC_PI_4)).floor() as usize).min(7);
+            octant_min_r[oct] = octant_min_r[oct].min(r);
+        }
+        let worst_octant_r = octant_min_r.iter().copied().fold(0.0_f32, f32::max);
+        let tp_outer = tp
+            .layers
+            .iter()
+            .find(|tl| tl.layer_index == outermost_cap.layer_index)
+            .unwrap();
+        let ow_cnt = tp_outer.paths.iter().filter(|p| p.feature_kind == 0).count();
+        println!(
+            "Flat+Boss conformal cap: layers={}, max_cap_idx={}, worst_octant_r={:.2}, hole_verts={}, OW={}",
+            cap_skins.len(),
+            max_cap_idx,
+            worst_octant_r,
+            hole_verts,
+            ow_cnt
+        );
+        assert!(
+            worst_octant_r <= r_boss + 0.90,
+            "Expected flat conformal cap to reach right up to r={r_boss:.2} mm boss in all 8 octants, got max min_r={worst_octant_r:.2}"
+        );
+        assert_eq!(hole_verts, 0, "Expected clean circular hole (0 verts inside r < 2.9 mm)");
+        assert_eq!(ow_cnt, 2, "Expected 2 OuterWall loops (outer square + inner boss hole), got {ow_cnt}");
+
+        let boss_layers: Vec<&ffi::SelectedLayerInfo> = iso
+            .layers
+            .iter()
+            .filter(|l| {
+                !l.vertices.is_empty()
+                    && l.vertices.iter().map(|v| v.z).fold(f32::INFINITY, f32::min) > z_deck + 0.3
+            })
+            .collect();
+        assert!(!boss_layers.is_empty());
+        for bl in &boss_layers {
+            assert!(
+                bl.layer_index > max_cap_idx,
+                "Boss layer #{} printed before conformal cap #{}",
+                bl.layer_index,
+                max_cap_idx
+            );
+        }
+
+        ffi::set_spatial_orientation_hints(&[]);
         let default_cfg = crate::config::SlicerConfig::default();
         crate::ui::sync_config_to_backend(&default_cfg);
         let _ = ffi::remove_cad_object(obj.object_id);

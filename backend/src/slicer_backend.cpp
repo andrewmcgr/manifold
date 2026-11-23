@@ -15,6 +15,7 @@
 #include <queue>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
@@ -5461,6 +5462,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         openvdb::Vec3f meanNormal{0.0f, 0.0f, 1.0f};
         std::vector<std::size_t> surfVoxelIndices;
         std::vector<int> deferredBranches;
+        bool hasDeferredGeoBoss = false;
     };
 
     std::vector<ConformalSkinPatch> conformalSkinPatches;
@@ -5472,6 +5474,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     skinPatchIdGrid.setTransform(fineSdfGrid.transform().copy());
     openvdb::Int32Grid skinCorePatchIdGrid(-1);
     skinCorePatchIdGrid.setTransform(fineSdfGrid.transform().copy());
+    openvdb::Int32Grid deferredBossPatchIdGrid(-1);
+    deferredBossPatchIdGrid.setTransform(fineSdfGrid.transform().copy());
+    bool anyDeferredGeoBoss = false;
     openvdb::Vec3SGrid skinPatchNormalGrid(openvdb::Vec3s(0.0f, 0.0f, 1.0f));
     skinPatchNormalGrid.setTransform(fineSdfGrid.transform().copy());
     openvdb::Vec3SGrid::Ptr skinPatchToolAxisGrid;
@@ -5582,66 +5587,6 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         const float fineBgLimit =
             fineSdfGrid.background() - std::max(0.5f * fineVoxelSize, 0.25f);
 
-        // Build a flat 3D coarse brick acceleration grid over the object's bounding box storing
-        // the minimum \tau of any solid voxel within each brick (dilated by 1 brick so boundary
-        // interpolation stencils are conservatively covered). This rejects empty-air and
-        // unprinted-future points in O(1) L1/L2 cache reads without touching OpenVDB's RootNode map.
-        const float brickSizeMm = std::max(2.0f * voxelSize, 1.0f);
-        const float invBrickSize = 1.0f / brickSizeMm;
-        const float brickPadMm = 2.0f * voxelSize;
-        const float brickOriginX = rec.minX - brickPadMm;
-        const float brickOriginY = rec.minY - brickPadMm;
-        const float brickOriginZ = rec.minZ - brickPadMm;
-        const int brickNx = std::max(
-            1,
-            static_cast<int>(std::ceil((rec.maxX - rec.minX + 2.0f * brickPadMm) * invBrickSize)) + 1);
-        const int brickNy = std::max(
-            1,
-            static_cast<int>(std::ceil((rec.maxY - rec.minY + 2.0f * brickPadMm) * invBrickSize)) + 1);
-        const int brickNz = std::max(
-            1,
-            static_cast<int>(std::ceil((rec.maxZ - rec.minZ + 2.0f * brickPadMm) * invBrickSize)) + 1);
-        const std::size_t brickStrideY = static_cast<std::size_t>(brickNx);
-        const std::size_t brickStrideZ =
-            static_cast<std::size_t>(brickNx) * static_cast<std::size_t>(brickNy);
-        std::vector<float> brickMinTau(
-            brickStrideZ * static_cast<std::size_t>(brickNz),
-            std::numeric_limits<float>::max());
-
-        for (const auto& vx : voxels) {
-            if (vx.sdf > 0.35f * voxelSize) {
-                continue;
-            }
-            const openvdb::Vec3d wp = eikGrid.transform().indexToWorld(vx.ijk);
-            const int bx0 = static_cast<int>(std::floor((static_cast<float>(wp.x()) - brickOriginX) * invBrickSize));
-            const int by0 = static_cast<int>(std::floor((static_cast<float>(wp.y()) - brickOriginY) * invBrickSize));
-            const int bz0 = static_cast<int>(std::floor((static_cast<float>(wp.z()) - brickOriginZ) * invBrickSize));
-            const float tVal = std::max(0.0f, std::min(vx.tau, vx.surfTauMin));
-            for (int dz = -1; dz <= 1; ++dz) {
-                const int bz = bz0 + dz;
-                if (bz < 0 || bz >= brickNz) {
-                    continue;
-                }
-                for (int dy = -1; dy <= 1; ++dy) {
-                    const int by = by0 + dy;
-                    if (by < 0 || by >= brickNy) {
-                        continue;
-                    }
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        const int bx = bx0 + dx;
-                        if (bx < 0 || bx >= brickNx) {
-                            continue;
-                        }
-                        const std::size_t bIdx =
-                            static_cast<std::size_t>(bz) * brickStrideZ +
-                            static_cast<std::size_t>(by) * brickStrideY +
-                            static_cast<std::size_t>(bx);
-                        brickMinTau[bIdx] = std::min(brickMinTau[bIdx], tVal);
-                    }
-                }
-            }
-        }
-
         const float solidBBoxMinX = rec.minX - 0.75f * fineVoxelSize;
         const float solidBBoxMaxX = rec.maxX + 0.75f * fineVoxelSize;
         const float solidBBoxMinY = rec.minY - 0.75f * fineVoxelSize;
@@ -5730,280 +5675,6 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 }
             }
             return (bestTau <= maxPlausibleTau) ? bestTau : 0.0f;
-        };
-
-        // Checks whether placing the nozzle at the innermost conformal skin layer
-        // (`xBase = xSurf - skinDepthMm * nSdf`) to print `xSurf` at `printTau` causes
-        // the 3D Tool Clearance Envelope (in the local `NozzleBasis` queried via
-        // `queryNozzleFrame`, AGENTS.md Rule 1) to collide with:
-        //   1. Any local protrusion rising above the surface tangent plane near the nozzle tip, or
-        //   2. Any already-printed solid geometry (`\phi_sdf(y) <= 0` with `\tau(y) <= printTau`)
-        //      such as the Benchy cabin or raised port/starboard hull gunwale walls.
-        auto hasNozzleClearanceCollision = [&](
-            const openvdb::Vec3f& xSurf,
-            const openvdb::Vec3f& nSdf,
-            float skinDepthMm,
-            float printTau,
-            const openvdb::FloatGrid::ConstAccessor& localSdfAcc,
-            const openvdb::tools::GridSampler<
-                openvdb::FloatGrid::ConstAccessor,
-                openvdb::tools::BoxSampler>& localSdfSampler,
-            const openvdb::tools::GridSampler<
-                openvdb::FloatGrid::ConstAccessor,
-                openvdb::tools::BoxSampler>& localFineSdfSampler,
-            const openvdb::FloatGrid::ConstAccessor& localFineEikAcc,
-            const openvdb::tools::GridSampler<
-                openvdb::FloatGrid::ConstAccessor,
-                openvdb::tools::BoxSampler>& localFineEikSampler,
-            const openvdb::FloatGrid::ConstAccessor& localMainEikAcc,
-            const openvdb::tools::GridSampler<
-                openvdb::FloatGrid::ConstAccessor,
-                openvdb::tools::BoxSampler>& localMainEikSampler,
-            bool* outNearBoundaryMargin = nullptr) -> bool {
-            if (outNearBoundaryMargin != nullptr) {
-                *outNearBoundaryMargin = false;
-            }
-            const NozzleBasis nb = queryNozzleFrame(
-                {xSurf.x(), xSurf.y(), xSurf.z()},
-                {1.0f, 0.0f, 0.0f});
-            const openvdb::Vec3f zAxis(
-                nb.nozzle_axis[0], nb.nozzle_axis[1], nb.nozzle_axis[2]);
-            const openvdb::Vec3f xAxis(
-                nb.travel_axis[0], nb.travel_axis[1], nb.travel_axis[2]);
-            const openvdb::Vec3f yAxis(
-                nb.lateral_axis[0], nb.lateral_axis[1], nb.lateral_axis[2]);
-
-            // Innermost conformal skin layer position where the nozzle reaches deepest
-            const openvdb::Vec3f xBase = xSurf - skinDepthMm * nSdf;
-
-            // Compute maximum axial height along +zAxis until exiting the object bounding box
-            const openvdb::Vec3f corners[8] = {
-                {solidBBoxMinX, solidBBoxMinY, solidBBoxMinZ},
-                {solidBBoxMaxX, solidBBoxMinY, solidBBoxMinZ},
-                {solidBBoxMinX, solidBBoxMaxY, solidBBoxMinZ},
-                {solidBBoxMaxX, solidBBoxMaxY, solidBBoxMinZ},
-                {solidBBoxMinX, solidBBoxMinY, solidBBoxMaxZ},
-                {solidBBoxMaxX, solidBBoxMinY, solidBBoxMaxZ},
-                {solidBBoxMinX, solidBBoxMaxY, solidBBoxMaxZ},
-                {solidBBoxMaxX, solidBBoxMaxY, solidBBoxMaxZ},
-            };
-            float maxZAlongNozzle = 0.0f;
-            for (const auto& c : corners) {
-                maxZAlongNozzle = std::max(maxZAlongNozzle, (c - xBase).dot(zAxis));
-            }
-            const float zSweepMax = std::min(
-                maxZAlongNozzle,
-                std::min(maxToolClearanceHeightMm, skinDepthMm + 3.0f * hTop));
-            const float zStart = std::max(0.60f * hTop, 0.50f * fineVoxelSize);
-            if (zSweepMax <= zStart) {
-                return false;
-            }
-
-            constexpr float kDirs24[24][2] = {
-                {1.0f, 0.0f},
-                {0.9659258f, 0.2588190f},
-                {0.8660254f, 0.5f},
-                {0.7071068f, 0.7071068f},
-                {0.5f, 0.8660254f},
-                {0.2588190f, 0.9659258f},
-                {0.0f, 1.0f},
-                {-0.2588190f, 0.9659258f},
-                {-0.5f, 0.8660254f},
-                {-0.7071068f, 0.7071068f},
-                {-0.8660254f, 0.5f},
-                {-0.9659258f, 0.2588190f},
-                {-1.0f, 0.0f},
-                {-0.9659258f, -0.2588190f},
-                {-0.8660254f, -0.5f},
-                {-0.7071068f, -0.7071068f},
-                {-0.5f, -0.8660254f},
-                {-0.2588190f, -0.9659258f},
-                {0.0f, -1.0f},
-                {0.2588190f, -0.9659258f},
-                {0.5f, -0.8660254f},
-                {0.7071068f, -0.7071068f},
-                {0.8660254f, -0.5f},
-                {0.9659258f, -0.2588190f},
-            };
-
-            const float radialStep = std::max({0.75f * fineVoxelSize, 0.50f * voxelSize, 0.45f});
-            const float nearTipLimit = skinDepthMm + std::max(1.25f * hTop, 1.0f * fineVoxelSize);
-            const float tipOrificeLimitZ = skinDepthMm + 0.85f * hTop;
-            const float tipOrificeClearR = tipRadiusMm + wallHalfWidthMm + 0.25f * fineVoxelSize;
-            const float printTauTol = printTau + 0.65f * hTop;
-            const float baseCurvTol = std::max(0.45f * hTop, 0.35f * fineVoxelSize);
-            const float cosNozSurf = nSdf.dot(zAxis);
-
-            auto isBrickPossiblyOccupiedAt = [&](
-                const openvdb::Vec3f& pt,
-                float maxAllowedTau) -> bool {
-                if (pt.x() < solidBBoxMinX || pt.x() > solidBBoxMaxX ||
-                    pt.y() < solidBBoxMinY || pt.y() > solidBBoxMaxY ||
-                    pt.z() < solidBBoxMinZ || pt.z() > solidBBoxMaxZ) {
-                    return false;
-                }
-                const int bx = static_cast<int>(std::floor((pt.x() - brickOriginX) * invBrickSize));
-                const int by = static_cast<int>(std::floor((pt.y() - brickOriginY) * invBrickSize));
-                const int bz = static_cast<int>(std::floor((pt.z() - brickOriginZ) * invBrickSize));
-                if (bx < 0 || bx >= brickNx ||
-                    by < 0 || by >= brickNy ||
-                    bz < 0 || bz >= brickNz) {
-                    return false;
-                }
-                const std::size_t bIdx =
-                    static_cast<std::size_t>(bz) * brickStrideZ +
-                    static_cast<std::size_t>(by) * brickStrideY +
-                    static_cast<std::size_t>(bx);
-                return brickMinTau[bIdx] <= maxAllowedTau;
-            };
-
-            for (float z = zStart; z <= zSweepMax;) {
-                const float rClear = evalToolClearanceRadiusAtZ(z);
-                const float rMargin =
-                    (outNearBoundaryMargin != nullptr && z <= nearTipLimit + 2.0f * hTop)
-                        ? (rClear + std::max(0.65f * fineVoxelSize, 0.85f * hTop))
-                        : rClear;
-                const openvdb::Vec3f pAxis = xBase + z * zAxis;
-                const bool allowFutureAtZ = (z <= tipOrificeLimitZ);
-                const float sliceTauLimit =
-                    allowFutureAtZ ? maxPlausibleTau : printTauTol;
-
-                const float zStep = (z < nearTipLimit + 2.0f * hTop)
-                    ? std::max(0.55f * fineVoxelSize, 0.65f * hTop)
-                    : std::max(0.95f * fineVoxelSize, 0.65f);
-
-                // Quick disk AABB overlap check against the solid object bounding box
-                if (pAxis.x() + rMargin < solidBBoxMinX || pAxis.x() - rMargin > solidBBoxMaxX ||
-                    pAxis.y() + rMargin < solidBBoxMinY || pAxis.y() - rMargin > solidBBoxMaxY ||
-                    pAxis.z() + rMargin < solidBBoxMinZ || pAxis.z() - rMargin > solidBBoxMaxZ) {
-                    z += zStep;
-                    continue;
-                }
-
-                // Check centerline point `pAxis` when above the outer surface
-                if (z > skinDepthMm + 0.55f * hTop) {
-                    const float hAboveSurfAxis = (pAxis - xSurf).dot(nSdf);
-                    const float hAboveNozAxis = (pAxis - xSurf).dot(zAxis);
-                    if (hAboveSurfAxis > baseCurvTol &&
-                        (cosNozSurf < 0.85f || hAboveNozAxis > baseCurvTol) &&
-                        isBrickPossiblyOccupiedAt(pAxis, sliceTauLimit)) {
-                        const openvdb::Vec3d wpAxis(pAxis.x(), pAxis.y(), pAxis.z());
-                        const float axisSdf = sampleAnySdfWith(
-                            wpAxis, localSdfAcc, localSdfSampler, localFineSdfSampler);
-                        if (axisSdf <= 0.08f * fineVoxelSize) {
-                            const float yTau = sampleTauAtWith(
-                                wpAxis,
-                                localFineEikAcc,
-                                localFineEikSampler,
-                                localMainEikAcc,
-                                localMainEikSampler);
-                            if (yTau <= printTauTol || allowFutureAtZ) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-
-                const int numRings = std::max(1, static_cast<int>(std::ceil(rMargin / radialStep)));
-                for (int ri = 1; ri <= numRings; ++ri) {
-                    const float r =
-                        (static_cast<float>(ri) / static_cast<float>(numRings)) * rMargin;
-                    const bool isMarginRing = (r > rClear + 1.0e-4f);
-                    if (isMarginRing &&
-                        (outNearBoundaryMargin == nullptr || *outNearBoundaryMargin)) {
-                        continue;
-                    }
-                    // Allow slight natural dome convexity without false self-collision
-                    const float curvTol = baseCurvTol + 0.03f * r;
-                    const bool checkSteepCore = (z > skinDepthMm + 0.75f * hTop);
-                    const bool allowFutureTip = allowFutureAtZ && (r <= tipOrificeClearR);
-
-                    for (const auto& dir : kDirs24) {
-                        const openvdb::Vec3f rVec = xAxis * dir[0] + yAxis * dir[1];
-                        const openvdb::Vec3f yPos = pAxis + r * rVec;
-
-                        // 1. Cheap geometric plane filter FIRST (3 flops)
-                        const float hAboveSurf = (yPos - xSurf).dot(nSdf);
-                        const float hAboveNoz = (yPos - xSurf).dot(zAxis);
-                        const float hAboveBase = hAboveSurf + skinDepthMm;
-                        const bool aboveSurf = (hAboveSurf > curvTol);
-                        const bool aboveBase =
-                            checkSteepCore &&
-                            (hAboveBase > curvTol) &&
-                            (cosNozSurf < 0.85f || hAboveNoz > baseCurvTol);
-                        if (!aboveSurf && !aboveBase) {
-                            continue;
-                        }
-
-                        // 2. O(1) flat 3D brick occupancy + \tau filter (zero OpenVDB queries)
-                        const float maxAllowedTau =
-                            (aboveSurf && allowFutureTip) ? maxPlausibleTau : printTauTol;
-                        if (!isBrickPossiblyOccupiedAt(yPos, maxAllowedTau)) {
-                            continue;
-                        }
-
-                        // 3. Exact SDF & Eikonal \tau check inside active brick
-                        const openvdb::Vec3d wpY(yPos.x(), yPos.y(), yPos.z());
-                        const float ySdf = sampleAnySdfWith(
-                            wpY, localSdfAcc, localSdfSampler, localFineSdfSampler);
-                        if (ySdf > 0.08f * fineVoxelSize) {
-                            continue;
-                        }
-
-                        bool effAboveSurf = aboveSurf;
-                        if (effAboveSurf && cosNozSurf >= 0.85f && hAboveNoz <= baseCurvTol) {
-                            const openvdb::Vec3f yOverhead =
-                                yPos + (baseCurvTol + 0.35f * fineVoxelSize - hAboveNoz) * zAxis;
-                            const openvdb::Vec3d wpOver(
-                                yOverhead.x(), yOverhead.y(), yOverhead.z());
-                            const float overheadSdf = sampleAnySdfWith(
-                                wpOver, localSdfAcc, localSdfSampler, localFineSdfSampler);
-                            if (overheadSdf > 0.05f * fineVoxelSize) {
-                                effAboveSurf = false;
-                            }
-                        }
-                        if (!effAboveSurf && !aboveBase) {
-                            continue;
-                        }
-
-                        bool hitsObstacle = false;
-                        if (effAboveSurf) {
-                            const float yTau = sampleTauAtWith(
-                                wpY,
-                                localFineEikAcc,
-                                localFineEikSampler,
-                                localMainEikAcc,
-                                localMainEikSampler);
-                            if (yTau <= printTauTol || allowFutureTip) {
-                                hitsObstacle = true;
-                            }
-                        } else if (aboveBase && ySdf <= -(skinDepthMm + 0.35f * hTop)) {
-                            const float yTau = sampleTauAtWith(
-                                wpY,
-                                localFineEikAcc,
-                                localFineEikSampler,
-                                localMainEikAcc,
-                                localMainEikSampler);
-                            if (yTau <= printTauTol) {
-                                hitsObstacle = true;
-                            }
-                        }
-
-                        if (hitsObstacle) {
-                            if (!isMarginRing) {
-                                return true;
-                            }
-                            if (outNearBoundaryMargin != nullptr) {
-                                *outNearBoundaryMargin = true;
-                            }
-                        }
-                    }
-                }
-
-                z += zStep;
-            }
-
-            return false;
         };
 
         // Collect active surface-band voxels from `fineSdfGrid`
@@ -6438,368 +6109,6 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
                     surfVoxels[k].surfNormal = clearanceNormals[k];
                     surfVoxels[k].surfPos = nextPositions[k];
-                }
-            }
-        }
-
-        // Lazy GPU dense `(sdf, tau)` narrow-band volume cache + batch clearance dispatcher
-        bool denseGpuGridReady = false;
-        bool denseGpuGridFailed = false;
-        int denseNx = 0;
-        int denseNy = 0;
-        int denseNz = 0;
-        float denseOriginX = solidBBoxMinX;
-        float denseOriginY = solidBBoxMinY;
-        float denseOriginZ = solidBBoxMinZ;
-        float invDenseStep = 1.0f / std::max(fineVoxelSize, 1.0e-3f);
-        std::vector<float> denseSdfTau;
-        std::vector<std::int32_t> gpuClearanceIntParams;
-        std::vector<float> gpuClearanceFloatParams;
-        std::vector<float> gpuProfileXzFlat;
-
-        auto ensureDenseGpuGrid = [&]() -> bool {
-            if (denseGpuGridReady) {
-                return true;
-            }
-            if (denseGpuGridFailed || !gpu_is_available()) {
-                denseGpuGridFailed = true;
-                return false;
-            }
-            float sweepMinX = solidBBoxMaxX;
-            float sweepMinY = solidBBoxMaxY;
-            float sweepMinZ = solidBBoxMaxZ;
-            float sweepMaxX = solidBBoxMinX;
-            float sweepMaxY = solidBBoxMinY;
-            float sweepMaxZ = solidBBoxMinZ;
-            const float marginExtra = std::max(0.65f * fineVoxelSize, 0.85f * hTop);
-            const float baseCurvTol = std::max(0.45f * hTop, 0.35f * fineVoxelSize);
-            const float overheadPad = baseCurvTol + fineVoxelSize;
-            const float clampPad = std::max(2.0f * fineVoxelSize, overheadPad);
-            for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
-                const auto& sv = surfVoxels[k];
-                const openvdb::Vec3f& cNorm = clearanceNormals[k];
-                const NozzleBasis candNb = queryNozzleFrame(
-                    {sv.surfPos.x(), sv.surfPos.y(), sv.surfPos.z()},
-                    {1.0f, 0.0f, 0.0f});
-                const openvdb::Vec3f zNoz(
-                    candNb.nozzle_axis[0], candNb.nozzle_axis[1], candNb.nozzle_axis[2]);
-                const float depthMm = static_cast<float>(sv.requestedLayers) * hTop;
-                const float zMaxCand =
-                    std::min(maxToolClearanceHeightMm, depthMm + 3.0f * hTop);
-                const float rMaxCand =
-                    evalToolClearanceRadiusAtZ(zMaxCand) + marginExtra + 2.0f * fineVoxelSize;
-                const openvdb::Vec3f xBase = sv.surfPos - depthMm * cNorm;
-                const openvdb::Vec3f pTop = xBase + zMaxCand * zNoz;
-                const openvdb::Vec3f pOver = sv.surfPos + overheadPad * zNoz;
-                sweepMinX = std::min(
-                    sweepMinX,
-                    std::min({xBase.x(), pTop.x(), sv.surfPos.x(), pOver.x()}) - rMaxCand);
-                sweepMaxX = std::max(
-                    sweepMaxX,
-                    std::max({xBase.x(), pTop.x(), sv.surfPos.x(), pOver.x()}) + rMaxCand);
-                sweepMinY = std::min(
-                    sweepMinY,
-                    std::min({xBase.y(), pTop.y(), sv.surfPos.y(), pOver.y()}) - rMaxCand);
-                sweepMaxY = std::max(
-                    sweepMaxY,
-                    std::max({xBase.y(), pTop.y(), sv.surfPos.y(), pOver.y()}) + rMaxCand);
-                sweepMinZ = std::min(
-                    sweepMinZ,
-                    std::min({xBase.z(), pTop.z(), sv.surfPos.z(), pOver.z()}) - rMaxCand);
-                sweepMaxZ = std::max(
-                    sweepMaxZ,
-                    std::max({xBase.z(), pTop.z(), sv.surfPos.z(), pOver.z()}) + rMaxCand);
-            }
-            if (sweepMaxX <= sweepMinX) {
-                sweepMinX = solidBBoxMinX;
-                sweepMaxX = solidBBoxMaxX;
-            }
-            if (sweepMaxY <= sweepMinY) {
-                sweepMinY = solidBBoxMinY;
-                sweepMaxY = solidBBoxMaxY;
-            }
-            if (sweepMaxZ <= sweepMinZ) {
-                sweepMinZ = solidBBoxMinZ;
-                sweepMaxZ = solidBBoxMaxZ;
-            }
-            denseOriginX = std::max(solidBBoxMinX - clampPad, sweepMinX);
-            denseOriginY = std::max(solidBBoxMinY - clampPad, sweepMinY);
-            denseOriginZ = std::max(solidBBoxMinZ - clampPad, sweepMinZ);
-            const float denseMaxX = std::min(solidBBoxMaxX + clampPad, sweepMaxX);
-            const float denseMaxY = std::min(solidBBoxMaxY + clampPad, sweepMaxY);
-            const float denseMaxZ = std::min(solidBBoxMaxZ + clampPad, sweepMaxZ);
-
-            float stepMm = fineVoxelSize;
-            const float spanX = std::max(voxelSize, denseMaxX - denseOriginX);
-            const float spanY = std::max(voxelSize, denseMaxY - denseOriginY);
-            const float spanZ = std::max(voxelSize, denseMaxZ - denseOriginZ);
-            const double estFineCells =
-                (static_cast<double>(spanX) / stepMm + 2.0) *
-                (static_cast<double>(spanY) / stepMm + 2.0) *
-                (static_cast<double>(spanZ) / stepMm + 2.0);
-            if (estFineCells > 7.5e6) {
-                stepMm = voxelSize;
-            }
-            invDenseStep = 1.0f / std::max(stepMm, 1.0e-3f);
-            denseNx = std::max(2, static_cast<int>(std::ceil(spanX * invDenseStep)) + 2);
-            denseNy = std::max(2, static_cast<int>(std::ceil(spanY * invDenseStep)) + 2);
-            denseNz = std::max(2, static_cast<int>(std::ceil(spanZ * invDenseStep)) + 2);
-            const std::size_t totalCells =
-                static_cast<std::size_t>(denseNx) *
-                static_cast<std::size_t>(denseNy) *
-                static_cast<std::size_t>(denseNz);
-            if (totalCells > 8'000'000u) {
-                denseGpuGridFailed = true;
-                return false;
-            }
-
-            denseSdfTau.assign(totalCells * 2u, 0.0f);
-            const std::size_t strideY = static_cast<std::size_t>(denseNx);
-            const std::size_t strideZ = strideY * static_cast<std::size_t>(denseNy);
-
-            tbb::parallel_for(
-                tbb::blocked_range<int>(0, denseNz, 4),
-                [&](const tbb::blocked_range<int>& rz) {
-                    auto localSdfAcc = sdfGrid.getConstAccessor();
-                    openvdb::tools::GridSampler<
-                        openvdb::FloatGrid::ConstAccessor,
-                        openvdb::tools::BoxSampler>
-                        localSdfSampler(localSdfAcc, sdfGrid.transform());
-                    auto localFineSdfAcc = fineSdfGrid.getConstAccessor();
-                    openvdb::tools::GridSampler<
-                        openvdb::FloatGrid::ConstAccessor,
-                        openvdb::tools::BoxSampler>
-                        localFineSdfSampler(localFineSdfAcc, fineSdfGrid.transform());
-                    auto localFineEikAcc = fineEikGrid.getConstAccessor();
-                    openvdb::tools::GridSampler<
-                        openvdb::FloatGrid::ConstAccessor,
-                        openvdb::tools::BoxSampler>
-                        localFineEikSampler(localFineEikAcc, fineEikGrid.transform());
-                    auto localMainEikAcc = eikGrid.getConstAccessor();
-                    openvdb::tools::GridSampler<
-                        openvdb::FloatGrid::ConstAccessor,
-                        openvdb::tools::BoxSampler>
-                        localMainEikSampler(localMainEikAcc, eikGrid.transform());
-
-                    for (int iz = rz.begin(); iz != rz.end(); ++iz) {
-                        const float wz = denseOriginZ + static_cast<float>(iz) * stepMm;
-                        for (int iy = 0; iy < denseNy; ++iy) {
-                            const float wy = denseOriginY + static_cast<float>(iy) * stepMm;
-                            for (int ix = 0; ix < denseNx; ++ix) {
-                                const float wx = denseOriginX + static_cast<float>(ix) * stepMm;
-                                const std::size_t cIdx =
-                                    static_cast<std::size_t>(iz) * strideZ +
-                                    static_cast<std::size_t>(iy) * strideY +
-                                    static_cast<std::size_t>(ix);
-                                const openvdb::Vec3d wp(wx, wy, wz);
-                                const float sVal = sampleAnySdfWith(
-                                    wp, localSdfAcc, localSdfSampler, localFineSdfSampler);
-                                float tVal = -1.0f;
-                                if (sVal <= 0.65f * voxelSize) {
-                                    tVal = sampleTauAtWith(
-                                        wp,
-                                        localFineEikAcc,
-                                        localFineEikSampler,
-                                        localMainEikAcc,
-                                        localMainEikSampler);
-                                }
-                                denseSdfTau[cIdx * 2u + 0u] = sVal;
-                                denseSdfTau[cIdx * 2u + 1u] = tVal;
-                            }
-                        }
-                    }
-                });
-
-            const NozzleBasis refNb = queryNozzleFrame(
-                {rec.minX, rec.minY, rec.minZ},
-                {1.0f, 0.0f, 0.0f});
-            const int cMode = (activeToolPtr != nullptr)
-                ? static_cast<int>(activeToolPtr->clearance_mode)
-                : 0;
-            float coneTipR = tipRadiusMm;
-            float coneSlope = 0.65f;
-            float rectHx = tipRadiusMm;
-            float rectHy = tipRadiusMm;
-            float rectSlopeX = 0.65f;
-            float rectSlopeY = 0.65f;
-            float profEndSlope = 0.0f;
-            gpuProfileXzFlat.clear();
-            if (activeToolPtr != nullptr) {
-                const auto& tool = *activeToolPtr;
-                coneTipR = tool.cone_tip_radius_mm;
-                coneSlope = std::tan(
-                    std::clamp(tool.cone_half_angle_deg, 1.0f, 85.0f) * kDegToRad);
-                rectHx = tool.rect_tip_half_width_x_mm;
-                rectHy = tool.rect_tip_half_width_y_mm;
-                rectSlopeX = std::tan(
-                    std::clamp(tool.rect_half_angle_x_deg, 1.0f, 85.0f) * kDegToRad);
-                rectSlopeY = std::tan(
-                    std::clamp(tool.rect_half_angle_y_deg, 1.0f, 85.0f) * kDegToRad);
-                const auto& prof = tool.clearance_profile_xz;
-                for (const auto& pt : prof) {
-                    gpuProfileXzFlat.push_back(pt.x_radius_mm);
-                    gpuProfileXzFlat.push_back(pt.z_height_mm);
-                }
-                if (prof.size() >= 2) {
-                    const float dz =
-                        prof.back().z_height_mm - prof[prof.size() - 2].z_height_mm;
-                    const float dr =
-                        prof.back().x_radius_mm - prof[prof.size() - 2].x_radius_mm;
-                    profEndSlope = (dz > 1.0e-4f) ? std::max(0.0f, dr / dz) : 0.0f;
-                }
-            }
-            const float radialStep =
-                std::max({0.75f * fineVoxelSize, 0.50f * voxelSize, 0.45f});
-
-            gpuClearanceIntParams = {
-                cMode,
-                brickNx,
-                brickNy,
-                brickNz,
-                denseNx,
-                denseNy,
-                denseNz,
-                1};
-            gpuClearanceFloatParams = {
-                refNb.nozzle_axis[0], refNb.nozzle_axis[1], refNb.nozzle_axis[2], 0.0f,
-                refNb.travel_axis[0], refNb.travel_axis[1], refNb.travel_axis[2], 0.0f,
-                refNb.lateral_axis[0], refNb.lateral_axis[1], refNb.lateral_axis[2], 0.0f,
-                solidBBoxMinX, solidBBoxMinY, solidBBoxMinZ, 0.0f,
-                solidBBoxMaxX, solidBBoxMaxY, solidBBoxMaxZ, 0.0f,
-                brickOriginX, brickOriginY, brickOriginZ, invBrickSize,
-                denseOriginX, denseOriginY, denseOriginZ, invDenseStep,
-                tipRadiusMm, wallHalfWidthMm, fineVoxelSize, hTop,
-                maxToolClearanceHeightMm, maxPlausibleTau, voxelSize, radialStep,
-                coneTipR, coneSlope, rectHx, rectHy,
-                rectSlopeX, rectSlopeY, profEndSlope, 0.0f};
-            denseGpuGridReady = true;
-            return true;
-        };
-
-        auto evaluateBatchNozzleClearance = [&](
-            const std::vector<int>& voxelIndices,
-            float overrideSkinDepthMm,
-            float overridePrintTau,
-            std::vector<std::uint32_t>& outFlags) {
-            const std::size_t count = voxelIndices.size();
-            outFlags.assign(count, 0u);
-            if (count == 0) {
-                return;
-            }
-            if (count >= 128 && ensureDenseGpuGrid()) {
-                std::vector<float> candPosDepth(count * 4u);
-                std::vector<float> candNormTau(count * 4u);
-                for (std::size_t k = 0; k < count; ++k) {
-                    const auto svIdx = static_cast<std::size_t>(voxelIndices[k]);
-                    const auto& sv = surfVoxels[svIdx];
-                    const openvdb::Vec3f& cNorm = clearanceNormals[svIdx];
-                    const float depthMm = (overrideSkinDepthMm > 0.0f)
-                        ? overrideSkinDepthMm
-                        : (static_cast<float>(sv.requestedLayers) * hTop);
-                    const float pTau = (overridePrintTau > 0.0f)
-                        ? overridePrintTau
-                        : (sv.tau + depthMm);
-                    candPosDepth[k * 4u + 0u] = sv.surfPos.x();
-                    candPosDepth[k * 4u + 1u] = sv.surfPos.y();
-                    candPosDepth[k * 4u + 2u] = sv.surfPos.z();
-                    candPosDepth[k * 4u + 3u] = depthMm;
-                    candNormTau[k * 4u + 0u] = cNorm.x();
-                    candNormTau[k * 4u + 1u] = cNorm.y();
-                    candNormTau[k * 4u + 2u] = cNorm.z();
-                    candNormTau[k * 4u + 3u] = pTau;
-                }
-                const rust::Slice<const float> posSlice(candPosDepth.data(), candPosDepth.size());
-                const rust::Slice<const float> normSlice(candNormTau.data(), candNormTau.size());
-                const rust::Slice<const float> brickSlice(brickMinTau.data(), brickMinTau.size());
-                const rust::Slice<const float> denseSlice(denseSdfTau.data(), denseSdfTau.size());
-                const rust::Slice<const std::int32_t> intSlice(
-                    gpuClearanceIntParams.data(), gpuClearanceIntParams.size());
-                const rust::Slice<const float> floatSlice(
-                    gpuClearanceFloatParams.data(), gpuClearanceFloatParams.size());
-                const rust::Slice<const float> profSlice(
-                    gpuProfileXzFlat.data(), gpuProfileXzFlat.size());
-                rust::Slice<std::uint32_t> flagsSlice(outFlags.data(), outFlags.size());
-                if (gpu_sweep_tool_clearance(
-                        posSlice,
-                        normSlice,
-                        brickSlice,
-                        denseSlice,
-                        intSlice,
-                        floatSlice,
-                        profSlice,
-                        flagsSlice)) {
-                    return;
-                }
-            }
-
-            // Multi-threaded TBB CPU fallback
-            tbb::parallel_for(
-                tbb::blocked_range<std::size_t>(0, count, 64),
-                [&](const tbb::blocked_range<std::size_t>& r) {
-                    auto localSdfAcc = sdfGrid.getConstAccessor();
-                    openvdb::tools::GridSampler<
-                        openvdb::FloatGrid::ConstAccessor,
-                        openvdb::tools::BoxSampler>
-                        localSdfSampler(localSdfAcc, sdfGrid.transform());
-                    auto localFineSdfAcc = fineSdfGrid.getConstAccessor();
-                    openvdb::tools::GridSampler<
-                        openvdb::FloatGrid::ConstAccessor,
-                        openvdb::tools::BoxSampler>
-                        localFineSdfSampler(localFineSdfAcc, fineSdfGrid.transform());
-                    auto localFineEikAcc = fineEikGrid.getConstAccessor();
-                    openvdb::tools::GridSampler<
-                        openvdb::FloatGrid::ConstAccessor,
-                        openvdb::tools::BoxSampler>
-                        localFineEikSampler(localFineEikAcc, fineEikGrid.transform());
-                    auto localMainEikAcc = eikGrid.getConstAccessor();
-                    openvdb::tools::GridSampler<
-                        openvdb::FloatGrid::ConstAccessor,
-                        openvdb::tools::BoxSampler>
-                        localMainEikSampler(localMainEikAcc, eikGrid.transform());
-
-                    for (std::size_t k = r.begin(); k != r.end(); ++k) {
-                        const auto svIdx = static_cast<std::size_t>(voxelIndices[k]);
-                        const auto& sv = surfVoxels[svIdx];
-                        const openvdb::Vec3f& cNorm = clearanceNormals[svIdx];
-                        const float depthMm = (overrideSkinDepthMm > 0.0f)
-                            ? overrideSkinDepthMm
-                            : (static_cast<float>(sv.requestedLayers) * hTop);
-                        const float pTau = (overridePrintTau > 0.0f)
-                            ? overridePrintTau
-                            : (sv.tau + depthMm);
-                        bool nearMargin = false;
-                        if (hasNozzleClearanceCollision(
-                                sv.surfPos,
-                                cNorm,
-                                depthMm,
-                                pTau,
-                                localSdfAcc,
-                                localSdfSampler,
-                                localFineSdfSampler,
-                                localFineEikAcc,
-                                localFineEikSampler,
-                                localMainEikAcc,
-                                localMainEikSampler,
-                                &nearMargin)) {
-                            outFlags[k] = 1u;
-                        } else if (nearMargin) {
-                            outFlags[k] = 2u;
-                        }
-                    }
-                });
-        };
-
-        if (!surfVoxels.empty()) {
-            std::vector<int> allSurfIndices(surfVoxels.size());
-            std::iota(allSurfIndices.begin(), allSurfIndices.end(), 0);
-            std::vector<std::uint32_t> stage1Flags;
-            evaluateBatchNozzleClearance(allSurfIndices, -1.0f, -1.0f, stage1Flags);
-            for (std::size_t k = 0; k < surfVoxels.size(); ++k) {
-                if ((stage1Flags[k] & 1u) != 0u) {
-                    surfVoxels[k].patchId = -2;
-                    surfVoxels[k].weight = 0.0f;
-                } else if ((stage1Flags[k] & 2u) != 0u) {
-                    surfVoxels[k].weight = 0.55f;
                 }
             }
         }
@@ -7284,6 +6593,57 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             const float maxStepHeight = 0.65f * fineVoxelSize;
             const openvdb::Vec3f zNozNominal = edtWAxis;
 
+            // Reusable per-patch 2D/3D scratch arrays (cleared via touched lists)
+            std::vector<std::uint8_t> patchColHasSurf(edtSliceStride, 0);
+            std::vector<std::uint8_t> survColMarked(edtSliceStride, 0);
+            std::vector<float> patchColMaxW(edtSliceStride, std::numeric_limits<float>::lowest());
+            std::vector<float> patchEstW(edtSliceStride, 0.0f);
+            std::vector<int> patchColHopDist(edtSliceStride, -1);
+            std::vector<std::uint8_t> patchDeferredBossCol(edtSliceStride, 0);
+            std::vector<std::uint8_t> colHasWallAbovePatch(edtSliceStride, 0);
+            std::vector<std::uint8_t> patchDeferredGeoCell(edtTotalCells, 0);
+            std::vector<std::uint8_t> geoBfsVisited(edtTotalCells, 0);
+            std::vector<int> touchedSurfCols;
+            std::vector<int> touchedHopCols;
+            std::vector<int> touchedBossCols;
+            std::vector<int> touchedWallCols;
+            std::vector<std::size_t> touchedGeoCells;
+            std::vector<std::size_t> touchedBfsVisited;
+
+            auto clearPatchScratch = [&]() {
+                for (const int uv : touchedSurfCols) {
+                    patchColHasSurf[static_cast<std::size_t>(uv)] = 0;
+                    patchColMaxW[static_cast<std::size_t>(uv)] = std::numeric_limits<float>::lowest();
+                }
+                touchedSurfCols.clear();
+                for (const int uv : touchedHopCols) {
+                    patchColHopDist[static_cast<std::size_t>(uv)] = -1;
+                    patchEstW[static_cast<std::size_t>(uv)] = 0.0f;
+                }
+                touchedHopCols.clear();
+                for (const int uv : touchedBossCols) {
+                    patchDeferredBossCol[static_cast<std::size_t>(uv)] = 0;
+                }
+                touchedBossCols.clear();
+                for (const int uv : touchedWallCols) {
+                    colHasWallAbovePatch[static_cast<std::size_t>(uv)] = 0;
+                }
+                touchedWallCols.clear();
+                for (const std::size_t cIdx : touchedGeoCells) {
+                    patchDeferredGeoCell[cIdx] = 0;
+                }
+                touchedGeoCells.clear();
+                for (const std::size_t cIdx : touchedBfsVisited) {
+                    geoBfsVisited[cIdx] = 0;
+                }
+                touchedBfsVisited.clear();
+            };
+
+            struct PatchScratchGuard {
+                decltype(clearPatchScratch)& fn;
+                ~PatchScratchGuard() { fn(); }
+            };
+
             for (std::size_t i = 0; i < surfVoxels.size(); ++i) {
                 if (surfVoxels[i].patchId != -1) {
                     continue;
@@ -7347,16 +6707,38 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     continue;
                 }
 
+                PatchScratchGuard scratchGuard{clearPatchScratch};
+
                 const int patchSkinLayers = std::clamp<int>(
                     static_cast<int>(std::lround(sumLayers / static_cast<double>(queue.size()))),
                     1,
                     12);
                 const float patchSkinThicknessMm = static_cast<float>(patchSkinLayers) * hTop;
+                const float rnInitLen = runningNormalSum.length();
+                openvdb::Vec3f initMeanNormal =
+                    (rnInitLen > 1.0e-5f) ? (runningNormalSum / rnInitLen) : edtWAxis;
+                if (initMeanNormal.dot(edtWAxis) < 0.0f) {
+                    initMeanNormal = -initMeanNormal;
+                }
 
-                // Determine patch branch & initial tau range for causal boss deferral
+                // Determine patch branch, initial tau range, 2D UV footprint, and least-squares plane
                 std::unordered_map<int, int> initBranchVotes;
                 float initTauMin = std::numeric_limits<float>::max();
                 float initTauComp = std::numeric_limits<float>::lowest();
+                float patchWMin = std::numeric_limits<float>::max();
+                float patchWMax = std::numeric_limits<float>::lowest();
+                float patchUMin = std::numeric_limits<float>::max();
+                float patchUMax = std::numeric_limits<float>::lowest();
+                float patchVMin = std::numeric_limits<float>::max();
+                float patchVMax = std::numeric_limits<float>::lowest();
+                int pIuMin = edtNu - 1;
+                int pIuMax = 0;
+                int pIvMin = edtNv - 1;
+                int pIvMax = 0;
+                double sumU = 0.0;
+                double sumV = 0.0;
+                double sumW = 0.0;
+
                 for (int idx : queue) {
                     const auto& sv = surfVoxels[static_cast<std::size_t>(idx)];
                     initBranchVotes[sv.branchId] += 1;
@@ -7364,7 +6746,134 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         initTauMin = std::min(initTauMin, sv.tau);
                         initTauComp = std::max(initTauComp, sv.tau);
                     }
+                    const float pu = sv.surfPos.dot(edtUAxis);
+                    const float pv = sv.surfPos.dot(edtVAxis);
+                    const float pw = sv.surfPos.dot(edtWAxis);
+                    patchUMin = std::min(patchUMin, pu);
+                    patchUMax = std::max(patchUMax, pu);
+                    patchVMin = std::min(patchVMin, pv);
+                    patchVMax = std::max(patchVMax, pv);
+                    patchWMin = std::min(patchWMin, pw);
+                    patchWMax = std::max(patchWMax, pw);
+                    sumU += static_cast<double>(pu);
+                    sumV += static_cast<double>(pv);
+                    sumW += static_cast<double>(pw);
+
+                    const int iu = std::clamp(static_cast<int>(std::floor((pu - edtU0) * invEdtStep)), 0, edtNu - 1);
+                    const int iv = std::clamp(static_cast<int>(std::floor((pv - edtV0) * invEdtStep)), 0, edtNv - 1);
+                    pIuMin = std::min(pIuMin, iu);
+                    pIuMax = std::max(pIuMax, iu);
+                    pIvMin = std::min(pIvMin, iv);
+                    pIvMax = std::max(pIvMax, iv);
+                    const int uvIdx = iv * edtNu + iu;
+                    if (!patchColHasSurf[static_cast<std::size_t>(uvIdx)]) {
+                        patchColHasSurf[static_cast<std::size_t>(uvIdx)] = 1;
+                        patchColMaxW[static_cast<std::size_t>(uvIdx)] = pw;
+                        touchedSurfCols.push_back(uvIdx);
+                    } else {
+                        patchColMaxW[static_cast<std::size_t>(uvIdx)] =
+                            std::max(patchColMaxW[static_cast<std::size_t>(uvIdx)], pw);
+                    }
                 }
+
+                const double invQ = 1.0 / static_cast<double>(queue.size());
+                const float meanU = static_cast<float>(sumU * invQ);
+                const float meanV = static_cast<float>(sumV * invQ);
+                const float meanW = static_cast<float>(sumW * invQ);
+                double sUU = 0.0, sUV = 0.0, sVV = 0.0, sUW = 0.0, sVW = 0.0;
+                for (int idx : queue) {
+                    const auto& sv = surfVoxels[static_cast<std::size_t>(idx)];
+                    const double du = static_cast<double>(sv.surfPos.dot(edtUAxis) - meanU);
+                    const double dv = static_cast<double>(sv.surfPos.dot(edtVAxis) - meanV);
+                    const double dw = static_cast<double>(sv.surfPos.dot(edtWAxis) - meanW);
+                    sUU += du * du;
+                    sUV += du * dv;
+                    sVV += dv * dv;
+                    sUW += du * dw;
+                    sVW += dv * dw;
+                }
+                float planeAu = 0.0f;
+                float planeAv = 0.0f;
+                const double det2 = sUU * sVV - sUV * sUV;
+                if (det2 > 1.0e-6) {
+                    planeAu = static_cast<float>((sUW * sVV - sVW * sUV) / det2);
+                    planeAv = static_cast<float>((sVW * sUU - sUW * sUV) / det2);
+                }
+                auto evalPlaneW = [&](float cu, float cv) -> float {
+                    return meanW + planeAu * (cu - meanU) + planeAv * (cv - meanV);
+                };
+
+                // Multi-source BFS across padded patch UV box to interpolate residual height over
+                // the fitted plane inside holes (such as boss footprints on sloped/curved roofs).
+                const int pBfsUMin = std::max(0, pIuMin - 3);
+                const int pBfsUMax = std::min(edtNu - 1, pIuMax + 3);
+                const int pBfsVMin = std::max(0, pIvMin - 3);
+                const int pBfsVMax = std::min(edtNv - 1, pIvMax + 3);
+                {
+                    std::vector<int> uvBfsQueue;
+                    uvBfsQueue.reserve(touchedSurfCols.size() * 4);
+                    for (const int uvIdx : touchedSurfCols) {
+                        const int cuIdx = uvIdx % edtNu;
+                        const int cvIdx = uvIdx / edtNu;
+                        const float cu = edtU0 + (static_cast<float>(cuIdx) + 0.5f) * edtStep;
+                        const float cv = edtV0 + (static_cast<float>(cvIdx) + 0.5f) * edtStep;
+                        patchColHopDist[static_cast<std::size_t>(uvIdx)] = 0;
+                        patchEstW[static_cast<std::size_t>(uvIdx)] =
+                            patchColMaxW[static_cast<std::size_t>(uvIdx)] - evalPlaneW(cu, cv);
+                        touchedHopCols.push_back(uvIdx);
+                        uvBfsQueue.push_back(uvIdx);
+                    }
+                    std::size_t uvHead = 0;
+                    while (uvHead < uvBfsQueue.size()) {
+                        const int currUv = uvBfsQueue[uvHead++];
+                        const int cu = currUv % edtNu;
+                        const int cv = currUv / edtNu;
+                        const int nextDist = patchColHopDist[static_cast<std::size_t>(currUv)] + 1;
+                        static constexpr int kNb4[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+                        for (const auto& d : kNb4) {
+                            const int nu = cu + d[0];
+                            const int nv = cv + d[1];
+                            if (nu < pBfsUMin || nu > pBfsUMax || nv < pBfsVMin || nv > pBfsVMax) {
+                                continue;
+                            }
+                            const int nuv = nv * edtNu + nu;
+                            if (patchColHopDist[static_cast<std::size_t>(nuv)] >= 0) {
+                                continue;
+                            }
+                            float sumNbW = 0.0f;
+                            int cntNbW = 0;
+                            for (const auto& d2 : kNb4) {
+                                const int bu = nu + d2[0];
+                                const int bv = nv + d2[1];
+                                if (bu < pBfsUMin || bu > pBfsUMax || bv < pBfsVMin || bv > pBfsVMax) {
+                                    continue;
+                                }
+                                const int buv = bv * edtNu + bu;
+                                const int hd = patchColHopDist[static_cast<std::size_t>(buv)];
+                                if (hd >= 0 && hd < nextDist) {
+                                    sumNbW += patchEstW[static_cast<std::size_t>(buv)];
+                                    ++cntNbW;
+                                }
+                            }
+                            patchColHopDist[static_cast<std::size_t>(nuv)] = nextDist;
+                            patchEstW[static_cast<std::size_t>(nuv)] =
+                                (cntNbW > 0) ? (sumNbW / static_cast<float>(cntNbW)) : 0.0f;
+                            touchedHopCols.push_back(nuv);
+                            uvBfsQueue.push_back(nuv);
+                        }
+                    }
+                }
+                auto evalLocalEstW = [&](int iu, int iv) -> float {
+                    const float cu = edtU0 + (static_cast<float>(iu) + 0.5f) * edtStep;
+                    const float cv = edtV0 + (static_cast<float>(iv) + 0.5f) * edtStep;
+                    const float planeW = evalPlaneW(cu, cv);
+                    const int uvIdx = iv * edtNu + iu;
+                    if (patchColHopDist[static_cast<std::size_t>(uvIdx)] >= 0) {
+                        return planeW + patchEstW[static_cast<std::size_t>(uvIdx)];
+                    }
+                    return planeW;
+                };
+
                 int initPatchBranch = 0;
                 int initBestVotes = -1;
                 for (const auto& [bId, cnt] : initBranchVotes) {
@@ -7376,52 +6885,89 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 initPatchBranch = std::clamp<int>(
                     initPatchBranch, 0, static_cast<int>(branches.size()) - 1);
 
-                // Option 2b: Detect upper protruding boss branches (e.g., Benchy smokestack) that
-                // rise above this roof patch and can safely print AFTER the patch via reverse clearance.
-                std::vector<int> deferredBossRoots;
-                std::vector<std::uint8_t> patchDeferredMask(numBranches, 0);
-                if (multiBranch && initTauComp >= initTauMin) {
-                    std::vector<openvdb::Vec3f> patchPts;
+                std::vector<openvdb::Vec3f> patchPts;
+                {
                     const std::size_t pStep = std::max<std::size_t>(1, queue.size() / 512);
                     patchPts.reserve(std::min<std::size_t>(queue.size(), 512));
                     for (std::size_t qIdx = 0; qIdx < queue.size(); qIdx += pStep) {
                         patchPts.push_back(surfVoxels[static_cast<std::size_t>(queue[qIdx])].surfPos);
                     }
+                }
 
+                auto checkReverseBossClearance = [&](const std::vector<openvdb::Vec3f>& basePts) -> bool {
+                    if (basePts.empty()) {
+                        return false;
+                    }
+                    auto testAxisClear = [&](const openvdb::Vec3f& testAxis) -> bool {
+                        const float dzThresh = std::max(0.32f, 0.50f * fineVoxelSize);
+                        for (const openvdb::Vec3f& pb : basePts) {
+                            for (const openvdb::Vec3f& pp : patchPts) {
+                                const openvdb::Vec3f diff = pp - pb;
+                                const float dz = diff.dot(testAxis);
+                                if (dz > dzThresh) {
+                                    const float rPerp =
+                                        std::sqrt(std::max(0.0f, diff.lengthSqr() - dz * dz));
+                                    if (rPerp <= evalToolClearanceRadiusAtZ(dz)) {
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                        return true;
+                    };
+                    if (testAxisClear(edtWAxis)) {
+                        return true;
+                    }
+                    if (canTiltSkinTool) {
+                        openvdb::Vec3f centroid(0.0f, 0.0f, 0.0f);
+                        for (const openvdb::Vec3f& pb : basePts) {
+                            centroid += pb;
+                        }
+                        centroid /= static_cast<float>(basePts.size());
+                        const float safeTilt = computeSkinBedSafeMaxTilt(centroid);
+                        const openvdb::Vec3f tiltedAxis =
+                            clampVec3fToCone(initMeanNormal, edtWAxis, safeTilt);
+                        if (tiltedAxis.dot(edtWAxis) < 0.9999f && testAxisClear(tiltedAxis)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
+                // Option 2b (Topological): Detect upper protruding boss branches that rise above
+                // this patch and can safely print AFTER the patch via reverse clearance (with optional 5/6-axis tilt).
+                std::vector<int> deferredBossRoots;
+                std::vector<std::uint8_t> patchDeferredMask(numBranches, 0);
+                if (multiBranch && initTauComp >= initTauMin) {
+                    const float minBranchTauStart =
+                        initTauMin - std::max(2.0f * hTop, 2.0f * voxelSize);
                     for (std::size_t b = 0; b < numBranches; ++b) {
                         if (static_cast<int>(b) == initPatchBranch ||
                             isSubtree[b][static_cast<std::size_t>(initPatchBranch)] != 0 ||
                             branchPatchOwner[b] >= 0) {
                             continue;
                         }
-                        if (branches[b].tauStart < initTauMin - 2.0f * hTop ||
+                        if (branches[b].tauStart < minBranchTauStart ||
                             branches[b].tauStart > initTauComp + 0.5f * hTop ||
                             branches[b].tauEnd <= initTauComp + 0.5f * hTop) {
                             continue;
                         }
-                        const auto& basePts = branchBaseSamples[b];
-                        if (basePts.empty()) {
+                        const auto& rawBasePts = branchBaseSamples[b];
+                        if (rawBasePts.empty()) {
                             continue;
                         }
-                        bool reverseOk = true;
-                        for (const openvdb::Vec3f& pb : basePts) {
-                            for (const openvdb::Vec3f& pp : patchPts) {
-                                const openvdb::Vec3f diff = pp - pb;
-                                const float dz = diff.dot(edtWAxis);
-                                if (dz > 0.30f) {
-                                    const float rPerp =
-                                        std::sqrt(std::max(0.0f, diff.lengthSqr() - dz * dz));
-                                    if (rPerp <= evalToolClearanceRadiusAtZ(dz)) {
-                                        reverseOk = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (!reverseOk) {
-                                break;
+                        std::vector<openvdb::Vec3f> filteredBasePts;
+                        filteredBasePts.reserve(rawBasePts.size());
+                        for (const openvdb::Vec3f& pb : rawBasePts) {
+                            const int biu = std::clamp(static_cast<int>(std::floor((pb.dot(edtUAxis) - edtU0) * invEdtStep)), 0, edtNu - 1);
+                            const int biv = std::clamp(static_cast<int>(std::floor((pb.dot(edtVAxis) - edtV0) * invEdtStep)), 0, edtNv - 1);
+                            if (pb.dot(edtWAxis) >= evalLocalEstW(biu, biv) - 0.15f * fineVoxelSize) {
+                                filteredBasePts.push_back(pb);
                             }
                         }
-                        if (reverseOk) {
+                        const auto& basePtsToCheck =
+                            filteredBasePts.empty() ? rawBasePts : filteredBasePts;
+                        if (checkReverseBossClearance(basePtsToCheck)) {
                             deferredBossRoots.push_back(static_cast<int>(b));
                             for (std::size_t u = 0; u < numBranches; ++u) {
                                 if (isSubtree[b][u] != 0) {
@@ -7433,14 +6979,10 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 }
 
                 // Compute w-bounds of candidate patch slices
-                float patchWMin = std::numeric_limits<float>::max();
-                float patchWMax = std::numeric_limits<float>::lowest();
-                for (int idx : queue) {
-                    const float pw = surfVoxels[static_cast<std::size_t>(idx)].surfPos.dot(edtWAxis);
-                    patchWMin = std::min(patchWMin, pw);
-                    patchWMax = std::max(patchWMax, pw);
-                }
                 const float maxCheckHeight = std::min(maxToolClearanceHeightMm, 12.0f);
+                const float maxBossCheckW = std::max(
+                    patchWMax + maxCheckHeight,
+                    ((initTauComp >= initTauMin) ? initTauComp : patchWMax) + 2.5f * hTop);
                 const int iwSliceMin = std::clamp(
                     static_cast<int>(std::floor((patchWMin - patchSkinThicknessMm - edtW0) * invEdtStep)) - 2,
                     0,
@@ -7449,16 +6991,320 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     static_cast<int>(std::ceil((patchWMax + maxCheckHeight - edtW0) * invEdtStep)) + 2,
                     iwSliceMin,
                     edtNw - 1);
-                const int iwTipSliceMax = std::clamp(
-                    static_cast<int>(std::ceil((patchWMax + patchSkinThicknessMm + 1.5f * hTop - edtW0) * invEdtStep)) + 2,
+                const int iwBossSliceMax = std::clamp(
+                    static_cast<int>(std::ceil((maxBossCheckW - edtW0) * invEdtStep)) + 2,
+                    iwSliceMin,
+                    edtNw - 1);
+                const int iwWallSliceMax = std::clamp(
+                    static_cast<int>(std::ceil((patchWMax + std::max(0.45f * hTop, 0.35f * fineVoxelSize) - edtW0) * invEdtStep)) + 2,
                     iwSliceMin,
                     edtNw - 1);
 
+                // Option 2b (Geometric): Detect upper protruding bosses strictly above this patch's
+                // surface (handles single-branch flat+boss parts, iso-aligned Benchy roofs, and
+                // boss bases below a Reeb-graph saddle).
+                std::vector<std::size_t> acceptedGeoBossCells;
+                const float cosPatchW = std::clamp(initMeanNormal.dot(edtWAxis), 0.10f, 1.0f);
+                const float patchSlopeTan =
+                    std::sqrt(std::max(0.0f, 1.0f - cosPatchW * cosPatchW)) / cosPatchW;
+                const float bossAboveSurfaceMargin =
+                    std::max(0.50f * hTop, 0.50f * fineVoxelSize) + 0.50f * edtStep * patchSlopeTan;
+                {
+                    const float minBossRiseMm =
+                        std::max({2.0f * hTop, 1.5f * fineVoxelSize, 0.60f});
+                    const float baseBandMm =
+                        std::max(2.0f * hTop, 1.5f * edtStep) + bossAboveSurfaceMargin;
+
+                    auto isAbovePatchSolid = [&](int iu, int iv, int iw, float& outCw, float& outEstW) -> bool {
+                        if (iu < 0 || iu >= edtNu || iv < 0 || iv >= edtNv ||
+                            iw < iwSliceMin || iw > iwBossSliceMax) {
+                            return false;
+                        }
+                        const std::size_t cIdx =
+                            static_cast<std::size_t>(iw) * edtSliceStride +
+                            static_cast<std::size_t>(iv) * static_cast<std::size_t>(edtNu) +
+                            static_cast<std::size_t>(iu);
+                        if (edtCellMinTau[cIdx] >= 0.5f * kNoOccTau ||
+                            edtCellSdf[cIdx] > 0.02f * fineVoxelSize) {
+                            return false;
+                        }
+                        outCw = edtW0 + (static_cast<float>(iw) + 0.5f) * edtStep;
+                        outEstW = evalLocalEstW(iu, iv);
+                        return outCw > outEstW + bossAboveSurfaceMargin;
+                    };
+
+                    const std::size_t patchColCount = std::max<std::size_t>(1, touchedSurfCols.size());
+                    const float boxPad = 1.5f * edtStep;
+
+                    for (int iv0 = pBfsVMin; iv0 <= pBfsVMax; ++iv0) {
+                        for (int iu0 = pBfsUMin; iu0 <= pBfsUMax; ++iu0) {
+                            const int seedUv = iv0 * edtNu + iu0;
+                            const float seedStartW = evalLocalEstW(iu0, iv0) + bossAboveSurfaceMargin;
+                            const int iwSeedLo = std::clamp(
+                                static_cast<int>(std::floor((seedStartW - edtW0) * invEdtStep)),
+                                iwSliceMin,
+                                iwBossSliceMax);
+                            const int iwSeedHi = std::min(
+                                iwBossSliceMax,
+                                iwSeedLo + std::max(2, static_cast<int>(std::ceil(baseBandMm * invEdtStep))) + 1);
+                            for (int iw0 = iwSeedLo; iw0 <= iwSeedHi; ++iw0) {
+                                const std::size_t seedIdx =
+                                    static_cast<std::size_t>(iw0) * edtSliceStride +
+                                    static_cast<std::size_t>(seedUv);
+                                if (geoBfsVisited[seedIdx]) {
+                                    continue;
+                                }
+                                float dummyCw = 0.0f, dummyEst = 0.0f;
+                                if (!isAbovePatchSolid(iu0, iv0, iw0, dummyCw, dummyEst)) {
+                                    continue;
+                                }
+
+                                // 3D 6-neighbor BFS unrestricted across the entire EDT volume
+                                std::vector<std::size_t> compCells;
+                                std::unordered_set<int> compColsSet;
+                                std::unordered_set<int> compBaseColsSet;
+                                std::vector<openvdb::Vec3f> compBaseAllPts;
+                                float compMaxRise = 0.0f;
+                                bool exceedsBossCap = false;
+                                bool touchesDeferredBranch = false;
+
+                                geoBfsVisited[seedIdx] = 1;
+                                touchedBfsVisited.push_back(seedIdx);
+                                compCells.push_back(seedIdx);
+
+                                std::size_t bfsHead = 0;
+                                while (bfsHead < compCells.size()) {
+                                    const std::size_t cIdx = compCells[bfsHead++];
+                                    const int cwBId = edtCellBranch[cIdx];
+                                    if (cwBId >= 0 &&
+                                        cwBId < static_cast<int>(numBranches) &&
+                                        patchDeferredMask[cwBId]) {
+                                        touchesDeferredBranch = true;
+                                    }
+                                    const int cwIw = static_cast<int>(cIdx / edtSliceStride);
+                                    const std::size_t rem = cIdx % edtSliceStride;
+                                    const int cwIv = static_cast<int>(rem / static_cast<std::size_t>(edtNu));
+                                    const int cwIu = static_cast<int>(rem % static_cast<std::size_t>(edtNu));
+                                    const int uvIdx = static_cast<int>(rem);
+
+                                    const float cw = edtW0 + (static_cast<float>(cwIw) + 0.5f) * edtStep;
+                                    const float estW = evalLocalEstW(cwIu, cwIv);
+                                    const float rise = cw - estW;
+                                    compMaxRise = std::max(compMaxRise, rise);
+                                    compColsSet.insert(uvIdx);
+                                    if (rise <= baseBandMm) {
+                                        compBaseColsSet.insert(uvIdx);
+                                        if (compBaseColsSet.size() >= patchColCount * 7u / 10u + 4u) {
+                                            exceedsBossCap = true;
+                                        }
+                                        const float cu = edtU0 + (static_cast<float>(cwIu) + 0.5f) * edtStep;
+                                        const float cv = edtV0 + (static_cast<float>(cwIv) + 0.5f) * edtStep;
+                                        compBaseAllPts.push_back(
+                                            cu * edtUAxis + cv * edtVAxis + cw * edtWAxis);
+                                    }
+
+                                    static constexpr int kNb6[6][3] = {
+                                        {-1, 0, 0}, {1, 0, 0},
+                                        {0, -1, 0}, {0, 1, 0},
+                                        {0, 0, -1}, {0, 0, 1}};
+                                    for (const auto& d : kNb6) {
+                                        const int nu = cwIu + d[0];
+                                        const int nv = cwIv + d[1];
+                                        const int nw = cwIw + d[2];
+                                        if (nu < 0 || nu >= edtNu || nv < 0 || nv >= edtNv ||
+                                            nw < iwSliceMin || nw > iwBossSliceMax) {
+                                            continue;
+                                        }
+                                        const std::size_t nIdx =
+                                            static_cast<std::size_t>(nw) * edtSliceStride +
+                                            static_cast<std::size_t>(nv) * static_cast<std::size_t>(edtNu) +
+                                            static_cast<std::size_t>(nu);
+                                        if (geoBfsVisited[nIdx]) {
+                                            continue;
+                                        }
+                                        float nbCw = 0.0f, nbEst = 0.0f;
+                                        if (isAbovePatchSolid(nu, nv, nw, nbCw, nbEst)) {
+                                            geoBfsVisited[nIdx] = 1;
+                                            touchedBfsVisited.push_back(nIdx);
+                                            compCells.push_back(nIdx);
+                                        }
+                                    }
+                                }
+
+                                if (exceedsBossCap ||
+                                    compMaxRise < minBossRiseMm ||
+                                    compColsSet.empty() ||
+                                    compBaseColsSet.empty() ||
+                                    compBaseColsSet.size() * 10u >= patchColCount * 7u) {
+                                    continue;
+                                }
+
+                                const auto& bboxColsToCheck =
+                                    touchesDeferredBranch ? compBaseColsSet : compColsSet;
+                                std::size_t insideBBoxCols = 0;
+                                for (const int uvIdx : bboxColsToCheck) {
+                                    const int iu = uvIdx % edtNu;
+                                    const int iv = uvIdx / edtNu;
+                                    const float cu = edtU0 + (static_cast<float>(iu) + 0.5f) * edtStep;
+                                    const float cv = edtV0 + (static_cast<float>(iv) + 0.5f) * edtStep;
+                                    if (cu >= patchUMin - boxPad && cu <= patchUMax + boxPad &&
+                                        cv >= patchVMin - boxPad && cv <= patchVMax + boxPad) {
+                                        ++insideBBoxCols;
+                                    }
+                                }
+                                const float insideBBoxFrac =
+                                    static_cast<float>(insideBBoxCols) /
+                                    static_cast<float>(bboxColsToCheck.size());
+                                if (insideBBoxFrac < 0.85f) {
+                                    continue;
+                                }
+
+                                // Verify boss base perimeter borders the patch surface footprint
+                                std::size_t perimCnt = 0;
+                                std::size_t adjPatchCnt = 0;
+                                static constexpr int kNb4Perim[4][2] = {
+                                    {-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+                                for (const int uvIdx : compBaseColsSet) {
+                                    const int bu = uvIdx % edtNu;
+                                    const int bv = uvIdx / edtNu;
+                                    bool isPerim = false;
+                                    for (const auto& d : kNb4Perim) {
+                                        const int nu = bu + d[0];
+                                        const int nv = bv + d[1];
+                                        if (nu < 0 || nu >= edtNu || nv < 0 || nv >= edtNv ||
+                                            compBaseColsSet.find(nv * edtNu + nu) == compBaseColsSet.end()) {
+                                            isPerim = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!isPerim) {
+                                        continue;
+                                    }
+                                    ++perimCnt;
+                                    bool touchesSurf = false;
+                                    for (int dv = -2; dv <= 2 && !touchesSurf; ++dv) {
+                                        const int svv = bv + dv;
+                                        if (svv < 0 || svv >= edtNv) {
+                                            continue;
+                                        }
+                                        for (int du = -2; du <= 2 && !touchesSurf; ++du) {
+                                            const int suu = bu + du;
+                                            if (suu < 0 || suu >= edtNu) {
+                                                continue;
+                                            }
+                                            if (patchColHasSurf[static_cast<std::size_t>(svv * edtNu + suu)]) {
+                                                touchesSurf = true;
+                                            }
+                                        }
+                                    }
+                                    if (touchesSurf) {
+                                        ++adjPatchCnt;
+                                    }
+                                }
+                                if (perimCnt == 0 ||
+                                    static_cast<float>(adjPatchCnt) / static_cast<float>(perimCnt) < 0.40f) {
+                                    continue;
+                                }
+
+                                // Subsample base points up to 128 and check reverse clearance
+                                std::vector<openvdb::Vec3f> compBasePts;
+                                if (compBaseAllPts.size() > 128u) {
+                                    const std::size_t bStep =
+                                        std::max<std::size_t>(1, compBaseAllPts.size() / 128u);
+                                    compBasePts.reserve(128u);
+                                    for (std::size_t bi = 0; bi < compBaseAllPts.size(); bi += bStep) {
+                                        compBasePts.push_back(compBaseAllPts[bi]);
+                                    }
+                                } else {
+                                    compBasePts = std::move(compBaseAllPts);
+                                }
+
+                                if (!checkReverseBossClearance(compBasePts)) {
+                                    continue;
+                                }
+
+                                // Accept geometrically deferred upper boss!
+                                for (const std::size_t cIdx : compCells) {
+                                    if (!patchDeferredGeoCell[cIdx]) {
+                                        patchDeferredGeoCell[cIdx] = 1;
+                                        touchedGeoCells.push_back(cIdx);
+                                        acceptedGeoBossCells.push_back(cIdx);
+                                    }
+                                }
+                                for (const int uvIdx : compColsSet) {
+                                    if (!patchDeferredBossCol[static_cast<std::size_t>(uvIdx)]) {
+                                        patchDeferredBossCol[static_cast<std::size_t>(uvIdx)] = 1;
+                                        touchedBossCols.push_back(uvIdx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Precompute non-patch, non-deferred columns that contain walls rising strictly
+                // above the patch surface (used to populate `edtPrintedWall` without false-hitting
+                // the patch's own outer wall below its top rim).
+                {
+                    const float wallAboveMargin = std::max(0.35f * hTop, 0.35f * fineVoxelSize);
+                    const int wUMin = std::clamp(
+                        static_cast<int>(std::floor((patchUMin - maxCheckHeight - 2.0f - edtU0) * invEdtStep)),
+                        0,
+                        edtNu - 1);
+                    const int wUMax = std::clamp(
+                        static_cast<int>(std::ceil((patchUMax + maxCheckHeight + 2.0f - edtU0) * invEdtStep)),
+                        wUMin,
+                        edtNu - 1);
+                    const int wVMin = std::clamp(
+                        static_cast<int>(std::floor((patchVMin - maxCheckHeight - 2.0f - edtV0) * invEdtStep)),
+                        0,
+                        edtNv - 1);
+                    const int wVMax = std::clamp(
+                        static_cast<int>(std::ceil((patchVMax + maxCheckHeight + 2.0f - edtV0) * invEdtStep)),
+                        wVMin,
+                        edtNv - 1);
+                    for (int iv = wVMin; iv <= wVMax; ++iv) {
+                        for (int iu = wUMin; iu <= wUMax; ++iu) {
+                            const int uvIdx = iv * edtNu + iu;
+                            if (patchColHasSurf[static_cast<std::size_t>(uvIdx)] ||
+                                patchDeferredBossCol[static_cast<std::size_t>(uvIdx)]) {
+                                continue;
+                            }
+                            const float wallThreshW = evalLocalEstW(iu, iv) + wallAboveMargin;
+                            const int iwThresh = std::clamp(
+                                static_cast<int>(std::floor((wallThreshW - edtW0) * invEdtStep)),
+                                iwSliceMin,
+                                iwSliceMax);
+                            for (int iw = iwThresh; iw <= iwSliceMax; ++iw) {
+                                const std::size_t cIdx =
+                                    static_cast<std::size_t>(iw) * edtSliceStride +
+                                    static_cast<std::size_t>(uvIdx);
+                                if (edtCellMinTau[cIdx] >= 0.5f * kNoOccTau ||
+                                    edtCellSdf[cIdx] > 0.02f * fineVoxelSize ||
+                                    patchDeferredGeoCell[cIdx]) {
+                                    continue;
+                                }
+                                const int bId = edtCellBranch[cIdx];
+                                if (bId >= 0 && bId < static_cast<int>(numBranches) && patchDeferredMask[bId]) {
+                                    continue;
+                                }
+                                const float cw = edtW0 + (static_cast<float>(iw) + 0.5f) * edtStep;
+                                if (cw > wallThreshW) {
+                                    colHasWallAbovePatch[static_cast<std::size_t>(uvIdx)] = 1;
+                                    touchedWallCols.push_back(uvIdx);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 const float deepCoreSdfCutoff = -(patchSkinThicknessMm + 0.35f * hTop);
-                const float tipOrificeKeepoutR = tipRadiusMm + wallHalfWidthMm + 0.25f * edtStep;
+                const float nozzleTipDepthMm =
+                    std::max(0.0f, (static_cast<float>(patchSkinLayers) - 0.75f) * hTop);
                 const float baseCurvTol = std::max(0.45f * hTop, 0.35f * fineVoxelSize);
                 const float marginExtra = std::max(0.65f * fineVoxelSize, 0.85f * hTop);
-                const float nearTipZLimit = patchSkinThicknessMm + std::max(1.25f * hTop, 1.0f * fineVoxelSize);
+                const float nearTipZLimit = nozzleTipDepthMm + std::max(1.25f * hTop, 1.0f * fineVoxelSize);
                 const float zStartSweep = std::max(0.60f * hTop, 0.50f * fineVoxelSize);
 
                 // Stage-2 Causal Print-Time Pruning via Exact 2D-Slice EDT + 5/6-Axis Avoidance Tilt
@@ -7467,7 +7313,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 float tauCompletion = 0.0f;
                 std::vector<float> edtPrintedSurface;
                 std::vector<float> edtPrintedDeep;
-                std::vector<float> edtDeferredTip;
+                std::vector<float> edtPrintedWall;
 
                 for (int pruneIter = 0; pruneIter < 3; ++pruneIter) {
                     std::vector<float> patchTaus;
@@ -7485,17 +7331,32 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     std::sort(patchTaus.begin(), patchTaus.end());
                     tauMin = patchTaus.front();
                     tauCompletion = patchTaus.back();
-                    const float printTauTol = tauCompletion + 0.65f * hTop;
+                    const float printTauTol = tauCompletion + 0.15f * fineVoxelSize;
 
                     // Mark cells belonging strictly inside the surviving patch's own eroded skin slab
                     std::vector<std::size_t> markedSlabCells;
-                    markedSlabCells.reserve(surviving.size() * 6);
+                    markedSlabCells.reserve(surviving.size() * 6 + touchedBossCols.size() * 6);
+                    std::vector<int> survivingUvCols;
+                    survivingUvCols.reserve(touchedSurfCols.size());
                     const float slabMinT = -std::max(0.25f * edtStep, 0.15f * fineVoxelSize);
                     const float slabMaxT = patchSkinThicknessMm + 0.50f * hTop;
                     const float slabStepT = std::max(0.25f * edtStep, 0.10f);
                     for (int idx : surviving) {
                         const auto& sv = surfVoxels[static_cast<std::size_t>(idx)];
                         const openvdb::Vec3f& cNorm = clearanceNormals[static_cast<std::size_t>(idx)];
+                        const int sIu = std::clamp(
+                            static_cast<int>(std::floor((sv.surfPos.dot(edtUAxis) - edtU0) * invEdtStep)),
+                            0,
+                            edtNu - 1);
+                        const int sIv = std::clamp(
+                            static_cast<int>(std::floor((sv.surfPos.dot(edtVAxis) - edtV0) * invEdtStep)),
+                            0,
+                            edtNv - 1);
+                        const int sUvIdx = sIv * edtNu + sIu;
+                        if (!survColMarked[static_cast<std::size_t>(sUvIdx)]) {
+                            survColMarked[static_cast<std::size_t>(sUvIdx)] = 1;
+                            survivingUvCols.push_back(sUvIdx);
+                        }
                         for (float t = slabMinT; t <= slabMaxT; t += slabStepT) {
                             const openvdb::Vec3f q = sv.surfPos - t * cNorm;
                             const int iu = static_cast<int>(std::floor((q.dot(edtUAxis) - edtU0) * invEdtStep));
@@ -7514,11 +7375,109 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         }
                     }
 
+                    // Mark open exterior eroded bevel/rim halo columns adjacent to surviving patch
+                    // surface columns (never marking real walls `colHasWallAbovePatch` or original
+                    // patch surface columns `patchColHasSurf`, preserving pruned cells in iter >= 1).
+                    const int rimHaloCells = std::clamp(
+                        static_cast<int>(std::ceil(1.65f * fineVoxelSize * invEdtStep)),
+                        1,
+                        2);
+                    for (const int uvIdx : survivingUvCols) {
+                        const int cu = uvIdx % edtNu;
+                        const int cv = uvIdx / edtNu;
+                        for (int dv = -rimHaloCells; dv <= rimHaloCells; ++dv) {
+                            const int nv = cv + dv;
+                            if (nv < 0 || nv >= edtNv) {
+                                continue;
+                            }
+                            for (int du = -rimHaloCells; du <= rimHaloCells; ++du) {
+                                if (du == 0 && dv == 0) {
+                                    continue;
+                                }
+                                const int nu = cu + du;
+                                if (nu < 0 || nu >= edtNu) {
+                                    continue;
+                                }
+                                const int nbUv = nv * edtNu + nu;
+                                if (colHasWallAbovePatch[static_cast<std::size_t>(nbUv)] ||
+                                    patchColHasSurf[static_cast<std::size_t>(nbUv)] ||
+                                    survColMarked[static_cast<std::size_t>(nbUv)]) {
+                                    continue;
+                                }
+                                const float nbEstW = evalLocalEstW(nu, nv);
+                                const float haloMinW =
+                                    nbEstW - patchSkinThicknessMm - 0.50f * hTop;
+                                const float haloMaxW = nbEstW + 0.25f * edtStep;
+                                const int iwHMin = std::clamp(
+                                    static_cast<int>(std::floor((haloMinW - edtW0) * invEdtStep)),
+                                    iwSliceMin,
+                                    iwSliceMax);
+                                const int iwHMax = std::clamp(
+                                    static_cast<int>(std::ceil((haloMaxW - edtW0) * invEdtStep)),
+                                    iwHMin,
+                                    iwSliceMax);
+                                for (int iw = iwHMin; iw <= iwHMax; ++iw) {
+                                    const float cw =
+                                        edtW0 + (static_cast<float>(iw) + 0.5f) * edtStep;
+                                    if (cw < haloMinW || cw > haloMaxW) {
+                                        continue;
+                                    }
+                                    const std::size_t cIdx =
+                                        static_cast<std::size_t>(iw) * edtSliceStride +
+                                        static_cast<std::size_t>(nbUv);
+                                    if (!inCurrentPatchSlab[cIdx]) {
+                                        inCurrentPatchSlab[cIdx] = 1;
+                                        markedSlabCells.push_back(cIdx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (const int uvIdx : survivingUvCols) {
+                        survColMarked[static_cast<std::size_t>(uvIdx)] = 0;
+                    }
+
+                    // Mark skin-slab cells under accepted deferred bosses so sloped boss footprints
+                    // below `bossAboveSurfaceMargin` do not trigger phantom self-collisions.
+                    for (const int uvIdx : touchedBossCols) {
+                        const int bu = uvIdx % edtNu;
+                        const int bv = uvIdx / edtNu;
+                        const float bEstW = evalLocalEstW(bu, bv);
+                        const float bossSlabMinW =
+                            bEstW - patchSkinThicknessMm - 0.50f * hTop;
+                        const float bossSlabMaxW =
+                            bEstW + bossAboveSurfaceMargin + 0.25f * edtStep;
+                        const int iwBMin = std::clamp(
+                            static_cast<int>(std::floor((bossSlabMinW - edtW0) * invEdtStep)),
+                            iwSliceMin,
+                            iwSliceMax);
+                        const int iwBMax = std::clamp(
+                            static_cast<int>(std::ceil((bossSlabMaxW - edtW0) * invEdtStep)),
+                            iwBMin,
+                            iwSliceMax);
+                        for (int iw = iwBMin; iw <= iwBMax; ++iw) {
+                            const float cw =
+                                edtW0 + (static_cast<float>(iw) + 0.5f) * edtStep;
+                            if (cw < bossSlabMinW || cw > bossSlabMaxW) {
+                                continue;
+                            }
+                            const std::size_t cIdx =
+                                static_cast<std::size_t>(iw) * edtSliceStride +
+                                static_cast<std::size_t>(uvIdx);
+                            if (!inCurrentPatchSlab[cIdx]) {
+                                inCurrentPatchSlab[cIdx] = 1;
+                                markedSlabCells.push_back(cIdx);
+                            }
+                        }
+                    }
+
                     compute2DSliceEdtRange(
                         iwSliceMin,
                         iwSliceMax,
                         [&](std::size_t cIdx, float cTau, int bId, float cSdf) {
-                            if (inCurrentPatchSlab[cIdx] || cTau > printTauTol) {
+                            if (inCurrentPatchSlab[cIdx] ||
+                                patchDeferredGeoCell[cIdx] ||
+                                cTau > printTauTol) {
                                 return false;
                             }
                             if (bId >= 0 && bId < static_cast<int>(numBranches) && patchDeferredMask[bId]) {
@@ -7532,7 +7491,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         iwSliceMin,
                         iwSliceMax,
                         [&](std::size_t cIdx, float cTau, int bId, float cSdf) {
-                            if (inCurrentPatchSlab[cIdx] || cTau > printTauTol) {
+                            if (inCurrentPatchSlab[cIdx] ||
+                                patchDeferredGeoCell[cIdx] ||
+                                cTau > printTauTol) {
                                 return false;
                             }
                             if (bId >= 0 && bId < static_cast<int>(numBranches) && patchDeferredMask[bId]) {
@@ -7542,21 +7503,25 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         },
                         edtPrintedDeep);
 
-                    if (!deferredBossRoots.empty()) {
-                        compute2DSliceEdtRange(
-                            iwSliceMin,
-                            iwTipSliceMax,
-                            [&](std::size_t cIdx, float /*cTau*/, int bId, float cSdf) {
-                                if (inCurrentPatchSlab[cIdx]) {
-                                    return false;
-                                }
-                                return bId >= 0 &&
-                                       bId < static_cast<int>(numBranches) &&
-                                       patchDeferredMask[bId] &&
-                                       cSdf <= -0.15f * fineVoxelSize;
-                            },
-                            edtDeferredTip);
-                    }
+                    compute2DSliceEdtRange(
+                        iwSliceMin,
+                        iwWallSliceMax,
+                        [&](std::size_t cIdx, float cTau, int bId, float cSdf) {
+                            if (inCurrentPatchSlab[cIdx] ||
+                                patchDeferredGeoCell[cIdx] ||
+                                cTau > printTauTol) {
+                                return false;
+                            }
+                            if (bId >= 0 && bId < static_cast<int>(numBranches) && patchDeferredMask[bId]) {
+                                return false;
+                            }
+                            const std::size_t uvIdx = cIdx % edtSliceStride;
+                            if (!colHasWallAbovePatch[uvIdx]) {
+                                return false;
+                            }
+                            return cSdf <= 0.02f * fineVoxelSize;
+                        },
+                        edtPrintedWall);
 
                     for (const std::size_t cIdx : markedSlabCells) {
                         inCurrentPatchSlab[cIdx] = 0;
@@ -7570,14 +7535,17 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         const openvdb::Vec3f& cNorm,
                         const openvdb::Vec3f& axis,
                         float& outGradU,
-                        float& outGradV) -> float {
+                        float& outGradV,
+                        float& outAwayU,
+                        float& outAwayV) -> float {
                         outGradU = 0.0f;
                         outGradV = 0.0f;
-                        const openvdb::Vec3f xBase = xSurf - patchSkinThicknessMm * cNorm;
+                        outAwayU = 0.0f;
+                        outAwayV = 0.0f;
+                        const openvdb::Vec3f xBase = xSurf - nozzleTipDepthMm * cNorm;
+                        const float xBaseU = xBase.dot(edtUAxis);
+                        const float xBaseV = xBase.dot(edtVAxis);
                         const float surfW = xSurf.dot(edtWAxis);
-                        const float maxZBox = std::max({
-                            (solidBBoxMaxX - xBase.x()) * axis.x(), 0.0f}) + maxCheckHeight;
-                        (void)maxZBox;
                         float maxZAlong = 0.0f;
                         for (int mask = 0; mask < 8; ++mask) {
                             const openvdb::Vec3f corner(
@@ -7609,24 +7577,38 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         }
 
                         float worstMargin = 1.0e4f;
-                        float worstU = xBase.dot(edtUAxis);
-                        float worstV = xBase.dot(edtVAxis);
+                        float worstU = xBaseU;
+                        float worstV = xBaseV;
                         int worstIw = iwSliceMin;
+                        int worstGridKind = 0; // 0=surface, 1=wall, 2=deep
 
-                        for (float z = zStartSweep; z <= zSweepMax;) {
-                            const float rClear = evalToolClearanceRadiusAtZ(z);
-                            const openvdb::Vec3f pAxis = xBase + z * axis;
-                            const float pu = pAxis.dot(edtUAxis);
-                            const float pv = pAxis.dot(edtVAxis);
-                            const float pw = pAxis.dot(edtWAxis);
-                            const float zStep = (z < nearTipZLimit + 2.0f * hTop)
-                                ? std::max(0.55f * fineVoxelSize, 0.65f * hTop)
-                                : std::max(0.95f * fineVoxelSize, 0.65f);
+                        if (!isTilted) {
+                            const float xBaseW = xBase.dot(edtWAxis);
+                            const float invCosA = 1.0f / std::max(cosA, 0.99f);
+                            const float wLow = xBaseW + zStartSweep * cosA;
+                            const float wHigh = xBaseW + zSweepMax * cosA;
+                            const int iwLoopMin = std::clamp(
+                                static_cast<int>(std::floor((wLow - edtW0) * invEdtStep)),
+                                iwSliceMin,
+                                iwSliceMax);
+                            const int iwLoopMax = std::clamp(
+                                static_cast<int>(std::ceil((wHigh - edtW0) * invEdtStep)),
+                                iwLoopMin,
+                                iwSliceMax);
 
-                            if (!isTilted) {
-                                const int iw = static_cast<int>(std::floor((pw - edtW0) * invEdtStep));
-                                const float sliceWMin = edtW0 + static_cast<float>(iw) * edtStep;
-                                if (sliceWMin > surfW + baseCurvTol) {
+                            for (int iw = iwLoopMin; iw <= iwLoopMax; ++iw) {
+                                const float sliceWCenter =
+                                    edtW0 + (static_cast<float>(iw) + 0.5f) * edtStep;
+                                const float zEff = (sliceWCenter - xBaseW) * invCosA;
+                                if (zEff < zStartSweep || zEff > zSweepMax) {
+                                    continue;
+                                }
+                                const float rClear = evalToolClearanceRadiusAtZ(zEff);
+                                const openvdb::Vec3f pAxis = xBase + zEff * axis;
+                                const float pu = pAxis.dot(edtUAxis);
+                                const float pv = pAxis.dot(edtVAxis);
+
+                                if (sliceWCenter > surfW + baseCurvTol) {
                                     const float dSurf = sampleEdtSliceDist(
                                         edtPrintedSurface, iwSliceMin, iwSliceMax, pu, pv, iw);
                                     const float mSurf = dSurf - (rClear + 0.25f * edtStep);
@@ -7635,9 +7617,21 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                         worstU = pu;
                                         worstV = pv;
                                         worstIw = iw;
+                                        worstGridKind = 0;
+                                    }
+                                } else if (iw <= iwWallSliceMax) {
+                                    const float dWall = sampleEdtSliceDist(
+                                        edtPrintedWall, iwSliceMin, iwWallSliceMax, pu, pv, iw);
+                                    const float mWall = dWall - (rClear + 0.25f * edtStep);
+                                    if (mWall < worstMargin) {
+                                        worstMargin = mWall;
+                                        worstU = pu;
+                                        worstV = pv;
+                                        worstIw = iw;
+                                        worstGridKind = 1;
                                     }
                                 }
-                                if (z > patchSkinThicknessMm + 0.75f * hTop) {
+                                if (zEff > nozzleTipDepthMm + 0.75f * hTop) {
                                     const float dDeep = sampleEdtSliceDist(
                                         edtPrintedDeep, iwSliceMin, iwSliceMax, pu, pv, iw);
                                     const float mDeep = dDeep - (rClear + 0.25f * edtStep);
@@ -7646,101 +7640,141 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                         worstU = pu;
                                         worstV = pv;
                                         worstIw = iw;
+                                        worstGridKind = 2;
                                     }
                                 }
-                                if (!deferredBossRoots.empty() && z <= patchSkinThicknessMm + 1.0f * hTop) {
-                                    const float dTip = sampleEdtSliceDist(
-                                        edtDeferredTip, iwSliceMin, iwTipSliceMax, pu, pv, iw);
-                                    const float mTip = dTip - tipOrificeKeepoutR;
-                                    if (mTip < worstMargin) {
-                                        worstMargin = mTip;
-                                        worstU = pu;
-                                        worstV = pv;
-                                        worstIw = iw;
-                                    }
-                                }
-                            } else {
-                                constexpr int kAz = 16;
-                                const int numRings = std::clamp(
-                                    static_cast<int>(std::ceil(rClear / std::max(1.5f, 4.0f * edtStep))),
-                                    1,
-                                    5);
-                                const float sphereCoverR = 0.35f * edtStep;
-                                for (int ri = 0; ri <= numRings; ++ri) {
-                                    const float r = (ri == 0)
-                                        ? 0.0f
-                                        : (static_cast<float>(ri) / static_cast<float>(numRings)) * rClear;
-                                    const int nAng = (ri == 0) ? 1 : kAz;
-                                    const float curvTol = baseCurvTol + 0.03f * r;
-                                    for (int a = 0; a < nAng; ++a) {
-                                        const float ang =
-                                            (2.0f * 3.14159265358979323846f * static_cast<float>(a)) /
-                                            static_cast<float>(nAng);
-                                        const openvdb::Vec3f q =
-                                            pAxis + r * (std::cos(ang) * diskX + std::sin(ang) * diskY);
-                                        const float qu = q.dot(edtUAxis);
-                                        const float qv = q.dot(edtVAxis);
-                                        const float qw = q.dot(edtWAxis);
-                                        const int qiw = static_cast<int>(
-                                            std::floor((qw - edtW0) * invEdtStep));
-                                        const float qSliceWMin = edtW0 + static_cast<float>(qiw) * edtStep;
-                                        const float hAboveSurf = (q - xSurf).dot(cNorm);
-                                        const float hAboveBase = hAboveSurf + patchSkinThicknessMm;
-                                        const bool aboveSurf =
-                                            (hAboveSurf > curvTol) &&
-                                            (cNorm.dot(edtWAxis) < 0.85f || qSliceWMin > surfW + baseCurvTol);
-                                        const bool aboveBase =
-                                            (z > patchSkinThicknessMm + 0.75f * hTop) &&
-                                            (hAboveBase > curvTol);
-                                        if (!aboveSurf && !aboveBase) {
-                                            continue;
+                            }
+                        } else {
+                            const float sphereCoverR = 0.35f * edtStep;
+                            for (float z = zStartSweep; z <= zSweepMax;) {
+                                const float rClear = evalToolClearanceRadiusAtZ(z);
+                                const openvdb::Vec3f pAxis = xBase + z * axis;
+                                const float zStep = (z < nearTipZLimit + 2.0f * hTop)
+                                    ? std::max(0.55f * fineVoxelSize, 0.65f * hTop)
+                                    : std::max(0.95f * fineVoxelSize, 0.65f);
+
+                                auto evalTiltedSample = [&](float sX, float sY, float rSample) {
+                                    const openvdb::Vec3f q = pAxis + sX * diskX + sY * diskY;
+                                    const float qu = q.dot(edtUAxis);
+                                    const float qv = q.dot(edtVAxis);
+                                    const float qw = q.dot(edtWAxis);
+                                    const int qiw = static_cast<int>(
+                                        std::floor((qw - edtW0) * invEdtStep));
+                                    const float qSliceWMin = edtW0 + static_cast<float>(qiw) * edtStep;
+                                    const float hAboveSurf = (q - xSurf).dot(cNorm);
+                                    const float hAboveBase = hAboveSurf + nozzleTipDepthMm;
+                                    const float curvTol = baseCurvTol + 0.03f * rSample;
+                                    const bool aboveSurf =
+                                        (hAboveSurf > curvTol) &&
+                                        (cNorm.dot(edtWAxis) < 0.85f || qSliceWMin > surfW + baseCurvTol);
+                                    const bool aboveWall =
+                                        !aboveSurf &&
+                                        (hAboveBase > baseCurvTol) &&
+                                        (qSliceWMin <= surfW + baseCurvTol);
+                                    const bool aboveBase =
+                                        !aboveSurf &&
+                                        (z > nozzleTipDepthMm + 0.75f * hTop) &&
+                                        (hAboveBase > curvTol);
+
+                                    if (aboveSurf) {
+                                        const float dS = sampleEdtSliceDist(
+                                            edtPrintedSurface, iwSliceMin, iwSliceMax, qu, qv, qiw);
+                                        const float mS = dS - sphereCoverR;
+                                        if (mS < worstMargin) {
+                                            worstMargin = mS;
+                                            worstU = qu;
+                                            worstV = qv;
+                                            worstIw = qiw;
+                                            worstGridKind = 0;
                                         }
-                                        if (aboveSurf) {
-                                            const float dS = sampleEdtSliceDist(
-                                                edtPrintedSurface, iwSliceMin, iwSliceMax, qu, qv, qiw);
-                                            const float mS = (dS - sphereCoverR) + (rClear - r);
-                                            if (mS < worstMargin) {
-                                                worstMargin = mS;
+                                    } else {
+                                        if (aboveWall) {
+                                            const float dW = sampleEdtSliceDist(
+                                                edtPrintedWall, iwSliceMin, iwWallSliceMax, qu, qv, qiw);
+                                            const float mW = dW - sphereCoverR;
+                                            if (mW < worstMargin) {
+                                                worstMargin = mW;
                                                 worstU = qu;
                                                 worstV = qv;
                                                 worstIw = qiw;
+                                                worstGridKind = 1;
                                             }
-                                            if (!deferredBossRoots.empty() &&
-                                                z <= patchSkinThicknessMm + 1.0f * hTop &&
-                                                r <= tipOrificeKeepoutR) {
-                                                const float dT = sampleEdtSliceDist(
-                                                    edtDeferredTip, iwSliceMin, iwTipSliceMax, qu, qv, qiw);
-                                                const float mT = (dT - sphereCoverR) + (tipOrificeKeepoutR - r);
-                                                if (mT < worstMargin) {
-                                                    worstMargin = mT;
-                                                    worstU = qu;
-                                                    worstV = qv;
-                                                    worstIw = qiw;
-                                                }
-                                            }
-                                        } else {
+                                        }
+                                        if (aboveBase) {
                                             const float dD = sampleEdtSliceDist(
                                                 edtPrintedDeep, iwSliceMin, iwSliceMax, qu, qv, qiw);
-                                            const float mD = (dD - sphereCoverR) + (rClear - r);
+                                            const float mD = dD - sphereCoverR;
                                             if (mD < worstMargin) {
                                                 worstMargin = mD;
                                                 worstU = qu;
                                                 worstV = qv;
                                                 worstIw = qiw;
+                                                worstGridKind = 2;
                                             }
                                         }
                                     }
+                                };
+
+                                // Sample perimeter circle + interior chord lattice for complete disk coverage
+                                constexpr int kPerim = 16;
+                                for (int a = 0; a < kPerim; ++a) {
+                                    const float ang =
+                                        (2.0f * 3.14159265358979323846f * static_cast<float>(a)) /
+                                        static_cast<float>(kPerim);
+                                    evalTiltedSample(
+                                        rClear * std::cos(ang),
+                                        rClear * std::sin(ang),
+                                        rClear);
                                 }
+                                const int numChord = std::clamp(
+                                    static_cast<int>(std::ceil((2.0f * rClear) / std::max(1.25f * edtStep, 0.8f))),
+                                    3,
+                                    11);
+                                for (int ix = 0; ix < numChord; ++ix) {
+                                    const float tx = (numChord > 1)
+                                        ? (-1.0f + 2.0f * static_cast<float>(ix) / static_cast<float>(numChord - 1))
+                                        : 0.0f;
+                                    const float sX = tx * rClear;
+                                    const float maxY = std::sqrt(std::max(0.0f, rClear * rClear - sX * sX));
+                                    const int numY = std::clamp(
+                                        static_cast<int>(std::ceil((2.0f * maxY) / std::max(1.25f * edtStep, 0.8f))),
+                                        1,
+                                        11);
+                                    for (int iy = 0; iy < numY; ++iy) {
+                                        const float ty = (numY > 1)
+                                            ? (-1.0f + 2.0f * static_cast<float>(iy) / static_cast<float>(numY - 1))
+                                            : 0.0f;
+                                        const float sY = ty * maxY;
+                                        evalTiltedSample(sX, sY, std::hypot(sX, sY));
+                                    }
+                                }
+                                z += zStep;
                             }
-                            z += zStep;
                         }
 
-                        const float dU = sampleEdtSliceDist(edtPrintedSurface, iwSliceMin, iwSliceMax, worstU + edtStep, worstV, worstIw) -
-                                         sampleEdtSliceDist(edtPrintedSurface, iwSliceMin, iwSliceMax, worstU - edtStep, worstV, worstIw);
-                        const float dV = sampleEdtSliceDist(edtPrintedSurface, iwSliceMin, iwSliceMax, worstU, worstV + edtStep, worstIw) -
-                                         sampleEdtSliceDist(edtPrintedSurface, iwSliceMin, iwSliceMax, worstU, worstV - edtStep, worstIw);
+                        const std::vector<float>* gradGrid = &edtPrintedSurface;
+                        int gradIwMax = iwSliceMax;
+                        if (worstGridKind == 1) {
+                            gradGrid = &edtPrintedWall;
+                            gradIwMax = iwWallSliceMax;
+                        } else if (worstGridKind == 2) {
+                            gradGrid = &edtPrintedDeep;
+                        }
+
+                        float dU = sampleEdtSliceDist(*gradGrid, iwSliceMin, gradIwMax, worstU + edtStep, worstV, worstIw) -
+                                   sampleEdtSliceDist(*gradGrid, iwSliceMin, gradIwMax, worstU - edtStep, worstV, worstIw);
+                        float dV = sampleEdtSliceDist(*gradGrid, iwSliceMin, gradIwMax, worstU, worstV + edtStep, worstIw) -
+                                   sampleEdtSliceDist(*gradGrid, iwSliceMin, gradIwMax, worstU, worstV - edtStep, worstIw);
+                        if (dU * dU + dV * dV <= 1.0e-8f) {
+                            dU = sampleEdtSliceDist(*gradGrid, iwSliceMin, gradIwMax, xBaseU + edtStep, xBaseV, worstIw) -
+                                 sampleEdtSliceDist(*gradGrid, iwSliceMin, gradIwMax, xBaseU - edtStep, xBaseV, worstIw);
+                            dV = sampleEdtSliceDist(*gradGrid, iwSliceMin, gradIwMax, xBaseU, xBaseV + edtStep, worstIw) -
+                                 sampleEdtSliceDist(*gradGrid, iwSliceMin, gradIwMax, xBaseU, xBaseV - edtStep, worstIw);
+                        }
                         outGradU = dU;
                         outGradV = dV;
+                        outAwayU = xBaseU - worstU;
+                        outAwayV = xBaseV - worstV;
                         return worstMargin;
                     };
 
@@ -7756,44 +7790,80 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                     ? clampVec3fToCone(cNorm, edtWAxis, bedSafeTilt)
                                     : edtWAxis;
 
-                                float gU = 0.0f;
-                                float gV = 0.0f;
-                                float bestMargin = evalAxisEdtMargin(sv.surfPos, cNorm, bestAxis, gU, gV);
+                                float gU = 0.0f, gV = 0.0f, awayU = 0.0f, awayV = 0.0f;
+                                float bestMargin = evalAxisEdtMargin(
+                                    sv.surfPos, cNorm, bestAxis, gU, gV, awayU, awayV);
 
-                                // Option 3: Active 5/6-axis obstacle-avoidance tilt (first test nominal 0-deg axis, then +grad(EDT))
+                                // Option 3: Active 5/6-axis obstacle-avoidance tilt
                                 if (canTiltSkinTool && bestMargin < marginExtra) {
                                     if (bestAxis.dot(edtWAxis) < 0.9999f) {
-                                        float gU0 = 0.0f;
-                                        float gV0 = 0.0f;
-                                        const float mW =
-                                            evalAxisEdtMargin(sv.surfPos, cNorm, edtWAxis, gU0, gV0);
+                                        float gU0 = 0.0f, gV0 = 0.0f, awayU0 = 0.0f, awayV0 = 0.0f;
+                                        const float mW = evalAxisEdtMargin(
+                                            sv.surfPos, cNorm, edtWAxis, gU0, gV0, awayU0, awayV0);
                                         if (mW > bestMargin) {
                                             bestMargin = mW;
                                             bestAxis = edtWAxis;
                                             gU = gU0;
                                             gV = gV0;
+                                            awayU = awayU0;
+                                            awayV = awayV0;
                                         }
                                     }
                                     if (bestMargin < marginExtra && bedSafeTilt > 0.02f) {
-                                        const float gLenSq = gU * gU + gV * gV;
-                                        if (gLenSq > 1.0e-8f) {
-                                            const float invG = 1.0f / std::sqrt(gLenSq);
+                                        auto tryTiltAlongDir = [&](float dirU, float dirV) {
+                                            const float lenSq = dirU * dirU + dirV * dirV;
+                                            if (lenSq <= 1.0e-8f) {
+                                                return;
+                                            }
+                                            const float invLen = 1.0f / std::sqrt(lenSq);
                                             const openvdb::Vec3f repulseDir =
-                                                (gU * invG) * edtUAxis + (gV * invG) * edtVAxis;
+                                                (dirU * invLen) * edtUAxis + (dirV * invLen) * edtVAxis;
                                             for (const float frac : {0.25f, 0.50f, 0.75f, 1.0f}) {
                                                 const float theta = frac * bedSafeTilt;
                                                 openvdb::Vec3f candAxis =
                                                     std::cos(theta) * edtWAxis + std::sin(theta) * repulseDir;
                                                 candAxis.normalize();
-                                                float dummyU = 0.0f, dummyV = 0.0f;
-                                                const float candM =
-                                                    evalAxisEdtMargin(sv.surfPos, cNorm, candAxis, dummyU, dummyV);
+                                                float dU = 0.0f, dV = 0.0f, dAu = 0.0f, dAv = 0.0f;
+                                                const float candM = evalAxisEdtMargin(
+                                                    sv.surfPos, cNorm, candAxis, dU, dV, dAu, dAv);
                                                 if (candM > bestMargin) {
                                                     bestMargin = candM;
                                                     bestAxis = candAxis;
                                                 }
                                                 if (candM >= marginExtra) {
                                                     break;
+                                                }
+                                            }
+                                        };
+
+                                        tryTiltAlongDir(gU, gV);
+                                        if (bestMargin < marginExtra) {
+                                            tryTiltAlongDir(awayU, awayV);
+                                        }
+                                        if (bestMargin < 0.0f) {
+                                            int bestAz = -1;
+                                            float bestAzMargin = bestMargin;
+                                            for (int az = 0; az < 8; ++az) {
+                                                const float phi = static_cast<float>(az) * (0.25f * 3.14159265358979323846f);
+                                                const openvdb::Vec3f azDir =
+                                                    std::cos(phi) * edtUAxis + std::sin(phi) * edtVAxis;
+                                                openvdb::Vec3f candAxis =
+                                                    std::cos(bedSafeTilt) * edtWAxis + std::sin(bedSafeTilt) * azDir;
+                                                candAxis.normalize();
+                                                float dU = 0.0f, dV = 0.0f, dAu = 0.0f, dAv = 0.0f;
+                                                const float candM = evalAxisEdtMargin(
+                                                    sv.surfPos, cNorm, candAxis, dU, dV, dAu, dAv);
+                                                if (candM > bestAzMargin) {
+                                                    bestAzMargin = candM;
+                                                    bestAz = az;
+                                                    bestAxis = candAxis;
+                                                }
+                                            }
+                                            if (bestAz >= 0) {
+                                                bestMargin = bestAzMargin;
+                                                if (bestMargin >= 0.0f) {
+                                                    const float phi = static_cast<float>(bestAz) * (0.25f * 3.14159265358979323846f);
+                                                    tryTiltAlongDir(std::cos(phi), std::sin(phi));
                                                 }
                                             }
                                         }
@@ -8157,6 +8227,58 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     branches[static_cast<std::size_t>(bestBranch)].primaryParentId);
                 patch.meanNormal = patchMeanNormal;
                 patch.deferredBranches = std::move(deferredBossRoots);
+                patch.hasDeferredGeoBoss = !acceptedGeoBossCells.empty();
+                if (patch.hasDeferredGeoBoss) {
+                    anyDeferredGeoBoss = true;
+                    auto defBossAcc = deferredBossPatchIdGrid.getAccessor();
+                    const int padFine = std::max(
+                        1, static_cast<int>(std::ceil(0.60f * edtStep / fineVoxelSize)));
+                    for (const std::size_t cIdx : acceptedGeoBossCells) {
+                        const int cwIw = static_cast<int>(cIdx / edtSliceStride);
+                        const std::size_t rem = cIdx % edtSliceStride;
+                        const int cwIv = static_cast<int>(rem / static_cast<std::size_t>(edtNu));
+                        const int cwIu = static_cast<int>(rem % static_cast<std::size_t>(edtNu));
+                        const float cw = edtW0 + (static_cast<float>(cwIw) + 0.5f) * edtStep;
+                        if (cw <= evalLocalEstW(cwIu, cwIv) + 0.15f * fineVoxelSize) {
+                            continue;
+                        }
+                        const float cu = edtU0 + (static_cast<float>(cwIu) + 0.5f) * edtStep;
+                        const float cv = edtV0 + (static_cast<float>(cwIv) + 0.5f) * edtStep;
+                        const openvdb::Vec3f cWorld =
+                            cu * edtUAxis + cv * edtVAxis + cw * edtWAxis;
+                        const openvdb::Coord cFineCenter =
+                            fineSdfGrid.transform().worldToIndexCellCentered(
+                                openvdb::Vec3d(cWorld.x(), cWorld.y(), cWorld.z()));
+                        for (int dz = -padFine; dz <= padFine; ++dz) {
+                            for (int dy = -padFine; dy <= padFine; ++dy) {
+                                for (int dx = -padFine; dx <= padFine; ++dx) {
+                                    const openvdb::Coord fc =
+                                        cFineCenter + openvdb::Coord(dx, dy, dz);
+                                    if (fineSdfAcc.getValue(fc) > 0.25f * fineVoxelSize) {
+                                        continue;
+                                    }
+                                    const openvdb::Vec3d fwp =
+                                        fineSdfGrid.transform().indexToWorld(fc);
+                                    const openvdb::Vec3f fw(
+                                        static_cast<float>(fwp.x()),
+                                        static_cast<float>(fwp.y()),
+                                        static_cast<float>(fwp.z()));
+                                    const int fiu = std::clamp(
+                                        static_cast<int>(std::floor((fw.dot(edtUAxis) - edtU0) * invEdtStep)),
+                                        0,
+                                        edtNu - 1);
+                                    const int fiv = std::clamp(
+                                        static_cast<int>(std::floor((fw.dot(edtVAxis) - edtV0) * invEdtStep)),
+                                        0,
+                                        edtNv - 1);
+                                    if (fw.dot(edtWAxis) > evalLocalEstW(fiu, fiv) + 0.15f * fineVoxelSize) {
+                                        defBossAcc.setValue(fc, candidatePatchId);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 patch.surfVoxelIndices.reserve(surviving.size());
                 for (int idx : surviving) {
                     patch.surfVoxelIndices.push_back(static_cast<std::size_t>(idx));
@@ -8332,7 +8454,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                     sv.surfPos.z() - static_cast<float>(wp.z()));
                                 const openvdb::Vec3f& cNorm = clearanceNormals[svIdx];
                                 const float dn = v.dot(cNorm);
-                                if (dn < -1.0f * fineVoxelSize || dn > maxDn) {
+                                if (dn < -0.15f * fineVoxelSize || dn > maxDn) {
                                     continue;
                                 }
                                 const float dtSq = std::max(0.0f, v.lengthSqr() - dn * dn);
@@ -8397,7 +8519,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                 sv.surfPos.y() - static_cast<float>(wp.y()),
                                 sv.surfPos.z() - static_cast<float>(wp.z()));
                             const float dn = v.dot(sv.surfNormal);
-                            if (dn < -1.0f * fineVoxelSize || dn > maxRejectedDn) {
+                            if (dn < -0.15f * fineVoxelSize || dn > maxRejectedDn) {
                                 continue;
                             }
                             const float dtSq = std::max(0.0f, v.lengthSqr() - dn * dn);
@@ -8527,12 +8649,13 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         conformalSkinPatches[static_cast<std::size_t>(acc.nearestPatchId)]
                             .skinThicknessMm;
                     const float tangErode = std::max(0.0f, (tangTEff - tangDn) - sdfVal);
-                    if (tangDn <= tangTEff + 0.35f * fineVoxelSize) {
+                    if (tangDn >= -0.10f * fineVoxelSize &&
+                        tangDn <= tangTEff + 0.35f * fineVoxelSize) {
                         if (tangErode > bestErodeDepth) {
                             bestErodeDepth = tangErode;
                             bestCorePatchId = acc.nearestPatchId;
                         }
-                    } else {
+                    } else if (tangDn > tangTEff + 0.35f * fineVoxelSize) {
                         // Below the conformal skin ceiling (`tangDn > tangTEff`), cap `bestErodeDepth`
                         // at `tangErode` so side walls below the skin slab are never falsely eroded.
                         bestErodeDepth = std::min(bestErodeDepth, tangErode);
@@ -8559,6 +8682,12 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         }
     }
 
+    struct DeferredCoreFragment {
+        int patchId = -1;
+        SelectedLayerInfo layer;
+    };
+    std::vector<std::vector<DeferredCoreFragment>> deferredCoreFragments(numLayers);
+
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, numLayers),
         [&](const tbb::blocked_range<std::size_t>& r) {
@@ -8576,6 +8705,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
                 skinErodeSampler(skinErodeAcc, skinErodeDepthGrid.transform());
             auto skinPatchIdAcc = skinCorePatchIdGrid.getConstAccessor();
+            auto deferredBossAcc = deferredBossPatchIdGrid.getConstAccessor();
 
             const float fineInnerCutoff =
                 -std::max(rec.fineShellInnerDepthMm - 1.75f * fineVoxelSize, 1.5f * fineVoxelSize);
@@ -9106,9 +9236,25 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                     static_cast<std::size_t>(pId) < conformalSkinPatches.size()) {
                                     const auto& patch =
                                         conformalSkinPatches[static_cast<std::size_t>(pId)];
+                                    bool skipBossErosion = false;
+                                    for (const int rootB : patch.deferredBranches) {
+                                        if (rootB >= 0 &&
+                                            static_cast<std::size_t>(rootB) < numBranches &&
+                                            pl.branchId < numBranches &&
+                                            isSubtree[static_cast<std::size_t>(rootB)][pl.branchId] != 0) {
+                                            skipBossErosion = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!skipBossErosion &&
+                                        patch.hasDeferredGeoBoss &&
+                                        deferredBossAcc.getValue(cFine) == pId) {
+                                        skipBossErosion = true;
+                                    }
                                     // Erode core layers beneath the conformal skin patch, while leaving
-                                    // taller protrusion layers above `patch.tauCompletion` un-eroded.
-                                    if (pl.isovalue >= patch.tauMin - patch.skinThicknessMm - 2.0f * hTop &&
+                                    // deferred bosses and taller protrusion layers un-eroded.
+                                    if (!skipBossErosion &&
+                                        pl.isovalue >= patch.tauMin - patch.skinThicknessMm - 2.0f * hTop &&
                                         pl.isovalue <= patch.tauCompletion + 2.5f * hTop) {
                                         s += erodeDepth;
                                         anyErodedByConformalSkin = true;
@@ -9282,10 +9428,23 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         }
                     }
 
+                    bool layerOverlapsAnyGeoBoss = false;
+                    if (anyDeferredGeoBoss) {
+                        for (const auto& patch : conformalSkinPatches) {
+                            if (patch.hasDeferredGeoBoss &&
+                                pl.isovalue >= patch.tauMin - patch.skinThicknessMm - 2.0f * hTop &&
+                                pl.isovalue <= patch.tauCompletion + static_cast<float>(patch.skinLayers + 1) * 1.0e-3f) {
+                                layerOverlapsAnyGeoBoss = true;
+                                break;
+                            }
+                        }
+                    }
+
                     auto clipAgainstSdfThreshold = [&](float sdfLimit) {
                         info.vertices.clear();
                         info.indices.clear();
                         info.contour_segments.clear();
+                        deferredCoreFragments[idx].clear();
 
                         std::vector<RenderVertex> rawVertices;
                         std::vector<std::uint32_t> rawIndices;
@@ -9395,7 +9554,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             }
                         }
 
-                        if (!multiBranch || rawIndices.empty()) {
+                        if ((!multiBranch && !layerOverlapsAnyGeoBoss) || rawIndices.empty()) {
                             info.vertices.reserve(rawVertices.size());
                             for (const auto& rv : rawVertices) {
                                 info.vertices.push_back(rv);
@@ -9455,6 +9614,8 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             int triCount = 0;
                             openvdb::Vec3d sumCentroids{0.0, 0.0, 0.0};
                             bool keep = false;
+                            int deferToPatchId = -1;
+                            std::unordered_map<int, int> deferVotes;
                         };
                         std::unordered_map<std::uint32_t, IslandStats> islands;
                         const int targetBranch = static_cast<int>(pl.branchId);
@@ -9471,16 +9632,49 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             st.sumCentroids += openvdb::Vec3d(cx, cy, cz);
                             st.triCount += 1;
 
-                            const int vBranch = lookupVoxelBranch(cx, cy, cz, targetBranch);
-                            if (vBranch >= 0) {
-                                const bool inSub =
-                                    isSubtree[static_cast<std::size_t>(targetBranch)][static_cast<std::size_t>(vBranch)] != 0;
-                                const bool inAnc =
-                                    isSubtree[static_cast<std::size_t>(vBranch)][static_cast<std::size_t>(targetBranch)] != 0;
-                                if (inSub) {
-                                    st.subtreeVotes += 1;
-                                } else if (!inAnc) {
-                                    st.otherBranchVotes += 1;
+                            if (multiBranch) {
+                                const int vBranch = lookupVoxelBranch(cx, cy, cz, targetBranch);
+                                if (vBranch >= 0) {
+                                    const bool inSub =
+                                        isSubtree[static_cast<std::size_t>(targetBranch)][static_cast<std::size_t>(vBranch)] != 0;
+                                    const bool inAnc =
+                                        isSubtree[static_cast<std::size_t>(vBranch)][static_cast<std::size_t>(targetBranch)] != 0;
+                                    if (inSub) {
+                                        st.subtreeVotes += 1;
+                                    } else if (!inAnc) {
+                                        st.otherBranchVotes += 1;
+                                    }
+                                }
+                            }
+
+                            if (layerOverlapsAnyGeoBoss) {
+                                const openvdb::Coord cFine =
+                                    fineSdfGrid.transform().worldToIndexCellCentered(
+                                        openvdb::Vec3d(cx, cy, cz));
+                                int dPId = deferredBossAcc.getValue(cFine);
+                                if (dPId < 0) {
+                                    static constexpr int kNb6[6][3] = {
+                                        {-1, 0, 0}, {1, 0, 0},
+                                        {0, -1, 0}, {0, 1, 0},
+                                        {0, 0, -1}, {0, 0, 1}};
+                                    for (const auto& d : kNb6) {
+                                        const int nbPid = deferredBossAcc.getValue(
+                                            cFine + openvdb::Coord(d[0], d[1], d[2]));
+                                        if (nbPid >= 0) {
+                                            dPId = nbPid;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (dPId >= 0 &&
+                                    static_cast<std::size_t>(dPId) < conformalSkinPatches.size()) {
+                                    const auto& defPatch =
+                                        conformalSkinPatches[static_cast<std::size_t>(dPId)];
+                                    if (defPatch.hasDeferredGeoBoss &&
+                                        pl.isovalue <= defPatch.tauCompletion +
+                                            static_cast<float>(defPatch.skinLayers + 1) * 1.0e-3f) {
+                                        st.deferVotes[dPId] += 1;
+                                    }
                                 }
                             }
                         }
@@ -9490,29 +9684,51 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         float closestIslandDistSq = std::numeric_limits<float>::max();
 
                         for (auto& [root, st] : islands) {
-                            const openvdb::Vec3d cAvg =
-                                st.sumCentroids / static_cast<double>(std::max(1, st.triCount));
-                            const openvdb::Vec3f centroid(
-                                static_cast<float>(cAvg.x()),
-                                static_cast<float>(cAvg.y()),
-                                static_cast<float>(cAvg.z()));
-                            st.keep = islandMatchesBranch(
-                                st.subtreeVotes,
-                                st.otherBranchVotes,
-                                centroid,
-                                targetBranch);
-                            if (st.keep) {
+                            if (!multiBranch) {
+                                st.keep = true;
                                 anyIslandKept = true;
-                            }
-                            const float dSq = nearestSubtreeDistSq(centroid, targetBranch);
-                            if (dSq < closestIslandDistSq) {
-                                closestIslandDistSq = dSq;
-                                closestIslandRoot = root;
+                            } else {
+                                const openvdb::Vec3d cAvg =
+                                    st.sumCentroids / static_cast<double>(std::max(1, st.triCount));
+                                const openvdb::Vec3f centroid(
+                                    static_cast<float>(cAvg.x()),
+                                    static_cast<float>(cAvg.y()),
+                                    static_cast<float>(cAvg.z()));
+                                st.keep = islandMatchesBranch(
+                                    st.subtreeVotes,
+                                    st.otherBranchVotes,
+                                    centroid,
+                                    targetBranch);
+                                if (st.keep) {
+                                    anyIslandKept = true;
+                                }
+                                const float dSq = nearestSubtreeDistSq(centroid, targetBranch);
+                                if (dSq < closestIslandDistSq) {
+                                    closestIslandDistSq = dSq;
+                                    closestIslandRoot = root;
+                                }
                             }
                         }
 
-                        if (!anyIslandKept && !islands.empty()) {
+                        if (multiBranch && !anyIslandKept && !islands.empty()) {
                             islands[closestIslandRoot].keep = true;
+                        }
+
+                        for (auto& [root, st] : islands) {
+                            if (!st.keep || st.deferVotes.empty()) {
+                                continue;
+                            }
+                            int bestPid = -1;
+                            int bestCnt = 0;
+                            for (const auto& [pid, cnt] : st.deferVotes) {
+                                if (cnt > bestCnt) {
+                                    bestCnt = cnt;
+                                    bestPid = pid;
+                                }
+                            }
+                            if (bestPid >= 0 && bestCnt >= 4 && bestCnt * 4 >= st.triCount) {
+                                st.deferToPatchId = bestPid;
+                            }
                         }
 
                         std::vector<std::int32_t> compactRemap(numClippedVerts, -1);
@@ -9526,17 +9742,65 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             return newIdx;
                         };
 
+                        struct FragBuilder {
+                            SelectedLayerInfo layer;
+                            std::vector<std::int32_t> remap;
+                        };
+                        std::unordered_map<int, FragBuilder> fragBuilders;
+
+                        auto getOrCreateFrag = [&](int deferPid) -> FragBuilder& {
+                            auto itF = fragBuilders.find(deferPid);
+                            if (itF == fragBuilders.end()) {
+                                FragBuilder fb{};
+                                fb.layer.layer_index = info.layer_index;
+                                fb.layer.branch_id = info.branch_id;
+                                fb.layer.parent_branch_id = info.parent_branch_id;
+                                fb.layer.branch_layer_index = info.branch_layer_index;
+                                fb.layer.branch_layer_count = info.branch_layer_count;
+                                fb.layer.isovalue = info.isovalue;
+                                fb.layer.mean_thickness_mm = info.mean_thickness_mm;
+                                fb.layer.min_thickness_mm = info.min_thickness_mm;
+                                fb.layer.max_thickness_mm = info.max_thickness_mm;
+                                fb.layer.is_first_layer = info.is_first_layer;
+                                fb.layer.is_top_layer = info.is_top_layer;
+                                fb.remap.assign(numClippedVerts, -1);
+                                itF = fragBuilders.emplace(deferPid, std::move(fb)).first;
+                            }
+                            return itF->second;
+                        };
+
                         for (std::size_t t = 0; t + 2 < rawIndices.size(); t += 3) {
                             const std::uint32_t root = findV(rawIndices[t + 0]);
-                            if (!islands[root].keep) {
+                            const auto& st = islands[root];
+                            if (!st.keep) {
                                 continue;
                             }
-                            const std::uint32_t n0 = emitKeptVert(rawIndices[t + 0]);
-                            const std::uint32_t n1 = emitKeptVert(rawIndices[t + 1]);
-                            const std::uint32_t n2 = emitKeptVert(rawIndices[t + 2]);
-                            info.indices.push_back(n0);
-                            info.indices.push_back(n1);
-                            info.indices.push_back(n2);
+                            if (st.deferToPatchId < 0) {
+                                const std::uint32_t n0 = emitKeptVert(rawIndices[t + 0]);
+                                const std::uint32_t n1 = emitKeptVert(rawIndices[t + 1]);
+                                const std::uint32_t n2 = emitKeptVert(rawIndices[t + 2]);
+                                info.indices.push_back(n0);
+                                info.indices.push_back(n1);
+                                info.indices.push_back(n2);
+                            } else {
+                                auto& fb = getOrCreateFrag(st.deferToPatchId);
+                                auto emitFragVert = [&](std::uint32_t rawIdx) -> std::uint32_t {
+                                    if (fb.remap[rawIdx] >= 0) {
+                                        return static_cast<std::uint32_t>(fb.remap[rawIdx]);
+                                    }
+                                    const auto newIdx =
+                                        static_cast<std::uint32_t>(fb.layer.vertices.size());
+                                    fb.layer.vertices.push_back(rawVertices[rawIdx]);
+                                    fb.remap[rawIdx] = static_cast<std::int32_t>(newIdx);
+                                    return newIdx;
+                                };
+                                const std::uint32_t n0 = emitFragVert(rawIndices[t + 0]);
+                                const std::uint32_t n1 = emitFragVert(rawIndices[t + 1]);
+                                const std::uint32_t n2 = emitFragVert(rawIndices[t + 2]);
+                                fb.layer.indices.push_back(n0);
+                                fb.layer.indices.push_back(n1);
+                                fb.layer.indices.push_back(n2);
+                            }
                         }
 
                         for (const auto& ce : rawContours) {
@@ -9547,12 +9811,29 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                             }
                             const auto& p0 = rawVertices[ce.v0];
                             const auto& p1 = rawVertices[ce.v1];
-                            info.contour_segments.push_back(p0.x);
-                            info.contour_segments.push_back(p0.y);
-                            info.contour_segments.push_back(p0.z);
-                            info.contour_segments.push_back(p1.x);
-                            info.contour_segments.push_back(p1.y);
-                            info.contour_segments.push_back(p1.z);
+                            if (it->second.deferToPatchId < 0) {
+                                info.contour_segments.push_back(p0.x);
+                                info.contour_segments.push_back(p0.y);
+                                info.contour_segments.push_back(p0.z);
+                                info.contour_segments.push_back(p1.x);
+                                info.contour_segments.push_back(p1.y);
+                                info.contour_segments.push_back(p1.z);
+                            } else {
+                                auto& fb = getOrCreateFrag(it->second.deferToPatchId);
+                                fb.layer.contour_segments.push_back(p0.x);
+                                fb.layer.contour_segments.push_back(p0.y);
+                                fb.layer.contour_segments.push_back(p0.z);
+                                fb.layer.contour_segments.push_back(p1.x);
+                                fb.layer.contour_segments.push_back(p1.y);
+                                fb.layer.contour_segments.push_back(p1.z);
+                            }
+                        }
+
+                        for (auto& [deferPid, fb] : fragBuilders) {
+                            if (!fb.layer.vertices.empty() && fb.layer.indices.size() >= 3) {
+                                deferredCoreFragments[idx].push_back(
+                                    DeferredCoreFragment{deferPid, std::move(fb.layer)});
+                            }
                         }
                     };
 
@@ -9560,13 +9841,18 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     // cross-sections with valid interior geometry are never inflated outward.
                     clipAgainstSdfThreshold(0.0f);
 
-                    if (info.indices.empty() && !anyErodedByConformalSkin && pl.sdfClipAllowance > 0.0f) {
+                    if (info.indices.empty() &&
+                        deferredCoreFragments[idx].empty() &&
+                        !anyErodedByConformalSkin &&
+                        pl.sdfClipAllowance > 0.0f) {
                         clipAgainstSdfThreshold(pl.sdfClipAllowance);
                     }
 
                     // If trilinear SDF rounding at a sharp 3D corner still left this layer empty,
                     // find the minimum SDF on the branch's isosurface sheet and clip with a small margin.
-                    if (info.indices.empty() && !anyErodedByConformalSkin) {
+                    if (info.indices.empty() &&
+                        deferredCoreFragments[idx].empty() &&
+                        !anyErodedByConformalSkin) {
                         float minBranchSdf = std::numeric_limits<float>::max();
                         const int targetBranch = static_cast<int>(pl.branchId);
                         for (std::size_t t = 0; t + 2 < inds.size(); t += 3) {
@@ -10162,72 +10448,130 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 }
             });
 
-        std::vector<SelectedLayerInfo> conformalSkinLayers;
-        for (auto& patchLayers : perPatchSkinLayers) {
-            for (auto& layer : patchLayers) {
-                conformalSkinLayers.push_back(std::move(layer));
+        bool anyConformalSkinLayers = false;
+        for (const auto& patchLayers : perPatchSkinLayers) {
+            if (!patchLayers.empty()) {
+                anyConformalSkinLayers = true;
+                break;
+            }
+        }
+        bool anyDeferredFragments = false;
+        for (const auto& frags : deferredCoreFragments) {
+            if (!frags.empty()) {
+                anyDeferredFragments = true;
+                break;
             }
         }
 
-        if (!conformalSkinLayers.empty()) {
-            // Option 2b: Shift the sort schedule key of deferred upper boss branches past the
-            // completion of the roof conformal skin patch while preserving true `layer.isovalue`.
+        if (anyConformalSkinLayers || anyDeferredFragments) {
+            struct SortableLayer {
+                float primaryTau = 0.0f;
+                int stage = 0; // 0 = regular core, 1 = conformal skin cap, 2 = deferred boss <= tauCompletion
+                float secondaryTau = 0.0f;
+                SelectedLayerInfo layer;
+            };
+
             const std::size_t nBranches = branches.size();
-            std::vector<float> deferredBranchTauShift(nBranches, 0.0f);
+            std::vector<float> deferredBranchDeferTau(nBranches, -1.0f);
             for (std::size_t pIdx = 0; pIdx < conformalSkinPatches.size(); ++pIdx) {
                 if (perPatchSkinLayers[pIdx].empty()) {
                     continue;
                 }
                 const auto& patch = conformalSkinPatches[pIdx];
-                const float afterSkinTau =
-                    patch.tauCompletion + static_cast<float>(patch.skinLayers + 1) * 1.0e-3f;
                 for (const int rootB : patch.deferredBranches) {
                     if (rootB < 0 || static_cast<std::size_t>(rootB) >= nBranches) {
                         continue;
                     }
-                    const float shift = std::max(
-                        0.0f,
-                        afterSkinTau - branches[static_cast<std::size_t>(rootB)].tauStart);
                     for (std::size_t u = 0; u < nBranches; ++u) {
                         if (isSubtree[static_cast<std::size_t>(rootB)][u] != 0) {
-                            deferredBranchTauShift[u] =
-                                std::max(deferredBranchTauShift[u], shift);
+                            deferredBranchDeferTau[u] =
+                                std::max(deferredBranchDeferTau[u], patch.tauCompletion);
                         }
                     }
                 }
             }
 
-            auto scheduleKey = [&](const SelectedLayerInfo& layer) -> float {
-                if (layer.branch_id < nBranches) {
-                    return layer.isovalue + deferredBranchTauShift[layer.branch_id];
-                }
-                return layer.isovalue;
-            };
+            std::vector<SortableLayer> sortable;
+            sortable.reserve(extractedLayers.size() + conformalSkinPatches.size() * 8 + 16);
 
-            // Merge non-empty core layers with conformal skin layers and sort causally
-            std::vector<SelectedLayerInfo> mergedLayers;
-            mergedLayers.reserve(extractedLayers.size() + conformalSkinLayers.size());
             for (auto& layer : extractedLayers) {
-                if (!layer.vertices.empty() && layer.indices.size() >= 3) {
-                    mergedLayers.push_back(std::move(layer));
+                if (layer.vertices.empty() || layer.indices.size() < 3) {
+                    continue;
+                }
+                SortableLayer sl{};
+                const float deferTau = (layer.branch_id < nBranches)
+                    ? deferredBranchDeferTau[layer.branch_id]
+                    : -1.0f;
+                if (deferTau >= 0.0f && layer.isovalue <= deferTau + 1.0e-3f) {
+                    sl.primaryTau = deferTau;
+                    sl.stage = 2;
+                    sl.secondaryTau = layer.isovalue;
+                } else {
+                    sl.primaryTau = layer.isovalue;
+                    sl.stage = 0;
+                    sl.secondaryTau = layer.isovalue;
+                }
+                sl.layer = std::move(layer);
+                sortable.push_back(std::move(sl));
+            }
+
+            for (auto& frags : deferredCoreFragments) {
+                for (auto& frag : frags) {
+                    if (frag.layer.vertices.empty() || frag.layer.indices.size() < 3) {
+                        continue;
+                    }
+                    SortableLayer sl{};
+                    if (frag.patchId >= 0 &&
+                        static_cast<std::size_t>(frag.patchId) < conformalSkinPatches.size() &&
+                        !perPatchSkinLayers[static_cast<std::size_t>(frag.patchId)].empty()) {
+                        sl.primaryTau =
+                            conformalSkinPatches[static_cast<std::size_t>(frag.patchId)].tauCompletion;
+                        sl.stage = 2;
+                        sl.secondaryTau = frag.layer.isovalue;
+                    } else {
+                        sl.primaryTau = frag.layer.isovalue;
+                        sl.stage = 0;
+                        sl.secondaryTau = frag.layer.isovalue;
+                    }
+                    sl.layer = std::move(frag.layer);
+                    sortable.push_back(std::move(sl));
                 }
             }
-            for (auto& skinLayer : conformalSkinLayers) {
-                mergedLayers.push_back(std::move(skinLayer));
+
+            for (std::size_t pIdx = 0; pIdx < conformalSkinPatches.size(); ++pIdx) {
+                const auto& patch = conformalSkinPatches[pIdx];
+                for (auto& skinLayer : perPatchSkinLayers[pIdx]) {
+                    SortableLayer sl{};
+                    sl.primaryTau = patch.tauCompletion;
+                    sl.stage = 1;
+                    sl.secondaryTau =
+                        static_cast<float>(skinLayer.branch_layer_index + 1u);
+                    sl.layer = std::move(skinLayer);
+                    sortable.push_back(std::move(sl));
+                }
             }
+
             std::stable_sort(
-                mergedLayers.begin(),
-                mergedLayers.end(),
-                [&](const SelectedLayerInfo& a, const SelectedLayerInfo& b) {
-                    const float ka = scheduleKey(a);
-                    const float kb = scheduleKey(b);
-                    if (std::abs(ka - kb) > 1.0e-5f) {
-                        return ka < kb;
+                sortable.begin(),
+                sortable.end(),
+                [](const SortableLayer& a, const SortableLayer& b) {
+                    if (std::abs(a.primaryTau - b.primaryTau) > 1.0e-5f) {
+                        return a.primaryTau < b.primaryTau;
                     }
-                    return a.branch_id < b.branch_id;
+                    if (a.stage != b.stage) {
+                        return a.stage < b.stage;
+                    }
+                    if (std::abs(a.secondaryTau - b.secondaryTau) > 1.0e-5f) {
+                        return a.secondaryTau < b.secondaryTau;
+                    }
+                    return a.layer.branch_id < b.layer.branch_id;
                 });
-            for (std::size_t i = 0; i < mergedLayers.size(); ++i) {
-                mergedLayers[i].layer_index = static_cast<std::uint32_t>(i);
+
+            std::vector<SelectedLayerInfo> mergedLayers;
+            mergedLayers.reserve(sortable.size());
+            for (std::size_t i = 0; i < sortable.size(); ++i) {
+                sortable[i].layer.layer_index = static_cast<std::uint32_t>(i);
+                mergedLayers.push_back(std::move(sortable[i].layer));
             }
             extractedLayers = std::move(mergedLayers);
         }
