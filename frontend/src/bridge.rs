@@ -314,6 +314,8 @@ pub mod ffi {
         pub tool_iso_angle_deg: f32,
         /// `true` when the nozzle axis at this point was actively oriented using the outward object surface normal $\nabla \phi_{\text{sdf}}$.
         pub uses_surface_normal: bool,
+        /// Signed distance $\phi_{\text{sdf}}(\mathbf{x})$ at the nozzle position (mm; negative inside solid, `0` on surface, positive outside).
+        pub sdf_mm: f32,
     }
 
     /// A continuous open or closed extrusion path on a non-planar slicing isosurface.
@@ -424,6 +426,13 @@ pub mod ffi {
             object_id: u64,
             points_xyz: &[f32],
         ) -> Vec<SurfaceOpticalSample>;
+
+        /// Batch-samples signed distance $\phi_{\text{sdf}}(\mathbf{x})$ (mm; negative inside solid,
+        /// `0` on surface, positive outside) at `points_xyz` (`3 * N` floats in object-local coordinates).
+        pub fn sample_object_sdf(
+            object_id: u64,
+            points_xyz: &[f32],
+        ) -> Vec<f32>;
 
         /// Retrieves the solved 3D unit tool axis (`[ax, ay, az]` per vertex in local object
         /// coordinates, length `3 * vertex_count`) sampled on the object's surface mesh from

@@ -17,9 +17,11 @@ use crate::config::{
     SparseInfillPattern, SupportStyle, SurfaceHintMode, ToolConfig, WallPrintOrder,
 };
 use crate::field_vis::{
-    high_contrast_parameter_ramp, sample_slice_colormap_rgba, FieldColormap,
-    FieldVisualizationState, IsoIntersectionMode, ObjectSurfaceColorMode,
-    SelectedLayersColorMode, SliceAxis, ToolpathColorMode, ToolpathQualityMode, BRANCH_PALETTE,
+    high_contrast_parameter_ramp, nozzle_sdf_reference_layer_height_mm, nozzle_sdf_signed_t,
+    raw_toolpaths_sdf_observed_range, sample_nozzle_sdf_rgba_for_signed_t,
+    sample_slice_colormap_rgba, FieldColormap, FieldVisualizationState, IsoIntersectionMode,
+    ObjectSurfaceColorMode, SelectedLayersColorMode, SliceAxis, ToolpathColorMode,
+    ToolpathQualityMode, BRANCH_PALETTE,
 };
 use crate::hull::rotation_to_place_face_on_bed;
 use crate::io::threemf::{save_project_to_3mf, ExportableObject};
@@ -135,6 +137,119 @@ fn draw_continuous_gradient_legend(
                     });
                 }
             });
+        });
+}
+
+/// Renders a centered non-linear diverging colorbar legend for `ToolpathColorMode::ByNozzleSdf`,
+/// keeping `0.0 mm` at center (`50%`) and marking `[-h, -h/4, 0, +h/4, +h]` along the scale.
+fn draw_nozzle_sdf_legend(
+    ui: &mut egui::Ui,
+    h_ref_mm: f32,
+    observed_range: Option<(f32, f32)>,
+) {
+    let decimals = if h_ref_mm < 0.16 { 3 } else { 2 };
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(6.0, 5.0))
+        .show(ui, |ui| {
+            ui.small(
+                egui::RichText::new(format!(
+                    "Nozzle SDF φ_sdf (mm, h = {h_ref_mm:.decimals$} mm)"
+                ))
+                .strong()
+                .color(egui::Color32::from_rgb(230, 238, 250)),
+            );
+
+            let bar_width = ui.available_width().clamp(160.0, 340.0);
+            let bar_height = 14.0;
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(bar_width, bar_height + 5.0),
+                egui::Sense::hover(),
+            );
+            let bar_rect =
+                egui::Rect::from_min_size(rect.min, egui::vec2(bar_width, bar_height));
+
+            let steps = 64usize;
+            let painter = ui.painter();
+            for i in 0..steps {
+                let t0 = (i as f32) / (steps as f32);
+                let t1 = ((i + 1) as f32) / (steps as f32);
+                let signed_t = 2.0 * (0.5 * (t0 + t1)) - 1.0;
+                let x0 = bar_rect.left() + bar_width * t0;
+                let x1 = bar_rect.left() + bar_width * t1;
+                let seg_rect = egui::Rect::from_min_max(
+                    egui::pos2(x0, bar_rect.top()),
+                    egui::pos2(x1 + 0.5, bar_rect.bottom()),
+                );
+                painter.rect_filled(
+                    seg_rect,
+                    0.0,
+                    rgba_to_color32(sample_nozzle_sdf_rgba_for_signed_t(signed_t)),
+                );
+            }
+            painter.rect_stroke(
+                bar_rect,
+                2.0,
+                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(95)),
+            );
+
+            let landmarks = [-h_ref_mm, -0.25 * h_ref_mm, 0.0, 0.25 * h_ref_mm, h_ref_mm];
+            for (idx, &val) in landmarks.iter().enumerate() {
+                let signed_t = nozzle_sdf_signed_t(val, h_ref_mm);
+                let frac = 0.5 * (1.0 + signed_t);
+                let x = (bar_rect.left() + bar_width * frac)
+                    .clamp(bar_rect.left() + 0.5, bar_rect.right() - 0.5);
+                let top_y = if idx == 2 {
+                    bar_rect.top() + 2.0
+                } else {
+                    bar_rect.bottom() - 4.0
+                };
+                painter.line_segment(
+                    [egui::pos2(x, top_y), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(
+                        if idx == 2 { 1.5_f32 } else { 1.25_f32 },
+                        if idx == 2 {
+                            egui::Color32::from_gray(45)
+                        } else {
+                            egui::Color32::from_gray(235)
+                        },
+                    ),
+                );
+            }
+
+            ui.columns(5, |cols| {
+                for (i, (col, &val)) in cols.iter_mut().zip(landmarks.iter()).enumerate() {
+                    let signed_t = nozzle_sdf_signed_t(val, h_ref_mm);
+                    let c32 = rgba_to_color32(sample_nozzle_sdf_rgba_for_signed_t(signed_t));
+                    col.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+                        ui.painter().rect_filled(dot_rect, 2.0, c32);
+                        let txt = if i == 2 {
+                            format!("{:.decimals$}", 0.0_f32)
+                        } else {
+                            format!("{val:+.decimals$}")
+                        };
+                        ui.label(
+                            egui::RichText::new(txt)
+                                .size(10.5)
+                                .monospace()
+                                .color(egui::Color32::from_gray(235)),
+                        );
+                    });
+                }
+            });
+
+            let quarter_h = 0.25 * h_ref_mm;
+            let mut caption = format!(
+                "Inside (<0) | ±¼h = ±{quarter_h:.decimals$} mm | Outside (>0)"
+            );
+            if let Some((lo, hi)) = observed_range {
+                caption.push_str(&format!(" [slice: {lo:+.2}..{hi:+.2} mm]"));
+            }
+            ui.small(
+                egui::RichText::new(caption).color(egui::Color32::from_rgb(180, 194, 214)),
+            );
         });
 }
 
@@ -762,7 +877,7 @@ fn render_layer_and_move_scrub_controls(
                 let (rot_l1, rot_l2) = config.machine.kinematics_mode.rotary_axis_letters();
                 ui.small(
                     egui::RichText::new(format!(
-                        "L#{} M{}/{} [{}] T{} | Pos=({:+.1},{:+.1},{:+.1}) | {}={:+.1}° {}={:+.1}° | θ_iso={:.1}° ({}) | g_bed=({:+.2},{:+.2},{:+.2}){}",
+                        "L#{} M{}/{} [{}] T{} | Pos=({:+.1},{:+.1},{:+.1}) | {}={:+.1}° {}={:+.1}° | θ_iso={:.1}° ({}) | φ_sdf={:+.3} mm | g_bed=({:+.2},{:+.2},{:+.2}){}",
                         pose.layer_index,
                         pose.move_index,
                         pose.total_layer_moves,
@@ -777,6 +892,7 @@ fn render_layer_and_move_scrub_controls(
                         pose.c_deg,
                         pose.tool_iso_angle_deg,
                         norm_source,
+                        pose.sdf_mm,
                         pose.gravity_bed.x,
                         pose.gravity_bed.y,
                         pose.gravity_bed.z,
@@ -989,6 +1105,26 @@ fn render_toolpath_color_legend(
         return;
     }
 
+    if vis_state.toolpath_color_mode == ToolpathColorMode::ByNozzleSdf {
+        let h_ref_mm = nozzle_sdf_reference_layer_height_mm(config);
+        let observed_range = if let Some(ref planned) = vis_state.cached_planned_gcode {
+            if planned.min_sdf_mm.is_finite()
+                && planned.max_sdf_mm.is_finite()
+                && planned.min_sdf_mm <= planned.max_sdf_mm
+            {
+                Some((planned.min_sdf_mm, planned.max_sdf_mm))
+            } else {
+                None
+            }
+        } else if let Some(ref tp_res) = vis_state.cached_toolpaths {
+            raw_toolpaths_sdf_observed_range(tp_res)
+        } else {
+            None
+        };
+        draw_nozzle_sdf_legend(ui, h_ref_mm, observed_range);
+        return;
+    }
+
     if let Some(ref planned) = vis_state.cached_planned_gcode {
         let (title, min_v, max_v, unit, decimals) = match vis_state.toolpath_color_mode {
             ToolpathColorMode::ByLineWidth => (
@@ -1059,7 +1195,8 @@ fn render_toolpath_color_legend(
             ToolpathColorMode::ByFeatureType
             | ToolpathColorMode::ByToolOrFilament
             | ToolpathColorMode::ByOpticalComposite
-            | ToolpathColorMode::BySurfaceNormalUsage => {
+            | ToolpathColorMode::BySurfaceNormalUsage
+            | ToolpathColorMode::ByNozzleSdf => {
                 unreachable!()
             }
         };

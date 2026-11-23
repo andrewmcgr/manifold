@@ -2595,6 +2595,106 @@ std::vector<std::uint32_t> SlicerBackend::objectTriangleColorsRgba(std::uint64_t
     return it->second.triangleColorsRgba;
 }
 
+namespace {
+
+/// Thread-local helper sampling composite fine+coarse OpenVDB SDF grids at world/object points.
+class CompositeObjectSdfSampler {
+public:
+    CompositeObjectSdfSampler(
+        const openvdb::FloatGrid& fineGrid,
+        const openvdb::FloatGrid* coarseGrid,
+        float fineShellInnerDepthMm)
+        : fineAcc_(fineGrid.getConstAccessor())
+        , fineSampler_(fineAcc_, fineGrid.transform())
+        , coarsePtr_(coarseGrid)
+    {
+        const float fineDx = static_cast<float>(fineGrid.transform().voxelSize()[0]);
+        fineInnerCutoff_ = (fineShellInnerDepthMm > 0.0f)
+            ? -std::max(fineShellInnerDepthMm - 1.5f * fineDx, 1.5f * fineDx)
+            : -(fineGrid.background() - std::max(0.5f * fineDx, 0.25f));
+        fineOuterCutoff_ = fineGrid.background() - std::max(1.5f * fineDx, 0.25f);
+        if (coarsePtr_ != nullptr) {
+            coarseAcc_.emplace(coarsePtr_->getConstAccessor());
+            coarseSampler_.emplace(*coarseAcc_, coarsePtr_->transform());
+        }
+    }
+
+    float sample(const openvdb::Vec3d& wp) {
+        const float fVal = fineSampler_.wsSample(wp);
+        if (std::isfinite(fVal) && fVal > fineInnerCutoff_ && fVal < fineOuterCutoff_) {
+            return fVal;
+        }
+        if (coarseSampler_.has_value()) {
+            const float cVal = coarseSampler_->wsSample(wp);
+            return std::isfinite(cVal) ? cVal : 0.0f;
+        }
+        return std::isfinite(fVal) ? fVal : 0.0f;
+    }
+
+private:
+    openvdb::FloatGrid::ConstAccessor fineAcc_;
+    openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+        fineSampler_;
+    const openvdb::FloatGrid* coarsePtr_ = nullptr;
+    std::optional<openvdb::FloatGrid::ConstAccessor> coarseAcc_;
+    std::optional<
+        openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>>
+        coarseSampler_;
+    float fineInnerCutoff_ = 0.0f;
+    float fineOuterCutoff_ = 0.0f;
+};
+
+} // namespace
+
+std::vector<float> SlicerBackend::sampleObjectSdf(
+    std::uint64_t objectId,
+    const float* pointsXyz,
+    std::size_t floatCount) const
+{
+    const std::size_t numPts = floatCount / 3;
+    std::vector<float> out(numPts, 0.0f);
+    if (pointsXyz == nullptr || numPts == 0) {
+        return out;
+    }
+
+    const auto it = impl_->objects.find(objectId);
+    if (it == impl_->objects.end()) {
+        return out;
+    }
+    const ObjectRecord& rec = it->second;
+    const auto sdfIt = rec.scalarFields.find("sdf");
+    if (sdfIt == rec.scalarFields.end() || !sdfIt->second) {
+        return out;
+    }
+
+    const openvdb::FloatGrid& sdfGrid = *sdfIt->second;
+    const openvdb::FloatGrid* coarseSdfPtr = nullptr;
+    if (rec.isMultiResolution) {
+        const auto cSdfIt = rec.coarseScalarFields.find("sdf");
+        if (cSdfIt != rec.coarseScalarFields.end() && cSdfIt->second) {
+            coarseSdfPtr = cSdfIt->second.get();
+        }
+    }
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, numPts, 256),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            CompositeObjectSdfSampler sdfEval(
+                sdfGrid,
+                coarseSdfPtr,
+                rec.fineShellInnerDepthMm);
+            for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                const openvdb::Vec3d wp(
+                    pointsXyz[3 * i + 0],
+                    pointsXyz[3 * i + 1],
+                    pointsXyz[3 * i + 2]);
+                out[i] = sdfEval.sample(wp);
+            }
+        });
+
+    return out;
+}
+
 std::vector<SurfaceOpticalSample> SlicerBackend::sampleObjectSurfaceOptics(
     std::uint64_t objectId,
     const float* pointsXyz,
@@ -3866,6 +3966,23 @@ rust::Vec<SurfaceOpticalSample> sample_object_surface_optics(
     out.reserve(src.size());
     for (const auto& s : src) {
         out.push_back(s);
+    }
+    return out;
+}
+
+rust::Vec<float> sample_object_sdf(
+    std::uint64_t object_id,
+    rust::Slice<const float> points_xyz)
+{
+    std::lock_guard<std::mutex> lock(g_backendMutex);
+    const auto src = globalBackend().sampleObjectSdf(
+        object_id,
+        points_xyz.data(),
+        points_xyz.size());
+    rust::Vec<float> out;
+    out.reserve(src.size());
+    for (const float v : src) {
+        out.push_back(v);
     }
     return out;
 }
@@ -13753,6 +13870,26 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                 }
             }
         }
+    }
+
+    if (!res.layers.empty()) {
+        const openvdb::FloatGrid& fineSdfGridRef = *sdfIt->second;
+        tbb::parallel_for(
+            tbb::blocked_range<std::size_t>(0, res.layers.size(), 1),
+            [&](const tbb::blocked_range<std::size_t>& r) {
+                CompositeObjectSdfSampler sdfEval(
+                    fineSdfGridRef,
+                    coarseSdfPtr,
+                    rec.fineShellInnerDepthMm);
+                for (std::size_t lIdx = r.begin(); lIdx != r.end(); ++lIdx) {
+                    auto& layerTp = res.layers[lIdx];
+                    for (auto& path : layerTp.paths) {
+                        for (auto& pt : path.points) {
+                            pt.sdf_mm = sdfEval.sample(openvdb::Vec3d(pt.x, pt.y, pt.z));
+                        }
+                    }
+                }
+            });
     }
 
     setFieldProgress(false, 1.0f, "Shell toolpaths ready.");

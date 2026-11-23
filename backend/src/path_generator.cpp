@@ -6027,6 +6027,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         m.tool_iso_angle_deg =
                             a.tool_iso_angle_deg + (b.tool_iso_angle_deg - a.tool_iso_angle_deg) * t;
                         m.uses_surface_normal = (t < 0.5f) ? a.uses_surface_normal : b.uses_surface_normal;
+                        m.sdf_mm = a.sdf_mm + (b.sdf_mm - a.sdf_mm) * t;
                         return m;
                     };
 

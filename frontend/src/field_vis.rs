@@ -198,6 +198,8 @@ pub enum ToolpathColorMode {
     ByToolIsoNormalAngle,
     /// Highlights segments where the tool axis is actively oriented using the outward object surface normal $\nabla \phi_{\text{sdf}}$ vs. the slicing isosurface normal $\hat{\mathbf{n}}_{\text{iso}}$.
     BySurfaceNormalUsage,
+    /// Colors extrusions by the continuous signed distance $\phi_{\text{sdf}}(\mathbf{x})$ (mm) sampled at the nozzle tip (negative inside CAD solid, 0 on CAD surface, positive outside).
+    ByNozzleSdf,
     /// Colors each segment by its 3MF filament / colour slot (`filament_slot`) and mapped machine tool.
     ByToolOrFilament,
     /// Colors each segment by its simulated Kubelka–Munk multi-layer optical print appearance (front-lit or back-lit lithophane).
@@ -205,7 +207,7 @@ pub enum ToolpathColorMode {
 }
 
 impl ToolpathColorMode {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::ByFeatureType,
         Self::ByToolOrFilament,
         Self::ByOpticalComposite,
@@ -219,6 +221,7 @@ impl ToolpathColorMode {
         Self::ByMeltZonePressure,
         Self::ByToolIsoNormalAngle,
         Self::BySurfaceNormalUsage,
+        Self::ByNozzleSdf,
     ];
 
     pub fn label(self) -> &'static str {
@@ -238,6 +241,7 @@ impl ToolpathColorMode {
             Self::ByMeltZonePressure => "Melt-Zone Pressure P_melt (MPa)",
             Self::ByToolIsoNormalAngle => "Angle: Tool vs. Isosurface Normal (°)",
             Self::BySurfaceNormalUsage => "Tool Orientation Source (Object Surface vs. Isosurface Normal)",
+            Self::ByNozzleSdf => "Nozzle SDF Value (φ_sdf mm)",
         }
     }
 
@@ -256,8 +260,181 @@ impl ToolpathColorMode {
             Self::ByMeltZonePressure => "Melt-Zone Pressure P_melt",
             Self::ByToolIsoNormalAngle => "Tool vs. Isosurface Normal (°)",
             Self::BySurfaceNormalUsage => "Surface vs. Isosurface Normal",
+            Self::ByNozzleSdf => "Nozzle SDF (mm)",
         }
     }
+}
+
+/// Returns the nominal positive layer height reference `h_ref` (mm) used to anchor the near-zero
+/// resolution of the nozzle-SDF colormap (`±h_ref / 4` stands out clearly around `0.0 mm`).
+pub fn nozzle_sdf_reference_layer_height_mm(config: &SlicerConfig) -> f32 {
+    let lh = config.slicing.layer_height;
+    let lo = if lh.min_mm.is_finite() {
+        lh.min_mm.max(0.02)
+    } else {
+        0.02
+    };
+    let hi = if lh.max_mm.is_finite() {
+        lh.max_mm.max(lo)
+    } else {
+        lo.max(1.0)
+    };
+    let target = if lh.target_mm.is_finite() && lh.target_mm > 0.0 {
+        lh.target_mm
+    } else {
+        0.5 * (lo + hi)
+    };
+    target.clamp(lo, hi)
+}
+
+/// Maps signed SDF distance (mm) non-linearly into `[-1.0, 1.0]` anchored to `h_ref = layer_height_mm`:
+/// `0 -> 0`, `±h_ref/4 -> ±1/3`, `±h_ref/2 -> ±1/2`, `±h_ref -> ±2/3`, `±2*h_ref -> ±4/5`, `±∞ -> ±1`.
+pub fn nozzle_sdf_signed_t(sdf_mm: f32, layer_height_mm: f32) -> f32 {
+    if !sdf_mm.is_finite() {
+        return 0.0;
+    }
+    let h_ref = if layer_height_mm.is_finite() && layer_height_mm > 0.0 {
+        layer_height_mm.max(0.02)
+    } else {
+        0.20
+    };
+    let k = 0.5 * h_ref;
+    (sdf_mm / (sdf_mm.abs() + k)).clamp(-1.0, 1.0)
+}
+
+fn lerp_rgb_stops(t: f32, stops: &[(f32, [f32; 3])]) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    for w in stops.windows(2) {
+        let (t0, c0) = w[0];
+        let (t1, c1) = w[1];
+        if t <= t1 {
+            let u = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+            return [
+                c0[0] + (c1[0] - c0[0]) * u,
+                c0[1] + (c1[1] - c0[1]) * u,
+                c0[2] + (c1[2] - c0[2]) * u,
+            ];
+        }
+    }
+    stops.last().map(|s| s.1).unwrap_or([0.5, 0.5, 0.5])
+}
+
+/// Evaluates the signed diverging nozzle-SDF colormap directly from normalized coordinate `signed_t ∈ [-1.0, 1.0]`:
+/// - `0.0`: crisp white (`CAD surface`)
+/// - `-1/3` (`-h/4`): vivid electric turquoise; `-1/2` (`-h/2`): sky-azure; `-2/3` (`-h`): royal blue; `-1`: deep indigo
+/// - `+1/3` (`+h/4`): vivid gold-amber; `+1/2` (`+h/2`): tangerine-orange; `+2/3` (`+h`): scarlet-red; `+1`: dark maroon
+pub fn sample_nozzle_sdf_rgba_for_signed_t(signed_t: f32) -> [f32; 4] {
+    if !signed_t.is_finite() {
+        return [0.5, 0.5, 0.5, 1.0];
+    }
+    let t = signed_t.abs().clamp(0.0, 1.0);
+    let rgb = if signed_t < 0.0 {
+        lerp_rgb_stops(
+            t,
+            &[
+                (0.0, [0.98, 0.98, 0.99]),
+                (0.18, [0.46, 0.95, 0.88]),
+                (1.0 / 3.0, [0.04, 0.86, 0.78]),
+                (0.50, [0.04, 0.64, 0.98]),
+                (2.0 / 3.0, [0.12, 0.34, 0.98]),
+                (0.84, [0.22, 0.14, 0.76]),
+                (1.0, [0.10, 0.05, 0.36]),
+            ],
+        )
+    } else {
+        lerp_rgb_stops(
+            t,
+            &[
+                (0.0, [0.98, 0.98, 0.99]),
+                (0.18, [1.00, 0.93, 0.40]),
+                (1.0 / 3.0, [1.00, 0.78, 0.04]),
+                (0.50, [1.00, 0.44, 0.04]),
+                (2.0 / 3.0, [0.94, 0.14, 0.10]),
+                (0.84, [0.70, 0.04, 0.30]),
+                (1.0, [0.36, 0.02, 0.22]),
+            ],
+        )
+    };
+    [rgb[0], rgb[1], rgb[2], 1.0]
+}
+
+/// Signed diverging colormap for nozzle-tip SDF values (mm) with heightened near-zero contrast
+/// anchored to `layer_height_mm` (`±layer_height_mm / 4` maps to saturated turquoise / gold-amber).
+pub fn sample_nozzle_sdf_rgba(sdf_mm: f32, layer_height_mm: f32) -> [f32; 4] {
+    if !sdf_mm.is_finite() {
+        return [0.5, 0.5, 0.5, 1.0];
+    }
+    sample_nozzle_sdf_rgba_for_signed_t(nozzle_sdf_signed_t(sdf_mm, layer_height_mm))
+}
+
+/// Computes observed signed nozzle-SDF range `(min_sdf_mm, max_sdf_mm)` across raw object toolpaths,
+/// excluding auxiliary paths (`Support`, `SupportInterface`, `PurgeTower`) unless no part points exist.
+pub(crate) fn raw_toolpaths_sdf_observed_range(tp_res: &ObjectToolpathsResult) -> Option<(f32, f32)> {
+    let mut part_min = f32::INFINITY;
+    let mut part_max = f32::NEG_INFINITY;
+    let mut all_min = f32::INFINITY;
+    let mut all_max = f32::NEG_INFINITY;
+    for layer in &tp_res.layers {
+        for path in &layer.paths {
+            let is_aux = matches!(path.feature_kind, 7 | 8 | 13);
+            for pt in &path.points {
+                if pt.sdf_mm.is_finite() {
+                    all_min = all_min.min(pt.sdf_mm);
+                    all_max = all_max.max(pt.sdf_mm);
+                    if !is_aux {
+                        part_min = part_min.min(pt.sdf_mm);
+                        part_max = part_max.max(pt.sdf_mm);
+                    }
+                }
+            }
+        }
+    }
+    if part_min <= part_max {
+        Some((part_min, part_max))
+    } else if all_min <= all_max {
+        Some((all_min, all_max))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn scale_srgba_to_linear(mut rgba: [f32; 4], brightness_scale: f32) -> [f32; 4] {
+    rgba[0] = (rgba[0] * brightness_scale).clamp(0.0, 1.0);
+    rgba[1] = (rgba[1] * brightness_scale).clamp(0.0, 1.0);
+    rgba[2] = (rgba[2] * brightness_scale).clamp(0.0, 1.0);
+    srgba_to_linear_rgba(rgba)
+}
+
+#[inline]
+fn nozzle_sdf_segment_linear_colors(
+    s0: f32,
+    sm: f32,
+    s1: f32,
+    layer_height_mm: f32,
+    brightness_scale: f32,
+) -> ([f32; 4], Option<[f32; 4]>, [f32; 4]) {
+    let c0 = scale_srgba_to_linear(
+        sample_nozzle_sdf_rgba(s0, layer_height_mm),
+        brightness_scale,
+    );
+    let c1 = scale_srgba_to_linear(
+        sample_nozzle_sdf_rgba(s1, layer_height_mm),
+        brightness_scale,
+    );
+    let cm_exact = scale_srgba_to_linear(
+        sample_nozzle_sdf_rgba(sm, layer_height_mm),
+        brightness_scale,
+    );
+    let max_rgb_dev = (0..3)
+        .map(|k| (cm_exact[k] - 0.5 * (c0[k] + c1[k])).abs())
+        .fold(0.0f32, f32::max);
+    let cm = if (s0 * s1 < 0.0) || max_rgb_dev > 0.03 {
+        Some(cm_exact)
+    } else {
+        None
+    };
+    (c0, cm, c1)
 }
 
 /// Geometry & PBR rendering quality mode for 3D extruded bead previews.
@@ -349,6 +526,8 @@ pub struct ScrubbedToolheadPose {
     pub tool_iso_angle_deg: f32,
     /// `true` when the active move's nozzle axis is actively oriented using the outward object surface normal.
     pub uses_surface_normal: bool,
+    /// Signed distance $\phi_{\text{sdf}}(\mathbf{x})$ (mm) sampled at the nozzle tip (negative inside solid, 0 on CAD surface, positive outside).
+    pub sdf_mm: f32,
 }
 
 /// Generic scalar field visualization state resource supporting any named `openvdb::FloatGrid`
@@ -2171,7 +2350,7 @@ pub fn sync_field_visualization_system(
                                         0.18 + 0.64 * ((p_idx as f32) / (num_printable as f32));
                                     let obj_span_frac = 0.64 / (num_printable as f32);
                                     let prog_ref = &progress;
-                                    let p =
+                                    let mut p =
                                         crate::gcode::plan_and_emit_gcode_for_object_with_progress(
                                             &o_name,
                                             oid,
@@ -2185,6 +2364,10 @@ pub fn sync_field_visualization_system(
                                                 );
                                             }),
                                         );
+                                    crate::gcode::refresh_planned_gcode_nozzle_sdf(
+                                        &mut p,
+                                        |xyz| ffi::sample_object_sdf(oid, xyz),
+                                    );
                                     planned_objects.push((o_name, p, o_tf));
                                 }
                             }
@@ -2743,6 +2926,7 @@ impl FieldVisualizationState {
                             height_mm: seg.height_mm,
                             tool_iso_angle_deg: seg.tool_iso_angle_deg,
                             uses_surface_normal: seg.uses_surface_normal,
+                            sdf_mm: seg.sdf_mm_1,
                         });
                     }
                 }
@@ -2835,6 +3019,7 @@ impl FieldVisualizationState {
                                     height_mm: pt1.height_mm,
                                     tool_iso_angle_deg: pt1.tool_iso_angle_deg,
                                     uses_surface_normal: pt1.uses_surface_normal,
+                                    sdf_mm: pt1.sdf_mm,
                                 });
                             }
                             rem -= seg_count;
@@ -2920,6 +3105,7 @@ impl FieldVisualizationState {
                             height_mm: layer.mean_thickness_mm,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm: 0.0,
                         });
                     }
                 }
@@ -3269,6 +3455,8 @@ fn clone_planned_without_gcode_text(
         max_height_mm: p.max_height_mm,
         min_tool_iso_angle_deg: p.min_tool_iso_angle_deg,
         max_tool_iso_angle_deg: p.max_tool_iso_angle_deg,
+        min_sdf_mm: p.min_sdf_mm,
+        max_sdf_mm: p.max_sdf_mm,
     }
 }
 
@@ -3928,6 +4116,40 @@ fn build_raw_toolpaths_bead_mesh_parallel(
     }
 }
 
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn push_fast_bead_ring(
+    p: Vec3,
+    frame: NozzleFrame,
+    half_w: f32,
+    half_h: f32,
+    linear_rgba: [f32; 4],
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    colors: &mut Vec<[f32; 4]>,
+) {
+    let v_top = p + frame.nozzle_axis * half_h;
+    let v_right = p + frame.lateral_axis * half_w;
+    let v_bottom = p - frame.nozzle_axis * half_h;
+    let v_left = p - frame.lateral_axis * half_w;
+
+    positions.push(v_top.to_array());
+    normals.push(frame.nozzle_axis.to_array());
+    colors.push(linear_rgba);
+
+    positions.push(v_right.to_array());
+    normals.push(frame.lateral_axis.to_array());
+    colors.push(linear_rgba);
+
+    positions.push(v_bottom.to_array());
+    normals.push((-frame.nozzle_axis).to_array());
+    colors.push(linear_rgba);
+
+    positions.push(v_left.to_array());
+    normals.push((-frame.lateral_axis).to_array());
+    colors.push(linear_rgba);
+}
+
 /// Appends a single planned segment (`PlannedSegment`) as a 3D oriented bead prism
 /// in its local `NozzleFrame` $(\hat{\mathbf{x}}_{\text{nozzle}}, \hat{\mathbf{y}}_{\text{nozzle}}, \hat{\mathbf{z}}_{\text{nozzle}})$.
 #[allow(clippy::too_many_arguments)]
@@ -3986,51 +4208,73 @@ fn append_planned_segment_bead_mesh(
         ((0.48 * w_eff).max(0.03), (0.42 * h_eff).max(0.02))
     };
 
-    let mut rgba = override_rgba
-        .unwrap_or_else(|| compute_planned_segment_color(seg, planned, color_mode, config));
-    rgba[0] = (rgba[0] * brightness_scale).clamp(0.0, 1.0);
-    rgba[1] = (rgba[1] * brightness_scale).clamp(0.0, 1.0);
-    rgba[2] = (rgba[2] * brightness_scale).clamp(0.0, 1.0);
-    let linear_rgba = srgba_to_linear_rgba(rgba);
+    let (c0, cm_opt, c1) =
+        if color_mode == ToolpathColorMode::ByNozzleSdf && override_rgba.is_none() {
+            nozzle_sdf_segment_linear_colors(
+                seg.sdf_mm_0,
+                seg.sdf_mm,
+                seg.sdf_mm_1,
+                nozzle_sdf_reference_layer_height_mm(config),
+                brightness_scale,
+            )
+        } else {
+            let rgba = override_rgba
+                .unwrap_or_else(|| compute_planned_segment_color(seg, planned, color_mode, config));
+            let lin = scale_srgba_to_linear(rgba, brightness_scale);
+            (lin, None, lin)
+        };
 
     let base_ring_start = positions.len() as u32;
+    let mut ring_count = 0u32;
 
-    for (p, frame) in [(seg.p0_local, frame0), (seg.p1_local, frame1)] {
-        let v_top = p + frame.nozzle_axis * half_h;
-        let v_right = p + frame.lateral_axis * half_w;
-        let v_bottom = p - frame.nozzle_axis * half_h;
-        let v_left = p - frame.lateral_axis * half_w;
+    push_fast_bead_ring(
+        seg.p0_local,
+        frame0,
+        half_w,
+        half_h,
+        c0,
+        positions,
+        normals,
+        colors,
+    );
+    ring_count += 1;
 
-        positions.push(v_top.to_array());
-        normals.push(frame.nozzle_axis.to_array());
-        colors.push(linear_rgba);
-
-        positions.push(v_right.to_array());
-        normals.push(frame.lateral_axis.to_array());
-        colors.push(linear_rgba);
-
-        positions.push(v_bottom.to_array());
-        normals.push((-frame.nozzle_axis).to_array());
-        colors.push(linear_rgba);
-
-        positions.push(v_left.to_array());
-        normals.push((-frame.lateral_axis).to_array());
-        colors.push(linear_rgba);
+    if let Some(cm) = cm_opt {
+        let pm = 0.5 * (seg.p0_local + seg.p1_local);
+        let nm = (n0 + n1).try_normalize().unwrap_or(n0);
+        let frame_m = NozzleFrame::from_nozzle_and_travel(nm, raw_travel);
+        push_fast_bead_ring(pm, frame_m, half_w, half_h, cm, positions, normals, colors);
+        ring_count += 1;
     }
 
-    let r0 = base_ring_start;
-    let r1 = base_ring_start + 4;
-    for k in 0..4u32 {
-        let k_next = (k + 1) % 4;
-        let a0 = r0 + k;
-        let a1 = r0 + k_next;
-        let b0 = r1 + k;
-        let b1 = r1 + k_next;
-        indices.extend_from_slice(&[a0, b0, b1, a0, b1, a1]);
+    push_fast_bead_ring(
+        seg.p1_local,
+        frame1,
+        half_w,
+        half_h,
+        c1,
+        positions,
+        normals,
+        colors,
+    );
+    ring_count += 1;
+
+    let r_first = base_ring_start;
+    indices.extend_from_slice(&[r_first, r_first + 2, r_first + 1, r_first, r_first + 3, r_first + 2]);
+    for ri in 0..(ring_count - 1) {
+        let r0 = base_ring_start + ri * 4;
+        let r1 = r0 + 4;
+        for k in 0..4u32 {
+            let k_next = (k + 1) % 4;
+            let a0 = r0 + k;
+            let a1 = r0 + k_next;
+            let b0 = r1 + k;
+            let b1 = r1 + k_next;
+            indices.extend_from_slice(&[a0, b0, b1, a0, b1, a1]);
+        }
     }
-    // End caps
-    indices.extend_from_slice(&[r0, r0 + 2, r0 + 1, r0, r0 + 3, r0 + 2]);
-    indices.extend_from_slice(&[r1, r1 + 1, r1 + 2, r1, r1 + 2, r1 + 3]);
+    let r_last = base_ring_start + (ring_count - 1) * 4;
+    indices.extend_from_slice(&[r_last, r_last + 1, r_last + 2, r_last, r_last + 2, r_last + 3]);
 }
 
 /// Converts a single sRGB channel ($[0, 1]$) into Linear RGB ($[0, 1]$) for `Mesh::ATTRIBUTE_COLOR`.
@@ -4366,6 +4610,7 @@ fn compute_planned_segment_color(
                 seg.width_mm,
                 seg.tool_iso_angle_deg,
                 seg.uses_surface_normal,
+                seg.sdf_mm,
                 ToolpathColorMode::ByFeatureType,
                 config,
             ),
@@ -4440,6 +4685,10 @@ fn compute_planned_segment_color(
                 [0.24, 0.52, 0.92, 1.0] // Cool sapphire blue: Isosurface Normal (Interior / Other)
             }
         }
+        ToolpathColorMode::ByNozzleSdf => sample_nozzle_sdf_rgba(
+            seg.sdf_mm,
+            nozzle_sdf_reference_layer_height_mm(config),
+        ),
     }
 }
 
@@ -4508,43 +4757,29 @@ fn append_extrusion_path_bead_mesh(
             ((0.48 * pt.width_mm).max(0.03), (0.42 * pt.height_mm).max(0.02))
         };
 
-        // 4-sided cross-section ring in local (lateral_axis, nozzle_axis):
-        // 0: top (+z_nozzle), 1: right (+y_nozzle), 2: bottom (-z_nozzle), 3: left (-y_nozzle)
-        let v_top = p_curr + frame.nozzle_axis * half_h;
-        let v_right = p_curr + frame.lateral_axis * half_w;
-        let v_bottom = p_curr - frame.nozzle_axis * half_h;
-        let v_left = p_curr - frame.lateral_axis * half_w;
-
-        let mut rgba = compute_toolpath_point_color(
+        let rgba = compute_toolpath_point_color(
             path.feature_kind,
             path.wall_index,
             path.filament_slot,
             pt.width_mm,
             pt.tool_iso_angle_deg,
             pt.uses_surface_normal,
+            pt.sdf_mm,
             color_mode,
             config,
         );
-        rgba[0] = (rgba[0] * brightness_scale).clamp(0.0, 1.0);
-        rgba[1] = (rgba[1] * brightness_scale).clamp(0.0, 1.0);
-        rgba[2] = (rgba[2] * brightness_scale).clamp(0.0, 1.0);
-        let linear_rgba = srgba_to_linear_rgba(rgba);
+        let linear_rgba = scale_srgba_to_linear(rgba, brightness_scale);
 
-        positions.push(v_top.to_array());
-        normals.push(frame.nozzle_axis.to_array());
-        colors.push(linear_rgba);
-
-        positions.push(v_right.to_array());
-        normals.push(frame.lateral_axis.to_array());
-        colors.push(linear_rgba);
-
-        positions.push(v_bottom.to_array());
-        normals.push((-frame.nozzle_axis).to_array());
-        colors.push(linear_rgba);
-
-        positions.push(v_left.to_array());
-        normals.push((-frame.lateral_axis).to_array());
-        colors.push(linear_rgba);
+        push_fast_bead_ring(
+            p_curr,
+            frame,
+            half_w,
+            half_h,
+            linear_rgba,
+            positions,
+            normals,
+            colors,
+        );
     }
 
     for s in 0..emit_seg_count {
@@ -4790,17 +5025,26 @@ fn build_hq_planned_toolpaths_buckets(
                 };
                 let is_circ = seg.kind == crate::gcode::PlannedMoveKind::Bridge;
 
-                let mut rgba = opt_ref
-                    .get(idx)
-                    .and_then(|lc| lc.get(seg_i))
-                    .copied()
-                    .unwrap_or_else(|| {
-                        compute_planned_segment_color(seg, planned, color_mode, config)
-                    });
-                rgba[0] = (rgba[0] * dim_factor).clamp(0.0, 1.0);
-                rgba[1] = (rgba[1] * dim_factor).clamp(0.0, 1.0);
-                rgba[2] = (rgba[2] * dim_factor).clamp(0.0, 1.0);
-                let lin_rgba = srgba_to_linear_rgba(rgba);
+                let (c0, cm_opt, c1) =
+                    if color_mode == ToolpathColorMode::ByNozzleSdf && opt_ref.is_empty() {
+                        nozzle_sdf_segment_linear_colors(
+                            seg.sdf_mm_0,
+                            seg.sdf_mm,
+                            seg.sdf_mm_1,
+                            nozzle_sdf_reference_layer_height_mm(config),
+                            dim_factor,
+                        )
+                    } else {
+                        let rgba = opt_ref
+                            .get(idx)
+                            .and_then(|lc| lc.get(seg_i))
+                            .copied()
+                            .unwrap_or_else(|| {
+                                compute_planned_segment_color(seg, planned, color_mode, config)
+                            });
+                        let lin = scale_srgba_to_linear(rgba, dim_factor);
+                        (lin, None, lin)
+                    };
 
                 let n0 = seg.nozzle_local_0.try_normalize().unwrap_or(fallback_nozzle);
                 let n1 = seg.nozzle_local_1.try_normalize().unwrap_or(n0);
@@ -4822,7 +5066,17 @@ fn build_hq_planned_toolpaths_buckets(
                         nozzle_axis: n0,
                         width_mm: w_eff,
                         height_mm: h_eff,
-                        linear_rgba: lin_rgba,
+                        linear_rgba: c0,
+                        is_circular: is_circ,
+                    });
+                }
+                if let Some(cm) = cm_opt {
+                    chain.push(HqChainNode {
+                        pos: 0.5 * (seg.p0_local + seg.p1_local),
+                        nozzle_axis: (n0 + n1).try_normalize().unwrap_or(n0),
+                        width_mm: w_eff,
+                        height_mm: h_eff,
+                        linear_rgba: cm,
                         is_circular: is_circ,
                     });
                 }
@@ -4831,7 +5085,7 @@ fn build_hq_planned_toolpaths_buckets(
                     nozzle_axis: n1,
                     width_mm: w_eff,
                     height_mm: h_eff,
-                    linear_rgba: lin_rgba,
+                    linear_rgba: c1,
                     is_circular: is_circ,
                 });
             }
@@ -4949,19 +5203,17 @@ fn build_hq_raw_toolpaths_buckets(
             chain.reserve(total_nodes);
             for step in 0..total_nodes {
                 let pt = &path.points[step % n];
-                let mut rgba = compute_toolpath_point_color(
+                let rgba = compute_toolpath_point_color(
                     path.feature_kind,
                     path.wall_index,
                     path.filament_slot,
                     pt.width_mm,
                     pt.tool_iso_angle_deg,
                     pt.uses_surface_normal,
+                    pt.sdf_mm,
                     color_mode,
                     config,
                 );
-                rgba[0] = (rgba[0] * dim_factor).clamp(0.0, 1.0);
-                rgba[1] = (rgba[1] * dim_factor).clamp(0.0, 1.0);
-                rgba[2] = (rgba[2] * dim_factor).clamp(0.0, 1.0);
                 chain.push(HqChainNode {
                     pos: Vec3::new(pt.x, pt.y, pt.z),
                     nozzle_axis: Vec3::new(pt.nx, pt.ny, pt.nz)
@@ -4969,7 +5221,7 @@ fn build_hq_raw_toolpaths_buckets(
                         .unwrap_or(fallback_nozzle),
                     width_mm: pt.width_mm.max(0.06),
                     height_mm: pt.height_mm.max(0.04),
-                    linear_rgba: srgba_to_linear_rgba(rgba),
+                    linear_rgba: scale_srgba_to_linear(rgba, dim_factor),
                     is_circular: path.feature_kind == 5,
                 });
             }
@@ -5214,6 +5466,7 @@ fn compute_toolpath_point_color(
     width_mm: f32,
     tool_iso_angle_deg: f32,
     uses_surface_normal: bool,
+    sdf_mm: f32,
     mode: ToolpathColorMode,
     config: &SlicerConfig,
 ) -> [f32; 4] {
@@ -5262,6 +5515,10 @@ fn compute_toolpath_point_color(
                 [0.24, 0.52, 0.92, 1.0] // Cool sapphire blue: Isosurface Normal (Interior / Other)
             }
         }
+        ToolpathColorMode::ByNozzleSdf => sample_nozzle_sdf_rgba(
+            sdf_mm,
+            nozzle_sdf_reference_layer_height_mm(config),
+        ),
         ToolpathColorMode::ByLineWidth | _ => {
             let spec = match feature_kind {
                 0 | 6 => config.slicing.outer_wall_width,
@@ -10529,6 +10786,9 @@ mod tests {
                 unretract_after_mm: 0.0,
                 tool_iso_angle_deg: 0.0,
                 uses_surface_normal: false,
+                sdf_mm_0: 0.0,
+                sdf_mm: 0.0,
+                sdf_mm_1: 0.0,
             }
         };
 
@@ -10621,6 +10881,8 @@ mod tests {
             max_pressure_mm3s: 6.7,
             min_tool_iso_angle_deg: 0.0,
             max_tool_iso_angle_deg: 30.0,
+            min_sdf_mm: -2.0,
+            max_sdf_mm: 0.5,
         };
 
         let mut vis = FieldVisualizationState::default();
@@ -11569,6 +11831,375 @@ mod tests {
                 }
             }
         }
+
+        let _ = ffi::remove_cad_object(part.object_id);
+    }
+
+    #[test]
+    fn test_nozzle_sdf_extrusion_visualization_and_sampling() {
+        // 1. Verify layer-height reference, signed transfer curve, non-finite guards & near-zero contrast
+        let mut ref_cfg = SlicerConfig::default();
+        ref_cfg.slicing.layer_height.min_mm = 0.08;
+        ref_cfg.slicing.layer_height.max_mm = 0.35;
+        ref_cfg.slicing.layer_height.target_mm = 0.20;
+        let h_ref = nozzle_sdf_reference_layer_height_mm(&ref_cfg);
+        assert!((h_ref - 0.20).abs() < 1.0e-6);
+        ref_cfg.slicing.layer_height.target_mm = 0.50;
+        assert!((nozzle_sdf_reference_layer_height_mm(&ref_cfg) - 0.35).abs() < 1.0e-6);
+        ref_cfg.slicing.layer_height.target_mm = f32::NAN;
+        assert!(nozzle_sdf_reference_layer_height_mm(&ref_cfg).is_finite());
+
+        assert_eq!(nozzle_sdf_signed_t(f32::NAN, 0.20), 0.0);
+        assert_eq!(nozzle_sdf_signed_t(0.0, 0.20), 0.0);
+        assert!((nozzle_sdf_signed_t(0.05, 0.20) - (1.0 / 3.0)).abs() < 1.0e-5);
+        assert!((nozzle_sdf_signed_t(-0.05, 0.20) + (1.0 / 3.0)).abs() < 1.0e-5);
+        assert!((nozzle_sdf_signed_t(0.10, 0.20) - 0.5).abs() < 1.0e-5);
+        assert!((nozzle_sdf_signed_t(-0.10, 0.20) + 0.5).abs() < 1.0e-5);
+        assert!((nozzle_sdf_signed_t(0.20, 0.20) - (2.0 / 3.0)).abs() < 1.0e-5);
+        assert!((nozzle_sdf_signed_t(-0.20, 0.20) + (2.0 / 3.0)).abs() < 1.0e-5);
+        assert!(nozzle_sdf_signed_t(-0.40, 0.20) < nozzle_sdf_signed_t(-0.20, 0.20));
+        assert!(nozzle_sdf_signed_t(0.40, 0.20) > nozzle_sdf_signed_t(0.20, 0.20));
+
+        let c_nan = sample_nozzle_sdf_rgba(f32::NAN, 0.20);
+        assert!(c_nan.iter().all(|c| c.is_finite()));
+        let c_t_nan = sample_nozzle_sdf_rgba_for_signed_t(f32::NAN);
+        assert!(c_t_nan.iter().all(|c| c.is_finite()));
+
+        let rgb_dist = |a: [f32; 4], b: [f32; 4]| -> f32 {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        };
+
+        let c_surf = sample_nozzle_sdf_rgba(0.0, 0.20);
+        assert!(
+            c_surf[0] > 0.90 && c_surf[1] > 0.90 && c_surf[2] > 0.90,
+            "Surface (sdf=0) should be crisp white, got {:?}",
+            c_surf
+        );
+        let c_qtr_in = sample_nozzle_sdf_rgba(-0.05, 0.20);
+        let c_qtr_out = sample_nozzle_sdf_rgba(0.05, 0.20);
+        let c_one_in = sample_nozzle_sdf_rgba(-0.20, 0.20);
+        let c_one_out = sample_nozzle_sdf_rgba(0.20, 0.20);
+        let c_deep_in = sample_nozzle_sdf_rgba(-2.0, 0.20);
+        let c_deep_out = sample_nozzle_sdf_rgba(2.0, 0.20);
+
+        assert!(
+            rgb_dist(c_qtr_in, c_surf) > 0.80,
+            "-h/4 (-0.05 mm) should strongly contrast with surface white: {:?} vs {:?}",
+            c_qtr_in,
+            c_surf
+        );
+        assert!(
+            rgb_dist(c_qtr_out, c_surf) > 0.80,
+            "+h/4 (+0.05 mm) should strongly contrast with surface white: {:?} vs {:?}",
+            c_qtr_out,
+            c_surf
+        );
+        assert!(rgb_dist(c_qtr_in, c_one_in) > 0.35);
+        assert!(rgb_dist(c_qtr_in, c_deep_in) > 0.80);
+        assert!(rgb_dist(c_qtr_out, c_one_out) > 0.35);
+        assert!(rgb_dist(c_qtr_out, c_deep_out) > 0.80);
+        assert!(
+            c_one_in[2] > c_one_in[0] + 0.25,
+            "Inside solid (sdf<0) should be cool cyan/blue/indigo, got {:?}",
+            c_one_in
+        );
+        assert!(
+            c_one_out[0] > c_one_out[2] + 0.50,
+            "Outside solid (sdf>0) should be warm amber/crimson, got {:?}",
+            c_one_out
+        );
+
+        // 2. Register a 12x12x3 mm closed box, build SDF, and verify backend + toolpath + planned SDF
+        let hx = 6.0f32;
+        let hy = 6.0f32;
+        let z0 = 0.0f32;
+        let z1 = 3.0f32;
+        let verts = [
+            [-hx, -hy, z0],
+            [hx, -hy, z0],
+            [hx, hy, z0],
+            [-hx, hy, z0],
+            [-hx, -hy, z1],
+            [hx, -hy, z1],
+            [hx, hy, z1],
+            [-hx, hy, z1],
+        ];
+        let tris: &[[u32; 3]] = &[
+            [0, 2, 1],
+            [0, 3, 2], // bottom -Z
+            [4, 5, 6],
+            [4, 6, 7], // top +Z
+            [0, 1, 5],
+            [0, 5, 4], // front -Y
+            [1, 2, 6],
+            [1, 6, 5], // right +X
+            [2, 3, 7],
+            [2, 7, 6], // back +Y
+            [3, 0, 4],
+            [3, 4, 7], // left -X
+        ];
+        let mut pos_flat = Vec::with_capacity(verts.len() * 3);
+        for v in &verts {
+            pos_flat.extend_from_slice(v);
+        }
+        let mut idx_flat = Vec::with_capacity(tris.len() * 3);
+        for t in tris {
+            idx_flat.extend_from_slice(t);
+        }
+
+        let part = ffi::register_triangle_mesh("NozzleSdfBox", &pos_flat, &idx_flat);
+        assert!(part.object_id > 0);
+
+        let mut cfg = SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.eikonal.voxel_size_mm = 0.25;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.30;
+        cfg.slicing.layer_height.min_mm = 0.20;
+        cfg.slicing.layer_height.max_mm = 0.40;
+        cfg.slicing.layer_height.first_layer_mm = 0.30;
+        cfg.slicing.shell_thickness_mm = 1.60;
+        cfg.slicing.inner_wall_count = 2;
+        cfg.slicing.enable_support_generation = false;
+        cfg.slicing.enable_auto_conformal_skin = false;
+
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.25, 4.0));
+
+        // Direct SDF batch query: interior vs surface vs outside
+        let sampled = ffi::sample_object_sdf(
+            part.object_id,
+            &[0.0, 0.0, 1.5, 0.0, 0.0, 3.0, 0.0, 0.0, 4.0],
+        );
+        assert_eq!(sampled.len(), 3);
+        assert!(
+            sampled[0] < -1.0,
+            "Box interior SDF expected < -1.0, got {}",
+            sampled[0]
+        );
+        assert!(
+            sampled[1].abs() < 0.15,
+            "Box top surface SDF expected near 0, got {}",
+            sampled[1]
+        );
+        assert!(
+            sampled[2] > 0.85,
+            "Outside point SDF expected > 0.85, got {}",
+            sampled[2]
+        );
+
+        let layers_res = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+        assert!(layers_res.valid);
+        let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp.valid && !tp.layers.is_empty());
+
+        let mut outer_sdfs = Vec::new();
+        let mut deep_sdfs = Vec::new();
+        for layer in &tp.layers {
+            for path in &layer.paths {
+                for pt in &path.points {
+                    assert!(pt.sdf_mm.is_finite());
+                    if path.feature_kind == 0 {
+                        outer_sdfs.push(pt.sdf_mm);
+                    } else if path.feature_kind == 1 || path.feature_kind == 4 {
+                        deep_sdfs.push(pt.sdf_mm);
+                    }
+                }
+            }
+        }
+        assert!(!outer_sdfs.is_empty() && !deep_sdfs.is_empty());
+        let mean_outer = outer_sdfs.iter().sum::<f32>() / outer_sdfs.len() as f32;
+        let min_deep = deep_sdfs.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(
+            mean_outer < -0.05 && mean_outer > -0.60,
+            "OuterWall mean SDF should sit near -0.5*W inside CAD, got {}",
+            mean_outer
+        );
+        assert!(
+            min_deep < mean_outer - 0.15,
+            "InnerWall/Infill should sample deeper negative SDF ({}) than OuterWall ({})",
+            min_deep,
+            mean_outer
+        );
+
+        // 3. Plan G-code, refresh exact OpenVDB nozzle SDF, and test Fast + HQ + Scrubbing
+        let mut planned = crate::gcode::plan_and_emit_gcode_for_object_with_progress(
+            "NozzleSdfBox",
+            part.object_id,
+            &tp,
+            Transform::IDENTITY,
+            &cfg,
+            None,
+        );
+        crate::gcode::refresh_planned_gcode_nozzle_sdf(&mut planned, |xyz| {
+            ffi::sample_object_sdf(part.object_id, xyz)
+        });
+        assert!(planned.min_sdf_mm.is_finite() && planned.max_sdf_mm.is_finite());
+        assert!(
+            planned.min_sdf_mm < -0.4,
+            "Expected deep negative planned min_sdf_mm, got {}",
+            planned.min_sdf_mm
+        );
+
+        let mut vis = FieldVisualizationState::default();
+        vis.show_toolpaths = true;
+        vis.toolpath_color_mode = ToolpathColorMode::ByNozzleSdf;
+        vis.selected_layer_min_idx = 0;
+        vis.selected_layer_max_idx = planned.layers.len().saturating_sub(1);
+        vis.cached_planned_gcode = Some(planned);
+
+        // Build Fast and HQ meshes
+        let BuiltToolpathGeometry::Fast {
+            positions: fast_pos,
+            colors: fast_colors,
+            ..
+        } = vis.toolpath_mesh_filter().build_geometry(
+            vis.cached_planned_gcode.as_ref(),
+            None,
+            &cfg,
+        )
+        else {
+            panic!("Expected BuiltToolpathGeometry::Fast");
+        };
+        assert!(!fast_pos.is_empty() && fast_colors.len() == fast_pos.len());
+        let first_c = fast_colors[0];
+        assert!(
+            fast_colors
+                .iter()
+                .any(|c| (c[0] - first_c[0]).abs() > 1.0e-3 || (c[2] - first_c[2]).abs() > 1.0e-3),
+            "Fast ByNozzleSdf mesh should exhibit varying per-vertex SDF colors"
+        );
+
+        vis.toolpath_quality_mode = ToolpathQualityMode::HighQualityPbr;
+        let BuiltToolpathGeometry::HighQualityPbr(hq_buckets) = vis
+            .toolpath_mesh_filter()
+            .build_geometry(vis.cached_planned_gcode.as_ref(), None, &cfg)
+        else {
+            panic!("Expected BuiltToolpathGeometry::HighQualityPbr");
+        };
+        assert!(!hq_buckets.is_empty() && !hq_buckets[0].positions.is_empty());
+
+        // Zero-crossing midpoint ring split test (-0.5 -> 0.0 -> +0.5 should emit 3 rings = 12 verts)
+        let cross_seg = crate::gcode::PlannedSegment {
+            p0_local: Vec3::new(0.0, 0.0, 1.0),
+            p1_local: Vec3::new(4.0, 0.0, 1.0),
+            p0_bed: Vec3::new(0.0, 0.0, 1.0),
+            p1_bed: Vec3::new(4.0, 0.0, 1.0),
+            nozzle_local_0: Vec3::Z,
+            nozzle_local_1: Vec3::Z,
+            nozzle_bed_0: Vec3::Z,
+            nozzle_bed_1: Vec3::Z,
+            b0_deg: 0.0,
+            c0_deg: 0.0,
+            b1_deg: 0.0,
+            c1_deg: 0.0,
+            kind: crate::gcode::PlannedMoveKind::OuterWall,
+            tool_id: 0,
+            filament_slot: 0,
+            wall_index: 0,
+            width_mm: 0.42,
+            height_mm: 0.30,
+            length_mm: 4.0,
+            nominal_speed_mms: 60.0,
+            entry_speed_mms: 60.0,
+            cruise_speed_mms: 60.0,
+            exit_speed_mms: 60.0,
+            accel_mms2: 1500.0,
+            duration_s: 0.06,
+            delta_e_mm: 0.2,
+            volumetric_flow_mm3s: 7.5,
+            extrusion_multiplier: 1.0,
+            pressure_advance_s: 0.02,
+            melt_pressure_mm3s: 7.5,
+            retract_before_mm: 0.0,
+            unretract_after_mm: 0.0,
+            tool_iso_angle_deg: 0.0,
+            uses_surface_normal: false,
+            sdf_mm_0: -0.5,
+            sdf_mm: 0.0,
+            sdf_mm_1: 0.5,
+        };
+        let mut seg_pos = Vec::new();
+        let mut seg_nrm = Vec::new();
+        let mut seg_col = Vec::new();
+        let mut seg_ind = Vec::new();
+        append_planned_segment_bead_mesh(
+            &cross_seg,
+            vis.cached_planned_gcode.as_ref().unwrap(),
+            ToolpathColorMode::ByNozzleSdf,
+            None,
+            &cfg,
+            1.0,
+            &mut seg_pos,
+            &mut seg_nrm,
+            &mut seg_col,
+            &mut seg_ind,
+        );
+        assert_eq!(
+            seg_pos.len(),
+            12,
+            "Zero-crossing segment should insert a midpoint ring (3 rings * 4 = 12 verts)"
+        );
+
+        // Same-side non-linear near-zero transition (-h -> -h/2 -> 0) also splits (3 rings = 12 verts)
+        let mut same_side_seg = cross_seg.clone();
+        same_side_seg.sdf_mm_0 = -0.30;
+        same_side_seg.sdf_mm = -0.15;
+        same_side_seg.sdf_mm_1 = 0.0;
+        seg_pos.clear();
+        seg_nrm.clear();
+        seg_col.clear();
+        seg_ind.clear();
+        append_planned_segment_bead_mesh(
+            &same_side_seg,
+            vis.cached_planned_gcode.as_ref().unwrap(),
+            ToolpathColorMode::ByNozzleSdf,
+            None,
+            &cfg,
+            1.0,
+            &mut seg_pos,
+            &mut seg_nrm,
+            &mut seg_col,
+            &mut seg_ind,
+        );
+        assert_eq!(
+            seg_pos.len(),
+            12,
+            "Single-sided non-linear gradient (-h -> -h/2 -> 0) should split with midpoint ring"
+        );
+
+        // Constant deep-interior SDF segment does not need midpoint ring (2 rings = 8 verts)
+        let mut flat_seg = cross_seg;
+        flat_seg.sdf_mm_0 = -1.5;
+        flat_seg.sdf_mm = -1.5;
+        flat_seg.sdf_mm_1 = -1.5;
+        seg_pos.clear();
+        seg_nrm.clear();
+        seg_col.clear();
+        seg_ind.clear();
+        append_planned_segment_bead_mesh(
+            &flat_seg,
+            vis.cached_planned_gcode.as_ref().unwrap(),
+            ToolpathColorMode::ByNozzleSdf,
+            None,
+            &cfg,
+            1.0,
+            &mut seg_pos,
+            &mut seg_nrm,
+            &mut seg_col,
+            &mut seg_ind,
+        );
+        assert_eq!(
+            seg_pos.len(),
+            8,
+            "Constant-SDF segment should not add an unnecessary midpoint ring"
+        );
+
+        // Verify scrubbed toolhead pose reports endpoint sdf_mm
+        let pose = vis
+            .compute_active_scrub_pose(&cfg, Transform::IDENTITY)
+            .expect("Expected valid scrub pose");
+        assert!(pose.sdf_mm.is_finite() && pose.sdf_mm <= 0.1);
 
         let _ = ffi::remove_cad_object(part.object_id);
     }

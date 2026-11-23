@@ -1406,6 +1406,7 @@ fn interpolate_point(a: &ToolpathPoint, b: &ToolpathPoint, t: f32) -> ToolpathPo
         } else {
             b.uses_surface_normal
         },
+        sdf_mm: a.sdf_mm + u * (b.sdf_mm - a.sdf_mm),
     }
 }
 

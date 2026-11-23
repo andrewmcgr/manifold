@@ -121,6 +121,14 @@ public:
         const float* pointsXyz,
         std::size_t floatCount) const;
 
+    /// Batch-samples signed distance \phi_sdf(x) (mm; negative inside solid, 0 on surface,
+    /// positive outside) across dual-grid fine/coarse OpenVDB SDF grids at `pointsXyz`
+    /// (`3 * N` floats in object-local coordinates).
+    std::vector<float> sampleObjectSdf(
+        std::uint64_t objectId,
+        const float* pointsXyz,
+        std::size_t floatCount) const;
+
     /// Returns the solved 3D unit tool axis (`3 * vertexBuffer.size()` floats `[ax, ay, az, ...]`)
     /// sampled at each surface vertex of `objectId` from `toolAxisGrid` (or empty if unavailable).
     std::vector<float> objectVertexToolAxes(std::uint64_t objectId) const;
@@ -296,6 +304,9 @@ void set_object_triangle_colors_rgba(
     rust::Slice<const std::uint32_t> triangle_rgba);
 rust::Vec<std::uint32_t> get_object_triangle_colors_rgba(std::uint64_t object_id);
 rust::Vec<SurfaceOpticalSample> sample_object_surface_optics(
+    std::uint64_t object_id,
+    rust::Slice<const float> points_xyz);
+rust::Vec<float> sample_object_sdf(
     std::uint64_t object_id,
     rust::Slice<const float> points_xyz);
 rust::Vec<float> get_object_vertex_tool_axes(std::uint64_t object_id);

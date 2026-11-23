@@ -180,6 +180,10 @@ pub struct PlannedSegment {
     pub tool_iso_angle_deg: f32,
     /// `true` when the nozzle axis on this segment was actively oriented using the outward object surface normal $\nabla \phi_{\text{sdf}}$.
     pub uses_surface_normal: bool,
+    /// Signed distance $\phi_{\text{sdf}}$ (mm; negative inside solid, `0` on surface, positive outside) at `p0`, midpoint, and `p1`.
+    pub sdf_mm_0: f32,
+    pub sdf_mm: f32,
+    pub sdf_mm_1: f32,
 }
 
 /// Planned segments for a single non-planar slicing layer $S_k$.
@@ -229,6 +233,8 @@ pub struct PlannedGcodeResult {
     pub max_height_mm: f32,
     pub min_tool_iso_angle_deg: f32,
     pub max_tool_iso_angle_deg: f32,
+    pub min_sdf_mm: f32,
+    pub max_sdf_mm: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -241,6 +247,7 @@ struct WorkingVertex {
     kind_override: Option<PlannedMoveKind>,
     tool_iso_angle_deg: f32,
     uses_surface_normal: bool,
+    sdf_mm: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -1420,6 +1427,7 @@ fn sample_closed_loop_at_arc_length(pts: &[WorkingVertex], s_target: f32) -> Wor
                 } else {
                     b.uses_surface_normal
                 },
+                sdf_mm: a.sdf_mm + t * (b.sdf_mm - a.sdf_mm),
             };
         }
         accum += seg_len;
@@ -1661,6 +1669,7 @@ fn subdivide_long_segments(pts: Vec<WorkingVertex>) -> Vec<WorkingVertex> {
                     } else {
                         b.uses_surface_normal
                     },
+                    sdf_mm: a.sdf_mm + t * (b.sdf_mm - a.sdf_mm),
                 });
             }
         }
@@ -2097,6 +2106,11 @@ fn subdivide_segments_for_slicer_pa(
             sub.delta_e_mm = base_de;
             sub.volumetric_flow_mm3s = q_sub;
             sub.pressure_advance_s = pa_sub;
+            let sub_s0 = seg.sdf_mm_0 + t0 * (seg.sdf_mm_1 - seg.sdf_mm_0);
+            let sub_s1 = seg.sdf_mm_0 + t1 * (seg.sdf_mm_1 - seg.sdf_mm_0);
+            sub.sdf_mm_0 = sub_s0;
+            sub.sdf_mm = 0.5 * (sub_s0 + sub_s1);
+            sub.sdf_mm_1 = sub_s1;
             if k > 0 {
                 sub.retract_before_mm = 0.0;
             }
@@ -3001,6 +3015,7 @@ fn generate_first_layer_brim_chains(
                     kind_override: None,
                     tool_iso_angle_deg: 0.0,
                     uses_surface_normal: false,
+                    sdf_mm: 0.0,
                 })
                 .collect();
             let mut wc = WorkingChain {
@@ -3651,6 +3666,7 @@ fn split_working_chain_at_volume(
                 tool_iso_angle_deg: a.tool_iso_angle_deg
                     + t * (b.tool_iso_angle_deg - a.tool_iso_angle_deg),
                 uses_surface_normal: a.uses_surface_normal && b.uses_surface_normal,
+                sdf_mm: a.sdf_mm + t * (b.sdf_mm - a.sdf_mm),
             };
 
             let mut head_pts = Vec::with_capacity(seg_idx + 2);
@@ -3709,6 +3725,7 @@ fn truncate_vertices_to_arc_length(pts: Vec<WorkingVertex>, max_arc_len_mm: f32)
                 kind_override: b.kind_override,
                 tool_iso_angle_deg: 0.0,
                 uses_surface_normal: false,
+                sdf_mm: a.sdf_mm + t * (b.sdf_mm - a.sdf_mm),
             });
             return out;
         }
@@ -3931,6 +3948,7 @@ impl NonPlanarPurgeTowerState {
                 kind_override: Some(PlannedMoveKind::PurgeTower),
                 tool_iso_angle_deg: 0.0,
                 uses_surface_normal: false,
+                sdf_mm: 0.0,
             });
         }
         verts
@@ -3992,6 +4010,7 @@ impl NonPlanarPurgeTowerState {
                     kind_override: Some(PlannedMoveKind::PurgeTower),
                     tool_iso_angle_deg: 0.0,
                     uses_surface_normal: false,
+                    sdf_mm: 0.0,
                 });
             }
             let brim_chain = WorkingChain {
@@ -4653,6 +4672,7 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                                 0.0
                             },
                             uses_surface_normal: pt.uses_surface_normal,
+                            sdf_mm: if pt.sdf_mm.is_finite() { pt.sdf_mm } else { 0.0 },
                         }
                     })
                     .collect();
@@ -4937,6 +4957,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                             unretract_after_mm: 0.0,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm_0: 0.0,
+                            sdf_mm: 0.0,
+                            sdf_mm_1: 0.0,
                         });
                     }
 
@@ -4989,6 +5012,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                             unretract_after_mm: 0.0,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm_0: 0.0,
+                            sdf_mm: 0.0,
+                            sdf_mm_1: 0.0,
                         });
 
                         let drop_dist = (chain_start_bed - p_above).length().max(1.0e-4);
@@ -5027,6 +5053,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                             unretract_after_mm: gcfg.retract_length_mm,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm_0: 0.0,
+                            sdf_mm: 0.0,
+                            sdf_mm_1: 0.0,
                         });
                     } else {
                         let direct_len = (chain_start_bed - post_tc_start_bed).length().max(1.0e-4);
@@ -5065,6 +5094,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                             unretract_after_mm: gcfg.retract_length_mm,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm_0: 0.0,
+                            sdf_mm: 0.0,
+                            sdf_mm_1: 0.0,
                         });
                     }
                 } else if travel_dist > 1.0e-3 {
@@ -5182,6 +5214,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                             unretract_after_mm: 0.0,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm_0: 0.0,
+                            sdf_mm: 0.0,
+                            sdf_mm_1: 0.0,
                         });
 
                         // 2. Elevated Travel Move
@@ -5221,6 +5256,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                             unretract_after_mm: 0.0,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm_0: 0.0,
+                            sdf_mm: 0.0,
+                            sdf_mm_1: 0.0,
                         });
 
                         // 3. Z-Hop Drop (carries `unretract_after_mm` marker)
@@ -5259,6 +5297,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                             unretract_after_mm: gcfg.retract_length_mm,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm_0: 0.0,
+                            sdf_mm: 0.0,
+                            sdf_mm_1: 0.0,
                         });
                     } else {
                         let r_len = if needs_retract {
@@ -5301,6 +5342,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                             unretract_after_mm: r_len,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm_0: 0.0,
+                            sdf_mm: 0.0,
+                            sdf_mm_1: 0.0,
                         });
                     }
                 }
@@ -5354,6 +5398,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                         unretract_after_mm: 0.0,
                         tool_iso_angle_deg: 0.0,
                         uses_surface_normal: false,
+                        sdf_mm_0: 0.0,
+                        sdf_mm: 0.0,
+                        sdf_mm_1: 0.0,
                     });
                 }
 
@@ -5404,6 +5451,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                         unretract_after_mm: 0.0,
                         tool_iso_angle_deg: 0.0,
                         uses_surface_normal: false,
+                        sdf_mm_0: 0.0,
+                        sdf_mm: 0.0,
+                        sdf_mm_1: 0.0,
                     });
                     let drop_dist = (chain_start_bed - p_above).length().max(1.0e-4);
                     layer_segments.push(PlannedSegment {
@@ -5441,6 +5491,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                         unretract_after_mm: init_unretract_after,
                         tool_iso_angle_deg: 0.0,
                         uses_surface_normal: false,
+                        sdf_mm_0: 0.0,
+                        sdf_mm: 0.0,
+                        sdf_mm_1: 0.0,
                     });
                 } else {
                     layer_segments.push(PlannedSegment {
@@ -5478,6 +5531,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                         unretract_after_mm: init_unretract_after,
                         tool_iso_angle_deg: 0.0,
                         uses_surface_normal: false,
+                        sdf_mm_0: 0.0,
+                        sdf_mm: 0.0,
+                        sdf_mm_1: 0.0,
                     });
                 }
             }
@@ -5678,6 +5734,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                         unretract_after_mm: 0.0,
                         tool_iso_angle_deg: 0.5 * (a.tool_iso_angle_deg + b.tool_iso_angle_deg),
                         uses_surface_normal: a.uses_surface_normal && b.uses_surface_normal,
+                        sdf_mm_0: a.sdf_mm,
+                        sdf_mm: 0.5 * (a.sdf_mm + b.sdf_mm),
+                        sdf_mm_1: b.sdf_mm,
                     });
                 } else {
                     layer_segments.push(PlannedSegment {
@@ -5715,6 +5774,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                         unretract_after_mm: 0.0,
                         tool_iso_angle_deg: 0.5 * (a.tool_iso_angle_deg + b.tool_iso_angle_deg),
                         uses_surface_normal: a.uses_surface_normal && b.uses_surface_normal,
+                        sdf_mm_0: a.sdf_mm,
+                        sdf_mm: 0.5 * (a.sdf_mm + b.sdf_mm),
+                        sdf_mm_1: b.sdf_mm,
                     });
                 }
             }
@@ -5946,6 +6008,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                 unretract_after_mm: 0.0,
                 tool_iso_angle_deg: last_ext.tool_iso_angle_deg,
                 uses_surface_normal: last_ext.uses_surface_normal,
+                sdf_mm_0: last_ext.sdf_mm_1,
+                sdf_mm: last_ext.sdf_mm_1,
+                sdf_mm_1: last_ext.sdf_mm_1,
             });
 
             last_layer.segments.push(PlannedSegment {
@@ -5983,6 +6048,9 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                 unretract_after_mm: 0.0,
                 tool_iso_angle_deg: 0.0,
                 uses_surface_normal: false,
+                sdf_mm_0: 0.0,
+                sdf_mm: 0.0,
+                sdf_mm_1: 0.0,
             });
         }
     }
@@ -6075,6 +6143,8 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
     let mut max_h = 0.0f32;
     let mut min_iso_angle = f32::MAX;
     let mut max_iso_angle = 0.0f32;
+    let mut min_sdf = f32::INFINITY;
+    let mut max_sdf = f32::NEG_INFINITY;
 
     let mut total_time_s_f64 = 0.0f64;
     let mut total_filament_mm_f64 = 0.0f64;
@@ -6526,6 +6596,7 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
                 max_h = max_h.max(seg.height_mm);
                 min_iso_angle = min_iso_angle.min(seg.tool_iso_angle_deg);
                 max_iso_angle = max_iso_angle.max(seg.tool_iso_angle_deg);
+                accumulate_segment_sdf_bounds(seg, &mut min_sdf, &mut max_sdf);
 
                 // Emit firmware PA update after toolchange or when dynamic PA shifts outside 8% deadband
                 if emitted_pa < 0.0
@@ -6805,6 +6876,10 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
         min_iso_angle = 0.0;
         max_iso_angle = 15.0;
     }
+    if !min_sdf.is_finite() || min_sdf > max_sdf {
+        min_sdf = -2.0;
+        max_sdf = 0.5;
+    }
 
     let total_time_s = total_time_s_f64 as f32;
     let total_filament_mm = total_filament_mm_f64 as f32;
@@ -6893,7 +6968,72 @@ pub fn plan_and_emit_gcode_for_object_with_progress(
         max_height_mm: max_h,
         min_tool_iso_angle_deg: min_iso_angle,
         max_tool_iso_angle_deg: max_iso_angle,
+        min_sdf_mm: min_sdf,
+        max_sdf_mm: max_sdf,
     }
+}
+
+/// Accumulates finite SDF bounds for part extrusions (excluding auxiliary purge towers and supports).
+#[inline]
+fn accumulate_segment_sdf_bounds(seg: &PlannedSegment, min_sdf: &mut f32, max_sdf: &mut f32) {
+    if seg.kind == PlannedMoveKind::PurgeTower || seg.kind.is_support() {
+        return;
+    }
+    for s in [seg.sdf_mm_0, seg.sdf_mm, seg.sdf_mm_1] {
+        if s.is_finite() {
+            *min_sdf = (*min_sdf).min(s);
+            *max_sdf = (*max_sdf).max(s);
+        }
+    }
+}
+
+/// Refreshes exact OpenVDB SDF values (`sdf_mm_0`, `sdf_mm`, `sdf_mm_1`) at every segment's
+/// object-local start, midpoint, and end coordinates using `sample_fn`, and updates
+/// `planned.min_sdf_mm` / `planned.max_sdf_mm`.
+pub fn refresh_planned_gcode_nozzle_sdf(
+    planned: &mut PlannedGcodeResult,
+    sample_fn: impl FnOnce(&[f32]) -> Vec<f32>,
+) {
+    let seg_count: usize = planned.layers.iter().map(|l| l.segments.len()).sum();
+    if seg_count == 0 {
+        return;
+    }
+    let mut flat_xyz: Vec<f32> = Vec::with_capacity(seg_count * 9);
+    for layer in &planned.layers {
+        for seg in &layer.segments {
+            let mid = 0.5 * (seg.p0_local + seg.p1_local);
+            flat_xyz.extend_from_slice(&seg.p0_local.to_array());
+            flat_xyz.extend_from_slice(&mid.to_array());
+            flat_xyz.extend_from_slice(&seg.p1_local.to_array());
+        }
+    }
+    let samples = sample_fn(&flat_xyz);
+    if samples.len() != seg_count * 3 {
+        return;
+    }
+    let mut idx = 0usize;
+    let mut min_sdf = f32::INFINITY;
+    let mut max_sdf = f32::NEG_INFINITY;
+    for layer in &mut planned.layers {
+        for seg in &mut layer.segments {
+            let s0 = samples[idx];
+            let sm = samples[idx + 1];
+            let s1 = samples[idx + 2];
+            idx += 3;
+            seg.sdf_mm_0 = if s0.is_finite() { s0 } else { 0.0 };
+            seg.sdf_mm = if sm.is_finite() { sm } else { 0.0 };
+            seg.sdf_mm_1 = if s1.is_finite() { s1 } else { 0.0 };
+            if seg.kind.is_extruding() && seg.delta_e_mm > 1.0e-6 {
+                accumulate_segment_sdf_bounds(seg, &mut min_sdf, &mut max_sdf);
+            }
+        }
+    }
+    if !min_sdf.is_finite() || min_sdf > max_sdf {
+        min_sdf = -2.0;
+        max_sdf = 0.5;
+    }
+    planned.min_sdf_mm = min_sdf;
+    planned.max_sdf_mm = max_sdf;
 }
 
 /// Combines one or more per-object `PlannedGcodeResult`s (with their scene `Transform`s) on a build
@@ -6943,6 +7083,8 @@ pub fn combine_planned_objects_into_plate_result(
             max_height_mm: 0.4,
             min_tool_iso_angle_deg: 0.0,
             max_tool_iso_angle_deg: 45.0,
+            min_sdf_mm: -2.0,
+            max_sdf_mm: 0.5,
         };
     }
 
@@ -7019,6 +7161,8 @@ pub fn combine_planned_objects_into_plate_result(
     let mut max_h = 0.0f32;
     let mut min_iso_angle = f32::MAX;
     let mut max_iso_angle = 0.0f32;
+    let mut min_sdf = f32::INFINITY;
+    let mut max_sdf = f32::NEG_INFINITY;
     let mut used_types: Vec<String> = Vec::new();
 
     for (_, p, obj_tf) in planned_objects {
@@ -7050,6 +7194,10 @@ pub fn combine_planned_objects_into_plate_result(
         max_h = max_h.max(p.max_height_mm);
         min_iso_angle = min_iso_angle.min(p.min_tool_iso_angle_deg);
         max_iso_angle = max_iso_angle.max(p.max_tool_iso_angle_deg);
+        if p.min_sdf_mm.is_finite() && p.max_sdf_mm.is_finite() && p.min_sdf_mm <= p.max_sdf_mm {
+            min_sdf = min_sdf.min(p.min_sdf_mm);
+            max_sdf = max_sdf.max(p.max_sdf_mm);
+        }
 
         for (l_idx, layer) in p.layers.iter().enumerate() {
             if merged_layers[l_idx].isovalue == 0.0 {
@@ -7205,6 +7353,11 @@ pub fn combine_planned_objects_into_plate_result(
         nozzle_temp_c,
     ));
 
+    if !min_sdf.is_finite() || min_sdf > max_sdf {
+        min_sdf = -2.0;
+        max_sdf = 0.5;
+    }
+
     let first_p = &planned_objects[0].1;
     PlannedGcodeResult {
         layers: merged_layers,
@@ -7240,6 +7393,8 @@ pub fn combine_planned_objects_into_plate_result(
         max_height_mm: max_h,
         min_tool_iso_angle_deg: min_iso_angle,
         max_tool_iso_angle_deg: max_iso_angle,
+        min_sdf_mm: min_sdf,
+        max_sdf_mm: max_sdf,
     }
 }
 
@@ -7260,6 +7415,7 @@ mod tests {
             height_mm: h,
             tool_iso_angle_deg: 0.0,
             uses_surface_normal: false,
+            sdf_mm: 0.0,
         }
     }
 
@@ -7483,6 +7639,7 @@ mod tests {
                             height_mm: h,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm: 0.0,
                         },
                         ToolpathPoint {
                             x: 0.0,
@@ -7495,6 +7652,7 @@ mod tests {
                             height_mm: h,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm: 0.0,
                         },
                         ToolpathPoint {
                             x: 20.0,
@@ -7507,6 +7665,7 @@ mod tests {
                             height_mm: h,
                             tool_iso_angle_deg: 0.0,
                             uses_surface_normal: false,
+                            sdf_mm: 0.0,
                         },
                     ],
                 }],
@@ -7885,6 +8044,7 @@ mod tests {
                     height_mm: 0.20,
                     tool_iso_angle_deg: 0.0,
                     uses_surface_normal: false,
+                    sdf_mm: 0.0,
                 },
                 ToolpathPoint {
                     x: 5.0,
@@ -7897,6 +8057,7 @@ mod tests {
                     height_mm: 0.20,
                     tool_iso_angle_deg: 0.0,
                     uses_surface_normal: false,
+                    sdf_mm: 0.0,
                 },
             ],
         };
@@ -7917,6 +8078,7 @@ mod tests {
                 height_mm: 0.20,
                 tool_iso_angle_deg: 0.0,
                 uses_surface_normal: false,
+                sdf_mm: 0.0,
             });
         }
         let cone_path = ExtrusionPath {
@@ -8326,6 +8488,7 @@ mod tests {
             height_mm: 0.20,
             tool_iso_angle_deg: 0.0,
             uses_surface_normal: false,
+            sdf_mm: 0.0,
         };
 
         // Layer 0 prints a tall crest at Z = 5.0 mm with Slot 0 (Tool 0).
@@ -9134,6 +9297,7 @@ mod tests {
                     height_mm: 0.20,
                     tool_iso_angle_deg: 0.0,
                     uses_surface_normal: false,
+                    sdf_mm: 0.0,
                 },
                 ToolpathPoint {
                     x: 10.0,
@@ -9146,6 +9310,7 @@ mod tests {
                     height_mm: 0.20,
                     tool_iso_angle_deg: 0.0,
                     uses_surface_normal: false,
+                    sdf_mm: 0.0,
                 },
             ],
         };
