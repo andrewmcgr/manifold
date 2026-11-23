@@ -5267,8 +5267,8 @@ fn finalize_hq_buckets(
 
 /// Emits a continuous welded 12-vertex pressed-stadium (capsule) extrusion chain in each node's
 /// local `NozzleFrame` $(\hat{\mathbf{x}}_{\text{travel}}, \hat{\mathbf{y}}_{\text{lateral}}, \hat{\mathbf{z}}_{\text{nozzle}})$
-/// (`AGENTS.md` Rule 1 — never assuming `+Z`), with bisecting mitered corner joints, smooth
-/// analytic meniscus normals, inter-layer micro-AO, and 3D convex bullnose endcaps.
+/// (`AGENTS.md` Rule 1 — never assuming `+Z`), splitting cleanly at self-intersecting / acute
+/// miter corners into rounded bullnose sub-chains so sharp U-turns never fold inside-out.
 fn append_hq_welded_chain_stadium_mesh(
     raw_nodes: &[HqChainNode],
     fallback_nozzle: Vec3,
@@ -5303,6 +5303,111 @@ fn append_hq_welded_chain_stadium_mesh(
         return;
     }
 
+    let hq_half_width = |nd: &HqChainNode| -> f32 {
+        if nd.is_circular {
+            0.5 * (std::f32::consts::FRAC_2_PI * 2.0 * nd.width_mm * nd.height_mm)
+                .sqrt()
+                .max(0.05)
+        } else {
+            (0.495 * nd.width_mm).max(0.028)
+        }
+    };
+
+    // Detect folding / self-intersecting acute miters so sharp turns split into capped sub-chains
+    let mut split_indices: Vec<usize> = Vec::new();
+    if n >= 3 {
+        for i in 0..n {
+            if !is_closed && (i == 0 || i + 1 == n) {
+                continue;
+            }
+            let prev_idx = (i + n - 1) % n;
+            let next_idx = (i + 1) % n;
+            let v_in = nodes[i].pos - nodes[prev_idx].pos;
+            let v_out = nodes[next_idx].pos - nodes[i].pos;
+            let len_in = v_in.length();
+            let len_out = v_out.length();
+            if len_in <= 1.0e-4 || len_out <= 1.0e-4 {
+                continue;
+            }
+            let z_noz = nodes[i].nozzle_axis.try_normalize().unwrap_or(fallback_nozzle);
+            let f_in = NozzleFrame::from_nozzle_and_travel(z_noz, v_in / len_in);
+            let f_out = NozzleFrame::from_nozzle_and_travel(z_noz, v_out / len_out);
+            let bisect_travel = (f_in.travel_axis + f_out.travel_axis)
+                .try_normalize()
+                .unwrap_or(f_out.travel_axis);
+            let f_mid = NozzleFrame::from_nozzle_and_travel(z_noz, bisect_travel);
+            let cos_half = f_mid.lateral_axis.dot(f_in.lateral_axis).abs().max(0.60);
+            let miter_scale = (1.0 / cos_half).clamp(1.0, 1.62);
+            let half_w = hq_half_width(&nodes[i]);
+            let proj_in = half_w * miter_scale * f_mid.lateral_axis.dot(f_in.travel_axis).abs();
+            let proj_out = half_w * miter_scale * f_mid.lateral_axis.dot(f_out.travel_axis).abs();
+            let turn_cos = f_in.travel_axis.dot(f_out.travel_axis);
+
+            if turn_cos < -0.15 || proj_in > 0.48 * len_in || proj_out > 0.48 * len_out {
+                split_indices.push(i);
+            }
+        }
+    }
+
+    if split_indices.is_empty() {
+        append_hq_welded_subchain_stadium_mesh(&nodes, is_closed, fallback_nozzle, acc);
+        return;
+    }
+
+    if is_closed {
+        let base = split_indices[0];
+        let mut rotated: Vec<HqChainNode> = Vec::with_capacity(n + 1);
+        rotated.extend_from_slice(&nodes[base..]);
+        rotated.extend_from_slice(&nodes[..base]);
+        rotated.push(nodes[base]);
+
+        let mut boundaries: Vec<usize> = Vec::with_capacity(split_indices.len() + 2);
+        boundaries.push(0);
+        for &s in split_indices.iter().skip(1) {
+            boundaries.push((s + n - base) % n);
+        }
+        boundaries.push(n);
+
+        for w in boundaries.windows(2) {
+            if w[1] > w[0] {
+                append_hq_welded_subchain_stadium_mesh(
+                    &rotated[w[0]..=w[1]],
+                    false,
+                    fallback_nozzle,
+                    acc,
+                );
+            }
+        }
+    } else {
+        let mut boundaries: Vec<usize> = Vec::with_capacity(split_indices.len() + 2);
+        boundaries.push(0);
+        boundaries.extend_from_slice(&split_indices);
+        boundaries.push(n - 1);
+
+        for w in boundaries.windows(2) {
+            if w[1] > w[0] {
+                append_hq_welded_subchain_stadium_mesh(
+                    &nodes[w[0]..=w[1]],
+                    false,
+                    fallback_nozzle,
+                    acc,
+                );
+            }
+        }
+    }
+}
+
+fn append_hq_welded_subchain_stadium_mesh(
+    nodes: &[HqChainNode],
+    is_closed: bool,
+    fallback_nozzle: Vec3,
+    acc: &mut HqBucketAccum,
+) {
+    let n = nodes.len();
+    if n < 2 || (is_closed && n < 3) {
+        return;
+    }
+
     // Precomputed stadium meniscus angles & micro-groove AO factors:
     // 0..6: right meniscus [-pi/2 .. +pi/2], 6..12: left meniscus [+pi/2 .. +3pi/2]
     const ANGLES_COS_SIN_SIDE_AO: [(f32, f32, f32, f32); HQ_RING_VERTS] = [
@@ -5329,8 +5434,8 @@ fn append_hq_welded_chain_stadium_mesh(
 
     let mut first_frame = NozzleFrame::from_nozzle_and_travel(fallback_nozzle, Vec3::X);
     let mut last_frame = first_frame;
-    let mut first_r = 0.10_f32;
-    let mut last_r = 0.10_f32;
+    let mut first_cap_ext = 0.04_f32;
+    let mut last_cap_ext = 0.04_f32;
 
     for i in 0..n {
         let nd = &nodes[i];
@@ -5382,11 +5487,11 @@ fn append_hq_welded_chain_stadium_mesh(
 
         if i == 0 {
             first_frame = frame;
-            first_r = b_vert;
+            first_cap_ext = 0.38 * b_vert.max(flat_a + r_lat);
         }
         if i + 1 == n {
             last_frame = frame;
-            last_r = b_vert;
+            last_cap_ext = 0.38 * b_vert.max(flat_a + r_lat);
         }
 
         acc.thickness_sum += 0.5 * ((nd.width_mm + nd.height_mm) as f64);
@@ -5430,7 +5535,7 @@ fn append_hq_welded_chain_stadium_mesh(
     if !is_closed {
         let n0 = &nodes[0];
         let start_apex_idx = acc.positions.len() as u32;
-        let start_apex_pos = n0.pos - first_frame.travel_axis * (0.38 * first_r);
+        let start_apex_pos = n0.pos - first_frame.travel_axis * first_cap_ext;
         acc.positions.push(start_apex_pos.to_array());
         acc.normals.push((-first_frame.travel_axis).to_array());
         acc.colors.push(n0.linear_rgba);
@@ -5444,7 +5549,7 @@ fn append_hq_welded_chain_stadium_mesh(
 
         let n_end = &nodes[n - 1];
         let end_apex_idx = acc.positions.len() as u32;
-        let end_apex_pos = n_end.pos + last_frame.travel_axis * (0.38 * last_r);
+        let end_apex_pos = n_end.pos + last_frame.travel_axis * last_cap_ext;
         acc.positions.push(end_apex_pos.to_array());
         acc.normals.push(last_frame.travel_axis.to_array());
         acc.colors.push(n_end.linear_rgba);
@@ -11837,6 +11942,7 @@ mod tests {
 
     #[test]
     fn test_nozzle_sdf_extrusion_visualization_and_sampling() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 1. Verify layer-height reference, signed transfer curve, non-finite guards & near-zero contrast
         let mut ref_cfg = SlicerConfig::default();
         ref_cfg.slicing.layer_height.min_mm = 0.08;
@@ -12202,6 +12308,387 @@ mod tests {
         assert!(pose.sdf_mm.is_finite() && pose.sdf_mm <= 0.1);
 
         let _ = ffi::remove_cad_object(part.object_id);
+        crate::ui::sync_config_to_backend(&SlicerConfig::default());
+    }
+
+    #[test]
+    fn test_hq_stadium_acute_hairpin_corner_splits_without_fold() {
+        // Use a non-Z tilted local nozzle frame (AGENTS.md Rule 1) and short acute segments
+        let z_noz = Vec3::new(0.25, -0.15, 0.95).normalize();
+        let frame = NozzleFrame::from_nozzle_and_travel(z_noz, Vec3::X);
+        let x_ax = frame.travel_axis;
+        let y_ax = frame.lateral_axis;
+        let origin = Vec3::new(1.0, 2.0, 3.0);
+
+        let p0 = origin;
+        let p1 = p0 + 1.5 * x_ax;
+        let p2 = p1 + 0.09 * x_ax;
+        let dir_back = (-0.7071 * x_ax + 0.7071 * y_ax).normalize();
+        let p3 = p2 + 0.15 * dir_back;
+        let p4 = p3 + 1.5 * dir_back;
+
+        let make_node = |pos: Vec3| HqChainNode {
+            pos,
+            nozzle_axis: z_noz,
+            width_mm: 0.40,
+            height_mm: 0.20,
+            linear_rgba: [0.2, 0.7, 0.95, 1.0],
+            is_circular: false,
+        };
+        let nodes = vec![
+            make_node(p0),
+            make_node(p1),
+            make_node(p2),
+            make_node(p3),
+            make_node(p4),
+        ];
+
+        let mut acc = HqBucketAccum::default();
+        append_hq_welded_chain_stadium_mesh(&nodes, z_noz, &mut acc);
+
+        assert!(!acc.positions.is_empty() && !acc.indices.is_empty());
+        assert!(
+            acc.positions.len() > nodes.len() * HQ_RING_VERTS + 2,
+            "Acute ~135° hairpin on short segments must split into capped sub-chains (got {} verts)",
+            acc.positions.len()
+        );
+        for p in &acc.positions {
+            assert!(p[0].is_finite() && p[1].is_finite() && p[2].is_finite());
+        }
+        for n in &acc.normals {
+            assert!(n[0].is_finite() && n[1].is_finite() && n[2].is_finite());
+        }
+        for tri in acc.indices.chunks_exact(3) {
+            let v0 = Vec3::from_array(acc.positions[tri[0] as usize]);
+            let v1 = Vec3::from_array(acc.positions[tri[1] as usize]);
+            let v2 = Vec3::from_array(acc.positions[tri[2] as usize]);
+            let face_n = (v1 - v0).cross(v2 - v0);
+            assert!(face_n.length() > 1.0e-7, "Degenerate triangle in split hairpin mesh");
+            let avg_n = Vec3::from_array(acc.normals[tri[0] as usize])
+                + Vec3::from_array(acc.normals[tri[1] as usize])
+                + Vec3::from_array(acc.normals[tri[2] as usize]);
+            assert!(
+                face_n.dot(avg_n) > 0.0,
+                "Hairpin miter split must produce strictly outward-wound triangles"
+            );
+        }
+    }
+
+    #[test]
+    fn test_concave_corner_sdf_not_filled_by_renormalization() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Watertight L-step bracket pre-centered at X=0, Y=0 so `recenterVertexBuffer` is identity:
+        // [-6,6]x[-4,4]x[0,4.10] U [-6,-0.10]x[-4,4]x[4.10,10], concave corner at x=-0.10, z=4.10
+        // (intentionally off the 0.25 mm voxel planes so voxel (0.0, 0.0, 4.25) has true SDF +0.10 mm).
+        let verts: &[[f32; 3]] = &[
+            [-6.0, -4.0, 0.0],  // 0
+            [6.0, -4.0, 0.0],   // 1
+            [6.0, -4.0, 4.10],  // 2
+            [-0.10, -4.0, 4.10], // 3 (concave corner)
+            [-0.10, -4.0, 10.0], // 4
+            [-6.0, -4.0, 10.0], // 5
+            [-6.0, 4.0, 0.0],   // 6
+            [6.0, 4.0, 0.0],    // 7
+            [6.0, 4.0, 4.10],   // 8
+            [-0.10, 4.0, 4.10], // 9 (concave corner)
+            [-0.10, 4.0, 10.0], // 10
+            [-6.0, 4.0, 10.0],  // 11
+        ];
+        let tris: &[[u32; 3]] = &[
+            // Front -Y
+            [0, 1, 2],
+            [0, 2, 3],
+            [0, 3, 4],
+            [0, 4, 5],
+            // Back +Y
+            [6, 8, 7],
+            [6, 9, 8],
+            [6, 10, 9],
+            [6, 11, 10],
+            // Bottom -Z
+            [0, 6, 7],
+            [0, 7, 1],
+            // Right lower +X
+            [1, 7, 8],
+            [1, 8, 2],
+            // Deck +Z
+            [2, 8, 9],
+            [2, 9, 3],
+            // Riser +X
+            [3, 9, 10],
+            [3, 10, 4],
+            // Top +Z
+            [4, 10, 11],
+            [4, 11, 5],
+            // Left -X
+            [5, 11, 6],
+            [5, 6, 0],
+        ];
+        let mut pos_flat = Vec::with_capacity(verts.len() * 3);
+        for v in verts {
+            pos_flat.extend_from_slice(v);
+        }
+        let mut idx_flat = Vec::with_capacity(tris.len() * 3);
+        for t in tris {
+            idx_flat.extend_from_slice(t);
+        }
+
+        let part = ffi::register_triangle_mesh("ConcaveLStep", &pos_flat, &idx_flat);
+        assert!(part.object_id > 0);
+
+        let mut cfg = SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.eikonal.voxel_size_mm = 0.25;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.20;
+        cfg.slicing.layer_height.min_mm = 0.16;
+        cfg.slicing.layer_height.max_mm = 0.24;
+        cfg.slicing.layer_height.first_layer_mm = 0.20;
+        cfg.slicing.enable_support_generation = false;
+        cfg.slicing.enable_auto_conformal_skin = false;
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.25, 4.0));
+
+        // 1. Exterior concave corner + adjacent interior near-surface voxels must all have exact signs
+        let sdfs = ffi::sample_object_sdf(
+            part.object_id,
+            &[
+                0.0, 0.0, 4.25,   // exterior concave-corner voxel center (true SDF +0.10 mm)
+                -0.15, 0.0, 4.25, // interior riser face (true SDF -0.05 mm)
+                0.0, 0.0, 4.00,   // interior deck face near corner (true SDF -0.10 mm)
+                0.25, 0.0, 4.00,  // interior deck face (true SDF -0.10 mm)
+            ],
+        );
+        assert_eq!(sdfs.len(), 4);
+        assert!(
+            sdfs[0] > 0.08,
+            "Exterior concave pocket (0.0, 0.0, 4.25) must remain positive (> +0.08 mm), got {}",
+            sdfs[0]
+        );
+        assert!(
+            sdfs[1] < -0.01 && sdfs[2] < -0.01 && sdfs[3] < -0.01,
+            "Interior near-surface voxels around concave corner must remain strictly negative, got {:?}",
+            &sdfs[1..]
+        );
+
+        // 2. OuterWall paths above the deck must not bulge outside the x=-0.10 riser face
+        let layers_res = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+        assert!(layers_res.valid);
+        let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp.valid && !tp.layers.is_empty());
+
+        let mut checked_riser_pts = 0usize;
+        for layer in &tp.layers {
+            for path in &layer.paths {
+                if path.feature_kind != 0 {
+                    continue;
+                }
+                for pt in &path.points {
+                    if pt.z > 4.35 && pt.z < 9.6 && pt.x > -1.0 && pt.y > -2.5 && pt.y < 2.5 {
+                        checked_riser_pts += 1;
+                        assert!(
+                            pt.x <= -0.065,
+                            "Concave-corner OuterWall must not bulge outside x=-0.10 at z={:.2}: x={:.4}",
+                            pt.z,
+                            pt.x
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked_riser_pts > 0, "Expected OuterWall points along riser x=-0.10");
+
+        let _ = ffi::remove_cad_object(part.object_id);
+        crate::ui::sync_config_to_backend(&SlicerConfig::default());
+    }
+
+    #[test]
+    fn test_slope_compensation_conformal_top_and_underside_containment() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Watertight cantilevered ramp prism pre-centered at X=0, Y=0 (Y in [-6, 6]):
+        // Pillar [-8,0]x[0,4], cantilevered ceiling [0,8] at Z=4, tip wall X=8 Z in [4,6],
+        // ~20 deg ramp (8,6)->(2,8.184), flat plateau [-8,2] at Z=8.184.
+        let z_top = 8.184f32;
+        let verts: &[[f32; 3]] = &[
+            [-8.0, -6.0, 0.0],   // 0
+            [0.0, -6.0, 0.0],    // 1
+            [0.0, -6.0, 4.0],    // 2 (reflex)
+            [8.0, -6.0, 4.0],    // 3
+            [8.0, -6.0, 6.0],    // 4
+            [2.0, -6.0, z_top],  // 5
+            [-8.0, -6.0, z_top], // 6
+            [-8.0, 6.0, 0.0],    // 7
+            [0.0, 6.0, 0.0],     // 8
+            [0.0, 6.0, 4.0],     // 9 (reflex)
+            [8.0, 6.0, 4.0],     // 10
+            [8.0, 6.0, 6.0],     // 11
+            [2.0, 6.0, z_top],   // 12
+            [-8.0, 6.0, z_top],  // 13
+        ];
+        let tris: &[[u32; 3]] = &[
+            // Front -Y
+            [2, 3, 4],
+            [2, 4, 5],
+            [2, 5, 6],
+            [2, 6, 0],
+            [2, 0, 1],
+            // Back +Y
+            [9, 11, 10],
+            [9, 12, 11],
+            [9, 13, 12],
+            [9, 7, 13],
+            [9, 8, 7],
+            // Sides
+            [0, 7, 8],
+            [0, 8, 1],
+            [1, 8, 9],
+            [1, 9, 2],
+            [2, 9, 10],
+            [2, 10, 3],
+            [3, 10, 11],
+            [3, 11, 4],
+            [4, 11, 12],
+            [4, 12, 5],
+            [5, 12, 13],
+            [5, 13, 6],
+            [6, 13, 7],
+            [6, 7, 0],
+        ];
+        let mut pos_flat = Vec::with_capacity(verts.len() * 3);
+        for v in verts {
+            pos_flat.extend_from_slice(v);
+        }
+        let mut idx_flat = Vec::with_capacity(tris.len() * 3);
+        for t in tris {
+            idx_flat.extend_from_slice(t);
+        }
+
+        let part = ffi::register_triangle_mesh("SlopeAndCeilingPrism", &pos_flat, &idx_flat);
+        assert!(part.object_id > 0);
+
+        let mut cfg = SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.eikonal.voxel_size_mm = 0.25;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.20;
+        cfg.slicing.layer_height.min_mm = 0.16;
+        cfg.slicing.layer_height.max_mm = 0.24;
+        cfg.slicing.layer_height.first_layer_mm = 0.20;
+        cfg.slicing.enable_support_generation = false;
+        cfg.slicing.enable_auto_conformal_skin = true;
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.25, 4.0));
+
+        // Phase 1: conformal skin enabled -> outermost flat top skin near 0.0 mm & ceiling containment
+        let layers_res = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+        assert!(layers_res.valid);
+        let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp.valid && !tp.layers.is_empty());
+
+        let mut top_z_errs = Vec::new();
+        let mut max_top_layer = 0usize;
+        let mut top_candidates: Vec<(usize, f32)> = Vec::new();
+        let mut ceil_min_z = f32::INFINITY;
+        let mut ceil_xyz = Vec::new();
+
+        for (li, layer) in tp.layers.iter().enumerate() {
+            for path in &layer.paths {
+                for pt in &path.points {
+                    if path.feature_kind == 2
+                        && pt.x >= -6.5
+                        && pt.x <= 0.5
+                        && pt.y >= -4.0
+                        && pt.y <= 4.0
+                        && pt.z >= z_top - 0.12
+                    {
+                        max_top_layer = max_top_layer.max(li);
+                        top_candidates.push((li, pt.z - z_top));
+                    }
+                    if pt.x >= 1.0
+                        && pt.x <= 7.0
+                        && pt.y >= -4.0
+                        && pt.y <= 4.0
+                        && pt.z >= 3.7
+                        && pt.z <= 4.45
+                    {
+                        ceil_min_z = ceil_min_z.min(pt.z);
+                        ceil_xyz.push(pt.x);
+                        ceil_xyz.push(pt.y);
+                        ceil_xyz.push(pt.z);
+                    }
+                }
+            }
+        }
+        for (li, dz) in top_candidates {
+            if li == max_top_layer {
+                top_z_errs.push(dz);
+            }
+        }
+        assert!(!top_z_errs.is_empty(), "Expected outermost top plateau conformal skin points");
+        top_z_errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let top_med = top_z_errs[top_z_errs.len() / 2];
+        assert!(
+            top_med.abs() < 0.025,
+            "Outermost conformal top skin should sit near CAD surface (0.0 mm), got median {} mm",
+            top_med
+        );
+
+        assert!(!ceil_xyz.is_empty(), "Expected underside ceiling overhang paths");
+        assert!(
+            ceil_min_z >= 4.0 + 0.70 * 0.20,
+            "Cantilevered underside Z=4.0 must keep nozzle >= 0.70*h inside, got min z={}",
+            ceil_min_z
+        );
+        let ceil_sdfs = ffi::sample_object_sdf(part.object_id, &ceil_xyz);
+        let max_ceil_sdf = ceil_sdfs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            max_ceil_sdf <= 0.02,
+            "Cantilevered underside paths must stay contained in CAD SDF, got max {}",
+            max_ceil_sdf
+        );
+
+        // Phase 2: conformal skin disabled (reusing existing SDF) -> planar OuterWall on 20 deg ramp
+        cfg.slicing.enable_auto_conformal_skin = false;
+        crate::ui::sync_config_to_backend(&cfg);
+        let layers_planar = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+        assert!(layers_planar.valid);
+        let tp_planar = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp_planar.valid && !tp_planar.layers.is_empty());
+
+        let slope_angle = (z_top - 6.0f32).atan2(6.0);
+        let sin_s = slope_angle.sin();
+        let cos_s = slope_angle.cos();
+        let mut slope_sdfs = Vec::new();
+        for layer in &tp_planar.layers {
+            for path in &layer.paths {
+                if path.feature_kind != 0 {
+                    continue;
+                }
+                for pt in &path.points {
+                    if pt.x >= 2.8
+                        && pt.x <= 7.4
+                        && pt.y >= -4.0
+                        && pt.y <= 4.0
+                        && pt.z >= 6.2
+                        && pt.z <= z_top - 0.15
+                    {
+                        let d_slope = (pt.x - 2.0) * sin_s + (pt.z - z_top) * cos_s;
+                        slope_sdfs.push(d_slope);
+                    }
+                }
+            }
+        }
+        assert!(!slope_sdfs.is_empty(), "Expected ~20 deg sloped OuterWall points");
+        slope_sdfs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let slope_med = slope_sdfs[slope_sdfs.len() / 2];
+        assert!(
+            slope_med > -0.10 && slope_med < 0.02,
+            "20 deg upward sloped OuterWall should follow -H_tip (~-0.04 mm, not -0.20 mm), got median {}",
+            slope_med
+        );
+
+        let _ = ffi::remove_cad_object(part.object_id);
+        crate::ui::sync_config_to_backend(&SlicerConfig::default());
     }
 }
 

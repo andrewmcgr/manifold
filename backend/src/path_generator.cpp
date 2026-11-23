@@ -97,6 +97,21 @@ inline Vec3f lerp3(const Vec3f& a, const Vec3f& b, float t) noexcept {
     };
 }
 
+/// Exact pressed-stadium support distance from nozzle tip (top center of bead) to outward
+/// CAD surface along surface normal `n_surf`, where `cosSurfNoz = dot(n_surf, z_nozzle)`.
+inline float beadTipSupportDistance(float cosSurfNoz, float widthMm, float heightMm) noexcept {
+    const float c = std::clamp(cosSurfNoz, -1.0f, 1.0f);
+    const float s = std::sqrt(std::max(0.0f, 1.0f - c * c));
+    const float w = std::max(0.0f, widthMm);
+    const float h = std::max(0.0f, heightMm);
+    if (w >= h) {
+        return 0.5f * h * (1.0f - c) + 0.5f * (w - h) * s;
+    }
+    return (c >= 0.0f)
+        ? (0.5f * w * (1.0f - c))
+        : (-h * c + 0.5f * w * (1.0f + c));
+}
+
 struct SanitizedLineWidth {
     float target_mm = 0.40f;
     float min_mm = 0.28f;
@@ -556,18 +571,37 @@ inline bool intersectTriangleWithIsoLevel(
     Crossing c0 = crossings[0];
     Crossing c1 = crossings[1];
 
-    // Orient segment consistently so that higher `field` is to the left (normal × tangent)
-    const Vec3f triNormal = normalize3(
+    // Orient segment consistently so that higher `field` is to the left (triNormal × tangent),
+    // aligning `triNormal` with the local nozzle axis and computing `inDir` relative to centroid.
+    Vec3f triNormal = normalize3(
         cross3(
             mesh.verts[idx[1]].pos - mesh.verts[idx[0]].pos,
             mesh.verts[idx[2]].pos - mesh.verts[idx[0]].pos),
         c0.v.normal);
-    const Vec3f gradDir =
-        (mesh.verts[idx[0]].pos * fp[0]) +
-        (mesh.verts[idx[1]].pos * fp[1]) +
-        (mesh.verts[idx[2]].pos * fp[2]);
+    const Vec3f upRef = normalize3(c0.v.nozzleAxis, c0.v.normal);
+    if (dot3(triNormal, upRef) < 0.0f) {
+        triNormal = triNormal * -1.0f;
+    }
+    Vec3f negPos{0.0f, 0.0f, 0.0f};
+    Vec3f posPos{0.0f, 0.0f, 0.0f};
+    int negCnt = 0;
+    int posCnt = 0;
+    for (int k = 0; k < 3; ++k) {
+        if (fp[k] < 0.0f) {
+            negPos = negPos + mesh.verts[idx[k]].pos;
+            ++negCnt;
+        } else {
+            posPos = posPos + mesh.verts[idx[k]].pos;
+            ++posCnt;
+        }
+    }
+    const Vec3f inDir = (negCnt > 0 && posCnt > 0)
+        ? ((posPos * (1.0f / static_cast<float>(posCnt))) -
+           (negPos * (1.0f / static_cast<float>(negCnt))))
+        : ((mesh.verts[idx[1]].pos - mesh.verts[idx[0]].pos) * (fp[1] - fp[0]) +
+           (mesh.verts[idx[2]].pos - mesh.verts[idx[0]].pos) * (fp[2] - fp[0]));
     const Vec3f segDir = c1.v.pos - c0.v.pos;
-    if (dot3(cross3(triNormal, segDir), gradDir) < 0.0f) {
+    if (dot3(cross3(triNormal, segDir), inDir) < 0.0f) {
         std::swap(c0, c1);
     }
 
@@ -3398,11 +3432,17 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             d = std::min(d, dFromClipBoundary[i]);
                         }
                         if (!layerInfo.is_first_layer && d > shellThicknessMm) {
-                            const float hStep = std::max(1.20f * baseMesh.verts[i].layerHeightMm, 1.15f * meanLayerH);
+                            const float hLocal = baseMesh.verts[i].layerHeightMm;
+                            const float hStep = std::max(1.20f * hLocal, 1.15f * meanLayerH);
+                            const float hPrevBot = hLocal + 0.85f * hLocal;
                             const Vec3f p = baseMesh.verts[i].pos;
+                            const Vec3f zNoz = sampleNozzleAxis(p);
                             const Vec3f localGrav = sampleGravityDir(p);
                             const float sdfDownGrav = sampleSdf(p + (localGrav * hStep)) - sdfZeroShift;
-                            if (sdfDownGrav > -0.20f * outerW.min_mm) {
+                            const float sdfPrevBotGrav = sampleSdf(p + (localGrav * hPrevBot)) - sdfZeroShift;
+                            const float sdfDownNoz = sampleSdf(p - (zNoz * hStep)) - sdfZeroShift;
+                            const float sdfPrevBotNoz = sampleSdf(p - (zNoz * hPrevBot)) - sdfZeroShift;
+                            if (std::max({sdfDownGrav, sdfPrevBotGrav, sdfDownNoz, sdfPrevBotNoz}) > -0.20f * outerW.min_mm) {
                                 d = std::min(d, 0.5f * shellThicknessMm);
                             }
                         }
@@ -3606,6 +3646,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 const float kInf = 1.0e9f;
                 std::vector<float> dOuter(nV, kInf);
                 std::vector<Vec3f> closestOuterNormal(nV, {1.0f, 0.0f, 0.0f});
+                std::vector<Vec3f> closestOuterFoot(nV, {0.0f, 0.0f, 0.0f});
                 std::vector<float> rMedial(nV, shellThicknessMm * 4.0f);
 
                 using QueueItem = std::pair<float, std::uint32_t>;
@@ -3659,6 +3700,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     if (bestDist < kInf * 0.5f) {
                         dOuter[i] = bestDist;
                         closestOuterNormal[i] = bestNormal;
+                        closestOuterFoot[i] = bestFoot;
                         pq.push({bestDist, static_cast<std::uint32_t>(i)});
 
                         const Vec3f v1 = p - bestFoot;
@@ -3698,6 +3740,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         if (dCurr + wEdge < dOuter[v]) {
                             dOuter[v] = dCurr + wEdge;
                             closestOuterNormal[v] = closestOuterNormal[u];
+                            closestOuterFoot[v] = closestOuterFoot[u];
                             pq.push({dOuter[v], v});
                         }
                     }
@@ -3710,6 +3753,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     if (dOuter[i] >= kInf * 0.5f) {
                         const Vec3f p = shellMesh.verts[i].pos;
                         float bestDist = kInf;
+                        Vec3f bestFoot = p;
                         Vec3f bestNormal{1.0f, 0.0f, 0.0f};
                         for (const auto& seg : outerSegments) {
                             const float tProj = (seg.abLenSq > 1.0e-12f)
@@ -3719,11 +3763,13 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             const float d = dist3(p, foot);
                             if (d < bestDist) {
                                 bestDist = d;
+                                bestFoot = foot;
                                 bestNormal = seg.inwardNormal;
                             }
                         }
                         dOuter[i] = (bestDist < kInf * 0.5f) ? bestDist : shellThicknessMm;
                         closestOuterNormal[i] = bestNormal;
+                        closestOuterFoot[i] = bestFoot;
                     }
                 }
 
@@ -3906,11 +3952,84 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         const float invDeg = 1.0f / static_cast<float>(adj[i].size() + 1);
                         nextOuter[i] = sumO * invDeg;
                         nextInner[i] = sumI * invDeg;
-                        totalWallSpan[i] = nextOuter[i] +
-                            static_cast<float>(activeInnerCount[i]) * nextInner[i];
                     }
                     localOuterWidth = std::move(nextOuter);
                     localInnerWidth = std::move(nextInner);
+                }
+
+                // Exact slope-compensated OuterWall centerline offset in local NozzleFrame:
+                // positions the pressed-stadium outer bead tangent to CAD SDF = 0 using
+                // `beadTipSupportDistance(dot(n_bound, z_nozzle), w, h)`.
+                std::vector<float> outerCenterOffset(nV, 0.0f);
+                std::vector<float> outerWallSpan(nV, 0.0f);
+                for (std::size_t i = 0; i < nV; ++i) {
+                    outerCenterOffset[i] = 0.5f * localOuterWidth[i];
+                }
+                if (!isConformalSkinLayer && !layerInfo.is_first_layer) {
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        const Vec3f b = closestOuterFoot[i];
+                        const Vec3f nIso = normalize3(shellMesh.verts[i].normal, fallbackNozzle);
+                        const Vec3f zNoz = outerSurfaceNozzleAxis[i];
+                        const Vec3f nBound = sampleOutwardSdfNormal(b, nIso, false);
+                        const float phiBound = sampleSdf(b);
+                        const float cNoz = dot3(nBound, zNoz);
+                        if (!dFromClipBoundary.empty() && phiBound < -0.5f * meanLayerH && cNoz > 0.2f) {
+                            continue;
+                        }
+
+                        const float w = localOuterWidth[i];
+                        const float hLocal = shellMesh.verts[i].layerHeightMm;
+                        const float hTip = beadTipSupportDistance(cNoz, w, hLocal);
+                        const float sNoz = std::sqrt(std::max(0.0f, 1.0f - cNoz * cNoz));
+                        // Treat underside clip boundary depth >= min(0.95*h*(-cNoz), -phiBound)
+                        // smoothly near cNoz -> -1 so the 0.05*h underside margin doesn't blow up / sinGamma.
+                        const float rawBoundaryDepth = std::max(0.0f, -phiBound);
+                        const float floorUnderDepth = (cNoz < -0.85f)
+                            ? std::max(rawBoundaryDepth, hLocal * (-cNoz))
+                            : rawBoundaryDepth;
+                        const float remSdf = std::max(0.0f, hTip - floorUnderDepth);
+                        const float cosGamma = std::clamp(dot3(nBound, nIso), -1.0f, 1.0f);
+                        const float sinGamma = std::sqrt(std::max(0.0f, 1.0f - cosGamma * cosGamma));
+
+                        const float minLim = 0.15f * w;
+                        const float maxLim = 0.75f * w;
+                        const float limTangent = std::clamp(
+                            0.5f * std::max(0.0f, w - hLocal) *
+                                std::min(1.0f, sNoz / std::max(sinGamma, 0.05f)),
+                            minLim,
+                            maxLim);
+
+                        float dTarget = (sinGamma > 0.12f) ? (remSdf / sinGamma) : limTangent;
+                        if (sinGamma > 0.12f && sinGamma < 0.25f) {
+                            const float t = (sinGamma - 0.12f) / (0.25f - 0.12f);
+                            dTarget = limTangent + t * (dTarget - limTangent);
+                        }
+                        outerCenterOffset[i] = std::clamp(dTarget, minLim, maxLim);
+                    }
+                    std::vector<float> nextOff = outerCenterOffset;
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (adj[i].empty()) {
+                            continue;
+                        }
+                        float sumOff = outerCenterOffset[i];
+                        for (std::uint32_t nb : adj[i]) {
+                            sumOff += outerCenterOffset[nb];
+                        }
+                        const float w = localOuterWidth[i];
+                        nextOff[i] = std::clamp(
+                            sumOff / static_cast<float>(adj[i].size() + 1),
+                            0.15f * w,
+                            0.75f * w);
+                    }
+                    outerCenterOffset = std::move(nextOff);
+                }
+                for (std::size_t i = 0; i < nV; ++i) {
+                    outerWallSpan[i] = outerCenterOffset[i] + 0.5f * localOuterWidth[i];
+                    if (totalWallSpan[i] > 0.0f) {
+                        totalWallSpan[i] = (activeInnerCount[i] == 0 && availableSpan[i] < outerW.target_mm)
+                            ? std::min(availableSpan[i], outerWallSpan[i])
+                            : (outerWallSpan[i] + static_cast<float>(activeInnerCount[i]) * localInnerWidth[i]);
+                    }
                 }
 
                 // ------------------------------------------------------------
@@ -3931,29 +4050,79 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     for (std::size_t i = 0; i < nV; ++i) {
                         const Vec3f p = shellMesh.verts[i].pos;
                         const Vec3f zNoz = shellMesh.verts[i].nozzleAxis;
+                        const float hLocal = shellMesh.verts[i].layerHeightMm;
                         const float hBedMm = std::max(0.0f, dot3(p, fallbackNozzle) - objectMinAxialBed);
-                        const float rawHStep = std::max(1.20f * shellMesh.verts[i].layerHeightMm, 1.15f * meanLayerH);
+                        const float rawHStep = std::max(1.20f * hLocal, 1.15f * meanLayerH);
                         const float hStep = (hBedMm > 0.35f * meanLayerH)
                             ? std::min(rawHStep, std::max(0.25f * meanLayerH, hBedMm - 0.25f * meanLayerH))
                             : rawHStep;
+                        const float hBotCheck = 0.85f * hLocal;
+                        const float hPrevBot = hLocal + hBotCheck;
                         const Vec3f localGrav = sampleGravityDir(p);
-                        const float phiCurr = sampleSdf(p) - sdfZeroShift;
+                        const float phiCurrRaw = sampleSdf(p) - sdfZeroShift;
+                        const float phiCurrBot = isConformalSkinLayer
+                            ? phiCurrRaw
+                            : (sampleSdf(p - (zNoz * hBotCheck)) - sdfZeroShift);
+                        const float phiCurr = std::max(phiCurrRaw, phiCurrBot);
+                        float sdfDirectBelow = 0.0f;
+                        float sdfPrevBotBelow = 0.0f;
+                        float sdfPrevBotNoz = 0.0f;
+                        float sdfPrevBotGrav = 0.0f;
                         float phiBelow = 0.0f;
                         if (isConformalSkinLayer) {
-                            phiBelow = sampleSdf(
-                                           p - (normalize3(shellMesh.verts[i].normal, zNoz) * hStep)) -
-                                       sdfZeroShift;
+                            sdfDirectBelow = sampleSdf(
+                                                 p - (normalize3(shellMesh.verts[i].normal, zNoz) * hStep)) -
+                                             sdfZeroShift;
+                            sdfPrevBotBelow = sdfDirectBelow;
+                            phiBelow = sdfDirectBelow;
                         } else {
                             const float sdfDownNoz = sampleSdf(p - (zNoz * hStep)) - sdfZeroShift;
                             const float sdfDownGrav = sampleSdf(p + (localGrav * hStep)) - sdfZeroShift;
-                            phiBelow = std::max(sdfDownNoz, sdfDownGrav);
+                            sdfDirectBelow = std::max(sdfDownNoz, sdfDownGrav);
+                            sdfPrevBotNoz = (hBedMm > 1.05f * hPrevBot)
+                                ? (sampleSdf(p - (zNoz * hPrevBot)) - sdfZeroShift)
+                                : sdfDownNoz;
+                            sdfPrevBotGrav = (hBedMm > 1.05f * hPrevBot)
+                                ? (sampleSdf(p + (localGrav * hPrevBot)) - sdfZeroShift)
+                                : sdfDownGrav;
+                            sdfPrevBotBelow = std::max(sdfPrevBotNoz, sdfPrevBotGrav);
+                            phiBelow = std::max(sdfDirectBelow, sdfPrevBotBelow);
                         }
-                        const float downwardSlope = (phiBelow - phiCurr) / std::max(hStep, 1.0e-4f);
+                        const float downwardSlope = (sdfDirectBelow - phiCurrRaw) / std::max(hStep, 1.0e-4f);
                         const float ov = std::min(
                             sampleOverhang(p),
                             sampleOverhang(p + (localGrav * (0.5f * hStep))));
+                        float prevBotDownSlope = 0.0f;
+                        if (!isConformalSkinLayer && sdfPrevBotBelow > 0.01f * meanLayerH) {
+                            const float delta = std::max(0.20f * hLocal, 0.25f * voxelSize);
+                            const float sdfBgLimit = 0.85f * sdfGrid.background();
+                            if (sdfPrevBotNoz > 0.01f * meanLayerH) {
+                                const float sDeeper = sampleSdf(p - (zNoz * (hPrevBot + delta))) - sdfZeroShift;
+                                if (sDeeper < sdfBgLimit) {
+                                    prevBotDownSlope = std::max(prevBotDownSlope, (sDeeper - sdfPrevBotNoz) / delta);
+                                } else {
+                                    const float sShallower =
+                                        sampleSdf(p - (zNoz * std::max(0.0f, hPrevBot - delta))) - sdfZeroShift;
+                                    prevBotDownSlope = std::max(prevBotDownSlope, (sdfPrevBotNoz - sShallower) / delta);
+                                }
+                            }
+                            if (sdfPrevBotGrav > 0.01f * meanLayerH) {
+                                const float sDeeper = sampleSdf(p + (localGrav * (hPrevBot + delta))) - sdfZeroShift;
+                                if (sDeeper < sdfBgLimit) {
+                                    prevBotDownSlope = std::max(prevBotDownSlope, (sDeeper - sdfPrevBotGrav) / delta);
+                                } else {
+                                    const float sShallower =
+                                        sampleSdf(p + (localGrav * std::max(0.0f, hPrevBot - delta))) - sdfZeroShift;
+                                    prevBotDownSlope = std::max(prevBotDownSlope, (sdfPrevBotGrav - sShallower) / delta);
+                                }
+                            }
+                        }
                         const bool exceedsOverhangAngle =
-                            (ov <= -sinOverhangThresh) || (downwardSlope >= sinOverhangThresh);
+                            (ov <= -sinOverhangThresh) ||
+                            (downwardSlope >= sinOverhangThresh) ||
+                            (!isConformalSkinLayer &&
+                             sdfPrevBotBelow > 0.01f * meanLayerH &&
+                             prevBotDownSlope >= sinOverhangThresh);
 
                         if (dOuter[i] <= 0.65f * localOuterWidth[i] &&
                             hBedMm > 1.35f * meanLayerH &&
@@ -3963,17 +4132,18 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         }
 
                         // A vertex is only carved out for free-air Bridging / WaveOverhang if stepping
-                        // one layer down genuinely exits the part into free air beyond the support of
-                        // the previous layer's perimeter bead (never chopping normal 45..60 deg sloped walls!).
+                        // one layer down genuinely exits the part into free air (including checking
+                        // whether the underlying layer survived the 0.85*h underside clip), never
+                        // chopping normal 45..60 deg sloped walls!
                         const bool isHorizontalBottomCeiling =
                             (dOuter[i] > 0.55f * localOuterWidth[i]) &&
                             (phiCurr > -0.35f * dOuter[i]) &&
-                            (phiBelow > 0.25f * meanLayerH) &&
+                            (sdfDirectBelow > 0.25f * meanLayerH || sdfPrevBotBelow > 0.02f * meanLayerH) &&
                             exceedsOverhangAngle;
 
                         const bool isFreeAirCeiling =
                             ((dOuter[i] > 1.05f * localOuterWidth[i]) &&
-                             (phiBelow > -0.05f * outerW.min_mm) &&
+                             (sdfDirectBelow > -0.05f * outerW.min_mm || sdfPrevBotBelow > 0.01f * meanLayerH) &&
                              exceedsOverhangAngle) ||
                             isHorizontalBottomCeiling;
 
@@ -3990,7 +4160,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         if ((isFreeAirCeiling || isCantileverPerimeter) && !isSolidlySupportedAnchor) {
                             rawUnsupported[i] = true;
                         }
-                        if (exceedsOverhangAngle && phiBelow > 0.0f) {
+                        if (exceedsOverhangAngle && phiBelow > 0.01f * meanLayerH) {
                             canPropagateOutward[i] = true;
                         }
                     }
@@ -4213,9 +4383,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
                             // Suppress unanchored inner walls that would float over empty sparse cells
                             if (!isConformalSkinLayer &&
-                                totalWallSpan[i] > localOuterWidth[i]) {
+                                totalWallSpan[i] > outerWallSpan[i]) {
                                 activeInnerCount[i] = 0;
-                                totalWallSpan[i] = localOuterWidth[i];
+                                totalWallSpan[i] = outerWallSpan[i];
                             }
                         }
                     }
@@ -4633,15 +4803,18 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                         continue;
                                     }
 
-                                    // Verify the straight 3D line between pStart and pEnd stays inside
-                                    // the part (within 0.45 * d_nozzle of SDF <= 0) and is kinematically accessible.
+                                    // Verify the straight 3D line between pStart and pEnd stays strictly inside
+                                    // the part (never cutting out of a curved arch into positive SDF) and
+                                    // is kinematically accessible.
                                     const int nSamples = std::max(4, static_cast<int>(std::ceil(chordLen / (0.5f * pitch))));
                                     bool pathAccessible = true;
+                                    const float maxBridgeChordSdf =
+                                        -std::min(0.35f * meanLayerH, 0.25f * nozzleDiameterMm);
                                     for (int s = 1; s < nSamples; ++s) {
                                         const float t = static_cast<float>(s) / static_cast<float>(nSamples);
                                         const Vec3f pMid = lerp3(pStart, pEnd, t);
                                         const float sdfMid = sampleSdf(pMid) - sdfZeroShift;
-                                        if (sdfMid > 0.45f * nozzleDiameterMm) {
+                                        if (sdfMid > maxBridgeChordSdf) {
                                             pathAccessible = false;
                                             break;
                                         }
@@ -4656,17 +4829,17 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                     }
 
                                     // Extend bridge endpoints slightly into the supported anchor extrusions
-                                    // without exceeding maxBridgeLengthMm
+                                    // while staying strictly inside the CAD part and within maxBridgeLengthMm
                                     const float anchorOverlap = std::min(
                                         0.15f * nozzleDiameterMm,
                                         0.5f * std::max(0.0f, maxBridgeLengthMm - chordLen));
                                     if (anchorOverlap > 1.0e-4f) {
                                         const Vec3f candStart = pStart - (chordDir * anchorOverlap);
-                                        if (sampleSdf(candStart) - sdfZeroShift <= 0.15f * nozzleDiameterMm) {
+                                        if (sampleSdf(candStart) - sdfZeroShift <= -0.15f * meanLayerH) {
                                             pStart = candStart;
                                         }
                                         const Vec3f candEnd = pEnd + (chordDir * anchorOverlap);
-                                        if (sampleSdf(candEnd) - sdfZeroShift <= 0.15f * nozzleDiameterMm) {
+                                        if (sampleSdf(candEnd) - sdfZeroShift <= -0.15f * meanLayerH) {
                                             pEnd = candEnd;
                                         }
                                     }
@@ -4798,7 +4971,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             availableSpan[i],
                             std::max(dOuter[i], localPeakDOuter[i]));
                         const float effOffset = std::min(
-                            0.5f * localOuterWidth[i],
+                            outerCenterOffset[i],
                             0.65f * stripHalfSpan);
                         outerLevel[i] = dOuter[i] - effOffset;
                     }
@@ -4809,10 +4982,40 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         supportedWallValidity,
                         0.02f,
                         localOuterWidth);
-                    const auto outerChains =
+                    auto outerChains =
                         stitchSegmentsIntoChains(outerSegs, stitchSnap, closeLoopTol);
 
-                    for (const auto& ch : outerChains) {
+                    for (auto& ch : outerChains) {
+                        // Ensure every OuterWall chain is oriented so `cross(z_nozzle, tangent)` points
+                        // strictly inward (into solid for CAD exterior boundaries, into layer interior
+                        // for conformal skin caps), so die-swell inset never moves outward on holes/open chains.
+                        if (ch.pts.size() >= 2 && !isConformalSkinLayer) {
+                            const float gStep = 0.5f * voxelSize;
+                            double inwardScore = 0.0;
+                            const std::size_t nSegs = ch.isClosed ? ch.pts.size() : (ch.pts.size() - 1);
+                            for (std::size_t sIdx = 0; sIdx < nSegs; ++sIdx) {
+                                const auto& pa = ch.pts[sIdx];
+                                const auto& pb = ch.pts[(sIdx + 1) % ch.pts.size()];
+                                const Vec3f seg = pb.pos - pa.pos;
+                                const float segLen = length3(seg);
+                                if (segLen <= 1.0e-5f) {
+                                    continue;
+                                }
+                                const Vec3f segDir = seg * (1.0f / segLen);
+                                const Vec3f mid = lerp3(pa.pos, pb.pos, 0.5f);
+                                const Vec3f zNoz = normalize3(pa.nozzleAxis + pb.nozzleAxis, fallbackNozzle);
+                                const Vec3f lateral = cross3(zNoz, segDir);
+                                const Vec3f rawGrad{
+                                    sampleSdf({mid.x + gStep, mid.y, mid.z}) - sampleSdf({mid.x - gStep, mid.y, mid.z}),
+                                    sampleSdf({mid.x, mid.y + gStep, mid.z}) - sampleSdf({mid.x, mid.y - gStep, mid.z}),
+                                    sampleSdf({mid.x, mid.y, mid.z + gStep}) - sampleSdf({mid.x, mid.y, mid.z - gStep}),
+                                };
+                                inwardScore += static_cast<double>(-dot3(lateral, rawGrad) * segLen);
+                            }
+                            if (inwardScore < 0.0) {
+                                std::reverse(ch.pts.begin(), ch.pts.end());
+                            }
+                        }
                         ExtrusionPath ep{};
                         if (finalizeExtrusionPath(
                                 ch,
@@ -4902,14 +5105,38 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 }
 
                 for (std::uint32_t j = 1; j <= layerNumInnerWalls; ++j) {
-                    const float minSpanForWallJ =
-                        outerW.min_mm + static_cast<float>(j) * innerW.min_mm;
+                    // Expand inner-wall domain by a 2-ring collar around vertices that genuinely fit
+                    // >= j inner walls so inner walls trace continuous U-turn apices around acute
+                    // rail corners instead of breaking into open stubs, while thin straight fins remain
+                    // protected against double-extrusion.
+                    std::vector<bool> nearActiveInner(nV, false);
+                    for (std::size_t i = 0; i < nV; ++i) {
+                        if (activeInnerCount[i] >= j && !isUnsupported[i]) {
+                            nearActiveInner[i] = true;
+                        }
+                    }
+                    for (int pass = 0; pass < 2; ++pass) {
+                        std::vector<bool> nextNear = nearActiveInner;
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            if (nearActiveInner[i] || isUnsupported[i]) {
+                                continue;
+                            }
+                            for (std::uint32_t nb : adj[i]) {
+                                if (nearActiveInner[nb]) {
+                                    nextNear[i] = true;
+                                    break;
+                                }
+                            }
+                        }
+                        nearActiveInner = std::move(nextNear);
+                    }
+
                     std::vector<float> innerLevel(nV, 0.0f);
-                    std::vector<float> innerValidity(nV, 0.0f);
+                    std::vector<float> innerValidity(nV, -1.0f);
                     std::vector<float> wallJWidth = localInnerWidth;
                     for (std::size_t i = 0; i < nV; ++i) {
                         float centerOffset =
-                            localOuterWidth[i] + (static_cast<float>(j) - 0.5f) * localInnerWidth[i];
+                            outerWallSpan[i] + (static_cast<float>(j) - 0.5f) * localInnerWidth[i];
                         if (brickLateralOddLayer && activeInnerCount[i] >= j && brickLateralScale[i] > 1.0e-4f) {
                             const float extraAvail =
                                 std::max(0.0f, availableSpan[i] - totalWallSpan[i]);
@@ -4922,26 +5149,33 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             if (j == 1) {
                                 const float w1 = localInnerWidth[i] + seamShift;
                                 wallJWidth[i] = w1;
-                                centerOffset = localOuterWidth[i] + 0.5f * w1;
+                                centerOffset = outerWallSpan[i] + 0.5f * w1;
                             } else if (j == activeInnerCount[i] && extraAvail < seamShift) {
                                 const float shrink = seamShift - extraAvail;
                                 const float wLast =
                                     std::max(innerW.min_mm, localInnerWidth[i] - shrink);
                                 wallJWidth[i] = wLast;
-                                centerOffset = localOuterWidth[i] +
+                                centerOffset = outerWallSpan[i] +
                                     static_cast<float>(j - 1) * localInnerWidth[i] +
                                     seamShift + 0.5f * wLast;
                             } else {
                                 wallJWidth[i] = localInnerWidth[i];
-                                centerOffset = localOuterWidth[i] +
+                                centerOffset = outerWallSpan[i] +
                                     (static_cast<float>(j) - 0.5f) * localInnerWidth[i] +
                                     seamShift;
                             }
                         }
                         innerLevel[i] = dOuter[i] - centerOffset;
-                        innerValidity[i] = (activeInnerCount[i] >= j)
-                            ? supportedWallValidity[i]
-                            : (-0.25f * innerW.target_mm);
+                        if (isUnsupported[i] || !nearActiveInner[i]) {
+                            innerValidity[i] = -0.25f * innerW.target_mm;
+                        } else if (activeInnerCount[i] >= j) {
+                            innerValidity[i] = supportedWallValidity[i];
+                        } else {
+                            // Near an acute corner U-turn apex adjacent to valid j-wall vertices
+                            innerValidity[i] = std::min(
+                                supportedWallValidity[i],
+                                availableSpan[i] - (centerOffset - 0.15f * wallJWidth[i]));
+                        }
                     }
 
                     const auto innerSegs = extractIsoContourSegments(
@@ -4949,7 +5183,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         innerLevel,
                         0.0f,
                         innerValidity,
-                        minSpanForWallJ,
+                        0.0f,
                         wallJWidth);
                     const auto innerChains =
                         stitchSegmentsIntoChains(innerSegs, stitchSnap, closeLoopTol);
@@ -5358,7 +5592,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             //     = (p - 0.5) * waveStep - 0.5 * \delta_overlap
                             const float centerDist =
                                 (static_cast<float>(p) - 0.5f) * waveStep[i] - 0.5f * waveOverlapMm;
-                            const float outerInset = 0.5f * waveRho[i] * waveWidth[i];
+                            const float outerInset = std::max(
+                                0.5f * waveRho[i] * waveWidth[i],
+                                outerCenterOffset[i]);
                             float lvl = dFromSupported[i] - centerDist;
                             if (dFromSupported[i] >= centerDist - 0.85f * waveStep[i]) {
                                 lvl = std::max(lvl, outerInset - dOuter[i]);
@@ -5404,9 +5640,11 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 auto sampleShiftedSdfForShell = [&](const Vec3f& p) -> float {
                     return sampleSdf(p) - sdfZeroShift;
                 };
-                const float maxSolidInfillSdf = isConformalSkinLayer
-                    ? (-0.04f * meanLayerH)
-                    : -(0.5f * outerW.min_mm);
+                const float maxSolidInfillSdf = isOutermostConformalSkinLayer
+                    ? (0.03f * meanLayerH)
+                    : (isConformalSkinLayer
+                        ? (-0.04f * meanLayerH)
+                        : -(0.5f * outerW.min_mm));
 
                 std::vector<float> negDRem(nV, 0.0f);
                 std::vector<float> remOneSidedSpan(nV, 0.0f);

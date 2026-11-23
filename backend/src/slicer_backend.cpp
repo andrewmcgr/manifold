@@ -877,6 +877,477 @@ void extractWeldedWatertightMesh(
     }
 }
 
+class IndexSpaceTriangleBvh {
+public:
+    IndexSpaceTriangleBvh(
+        const openvdb::Vec3s* indexPts,
+        std::size_t numPts,
+        const std::vector<openvdb::Vec3I>& triangles)
+        : pts_(indexPts), tris_(triangles.data())
+    {
+        if (pts_ == nullptr || tris_ == nullptr || triangles.empty()) {
+            return;
+        }
+        prims_.reserve(triangles.size());
+        for (std::size_t idx = 0; idx < triangles.size(); ++idx) {
+            const openvdb::Vec3I& tri = triangles[idx];
+            if (tri[0] >= numPts || tri[1] >= numPts || tri[2] >= numPts) {
+                continue;
+            }
+            const openvdb::Vec3s& p0 = pts_[tri[0]];
+            const openvdb::Vec3s& p1 = pts_[tri[1]];
+            const openvdb::Vec3s& p2 = pts_[tri[2]];
+            const openvdb::Vec3d v0(p0), v1(p1), v2(p2);
+            if ((v1 - v0).cross(v2 - v0).lengthSqr() <= 1e-20) {
+                continue;
+            }
+            TriPrim prim{};
+            for (int k = 0; k < 3; ++k) {
+                prim.min[k] = std::min({p0[k], p1[k], p2[k]});
+                prim.max[k] = std::max({p0[k], p1[k], p2[k]});
+                prim.cen[k] = 0.5f * (prim.min[k] + prim.max[k]);
+            }
+            prim.triIdx = static_cast<std::uint32_t>(idx);
+            prims_.push_back(prim);
+        }
+        if (prims_.empty()) {
+            return;
+        }
+        nodes_.reserve(2 * prims_.size());
+        buildNode(0, static_cast<std::uint32_t>(prims_.size()));
+    }
+
+    bool segmentIntersectsAny(const openvdb::Vec3d& a, const openvdb::Vec3d& b) const
+    {
+        if (nodes_.empty()) {
+            return false;
+        }
+        const openvdb::Vec3d d = b - a;
+        const float segMin[3] = {
+            static_cast<float>(std::min(a[0], b[0]) - 1e-4),
+            static_cast<float>(std::min(a[1], b[1]) - 1e-4),
+            static_cast<float>(std::min(a[2], b[2]) - 1e-4),
+        };
+        const float segMax[3] = {
+            static_cast<float>(std::max(a[0], b[0]) + 1e-4),
+            static_cast<float>(std::max(a[1], b[1]) + 1e-4),
+            static_cast<float>(std::max(a[2], b[2]) + 1e-4),
+        };
+
+        auto nodeOverlapsSegment = [&](const BvhNode& node) -> bool {
+            double tMin = -1e-4;
+            double tMax = 1.0 + 1e-4;
+            for (int k = 0; k < 3; ++k) {
+                if (node.max[k] < segMin[k] || node.min[k] > segMax[k]) {
+                    return false;
+                }
+                const double dk = d[k];
+                const double nMin = static_cast<double>(node.min[k]) - 1e-4;
+                const double nMax = static_cast<double>(node.max[k]) + 1e-4;
+                if (std::abs(dk) < 1e-12) {
+                    if (a[k] < nMin || a[k] > nMax) {
+                        return false;
+                    }
+                    continue;
+                }
+                const double invD = 1.0 / dk;
+                double t0 = (nMin - a[k]) * invD;
+                double t1 = (nMax - a[k]) * invD;
+                if (t0 > t1) {
+                    std::swap(t0, t1);
+                }
+                tMin = std::max(tMin, t0);
+                tMax = std::min(tMax, t1);
+                if (tMin > tMax) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        std::uint32_t stack[64];
+        int sp = 0;
+        stack[sp++] = 0;
+        while (sp > 0) {
+            const BvhNode& node = nodes_[stack[--sp]];
+            if (!nodeOverlapsSegment(node)) {
+                continue;
+            }
+            if (node.count > 0) {
+                for (std::uint32_t p = 0; p < node.count; ++p) {
+                    const TriPrim& prim = prims_[node.leftOrFirst + p];
+                    if (prim.max[0] < segMin[0] || prim.min[0] > segMax[0] ||
+                        prim.max[1] < segMin[1] || prim.min[1] > segMax[1] ||
+                        prim.max[2] < segMin[2] || prim.min[2] > segMax[2]) {
+                        continue;
+                    }
+                    const openvdb::Vec3I& tri = tris_[prim.triIdx];
+                    const openvdb::Vec3d v0(pts_[tri[0]]);
+                    const openvdb::Vec3d v1(pts_[tri[1]]);
+                    const openvdb::Vec3d v2(pts_[tri[2]]);
+                    const openvdb::Vec3d e1 = v1 - v0;
+                    const openvdb::Vec3d e2 = v2 - v0;
+                    const openvdb::Vec3d pvec = d.cross(e2);
+                    const double det = e1.dot(pvec);
+                    if (std::abs(det) < 1e-12) {
+                        continue;
+                    }
+                    const double invDet = 1.0 / det;
+                    const openvdb::Vec3d tvec = a - v0;
+                    const double u = tvec.dot(pvec) * invDet;
+                    constexpr double kBaryEps = 1e-6;
+                    if (u < -kBaryEps || u > 1.0 + kBaryEps) {
+                        continue;
+                    }
+                    const openvdb::Vec3d qvec = tvec.cross(e1);
+                    const double v = d.dot(qvec) * invDet;
+                    if (v < -kBaryEps || (u + v) > 1.0 + kBaryEps) {
+                        continue;
+                    }
+                    const double t = e2.dot(qvec) * invDet;
+                    if (t >= -1e-6 && t <= 1.0 + 1e-6) {
+                        return true;
+                    }
+                }
+            } else {
+                if (sp + 2 <= 64) {
+                    stack[sp++] = node.rightChild;
+                    stack[sp++] = node.leftOrFirst;
+                }
+            }
+        }
+        return false;
+    }
+
+private:
+    struct TriPrim {
+        float min[3];
+        float max[3];
+        float cen[3];
+        std::uint32_t triIdx;
+    };
+
+    struct BvhNode {
+        float min[3];
+        float max[3];
+        std::uint32_t leftOrFirst;
+        std::uint32_t rightChild;
+        std::uint32_t count;
+    };
+
+    std::uint32_t buildNode(std::uint32_t begin, std::uint32_t end)
+    {
+        const std::uint32_t nodeIdx = static_cast<std::uint32_t>(nodes_.size());
+        nodes_.emplace_back();
+
+        float bMin[3] = {prims_[begin].min[0], prims_[begin].min[1], prims_[begin].min[2]};
+        float bMax[3] = {prims_[begin].max[0], prims_[begin].max[1], prims_[begin].max[2]};
+        float cMin[3] = {prims_[begin].cen[0], prims_[begin].cen[1], prims_[begin].cen[2]};
+        float cMax[3] = {prims_[begin].cen[0], prims_[begin].cen[1], prims_[begin].cen[2]};
+        for (std::uint32_t i = begin + 1; i < end; ++i) {
+            for (int k = 0; k < 3; ++k) {
+                bMin[k] = std::min(bMin[k], prims_[i].min[k]);
+                bMax[k] = std::max(bMax[k], prims_[i].max[k]);
+                cMin[k] = std::min(cMin[k], prims_[i].cen[k]);
+                cMax[k] = std::max(cMax[k], prims_[i].cen[k]);
+            }
+        }
+        for (int k = 0; k < 3; ++k) {
+            nodes_[nodeIdx].min[k] = bMin[k];
+            nodes_[nodeIdx].max[k] = bMax[k];
+        }
+
+        const std::uint32_t n = end - begin;
+        if (n <= 8u) {
+            nodes_[nodeIdx].leftOrFirst = begin;
+            nodes_[nodeIdx].rightChild = 0;
+            nodes_[nodeIdx].count = n;
+            return nodeIdx;
+        }
+
+        int axis = 0;
+        const float ex = cMax[0] - cMin[0];
+        const float ey = cMax[1] - cMin[1];
+        const float ez = cMax[2] - cMin[2];
+        if (ey > ex && ey >= ez) {
+            axis = 1;
+        } else if (ez > ex && ez > ey) {
+            axis = 2;
+        }
+
+        const std::uint32_t mid = begin + n / 2u;
+        std::nth_element(
+            prims_.begin() + begin,
+            prims_.begin() + mid,
+            prims_.begin() + end,
+            [axis](const TriPrim& lhs, const TriPrim& rhs) {
+                return lhs.cen[axis] < rhs.cen[axis];
+            });
+
+        const std::uint32_t leftIdx = buildNode(begin, mid);
+        const std::uint32_t rightIdx = buildNode(mid, end);
+        nodes_[nodeIdx].leftOrFirst = leftIdx;
+        nodes_[nodeIdx].rightChild = rightIdx;
+        nodes_[nodeIdx].count = 0;
+        return nodeIdx;
+    }
+
+    const openvdb::Vec3s* pts_ = nullptr;
+    const openvdb::Vec3I* tris_ = nullptr;
+    std::vector<TriPrim> prims_;
+    std::vector<BvhNode> nodes_;
+};
+
+/// Repairs sign errors introduced by OpenVDB's `ComputeIntersectingVoxelSign` on near-surface
+/// voxels (`|sdf| <= sqrt(0.75) * voxelSize`) at concave corners without applying morphological
+/// closing, by verifying line-of-sight visibility to signed seed neighbors against the mesh BVH.
+void repairIntersectingVoxelSigns(
+    openvdb::FloatGrid& sdfGrid,
+    const openvdb::Vec3s* indexPts,
+    std::size_t numPts,
+    const std::vector<openvdb::Vec3I>& triangles,
+    float voxelSize)
+{
+    if (indexPts == nullptr || triangles.empty() || !(voxelSize > 0.0f)) {
+        return;
+    }
+    const IndexSpaceTriangleBvh bvh(indexPts, numPts, triangles);
+
+    const float kIntersectRadiusMm =
+        static_cast<float>(std::sqrt(0.75) * static_cast<double>(voxelSize));
+    const float kZeroEpsMm = 1e-5f * voxelSize;
+    const float kCandidateMaxMm = kIntersectRadiusMm + 1e-4f * voxelSize;
+    const float kSeedMinMm = kIntersectRadiusMm + 1e-3f * voxelSize;
+
+    // 26-connected offsets ordered face (6) -> edge (12) -> corner (8).
+    static constexpr std::array<openvdb::Coord, 26> kOffsets26{{
+        {1, 0, 0},   {-1, 0, 0},  {0, 1, 0},   {0, -1, 0},  {0, 0, 1},   {0, 0, -1},
+        {1, 1, 0},   {1, -1, 0},  {-1, 1, 0},  {-1, -1, 0}, {1, 0, 1},   {1, 0, -1},
+        {-1, 0, 1},  {-1, 0, -1}, {0, 1, 1},   {0, 1, -1},  {0, -1, 1},  {0, -1, -1},
+        {1, 1, 1},   {1, 1, -1},  {1, -1, 1},  {1, -1, -1}, {-1, 1, 1},  {-1, 1, -1},
+        {-1, -1, 1}, {-1, -1, -1},
+    }};
+
+    struct CoordHash {
+        std::size_t operator()(const openvdb::Coord& c) const noexcept
+        {
+            std::uint64_t h = 14695981039346656037ULL;
+            auto mix = [&](std::uint32_t v) {
+                h ^= static_cast<std::uint64_t>(v);
+                h *= 1099511628211ULL;
+            };
+            mix(static_cast<std::uint32_t>(c.x()));
+            mix(static_cast<std::uint32_t>(c.y()));
+            mix(static_cast<std::uint32_t>(c.z()));
+            return static_cast<std::size_t>(h);
+        }
+    };
+
+    struct VoxelFlip {
+        openvdb::Index pos;
+        float newVal;
+    };
+    struct UnresolvedVoxel {
+        openvdb::Coord ijk;
+        std::size_t leafIdx;
+        openvdb::Index pos;
+        float absVal;
+    };
+
+    std::vector<openvdb::FloatTree::LeafNodeType*> nodes;
+    nodes.reserve(sdfGrid.tree().leafCount());
+    sdfGrid.tree().getNodes(nodes);
+    if (nodes.empty()) {
+        return;
+    }
+
+    std::vector<std::vector<VoxelFlip>> leafFlips(nodes.size());
+    std::vector<std::vector<UnresolvedVoxel>> leafUnresolved(nodes.size());
+    std::vector<std::vector<openvdb::Coord>> leafConflicts(nodes.size());
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, nodes.size()),
+        [&](const tbb::blocked_range<std::size_t>& range) {
+            openvdb::tree::ValueAccessor<const openvdb::FloatTree> acc(sdfGrid.tree());
+            for (std::size_t n = range.begin(); n < range.end(); ++n) {
+                const openvdb::FloatTree::LeafNodeType* node = nodes[n];
+                const float* data = node->buffer().data();
+                for (auto it = node->cbeginValueOn(); it; ++it) {
+                    const openvdb::Index pos = it.pos();
+                    const float val = data[pos];
+                    const float absVal = std::abs(val);
+                    if (absVal <= kZeroEpsMm || absVal > kCandidateMaxMm) {
+                        continue;
+                    }
+                    const openvdb::Coord ijk = node->offsetToGlobalCoord(pos);
+                    const openvdb::Vec3d centerA(
+                        static_cast<double>(ijk.x()),
+                        static_cast<double>(ijk.y()),
+                        static_cast<double>(ijk.z()));
+
+                    bool seesExt = false;
+                    bool seesInt = false;
+                    for (int m = 0; m < 26; ++m) {
+                        const openvdb::Coord nijk = ijk + kOffsets26[m];
+                        const float nval = acc.getValue(nijk);
+                        if (nval > kSeedMinMm && !seesExt) {
+                            const openvdb::Vec3d centerB(
+                                static_cast<double>(nijk.x()),
+                                static_cast<double>(nijk.y()),
+                                static_cast<double>(nijk.z()));
+                            if (!bvh.segmentIntersectsAny(centerA, centerB)) {
+                                seesExt = true;
+                            }
+                        } else if (nval < -kSeedMinMm && !seesInt) {
+                            const openvdb::Vec3d centerB(
+                                static_cast<double>(nijk.x()),
+                                static_cast<double>(nijk.y()),
+                                static_cast<double>(nijk.z()));
+                            if (!bvh.segmentIntersectsAny(centerA, centerB)) {
+                                seesInt = true;
+                            }
+                        }
+                        if (seesExt && seesInt) {
+                            break;
+                        }
+                    }
+
+                    if (seesExt && !seesInt) {
+                        if (val < 0.0f) {
+                            leafFlips[n].push_back(VoxelFlip{pos, absVal});
+                        }
+                    } else if (seesInt && !seesExt) {
+                        if (val > 0.0f) {
+                            leafFlips[n].push_back(VoxelFlip{pos, -absVal});
+                        }
+                    } else if (!seesExt && !seesInt) {
+                        leafUnresolved[n].push_back(UnresolvedVoxel{ijk, n, pos, absVal});
+                    } else {
+                        leafConflicts[n].push_back(ijk);
+                    }
+                }
+            }
+        });
+
+    for (std::size_t n = 0; n < nodes.size(); ++n) {
+        if (leafFlips[n].empty()) {
+            continue;
+        }
+        float* data = nodes[n]->buffer().data();
+        for (const VoxelFlip& flip : leafFlips[n]) {
+            data[flip.pos] = flip.newVal;
+        }
+    }
+
+    std::vector<UnresolvedVoxel> unresolved;
+    for (const auto& vec : leafUnresolved) {
+        unresolved.insert(unresolved.end(), vec.begin(), vec.end());
+    }
+    if (unresolved.empty()) {
+        return;
+    }
+
+    std::unordered_set<openvdb::Coord, CoordHash> unresolvedSet;
+    unresolvedSet.reserve(unresolved.size() * 2);
+    for (const UnresolvedVoxel& u : unresolved) {
+        unresolvedSet.insert(u.ijk);
+    }
+    std::unordered_set<openvdb::Coord, CoordHash> conflictSet;
+    for (const auto& vec : leafConflicts) {
+        conflictSet.insert(vec.begin(), vec.end());
+    }
+
+    openvdb::tree::ValueAccessor<const openvdb::FloatTree> acc(sdfGrid.tree());
+    struct WaveUpdate {
+        std::size_t leafIdx;
+        openvdb::Index pos;
+        float newVal;
+    };
+    std::vector<WaveUpdate> roundUpdates;
+    std::vector<openvdb::Coord> roundResolvedCoords;
+    std::vector<openvdb::Coord> roundConflictCoords;
+    std::vector<UnresolvedVoxel> nextUnresolved;
+
+    for (int round = 0; round < 64 && !unresolved.empty(); ++round) {
+        roundUpdates.clear();
+        roundResolvedCoords.clear();
+        roundConflictCoords.clear();
+        nextUnresolved.clear();
+
+        for (const UnresolvedVoxel& u : unresolved) {
+            const openvdb::Vec3d centerA(
+                static_cast<double>(u.ijk.x()),
+                static_cast<double>(u.ijk.y()),
+                static_cast<double>(u.ijk.z()));
+            bool seesExt = false;
+            bool seesInt = false;
+            for (int m = 0; m < 26; ++m) {
+                const openvdb::Coord nijk = u.ijk + kOffsets26[m];
+                if (unresolvedSet.count(nijk) || conflictSet.count(nijk)) {
+                    continue;
+                }
+                const float nval = acc.getValue(nijk);
+                if (std::abs(nval) <= kZeroEpsMm) {
+                    continue;
+                }
+                if (nval > 0.0f && !seesExt) {
+                    const openvdb::Vec3d centerB(
+                        static_cast<double>(nijk.x()),
+                        static_cast<double>(nijk.y()),
+                        static_cast<double>(nijk.z()));
+                    if (!bvh.segmentIntersectsAny(centerA, centerB)) {
+                        seesExt = true;
+                    }
+                } else if (nval < 0.0f && !seesInt) {
+                    const openvdb::Vec3d centerB(
+                        static_cast<double>(nijk.x()),
+                        static_cast<double>(nijk.y()),
+                        static_cast<double>(nijk.z()));
+                    if (!bvh.segmentIntersectsAny(centerA, centerB)) {
+                        seesInt = true;
+                    }
+                }
+                if (seesExt && seesInt) {
+                    break;
+                }
+            }
+
+            if (seesExt && !seesInt) {
+                roundUpdates.push_back(WaveUpdate{u.leafIdx, u.pos, u.absVal});
+                roundResolvedCoords.push_back(u.ijk);
+            } else if (seesInt && !seesExt) {
+                roundUpdates.push_back(WaveUpdate{u.leafIdx, u.pos, -u.absVal});
+                roundResolvedCoords.push_back(u.ijk);
+            } else if (seesExt && seesInt) {
+                roundConflictCoords.push_back(u.ijk);
+            } else {
+                nextUnresolved.push_back(u);
+            }
+        }
+
+        if (roundResolvedCoords.empty() && roundConflictCoords.empty()) {
+            break;
+        }
+        for (const WaveUpdate& upd : roundUpdates) {
+            nodes[upd.leafIdx]->buffer().data()[upd.pos] = upd.newVal;
+        }
+        for (const openvdb::Coord& c : roundResolvedCoords) {
+            unresolvedSet.erase(c);
+        }
+        for (const openvdb::Coord& c : roundConflictCoords) {
+            unresolvedSet.erase(c);
+            conflictSet.insert(c);
+        }
+        unresolved.swap(nextUnresolved);
+    }
+
+    // Any remaining unresolved voxel is enclosed inside a sub-band thin wall with no
+    // unobstructed path to an exterior or deep-interior seed: treat as interior.
+    for (const UnresolvedVoxel& u : unresolved) {
+        nodes[u.leafIdx]->buffer().data()[u.pos] = -u.absVal;
+    }
+}
+
 openvdb::FloatGrid::Ptr buildSdfAndFilamentSlotGrids(
     const openvdb::math::Transform& xform,
     const std::vector<openvdb::Vec3s>& points,
@@ -898,7 +1369,7 @@ openvdb::FloatGrid::Ptr buildSdfAndFilamentSlotGrids(
     }
     const bool wantSlotGrid = hasMultiFilament && (outFilamentSlotGrid != nullptr);
     const bool wantColorGrid = hasSurfaceColors && (outSurfaceColorGrid != nullptr);
-    if ((!wantSlotGrid && !wantColorGrid) || points.empty() || triangles.empty()) {
+    if (points.empty() || triangles.empty()) {
         std::vector<openvdb::Vec4I> quads;
         return openvdb::tools::meshToSignedDistanceField<openvdb::FloatGrid>(
             xform, points, triangles, quads, exBandVoxels, inBandVoxels);
@@ -914,17 +1385,37 @@ openvdb::FloatGrid::Ptr buildSdfAndFilamentSlotGrids(
     openvdb::tools::QuadAndTriangleDataAdapter<openvdb::Vec3s, openvdb::Vec3I> meshAdapter(
         indexSpacePoints.get(), numPoints, &triangles[0], triangles.size());
 
-    openvdb::Int32Grid::Ptr polyIdxGrid =
-        openvdb::Int32Grid::create(openvdb::Int32(openvdb::util::INVALID_IDX));
-    polyIdxGrid->setTransform(xform.copy());
+    openvdb::Int32Grid::Ptr polyIdxGrid;
+    if (wantSlotGrid || wantColorGrid) {
+        polyIdxGrid = openvdb::Int32Grid::create(openvdb::Int32(openvdb::util::INVALID_IDX));
+        polyIdxGrid->setTransform(xform.copy());
+    }
 
+    // Disable OpenVDB's default post-voxelization renormalization pass (`Offset(-0.8*dx) ->
+    // Renormalize -> MinCombine -> Offset(+0.8*dx)`), which performs a morphological closing of
+    // radius `0.8 * voxelSize` that fills sharp concave 90-degree corners with phantom negative SDF.
+    // Intersecting-voxel removal remains enabled, and `repairIntersectingVoxelSigns` fixes
+    // OpenVDB's `ComputeIntersectingVoxelSign` half-space sign flips at concave corners.
     openvdb::FloatGrid::Ptr sdfGrid = openvdb::tools::meshToVolume<openvdb::FloatGrid>(
         meshAdapter,
         xform,
         exBandVoxels,
         inBandVoxels,
-        0,
+        openvdb::tools::DISABLE_RENORMALIZATION,
         polyIdxGrid.get());
+
+    if (sdfGrid) {
+        repairIntersectingVoxelSigns(
+            *sdfGrid,
+            indexSpacePoints.get(),
+            numPoints,
+            triangles,
+            static_cast<float>(xform.voxelSize()[0]));
+    }
+
+    if (!wantSlotGrid && !wantColorGrid) {
+        return sdfGrid;
+    }
 
     openvdb::FloatGrid::Ptr slotGrid;
     if (wantSlotGrid) {
@@ -8805,6 +9296,25 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     };
     std::vector<std::vector<DeferredCoreFragment>> deferredCoreFragments(numLayers);
 
+    const openvdb::Vec3f fallbackNozzle = [&]() -> openvdb::Vec3f {
+        openvdb::Vec3f n(impl_->nozzleAxisBed[0], impl_->nozzleAxisBed[1], impl_->nozzleAxisBed[2]);
+        const float len = n.length();
+        return (len > 1.0e-6f) ? (n / len) : openvdb::Vec3f(0.0f, 0.0f, 1.0f);
+    }();
+    float objMinAxialBed = std::numeric_limits<float>::max();
+    for (const auto& v : rec.vertexBuffer) {
+        const float proj = v.x * fallbackNozzle.x() +
+                           v.y * fallbackNozzle.y() +
+                           v.z * fallbackNozzle.z();
+        objMinAxialBed = std::min(objMinAxialBed, proj);
+    }
+    if (!std::isfinite(objMinAxialBed)) {
+        objMinAxialBed = rec.minZ;
+    }
+    const openvdb::Vec3SGrid* toolAxisPtr = rec.toolAxisGrid.get();
+    const openvdb::Vec3SGrid* coarseToolAxisPtr =
+        useDualGridExtraction ? rec.coarseToolAxisGrid.get() : nullptr;
+
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, numLayers),
         [&](const tbb::blocked_range<std::size_t>& r) {
@@ -8817,6 +9327,23 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             auto fineEikAcc = fineEikGrid.getConstAccessor();
             openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
                 fineEikSampler(fineEikAcc, fineEikGrid.transform());
+            auto eikAcc = eikGrid.getConstAccessor();
+            openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+                coarseEikSampler(eikAcc, eikGrid.transform());
+            using Vec3ConstAcc = openvdb::Vec3SGrid::ConstAccessor;
+            using Vec3BoxSampler = openvdb::tools::GridSampler<Vec3ConstAcc, openvdb::tools::BoxSampler>;
+            std::unique_ptr<Vec3ConstAcc> toolAccPtr;
+            std::unique_ptr<Vec3BoxSampler> toolSamplerPtr;
+            if (toolAxisPtr != nullptr) {
+                toolAccPtr = std::make_unique<Vec3ConstAcc>(toolAxisPtr->getConstAccessor());
+                toolSamplerPtr = std::make_unique<Vec3BoxSampler>(*toolAccPtr, toolAxisPtr->transform());
+            }
+            std::unique_ptr<Vec3ConstAcc> cToolAccPtr;
+            std::unique_ptr<Vec3BoxSampler> cToolSamplerPtr;
+            if (coarseToolAxisPtr != nullptr) {
+                cToolAccPtr = std::make_unique<Vec3ConstAcc>(coarseToolAxisPtr->getConstAccessor());
+                cToolSamplerPtr = std::make_unique<Vec3BoxSampler>(*cToolAccPtr, coarseToolAxisPtr->transform());
+            }
             auto bAcc = branchGrid.getConstAccessor();
             auto skinErodeAcc = skinErodeDepthGrid.getConstAccessor();
             openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
@@ -8828,6 +9355,62 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 -std::max(rec.fineShellInnerDepthMm - 1.75f * fineVoxelSize, 1.5f * fineVoxelSize);
             const float fineOuterCutoff = fineSdfGrid.background() - 1.5f * fineVoxelSize;
             const float shellThicknessMm = std::max(0.4f, impl_->shellPathSpec.shell_thickness_mm);
+
+            auto sampleLocalNozzleAxis = [&](const openvdb::Vec3d& wp) -> openvdb::Vec3f {
+                if (cToolSamplerPtr != nullptr && fineSdfSampler.wsSample(wp) <= fineInnerCutoff) {
+                    const openvdb::Vec3s v = cToolSamplerPtr->wsSample(wp);
+                    const openvdb::Vec3f raw(v.x(), v.y(), v.z());
+                    if (raw.lengthSqr() > 1.0e-4f) {
+                        return raw / raw.length();
+                    }
+                }
+                if (toolSamplerPtr != nullptr) {
+                    const openvdb::Vec3s v = toolSamplerPtr->wsSample(wp);
+                    const openvdb::Vec3f raw(v.x(), v.y(), v.z());
+                    if (raw.lengthSqr() > 1.0e-4f) {
+                        return raw / raw.length();
+                    }
+                }
+                const auto nb = queryNozzleFrame(
+                    {static_cast<float>(wp.x()), static_cast<float>(wp.y()), static_cast<float>(wp.z())},
+                    {1.0f, 0.0f, 0.0f});
+                return openvdb::Vec3f(nb.nozzle_axis[0], nb.nozzle_axis[1], nb.nozzle_axis[2]);
+            };
+
+            const float coarseEikValidLimit = eikBg - std::max(0.5f * voxelSize, 0.5f);
+            auto sampleEikGradNormAt = [&](const openvdb::Vec3d& wp) -> float {
+                const bool useCoarse =
+                    useDualGridExtraction && (fineSdfSampler.wsSample(wp) <= fineInnerCutoff);
+                const auto& activeEik = useCoarse ? coarseEikSampler : fineEikSampler;
+                const auto& activeSdf = useCoarse ? sdfSampler : fineSdfSampler;
+                const float stepVoxel = useCoarse ? voxelSize : fineVoxelSize;
+                const float h = 0.5f * stepVoxel;
+                const float sdfCut = 0.05f * stepVoxel;
+                const float t0 = activeEik.wsSample(wp);
+                auto axisDeriv = [&](float dx, float dy, float dz) -> float {
+                    const openvdb::Vec3d pP(wp.x() + dx, wp.y() + dy, wp.z() + dz);
+                    const openvdb::Vec3d pM(wp.x() - dx, wp.y() - dy, wp.z() - dz);
+                    const float tP = activeEik.wsSample(pP);
+                    const float tM = activeEik.wsSample(pM);
+                    const bool inP = activeSdf.wsSample(pP) <= sdfCut;
+                    const bool inM = activeSdf.wsSample(pM) <= sdfCut;
+                    if (inP && inM) {
+                        return (tP - tM) / (2.0f * h);
+                    }
+                    if (inP) {
+                        return (tP - t0) / h;
+                    }
+                    if (inM) {
+                        return (t0 - tM) / h;
+                    }
+                    return (tP - tM) / (2.0f * h);
+                };
+                const float gx = axisDeriv(h, 0.0f, 0.0f);
+                const float gy = axisDeriv(0.0f, h, 0.0f);
+                const float gz = axisDeriv(0.0f, 0.0f, h);
+                const float g = std::sqrt(gx * gx + gy * gy + gz * gz);
+                return (std::isfinite(t0) && t0 < coarseEikValidLimit && g > 1.0e-4f) ? g : 1.0f;
+            };
 
             auto sampleCompositeSdf = [&](const openvdb::Vec3d& wp) -> float {
                 float baseSdf = 0.0f;
@@ -9329,6 +9912,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     computeMeshNormals(verts, inds);
 
                     bool anyErodedByConformalSkin = false;
+                    bool anyClippedByUnderside = false;
                     auto sampleErodedCoreSdf = [&](const openvdb::Vec3d& wp) -> float {
                         float s = sampleCompositeSdf(wp);
                         if (!conformalSkinPatches.empty() &&
@@ -9382,10 +9966,81 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         return s;
                     };
 
+                    // Underside bead-bottom containment: ensure no non-first core layer extrudes
+                    // a bead whose bottom (nozzle_tip - 0.85 * hLocal * nozzle_axis) protrudes outside
+                    // the CAD surface into free air below downward-facing overhangs/ceilings.
+                    const float meanLayerH = std::max(0.02f, pl.meanThicknessMm);
+                    const float layerMinH = 0.02f;
+                    const float layerMaxH = std::max({2.0f * hMax, meanLayerH, pl.maxThicknessMm});
+                    const float hLocalCap = std::min(layerMaxH, std::max(meanLayerH, pl.maxThicknessMm));
+                    const bool isUniformThicknessLayer =
+                        (std::abs(pl.maxThicknessMm - pl.minThicknessMm) <= 1.0e-4f);
+                    float layerMeanGrad = 1.0f;
+                    if (!isUniformThicknessLayer && !pl.isFirstLayer && !verts.empty()) {
+                        double sumInvGrad = 0.0;
+                        std::size_t cntGrad = 0;
+                        for (std::size_t i = 0; i < verts.size(); ++i) {
+                            const openvdb::Vec3d wp(verts[i].x, verts[i].y, verts[i].z);
+                            if (sampleCompositeSdf(wp) > 0.0f) {
+                                continue;
+                            }
+                            const float g = sampleEikGradNormAt(wp);
+                            if (g > 0.20f && g < 4.0f) {
+                                sumInvGrad += 1.0 / static_cast<double>(g);
+                                ++cntGrad;
+                            }
+                        }
+                        if (cntGrad > 0 && sumInvGrad > 1.0e-8) {
+                            layerMeanGrad =
+                                static_cast<float>(static_cast<double>(cntGrad) / sumInvGrad);
+                        }
+                    }
+
+                    auto sampleUndersideSafeCoreSdf = [&](const openvdb::Vec3d& wp) -> float {
+                        float s = sampleErodedCoreSdf(wp);
+                        if (!pl.isFirstLayer && s <= 1.5f * voxelSize) {
+                            const float hBedWp = static_cast<float>(
+                                wp.x() * fallbackNozzle.x() +
+                                wp.y() * fallbackNozzle.y() +
+                                wp.z() * fallbackNozzle.z()) - objMinAxialBed;
+                            if (hBedWp > 1.05f * hFirst) {
+                                float hLocal = meanLayerH;
+                                if (!isUniformThicknessLayer) {
+                                    const float g = sampleEikGradNormAt(wp);
+                                    if (g > 0.20f) {
+                                        hLocal = std::clamp(
+                                            meanLayerH * (layerMeanGrad / g),
+                                            layerMinH,
+                                            hLocalCap);
+                                    }
+                                }
+                                if (s >= -(1.5f * layerMaxH + 2.0f * fineVoxelSize)) {
+                                    const openvdb::Vec3f localNoz = sampleLocalNozzleAxis(wp);
+                                    const openvdb::Vec3d wpBot(
+                                        wp.x() - static_cast<double>(0.85f * hLocal * localNoz.x()),
+                                        wp.y() - static_cast<double>(0.85f * hLocal * localNoz.y()),
+                                        wp.z() - static_cast<double>(0.85f * hLocal * localNoz.z()));
+                                    const float hBedBot = static_cast<float>(
+                                        wpBot.x() * fallbackNozzle.x() +
+                                        wpBot.y() * fallbackNozzle.y() +
+                                        wpBot.z() * fallbackNozzle.z()) - objMinAxialBed;
+                                    if (hBedBot > 0.05f * hFirst) {
+                                        const float sBot = sampleCompositeSdf(wpBot);
+                                        if (s <= 0.0f && sBot > 0.0f) {
+                                            anyClippedByUnderside = true;
+                                        }
+                                        s = std::max(s, sBot);
+                                    }
+                                }
+                            }
+                        }
+                        return s;
+                    };
+
                     std::vector<float> vertSdf(verts.size(), 0.0f);
                     for (std::size_t i = 0; i < verts.size(); ++i) {
                         const openvdb::Vec3d wp(verts[i].x, verts[i].y, verts[i].z);
-                        vertSdf[i] = sampleErodedCoreSdf(wp);
+                        vertSdf[i] = sampleUndersideSafeCoreSdf(wp);
                     }
 
                     // Conformal Thin-Wall Valley Edge Split:
@@ -9427,7 +10082,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                 verts[lo].x + 0.50f * edx,
                                 verts[lo].y + 0.50f * edy,
                                 verts[lo].z + 0.50f * edz);
-                            const float sMid = sampleErodedCoreSdf(wpMid);
+                            const float sMid = sampleUndersideSafeCoreSdf(wpMid);
                             float bestT = 0.50f;
                             float bestSdf = std::min(minEndpointSdf, sMid);
 
@@ -9439,7 +10094,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                         verts[lo].x + tCand * edx,
                                         verts[lo].y + tCand * edy,
                                         verts[lo].z + tCand * edz);
-                                    const float sCand = sampleErodedCoreSdf(wpCand);
+                                    const float sCand = sampleUndersideSafeCoreSdf(wpCand);
                                     if (sCand < bestSdf) {
                                         bestSdf = sCand;
                                         bestT = tCand;
@@ -9961,6 +10616,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     if (info.indices.empty() &&
                         deferredCoreFragments[idx].empty() &&
                         !anyErodedByConformalSkin &&
+                        !anyClippedByUnderside &&
                         pl.sdfClipAllowance > 0.0f) {
                         clipAgainstSdfThreshold(pl.sdfClipAllowance);
                     }
@@ -9969,7 +10625,8 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     // find the minimum SDF on the branch's isosurface sheet and clip with a small margin.
                     if (info.indices.empty() &&
                         deferredCoreFragments[idx].empty() &&
-                        !anyErodedByConformalSkin) {
+                        !anyErodedByConformalSkin &&
+                        !anyClippedByUnderside) {
                         float minBranchSdf = std::numeric_limits<float>::max();
                         const int targetBranch = static_cast<int>(pl.branchId);
                         for (std::size_t t = 0; t + 2 < inds.size(); t += 3) {
@@ -10003,7 +10660,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         });
 
     // ------------------------------------------------------------------------
-    // 5c. Extract Conformal SDF Skin Layers (\phi_sdf = -(N_p - m + 0.15) * hTop)
+    // 5c. Extract Conformal SDF Skin Layers (\phi_sdf = -(N_p - m) * hTop)
     //     and Schedule Causally at Each Patch's Completion Isovalue \tau_completion
     // ------------------------------------------------------------------------
     if (!conformalSkinPatches.empty()) {
@@ -10152,7 +10809,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     }
                     const auto& patchSdfGrid = *patchSdfGrids[pIdx];
 
-                    const float phiRef = -0.15f * hTop;
+                    const float phiRef = 0.0f;
                     std::vector<openvdb::Vec3s> points;
                     std::vector<openvdb::Vec3I> triangles;
                     std::vector<openvdb::Vec4I> quads;
@@ -10269,8 +10926,8 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         RenderVertex cv = lerpSkinVertex(verts[lo], verts[hi], t);
                         const openvdb::Vec3d wpC(cv.x, cv.y, cv.z);
                         const float cSdf = fineSdfSampler.wsSample(wpC);
-                        if (cSdf > -0.02f * hTop) {
-                            const float pushIn = cSdf + 0.05f * hTop;
+                        if (cSdf > 0.002f) {
+                            const float pushIn = cSdf;
                             cv.x -= pushIn * cv.nx;
                             cv.y -= pushIn * cv.ny;
                             cv.z -= pushIn * cv.nz;
@@ -10522,11 +11179,19 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                         skinInfo.is_top_layer = true;
                         skinInfo.vertices.reserve(numTopVerts);
 
+                        const bool isOutermostSkinLayer = (m == patch.skinLayers);
                         for (std::size_t v = 0; v < numTopVerts; ++v) {
                             openvdb::Vec3f p = pTop[v] + deltaDepthMm * dSlide[v];
                             const openvdb::Vec3d wp(p.x(), p.y(), p.z());
                             const float cSdf = fineSdfSampler.wsSample(wp);
-                            if (cSdf > -0.04f * hTop) {
+                            if (isOutermostSkinLayer) {
+                                if (cSdf > 0.002f) {
+                                    openvdb::Vec3f nOut = nPatch[v];
+                                    sampleFineSdfGradUnit(wp, nOut);
+                                    const float pushIn = cSdf;
+                                    p -= pushIn * nOut;
+                                }
+                            } else if (cSdf > -0.04f * hTop) {
                                 openvdb::Vec3f nOut = nPatch[v];
                                 sampleFineSdfGradUnit(wp, nOut);
                                 const float pushIn = cSdf + 0.05f * hTop;
@@ -11543,7 +12208,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             inVertContact)) {
                         return -1000.0f + sNowRaw;
                     }
-                    const float reqClearance = xyGapMm + 0.65f * rCenterClear;
+                    const float reqClearance = xyGapMm + rCenterClear;
                     const float sNow = normalizeOpenAirSdf(sNowRaw, reqClearance);
                     const float roofVertDist = std::max(zGapMm, nodeRoofH - hCand + zGapMm);
                     const float floorVertDist = (!onBedOnly && nodeFloorH > 1.0e-3f)
@@ -11555,7 +12220,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             ? reqClearance
                             : sNow;
                     float minLookSdf = effNow;
-                    const std::array<float, 5> lookaheadOffsetsMm{1.2f, 2.8f, 5.5f, 9.5f, 15.0f};
+                    const std::array<float, 6> lookaheadOffsetsMm{1.2f, 2.4f, 3.8f, 5.5f, 9.5f, 15.0f};
                     for (const float dhLook : lookaheadOffsetsMm) {
                         const float hProbe = hCand - dhLook;
                         if (hProbe <= 0.1f) {
@@ -11816,7 +12481,7 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             if (bestScore < 0.35f) {
                                 float hBlocked = -1.0f;
                                 const float reqClear =
-                                    xyGapMm + 0.65f * std::min(node.radius, tipRadiusMm);
+                                    xyGapMm + std::min(node.radius, tipRadiusMm);
                                 const float hMinProbe =
                                     onBedOnly ? 0.25f : std::max(0.25f, node.floorH + 0.8f * targetLayerH);
                                 for (float hProbe = hNext - 0.8f; hProbe >= hMinProbe; hProbe -= 0.8f) {
@@ -11976,7 +12641,9 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 }
                                 const float pushNorm = std::hypot(pushU, pushV);
                                 if (blockedCount > 0 && blockedCount < 14 && pushNorm > 1.0e-4f) {
-                                    const float nudgeFrac = 0.55f;
+                                    const bool currPerimClear =
+                                        isTrunkPerimeterClear(node.u, node.v, hNext, node.radius, inVertContact);
+                                    const float nudgeFrac = currPerimClear ? 0.55f : 0.90f;
                                     const float nudgeDist = nudgeFrac * remSteer;
                                     const float nudgeU = node.u + nudgeDist * (pushU / pushNorm);
                                     const float nudgeV = node.v + nudgeDist * (pushV / pushNorm);
@@ -11985,7 +12652,8 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                     if (nudgeDist > 1.0e-4f &&
                                         nudgeScore >= straightScore - 0.10f &&
                                         hasSupportClearanceAtUVH(nudgeU, nudgeV, hNext, 0.0f, inVertContact) &&
-                                        isTrunkPerimeterClear(nudgeU, nudgeV, hNext, node.radius, inVertContact)) {
+                                        (!currPerimClear ||
+                                         isTrunkPerimeterClear(nudgeU, nudgeV, hNext, node.radius, inVertContact))) {
                                         node.u = nudgeU;
                                         node.v = nudgeV;
                                         usedLatStep = std::hypot(node.u - startU, node.v - startV);
@@ -12304,19 +12972,30 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                         return kStart;
                     };
 
-                    const float minTipExtraR = std::max(0.0f, 0.70f * tipRadiusMm - 0.5f * lineWidthMm);
+                    const float minTipExtraR = std::max(0.0f, tipRadiusMm - 0.5f * lineWidthMm);
                     auto isStraightenedStationClear = [&](float uVal,
                                                           float vVal,
                                                           float hVal,
                                                           float roofHVal,
                                                           float floorHVal) -> bool {
                         const bool vertZ = isVerticalContactZoneAtH(hVal, roofHVal, floorHVal);
-                        return hasSupportClearanceAtUVH(
-                            uVal,
-                            vVal,
-                            hVal,
-                            vertZ ? 0.0f : minTipExtraR,
-                            vertZ);
+                        if (!hasSupportClearanceAtUVH(
+                                uVal,
+                                vVal,
+                                hVal,
+                                vertZ ? 0.0f : minTipExtraR,
+                                vertZ)) {
+                            return false;
+                        }
+                        if (!vertZ && minTipExtraR > 0.0f) {
+                            return isTrunkPerimeterClear(
+                                uVal,
+                                vVal,
+                                hVal,
+                                std::max(0.5f * lineWidthMm, tipRadiusMm - 0.5f * lineWidthMm),
+                                false);
+                        }
+                        return true;
                     };
 
                     std::vector<std::vector<std::size_t>> childrenOf(treeBranches.size());
@@ -12791,21 +13470,25 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             }
                             runningTargetR = std::min(
                                 maxTrunkRadiusMm,
-                                std::max(runningTargetR, st.radius + (0.18f + flareSlope) * dhSeg));
+                                std::max(runningTargetR, br.stations[k - 1].radius) +
+                                    (0.18f + flareSlope) * dhSeg);
                             const float maxDrStep = 0.42f * dhSeg * tanBranchMax;
                             const float desiredR = std::min(
                                 maxTrunkRadiusMm,
                                 std::min(runningTargetR, br.stations[k - 1].radius + maxDrStep));
-                            if (desiredR > st.radius) {
-                                const bool vertZ =
-                                    isVerticalContactZoneAtH(st.h, br.roofH, br.floorH);
-                                if (isTrunkPerimeterClear(st.u, st.v, st.h, desiredR, vertZ)) {
-                                    st.radius = desiredR;
+                            const bool vertZ =
+                                isVerticalContactZoneAtH(st.h, br.roofH, br.floorH);
+                            const bool currClear =
+                                isTrunkPerimeterClear(st.u, st.v, st.h, st.radius, vertZ);
+                            if (desiredR > st.radius || !currClear) {
+                                const float searchHi = std::max(desiredR, tipRadiusMm);
+                                if (isTrunkPerimeterClear(st.u, st.v, st.h, searchHi, vertZ)) {
+                                    st.radius = searchHi;
                                 } else {
-                                    float rLow = st.radius;
-                                    float rHigh = desiredR;
+                                    float rLow = currClear ? st.radius : tipRadiusMm;
+                                    float rHigh = searchHi;
                                     float bestR = rLow;
-                                    for (int iter = 0; iter < 5; ++iter) {
+                                    for (int iter = 0; iter < 6; ++iter) {
                                         const float rMid = 0.5f * (rLow + rHigh);
                                         if (isTrunkPerimeterClear(st.u, st.v, st.h, rMid, vertZ)) {
                                             bestR = rMid;

@@ -702,16 +702,22 @@ fn compensate_wall_geometry(
         let z_nozzle = curr.nozzle_bed.try_normalize().unwrap_or(up_bed);
         let mut delta = Vec3::ZERO;
 
-        // 1. Flat-nozzle slope clearance along local `z_nozzle`
+        // 1. Flat-nozzle slope clearance along local `z_nozzle` using the true local angle
+        //    between `z_nozzle` and the slicing isosurface normal (`tool_iso_angle_deg`),
+        //    so 5-axis walls aligned with `z_nozzle` are never pushed outward.
         if enable_flat_nozzle && is_outer {
-            let cos_alpha = z_nozzle.dot(up_bed).abs().clamp(0.0, 1.0);
-            let sin_alpha = (1.0 - cos_alpha * cos_alpha).max(0.0).sqrt();
+            let alpha = curr
+                .tool_iso_angle_deg
+                .to_radians()
+                .clamp(0.0, std::f32::consts::FRAC_PI_2);
+            let cos_alpha = alpha.cos();
+            let sin_alpha = alpha.sin();
             let dz_slope = (r_flat * sin_alpha * (1.0 - cos_alpha)).min(0.45 * curr.height_mm);
             delta += z_nozzle * dz_slope;
         }
 
-        // 2. Viscoelastic die-swell inset (note: `path_generator.cpp` already extracts `OuterWall`
-        //    at `d_outer = 0.5 * local_outer_width`, so only die-swell inset is applied here).
+        // 2. Viscoelastic die-swell inset (`path_generator.cpp` orients `OuterWall` chains so
+        //    `z_nozzle × tangent` points strictly inward).
         if is_outer {
             let inward_dir = z_nozzle.cross(tangent).try_normalize().unwrap_or(Vec3::Y);
             let est_q = curr.width_mm * curr.height_mm * nominal_speed_mms;
@@ -1464,17 +1470,19 @@ fn finalize_chain_seam_and_wipe(chain: &mut WorkingChain, cfg: &GcodeProcessConf
         let l_scarf = cfg.scarf_length_mm.min(0.35 * total_len).max(1.0);
         let k_steps = ((l_scarf / 0.40).ceil() as usize).clamp(4, 32);
         let ds = l_scarf / (k_steps as f32);
-        let h_start = cfg.scarf_start_height_ratio.clamp(0.05, 0.50);
+        let h_start = cfg.scarf_start_height_ratio.clamp(0.20, 0.50);
 
         let mut out: Vec<WorkingVertex> = Vec::with_capacity(chain.pts.len() + 2 * k_steps + 4);
 
         // Lead-in bottom wedge (s in [0, l_scarf]): displaced downward along -nozzle_bed
+        // (capped <= 0.80 * height_mm to stay safely inside the 0.85 * h underside containment envelope).
         for k in 0..=k_steps {
             let tau = (k as f32) / (k_steps as f32);
             let h_frac = h_start + (1.0 - h_start) * tau;
             let mut v = sample_closed_loop_at_arc_length(&chain.pts, (k as f32) * ds);
             let z_axis = v.nozzle_bed.try_normalize().unwrap_or(Vec3::Z);
-            v.pos_bed -= z_axis * ((1.0 - h_frac) * v.height_mm);
+            let scarf_drop = ((1.0 - h_frac) * v.height_mm).min(0.80 * v.height_mm);
+            v.pos_bed -= z_axis * scarf_drop;
             v.flow_rate_mult = h_frac;
             v.kind_override = Some(PlannedMoveKind::ScarfSeam);
             out.push(v);
@@ -9361,5 +9369,79 @@ mod tests {
         assert!(g.contains("M104 S215 T1 ; Preheat tool T1"));
         assert!(g.contains("T1 ; Switch tool"));
         assert!(g.contains("M104 S0 T3 ; Turn off INDX tool T3"));
+    }
+
+    #[test]
+    fn test_compensate_wall_geometry_uses_tool_iso_angle_not_bed_z() {
+        let zero_swell_fluid = FluidDynamicsModel {
+            pa_zero: 0.04,
+            pa_alpha: 0.0,
+            pa_max: 0.08,
+            q_low: 2.0,
+            swell_k: 0.0,
+            swell_m: 1.0,
+            delta_t: 0.0,
+        };
+
+        let make_chain = |nozzle_bed: Vec3, tool_iso_angle_deg: f32| {
+            let mk = |y: f32| WorkingVertex {
+                pos_bed: Vec3::new(0.0, y, 5.0),
+                nozzle_bed,
+                width_mm: 0.40,
+                height_mm: 0.20,
+                flow_rate_mult: 1.0,
+                kind_override: None,
+                tool_iso_angle_deg,
+                uses_surface_normal: false,
+                sdf_mm: -0.20,
+            };
+            WorkingChain {
+                pts: vec![mk(0.0), mk(2.0), mk(4.0)],
+                base_kind: PlannedMoveKind::OuterWall,
+                wall_index: 0,
+                filament_slot: 0,
+                is_closed: false,
+            }
+        };
+
+        // Case A: 5-axis wall tilted 35 deg from bed Z, aligned with local nozzle (`tool_iso_angle_deg = 0`).
+        let z_tilted = Vec3::new(35.0f32.to_radians().sin(), 0.0, 35.0f32.to_radians().cos())
+            .normalize();
+        let mut chain_a = make_chain(z_tilted, 0.0);
+        let before_a = chain_a.pts[1].pos_bed;
+        compensate_wall_geometry(
+            &mut chain_a,
+            0.40,
+            0.40,
+            Vec3::Z,
+            &zero_swell_fluid,
+            60.0,
+            true,
+        );
+        let delta_a = chain_a.pts[1].pos_bed - before_a;
+        assert!(
+            delta_a.dot(z_tilted).abs() < 1.0e-5,
+            "5-axis wall aligned with local nozzle axis (tool_iso_angle_deg=0) must not get flat-nozzle shift: {:?}",
+            delta_a
+        );
+
+        // Case B: Vertical nozzle (`Vec3::Z`) printing across a 35 deg sloped isosurface (`tool_iso_angle_deg = 35`).
+        let mut chain_b = make_chain(Vec3::Z, 35.0);
+        let before_b = chain_b.pts[1].pos_bed;
+        compensate_wall_geometry(
+            &mut chain_b,
+            0.40,
+            0.40,
+            Vec3::Z,
+            &zero_swell_fluid,
+            60.0,
+            true,
+        );
+        let delta_b = chain_b.pts[1].pos_bed - before_b;
+        assert!(
+            delta_b.dot(Vec3::Z) > 0.01,
+            "Sloped isosurface relative to nozzle (tool_iso_angle_deg=35) must apply flat-nozzle elevation along local z_nozzle: {:?}",
+            delta_b
+        );
     }
 }
