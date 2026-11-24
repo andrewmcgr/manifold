@@ -2927,20 +2927,62 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
         }
     }
 
+    struct SkinCapTri {
+        Vec3f a;
+        Vec3f b;
+        Vec3f c;
+    };
     const float skinVetoCell = std::max(1.0f, 2.0f * hMax);
     const float invSkinVetoCell = 1.0f / skinVetoCell;
-    std::unordered_map<GridKey3D, std::vector<Vec3f>, GridKey3DHash> skinVertBuckets;
+    std::vector<SkinCapTri> skinCapTris;
+    std::unordered_map<GridKey3D, std::vector<std::uint32_t>, GridKey3DHash> skinTriBuckets;
     if (enableTopSurfaceLofting && anyConformalSkinLayer) {
-        const float invDedupCell = 1.0f / 0.35f;
-        std::unordered_set<GridKey3D, GridKey3DHash> seenSkinDedup;
+        std::size_t approxTris = 0;
+        for (std::size_t k = 0; k < numLayers; ++k) {
+            if (isConformalSkinFlags[k]) {
+                approxTris += selectedLayers.layers[k].indices.size() / 3;
+            }
+        }
+        skinCapTris.reserve(approxTris);
         for (std::size_t k = 0; k < numLayers; ++k) {
             if (!isConformalSkinFlags[k]) {
                 continue;
             }
-            for (const auto& rv : selectedLayers.layers[k].vertices) {
-                const Vec3f v{rv.x, rv.y, rv.z};
-                if (seenSkinDedup.insert(toGridKey(v, invDedupCell)).second) {
-                    skinVertBuckets[toGridKey(v, invSkinVetoCell)].push_back(v);
+            const auto& layerVerts = selectedLayers.layers[k].vertices;
+            const auto& layerInds = selectedLayers.layers[k].indices;
+            for (std::size_t t = 0; t + 2 < layerInds.size(); t += 3) {
+                const std::uint32_t i0 = layerInds[t + 0];
+                const std::uint32_t i1 = layerInds[t + 1];
+                const std::uint32_t i2 = layerInds[t + 2];
+                if (i0 >= layerVerts.size() ||
+                    i1 >= layerVerts.size() ||
+                    i2 >= layerVerts.size()) {
+                    continue;
+                }
+                const auto& va = layerVerts[i0];
+                const auto& vb = layerVerts[i1];
+                const auto& vc = layerVerts[i2];
+                const Vec3f a{va.x, va.y, va.z};
+                const Vec3f b{vb.x, vb.y, vb.z};
+                const Vec3f c{vc.x, vc.y, vc.z};
+                const auto triIdx = static_cast<std::uint32_t>(skinCapTris.size());
+                skinCapTris.push_back(SkinCapTri{a, b, c});
+                const Vec3f triMin{
+                    std::min({a.x, b.x, c.x}),
+                    std::min({a.y, b.y, c.y}),
+                    std::min({a.z, b.z, c.z})};
+                const Vec3f triMax{
+                    std::max({a.x, b.x, c.x}),
+                    std::max({a.y, b.y, c.y}),
+                    std::max({a.z, b.z, c.z})};
+                const GridKey3D kMin = toGridKey(triMin, invSkinVetoCell);
+                const GridKey3D kMax = toGridKey(triMax, invSkinVetoCell);
+                for (int iz = kMin.iz; iz <= kMax.iz; ++iz) {
+                    for (int iy = kMin.iy; iy <= kMax.iy; ++iy) {
+                        for (int ix = kMin.ix; ix <= kMax.ix; ++ix) {
+                            skinTriBuckets[GridKey3D{ix, iy, iz}].push_back(triIdx);
+                        }
+                    }
                 }
             }
         }
@@ -4057,7 +4099,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         const Vec3f nBound = sampleOutwardSdfNormal(b, nIso, false);
                         const float phiBound = sampleSdf(b);
                         const float cNoz = dot3(nBound, zNoz);
-                        if (!dFromClipBoundary.empty() && phiBound < -0.5f * meanLayerH && cNoz > 0.2f) {
+                        if (!dFromClipBoundary.empty() && phiBound < -0.25f * meanLayerH && cNoz > 0.2f) {
                             continue;
                         }
 
@@ -6750,40 +6792,138 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     const float unsupLoftGuardRad = 1.5f * outerW.target_mm;
                     const float unsupLoftGuardRadSq = unsupLoftGuardRad * unsupLoftGuardRad;
 
-                    auto isUnderConformalSkin = [&](const Vec3f& p,
-                                                    const Vec3f& zNoz,
-                                                    float hNext,
-                                                    float w) -> bool {
-                        if (skinVertBuckets.empty()) {
-                            return false;
+                    auto evalConformalSkinLoftScale = [&](const Vec3f& p,
+                                                          const Vec3f& zNoz,
+                                                          float hNext,
+                                                          float w) -> float {
+                        if (skinTriBuckets.empty() || skinCapTris.empty()) {
+                            return 1.0f;
                         }
+                        const Vec3f refAxis = (std::abs(zNoz.x) < 0.9f)
+                            ? Vec3f{1.0f, 0.0f, 0.0f}
+                            : Vec3f{0.0f, 1.0f, 0.0f};
+                        const Vec3f e1 = normalize3(cross3(refAxis, zNoz), {1.0f, 0.0f, 0.0f});
+                        const Vec3f e2 = normalize3(cross3(zNoz, e1), {0.0f, 1.0f, 0.0f});
+
                         const Vec3f q = p + (zNoz * (0.5f * hNext));
                         const GridKey3D ck = toGridKey(q, invSkinVetoCell);
-                        const float maxLatSq = (1.25f * w) * (1.25f * w);
                         const float minDz = -0.15f * hMax;
-                        const float maxDz = hMax + 1.5f * meanLayerH;
+                        const float maxDz = hMax + 2.0f * meanLayerH;
+                        const float rOuter = 0.35f * w;
+                        const float rInner = 0.12f * w;
+                        float minLatDist = std::numeric_limits<float>::max();
+
                         for (int dzKey = -1; dzKey <= 1; ++dzKey) {
                             for (int dyKey = -1; dyKey <= 1; ++dyKey) {
                                 for (int dxKey = -1; dxKey <= 1; ++dxKey) {
                                     const GridKey3D nk{ck.ix + dxKey, ck.iy + dyKey, ck.iz + dzKey};
-                                    auto it = skinVertBuckets.find(nk);
-                                    if (it == skinVertBuckets.end()) {
+                                    auto it = skinTriBuckets.find(nk);
+                                    if (it == skinTriBuckets.end()) {
                                         continue;
                                     }
-                                    for (const Vec3f& sv : it->second) {
-                                        const Vec3f d = sv - p;
-                                        const float dz = dot3(d, zNoz);
-                                        if (dz > minDz && dz < maxDz) {
-                                            const float latSq = lengthSq3(d - (zNoz * dz));
-                                            if (latSq < maxLatSq) {
-                                                return true;
+                                    for (const std::uint32_t triIdx : it->second) {
+                                        const SkinCapTri& tri = skinCapTris[triIdx];
+                                        const Vec3f da = tri.a - p;
+                                        const Vec3f db = tri.b - p;
+                                        const Vec3f dc = tri.c - p;
+                                        const float za = dot3(da, zNoz);
+                                        const float zb = dot3(db, zNoz);
+                                        const float zc = dot3(dc, zNoz);
+                                        if (std::max({za, zb, zc}) <= minDz ||
+                                            std::min({za, zb, zc}) >= maxDz) {
+                                            continue;
+                                        }
+
+                                        const float ax = dot3(da, e1);
+                                        const float ay = dot3(da, e2);
+                                        const float bx = dot3(db, e1);
+                                        const float by = dot3(db, e2);
+                                        const float cx = dot3(dc, e1);
+                                        const float cy = dot3(dc, e2);
+
+                                        const float abx = bx - ax;
+                                        const float aby = by - ay;
+                                        const float acx = cx - ax;
+                                        const float acy = cy - ay;
+                                        const float apx = -ax;
+                                        const float apy = -ay;
+                                        const float d1 = abx * apx + aby * apy;
+                                        const float d2 = acx * apx + acy * apy;
+
+                                        float uB = 0.0f, vB = 0.0f, wB = 0.0f;
+                                        if (d1 <= 0.0f && d2 <= 0.0f) {
+                                            uB = 1.0f;
+                                        } else {
+                                            const float bpx = -bx;
+                                            const float bpy = -by;
+                                            const float d3 = abx * bpx + aby * bpy;
+                                            const float d4 = acx * bpx + acy * bpy;
+                                            if (d3 >= 0.0f && d4 <= d3) {
+                                                vB = 1.0f;
+                                            } else {
+                                                const float vc = d1 * d4 - d3 * d2;
+                                                if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+                                                    const float sEdge =
+                                                        d1 / std::max(d1 - d3, 1.0e-12f);
+                                                    uB = 1.0f - sEdge;
+                                                    vB = sEdge;
+                                                } else {
+                                                    const float cpx = -cx;
+                                                    const float cpy = -cy;
+                                                    const float d5 = abx * cpx + aby * cpy;
+                                                    const float d6 = acx * cpx + acy * cpy;
+                                                    if (d6 >= 0.0f && d5 <= d6) {
+                                                        wB = 1.0f;
+                                                    } else {
+                                                        const float vb = d5 * d2 - d1 * d6;
+                                                        if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+                                                            const float sEdge =
+                                                                d2 / std::max(d2 - d6, 1.0e-12f);
+                                                            uB = 1.0f - sEdge;
+                                                            wB = sEdge;
+                                                        } else {
+                                                            const float va = d3 * d6 - d5 * d4;
+                                                            if (va <= 0.0f &&
+                                                                (d4 - d3) >= 0.0f &&
+                                                                (d5 - d6) >= 0.0f) {
+                                                                const float sEdge = (d4 - d3) /
+                                                                    std::max((d4 - d3) + (d5 - d6),
+                                                                             1.0e-12f);
+                                                                vB = 1.0f - sEdge;
+                                                                wB = sEdge;
+                                                            } else {
+                                                                const float denom = 1.0f /
+                                                                    std::max(va + vb + vc, 1.0e-12f);
+                                                                vB = vb * denom;
+                                                                wB = vc * denom;
+                                                                uB = 1.0f - vB - wB;
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
+
+                                        const float zAtClosest = uB * za + vB * zb + wB * zc;
+                                        if (zAtClosest <= minDz || zAtClosest >= maxDz) {
+                                            continue;
+                                        }
+                                        const float qx = uB * ax + vB * bx + wB * cx;
+                                        const float qy = uB * ay + vB * by + wB * cy;
+                                        const float latDist = std::hypot(qx, qy);
+                                        if (latDist <= 1.0e-4f) {
+                                            return 0.0f;
+                                        }
+                                        minLatDist = std::min(minLatDist, latDist);
                                     }
                                 }
                             }
                         }
-                        return false;
+
+                        if (minLatDist > rOuter) {
+                            return 1.0f;
+                        }
+                        return smoothstep01(rInner, rOuter, minLatDist);
                     };
 
                     auto computeNextLayerStep = [&](const Vec3f& p, float h0) -> float {
@@ -6834,7 +6974,9 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             return 0.0f;
                         }
                         const float hNext = computeNextLayerStep(p, h0);
-                        if (isUnderConformalSkin(p, zNoz, hNext, w)) {
+                        const float skinLoftScale =
+                            evalConformalSkinLoftScale(p, zNoz, hNext, w);
+                        if (skinLoftScale <= 1.0e-4f) {
                             return 0.0f;
                         }
                         const float phiNext = sampleSdf(p + (zNoz * hNext));
@@ -6857,8 +6999,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
 
                         const Vec3f nTop = sampleTopSdfNormal(pSurf, zNoz);
                         const float cTop = dot3(nTop, zNoz);
-                        const float minCTop = isOuterWall ? 0.70f : 0.45f;
-                        const float fullCTop = isOuterWall ? 0.85f : 0.60f;
+                        const float minCTop = isOuterWall ? 0.55f : 0.45f;
+                        const float fullCTop = isOuterWall ? 0.72f : 0.60f;
                         if (cTop <= minCTop) {
                             return 0.0f;
                         }
@@ -6945,7 +7087,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         }
                         const float dClear = std::min(dSlope, phiAbove);
                         const float wExp = smoothstep01(0.0f, 0.45f * w, dClear);
-                        return dzGeom * wSlope * wExp;
+                        return dzGeom * wSlope * wExp * skinLoftScale;
                     };
 
                     auto lerpLoftPt = [](const ToolpathPoint& a,

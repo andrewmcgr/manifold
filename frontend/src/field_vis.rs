@@ -13988,6 +13988,261 @@ mod tests {
         let _ = ffi::remove_cad_object(part.object_id);
         crate::ui::sync_config_to_backend(&SlicerConfig::default());
     }
+
+    #[test]
+    fn test_conformal_cap_adjacent_collar_no_gap_or_deep_sdf_trench() {
+        let _guard = TEST_BACKEND_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut stl = String::from("solid conformal_cap_collar\n");
+        let mut add_tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+            stl.push_str(&format!(
+                "  facet normal 0 0 0\n    outer loop\n      vertex {} {} {}\n      vertex {} {} {}\n      vertex {} {} {}\n    endloop\n  endfacet\n",
+                a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]
+            ));
+        };
+        let mut add_quad = |p00: [f32; 3], p10: [f32; 3], p11: [f32; 3], p01: [f32; 3]| {
+            add_tri(p00, p10, p11);
+            add_tri(p00, p11, p01);
+        };
+        let mut add_sloped_box =
+            |xa: f32, xb: f32, ya: f32, yb: f32, za0: f32, zb0: f32, za1: f32, zb1: f32| {
+                add_quad([xa, ya, za0], [xa, yb, za0], [xb, yb, zb0], [xb, ya, zb0]);
+                add_quad([xa, ya, za1], [xb, ya, zb1], [xb, yb, zb1], [xa, yb, za1]);
+                add_quad([xa, ya, za0], [xb, ya, zb0], [xb, ya, zb1], [xa, ya, za1]);
+                add_quad([xb, yb, zb0], [xa, yb, za0], [xa, yb, za1], [xb, yb, zb1]);
+                add_quad([xa, yb, za0], [xa, ya, za0], [xa, ya, za1], [xa, yb, za1]);
+                add_quad([xb, ya, zb0], [xb, yb, zb0], [xb, yb, zb1], [xb, ya, zb1]);
+            };
+
+        let z_deck = |x: f32| -> f32 { 3.2 + 0.16 * (x + 2.0) };
+        add_sloped_box(-2.0, 9.0, -5.5, 5.5, 0.0, 0.0, z_deck(-2.0), z_deck(9.0));
+        add_sloped_box(-9.0, -2.0, -5.5, 5.5, 0.0, 0.0, 9.5, 9.5);
+        add_sloped_box(
+            -9.0,
+            9.0,
+            -7.5,
+            -5.5,
+            0.0,
+            0.0,
+            z_deck(-9.0) + 2.4,
+            z_deck(9.0) + 2.4,
+        );
+        add_sloped_box(
+            -9.0,
+            9.0,
+            5.5,
+            7.5,
+            0.0,
+            0.0,
+            z_deck(-9.0) + 2.4,
+            z_deck(9.0) + 2.4,
+        );
+        stl.push_str("endsolid conformal_cap_collar\n");
+
+        let tmp_path = std::env::temp_dir().join("manifold_test_conformal_cap_collar.stl");
+        std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write temporary STL");
+        let obj = crate::io::stl::load_stl_file(&tmp_path)
+            .expect("Expected synthetic conformal cap collar STL import to succeed");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut cfg = crate::config::SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.eikonal.auto_voxel_size = false;
+        cfg.eikonal.voxel_size_mm = 0.25;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.20;
+        cfg.slicing.layer_height.min_mm = 0.10;
+        cfg.slicing.layer_height.max_mm = 0.32;
+        cfg.slicing.layer_height.first_layer_mm = 0.20;
+        cfg.slicing.layer_height.top_layer_mm = 0.20;
+        cfg.slicing.enable_auto_conformal_skin = true;
+        cfg.slicing.conformal_skin_layers = 3;
+        cfg.slicing.conformal_skin_min_oblique_deg = 6.0;
+        cfg.slicing.conformal_skin_max_slope_deg = 60.0;
+        cfg.slicing.enable_top_surface_lofting = true;
+        cfg.slicing.enable_support_generation = false;
+        cfg.slicing.sanitize();
+        crate::ui::sync_config_to_backend(&cfg);
+        ffi::set_spatial_orientation_hints(&[]);
+        ffi::set_nozzle_axis_bed([0.0, 0.0, 1.0]);
+        ffi::set_gravity_direction_bed([0.0, 0.0, -1.0]);
+
+        assert!(ffi::recompute_object_fields(
+            obj.object_id,
+            cfg.eikonal.voxel_size_mm,
+            cfg.eikonal.narrow_band_width_voxels as f32
+        ));
+
+        let iso = ffi::select_slicing_isosurfaces(obj.object_id, 0.0);
+        assert!(iso.valid && !iso.layers.is_empty());
+        let tp = ffi::generate_object_shell_toolpaths(obj.object_id, 0.0);
+        assert!(tp.valid && iso.layers.len() == tp.layers.len());
+
+        let top_h = cfg.slicing.layer_height.top_layer_mm;
+        let mut bow_skin_layers: Vec<&ffi::SelectedLayerInfo> = iso
+            .layers
+            .iter()
+            .filter(|l| {
+                l.is_top_layer
+                    && !l.is_first_layer
+                    && (l.max_thickness_mm - l.min_thickness_mm).abs() <= 1.0e-4
+                    && (l.mean_thickness_mm - top_h).abs() <= 1.0e-3
+                    && l.vertices
+                        .iter()
+                        .any(|v| v.x > -1.5 && v.y.abs() < 4.5 && v.z < 5.1)
+            })
+            .collect();
+        assert!(
+            bow_skin_layers.len() >= 3,
+            "Expected >= 3 conformal skin cap layers on bow deck, got {}",
+            bow_skin_layers.len()
+        );
+        bow_skin_layers.sort_by_key(|l| (l.branch_layer_index, l.layer_index));
+
+        // 1. Conformal skin layers remain collision-clear of aft cabin (x=-2) & gunwales (|y|=5.5)
+        for layer in &bow_skin_layers {
+            for v in &layer.vertices {
+                if v.y.abs() < 5.2 && v.z < 5.1 {
+                    assert!(
+                        v.x - (-2.0) >= 1.65 && 5.5 - v.y.abs() >= 1.25,
+                        "Conformal skin vertex ({:.2}, {:.2}, {:.2}) violated clearance",
+                        v.x,
+                        v.y,
+                        v.z
+                    );
+                }
+            }
+        }
+
+        let outermost_skin = bow_skin_layers.last().copied().unwrap();
+        let outermost_skin_tp = tp
+            .layers
+            .iter()
+            .find(|tl| tl.layer_index == outermost_skin.layer_index)
+            .expect("Expected toolpath layer for outermost bow deck skin");
+        let skin_layer_indices: std::collections::HashSet<u32> =
+            bow_skin_layers.iter().map(|l| l.layer_index).collect();
+
+        let cap_outer_wall_pts: Vec<[f32; 3]> = outermost_skin_tp
+            .paths
+            .iter()
+            .filter(|p| p.feature_kind == 0)
+            .flat_map(|p| p.points.iter().map(|pt| [pt.x, pt.y, pt.z]))
+            .collect();
+        assert!(
+            !cap_outer_wall_pts.is_empty(),
+            "Expected OuterWall points on outermost conformal skin cap"
+        );
+        let cap_all_pts: Vec<[f32; 3]> = outermost_skin_tp
+            .paths
+            .iter()
+            .flat_map(|p| p.points.iter().map(|pt| [pt.x, pt.y, pt.z]))
+            .collect();
+
+        let mut core_pts: Vec<(u8, [f32; 3])> = Vec::new();
+        for (li, layer) in tp.layers.iter().enumerate() {
+            let info = &iso.layers[li];
+            if info.is_first_layer || skin_layer_indices.contains(&info.layer_index) {
+                continue;
+            }
+            for path in &layer.paths {
+                if path.feature_kind > 3 {
+                    continue;
+                }
+                for pt in &path.points {
+                    if pt.x > -1.3
+                        && pt.x < 8.5
+                        && pt.y.abs() < 4.8
+                        && pt.z >= 2.5
+                        && pt.z <= z_deck(pt.x) + 0.5
+                    {
+                        core_pts.push((path.feature_kind, [pt.x, pt.y, pt.z]));
+                    }
+                }
+            }
+        }
+
+        let cos_deck = 1.0f32 / (1.0f32 + 0.16 * 0.16).sqrt();
+        let mut max_under_cap_sdf = f32::NEG_INFINITY;
+        let mut under_cap_count = 0usize;
+        let mut collar_sdfs: Vec<f32> = Vec::new();
+        let mut min_d3_to_cap_ow = f32::MAX;
+
+        for &(fk, p) in &core_pts {
+            let mut min_dxy_cap = f32::MAX;
+            for &cp in &cap_all_pts {
+                let dxy = (p[0] - cp[0]).hypot(p[1] - cp[1]);
+                if dxy < min_dxy_cap {
+                    min_dxy_cap = dxy;
+                }
+            }
+            let mut min_dxy_cap_ow = f32::MAX;
+            let mut min_d3_cap_ow_pt = f32::MAX;
+            for &cp in &cap_outer_wall_pts {
+                let dxy = (p[0] - cp[0]).hypot(p[1] - cp[1]);
+                if dxy < min_dxy_cap_ow {
+                    min_dxy_cap_ow = dxy;
+                }
+                let d3 = ((p[0] - cp[0]).powi(2)
+                    + (p[1] - cp[1]).powi(2)
+                    + (p[2] - cp[2]).powi(2))
+                .sqrt();
+                if d3 < min_d3_cap_ow_pt {
+                    min_d3_cap_ow_pt = d3;
+                }
+            }
+
+            let sdf_deck = (p[2] - z_deck(p[0])) * cos_deck;
+
+            // 2. Core directly under the interior of the cap remains eroded below the skin slab
+            if min_dxy_cap <= 0.15 && min_dxy_cap_ow >= 0.55 {
+                max_under_cap_sdf = max_under_cap_sdf.max(sdf_deck);
+                under_cap_count += 1;
+            }
+
+            // 3. Exposed top core OuterWalls in the collar outside the cap footprint
+            if fk == 0 && (0.25..=0.90).contains(&min_dxy_cap) {
+                let has_higher_core_above = core_pts.iter().any(|&(_, q)| {
+                    (q[0] - p[0]).hypot(q[1] - p[1]) < 0.22 && q[2] - p[2] > 0.10
+                });
+                if !has_higher_core_above {
+                    collar_sdfs.push(sdf_deck);
+                    min_d3_to_cap_ow = min_d3_to_cap_ow.min(min_d3_cap_ow_pt);
+                }
+            }
+        }
+
+        assert!(under_cap_count > 0, "Expected core points beneath cap interior");
+        assert!(
+            max_under_cap_sdf <= -0.35,
+            "Expected core under cap interior to stay eroded <= -0.35 mm, got {max_under_cap_sdf:.4}"
+        );
+        assert!(
+            !collar_sdfs.is_empty(),
+            "Expected exposed top core OuterWall points in the adjacent cap collar [0.25, 0.90] mm"
+        );
+
+        collar_sdfs.sort_by(|a, b| a.total_cmp(b));
+        let p10_idx = (collar_sdfs.len() * 10) / 100;
+        let med_idx = collar_sdfs.len() / 2;
+        let p10_sdf = collar_sdfs[p10_idx];
+        let med_sdf = collar_sdfs[med_idx];
+        let max_sdf = *collar_sdfs.last().unwrap();
+
+        assert!(
+            p10_sdf >= -0.22 && med_sdf >= -0.10 && max_sdf <= 0.02,
+            "Expected collar OuterWall without deep SDF trench (p10 >= -0.22, med >= -0.10, max <= 0.02), got p10={p10_sdf:.3}, med={med_sdf:.3}, max={max_sdf:.3}"
+        );
+        assert!(
+            min_d3_to_cap_ow <= 0.55,
+            "Expected close seam between collar OuterWall and cap OuterWall (<= 0.55 mm), got {min_d3_to_cap_ow:.3} mm"
+        );
+
+        let _ = ffi::remove_cad_object(obj.object_id);
+        crate::ui::sync_config_to_backend(&SlicerConfig::default());
+    }
 }
 
 
