@@ -6670,7 +6670,9 @@ mod tests {
             if !non_bridge_segs.is_empty() {
                 let mean_seg_h = non_bridge_segs.iter().map(|s| s.height_mm).sum::<f32>()
                     / (non_bridge_segs.len() as f32);
-                if l.is_top_layer && cfg.slicing.enable_top_surface_lofting {
+                if (l.is_top_layer || l.branch_layer_index + 2 >= l.branch_layer_count)
+                    && cfg.slicing.enable_top_surface_lofting
+                {
                     assert!(
                         mean_seg_h >= l.mean_thickness_mm - 0.03
                             && mean_seg_h <= cfg.slicing.layer_height.max_mm + 1.0e-4,
@@ -13717,6 +13719,273 @@ mod tests {
             let _ = ffi::remove_cad_object(part.object_id);
         }
 
+        crate::ui::sync_config_to_backend(&SlicerConfig::default());
+    }
+
+    #[test]
+    fn test_window_lintel_and_ceiling_bridge_leveling_and_direction() {
+        let _guard = TEST_BACKEND_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Construct a watertight cabin mesh with:
+        // - Front window opening: X in [3.6, 6.0], Y in [-5.0, 5.0], Z in [0.0, 6.0]
+        // - Front window lintel:  X in [3.6, 6.0], Y in [-5.0, 5.0], Z in [6.0, 9.0] (2.4 mm thick)
+        // - Flat cabin ceiling:   X in [-6.0, 6.0], Y in [-7.0, 7.0], Z in [9.0, 11.0]
+        // - One-sided cantilever: X in [-6.0, 6.0], Y in [7.0, 11.0], Z in [9.0, 11.0]
+        let x_coords = [-6.0f32, -3.6, 3.6, 6.0];
+        let y_coords = [-7.0f32, -5.0, 5.0, 7.0, 11.0];
+        let z_coords = [0.0f32, 6.0, 9.0, 11.0];
+        let is_occupied = |ix: i32, iy: i32, iz: i32| -> bool {
+            if ix < 0 || ix >= 3 || iy < 0 || iy >= 4 || iz < 0 || iz >= 3 {
+                return false;
+            }
+            match iz {
+                0 => (iy == 0 || iy == 2) || (ix == 0 && iy == 1),
+                1 => (iy == 0 || iy == 2) || ((ix == 0 || ix == 2) && iy == 1),
+                2 => true,
+                _ => false,
+            }
+        };
+
+        let mut positions: Vec<f32> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut add_quad = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3]| {
+            let base = (positions.len() / 3) as u32;
+            for p in [p0, p1, p2, p3] {
+                positions.extend_from_slice(&p);
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        };
+
+        for ix in 0..3 {
+            for iy in 0..4 {
+                for iz in 0..3 {
+                    if !is_occupied(ix, iy, iz) {
+                        continue;
+                    }
+                    let x0 = x_coords[ix as usize];
+                    let x1 = x_coords[(ix + 1) as usize];
+                    let y0 = y_coords[iy as usize];
+                    let y1 = y_coords[(iy + 1) as usize];
+                    let z0 = z_coords[iz as usize];
+                    let z1 = z_coords[(iz + 1) as usize];
+
+                    if !is_occupied(ix - 1, iy, iz) {
+                        add_quad([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]);
+                    }
+                    if !is_occupied(ix + 1, iy, iz) {
+                        add_quad([x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]);
+                    }
+                    if !is_occupied(ix, iy - 1, iz) {
+                        add_quad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]);
+                    }
+                    if !is_occupied(ix, iy + 1, iz) {
+                        add_quad([x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]);
+                    }
+                    if !is_occupied(ix, iy, iz - 1) {
+                        add_quad([x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]);
+                    }
+                    if !is_occupied(ix, iy, iz + 1) {
+                        add_quad([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]);
+                    }
+                }
+            }
+        }
+
+        let part = ffi::register_triangle_mesh("cabin_window_lintel_and_ceiling", &positions, &indices);
+        assert!(part.object_id > 0);
+
+        let mut cfg = SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::ConstrainedNonPlanar;
+        cfg.eikonal.enable_overhang_orientation_bias = true;
+        cfg.eikonal.auto_voxel_size = false;
+        cfg.eikonal.voxel_size_mm = 0.4;
+        cfg.slicing.layer_height.target_mm = 0.20;
+        cfg.slicing.layer_height.first_layer_mm = 0.20;
+        cfg.slicing.max_bridge_length_mm = 15.0;
+        cfg.slicing.overhang_angle_threshold_deg = 45.0;
+        cfg.slicing.enable_support_generation = false;
+        cfg.machine.kinematics_mode = crate::config::FiveAxisKinematicsMode::ThreeAxis;
+        let mut tool = cfg.tools[0].clone();
+        tool.has_rotational_axes = false;
+        cfg.tools = vec![tool];
+        cfg.active_tool_index = 0;
+
+        crate::ui::sync_config_to_backend(&cfg);
+        ffi::set_nozzle_axis_bed([0.0, 0.0, 1.0]);
+        ffi::set_gravity_direction_bed([0.0, 0.0, -1.0]);
+
+        assert!(ffi::recompute_object_fields(part.object_id, 0.4, 5.0));
+        assert!(ffi::select_slicing_isosurfaces(part.object_id, 0.0).valid);
+        let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp.valid);
+
+        #[derive(Default)]
+        struct LayerBridgeStats {
+            bridge_len: f32,
+            weighted_abs_dy: f32,
+            max_path_len: f32,
+            min_z: f32,
+            max_z: f32,
+        }
+
+        let mut lintel_by_layer: std::collections::BTreeMap<usize, LayerBridgeStats> =
+            std::collections::BTreeMap::new();
+        let mut ceiling_by_layer: std::collections::BTreeMap<usize, LayerBridgeStats> =
+            std::collections::BTreeMap::new();
+        let mut lintel_wave_len = 0.0f32;
+        let mut cantilever_wave_count = 0usize;
+        let mut cantilever_wave_len = 0.0f32;
+
+        for (l_idx, layer) in tp.layers.iter().enumerate() {
+            for path in &layer.paths {
+                if path.points.len() < 2 {
+                    continue;
+                }
+                let n = path.points.len();
+                let mut path_lintel_bridge_len = 0.0f32;
+                let mut path_ceiling_bridge_len = 0.0f32;
+
+                for k in 0..(n - 1) {
+                    let a = &path.points[k];
+                    let b = &path.points[k + 1];
+                    let dx = b.x - a.x;
+                    let dy = b.y - a.y;
+                    let dz = b.z - a.z;
+                    let seg_len = (dx * dx + dy * dy + dz * dz).sqrt();
+                    if seg_len <= 1.0e-5 {
+                        continue;
+                    }
+                    let mx = 0.5 * (a.x + b.x);
+                    let my = 0.5 * (a.y + b.y);
+                    let mz = 0.5 * (a.z + b.z);
+
+                    if path.feature_kind == 5 {
+                        if (3.6..=6.0).contains(&mx)
+                            && (-4.5..=4.5).contains(&my)
+                            && (5.5..=7.2).contains(&mz)
+                        {
+                            let e = lintel_by_layer.entry(l_idx).or_insert(LayerBridgeStats {
+                                bridge_len: 0.0,
+                                weighted_abs_dy: 0.0,
+                                max_path_len: 0.0,
+                                min_z: f32::MAX,
+                                max_z: f32::MIN,
+                            });
+                            e.bridge_len += seg_len;
+                            e.weighted_abs_dy += dy.abs();
+                            e.min_z = e.min_z.min(a.z.min(b.z));
+                            e.max_z = e.max_z.max(a.z.max(b.z));
+                            path_lintel_bridge_len += seg_len;
+                        }
+                        if (-3.4..=3.4).contains(&mx)
+                            && (-4.8..=4.8).contains(&my)
+                            && (8.5..=9.8).contains(&mz)
+                        {
+                            let e = ceiling_by_layer.entry(l_idx).or_insert(LayerBridgeStats {
+                                bridge_len: 0.0,
+                                weighted_abs_dy: 0.0,
+                                max_path_len: 0.0,
+                                min_z: f32::MAX,
+                                max_z: f32::MIN,
+                            });
+                            e.bridge_len += seg_len;
+                            e.weighted_abs_dy += dy.abs();
+                            e.min_z = e.min_z.min(a.z.min(b.z));
+                            e.max_z = e.max_z.max(a.z.max(b.z));
+                            path_ceiling_bridge_len += seg_len;
+                        }
+                    } else if path.feature_kind == 6 {
+                        if (3.6..=6.0).contains(&mx)
+                            && (-4.0..=4.0).contains(&my)
+                            && (5.5..=7.2).contains(&mz)
+                        {
+                            lintel_wave_len += seg_len;
+                        }
+                        if my > 7.5 && (8.5..=10.5).contains(&mz) {
+                            cantilever_wave_count += 1;
+                            cantilever_wave_len += seg_len;
+                        }
+                    }
+                }
+
+                if path_lintel_bridge_len > 0.0 {
+                    if let Some(e) = lintel_by_layer.get_mut(&l_idx) {
+                        e.max_path_len = e.max_path_len.max(path_lintel_bridge_len);
+                    }
+                }
+                if path_ceiling_bridge_len > 0.0 {
+                    if let Some(e) = ceiling_by_layer.get_mut(&l_idx) {
+                        e.max_path_len = e.max_path_len.max(path_ceiling_bridge_len);
+                    }
+                }
+            }
+        }
+
+        let lintel_total_bridge_len: f32 =
+            lintel_by_layer.values().map(|s| s.bridge_len).sum();
+        let lintel_total_abs_dy: f32 =
+            lintel_by_layer.values().map(|s| s.weighted_abs_dy).sum();
+        let lintel_mean_abs_dy_ratio = lintel_total_abs_dy / lintel_total_bridge_len.max(1.0e-5);
+        let max_lintel_bridge_len = lintel_by_layer
+            .values()
+            .map(|s| s.max_path_len)
+            .fold(0.0f32, f32::max);
+        let primary_lintel = lintel_by_layer
+            .values()
+            .max_by(|a, b| a.bridge_len.total_cmp(&b.bridge_len));
+
+        assert!(
+            lintel_total_bridge_len > 0.0,
+            "Expected bridge extrusions under the front window lintel"
+        );
+        assert!(
+            lintel_mean_abs_dy_ratio >= 0.85,
+            "Expected window lintel bridges to span predominantly along Y (|dy|/len = {lintel_mean_abs_dy_ratio:.3})"
+        );
+        assert!(
+            max_lintel_bridge_len >= 9.0,
+            "Expected window lintel bridge to span >= 9.0 mm across opening, got {max_lintel_bridge_len:.3} mm"
+        );
+        assert!(
+            lintel_by_layer.len() <= 2,
+            "Expected <= 2 bridging layers on window lintel, got {}",
+            lintel_by_layer.len()
+        );
+        if let Some(prim) = primary_lintel {
+            let z_spread = prim.max_z - prim.min_z;
+            assert!(
+                z_spread <= 0.30,
+                "Expected flat window lintel primary bridge layer (z spread <= 0.30 mm), got {z_spread:.3} mm"
+            );
+        }
+        assert!(
+            lintel_wave_len < 0.15 * lintel_total_bridge_len,
+            "Expected minimal WaveOverhang inside window lintel opening (wave={lintel_wave_len:.3}, bridge={lintel_total_bridge_len:.3})"
+        );
+
+        let primary_ceiling = ceiling_by_layer
+            .values()
+            .max_by(|a, b| a.bridge_len.total_cmp(&b.bridge_len));
+        assert!(
+            primary_ceiling.is_some(),
+            "Expected bridge extrusions on the cabin ceiling"
+        );
+        if let Some(prim) = primary_ceiling {
+            let z_spread = prim.max_z - prim.min_z;
+            assert!(
+                z_spread <= 0.35,
+                "Expected flat cabin ceiling primary bridge layer (z spread <= 0.35 mm), got {z_spread:.3} mm"
+            );
+        }
+
+        assert!(
+            cantilever_wave_count > 0 && cantilever_wave_len > 2.0,
+            "Expected WaveOverhang extrusions on the one-sided cantilever (count={cantilever_wave_count}, len={cantilever_wave_len:.3})"
+        );
+
+        let _ = ffi::remove_cad_object(part.object_id);
         crate::ui::sync_config_to_backend(&SlicerConfig::default());
     }
 }

@@ -5685,6 +5685,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     struct BranchPlateau {
         float sMm = 0.0f;
         float areaMm2 = 0.0f;
+        bool isBottom = false;
     };
     std::vector<std::vector<BranchPlateau>> branchPlateaus(branches.size());
 
@@ -5713,6 +5714,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                                         float samplerValidLimit,
                                         const openvdb::Vec3d& wpSurf,
                                         const openvdb::Vec3d& wpIn,
+                                        const openvdb::Vec3f& nTri,
                                         float inOffset,
                                         float& outTau,
                                         openvdb::Vec3f& outGradUnit) -> bool {
@@ -5736,10 +5738,11 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 return false;
             }
             outGradUnit = g / gLen;
+            const float gradSign = (nTri.dot(outGradUnit) >= 0.0f) ? 1.0f : -1.0f;
             const float tSurf = eikSamplerRef.wsSample(wpSurf);
             outTau = (std::isfinite(tSurf) && tSurf < samplerValidLimit)
                 ? tSurf
-                : (tIn + inOffset * gLen);
+                : (tIn + gradSign * inOffset * gLen);
             return std::isfinite(outTau);
         };
 
@@ -5792,6 +5795,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
         constexpr float kPlateauBinMm = 0.02f;
         constexpr float kCos5Deg = 0.9961947f;
         std::vector<std::unordered_map<int, std::pair<double, double>>> branchHistBins(branches.size());
+        std::vector<std::unordered_map<int, std::pair<double, double>>> branchBottomHistBins(branches.size());
 
         auto recordSample = [&](const openvdb::Vec3f& pSample,
                                 const openvdb::Vec3f& nTri,
@@ -5836,13 +5840,19 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             openvdb::Vec3f nTau(0.0f, 0.0f, 1.0f);
             bool ok = sampleTauAndGradWith(
                 fineEikSamplerP, fineVoxelSize, fineTauValidLimit,
-                wpSurf, wpIn, inOffset, tauTri, nTau);
+                wpSurf, wpIn, nTri, inOffset, tauTri, nTau);
             if (!ok && useDualGridExtraction) {
                 ok = sampleTauAndGradWith(
                     coarseEikSamplerP, voxelSize, validTauLimit,
-                    wpSurf, wpIn, inOffset, tauTri, nTau);
+                    wpSurf, wpIn, nTri, inOffset, tauTri, nTau);
             }
-            if (!ok || nTri.dot(nTau) < kCos5Deg) {
+            if (!ok) {
+                return;
+            }
+            const float nDot = nTri.dot(nTau);
+            const bool isTopPlateau = (nDot >= kCos5Deg);
+            const bool isBottomPlateau = (nDot <= -kCos5Deg);
+            if (!isTopPlateau && !isBottomPlateau) {
                 return;
             }
 
@@ -5852,8 +5862,14 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             }
             const auto& mb = branches[static_cast<std::size_t>(bId)];
             const float sTri = mb.tauToArcS(std::clamp(tauTri, mb.tauStart, mb.tauEnd));
+            if (isBottomPlateau && sTri <= std::max(1.5f * hFirst, 0.5f * voxelSize)) {
+                return;
+            }
             const int binIdx = static_cast<int>(std::floor(sTri / kPlateauBinMm));
-            auto& entry = branchHistBins[static_cast<std::size_t>(bId)][binIdx];
+            auto& histMap = isBottomPlateau
+                ? branchBottomHistBins[static_cast<std::size_t>(bId)]
+                : branchHistBins[static_cast<std::size_t>(bId)];
+            auto& entry = histMap[binIdx];
             entry.first += static_cast<double>(subArea);
             entry.second += static_cast<double>(subArea) * static_cast<double>(sTri);
         };
@@ -5911,46 +5927,55 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             double weightedS = 0.0;
         };
 
-        for (std::size_t b = 0; b < branches.size(); ++b) {
-            if (branchHistBins[b].empty()) {
-                continue;
-            }
-            std::vector<BinAccum> sortedBins;
-            sortedBins.reserve(branchHistBins[b].size());
-            for (const auto& [bin, val] : branchHistBins[b]) {
-                if (val.first > 1.0e-7) {
-                    sortedBins.push_back(BinAccum{bin, val.first, val.second});
+        auto clusterPlateauHistogram =
+            [&](std::size_t b,
+                const std::unordered_map<int, std::pair<double, double>>& histMap,
+                bool isBottom) {
+                if (histMap.empty()) {
+                    return;
                 }
-            }
-            std::sort(sortedBins.begin(), sortedBins.end(), [](const BinAccum& a, const BinAccum& c) {
-                return a.bin < c.bin;
-            });
-
-            std::size_t idx = 0;
-            while (idx < sortedBins.size()) {
-                double clusterArea = sortedBins[idx].area;
-                double clusterWeightedS = sortedBins[idx].weightedS;
-                int prevBin = sortedBins[idx].bin;
-                ++idx;
-                while (idx < sortedBins.size()) {
-                    const double clusterS = clusterWeightedS / clusterArea;
-                    const double currS = sortedBins[idx].weightedS / sortedBins[idx].area;
-                    if (sortedBins[idx].bin - prevBin <= 3 || std::abs(currS - clusterS) <= 0.06) {
-                        clusterArea += sortedBins[idx].area;
-                        clusterWeightedS += sortedBins[idx].weightedS;
-                        prevBin = sortedBins[idx].bin;
-                        ++idx;
-                    } else {
-                        break;
+                std::vector<BinAccum> sortedBins;
+                sortedBins.reserve(histMap.size());
+                for (const auto& [bin, val] : histMap) {
+                    if (val.first > 1.0e-7) {
+                        sortedBins.push_back(BinAccum{bin, val.first, val.second});
                     }
                 }
-                if (clusterArea >= static_cast<double>(minPlateauAreaMm2)) {
-                    branchPlateaus[b].push_back(BranchPlateau{
-                        static_cast<float>(clusterWeightedS / clusterArea),
-                        static_cast<float>(clusterArea),
-                    });
+                std::sort(sortedBins.begin(), sortedBins.end(), [](const BinAccum& a, const BinAccum& c) {
+                    return a.bin < c.bin;
+                });
+
+                std::size_t idx = 0;
+                while (idx < sortedBins.size()) {
+                    double clusterArea = sortedBins[idx].area;
+                    double clusterWeightedS = sortedBins[idx].weightedS;
+                    int prevBin = sortedBins[idx].bin;
+                    ++idx;
+                    while (idx < sortedBins.size()) {
+                        const double clusterS = clusterWeightedS / clusterArea;
+                        const double currS = sortedBins[idx].weightedS / sortedBins[idx].area;
+                        if (sortedBins[idx].bin - prevBin <= 3 || std::abs(currS - clusterS) <= 0.06) {
+                            clusterArea += sortedBins[idx].area;
+                            clusterWeightedS += sortedBins[idx].weightedS;
+                            prevBin = sortedBins[idx].bin;
+                            ++idx;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (clusterArea >= static_cast<double>(minPlateauAreaMm2)) {
+                        branchPlateaus[b].push_back(BranchPlateau{
+                            static_cast<float>(clusterWeightedS / clusterArea),
+                            static_cast<float>(clusterArea),
+                            isBottom,
+                        });
+                    }
                 }
-            }
+            };
+
+        for (std::size_t b = 0; b < branches.size(); ++b) {
+            clusterPlateauHistogram(b, branchHistBins[b], /*isBottom=*/false);
+            clusterPlateauHistogram(b, branchBottomHistBins[b], /*isBottom=*/true);
         }
     }
 
@@ -5968,7 +5993,8 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     // - Internal flat isosurface-parallel plateaus get greedy intermediate pins strictly
     //   when both adjacent intervals cleanly satisfy [hMin, hMax] without violating slope limits.
     // - Internal branches anchor their final layer at the junction s_{N_b} = L_b.
-    const float plateauEpsMm = std::clamp(0.020f, 0.008f, 0.15f * hMin);
+    const float plateauEpsMm = std::clamp(0.020f, 0.008f, std::max(0.008f, 0.15f * hMin));
+    const float bottomClearEps = std::clamp(0.20f * hMin, 0.015f, 0.030f);
     const float hPinMinFloor = (hMin < 0.10f && hTarget >= 0.16f) ? 0.10f : hMin;
     const float hPinMin = std::min(hTarget, std::max(hPinMinFloor, 0.60f * hTarget));
     const float hPinMax = std::max(hTarget, std::min(hMax, 1.40f * hTarget));
@@ -5992,7 +6018,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             const float leafTopWindowS = L - leafTopWindowOffset;
             float bestTopArea = 0.0f;
             for (const auto& bp : branchPlateaus[bIdx]) {
-                if (bp.sMm >= leafTopWindowS && bp.areaMm2 > bestTopArea) {
+                if (!bp.isBottom && bp.sMm >= leafTopWindowS && bp.areaMm2 > bestTopArea) {
                     bestTopArea = bp.areaMm2;
                     flatTopSMm = std::min(L, bp.sMm);
                     hasFlatLeafTop = true;
@@ -6025,7 +6051,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             continue;
         }
 
-        auto canTileSubinterval = [&](float a, float b) -> bool {
+        auto canTileSubinterval = [&](float a, float b, float* outStepMean = nullptr) -> bool {
             const float span = b - a;
             if (span < hPinMin - 1.0e-4f) {
                 return false;
@@ -6059,6 +6085,9 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                     return false;
                 }
             }
+            if (outStepMean != nullptr) {
+                *outStepMean = stepMean;
+            }
             return true;
         };
 
@@ -6078,13 +6107,48 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
 
             const float minAnchorSep = std::max(hPinMin, 0.50f * hTarget);
             for (const auto& bp : sortedPlateaus) {
-                if (hasFlatLeafTop && bp.sMm >= L - leafTopWindowOffset) {
+                if (!bp.isBottom && hasFlatLeafTop && bp.sMm >= L - leafTopWindowOffset) {
                     continue;
                 }
-                const float sPin = bp.sMm - plateauEpsMm;
+                float sPin = bp.isBottom
+                    ? (bp.sMm + 1.05f * hTarget + bottomClearEps)
+                    : (bp.sMm - plateauEpsMm);
                 if (sPin <= sStart + hPinMin || sPin >= sEnd - hPinMin) {
                     continue;
                 }
+                auto upperIt = std::upper_bound(anchors.begin(), anchors.end(), sPin);
+                if (upperIt == anchors.begin() || upperIt == anchors.end()) {
+                    continue;
+                }
+                const float nextAnchor = *upperIt;
+                const float prevAnchor = *(upperIt - 1);
+
+                float stepBelow = hTarget;
+                bool okBelow = canTileSubinterval(prevAnchor, sPin, &stepBelow);
+                if (bp.isBottom && okBelow) {
+                    const float minDelta = 0.90f * stepBelow + 0.025f;
+                    if (sPin - bp.sMm < minDelta) {
+                        sPin = bp.sMm + minDelta + 0.005f;
+                        if (sPin <= sStart + hPinMin || sPin >= sEnd - hPinMin) {
+                            continue;
+                        }
+                        upperIt = std::upper_bound(anchors.begin(), anchors.end(), sPin);
+                        if (upperIt == anchors.begin() || upperIt == anchors.end() ||
+                            *upperIt != nextAnchor || *(upperIt - 1) != prevAnchor) {
+                            continue;
+                        }
+                        okBelow = canTileSubinterval(prevAnchor, sPin, &stepBelow);
+                    }
+                    const float minDeltaFinal = 0.90f * stepBelow + 0.025f;
+                    const float maxDeltaFinal = 1.65f * stepBelow - 0.025f;
+                    const float deltaFinal = sPin - bp.sMm;
+                    if (!okBelow || deltaFinal < minDeltaFinal || deltaFinal > maxDeltaFinal) {
+                        continue;
+                    }
+                } else if (!okBelow) {
+                    continue;
+                }
+
                 bool tooClose = false;
                 for (const float a : anchors) {
                     if (std::abs(sPin - a) < minAnchorSep) {
@@ -6095,14 +6159,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
                 if (tooClose) {
                     continue;
                 }
-                auto upperIt = std::upper_bound(anchors.begin(), anchors.end(), sPin);
-                if (upperIt == anchors.begin() || upperIt == anchors.end()) {
-                    continue;
-                }
-                const float nextAnchor = *upperIt;
-                const float prevAnchor = *(upperIt - 1);
-                if (canTileSubinterval(prevAnchor, sPin) &&
-                    canTileSubinterval(sPin, nextAnchor)) {
+                if (canTileSubinterval(sPin, nextAnchor)) {
                     anchors.insert(upperIt, sPin);
                 }
             }
@@ -14371,18 +14428,10 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             static_cast<int>(std::ceil(2.0f * 3.14159265f * ringRadius / 0.45f)),
                             12,
                             64);
-                        std::vector<ToolpathPoint> currentArc;
-                        currentArc.reserve(static_cast<std::size_t>(numSegs) + 1);
-                        bool allValid = true;
-                        for (int s = 0; s <= numSegs; ++s) {
-                            const float ang =
-                                static_cast<float>(s) * (2.0f * 3.14159265358979323846f / static_cast<float>(numSegs));
-                            const float ca = std::cos(ang);
-                            const float sa = std::sin(ang);
-                            const float uPt = d.u + ringRadius * ca;
-                            const float vPt = d.v + ringRadius * sa;
-
-                            bool insideOtherDisk = false;
+                        const float dTheta =
+                            2.0f * 3.14159265358979323846f / static_cast<float>(numSegs);
+                        const float sagitta = ringRadius * (1.0f - std::cos(0.5f * dTheta));
+                        auto isPointInsideOtherDisk = [&](float uChk, float vChk) -> bool {
                             for (std::size_t j = 0; j < numUniqueDisks; ++j) {
                                 if (j == diskIdx) {
                                     continue;
@@ -14402,7 +14451,9 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                     distIJ / std::max({ringRadius, rJ, 0.1f}),
                                     0.01f,
                                     1.0f);
-                                const float seamMargin = 0.08f * lineWidthMm * sinFactor;
+                                const float seamMargin = std::max(
+                                    0.08f * lineWidthMm * sinFactor,
+                                    sagitta + 0.02f * lineWidthMm);
                                 const float minAllowedR =
                                     (diskIsBedIntf[diskIdx] == diskIsBedIntf[j])
                                         ? (rJ + seamMargin)
@@ -14410,14 +14461,36 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                                 if (minAllowedR <= 0.0f) {
                                     continue;
                                 }
-                                const float duJ = uPt - uniqueDisks[j].u;
-                                const float dvJ = vPt - uniqueDisks[j].v;
+                                const float duJ = uChk - uniqueDisks[j].u;
+                                const float dvJ = vChk - uniqueDisks[j].v;
                                 if (duJ * duJ + dvJ * dvJ < minAllowedR * minAllowedR) {
-                                    insideOtherDisk = true;
-                                    break;
+                                    return true;
                                 }
                             }
-                            if (insideOtherDisk) {
+                            return false;
+                        };
+                        std::vector<ToolpathPoint> currentArc;
+                        currentArc.reserve(static_cast<std::size_t>(numSegs) + 1);
+                        bool allValid = true;
+                        float prevU = 0.0f;
+                        float prevV = 0.0f;
+                        for (int s = 0; s <= numSegs; ++s) {
+                            const float ang = static_cast<float>(s) * dTheta;
+                            const float ca = std::cos(ang);
+                            const float sa = std::sin(ang);
+                            const float uPt = d.u + ringRadius * ca;
+                            const float vPt = d.v + ringRadius * sa;
+
+                            if (!currentArc.empty() &&
+                                isPointInsideOtherDisk(0.5f * (prevU + uPt), 0.5f * (prevV + vPt))) {
+                                allValid = false;
+                                if (currentArc.size() >= 2) {
+                                    pushSupportPath(featureKind, false, std::move(currentArc));
+                                }
+                                currentArc.clear();
+                            }
+
+                            if (isPointInsideOtherDisk(uPt, vPt)) {
                                 allValid = false;
                                 if (currentArc.size() >= 2) {
                                     pushSupportPath(featureKind, false, std::move(currentArc));
@@ -14449,6 +14522,8 @@ ObjectToolpathsResult SlicerBackend::generateObjectShellToolpaths(
                             }
                             if (ok) {
                                 currentArc.push_back(tp);
+                                prevU = uPt;
+                                prevV = vPt;
                             } else {
                                 allValid = false;
                                 if (currentArc.size() >= 2) {

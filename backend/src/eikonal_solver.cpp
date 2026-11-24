@@ -11,6 +11,7 @@
 #include <queue>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <openvdb/tools/Interpolation.h>
 #include <tbb/blocked_range.h>
@@ -1268,60 +1269,12 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
                     continue;
                 }
 
-                // Check local normal coherence across 6-neighbors so sharp 90° box edges and
-                // 1-voxel thin-wall medial creases are smoothly damped without spurious tilt.
-                const auto& nSurf = domain.sdfGrad[i];
-                float minNrmDot = 1.0f;
-                float sumNrmDot = 0.0f;
-                int nrmCount = 0;
-                for (const std::int32_t nb : domain.neighbors6[i]) {
-                    if (nb >= 0) {
-                        const float d = dot3(nSurf, domain.sdfGrad[static_cast<std::size_t>(nb)]);
-                        minNrmDot = std::min(minNrmDot, d);
-                        sumNrmDot += d;
-                        ++nrmCount;
-                    }
-                }
-                const float avgNrmDot =
-                    (nrmCount > 0) ? (sumNrmDot / static_cast<float>(nrmCount)) : 1.0f;
-
-                // Also probe inward along -n_surf to verify that this surface is backed by solid
-                // interior rather than a thin fin/arch tip where opposite walls would fight each other.
-                const int probeSteps =
-                    std::clamp<int>(static_cast<int>(std::lround(1.5f / dx)), 3, 6);
-                const openvdb::Coord probeCoord = domain.coords[i].offsetBy(
-                    static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[0])),
-                    static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[1])),
-                    static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[2])));
-                const std::int32_t probeIdx = domain.findVoxelIndex(probeCoord);
-                if (probeIdx < 0 || !domain.isInterior[static_cast<std::size_t>(probeIdx)]) {
-                    continue;
-                }
-                const float probeDot =
-                    dot3(nSurf, domain.sdfGrad[static_cast<std::size_t>(probeIdx)]);
-
-                const float coherenceFactor =
-                    smoothstep01(0.75f, 0.94f, avgNrmDot) *
-                    smoothstep01(0.35f, 0.80f, minNrmDot) *
-                    smoothstep01(0.55f, 0.85f, probeDot);
-                if (coherenceFactor <= 1.0e-4f) {
-                    continue;
-                }
-
-                const NozzleBasis baseFrame =
-                    ctx.backend.queryNozzleFrame(domain.posBed[i], {1.0f, 0.0f, 0.0f});
-                const float hBed =
-                    std::max(0.0f, dot3(domain.posBed[i], baseFrame.nozzle_axis) - domain.minZBed);
-                const float bedFactor = smoothstep01(1.5f * dx, 3.5f * dx, hBed);
-                if (bedFactor <= 1.0e-4f) {
-                    continue;
-                }
-
                 // Always evaluate the driving overhang bias against the nominal bed gravity
                 // `baseGravityDir = queryGravityDirection(pos)` so the solver maintains a steady
                 // restoring tilt that keeps the bed/tool tilted to support the overhang across
                 // outer iterations; the residual post-tilt overhang relative to `-domain.toolAxis[i]`
                 // is evaluated in `evaluateSupportNeededAndSeedOrderField` once `toolAxis` converges.
+                const auto& nSurf = domain.sdfGrad[i];
                 const std::array<float, 3> baseGravityDir =
                     ctx.backend.queryGravityDirection(domain.posBed[i]);
                 const std::array<float, 3> upDir{
@@ -1348,6 +1301,72 @@ void OverhangIslandConstraint::applyPreSweepModifiers(
                     signedOverhangDeg);
                 const float alphaOrth = std::clamp(wLow * wHigh, 0.0f, 1.0f);
                 const float alphaConf = 1.0f - alphaOrth;
+
+                // Check local normal coherence across 6-neighbors so sharp 90° box edges and
+                // 1-voxel thin-wall medial creases are smoothly damped without spurious tilt.
+                float minNrmDot = 1.0f;
+                float sumNrmDot = 0.0f;
+                int nrmCount = 0;
+                for (const std::int32_t nb : domain.neighbors6[i]) {
+                    if (nb >= 0) {
+                        const float d = dot3(nSurf, domain.sdfGrad[static_cast<std::size_t>(nb)]);
+                        minNrmDot = std::min(minNrmDot, d);
+                        sumNrmDot += d;
+                        ++nrmCount;
+                    }
+                }
+                const float avgNrmDot =
+                    (nrmCount > 0) ? (sumNrmDot / static_cast<float>(nrmCount)) : 1.0f;
+
+                // For near-horizontal overhangs / bridge ceilings (>= 70 deg overhang in conformal regime),
+                // the opposite top face normal (-nSurf) agrees with dConf = -nSurf rather than fighting it;
+                // use a 1-voxel inward interior check so thin slabs (1.3-2.3 mm) are not zeroed out.
+                const bool isFlatConformalCeiling =
+                    (alphaConf >= 0.70f) && (signedOverhangDeg >= 70.0f);
+                float coherenceFactor = 0.0f;
+                if (isFlatConformalCeiling) {
+                    const openvdb::Coord probeCoord = domain.coords[i].offsetBy(
+                        static_cast<int>(std::lround(-nSurf[0])),
+                        static_cast<int>(std::lround(-nSurf[1])),
+                        static_cast<int>(std::lround(-nSurf[2])));
+                    const std::int32_t probeIdx = domain.findVoxelIndex(probeCoord);
+                    if (probeIdx < 0 || !domain.isInterior[static_cast<std::size_t>(probeIdx)]) {
+                        continue;
+                    }
+                    coherenceFactor = smoothstep01(0.45f, 0.80f, avgNrmDot);
+                } else {
+                    // Also probe inward along -n_surf to verify that this surface is backed by solid
+                    // interior rather than a thin fin/arch tip where opposite walls would fight each other.
+                    const int probeSteps =
+                        std::clamp<int>(static_cast<int>(std::lround(1.5f / dx)), 3, 6);
+                    const openvdb::Coord probeCoord = domain.coords[i].offsetBy(
+                        static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[0])),
+                        static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[1])),
+                        static_cast<int>(std::lround(-static_cast<float>(probeSteps) * nSurf[2])));
+                    const std::int32_t probeIdx = domain.findVoxelIndex(probeCoord);
+                    if (probeIdx < 0 || !domain.isInterior[static_cast<std::size_t>(probeIdx)]) {
+                        continue;
+                    }
+                    const float probeDot =
+                        dot3(nSurf, domain.sdfGrad[static_cast<std::size_t>(probeIdx)]);
+
+                    coherenceFactor =
+                        smoothstep01(0.75f, 0.94f, avgNrmDot) *
+                        smoothstep01(0.35f, 0.80f, minNrmDot) *
+                        smoothstep01(0.55f, 0.85f, probeDot);
+                }
+                if (coherenceFactor <= 1.0e-4f) {
+                    continue;
+                }
+
+                const NozzleBasis baseFrame =
+                    ctx.backend.queryNozzleFrame(domain.posBed[i], {1.0f, 0.0f, 0.0f});
+                const float hBed =
+                    std::max(0.0f, dot3(domain.posBed[i], baseFrame.nozzle_axis) - domain.minZBed);
+                const float bedFactor = smoothstep01(1.5f * dx, 3.5f * dx, hBed);
+                if (bedFactor <= 1.0e-4f) {
+                    continue;
+                }
 
                 // 1. Orthogonal-to-surface target (\nabla \tau \perp n_surf):
                 //    Blend `baseDir` and `upDir` by |ovh| so vertical side walls (ovh \approx 0)
@@ -1747,26 +1766,37 @@ void OrientationHintConstraint::enforceOnField(
 
 namespace {
 
-/// Detects interior & boundary regions of `domain` that cannot be reached causally by the
-/// constrained Eikonal order field `\tau(x)` without external support, populates
-/// `domain.supportNeeded` in `[0.0, 1.0]`, and optionally seeds unreachable boundary
-/// contact patches as secondary support seeds (`ctx.enableSupportSeeding`).
-void evaluateSupportNeededAndSeedOrderField(
+struct TwoPierBridgeResult {
+    bool isTwoPier = false;
+    float minSpanMm = std::numeric_limits<float>::max();
+    std::size_t bestPierPosIdx = 0;
+    std::size_t bestPierNegIdx = 0;
+};
+
+/// Computes anti-gravity height `gravHeight`, local anti-gravity direction `upDirs`,
+/// causal upward reachability `causallyReachable`, and supported two-pier anchor mask
+/// `isValidBridgePier` across `domain`.
+void computeCausalReachabilityAndBridgePiers(
     ActiveVolumeDomain& domain,
     const EikonalSolverContext& ctx,
-    const std::vector<std::uint8_t>& isTrueBedSeed)
+    const std::vector<std::uint8_t>& isTrueBedSeed,
+    std::vector<float>& gravHeight,
+    std::vector<std::array<float, 3>>& upDirs,
+    std::vector<std::uint8_t>& causallyReachable,
+    std::vector<std::uint8_t>& isValidBridgePier)
 {
     const std::size_t n = domain.coords.size();
     const float dx = static_cast<float>(domain.voxelSize);
-    domain.supportNeeded.assign(n, 0.0f);
+    gravHeight.assign(n, 0.0f);
+    upDirs.assign(n, {0.0f, 0.0f, 1.0f});
+    causallyReachable.assign(n, 0);
+    isValidBridgePier.assign(n, 0);
     if (n == 0 || !domain.indexGrid) {
         return;
     }
 
     // 1. Compute anti-gravity height h_g(x_i) = (x_i - x_min) \cdot (-\hat{g}_{bed}(x_i))
-    std::vector<float> gravHeight(n, 0.0f);
     float minGravProj = std::numeric_limits<float>::max();
-    std::vector<std::array<float, 3>> upDirs(n, {0.0f, 0.0f, 1.0f});
     const bool bedTiltsWithRotary = ctx.backend.bedTiltsWithRotaryAxes();
 
     for (std::size_t i = 0; i < n; ++i) {
@@ -1805,7 +1835,6 @@ void evaluateSupportNeededAndSeedOrderField(
     }
 
     // 2. Causal upward reachability from true build-plate seeds (and multi-res inner core pins)
-    std::vector<std::uint8_t> causallyReachable(n, 0);
     std::vector<std::size_t> interiorOrder;
     interiorOrder.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
@@ -1904,17 +1933,11 @@ void evaluateSupportNeededAndSeedOrderField(
         cursor = bandEnd;
     }
 
-    // 3. Evaluate Constrained Layer-Normal vs. Surface-Normal Boundary Starvation & 3D Bridge Subtraction
-    const float critDeg = std::clamp(ctx.overhangThresholdDeg, 5.0f, 89.0f);
-    const float sinCrit = std::sin(critDeg * kDegToRad);
-    const float sinSteep = std::sin(65.0f * kDegToRad);
-    const float maxBridgeMm = std::max(0.0f, ctx.maxBridgeLengthMm);
-    const float shellBandMm = std::max(3.0f * dx, 2.5f * ctx.layerHeight.target_mm);
-
-    // Precompute which causally-reachable interior voxels are valid bridge anchor piers
+    // 3. Precompute which causally-reachable interior voxels are valid bridge anchor piers
     // (supported from below along gravity +\hat{g}_{bed}) so cantilever side edges are never
     // mistaken for bridge piers.
-    std::vector<std::uint8_t> isValidBridgePier(n, 0);
+    const float critDeg = std::clamp(ctx.overhangThresholdDeg, 5.0f, 89.0f);
+    const float sinCrit = std::sin(critDeg * kDegToRad);
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, n, 512),
         [&](const tbb::blocked_range<std::size_t>& r) {
@@ -1927,11 +1950,6 @@ void evaluateSupportNeededAndSeedOrderField(
                     isValidBridgePier[i] = 1;
                     continue;
                 }
-                // Step 1.75*dx downward along gravity (+gDir = -upDirs[i]).
-                // Note: we do not require uBelow to be strictly interior because a self-supporting
-                // sloped wall (< critDeg) has exterior voxels directly below it whose SDF gradient
-                // still satisfies (-overhang[uBelow]) <= sinCrit, whereas a cantilever side-wall
-                // has the downward-facing ceiling (-overhang > sinCrit) directly below it.
                 const auto& pos = domain.posBed[i];
                 const auto& uUp = upDirs[i];
                 const openvdb::Vec3d wpBelow(
@@ -1951,6 +1969,147 @@ void evaluateSupportNeededAndSeedOrderField(
                 }
             }
         });
+}
+
+/// Tests whether interior overhanging voxel `i` lies on a straight 3D two-pier bridge
+/// anchored at valid supported piers on both ends in the plane orthogonal to `uUp`.
+template <typename IdxAccT>
+TwoPierBridgeResult probeTwoPierBridge(
+    const ActiveVolumeDomain& domain,
+    IdxAccT& localIdxAcc,
+    const std::vector<std::uint8_t>& isValidBridgePier,
+    const std::array<float, 3>& uUp,
+    std::size_t i,
+    float dx,
+    int maxBridgeSearchSteps)
+{
+    TwoPierBridgeResult res{};
+    const std::array<float, 3> refAxis =
+        (std::abs(uUp[0]) < 0.9f) ? std::array<float, 3>{1.0f, 0.0f, 0.0f}
+                                  : std::array<float, 3>{0.0f, 1.0f, 0.0f};
+    const float dotRef = dot3(refAxis, uUp);
+    const std::array<float, 3> t0 = normalize3(
+        {refAxis[0] - dotRef * uUp[0],
+         refAxis[1] - dotRef * uUp[1],
+         refAxis[2] - dotRef * uUp[2]},
+        {1.0f, 0.0f, 0.0f});
+    const std::array<float, 3> t1 = normalize3(
+        {uUp[1] * t0[2] - uUp[2] * t0[1],
+         uUp[2] * t0[0] - uUp[0] * t0[2],
+         uUp[0] * t0[1] - uUp[1] * t0[0]},
+        {0.0f, 1.0f, 0.0f});
+    constexpr float c45 = 0.70710678f;
+    constexpr float c22 = 0.92387953f;
+    constexpr float s22 = 0.38268343f;
+    const std::array<std::array<float, 3>, 8> bridgeDirs{{
+        t0,
+        t1,
+        {c45 * (t0[0] + t1[0]), c45 * (t0[1] + t1[1]), c45 * (t0[2] + t1[2])},
+        {c45 * (t0[0] - t1[0]), c45 * (t0[1] - t1[1]), c45 * (t0[2] - t1[2])},
+        {c22 * t0[0] + s22 * t1[0], c22 * t0[1] + s22 * t1[1], c22 * t0[2] + s22 * t1[2]},
+        {s22 * t0[0] + c22 * t1[0], s22 * t0[1] + c22 * t1[1], s22 * t0[2] + c22 * t1[2]},
+        {c22 * t0[0] - s22 * t1[0], c22 * t0[1] - s22 * t1[1], c22 * t0[2] - s22 * t1[2]},
+        {s22 * t0[0] - c22 * t1[0], s22 * t0[1] - c22 * t1[1], s22 * t0[2] - c22 * t1[2]},
+    }};
+
+    // Nudge ray origin slightly inward along -\nabla\phi_sdf so boundary ceiling voxels
+    // march cleanly inside the bridge deck rather than skimming the exterior air below.
+    std::array<float, 3> pStart = domain.posBed[i];
+    const float nudgeInward = std::clamp(0.85f * dx + domain.sdf[i], 0.0f, 1.25f * dx);
+    if (nudgeInward > 1.0e-4f) {
+        const std::array<float, 3> pNudged{
+            pStart[0] - nudgeInward * domain.sdfGrad[i][0],
+            pStart[1] - nudgeInward * domain.sdfGrad[i][1],
+            pStart[2] - nudgeInward * domain.sdfGrad[i][2]};
+        const openvdb::Coord cNudged = domain.transform->worldToIndexCellCentered(
+            openvdb::Vec3d(pNudged[0], pNudged[1], pNudged[2]));
+        const std::int32_t nbNudged = localIdxAcc.getValue(cNudged);
+        if (nbNudged >= 0 && domain.isInterior[static_cast<std::size_t>(nbNudged)]) {
+            pStart = pNudged;
+        }
+    }
+
+    for (const auto& bDir : bridgeDirs) {
+        auto marchBridgeHalf = [&](float sign, float& outDistMm, std::size_t& outPierIdx) -> bool {
+            for (int s = 1; s <= maxBridgeSearchSteps; ++s) {
+                const float dMm = static_cast<float>(s) * dx;
+                const openvdb::Vec3d wp(
+                    pStart[0] + sign * dMm * bDir[0],
+                    pStart[1] + sign * dMm * bDir[1],
+                    pStart[2] + sign * dMm * bDir[2]);
+                const openvdb::Coord cStep =
+                    domain.transform->worldToIndexCellCentered(wp);
+                const std::int32_t nb = localIdxAcc.getValue(cStep);
+                if (nb < 0) {
+                    return false;
+                }
+                const std::size_t u = static_cast<std::size_t>(nb);
+                if (!domain.isInterior[u]) {
+                    return false;
+                }
+                if (isValidBridgePier[u]) {
+                    outDistMm = dMm;
+                    outPierIdx = u;
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        float distPos = 0.0f;
+        float distNeg = 0.0f;
+        std::size_t pierPosIdx = 0;
+        std::size_t pierNegIdx = 0;
+        if (marchBridgeHalf(1.0f, distPos, pierPosIdx) &&
+            marchBridgeHalf(-1.0f, distNeg, pierNegIdx)) {
+            const float spanMm = distPos + distNeg;
+            if (!res.isTwoPier || spanMm < res.minSpanMm) {
+                res.isTwoPier = true;
+                res.minSpanMm = spanMm;
+                res.bestPierPosIdx = pierPosIdx;
+                res.bestPierNegIdx = pierNegIdx;
+            }
+        }
+    }
+
+    return res;
+}
+
+/// Detects interior & boundary regions of `domain` that cannot be reached causally by the
+/// constrained Eikonal order field `\tau(x)` without external support, populates
+/// `domain.supportNeeded` in `[0.0, 1.0]`, and optionally seeds unreachable boundary
+/// contact patches as secondary support seeds (`ctx.enableSupportSeeding`).
+void evaluateSupportNeededAndSeedOrderField(
+    ActiveVolumeDomain& domain,
+    const EikonalSolverContext& ctx,
+    const std::vector<std::uint8_t>& isTrueBedSeed)
+{
+    const std::size_t n = domain.coords.size();
+    const float dx = static_cast<float>(domain.voxelSize);
+    domain.supportNeeded.assign(n, 0.0f);
+    if (n == 0 || !domain.indexGrid) {
+        return;
+    }
+
+    std::vector<float> gravHeight;
+    std::vector<std::array<float, 3>> upDirs;
+    std::vector<std::uint8_t> causallyReachable;
+    std::vector<std::uint8_t> isValidBridgePier;
+    computeCausalReachabilityAndBridgePiers(
+        domain,
+        ctx,
+        isTrueBedSeed,
+        gravHeight,
+        upDirs,
+        causallyReachable,
+        isValidBridgePier);
+
+    // Evaluate Constrained Layer-Normal vs. Surface-Normal Boundary Starvation & 3D Bridge Subtraction
+    const float critDeg = std::clamp(ctx.overhangThresholdDeg, 5.0f, 89.0f);
+    const float sinCrit = std::sin(critDeg * kDegToRad);
+    const float sinSteep = std::sin(65.0f * kDegToRad);
+    const float maxBridgeMm = std::max(0.0f, ctx.maxBridgeLengthMm);
+    const float shellBandMm = std::max(3.0f * dx, 2.5f * ctx.layerHeight.target_mm);
 
     const int maxBridgeSearchSteps = std::clamp<int>(
         static_cast<int>(std::ceil(std::max(domain.maxSpanMm, maxBridgeMm * 2.0f) / dx)) + 4,
@@ -2000,96 +2159,18 @@ void evaluateSupportNeededAndSeedOrderField(
                     continue;
                 }
 
-                // Test whether this overhanging boundary voxel lies on a straight 3D two-pier bridge
-                // (anchored at valid supported piers on both ends in the plane orthogonal to anti-gravity `uUp`)
-                // and measure its shortest two-pier span `minBridgeSpanMm`.
-                const auto& uUp = upDirs[i];
-                const std::array<float, 3> refAxis =
-                    (std::abs(uUp[0]) < 0.9f) ? std::array<float, 3>{1.0f, 0.0f, 0.0f}
-                                              : std::array<float, 3>{0.0f, 1.0f, 0.0f};
-                const float dotRef = dot3(refAxis, uUp);
-                const std::array<float, 3> t0 = normalize3(
-                    {refAxis[0] - dotRef * uUp[0],
-                     refAxis[1] - dotRef * uUp[1],
-                     refAxis[2] - dotRef * uUp[2]},
-                    {1.0f, 0.0f, 0.0f});
-                const std::array<float, 3> t1 = normalize3(
-                    {uUp[1] * t0[2] - uUp[2] * t0[1],
-                     uUp[2] * t0[0] - uUp[0] * t0[2],
-                     uUp[0] * t0[1] - uUp[1] * t0[0]},
-                    {0.0f, 1.0f, 0.0f});
-                const float c45 = 0.70710678f;
-                const float c22 = 0.92387953f;
-                const float s22 = 0.38268343f;
-                const std::array<std::array<float, 3>, 8> bridgeDirs{{
-                    t0,
-                    t1,
-                    {c45 * (t0[0] + t1[0]), c45 * (t0[1] + t1[1]), c45 * (t0[2] + t1[2])},
-                    {c45 * (t0[0] - t1[0]), c45 * (t0[1] - t1[1]), c45 * (t0[2] - t1[2])},
-                    {c22 * t0[0] + s22 * t1[0], c22 * t0[1] + s22 * t1[1], c22 * t0[2] + s22 * t1[2]},
-                    {s22 * t0[0] + c22 * t1[0], s22 * t0[1] + c22 * t1[1], s22 * t0[2] + c22 * t1[2]},
-                    {c22 * t0[0] - s22 * t1[0], c22 * t0[1] - s22 * t1[1], c22 * t0[2] - s22 * t1[2]},
-                    {s22 * t0[0] - c22 * t1[0], s22 * t0[1] - c22 * t1[1], s22 * t0[2] - c22 * t1[2]},
-                }};
+                const TwoPierBridgeResult bridgeProbe = probeTwoPierBridge(
+                    domain,
+                    localIdxAcc,
+                    isValidBridgePier,
+                    upDirs[i],
+                    i,
+                    dx,
+                    maxBridgeSearchSteps);
 
-                // Nudge ray origin slightly inward along -\nabla\phi_sdf so boundary ceiling voxels
-                // march cleanly inside the bridge deck rather than skimming the exterior air below.
-                std::array<float, 3> pStart = domain.posBed[i];
-                const float nudgeInward = std::clamp(0.85f * dx + domain.sdf[i], 0.0f, 1.25f * dx);
-                if (nudgeInward > 1.0e-4f) {
-                    const std::array<float, 3> pNudged{
-                        pStart[0] - nudgeInward * domain.sdfGrad[i][0],
-                        pStart[1] - nudgeInward * domain.sdfGrad[i][1],
-                        pStart[2] - nudgeInward * domain.sdfGrad[i][2]};
-                    const openvdb::Coord cNudged = domain.transform->worldToIndexCellCentered(
-                        openvdb::Vec3d(pNudged[0], pNudged[1], pNudged[2]));
-                    const std::int32_t nbNudged = localIdxAcc.getValue(cNudged);
-                    if (nbNudged >= 0 && domain.isInterior[static_cast<std::size_t>(nbNudged)]) {
-                        pStart = pNudged;
-                    }
-                }
-
-                bool isTwoPierBridge = false;
-                float minBridgeSpanMm = std::numeric_limits<float>::max();
-
-                for (const auto& bDir : bridgeDirs) {
-                    auto marchBridgeHalf = [&](float sign, float& outDistMm) -> bool {
-                        for (int s = 1; s <= maxBridgeSearchSteps; ++s) {
-                            const float dMm = static_cast<float>(s) * dx;
-                            const openvdb::Vec3d wp(
-                                pStart[0] + sign * dMm * bDir[0],
-                                pStart[1] + sign * dMm * bDir[1],
-                                pStart[2] + sign * dMm * bDir[2]);
-                            const openvdb::Coord cStep =
-                                domain.transform->worldToIndexCellCentered(wp);
-                            const std::int32_t nb = localIdxAcc.getValue(cStep);
-                            if (nb < 0) {
-                                return false;
-                            }
-                            const std::size_t u = static_cast<std::size_t>(nb);
-                            if (!domain.isInterior[u]) {
-                                return false;
-                            }
-                            if (isValidBridgePier[u]) {
-                                outDistMm = dMm;
-                                return true;
-                            }
-                        }
-                        return false;
-                    };
-
-                    float distPos = 0.0f;
-                    float distNeg = 0.0f;
-                    if (marchBridgeHalf(1.0f, distPos) &&
-                        marchBridgeHalf(-1.0f, distNeg)) {
-                        isTwoPierBridge = true;
-                        minBridgeSpanMm = std::min(minBridgeSpanMm, distPos + distNeg);
-                    }
-                }
-
-                if (isTwoPierBridge) {
+                if (bridgeProbe.isTwoPier) {
                     // Self-supporting straight bridge within the configured max bridge length
-                    if (minBridgeSpanMm <= maxBridgeMm) {
+                    if (bridgeProbe.minSpanMm <= maxBridgeMm) {
                         continue;
                     }
                     // Otherwise (`minBridgeSpanMm > maxBridgeMm`), this is a bridge over the set length
@@ -2612,6 +2693,529 @@ void updateCrownSlownessAndDirections(
         });
 }
 
+/// Self-supporting two-pier horizontal bridge deck state for bottom-up Eikonal leveling.
+struct BridgeDeckPatch {
+    std::vector<std::size_t> ceilingVoxels;
+    std::vector<std::size_t> slabVoxels;
+    std::vector<float> slabWeights;
+    std::vector<float> slabDUp;
+    std::vector<std::size_t> pierAnchors;
+    std::array<float, 3> nPatch{0.0f, 0.0f, 1.0f};
+    std::array<float, 3> pRef{0.0f, 0.0f, 0.0f};
+    float meanGravHeight = 0.0f;
+    float tauDeck = 0.0f;
+};
+
+struct BridgeDeckState {
+    bool active = false;
+    std::vector<BridgeDeckPatch> patches;
+};
+
+BridgeDeckState buildBridgeDeckState(
+    ActiveVolumeDomain& domain,
+    const EikonalSolverContext& ctx,
+    const std::vector<std::uint8_t>& isTrueBedSeed)
+{
+    BridgeDeckState state{};
+    const std::size_t n = domain.coords.size();
+    if (n == 0 ||
+        !domain.indexGrid ||
+        !domain.transform ||
+        ctx.heightOnlyOrderField ||
+        ctx.maxBridgeLengthMm <= 1.0e-3f) {
+        return state;
+    }
+
+    std::vector<float> gravHeight;
+    std::vector<std::array<float, 3>> upDirs;
+    std::vector<std::uint8_t> causallyReachable;
+    std::vector<std::uint8_t> isValidBridgePier;
+    computeCausalReachabilityAndBridgePiers(
+        domain,
+        ctx,
+        isTrueBedSeed,
+        gravHeight,
+        upDirs,
+        causallyReachable,
+        isValidBridgePier);
+
+    const float dx = static_cast<float>(domain.voxelSize);
+    const float hTarget = std::max(0.02f, ctx.layerHeight.target_mm);
+    const float critDeg = std::clamp(ctx.overhangThresholdDeg, 5.0f, 89.0f);
+    const float sinCrit = std::sin(critDeg * kDegToRad);
+    const float sinCeilingMin = std::max(sinCrit, 0.8660254f); // >= 60 deg overhang
+    const float maxBridgeMm = std::max(0.0f, ctx.maxBridgeLengthMm);
+    const float surfBandMm = std::max(1.5f * dx, 1.25f * hTarget);
+    const int maxBridgeSearchSteps = std::clamp<int>(
+        static_cast<int>(std::ceil(std::max(domain.maxSpanMm, maxBridgeMm * 2.0f) / dx)) + 4,
+        16,
+        1024);
+
+    std::vector<std::uint8_t> isBridgeCand(n, 0);
+    std::vector<std::size_t> candPierPos(n, 0);
+    std::vector<std::size_t> candPierNeg(n, 0);
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, n, 256),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            auto localIdxAcc = domain.indexGrid->getConstAccessor();
+            for (std::size_t i = r.begin(); i != r.end(); ++i) {
+                if (!domain.isInterior[i] ||
+                    domain.isSeed[i] ||
+                    domain.isPinnedSeed[i] ||
+                    !causallyReachable[i] ||
+                    domain.tau[i] >= 0.5f * kInfinityTau) {
+                    continue;
+                }
+                if (gravHeight[i] <= 2.5f * dx) {
+                    continue;
+                }
+                if (std::abs(domain.sdf[i]) > surfBandMm) {
+                    continue;
+                }
+
+                const auto& uUp = upDirs[i];
+                const float sGravUp = -dot3(domain.sdfGrad[i], uUp);
+                if (sGravUp < sinCeilingMin) {
+                    continue;
+                }
+
+                const auto& pos = domain.posBed[i];
+                // Require exterior free air directly below along -upDir
+                const float airStepMm = std::max(1.5f * dx, std::max(0.0f, -domain.sdf[i]) + 1.0f * dx);
+                const openvdb::Vec3d wpBelow(
+                    pos[0] - airStepMm * uUp[0],
+                    pos[1] - airStepMm * uUp[1],
+                    pos[2] - airStepMm * uUp[2]);
+                const std::int32_t nbBelow =
+                    localIdxAcc.getValue(domain.transform->worldToIndexCellCentered(wpBelow));
+                if (nbBelow >= 0 &&
+                    domain.isInterior[static_cast<std::size_t>(nbBelow)] &&
+                    domain.sdf[static_cast<std::size_t>(nbBelow)] <= 0.25f * dx) {
+                    continue;
+                }
+
+                // Require interior solid backing directly above along +upDir
+                const openvdb::Vec3d wpAbove(
+                    pos[0] + 1.0f * dx * uUp[0],
+                    pos[1] + 1.0f * dx * uUp[1],
+                    pos[2] + 1.0f * dx * uUp[2]);
+                const std::int32_t nbAbove =
+                    localIdxAcc.getValue(domain.transform->worldToIndexCellCentered(wpAbove));
+                if (nbAbove < 0 || !domain.isInterior[static_cast<std::size_t>(nbAbove)]) {
+                    continue;
+                }
+
+                const TwoPierBridgeResult probe = probeTwoPierBridge(
+                    domain,
+                    localIdxAcc,
+                    isValidBridgePier,
+                    uUp,
+                    i,
+                    dx,
+                    maxBridgeSearchSteps);
+                if (probe.isTwoPier && probe.minSpanMm <= maxBridgeMm) {
+                    isBridgeCand[i] = 1;
+                    candPierPos[i] = probe.bestPierPosIdx;
+                    candPierNeg[i] = probe.bestPierNegIdx;
+                }
+            }
+        });
+
+    std::vector<std::uint8_t> visited(n, 0);
+    std::vector<std::size_t> compQueue;
+    compQueue.reserve(512);
+    const float slabDepthMm = std::max(1.75f * dx, 1.0f * hTarget);
+    const float fullWeightDepthMm = 0.75f * dx;
+    const float clearanceSlopeRad =
+        ToolClearanceConstraint::computeMaxClearanceSlopeRad(ctx.activeTool) +
+        (ctx.activeTool.has_rotational_axes
+             ? std::clamp(ctx.activeTool.max_angle_from_bed_normal_deg, 0.0f, 85.0f) * kDegToRad
+             : 0.0f);
+    const float maxTiltRad = std::clamp(clearanceSlopeRad, 5.0f * kDegToRad, 80.0f * kDegToRad);
+
+    for (std::size_t seed = 0; seed < n; ++seed) {
+        if (!isBridgeCand[seed] || visited[seed]) {
+            continue;
+        }
+        compQueue.clear();
+        visited[seed] = 1;
+        compQueue.push_back(seed);
+        std::size_t head = 0;
+        while (head < compQueue.size()) {
+            const std::size_t u = compQueue[head++];
+            const openvdb::Coord& cu = domain.coords[u];
+            const auto& gU = domain.sdfGrad[u];
+            const auto& uUp = upDirs[u];
+            const auto& pU = domain.posBed[u];
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dxOff = -1; dxOff <= 1; ++dxOff) {
+                        if (dxOff == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        const std::int32_t nb =
+                            domain.findVoxelIndex(cu.offsetBy(dxOff, dy, dz));
+                        if (nb < 0) {
+                            continue;
+                        }
+                        const auto v = static_cast<std::size_t>(nb);
+                        if (!isBridgeCand[v] || visited[v]) {
+                            continue;
+                        }
+                        if (dot3(gU, domain.sdfGrad[v]) < 0.88f) {
+                            continue;
+                        }
+                        const std::array<float, 3> diff{
+                            domain.posBed[v][0] - pU[0],
+                            domain.posBed[v][1] - pU[1],
+                            domain.posBed[v][2] - pU[2]};
+                        if (std::abs(dot3(diff, uUp)) > 1.25f * dx) {
+                            continue;
+                        }
+                        visited[v] = 1;
+                        compQueue.push_back(v);
+                    }
+                }
+            }
+        }
+
+        if (compQueue.size() < 3) {
+            continue;
+        }
+
+        double sumX = 0.0, sumY = 0.0, sumZ = 0.0, sumGravH = 0.0;
+        std::array<float, 3> sumNegGrad{0.0f, 0.0f, 0.0f};
+        std::array<float, 3> sumUp{0.0f, 0.0f, 0.0f};
+        for (const std::size_t v : compQueue) {
+            sumX += static_cast<double>(domain.posBed[v][0]);
+            sumY += static_cast<double>(domain.posBed[v][1]);
+            sumZ += static_cast<double>(domain.posBed[v][2]);
+            sumGravH += static_cast<double>(gravHeight[v]);
+            sumNegGrad[0] -= domain.sdfGrad[v][0];
+            sumNegGrad[1] -= domain.sdfGrad[v][1];
+            sumNegGrad[2] -= domain.sdfGrad[v][2];
+            sumUp[0] += upDirs[v][0];
+            sumUp[1] += upDirs[v][1];
+            sumUp[2] += upDirs[v][2];
+        }
+        const float invCnt = 1.0f / static_cast<float>(compQueue.size());
+        const std::array<float, 3> pRef{
+            static_cast<float>(sumX) * invCnt,
+            static_cast<float>(sumY) * invCnt,
+            static_cast<float>(sumZ) * invCnt};
+        const float meanGravH = static_cast<float>(sumGravH) * invCnt;
+
+        const NozzleBasis pFrame = ctx.backend.queryNozzleFrame(pRef, {1.0f, 0.0f, 0.0f});
+        const std::array<float, 3> upMean = normalize3(sumUp, pFrame.nozzle_axis);
+        const std::array<float, 3> negGradMean = normalize3(sumNegGrad, upMean);
+        const std::array<float, 3> nPatchRaw = normalize3(
+            {0.70f * negGradMean[0] + 0.30f * upMean[0],
+             0.70f * negGradMean[1] + 0.30f * upMean[1],
+             0.70f * negGradMean[2] + 0.30f * upMean[2]},
+            upMean);
+        const std::array<float, 3> nPatch =
+            clampUnitVectorToCone(nPatchRaw, pFrame.nozzle_axis, maxTiltRad);
+
+        // Respect conflicting explicit user orthogonality orientation hints
+        bool conflictsWithHint = false;
+        for (const auto& hint : ctx.hints) {
+            if (hint.kind != HintKind::Orthogonality || hint.weight <= 0.25f) {
+                continue;
+            }
+            const float rad = std::max(hint.influenceRadiusMm, 3.0f * dx);
+            const std::array<float, 3> diffH{
+                pRef[0] - hint.positionBed[0],
+                pRef[1] - hint.positionBed[1],
+                pRef[2] - hint.positionBed[2]};
+            if (length3(diffH) > rad) {
+                continue;
+            }
+            std::array<float, 3> hintDir = normalize3(hint.directionBed, pFrame.nozzle_axis);
+            const float dotBed = dot3(hintDir, pFrame.nozzle_axis);
+            if ((hint.applyOnSurfaceOnly && dotBed < -0.15f) ||
+                (!hint.applyOnSurfaceOnly && dotBed < -0.25f)) {
+                hintDir = {-hintDir[0], -hintDir[1], -hintDir[2]};
+            }
+            if (dot3(hintDir, nPatch) < 0.9659258f) { // cos(15 deg)
+                conflictsWithHint = true;
+                break;
+            }
+        }
+        if (conflictsWithHint) {
+            continue;
+        }
+
+        std::unordered_set<std::size_t> pierSet;
+        pierSet.reserve(compQueue.size() * 2);
+        for (const std::size_t v : compQueue) {
+            const std::size_t uPos = candPierPos[v];
+            const std::size_t uNeg = candPierNeg[v];
+            if (uPos < n && isValidBridgePier[uPos]) {
+                pierSet.insert(uPos);
+            }
+            if (uNeg < n && isValidBridgePier[uNeg]) {
+                pierSet.insert(uNeg);
+            }
+            const openvdb::Coord& cv = domain.coords[v];
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dxOff = -1; dxOff <= 1; ++dxOff) {
+                        if (dxOff == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        const std::int32_t nb =
+                            domain.findVoxelIndex(cv.offsetBy(dxOff, dy, dz));
+                        if (nb >= 0 && isValidBridgePier[static_cast<std::size_t>(nb)]) {
+                            pierSet.insert(static_cast<std::size_t>(nb));
+                        }
+                    }
+                }
+            }
+        }
+        if (pierSet.size() < 2) {
+            continue;
+        }
+
+        BridgeDeckPatch patch{};
+        patch.ceilingVoxels = compQueue;
+        patch.pierAnchors.assign(pierSet.begin(), pierSet.end());
+        patch.nPatch = nPatch;
+        patch.pRef = pRef;
+        patch.meanGravHeight = meanGravH;
+
+        // Build thin upward transition slab strictly along +nPatch columns above ceilingVoxels
+        std::unordered_set<std::size_t> ceilingSet(compQueue.begin(), compQueue.end());
+        std::unordered_set<std::size_t> seenSlab(compQueue.begin(), compQueue.end());
+        auto slabIdxAcc = domain.indexGrid->getConstAccessor();
+        const float colStepMm = 0.5f * dx;
+        for (const std::size_t v : compQueue) {
+            const auto& pBase = domain.posBed[v];
+            for (float dCol = colStepMm; dCol <= slabDepthMm + 1.0e-4f; dCol += colStepMm) {
+                const openvdb::Vec3d wp(
+                    pBase[0] + dCol * nPatch[0],
+                    pBase[1] + dCol * nPatch[1],
+                    pBase[2] + dCol * nPatch[2]);
+                const std::int32_t nb =
+                    slabIdxAcc.getValue(domain.transform->worldToIndexCellCentered(wp));
+                if (nb < 0) {
+                    break;
+                }
+                const auto w = static_cast<std::size_t>(nb);
+                if (!domain.isInterior[w] ||
+                    domain.isSeed[w] ||
+                    domain.isPinnedSeed[w] ||
+                    isValidBridgePier[w]) {
+                    break;
+                }
+                if (ceilingSet.count(w) || !seenSlab.insert(w).second) {
+                    continue;
+                }
+                const std::array<float, 3> relBase{
+                    domain.posBed[w][0] - pBase[0],
+                    domain.posBed[w][1] - pBase[1],
+                    domain.posBed[w][2] - pBase[2]};
+                const float dUp = dot3(relBase, nPatch);
+                if (dUp < -0.35f * dx || dUp > slabDepthMm) {
+                    continue;
+                }
+                float wt = 1.0f;
+                if (dUp > fullWeightDepthMm) {
+                    const float span = std::max(slabDepthMm - fullWeightDepthMm, 1.0e-4f);
+                    const float t = std::clamp((dUp - fullWeightDepthMm) / span, 0.0f, 1.0f);
+                    wt = 1.0f - (t * t * (3.0f - 2.0f * t));
+                }
+                if (wt > 1.0e-3f) {
+                    patch.slabVoxels.push_back(w);
+                    patch.slabWeights.push_back(wt);
+                    patch.slabDUp.push_back(dUp);
+                }
+            }
+        }
+
+        state.patches.push_back(std::move(patch));
+    }
+
+    if (state.patches.empty()) {
+        return state;
+    }
+
+    std::sort(
+        state.patches.begin(),
+        state.patches.end(),
+        [](const BridgeDeckPatch& a, const BridgeDeckPatch& b) {
+            return a.meanGravHeight < b.meanGravHeight;
+        });
+    state.active = true;
+    return state;
+}
+
+void levelBridgeDecksInTau(
+    ActiveVolumeDomain& domain,
+    BridgeDeckState& state,
+    float hTargetMm,
+    bool runUpwardSweep,
+    bool onlyIfBowed = false)
+{
+    if (!state.active || state.patches.empty()) {
+        return;
+    }
+
+    const float dx = static_cast<float>(domain.voxelSize);
+    const float hTarget = std::max(0.02f, hTargetMm);
+    const float tierMergeDistMm = std::max(2.0f * dx, 1.5f);
+
+    std::vector<std::pair<std::size_t, std::size_t>> tiers;
+    std::size_t tBegin = 0;
+    for (std::size_t p = 1; p < state.patches.size(); ++p) {
+        if (state.patches[p].meanGravHeight - state.patches[p - 1].meanGravHeight > tierMergeDistMm) {
+            tiers.emplace_back(tBegin, p);
+            tBegin = p;
+        }
+    }
+    tiers.emplace_back(tBegin, state.patches.size());
+
+    while (tiers.size() > 4) {
+        std::size_t bestIdx = 0;
+        float bestGap = std::numeric_limits<float>::max();
+        for (std::size_t k = 0; k + 1 < tiers.size(); ++k) {
+            const float gap =
+                state.patches[tiers[k + 1].first].meanGravHeight -
+                state.patches[tiers[k].second - 1].meanGravHeight;
+            if (gap < bestGap) {
+                bestGap = gap;
+                bestIdx = k;
+            }
+        }
+        tiers[bestIdx].second = tiers[bestIdx + 1].second;
+        tiers.erase(tiers.begin() + static_cast<std::ptrdiff_t>(bestIdx + 1));
+    }
+
+    std::vector<float> ceilTaus;
+    std::vector<float> tauProjSamples;
+    std::vector<std::size_t> tempSeeds;
+
+    for (const auto& [tierBegin, tierEnd] : tiers) {
+        tempSeeds.clear();
+
+        for (std::size_t p = tierBegin; p < tierEnd; ++p) {
+            auto& patch = state.patches[p];
+            if (onlyIfBowed && runUpwardSweep && !patch.ceilingVoxels.empty()) {
+                ceilTaus.clear();
+                ceilTaus.reserve(patch.ceilingVoxels.size());
+                for (const std::size_t cv : patch.ceilingVoxels) {
+                    if (cv < domain.tau.size() && domain.tau[cv] < 0.5f * kInfinityTau) {
+                        ceilTaus.push_back(domain.tau[cv]);
+                    }
+                }
+                if (!ceilTaus.empty()) {
+                    std::sort(ceilTaus.begin(), ceilTaus.end());
+                    const std::size_t idx05 = std::min(
+                        ceilTaus.size() - 1,
+                        (ceilTaus.size() * 5) / 100);
+                    const std::size_t idx95 = std::min(
+                        ceilTaus.size() - 1,
+                        (ceilTaus.size() * 95) / 100);
+                    if (ceilTaus[idx95] - ceilTaus[idx05] <= 0.35f * hTarget) {
+                        continue;
+                    }
+                }
+            }
+            tauProjSamples.clear();
+            for (const std::size_t u : patch.pierAnchors) {
+                if (u < domain.tau.size() && domain.tau[u] < 0.5f * kInfinityTau) {
+                    const std::array<float, 3> delta{
+                        patch.pRef[0] - domain.posBed[u][0],
+                        patch.pRef[1] - domain.posBed[u][1],
+                        patch.pRef[2] - domain.posBed[u][2]};
+                    tauProjSamples.push_back(domain.tau[u] + dot3(delta, patch.nPatch));
+                }
+            }
+            if (tauProjSamples.empty()) {
+                continue;
+            }
+
+            std::sort(tauProjSamples.begin(), tauProjSamples.end());
+            const std::size_t qIdx =
+                std::min(tauProjSamples.size() - 1, (tauProjSamples.size() * 3) / 4);
+            patch.tauDeck = std::max(0.0f, tauProjSamples[qIdx]);
+
+            auto applyVoxel = [&](std::size_t v, float wt, float dUpVal) {
+                if (!domain.isInterior[v] || domain.isSeed[v] || domain.isPinnedSeed[v]) {
+                    return;
+                }
+                const std::array<float, 3> rel{
+                    domain.posBed[v][0] - patch.pRef[0],
+                    domain.posBed[v][1] - patch.pRef[1],
+                    domain.posBed[v][2] - patch.pRef[2]};
+                const float tauTarget = std::max(0.0f, patch.tauDeck + dot3(rel, patch.nPatch));
+                if (runUpwardSweep) {
+                    if (dUpVal <= dx && tauTarget < domain.tau[v]) {
+                        domain.tau[v] = tauTarget;
+                        domain.isSeed[v] = 1;
+                        tempSeeds.push_back(v);
+                    }
+                } else {
+                    const float diff = tauTarget - domain.tau[v];
+                    if (diff < 0.0f || std::abs(diff) > 0.15f * hTarget) {
+                        const float alpha = std::clamp(0.65f * wt, 0.0f, 1.0f);
+                        domain.tau[v] = (1.0f - alpha) * domain.tau[v] + alpha * tauTarget;
+                    }
+                }
+            };
+
+            for (const std::size_t v : patch.ceilingVoxels) {
+                applyVoxel(v, 1.0f, 0.0f);
+            }
+            for (std::size_t k = 0; k < patch.slabVoxels.size(); ++k) {
+                applyVoxel(patch.slabVoxels[k], patch.slabWeights[k], patch.slabDUp[k]);
+            }
+        }
+
+        if (runUpwardSweep && !tempSeeds.empty()) {
+            runInteriorFastSweeping(domain, 1, /*useDirectionalGuidance=*/false);
+            for (const std::size_t v : tempSeeds) {
+                domain.isSeed[v] = 0;
+            }
+        }
+    }
+}
+
+void applyBridgeDeckDirections(
+    ActiveVolumeDomain& domain,
+    const BridgeDeckState& state)
+{
+    if (!state.active) {
+        return;
+    }
+
+    for (const auto& patch : state.patches) {
+        auto applyDir = [&](std::size_t v, float wt) {
+            if (!domain.isInterior[v] || domain.isSeed[v] || domain.isPinnedSeed[v]) {
+                return;
+            }
+            const float wDir = std::clamp(0.95f * wt, 0.0f, 1.0f);
+            const auto& dCur = domain.targetDir[v];
+            domain.targetDir[v] = normalize3(
+                {(1.0f - wDir) * dCur[0] + wDir * patch.nPatch[0],
+                 (1.0f - wDir) * dCur[1] + wDir * patch.nPatch[1],
+                 (1.0f - wDir) * dCur[2] + wDir * patch.nPatch[2]},
+                patch.nPatch);
+            if (wt >= 0.85f) {
+                domain.slowness[v] = 1.0f;
+                domain.baseSlowness[v] = 1.0f;
+            }
+        };
+
+        for (const std::size_t v : patch.ceilingVoxels) {
+            applyDir(v, 1.0f);
+        }
+        for (std::size_t k = 0; k < patch.slabVoxels.size(); ++k) {
+            applyDir(patch.slabVoxels[k], patch.slabWeights[k]);
+        }
+    }
+}
+
 } // namespace
 
 EikonalSolveResult solveConstrainedEikonal(
@@ -2799,6 +3403,15 @@ EikonalSolveResult solveConstrainedEikonal(
         iterCtx.outerIteration = 0;
         overhangConstraint.enforceOnField(domain, iterCtx);
 
+        BridgeDeckState bridgeState = buildBridgeDeckState(domain, iterCtx, isTrueBedSeed);
+        if (bridgeState.active) {
+            levelBridgeDecksInTau(
+                domain,
+                bridgeState,
+                baseContext.layerHeight.target_mm,
+                /*runUpwardSweep=*/true);
+        }
+
         CrownAlignmentState crownState = buildCrownAlignmentState(domain, iterCtx);
         hasCrownSlowness = crownState.active;
 
@@ -2817,9 +3430,10 @@ EikonalSolveResult solveConstrainedEikonal(
                 ": Evaluating orientation hints & 5/6-axis tool axes...";
             notifyProgress(iterBaseFrac, msgOrient.c_str());
 
-            // 3a. Initialize targetDir from \nabla \tau + overhang bias, align crown cushions, then diffuse soft orientation hints
+            // 3a. Initialize targetDir from \nabla \tau + overhang bias, align crown cushions, level bridge decks, then diffuse soft orientation hints
             overhangConstraint.applyPreSweepModifiers(domain, iterCtx);
             updateCrownSlownessAndDirections(domain, crownState);
+            applyBridgeDeckDirections(domain, bridgeState);
             hintConstraint.applyPreSweepModifiers(domain, iterCtx);
 
             // 3b. Update 5/6-axis tool orientation (clamped strictly to tool rotational angle limits)
@@ -2834,7 +3448,12 @@ EikonalSolveResult solveConstrainedEikonal(
                 ": Parallel Eikonal sweeping & hard clearance enforcement...";
             notifyProgress(iterBaseFrac + 0.5f * iterSpan, msgSweep.c_str());
 
-            // 3d. Directional wavefront integration + soft hint refinement on \tau
+            // 3d. Bridge-deck leveling followed by directional wavefront integration + soft hint refinement on \tau
+            levelBridgeDecksInTau(
+                domain,
+                bridgeState,
+                baseContext.layerHeight.target_mm,
+                /*runUpwardSweep=*/false);
             runInteriorFastSweeping(domain, 2, /*useDirectionalGuidance=*/true);
             hintConstraint.enforceOnField(domain, iterCtx);
 
@@ -3140,6 +3759,16 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
         ToolClearanceConstraint clearanceConstraint;
 
         EikonalSolverContext iterCtx = baseContext;
+        BridgeDeckState fineBridgeState = buildBridgeDeckState(domain, iterCtx, isTrueBedSeed);
+        if (fineBridgeState.active) {
+            levelBridgeDecksInTau(
+                domain,
+                fineBridgeState,
+                baseContext.layerHeight.target_mm,
+                /*runUpwardSweep=*/true,
+                /*onlyIfBowed=*/true);
+        }
+
         const std::uint32_t fineIters =
             std::clamp<std::uint32_t>( std::min<std::uint32_t>(baseContext.totalIterations, 2), 1, 4);
 
@@ -3152,10 +3781,16 @@ EikonalSolveResult solveFineShellWithCoarseGuidance(
             notifyProgress(frac, "Refining fine boundary-shell Eikonal field & surface orientations...");
 
             overhangConstraint.applyPreSweepModifiers(domain, iterCtx);
+            applyBridgeDeckDirections(domain, fineBridgeState);
             hintConstraint.applyPreSweepModifiers(domain, iterCtx);
             orientationStrategy.updateToolOrientations(domain, iterCtx);
             clearanceConstraint.applyPreSweepModifiers(domain, iterCtx);
 
+            levelBridgeDecksInTau(
+                domain,
+                fineBridgeState,
+                baseContext.layerHeight.target_mm,
+                /*runUpwardSweep=*/false);
             runInteriorFastSweeping(domain, 1, /*useDirectionalGuidance=*/true);
             hintConstraint.enforceOnField(domain, iterCtx);
             clearanceConstraint.enforceOnField(domain, iterCtx);

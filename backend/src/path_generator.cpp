@@ -3256,7 +3256,16 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 return isConformalSkin ? baseSkinIso : isoAxis;
             };
 
-            auto sampleEikGradNorm = [&](const Vec3f& p) -> float {
+            auto sampleEikTau = [&](const Vec3f& p) -> float {
+                const openvdb::Vec3d wp(p.x, p.y, p.z);
+                const bool useCoarse =
+                    (cEikSamplerPtr != nullptr && cSdfSamplerPtr != nullptr &&
+                     sdfSampler.wsSample(wp) <= fineShellCutoff);
+                const auto& activeEik = useCoarse ? *cEikSamplerPtr : eikSampler;
+                return activeEik.wsSample(wp);
+            };
+
+            auto sampleEikGrad = [&](const Vec3f& p) -> Vec3f {
                 const openvdb::Vec3d wp(p.x, p.y, p.z);
                 const bool useCoarse =
                     (cEikSamplerPtr != nullptr && cSdfSamplerPtr != nullptr &&
@@ -3283,10 +3292,14 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     }
                     return (tP - tM) / (2.0f * h);
                 };
-                const float gx = axisDeriv(h, 0.0f, 0.0f);
-                const float gy = axisDeriv(0.0f, h, 0.0f);
-                const float gz = axisDeriv(0.0f, 0.0f, h);
-                return std::sqrt(gx * gx + gy * gy + gz * gz);
+                return Vec3f{
+                    axisDeriv(h, 0.0f, 0.0f),
+                    axisDeriv(0.0f, h, 0.0f),
+                    axisDeriv(0.0f, 0.0f, h)};
+            };
+
+            auto sampleEikGradNorm = [&](const Vec3f& p) -> float {
+                return length3(sampleEikGrad(p));
             };
 
             for (std::size_t layerIdx = range.begin(); layerIdx != range.end(); ++layerIdx) {
@@ -4117,6 +4130,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                 if (!layerInfo.is_first_layer) {
                     std::vector<bool> rawUnsupported(nV, false);
                     std::vector<bool> canPropagateOutward(nV, false);
+                    std::vector<float> vertPhiBelow(nV, 0.0f);
                     constexpr float kBrickOverhangDisableSin = 0.42261826f; // sin(25 deg)
                     for (std::size_t i = 0; i < nV; ++i) {
                         const Vec3f p = shellMesh.verts[i].pos;
@@ -4159,6 +4173,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             sdfPrevBotBelow = std::max(sdfPrevBotNoz, sdfPrevBotGrav);
                             phiBelow = std::max(sdfDirectBelow, sdfPrevBotBelow);
                         }
+                        vertPhiBelow[i] = phiBelow;
                         const float downwardSlope = (sdfDirectBelow - phiCurrRaw) / std::max(hStep, 1.0e-4f);
                         const float ov = std::min(
                             sampleOverhang(p),
@@ -4233,6 +4248,19 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                         }
                         if (exceedsOverhangAngle && phiBelow > 0.01f * meanLayerH) {
                             canPropagateOutward[i] = true;
+                        } else if (!isConformalSkinLayer &&
+                                   dOuter[i] <= 1.05f * localOuterWidth[i] &&
+                                   (phiBelow > 0.08f * meanLayerH || sdfPrevBotBelow > 0.02f * meanLayerH)) {
+                            // Outer vertical boundary ring of a horizontal bridge bar (where sampleOverhang(p) ~ 0):
+                            // propagate outward only if stepping inward + down also exits into free air.
+                            const Vec3f pIn = p + (closestOuterNormal[i] * (0.35f * localOuterWidth[i]));
+                            const Vec3f inNoz = sampleNozzleAxis(pIn);
+                            const Vec3f inGrav = sampleGravityDir(pIn);
+                            const float inDownNoz = sampleSdf(pIn - (inNoz * hPrevBot)) - sdfZeroShift;
+                            const float inDownGrav = sampleSdf(pIn + (inGrav * hPrevBot)) - sdfZeroShift;
+                            if (std::max(inDownNoz, inDownGrav) > 0.01f * meanLayerH) {
+                                canPropagateOutward[i] = true;
+                            }
                         }
                     }
 
@@ -4275,6 +4303,29 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                     dOuter[nb] <= dOuter[u] + 0.05f * localOuterWidth[u]) {
                                     isUnsupported[nb] = true;
                                     outQ.push(nb);
+                                }
+                            }
+                        }
+
+                        // 1-ring boundary-sliver cleanup: absorb remaining outer-boundary vertices
+                        // surrounded entirely by unsupported interior vertices above free air.
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            if (!isUnsupported[i] &&
+                                shellMesh.verts[i].onOuterBoundary &&
+                                vertPhiBelow[i] > -0.05f * outerW.min_mm) {
+                                bool hasInteriorNb = false;
+                                bool allInteriorUnsup = true;
+                                for (std::uint32_t nb : adj[i]) {
+                                    if (!shellMesh.verts[nb].onOuterBoundary) {
+                                        hasInteriorNb = true;
+                                        if (!isUnsupported[nb]) {
+                                            allInteriorUnsup = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (hasInteriorNb && allInteriorUnsup) {
+                                    isUnsupported[i] = true;
                                 }
                             }
                         }
@@ -4679,11 +4730,15 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 continue;
                             }
 
-                            // Extract exact boundary edges of `islMesh` that touch the supported region
+                            // Extract exact boundary edges of `islMesh` that touch a genuinely supported pier
                             struct IslAnchorEdge {
+                                std::uint32_t va = 0;
+                                std::uint32_t vb = 0;
                                 Vec3f mid;
                                 Vec3f nIntoGap;
-                                float length;
+                                Vec3f nIntoGapSmooth;
+                                float length = 0.0f;
+                                int chainId = -1;
                             };
                             std::unordered_map<EdgeKey, std::pair<std::uint32_t, std::uint32_t>, EdgeKeyHash> islEdgeCountAndOpp;
                             islEdgeCountAndOpp.reserve(islMesh.tris.size() * 3);
@@ -4698,7 +4753,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 }
                             }
 
-                            std::vector<IslAnchorEdge> islSupEdges;
+                            std::vector<IslAnchorEdge> rawSupEdges;
                             for (const auto& [ek, countAndOpp] : islEdgeCountAndOpp) {
                                 if (countAndOpp.first != 1) {
                                     continue;
@@ -4726,10 +4781,38 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                     continue;
                                 }
                                 const Vec3f nIntoGap = normalize3(vIn, {1.0f, 0.0f, 0.0f});
-                                islSupEdges.push_back(IslAnchorEdge{mid, nIntoGap, edgeLen});
+
+                                // Verify genuine solid pier backing behind this clip edge (reject free-air slivers)
+                                const Vec3f pBehind = mid - (nIntoGap * (0.45f * outerW.target_mm));
+                                if (sampleSdf(pBehind) - sdfZeroShift > -0.05f * meanLayerH) {
+                                    continue;
+                                }
+                                const float hBedBehind =
+                                    dot3(pBehind, fallbackNozzle) - objectMinAxialBed;
+                                if (hBedBehind > 1.35f * meanLayerH) {
+                                    const Vec3f zLocal = normalize3(
+                                        islMesh.verts[ek.a].nozzleAxis + islMesh.verts[ek.b].nozzleAxis,
+                                        fallbackNozzle);
+                                    const float hLocalAvg = 0.5f * (
+                                        islMesh.verts[ek.a].layerHeightMm +
+                                        islMesh.verts[ek.b].layerHeightMm);
+                                    const float hPrevBotChk = 1.85f * std::max(hLocalAvg, meanLayerH);
+                                    const Vec3f gLocal = sampleGravityDir(pBehind);
+                                    const float sdfDownNoz =
+                                        sampleSdf(pBehind - (zLocal * hPrevBotChk)) - sdfZeroShift;
+                                    const float sdfDownGrav =
+                                        sampleSdf(pBehind + (gLocal * hPrevBotChk)) - sdfZeroShift;
+                                    if (sdfDownNoz > 0.05f * meanLayerH &&
+                                        sdfDownGrav > 0.05f * meanLayerH) {
+                                        continue;
+                                    }
+                                }
+
+                                rawSupEdges.push_back(IslAnchorEdge{
+                                    ek.a, ek.b, mid, nIntoGap, nIntoGap, edgeLen, -1});
                             }
 
-                            if (islSupEdges.size() < 2) {
+                            if (rawSupEdges.size() < 2) {
                                 continue;
                             }
 
@@ -4740,15 +4823,201 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             const Vec3f e1 = normalize3(refAx - (zIsl * dot3(refAx, zIsl)), {1.0f, 0.0f, 0.0f});
                             const Vec3f e2 = normalize3(cross3(zIsl, e1), {0.0f, 1.0f, 0.0f});
 
-                            // Accumulate the length-weighted 2D structure tensor of directions orthogonal
-                            // to supported gap boundary edges that have an opposing supported boundary partner
-                            // across the gap within `maxBridgeLengthMm`.
+                            // Stitch supported anchor edges into smooth continuous boundary chains
+                            // (splitting at sharp bends < ~45 deg), filter short noise slivers, and
+                            // smooth anchor normals across +-2 neighbors.
+                            struct AnchorChainSummary {
+                                std::vector<std::size_t> edgeIndices;
+                                Vec3f centroid{0.0f, 0.0f, 0.0f};
+                                Vec3f meanNormal{1.0f, 0.0f, 0.0f};
+                                float totalLen = 0.0f;
+                                bool isClosed = false;
+                            };
+
+                            std::unordered_map<std::uint32_t, std::vector<std::size_t>> vertAnchorAdj;
+                            vertAnchorAdj.reserve(rawSupEdges.size() * 2);
+                            for (std::size_t idx = 0; idx < rawSupEdges.size(); ++idx) {
+                                vertAnchorAdj[rawSupEdges[idx].va].push_back(idx);
+                                vertAnchorAdj[rawSupEdges[idx].vb].push_back(idx);
+                            }
+
+                            auto alignedDegreeAt = [&](std::size_t eIdx) -> int {
+                                int deg = 0;
+                                const auto& eCurr = rawSupEdges[eIdx];
+                                for (std::uint32_t endV : {eCurr.va, eCurr.vb}) {
+                                    auto it = vertAnchorAdj.find(endV);
+                                    if (it == vertAnchorAdj.end()) {
+                                        continue;
+                                    }
+                                    for (std::size_t nbIdx : it->second) {
+                                        if (nbIdx != eIdx &&
+                                            dot3(eCurr.nIntoGap, rawSupEdges[nbIdx].nIntoGap) >= 0.70f) {
+                                            ++deg;
+                                            break;
+                                        }
+                                    }
+                                }
+                                return deg;
+                            };
+
+                            std::vector<bool> edgeUsed(rawSupEdges.size(), false);
+                            std::vector<AnchorChainSummary> anchorChains;
+                            std::vector<IslAnchorEdge> islSupEdges;
+                            const float minChainLenMm = 0.40f * nozzleDiameterMm;
+
+                            auto buildChainFromSeed = [&](std::size_t seedEdge, bool startAtEndV) {
+                                std::vector<std::size_t> ordered;
+                                auto extendFrom = [&](std::uint32_t vStart, std::size_t firstEdge) -> std::vector<std::size_t> {
+                                    std::vector<std::size_t> walk;
+                                    std::uint32_t curV = vStart;
+                                    std::size_t curE = firstEdge;
+                                    while (true) {
+                                        auto it = vertAnchorAdj.find(curV);
+                                        if (it == vertAnchorAdj.end()) {
+                                            break;
+                                        }
+                                        std::size_t bestNb = std::numeric_limits<std::size_t>::max();
+                                        float bestDot = 0.70f;
+                                        for (std::size_t cand : it->second) {
+                                            if (cand == curE || edgeUsed[cand]) {
+                                                continue;
+                                            }
+                                            const float d = dot3(
+                                                rawSupEdges[curE].nIntoGap,
+                                                rawSupEdges[cand].nIntoGap);
+                                            if (d >= bestDot) {
+                                                bestDot = d;
+                                                bestNb = cand;
+                                            }
+                                        }
+                                        if (bestNb == std::numeric_limits<std::size_t>::max()) {
+                                            break;
+                                        }
+                                        edgeUsed[bestNb] = true;
+                                        walk.push_back(bestNb);
+                                        curV = (rawSupEdges[bestNb].va == curV)
+                                            ? rawSupEdges[bestNb].vb
+                                            : rawSupEdges[bestNb].va;
+                                        curE = bestNb;
+                                    }
+                                    return walk;
+                                };
+
+                                edgeUsed[seedEdge] = true;
+                                auto leftWalk = extendFrom(
+                                    startAtEndV ? rawSupEdges[seedEdge].vb : rawSupEdges[seedEdge].va,
+                                    seedEdge);
+                                auto rightWalk = extendFrom(
+                                    startAtEndV ? rawSupEdges[seedEdge].va : rawSupEdges[seedEdge].vb,
+                                    seedEdge);
+                                for (std::size_t k = leftWalk.size(); k-- > 0;) {
+                                    ordered.push_back(leftWalk[k]);
+                                }
+                                ordered.push_back(seedEdge);
+                                for (std::size_t nb : rightWalk) {
+                                    ordered.push_back(nb);
+                                }
+
+                                float totLen = 0.0f;
+                                for (std::size_t eIdx : ordered) {
+                                    totLen += rawSupEdges[eIdx].length;
+                                }
+                                if (totLen < minChainLenMm) {
+                                    return;
+                                }
+
+                                bool closed = false;
+                                if (ordered.size() >= 3) {
+                                    const auto& firstE = rawSupEdges[ordered.front()];
+                                    const auto& lastE = rawSupEdges[ordered.back()];
+                                    closed =
+                                        (firstE.va == lastE.va || firstE.va == lastE.vb ||
+                                         firstE.vb == lastE.va || firstE.vb == lastE.vb) &&
+                                        dot3(firstE.nIntoGap, lastE.nIntoGap) >= 0.70f;
+                                }
+
+                                const int cid = static_cast<int>(anchorChains.size());
+                                AnchorChainSummary chainSum{};
+                                chainSum.totalLen = totLen;
+                                chainSum.isClosed = closed;
+                                Vec3f centSum{0.0f, 0.0f, 0.0f};
+                                Vec3f normSum{0.0f, 0.0f, 0.0f};
+                                const int mOrd = static_cast<int>(ordered.size());
+
+                                for (int pos = 0; pos < mOrd; ++pos) {
+                                    Vec3f smN{0.0f, 0.0f, 0.0f};
+                                    for (int off = -2; off <= 2; ++off) {
+                                        int nbPos = pos + off;
+                                        if (closed) {
+                                            nbPos = ((nbPos % mOrd) + mOrd) % mOrd;
+                                        } else if (nbPos < 0 || nbPos >= mOrd) {
+                                            continue;
+                                        }
+                                        const auto& eNb = rawSupEdges[ordered[static_cast<std::size_t>(nbPos)]];
+                                        smN = smN + (eNb.nIntoGap * eNb.length);
+                                    }
+                                    smN = smN - (zIsl * dot3(smN, zIsl));
+                                    const auto& eOrig = rawSupEdges[ordered[static_cast<std::size_t>(pos)]];
+                                    const Vec3f nPerpFallback = normalize3(
+                                        eOrig.nIntoGap - (zIsl * dot3(eOrig.nIntoGap, zIsl)),
+                                        e1);
+                                    const Vec3f smoothNorm = normalize3(smN, nPerpFallback);
+
+                                    const std::size_t outIdx = islSupEdges.size();
+                                    IslAnchorEdge outEdge = eOrig;
+                                    outEdge.nIntoGapSmooth = smoothNorm;
+                                    outEdge.chainId = cid;
+                                    islSupEdges.push_back(outEdge);
+                                    chainSum.edgeIndices.push_back(outIdx);
+
+                                    centSum = centSum + (outEdge.mid * outEdge.length);
+                                    normSum = normSum + (smoothNorm * outEdge.length);
+                                }
+
+                                chainSum.centroid = centSum * (1.0f / std::max(totLen, 1.0e-5f));
+                                normSum = normSum - (zIsl * dot3(normSum, zIsl));
+                                chainSum.meanNormal = normalize3(normSum, e1);
+                                anchorChains.push_back(std::move(chainSum));
+                            };
+
+                            for (std::size_t eIdx = 0; eIdx < rawSupEdges.size(); ++eIdx) {
+                                if (!edgeUsed[eIdx] && alignedDegreeAt(eIdx) < 2) {
+                                    buildChainFromSeed(eIdx, false);
+                                }
+                            }
+                            for (std::size_t eIdx = 0; eIdx < rawSupEdges.size(); ++eIdx) {
+                                if (!edgeUsed[eIdx]) {
+                                    buildChainFromSeed(eIdx, false);
+                                }
+                            }
+
+                            if (islSupEdges.size() < 2 || anchorChains.empty()) {
+                                continue;
+                            }
+
+                            // Collect deduplicated candidate bridge directions (projected perpendicular to zIsl)
+                            std::vector<Vec3f> candBridgeDirs;
+                            auto pushCandDir = [&](const Vec3f& rawDir) {
+                                const Vec3f perp = rawDir - (zIsl * dot3(rawDir, zIsl));
+                                if (lengthSq3(perp) <= 1.0e-8f) {
+                                    return;
+                                }
+                                const Vec3f unitDir = normalize3(perp, e1);
+                                for (const auto& ex : candBridgeDirs) {
+                                    if (std::abs(dot3(unitDir, ex)) > 0.9961947f) { // within ~5 deg
+                                        return;
+                                    }
+                                }
+                                candBridgeDirs.push_back(unitDir);
+                            };
+
+                            // 1. Structure tensor eigenvectors using smoothed anchor normals
                             float m11 = 0.0f;
                             float m12 = 0.0f;
                             float m22 = 0.0f;
                             for (std::size_t bIdx = 0; bIdx < islSupEdges.size(); ++bIdx) {
                                 const Vec3f& bp = islSupEdges[bIdx].mid;
-                                const Vec3f& nGap = islSupEdges[bIdx].nIntoGap;
+                                const Vec3f& nGap = islSupEdges[bIdx].nIntoGapSmooth;
                                 bool hasOpposingPartner = false;
                                 for (std::size_t oIdx = 0; oIdx < islSupEdges.size(); ++oIdx) {
                                     if (oIdx == bIdx) {
@@ -4760,10 +5029,10 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                         continue;
                                     }
                                     const Vec3f spanDir = spanVec * (1.0f / spanLen);
-                                    const Vec3f& nOpp = islSupEdges[oIdx].nIntoGap;
-                                    if (dot3(nGap, spanDir) >= 0.70f &&
-                                        dot3(nOpp, spanDir) <= -0.70f &&
-                                        dot3(nGap, nOpp) <= -0.50f) {
+                                    const Vec3f& nOpp = islSupEdges[oIdx].nIntoGapSmooth;
+                                    if (dot3(nGap, spanDir) >= 0.45f &&
+                                        dot3(nOpp, spanDir) <= -0.45f &&
+                                        dot3(nGap, nOpp) <= -0.30f) {
                                         hasOpposingPartner = true;
                                         break;
                                     }
@@ -4778,208 +5047,303 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 m12 += wLen * c1 * c2;
                                 m22 += wLen * c2 * c2;
                             }
+                            if (m11 + m22 >= 1.0e-5f) {
+                                const float halfAngle = 0.5f * std::atan2(2.0f * m12, m11 - m22);
+                                const Vec3f primaryDir =
+                                    (e1 * std::cos(halfAngle)) + (e2 * std::sin(halfAngle));
+                                pushCandDir(primaryDir);
+                                pushCandDir(cross3(zIsl, primaryDir));
+                            }
 
-                            if (m11 + m22 < 1.0e-5f) {
+                            // 2. Pairwise opposing anchor-chain directions (centroid-to-centroid and normal difference)
+                            for (std::size_t ca = 0; ca < anchorChains.size(); ++ca) {
+                                for (std::size_t cb = ca + 1; cb < anchorChains.size(); ++cb) {
+                                    if (dot3(anchorChains[ca].meanNormal, anchorChains[cb].meanNormal) > -0.30f) {
+                                        continue;
+                                    }
+                                    const Vec3f spanRaw = anchorChains[cb].centroid - anchorChains[ca].centroid;
+                                    const Vec3f spanPerp = spanRaw - (zIsl * dot3(spanRaw, zIsl));
+                                    const float spanPerpLen = length3(spanPerp);
+                                    if (spanPerpLen >= 0.5f * minExtrusionLengthMm &&
+                                        spanPerpLen <= maxBridgeLengthMm * 1.25f) {
+                                        pushCandDir(spanPerp);
+                                    }
+                                    pushCandDir(anchorChains[ca].meanNormal - anchorChains[cb].meanNormal);
+                                }
+                            }
+
+                            if (candBridgeDirs.empty()) {
                                 continue;
                             }
 
-                            // Principal eigenvector of [[m11, m12], [m12, m22]] gives the dominant
-                            // direction roughly orthogonal to the supported gap boundary edges.
-                            const float halfAngle = 0.5f * std::atan2(2.0f * m12, m11 - m22);
-                            const Vec3f bridgeDir = normalize3(
-                                (e1 * std::cos(halfAngle)) + (e2 * std::sin(halfAngle)),
-                                e1);
-                            const Vec3f scanAxis = normalize3(cross3(zIsl, bridgeDir), e2);
+                            struct BridgeCandidateSeg {
+                                Vec3f pStart;
+                                Vec3f pEnd;
+                                Vec3f nIsoStart;
+                                Vec3f nIsoEnd;
+                                float chordLen = 0.0f;
+                                int lineIdx = 0;
+                            };
+                            struct CandidateBridgeSet {
+                                std::vector<BridgeCandidateSeg> segs;
+                                float totalArea = 0.0f;
+                                float score = -1.0f;
+                            };
 
                             const std::size_t nIslV = islMesh.verts.size();
-                            std::vector<float> uCoord(nIslV, 0.0f);
+                            const float pitch = std::max(0.15f, nozzleDiameterMm);
                             std::vector<float> dummyValid(nIslV, 1.0f);
                             std::vector<float> bridgeWidths(nIslV, nozzleDiameterMm);
-                            float uMin = std::numeric_limits<float>::max();
-                            float uMax = std::numeric_limits<float>::lowest();
-                            for (std::size_t i = 0; i < nIslV; ++i) {
-                                const float u = dot3(islMesh.verts[i].pos, scanAxis);
-                                uCoord[i] = u;
-                                uMin = std::min(uMin, u);
-                                uMax = std::max(uMax, u);
+
+                            auto evaluateBridgeDirection = [&](const Vec3f& bridgeDirCand) -> CandidateBridgeSet {
+                                CandidateBridgeSet outSet{};
+                                const Vec3f scanAxis = normalize3(cross3(zIsl, bridgeDirCand), e2);
+
+                                std::vector<float> uCoord(nIslV, 0.0f);
+                                float uMin = std::numeric_limits<float>::max();
+                                float uMax = std::numeric_limits<float>::lowest();
+                                for (std::size_t i = 0; i < nIslV; ++i) {
+                                    const float u = dot3(islMesh.verts[i].pos, scanAxis);
+                                    uCoord[i] = u;
+                                    uMin = std::min(uMin, u);
+                                    uMax = std::max(uMax, u);
+                                }
+
+                                const float uSpan = uMax - uMin;
+                                const float uSpanInset = std::max(0.0f, uSpan - 0.85f * pitch);
+                                const int nLines =
+                                    std::max(1, static_cast<int>(std::floor(uSpanInset / pitch)) + 1);
+                                const float startU =
+                                    uMin + 0.5f * (uSpan - static_cast<float>(nLines - 1) * pitch);
+
+                                double totalLenSum = 0.0;
+                                for (int lineIdx = 0; lineIdx < nLines; ++lineIdx) {
+                                    const float isoU = startU + static_cast<float>(lineIdx) * pitch;
+                                    const auto segs = extractIsoContourSegments(
+                                        islMesh,
+                                        uCoord,
+                                        isoU,
+                                        dummyValid,
+                                        0.0f,
+                                        bridgeWidths);
+                                    const auto chains = stitchSegmentsIntoChains(
+                                        segs,
+                                        stitchSnap,
+                                        0.0f); // Bridges are always open straight lines
+
+                                    for (const auto& ch : chains) {
+                                        if (ch.pts.size() < 2) {
+                                            continue;
+                                        }
+                                        Vec3f pStart = ch.pts.front().pos;
+                                        Vec3f pEnd = ch.pts.back().pos;
+                                        const float chordLen = dist3(pStart, pEnd);
+                                        if (chordLen < minExtrusionLengthMm ||
+                                            chordLen > maxBridgeLengthMm ||
+                                            chordLen <= 1.0e-4f) {
+                                            continue;
+                                        }
+
+                                        const Vec3f chordDir = (pEnd - pStart) * (1.0f / chordLen);
+
+                                        // Verify both endpoints are anchored on opposing smoothed supported chains
+                                        float bestStartDistSq = anchorTolSq;
+                                        Vec3f startSmoothNorm{0.0f, 0.0f, 0.0f};
+                                        int startChainId = -1;
+
+                                        float bestEndDistSq = anchorTolSq;
+                                        Vec3f endSmoothNorm{0.0f, 0.0f, 0.0f};
+                                        int endChainId = -1;
+
+                                        for (std::size_t bIdx = 0; bIdx < islSupEdges.size(); ++bIdx) {
+                                            const float dStartSq = lengthSq3(islSupEdges[bIdx].mid - pStart);
+                                            if (dStartSq < bestStartDistSq) {
+                                                bestStartDistSq = dStartSq;
+                                                startSmoothNorm = islSupEdges[bIdx].nIntoGapSmooth;
+                                                startChainId = islSupEdges[bIdx].chainId;
+                                            }
+                                            const float dEndSq = lengthSq3(islSupEdges[bIdx].mid - pEnd);
+                                            if (dEndSq < bestEndDistSq) {
+                                                bestEndDistSq = dEndSq;
+                                                endSmoothNorm = islSupEdges[bIdx].nIntoGapSmooth;
+                                                endChainId = islSupEdges[bIdx].chainId;
+                                            }
+                                        }
+
+                                        if (startChainId < 0 || endChainId < 0) {
+                                            continue;
+                                        }
+                                        if (dot3(startSmoothNorm, chordDir) < 0.40f ||
+                                            dot3(endSmoothNorm, chordDir) > -0.40f ||
+                                            dot3(startSmoothNorm, endSmoothNorm) > -0.25f) {
+                                            continue;
+                                        }
+
+                                        // Verify the straight 3D line between pStart and pEnd stays strictly inside
+                                        // the part (never cutting out of a curved arch into positive SDF) and
+                                        // is kinematically accessible.
+                                        const int nSamples = std::max(
+                                            4,
+                                            static_cast<int>(std::ceil(chordLen / (0.5f * pitch))));
+                                        bool pathAccessible = true;
+                                        const float maxBridgeChordSdf =
+                                            -std::min(0.35f * meanLayerH, 0.25f * nozzleDiameterMm);
+                                        for (int s = 1; s < nSamples; ++s) {
+                                            const float t = static_cast<float>(s) / static_cast<float>(nSamples);
+                                            const Vec3f pMid = lerp3(pStart, pEnd, t);
+                                            const float sdfMid = sampleSdf(pMid) - sdfZeroShift;
+                                            if (sdfMid > maxBridgeChordSdf) {
+                                                pathAccessible = false;
+                                                break;
+                                            }
+                                            const Vec3f nozMid = sampleNozzleAxis(pMid);
+                                            if (std::abs(dot3(chordDir, nozMid)) > 0.88f) {
+                                                pathAccessible = false;
+                                                break;
+                                            }
+                                        }
+                                        if (!pathAccessible) {
+                                            continue;
+                                        }
+
+                                        // Extend bridge endpoints deeply onto supported anchor piers while
+                                        // staying inside the CAD solid, supported below, and <= maxBridgeLengthMm
+                                        const float targetOverlap = std::min(
+                                            0.85f * nozzleDiameterMm,
+                                            0.5f * std::max(0.0f, maxBridgeLengthMm - chordLen));
+                                        if (targetOverlap > 1.0e-4f) {
+                                            auto extendEndpoint = [&](Vec3f& pt, const Vec3f& dir) {
+                                                const float hStepEnd = 1.5f * meanLayerH;
+                                                for (const float frac : {1.0f, 0.75f, 0.50f, 0.25f}) {
+                                                    const Vec3f cand = pt + (dir * (frac * targetOverlap));
+                                                    if (!isConformalSkinLayer) {
+                                                        const float tauCand = sampleEikTau(cand);
+                                                        if (!std::isfinite(tauCand) ||
+                                                            std::abs(tauCand - layerInfo.isovalue) > 0.75f * meanLayerH) {
+                                                            continue;
+                                                        }
+                                                    }
+                                                    if (sampleSdf(cand) - sdfZeroShift > -0.50f * outerW.min_mm) {
+                                                        continue;
+                                                    }
+                                                    const float hBedEnd =
+                                                        dot3(cand, fallbackNozzle) - objectMinAxialBed;
+                                                    if (hBedEnd > 1.35f * meanLayerH) {
+                                                        const Vec3f cNoz = sampleNozzleAxis(cand);
+                                                        const Vec3f cGrav = sampleGravityDir(cand);
+                                                        const float sDownNoz =
+                                                            sampleSdf(cand - (cNoz * hStepEnd)) - sdfZeroShift;
+                                                        const float sDownGrav =
+                                                            sampleSdf(cand + (cGrav * hStepEnd)) - sdfZeroShift;
+                                                        if (std::min(sDownNoz, sDownGrav) > -0.10f * meanLayerH) {
+                                                            continue;
+                                                        }
+                                                    }
+                                                    pt = cand;
+                                                    break;
+                                                }
+                                            };
+                                            extendEndpoint(pStart, chordDir * -1.0f);
+                                            extendEndpoint(pEnd, chordDir);
+                                        }
+
+                                        Vec3f nIsoStart = normalize3(ch.pts.front().isoNormal, zIsl);
+                                        Vec3f nIsoEnd = normalize3(ch.pts.back().isoNormal, zIsl);
+                                        totalLenSum += static_cast<double>(chordLen);
+                                        outSet.segs.push_back(BridgeCandidateSeg{
+                                            pStart,
+                                            pEnd,
+                                            nIsoStart,
+                                            nIsoEnd,
+                                            chordLen,
+                                            lineIdx,
+                                        });
+                                    }
+                                }
+
+                                if (!outSet.segs.empty()) {
+                                    const float totalLenF = static_cast<float>(totalLenSum);
+                                    const float meanSpanF =
+                                        totalLenF / static_cast<float>(outSet.segs.size());
+                                    outSet.totalArea = totalLenF * pitch;
+                                    outSet.score =
+                                        outSet.totalArea /
+                                        std::pow(std::max(meanSpanF, pitch), 0.25f);
+                                }
+                                return outSet;
+                            };
+
+                            CandidateBridgeSet bestSet{};
+                            for (const auto& candDir : candBridgeDirs) {
+                                CandidateBridgeSet candSet = evaluateBridgeDirection(candDir);
+                                if (candSet.score > bestSet.score) {
+                                    bestSet = std::move(candSet);
+                                }
                             }
 
-                            const float uSpan = uMax - uMin;
-                            const float pitch = std::max(0.15f, nozzleDiameterMm);
-                            const int nLines = std::max(1, static_cast<int>(std::floor(uSpan / pitch)) + 1);
-                            const float startU = uMin + 0.5f * (uSpan - static_cast<float>(nLines - 1) * pitch);
-
-                            for (int lineIdx = 0; lineIdx < nLines; ++lineIdx) {
-                                const float isoU = startU + static_cast<float>(lineIdx) * pitch;
-                                const auto segs = extractIsoContourSegments(
-                                    islMesh,
-                                    uCoord,
-                                    isoU,
-                                    dummyValid,
-                                    0.0f,
-                                    bridgeWidths);
-                                const auto chains = stitchSegmentsIntoChains(
-                                    segs,
-                                    stitchSnap,
-                                    0.0f); // Bridges are always open straight lines
-
-                                for (const auto& ch : chains) {
-                                    if (ch.pts.size() < 2) {
-                                        continue;
-                                    }
-                                    Vec3f pStart = ch.pts.front().pos;
-                                    Vec3f pEnd = ch.pts.back().pos;
-                                    const float chordLen = dist3(pStart, pEnd);
-                                    if (chordLen < minExtrusionLengthMm ||
-                                        chordLen > maxBridgeLengthMm ||
-                                        chordLen <= 1.0e-4f) {
-                                        continue;
-                                    }
-
-                                    const Vec3f chordDir = (pEnd - pStart) * (1.0f / chordLen);
-
-                                    // Verify both endpoints are anchored on opposing supported gap boundaries
-                                    float bestStartDistSq = anchorTolSq;
-                                    Vec3f startGapNormal{0.0f, 0.0f, 0.0f};
-                                    bool startAnchored = false;
-
-                                    float bestEndDistSq = anchorTolSq;
-                                    Vec3f endGapNormal{0.0f, 0.0f, 0.0f};
-                                    bool endAnchored = false;
-
-                                    for (std::size_t bIdx = 0; bIdx < islSupEdges.size(); ++bIdx) {
-                                        const float dStartSq = lengthSq3(islSupEdges[bIdx].mid - pStart);
-                                        if (dStartSq < bestStartDistSq) {
-                                            bestStartDistSq = dStartSq;
-                                            startGapNormal = islSupEdges[bIdx].nIntoGap;
-                                            startAnchored = true;
-                                        }
-                                        const float dEndSq = lengthSq3(islSupEdges[bIdx].mid - pEnd);
-                                        if (dEndSq < bestEndDistSq) {
-                                            bestEndDistSq = dEndSq;
-                                            endGapNormal = islSupEdges[bIdx].nIntoGap;
-                                            endAnchored = true;
-                                        }
-                                    }
-
-                                    if (!startAnchored || !endAnchored) {
-                                        continue;
-                                    }
-                                    // At start, the into-gap normal must point roughly orthogonal to the gap
-                                    // along +chordDir; at end, the opposing into-gap normal must point along
-                                    // -chordDir, and the two boundaries must genuinely oppose each other.
-                                    if (dot3(startGapNormal, chordDir) < 0.70f ||
-                                        dot3(endGapNormal, chordDir) > -0.70f ||
-                                        dot3(startGapNormal, endGapNormal) > -0.50f) {
-                                        continue;
-                                    }
-
-                                    // Verify the straight 3D line between pStart and pEnd stays strictly inside
-                                    // the part (never cutting out of a curved arch into positive SDF) and
-                                    // is kinematically accessible.
-                                    const int nSamples = std::max(4, static_cast<int>(std::ceil(chordLen / (0.5f * pitch))));
-                                    bool pathAccessible = true;
-                                    const float maxBridgeChordSdf =
-                                        -std::min(0.35f * meanLayerH, 0.25f * nozzleDiameterMm);
-                                    for (int s = 1; s < nSamples; ++s) {
-                                        const float t = static_cast<float>(s) / static_cast<float>(nSamples);
-                                        const Vec3f pMid = lerp3(pStart, pEnd, t);
-                                        const float sdfMid = sampleSdf(pMid) - sdfZeroShift;
-                                        if (sdfMid > maxBridgeChordSdf) {
-                                            pathAccessible = false;
-                                            break;
-                                        }
-                                        const Vec3f nozMid = sampleNozzleAxis(pMid);
-                                        if (std::abs(dot3(chordDir, nozMid)) > 0.88f) {
-                                            pathAccessible = false;
-                                            break;
-                                        }
-                                    }
-                                    if (!pathAccessible) {
-                                        continue;
-                                    }
-
-                                    // Extend bridge endpoints slightly into the supported anchor extrusions
-                                    // while staying strictly inside the CAD part and within maxBridgeLengthMm
-                                    const float anchorOverlap = std::min(
-                                        0.15f * nozzleDiameterMm,
-                                        0.5f * std::max(0.0f, maxBridgeLengthMm - chordLen));
-                                    if (anchorOverlap > 1.0e-4f) {
-                                        const Vec3f candStart = pStart - (chordDir * anchorOverlap);
-                                        if (sampleSdf(candStart) - sdfZeroShift <= -0.15f * meanLayerH) {
-                                            pStart = candStart;
-                                        }
-                                        const Vec3f candEnd = pEnd + (chordDir * anchorOverlap);
-                                        if (sampleSdf(candEnd) - sdfZeroShift <= -0.15f * meanLayerH) {
-                                            pEnd = candEnd;
-                                        }
-                                    }
-
-                                    // Alternate scan direction on odd lines for continuous back-and-forth bridging
-                                    Vec3f nIsoStart = normalize3(ch.pts.front().isoNormal, zIsl);
-                                    Vec3f nIsoEnd = normalize3(ch.pts.back().isoNormal, zIsl);
-                                    if (lineIdx % 2 == 1) {
-                                        std::swap(pStart, pEnd);
-                                        std::swap(nIsoStart, nIsoEnd);
-                                    }
-
-                                    const Vec3f nozStart = sampleNozzleAxis(pStart);
-                                    const Vec3f nozEnd = sampleNozzleAxis(pEnd);
-                                    const float finalLen = dist3(pStart, pEnd);
-
-                                    ExtrusionPath bridgePath{};
-                                    bridgePath.feature_kind = kFeatureBridge;
-                                    bridgePath.wall_index = bridgePassIdx++;
-                                    bridgePath.is_closed = false;
-                                    bridgePath.total_length_mm = finalLen;
-                                    bridgePath.mean_width_mm = nozzleDiameterMm;
-
-                                    if (dot3(nIsoStart, nozStart) < 0.0f) {
-                                        nIsoStart = nIsoStart * -1.0f;
-                                    }
-                                    if (dot3(nIsoEnd, nozEnd) < 0.0f) {
-                                        nIsoEnd = nIsoEnd * -1.0f;
-                                    }
-                                    ToolpathPoint tp0{};
-                                    tp0.x = pStart.x;
-                                    tp0.y = pStart.y;
-                                    tp0.z = pStart.z;
-                                    tp0.nx = nozStart.x;
-                                    tp0.ny = nozStart.y;
-                                    tp0.nz = nozStart.z;
-                                    tp0.width_mm = nozzleDiameterMm;
-                                    tp0.height_mm = nozzleDiameterMm; // Circular cross-section!
-                                    tp0.tool_iso_angle_deg =
-                                        std::acos(std::clamp(dot3(nozStart, nIsoStart), -1.0f, 1.0f)) *
-                                        (180.0f / 3.14159265358979323846f);
-                                    tp0.uses_surface_normal = false;
-
-                                    ToolpathPoint tp1{};
-                                    tp1.x = pEnd.x;
-                                    tp1.y = pEnd.y;
-                                    tp1.z = pEnd.z;
-                                    tp1.nx = nozEnd.x;
-                                    tp1.ny = nozEnd.y;
-                                    tp1.nz = nozEnd.z;
-                                    tp1.width_mm = nozzleDiameterMm;
-                                    tp1.height_mm = nozzleDiameterMm; // Circular cross-section!
-                                    tp1.tool_iso_angle_deg =
-                                        std::acos(std::clamp(dot3(nozEnd, nIsoEnd), -1.0f, 1.0f)) *
-                                        (180.0f / 3.14159265358979323846f);
-                                    tp1.uses_surface_normal = false;
-
-                                    bridgePath.points.push_back(tp0);
-                                    bridgePath.points.push_back(tp1);
-                                    layerOut.paths.push_back(std::move(bridgePath));
-
-                                    const Vec3f ab = pEnd - pStart;
-                                    emittedBridgeSegs.push_back(BridgeSpanSeg{
-                                        pStart,
-                                        pEnd,
-                                        ab,
-                                        lengthSq3(ab),
-                                    });
+                            for (auto& seg : bestSet.segs) {
+                                // Alternate scan direction on odd lines for continuous back-and-forth bridging
+                                if (seg.lineIdx % 2 == 1) {
+                                    std::swap(seg.pStart, seg.pEnd);
+                                    std::swap(seg.nIsoStart, seg.nIsoEnd);
                                 }
+
+                                const Vec3f nozStart = sampleNozzleAxis(seg.pStart);
+                                const Vec3f nozEnd = sampleNozzleAxis(seg.pEnd);
+                                const float finalLen = dist3(seg.pStart, seg.pEnd);
+
+                                ExtrusionPath bridgePath{};
+                                bridgePath.feature_kind = kFeatureBridge;
+                                bridgePath.wall_index = bridgePassIdx++;
+                                bridgePath.is_closed = false;
+                                bridgePath.total_length_mm = finalLen;
+                                bridgePath.mean_width_mm = nozzleDiameterMm;
+
+                                if (dot3(seg.nIsoStart, nozStart) < 0.0f) {
+                                    seg.nIsoStart = seg.nIsoStart * -1.0f;
+                                }
+                                if (dot3(seg.nIsoEnd, nozEnd) < 0.0f) {
+                                    seg.nIsoEnd = seg.nIsoEnd * -1.0f;
+                                }
+                                ToolpathPoint tp0{};
+                                tp0.x = seg.pStart.x;
+                                tp0.y = seg.pStart.y;
+                                tp0.z = seg.pStart.z;
+                                tp0.nx = nozStart.x;
+                                tp0.ny = nozStart.y;
+                                tp0.nz = nozStart.z;
+                                tp0.width_mm = nozzleDiameterMm;
+                                tp0.height_mm = nozzleDiameterMm; // Circular cross-section!
+                                tp0.tool_iso_angle_deg =
+                                    std::acos(std::clamp(dot3(nozStart, seg.nIsoStart), -1.0f, 1.0f)) *
+                                    (180.0f / 3.14159265358979323846f);
+                                tp0.uses_surface_normal = false;
+
+                                ToolpathPoint tp1{};
+                                tp1.x = seg.pEnd.x;
+                                tp1.y = seg.pEnd.y;
+                                tp1.z = seg.pEnd.z;
+                                tp1.nx = nozEnd.x;
+                                tp1.ny = nozEnd.y;
+                                tp1.nz = nozEnd.z;
+                                tp1.width_mm = nozzleDiameterMm;
+                                tp1.height_mm = nozzleDiameterMm; // Circular cross-section!
+                                tp1.tool_iso_angle_deg =
+                                    std::acos(std::clamp(dot3(nozEnd, seg.nIsoEnd), -1.0f, 1.0f)) *
+                                    (180.0f / 3.14159265358979323846f);
+                                tp1.uses_surface_normal = false;
+
+                                bridgePath.points.push_back(tp0);
+                                bridgePath.points.push_back(tp1);
+                                layerOut.paths.push_back(std::move(bridgePath));
+
+                                const Vec3f ab = seg.pEnd - seg.pStart;
+                                emittedBridgeSegs.push_back(BridgeSpanSeg{
+                                    seg.pStart,
+                                    seg.pEnd,
+                                    ab,
+                                    lengthSq3(ab),
+                                });
                             }
                         }
                     }
@@ -5951,35 +6315,82 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 96);
                             float bestDist = dRib0;
                             std::optional<Vec3f> anchoredPos;
+                            Vec3f currPos = endPt.pos;
+                            std::vector<Vec3f> marchedTrail;
+                            marchedTrail.reserve(static_cast<std::size_t>(maxSteps));
 
                             for (int s = 1; s <= maxSteps; ++s) {
-                                const float dist = static_cast<float>(s) * marchStepMm;
-                                Vec3f pCand = endPt.pos + (rayDir * dist);
+                                Vec3f pCand = currPos + (rayDir * marchStepMm);
                                 if (!isConformalSkinLayer) {
-                                    const float tauCand = eikSampler.wsSample(
-                                        openvdb::Vec3d(pCand.x, pCand.y, pCand.z));
-                                    const float gCand = std::max(0.25f, sampleEikGradNorm(pCand));
-                                    const float dTau = std::clamp(
-                                        (layerInfo.isovalue - tauCand) / gCand,
-                                        -0.35f * meanLayerH,
-                                        0.35f * meanLayerH);
-                                    pCand = pCand + (zNoz * dTau);
+                                    const Vec3f gCurr = sampleEikGrad(currPos);
+                                    const float gLen = length3(gCurr);
+                                    const Vec3f nIsoLocal = (gLen > 0.25f)
+                                        ? (gCurr * (1.0f / gLen))
+                                        : sampleNozzleAxis(currPos);
+                                    const Vec3f stepTangent =
+                                        rayDir - (nIsoLocal * dot3(rayDir, nIsoLocal));
+                                    const float stepTanLen = length3(stepTangent);
+                                    if (stepTanLen < 0.35f) {
+                                        break;
+                                    }
+                                    const Vec3f stepDir = stepTangent * (1.0f / stepTanLen);
+                                    pCand = currPos + (stepDir * marchStepMm);
+
+                                    bool projOk = true;
+                                    for (int newtonIt = 0; newtonIt < 2; ++newtonIt) {
+                                        const float tauC = sampleEikTau(pCand);
+                                        if (!std::isfinite(tauC) || tauC > 1.0e5f) {
+                                            projOk = false;
+                                            break;
+                                        }
+                                        const float err = layerInfo.isovalue - tauC;
+                                        if (std::abs(err) <= 0.02f * meanLayerH) {
+                                            break;
+                                        }
+                                        const Vec3f gC = sampleEikGrad(pCand);
+                                        const float gCLen = length3(gC);
+                                        if (gCLen < 0.25f) {
+                                            break;
+                                        }
+                                        const float dStep = std::clamp(
+                                            err / gCLen,
+                                            -0.5f * meanLayerH,
+                                            0.5f * meanLayerH);
+                                        pCand = pCand + (gC * (dStep / gCLen));
+                                    }
+                                    if (!projOk) {
+                                        break;
+                                    }
+                                    const float tauFinal = sampleEikTau(pCand);
+                                    if (!std::isfinite(tauFinal) ||
+                                        std::abs(tauFinal - layerInfo.isovalue) > 0.45f * meanLayerH) {
+                                        break;
+                                    }
+                                    if (dot3(pCand - currPos, rayDir) <= 0.15f * marchStepMm) {
+                                        break;
+                                    }
                                 }
 
+                                const Vec3f zNozLocal = sampleNozzleAxis(pCand);
                                 const float phiCand = sampleShiftedSdfForShell(pCand);
                                 if (sampleSolidInfillExcessSdf(pCand) > 0.0f) {
                                     break;
                                 }
                                 const float phiDownCand =
-                                    sampleShiftedSdfForShell(pCand - (zNoz * hStep));
+                                    sampleShiftedSdfForShell(pCand - (zNozLocal * hStep));
                                 // If marching reaches an opposing outer/inner perimeter wall band, anchor onto the wall
                                 if (-phiDownCand <= wTargetSumConfig + 0.35f * infillW.target_mm &&
                                     phiDownCand > phiDown0 + 0.05f) {
+                                    currPos = pCand;
+                                    marchedTrail.push_back(pCand);
                                     anchoredPos = pCand;
                                     break;
                                 }
 
-                                const float dRib = evalMinRibDist(pCand, zNoz, phiCand);
+                                currPos = pCand;
+                                marchedTrail.push_back(pCand);
+
+                                const float dRib = evalMinRibDist(pCand, zNozLocal, phiCand);
                                 if (dRib < bestDist) {
                                     bestDist = dRib;
                                     if (dRib <= 0.25f * sparseW.target_mm) {
@@ -5988,19 +6399,39 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                     }
                                 } else if (bestDist <= 0.35f * sparseW.target_mm) {
                                     // Local minimum passed on a sparse infill rib
-                                    anchoredPos = pCand - (rayDir * marchStepMm);
+                                    marchedTrail.pop_back();
+                                    if (!marchedTrail.empty()) {
+                                        anchoredPos = marchedTrail.back();
+                                    }
                                     break;
                                 }
                             }
 
-                            if (anchoredPos.has_value()) {
-                                RawChainPoint newPt = endPt;
-                                newPt.pos = *anchoredPos;
-                                newPt.nozzleAxis = sampleNozzleAxis(newPt.pos);
+                            if (anchoredPos.has_value() && !marchedTrail.empty()) {
+                                std::vector<RawChainPoint> addedPts;
+                                Vec3f lastKeptPos = endPt.pos;
+                                for (std::size_t k = 0; k < marchedTrail.size(); ++k) {
+                                    const bool isFinal = (k + 1 == marchedTrail.size());
+                                    const Vec3f& pos = marchedTrail[k];
+                                    if (!isFinal && dist3(lastKeptPos, pos) < 0.30f) {
+                                        continue;
+                                    }
+                                    RawChainPoint newPt = endPt;
+                                    newPt.pos = pos;
+                                    newPt.nozzleAxis = sampleNozzleAxis(pos);
+                                    if (!isConformalSkinLayer) {
+                                        const Vec3f gPos = sampleEikGrad(pos);
+                                        if (length3(gPos) > 0.25f) {
+                                            newPt.isoNormal = normalize3(gPos, endPt.isoNormal);
+                                        }
+                                    }
+                                    addedPts.push_back(newPt);
+                                    lastKeptPos = pos;
+                                }
                                 if (isFront) {
-                                    ch.pts.insert(ch.pts.begin(), newPt);
+                                    ch.pts.insert(ch.pts.begin(), addedPts.rbegin(), addedPts.rend());
                                 } else {
-                                    ch.pts.push_back(newPt);
+                                    ch.pts.insert(ch.pts.end(), addedPts.begin(), addedPts.end());
                                 }
                             }
                         };
