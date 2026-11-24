@@ -8710,6 +8710,19 @@ fn render_process_config_tab(
         ui.horizontal(|ui| {
             tp_cfg_changed |= ui
                 .checkbox(
+                    &mut config.slicing.enable_top_surface_lofting,
+                    "Top-Surface Lofting",
+                )
+                .on_hover_text(
+                    "Lift exposed top-surface inner walls and solid infill along the local nozzle axis toward the CAD surface (up to max layer height) and scale extrusion volume to smooth shallow non-conformal slopes.",
+                )
+                .changed();
+            param_help_button(ui, "slicing.enable_top_surface_lofting");
+        });
+
+        ui.horizontal(|ui| {
+            tp_cfg_changed |= ui
+                .checkbox(
                     &mut config.slicing.orient_outer_surfaces_to_normal,
                     "Orient Tool to Outer Surface Normal (else Isosurface Normal)",
                 )
@@ -10690,6 +10703,7 @@ pub fn sync_config_to_backend(config: &SlicerConfig) {
         orient_outer_surfaces_to_normal: config.slicing.orient_outer_surfaces_to_normal,
         outer_surface_parallel_angle_deg: config.slicing.outer_surface_parallel_angle_deg,
         brick_layer_mode: config.slicing.brick_layer_mode.as_u8(),
+        enable_top_surface_lofting: config.slicing.enable_top_surface_lofting,
     });
 
     ffi::set_order_field_mode(config.eikonal.order_field_mode.as_u8());

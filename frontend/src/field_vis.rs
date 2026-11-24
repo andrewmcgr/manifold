@@ -1059,6 +1059,7 @@ impl FieldVisualizationState {
             orient_outer_surfaces_to_normal: s.orient_outer_surfaces_to_normal,
             outer_surface_parallel_angle_deg: s.outer_surface_parallel_angle_deg,
             brick_layer_mode: s.brick_layer_mode.as_u8(),
+            enable_top_surface_lofting: s.enable_top_surface_lofting,
         };
         let support_spec = SupportSpec {
             enabled: s.enable_support_generation,
@@ -6386,6 +6387,7 @@ mod tests {
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
             brick_layer_mode: 0,
+            enable_top_surface_lofting: true,
         };
         ffi::set_shell_path_spec(base_spec.clone());
 
@@ -6568,6 +6570,7 @@ mod tests {
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
             brick_layer_mode: 0,
+            enable_top_surface_lofting: true,
         });
 
         let res = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -6667,14 +6670,27 @@ mod tests {
             if !non_bridge_segs.is_empty() {
                 let mean_seg_h = non_bridge_segs.iter().map(|s| s.height_mm).sum::<f32>()
                     / (non_bridge_segs.len() as f32);
-                assert!(
-                    (mean_seg_h - l.mean_thickness_mm).abs() <= 0.03,
-                    "Layer #{i} (branch B{}, {}/{}) mean planned segment height ({mean_seg_h:.3} mm) diverged from layer mean_thickness_mm ({:.3} mm)",
-                    l.branch_id,
-                    l.branch_layer_index + 1,
-                    l.branch_layer_count,
-                    l.mean_thickness_mm,
-                );
+                if l.is_top_layer && cfg.slicing.enable_top_surface_lofting {
+                    assert!(
+                        mean_seg_h >= l.mean_thickness_mm - 0.03
+                            && mean_seg_h <= cfg.slicing.layer_height.max_mm + 1.0e-4,
+                        "Top Layer #{i} (branch B{}, {}/{}) mean planned segment height ({mean_seg_h:.3} mm) out of loft bounds [{:.3}, {:.3}]",
+                        l.branch_id,
+                        l.branch_layer_index + 1,
+                        l.branch_layer_count,
+                        l.mean_thickness_mm - 0.03,
+                        cfg.slicing.layer_height.max_mm,
+                    );
+                } else {
+                    assert!(
+                        (mean_seg_h - l.mean_thickness_mm).abs() <= 0.03,
+                        "Layer #{i} (branch B{}, {}/{}) mean planned segment height ({mean_seg_h:.3} mm) diverged from layer mean_thickness_mm ({:.3} mm)",
+                        l.branch_id,
+                        l.branch_layer_index + 1,
+                        l.branch_layer_count,
+                        l.mean_thickness_mm,
+                    );
+                }
             }
         }
 
@@ -6967,6 +6983,7 @@ mod tests {
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
             brick_layer_mode: 0,
+            enable_top_surface_lofting: true,
         };
 
         // Test all 7 sparse infill patterns (0..=6: Monotonic, Cubic, Gyroid, SchwarzD, SchwarzP, Concentric, AllWalls)
@@ -7862,6 +7879,7 @@ mod tests {
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
             brick_layer_mode: 0,
+            enable_top_surface_lofting: true,
         });
 
         let tp_bridge = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -7935,6 +7953,7 @@ mod tests {
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
             brick_layer_mode: 0,
+            enable_top_surface_lofting: true,
         });
 
         let tp_wave_only = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
@@ -12688,6 +12707,1016 @@ mod tests {
         );
 
         let _ = ffi::remove_cad_object(part.object_id);
+        crate::ui::sync_config_to_backend(&SlicerConfig::default());
+    }
+
+    #[test]
+    fn test_top_surface_lofting_smooths_shallow_slope_and_scales_extrusion() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Helper: builds a watertight 10-deg sloped wedge (`lx in [-12, 12]`, `ly in [-8, 8]`,
+        // bottom `lz = 0`, top `lz = 4.0 + (lx + 12) * tan(10 deg)`), optionally rigidly rotated
+        // around +Y by `tilt_deg` and shifted in +Z by `z_offset` to verify NozzleFrame invariance.
+        let run_case = |tilt_deg: f32, z_offset: f32| {
+            let slope_rad = 10.0f32.to_radians();
+            let z_slope_max = 4.0 + 24.0 * slope_rad.tan();
+            let local_verts: [[f32; 3]; 8] = [
+                [-12.0, -8.0, 0.0],
+                [12.0, -8.0, 0.0],
+                [12.0, 8.0, 0.0],
+                [-12.0, 8.0, 0.0],
+                [-12.0, -8.0, 4.0],
+                [12.0, -8.0, z_slope_max],
+                [12.0, 8.0, z_slope_max],
+                [-12.0, 8.0, 4.0],
+            ];
+            let tris: [u32; 36] = [
+                0, 2, 1, 0, 3, 2, // bottom
+                4, 5, 6, 4, 6, 7, // sloped top (10 deg)
+                0, 1, 5, 0, 5, 4, // -Y
+                1, 2, 6, 1, 6, 5, // +X
+                2, 3, 7, 2, 7, 6, // +Y
+                3, 0, 4, 3, 4, 7, // -X
+            ];
+
+            let th = tilt_deg.to_radians();
+            let (st, ct) = th.sin_cos();
+            let u_x = Vec3::new(ct, 0.0, -st);
+            let u_y = Vec3::Y;
+            let u_z = Vec3::new(st, 0.0, ct);
+            let origin = Vec3::new(0.0, 0.0, z_offset);
+
+            let mut positions = Vec::with_capacity(24);
+            for lv in &local_verts {
+                let p = origin + u_x * lv[0] + u_y * lv[1] + u_z * lv[2];
+                positions.extend_from_slice(&[p.x, p.y, p.z]);
+            }
+
+            let part = ffi::register_triangle_mesh(
+                &format!("loft_wedge_{:.0}", tilt_deg),
+                &positions,
+                &tris,
+            );
+            assert!(part.object_id > 0);
+
+            let mut cfg = SlicerConfig::default();
+            cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+            cfg.eikonal.voxel_size_mm = 0.25;
+            cfg.eikonal.enable_multi_resolution_grid = false;
+            cfg.machine.nozzle_axis_bed = [u_z.x, u_z.y, u_z.z];
+            cfg.machine.gravity_direction_bed = [-u_z.x, -u_z.y, -u_z.z];
+            cfg.slicing.layer_height.target_mm = 0.20;
+            cfg.slicing.layer_height.min_mm = 0.08;
+            cfg.slicing.layer_height.max_mm = 0.36;
+            cfg.slicing.layer_height.first_layer_mm = 0.20;
+            cfg.slicing.inner_wall_count = 1;
+            cfg.slicing.shell_thickness_mm = 2.0;
+            cfg.slicing.infill_density_percent = 20.0;
+            cfg.slicing.enable_support_generation = false;
+            cfg.slicing.enable_auto_conformal_skin = false;
+            cfg.slicing.enable_top_surface_lofting = false;
+            crate::ui::sync_config_to_backend(&cfg);
+            assert!(ffi::recompute_object_fields(part.object_id, 0.25, 4.0));
+
+            let layers_off = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+            assert!(layers_off.valid && !layers_off.layers.is_empty());
+            let tp_off = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+            assert!(tp_off.valid);
+
+            cfg.slicing.enable_top_surface_lofting = true;
+            crate::ui::sync_config_to_backend(&cfg);
+            let layers_on = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+            assert!(layers_on.valid && !layers_on.layers.is_empty());
+            let tp_on = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+            assert!(tp_on.valid);
+
+            let effective_origin = origin - Vec3::new(part.origin_x, part.origin_y, part.origin_z);
+            let to_local = |x: f32, y: f32, z: f32| -> (f32, f32, f32) {
+                let rel = Vec3::new(x, y, z) - effective_origin;
+                (rel.dot(u_x), rel.dot(u_y), rel.dot(u_z))
+            };
+            let z_top_local = |lx: f32| -> f32 { 4.0 + (lx + 12.0) * slope_rad.tan() };
+            let cos_s = slope_rad.cos();
+
+            let collect_stats = |tp: &ffi::ObjectToolpathsResult| {
+                let mut iw_exp_sdfs = Vec::new();
+                let mut iw_exp_heights = Vec::new();
+                let mut si_exp_sdfs = Vec::new();
+                let mut si_exp_heights = Vec::new();
+                let mut covered_heights = Vec::new();
+                let mut max_slope_sdf = f32::NEG_INFINITY;
+                let mut max_height = 0.0f32;
+
+                for layer in &tp.layers {
+                    for path in &layer.paths {
+                        if path.feature_kind != 1 && path.feature_kind != 2 {
+                            continue;
+                        }
+                        for pt in &path.points {
+                            let (lx, ly, lz) = to_local(pt.x, pt.y, pt.z);
+                            if lx.abs() > 10.0 || ly.abs() > 6.0 || lz < 4.1 {
+                                continue;
+                            }
+                            let z_top = z_top_local(lx);
+                            let dz_below = z_top - lz;
+                            let sdf_plane = (lz - z_top) * cos_s;
+                            max_slope_sdf = max_slope_sdf.max(sdf_plane);
+                            max_height = max_height.max(pt.height_mm);
+                            assert!(
+                                pt.height_mm <= cfg.slicing.layer_height.max_mm + 1.0e-4,
+                                "Lofted height_mm ({}) must not exceed layer_height.max_mm ({})",
+                                pt.height_mm,
+                                cfg.slicing.layer_height.max_mm
+                            );
+                            if tilt_deg > 1.0 {
+                                let noz_dot = Vec3::new(pt.nx, pt.ny, pt.nz).dot(u_z);
+                                assert!(
+                                    noz_dot > 0.995,
+                                    "Expected local nozzle axis aligned with tilted u_z, got dot={noz_dot}"
+                                );
+                            }
+                            // Interior covered points well beneath Layer k+1:
+                            if dz_below >= 0.35 && lz >= 4.4 && lx.abs() <= 9.0 && ly.abs() <= 5.0 {
+                                covered_heights.push(pt.height_mm);
+                            }
+                        }
+                    }
+                }
+
+                // Collect exposed terrace points by scanning layers where the unlofted layer sits
+                // inside `0.05 < z_top(lx) - lz_layer < 0.155` (strictly outside Layer k+1).
+                for (_li, layer) in tp.layers.iter().enumerate() {
+                    let mut ow_lzs: Vec<f32> = layer
+                        .paths
+                        .iter()
+                        .filter(|p| p.feature_kind == 0)
+                        .flat_map(|p| p.points.iter())
+                        .map(|pt| to_local(pt.x, pt.y, pt.z).2)
+                        .collect();
+                    if ow_lzs.is_empty() {
+                        continue;
+                    }
+                    ow_lzs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let layer_lz = ow_lzs[ow_lzs.len() / 2];
+                    if layer_lz < 4.5 || layer_lz > z_slope_max - 0.6 {
+                        continue;
+                    }
+                    for path in &layer.paths {
+                        if path.feature_kind != 1 && path.feature_kind != 2 {
+                            continue;
+                        }
+                        for pt in &path.points {
+                            let (lx, ly, lz) = to_local(pt.x, pt.y, pt.z);
+                            if lx.abs() > 10.0 || ly.abs() > 6.0 {
+                                continue;
+                            }
+                            let z_top = z_top_local(lx);
+                            let base_dz_below = z_top - layer_lz;
+                            // Inside the unlofted exposed terrace band where wSlope = wExp = 1.0
+                            if base_dz_below > 0.05 && base_dz_below < 0.155 {
+                                let sdf_plane = (lz - z_top) * cos_s;
+                                if path.feature_kind == 1 {
+                                    iw_exp_sdfs.push(sdf_plane);
+                                    iw_exp_heights.push(pt.height_mm);
+                                } else {
+                                    si_exp_sdfs.push(sdf_plane);
+                                    si_exp_heights.push(pt.height_mm);
+                                }
+                            }
+                        }
+                    }
+                }
+                (
+                    iw_exp_sdfs,
+                    iw_exp_heights,
+                    si_exp_sdfs,
+                    si_exp_heights,
+                    covered_heights,
+                    max_slope_sdf,
+                    max_height,
+                )
+            };
+
+            let (iw_s_off, iw_h_off, si_s_off, si_h_off, _, _, _) = collect_stats(&tp_off);
+            let (iw_s_on, iw_h_on, si_s_on, si_h_on, cov_h_on, max_sdf_on, _max_h_on) =
+                collect_stats(&tp_on);
+
+            assert!(
+                !iw_s_off.is_empty() && !iw_s_on.is_empty(),
+                "Expected exposed InnerWall samples at tilt={tilt_deg}°"
+            );
+            assert!(
+                !si_s_off.is_empty() && !si_s_on.is_empty(),
+                "Expected exposed SolidInfill samples at tilt={tilt_deg}°"
+            );
+            assert!(!cov_h_on.is_empty(), "Expected covered interior points at tilt={tilt_deg}°");
+
+            let mean = |v: &[f32]| -> f32 { v.iter().sum::<f32>() / (v.len() as f32) };
+            let iw_sdf_off = mean(&iw_s_off);
+            let iw_sdf_on = mean(&iw_s_on);
+            let si_sdf_off = mean(&si_s_off);
+            let si_sdf_on = mean(&si_s_on);
+            let iw_h_mean_on = mean(&iw_h_on);
+            let si_h_mean_on = mean(&si_h_on);
+            let cov_h_mean_on = mean(&cov_h_on);
+            let _ = (mean(&iw_h_off), mean(&si_h_off));
+
+            assert!(
+                iw_sdf_on - iw_sdf_off >= 0.04,
+                "Exposed InnerWall SDF should improve by >= 0.04 mm (tilt={tilt_deg}°): off={iw_sdf_off:.4}, on={iw_sdf_on:.4}"
+            );
+            assert!(
+                si_sdf_on - si_sdf_off >= 0.05,
+                "Exposed SolidInfill SDF should improve by >= 0.05 mm (tilt={tilt_deg}°): off={si_sdf_off:.4}, on={si_sdf_on:.4}"
+            );
+            assert!(
+                iw_h_mean_on > 0.24 && si_h_mean_on > 0.26,
+                "Expected lofted bead height > target_mm (tilt={tilt_deg}°): iw={iw_h_mean_on:.4}, si={si_h_mean_on:.4}"
+            );
+            assert!(
+                max_sdf_on <= 0.025,
+                "Lofted vertices must not protrude above CAD surface (tilt={tilt_deg}°): max_sdf={max_sdf_on:.4}"
+            );
+            assert!(
+                (cov_h_mean_on - 0.20).abs() < 0.015,
+                "Covered interior vertices must remain unlofted near 0.20 mm (tilt={tilt_deg}°): got {cov_h_mean_on:.4}"
+            );
+
+            // Plan G-code and verify extruded filament volume (`delta_e_mm`) increases cleanly
+            // for both InnerWall and SolidInfill when top-surface lofting is enabled.
+            cfg.slicing.enable_top_surface_lofting = false;
+            let planned_off = crate::gcode::plan_and_emit_gcode_for_object(
+                "loft_wedge",
+                part.object_id,
+                &tp_off,
+                Transform::IDENTITY,
+                &cfg,
+            );
+            cfg.slicing.enable_top_surface_lofting = true;
+            let planned_on = crate::gcode::plan_and_emit_gcode_for_object(
+                "loft_wedge",
+                part.object_id,
+                &tp_on,
+                Transform::IDENTITY,
+                &cfg,
+            );
+
+            let sum_e = |p: &crate::gcode::PlannedGcodeResult, kind: crate::gcode::PlannedMoveKind| -> f32 {
+                p.layers
+                    .iter()
+                    .flat_map(|l| l.segments.iter())
+                    .filter(|s| s.kind == kind && s.delta_e_mm > 0.0)
+                    .map(|s| s.delta_e_mm)
+                    .sum()
+            };
+            let iw_e_off = sum_e(&planned_off, crate::gcode::PlannedMoveKind::InnerWall);
+            let iw_e_on = sum_e(&planned_on, crate::gcode::PlannedMoveKind::InnerWall);
+            let si_e_off = sum_e(&planned_off, crate::gcode::PlannedMoveKind::SolidInfill);
+            let si_e_on = sum_e(&planned_on, crate::gcode::PlannedMoveKind::SolidInfill);
+            assert!(
+                iw_e_on > iw_e_off && si_e_on > si_e_off,
+                "Expected lofted G-code extruded filament delta_e to increase (tilt={tilt_deg}°): InnerWall {iw_e_off:.3}->{iw_e_on:.3}, SolidInfill {si_e_off:.3}->{si_e_on:.3}"
+            );
+
+            let _ = ffi::remove_cad_object(part.object_id);
+        };
+
+        run_case(0.0, 0.0);
+        run_case(20.0, 10.0);
+        crate::ui::sync_config_to_backend(&SlicerConfig::default());
+    }
+
+    #[test]
+    fn test_top_surface_lofting_respects_conformal_skin_caps() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 18-deg sloped wedge (`18° > 12°` auto conformal skin trigger) with both conformal skin
+        // and top-surface lofting enabled. Core layers beneath the conformal skin cap must not
+        // loft up into the conformal skin patch.
+        let slope_rad = 18.0f32.to_radians();
+        let z_slope_max = 4.0 + 24.0 * slope_rad.tan();
+        let verts: &[[f32; 3]] = &[
+            [-12.0, -8.0, 0.0],
+            [12.0, -8.0, 0.0],
+            [12.0, 8.0, 0.0],
+            [-12.0, 8.0, 0.0],
+            [-12.0, -8.0, 4.0],
+            [12.0, -8.0, z_slope_max],
+            [12.0, 8.0, z_slope_max],
+            [-12.0, 8.0, 4.0],
+        ];
+        let tris: &[[u32; 3]] = &[
+            [0, 2, 1],
+            [0, 3, 2],
+            [4, 5, 6],
+            [4, 6, 7],
+            [0, 1, 5],
+            [0, 5, 4],
+            [1, 2, 6],
+            [1, 6, 5],
+            [2, 3, 7],
+            [2, 7, 6],
+            [3, 0, 4],
+            [3, 4, 7],
+        ];
+        let mut pos_flat = Vec::with_capacity(verts.len() * 3);
+        for v in verts {
+            pos_flat.extend_from_slice(v);
+        }
+        let mut idx_flat = Vec::with_capacity(tris.len() * 3);
+        for t in tris {
+            idx_flat.extend_from_slice(t);
+        }
+
+        let part = ffi::register_triangle_mesh("ConformalLoftCoexistWedge", &pos_flat, &idx_flat);
+        assert!(part.object_id > 0);
+
+        let mut cfg = SlicerConfig::default();
+        cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+        cfg.eikonal.voxel_size_mm = 0.25;
+        cfg.eikonal.enable_multi_resolution_grid = false;
+        cfg.slicing.layer_height.target_mm = 0.20;
+        cfg.slicing.layer_height.min_mm = 0.08;
+        cfg.slicing.layer_height.max_mm = 0.36;
+        cfg.slicing.layer_height.first_layer_mm = 0.20;
+        cfg.slicing.inner_wall_count = 2;
+        cfg.slicing.shell_thickness_mm = 2.0;
+        cfg.slicing.enable_support_generation = false;
+        cfg.slicing.enable_auto_conformal_skin = true;
+        cfg.slicing.conformal_skin_layers = 3;
+        cfg.slicing.enable_top_surface_lofting = true;
+        crate::ui::sync_config_to_backend(&cfg);
+        assert!(ffi::recompute_object_fields(part.object_id, 0.25, 4.0));
+
+        let sel = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+        assert!(sel.valid);
+        let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+        assert!(tp.valid && sel.layers.len() == tp.layers.len());
+
+        let z_top = |x: f32| -> f32 { 4.0 + (x + 12.0) * slope_rad.tan() };
+        let cos_s = slope_rad.cos();
+        let mut skin_layer_count = 0usize;
+        let mut checked_core_pts = 0usize;
+        let mut max_core_sdf = f32::NEG_INFINITY;
+
+        for (li, layer) in tp.layers.iter().enumerate() {
+            let info = &sel.layers[li];
+            let is_uniform = (info.max_thickness_mm - info.min_thickness_mm).abs() <= 1.0e-4;
+            let is_skin = is_uniform && info.is_top_layer && !info.is_first_layer;
+            if is_skin {
+                skin_layer_count += 1;
+                for path in &layer.paths {
+                    for pt in &path.points {
+                        assert!(
+                            pt.height_mm <= 0.23,
+                            "Conformal skin layers should keep conformal thickness <= 0.23 mm, got {}",
+                            pt.height_mm
+                        );
+                    }
+                }
+                continue;
+            }
+            if info.is_first_layer {
+                continue;
+            }
+            for path in &layer.paths {
+                if path.feature_kind != 1 && path.feature_kind != 2 && path.feature_kind != 3 {
+                    continue;
+                }
+                for pt in &path.points {
+                    if pt.x.abs() <= 8.0 && pt.y.abs() <= 4.0 && pt.z >= 4.0 {
+                        let sdf_plane = (pt.z - z_top(pt.x)) * cos_s;
+                        max_core_sdf = max_core_sdf.max(sdf_plane);
+                        checked_core_pts += 1;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            skin_layer_count >= 3,
+            "Expected >= 3 conformal skin layers on 18-deg wedge, got {skin_layer_count}"
+        );
+        assert!(checked_core_pts > 0, "Expected core InnerWall/SolidInfill points beneath skin cap");
+        assert!(
+            max_core_sdf <= -0.35,
+            "Core layers beneath conformal skin cap must not loft into the skin cap, got max_core_sdf={max_core_sdf:.4}"
+        );
+
+        let _ = ffi::remove_cad_object(part.object_id);
+        crate::ui::sync_config_to_backend(&SlicerConfig::default());
+    }
+
+    #[test]
+    fn test_plateau_pinning_and_flat_deck_solid_infill() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Exact signed distance helper for a closed watertight triangle mesh (`local` frame)
+        let tri_mesh_signed_dist = |verts: &[[f32; 3]], tris: &[[u32; 3]], q: Vec3| -> f32 {
+            let closest_pt_tri = |p: Vec3, a: Vec3, b: Vec3, c: Vec3| -> (f32, Vec3) {
+                let ab = b - a;
+                let ac = c - a;
+                let ap = p - a;
+                let d1 = ab.dot(ap);
+                let d2 = ac.dot(ap);
+                if d1 <= 0.0 && d2 <= 0.0 {
+                    return (p.distance_squared(a), a);
+                }
+                let bp = p - b;
+                let d3 = ab.dot(bp);
+                let d4 = ac.dot(bp);
+                if d3 >= 0.0 && d4 <= d3 {
+                    return (p.distance_squared(b), b);
+                }
+                let vc = d1 * d4 - d3 * d2;
+                if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+                    let v = d1 / (d1 - d3);
+                    let cp = a + ab * v;
+                    return (p.distance_squared(cp), cp);
+                }
+                let cp_v = p - c;
+                let d5 = ab.dot(cp_v);
+                let d6 = ac.dot(cp_v);
+                if d6 >= 0.0 && d5 <= d6 {
+                    return (p.distance_squared(c), c);
+                }
+                let vb = d5 * d2 - d1 * d6;
+                if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+                    let w = d2 / (d2 - d6);
+                    let cp = a + ac * w;
+                    return (p.distance_squared(cp), cp);
+                }
+                let va = d3 * d6 - d5 * d4;
+                if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+                    let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+                    let cp = b + (c - b) * w;
+                    return (p.distance_squared(cp), cp);
+                }
+                let denom = 1.0 / (va + vb + vc);
+                let v = vb * denom;
+                let w = vc * denom;
+                let cp = a + ab * v + ac * w;
+                (p.distance_squared(cp), cp)
+            };
+
+            let mut min_sq = f32::MAX;
+            for tri in tris {
+                let a = Vec3::from_array(verts[tri[0] as usize]);
+                let b = Vec3::from_array(verts[tri[1] as usize]);
+                let c = Vec3::from_array(verts[tri[2] as usize]);
+                let (d_sq, _) = closest_pt_tri(q, a, b, c);
+                if d_sq < min_sq {
+                    min_sq = d_sq;
+                }
+            }
+            let unsigned_d = min_sq.sqrt();
+            // Stepped block interior check: base [-12,12]^2 x [0,8.5], boss [-5,5]^2 x [8.5,15.5]
+            let in_base = q.x.abs() <= 12.0 && q.y.abs() <= 12.0 && q.z >= 0.0 && q.z <= 8.50;
+            let in_boss = q.x.abs() <= 5.0 && q.y.abs() <= 5.0 && q.z >= 8.50 && q.z <= 15.50;
+            if in_base || in_boss {
+                -unsigned_d
+            } else {
+                unsigned_d
+            }
+        };
+
+        let local_verts: [[f32; 3]; 16] = [
+            // Base bottom (z = 0.0)
+            [-12.0, -12.0, 0.0],
+            [12.0, -12.0, 0.0],
+            [12.0, 12.0, 0.0],
+            [-12.0, 12.0, 0.0],
+            // Base deck outer ring (z = 8.50)
+            [-12.0, -12.0, 8.50],
+            [12.0, -12.0, 8.50],
+            [12.0, 12.0, 8.50],
+            [-12.0, 12.0, 8.50],
+            // Boss base inner ring (z = 8.50)
+            [-5.0, -5.0, 8.50],
+            [5.0, -5.0, 8.50],
+            [5.0, 5.0, 8.50],
+            [-5.0, 5.0, 8.50],
+            // Boss top (z = 15.50)
+            [-5.0, -5.0, 15.50],
+            [5.0, -5.0, 15.50],
+            [5.0, 5.0, 15.50],
+            [-5.0, 5.0, 15.50],
+        ];
+        let local_tris: &[[u32; 3]] = &[
+            // Bottom
+            [0, 2, 1],
+            [0, 3, 2],
+            // Base outer walls
+            [0, 1, 5],
+            [0, 5, 4],
+            [1, 2, 6],
+            [1, 6, 5],
+            [2, 3, 7],
+            [2, 7, 6],
+            [3, 0, 4],
+            [3, 4, 7],
+            // Flat deck annulus at z = 8.50
+            [4, 5, 9],
+            [4, 9, 8],
+            [5, 6, 10],
+            [5, 10, 9],
+            [6, 7, 11],
+            [6, 11, 10],
+            [7, 4, 8],
+            [7, 8, 11],
+            // Boss vertical walls
+            [8, 9, 13],
+            [8, 13, 12],
+            [9, 10, 14],
+            [9, 14, 13],
+            [10, 11, 15],
+            [10, 15, 14],
+            [11, 8, 12],
+            [11, 12, 15],
+            // Boss top at z = 15.50
+            [12, 13, 14],
+            [12, 14, 15],
+        ];
+
+        let run_case = |tilt_deg: f32, order_mode: crate::config::OrderFieldMode| {
+            let th = tilt_deg.to_radians();
+            let (st, ct) = th.sin_cos();
+            let u_x = Vec3::new(ct, 0.0, -st);
+            let u_y = Vec3::Y;
+            let u_z = Vec3::new(st, 0.0, ct);
+            let origin = Vec3::new(0.0, 0.0, 4.0);
+
+            let mut positions = Vec::with_capacity(local_verts.len() * 3);
+            for lv in &local_verts {
+                let p = origin + u_x * lv[0] + u_y * lv[1] + u_z * lv[2];
+                positions.extend_from_slice(&[p.x, p.y, p.z]);
+            }
+            let mut indices = Vec::with_capacity(local_tris.len() * 3);
+            for t in local_tris {
+                indices.extend_from_slice(t);
+            }
+
+            let part = ffi::register_triangle_mesh(
+                &format!("plateau_stepped_block_{:.0}", tilt_deg),
+                &positions,
+                &indices,
+            );
+            assert!(part.object_id > 0);
+
+            let mut cfg = SlicerConfig::default();
+            cfg.eikonal.order_field_mode = order_mode;
+            cfg.eikonal.voxel_size_mm = 0.25;
+            cfg.eikonal.enable_multi_resolution_grid = false;
+            cfg.machine.nozzle_axis_bed = [u_z.x, u_z.y, u_z.z];
+            cfg.machine.gravity_direction_bed = [-u_z.x, -u_z.y, -u_z.z];
+            cfg.slicing.layer_height.target_mm = 0.20;
+            cfg.slicing.layer_height.min_mm = 0.08;
+            cfg.slicing.layer_height.max_mm = 0.36;
+            cfg.slicing.layer_height.first_layer_mm = 0.20;
+            cfg.slicing.layer_height.top_layer_mm = 0.20;
+            cfg.slicing.inner_wall_count = 1;
+            cfg.slicing.shell_thickness_mm = 2.0;
+            cfg.slicing.infill_density_percent = 20.0;
+            cfg.slicing.enable_support_generation = false;
+            cfg.slicing.enable_auto_conformal_skin = false;
+            cfg.slicing.enable_top_surface_lofting = true;
+            crate::ui::sync_config_to_backend(&cfg);
+            assert!(ffi::recompute_object_fields(part.object_id, 0.25, 4.0));
+
+            let sel = ffi::select_slicing_isosurfaces(part.object_id, 0.0);
+            assert!(sel.valid && !sel.layers.is_empty());
+            let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+            assert!(tp.valid && sel.layers.len() == tp.layers.len());
+
+            let effective_origin = origin - Vec3::new(part.origin_x, part.origin_y, part.origin_z);
+            let to_local = |x: f32, y: f32, z: f32| -> Vec3 {
+                let rel = Vec3::new(x, y, z) - effective_origin;
+                Vec3::new(rel.dot(u_x), rel.dot(u_y), rel.dot(u_z))
+            };
+
+            // 1. Check all layer thicknesses obey [min_mm, max_mm]
+            for l in &sel.layers {
+                if !l.is_first_layer {
+                    assert!(
+                        l.mean_thickness_mm >= 0.08 - 0.01 && l.mean_thickness_mm <= 0.36 + 0.01,
+                        "Layer {} (tilt={tilt_deg}°) thickness {} out of [0.08, 0.36]",
+                        l.layer_index,
+                        l.mean_thickness_mm
+                    );
+                }
+            }
+
+            // 2. Verify a plateau-pinned intermediate layer lands at lz ≈ 8.48 (within 0.04 mm of 8.50)
+            //    with is_top_layer = false, AND a flat leaf-top layer lands at lz ≈ 15.48.
+            let mut deck_layer_idx: Option<usize> = None;
+            let mut best_deck_err = f32::MAX;
+            let mut boss_top_layer_idx: Option<usize> = None;
+            let mut best_boss_err = f32::MAX;
+
+            for (li, layer) in tp.layers.iter().enumerate() {
+                let info = &sel.layers[li];
+                let mut deck_zs = Vec::new();
+                let mut boss_zs = Vec::new();
+                for path in &layer.paths {
+                    for pt in &path.points {
+                        let lp = to_local(pt.x, pt.y, pt.z);
+                        if lp.x.abs().max(lp.y.abs()) > 5.8 && lp.x.abs().max(lp.y.abs()) < 11.4 {
+                            deck_zs.push(lp.z);
+                        } else if lp.x.abs() < 4.4 && lp.y.abs() < 4.4 && lp.z > 14.5 {
+                            boss_zs.push(lp.z);
+                        }
+                    }
+                }
+                if !deck_zs.is_empty() && !info.is_top_layer {
+                    deck_zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let med_z = deck_zs[deck_zs.len() / 2];
+                    let err = (med_z - 8.48).abs();
+                    if med_z <= 8.51 && err < best_deck_err {
+                        best_deck_err = err;
+                        deck_layer_idx = Some(li);
+                    }
+                }
+                if !boss_zs.is_empty() && info.is_top_layer {
+                    boss_zs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let med_z = boss_zs[boss_zs.len() / 2];
+                    let err = (med_z - 15.48).abs();
+                    if med_z <= 15.51 && err < best_boss_err {
+                        best_boss_err = err;
+                        boss_top_layer_idx = Some(li);
+                    }
+                }
+            }
+
+            let d_idx = deck_layer_idx.expect("Expected plateau-pinned deck layer near z=8.50");
+            assert!(
+                best_deck_err <= 0.045,
+                "Expected plateau-pinned deck layer within 0.045 mm of 8.48 (tilt={tilt_deg}°), got err={best_deck_err:.4}"
+            );
+            let b_idx = boss_top_layer_idx.expect("Expected flat leaf-top layer near z=15.50");
+            assert!(
+                best_boss_err <= 0.045,
+                "Expected flat leaf-top layer within 0.045 mm of 15.48 (tilt={tilt_deg}°), got err={best_boss_err:.4}"
+            );
+
+            // 3. Verify the plateau-pinned deck layer has FULL SolidInfill (not erased by maxSolidInfillSdf!)
+            //    and OuterWall / InnerWall / SolidInfill all sit flush near lz ≈ 8.48..8.50 with no protrusion.
+            let mut deck_ow_zs = Vec::new();
+            let mut deck_iw_zs = Vec::new();
+            let mut deck_si_zs = Vec::new();
+            let mut deck_si_len = 0.0f32;
+            let mut deck_max_sdf = f32::NEG_INFINITY;
+            for path in &tp.layers[d_idx].paths {
+                for pt in &path.points {
+                    let lp = to_local(pt.x, pt.y, pt.z);
+                    let sdf = tri_mesh_signed_dist(&local_verts, local_tris, lp);
+                    deck_max_sdf = deck_max_sdf.max(sdf);
+                    let in_deck_annulus =
+                        lp.x.abs().max(lp.y.abs()) > 5.8 && lp.x.abs().max(lp.y.abs()) < 11.4;
+                    let on_outer_rim =
+                        lp.x.abs().max(lp.y.abs()) > 11.4 && lp.z > 8.1;
+                    if path.feature_kind == 0 && (in_deck_annulus || on_outer_rim) {
+                        deck_ow_zs.push(lp.z);
+                    } else if path.feature_kind == 1 && (in_deck_annulus || on_outer_rim) {
+                        deck_iw_zs.push(lp.z);
+                    } else if path.feature_kind == 2 && in_deck_annulus {
+                        deck_si_zs.push(lp.z);
+                    }
+                }
+                if path.feature_kind == 2 {
+                    let any_annulus = path.points.iter().any(|pt| {
+                        let lp = to_local(pt.x, pt.y, pt.z);
+                        lp.x.abs().max(lp.y.abs()) > 5.8 && lp.x.abs().max(lp.y.abs()) < 11.4
+                    });
+                    if any_annulus {
+                        deck_si_len += path.total_length_mm;
+                    }
+                }
+            }
+
+            assert!(
+                !deck_si_zs.is_empty() && deck_si_len >= 60.0,
+                "Flat deck layer must retain full SolidInfill (tilt={tilt_deg}°): n_pts={}, len={deck_si_len:.1} mm",
+                deck_si_zs.len()
+            );
+            assert!(
+                !deck_ow_zs.is_empty() && !deck_iw_zs.is_empty(),
+                "Expected OuterWall and InnerWall on plateau-pinned deck layer (tilt={tilt_deg}°)"
+            );
+            let median = |v: &mut Vec<f32>| -> f32 {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let ow_med = median(&mut deck_ow_zs);
+            let iw_med = median(&mut deck_iw_zs);
+            let si_med = median(&mut deck_si_zs);
+            assert!(
+                (ow_med - 8.48).abs() <= 0.045
+                    && (iw_med - 8.48).abs() <= 0.045
+                    && (si_med - 8.48).abs() <= 0.045,
+                "Deck OuterWall/InnerWall/SolidInfill should all sit flush near z=8.48 (tilt={tilt_deg}°): ow={ow_med:.3}, iw={iw_med:.3}, si={si_med:.3}"
+            );
+            assert!(
+                deck_max_sdf <= 0.025,
+                "Deck layer must not protrude outside CAD (tilt={tilt_deg}°): max_sdf={deck_max_sdf:.4}"
+            );
+
+            // 4. Verify boss top layer also has SolidInfill and flush walls without protrusion
+            let mut boss_max_sdf = f32::NEG_INFINITY;
+            let mut boss_si_pts = 0usize;
+            for path in &tp.layers[b_idx].paths {
+                for pt in &path.points {
+                    let lp = to_local(pt.x, pt.y, pt.z);
+                    boss_max_sdf = boss_max_sdf.max(tri_mesh_signed_dist(&local_verts, local_tris, lp));
+                    if path.feature_kind == 2 && lp.x.abs() < 4.5 && lp.y.abs() < 4.5 {
+                        boss_si_pts += 1;
+                    }
+                }
+            }
+            assert!(
+                boss_si_pts > 0,
+                "Boss top leaf layer must retain SolidInfill (tilt={tilt_deg}°)"
+            );
+            assert!(
+                boss_max_sdf <= 0.025,
+                "Boss top layer must not protrude outside CAD (tilt={tilt_deg}°): max_sdf={boss_max_sdf:.4}"
+            );
+
+            let _ = ffi::remove_cad_object(part.object_id);
+        };
+
+        run_case(0.0, crate::config::OrderFieldMode::ConstrainedNonPlanar);
+        run_case(20.0, crate::config::OrderFieldMode::HeightOnlyPlanar);
+        crate::ui::sync_config_to_backend(&SlicerConfig::default());
+    }
+
+    #[test]
+    fn test_outer_wall_rim_lofting_and_tool_clearance_slope_limit() {
+        let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Part A: Stepped base with a narrow 6-deg sloped top rim (`> 5°`, so NOT plateau-pinned)
+        // where exposed top-facing OuterWall beads sit ~0.10 mm below the top face and must loft
+        // upward with InnerWall while obeying strict side-wall containment (`max_sdf <= 0.025`).
+        {
+            let slope_rad = 6.0f32.to_radians();
+            let z_hi = 4.6 + 24.0 * slope_rad.tan();
+            let local_verts: [[f32; 3]; 16] = [
+                // Base bottom (z = 0.0)
+                [-14.0, -5.0, 0.0],
+                [14.0, -5.0, 0.0],
+                [14.0, 5.0, 0.0],
+                [-14.0, 5.0, 0.0],
+                // Base top outer ring (z = 4.0)
+                [-14.0, -5.0, 4.0],
+                [14.0, -5.0, 4.0],
+                [14.0, 5.0, 4.0],
+                [-14.0, 5.0, 4.0],
+                // Rail base inner ring (z = 4.0)
+                [-12.0, -1.0, 4.0],
+                [12.0, -1.0, 4.0],
+                [12.0, 1.0, 4.0],
+                [-12.0, 1.0, 4.0],
+                // Sloped rail top (6 deg along +X)
+                [-12.0, -1.0, 4.6],
+                [12.0, -1.0, z_hi],
+                [12.0, 1.0, z_hi],
+                [-12.0, 1.0, 4.6],
+            ];
+            let local_tris: &[[u32; 3]] = &[
+                [0, 2, 1],
+                [0, 3, 2],
+                [0, 1, 5],
+                [0, 5, 4],
+                [1, 2, 6],
+                [1, 6, 5],
+                [2, 3, 7],
+                [2, 7, 6],
+                [3, 0, 4],
+                [3, 4, 7],
+                [4, 5, 9],
+                [4, 9, 8],
+                [5, 6, 10],
+                [5, 10, 9],
+                [6, 7, 11],
+                [6, 11, 10],
+                [7, 4, 8],
+                [7, 8, 11],
+                [8, 9, 13],
+                [8, 13, 12],
+                [9, 10, 14],
+                [9, 14, 13],
+                [10, 11, 15],
+                [10, 15, 14],
+                [11, 8, 12],
+                [11, 12, 15],
+                [12, 13, 14],
+                [12, 14, 15],
+            ];
+
+            let mut positions = Vec::with_capacity(local_verts.len() * 3);
+            for lv in &local_verts {
+                positions.extend_from_slice(lv);
+            }
+            let mut indices = Vec::with_capacity(local_tris.len() * 3);
+            for t in local_tris {
+                indices.extend_from_slice(t);
+            }
+            let part = ffi::register_triangle_mesh("outer_rim_sloped_rail", &positions, &indices);
+            assert!(part.object_id > 0);
+            let origin_shift = Vec3::new(part.origin_x, part.origin_y, part.origin_z);
+
+            let mut cfg = SlicerConfig::default();
+            cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+            cfg.eikonal.voxel_size_mm = 0.25;
+            cfg.eikonal.enable_multi_resolution_grid = false;
+            cfg.slicing.layer_height.target_mm = 0.20;
+            cfg.slicing.layer_height.min_mm = 0.08;
+            cfg.slicing.layer_height.max_mm = 0.36;
+            cfg.slicing.layer_height.first_layer_mm = 0.20;
+            cfg.slicing.inner_wall_count = 1;
+            cfg.slicing.shell_thickness_mm = 2.0;
+            cfg.slicing.enable_support_generation = false;
+            cfg.slicing.enable_auto_conformal_skin = false;
+            cfg.slicing.enable_top_surface_lofting = false;
+            crate::ui::sync_config_to_backend(&cfg);
+            assert!(ffi::recompute_object_fields(part.object_id, 0.25, 4.0));
+            assert!(ffi::select_slicing_isosurfaces(part.object_id, 0.0).valid);
+            let tp_off = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+            assert!(tp_off.valid);
+
+            cfg.slicing.enable_top_surface_lofting = true;
+            crate::ui::sync_config_to_backend(&cfg);
+            let tp_on = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+            assert!(tp_on.valid);
+
+            let z_top_at = |lx: f32| -> f32 { 4.6 + (lx + 12.0) * slope_rad.tan() };
+            let cos_s = slope_rad.cos();
+            let collect_ow_stats = |tp: &ffi::ObjectToolpathsResult| {
+                let mut exp_sdfs = Vec::new();
+                let mut exp_heights = Vec::new();
+                let mut max_side_x = f32::NEG_INFINITY;
+                let mut max_side_y = f32::NEG_INFINITY;
+                for layer in &tp.layers {
+                    let mut ys_z = Vec::new();
+                    for path in &layer.paths {
+                        if path.feature_kind == 0 {
+                            for pt in &path.points {
+                                let lp = Vec3::new(pt.x, pt.y, pt.z) + origin_shift;
+                                if lp.z > 4.2 {
+                                    ys_z.push(lp.z);
+                                }
+                            }
+                        }
+                    }
+                    if ys_z.is_empty() {
+                        continue;
+                    }
+                    ys_z.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let base_lz = ys_z[0];
+                    for path in &layer.paths {
+                        if path.feature_kind != 0 {
+                            continue;
+                        }
+                        for pt in &path.points {
+                            let lp = Vec3::new(pt.x, pt.y, pt.z) + origin_shift;
+                            if lp.z < 4.5 || lp.x < -10.5 || lp.x > 10.5 {
+                                continue;
+                            }
+                            if lp.y.abs() <= 1.15 {
+                                // Check lateral side-wall bounds of the rail ([-12, 12] x [-1, 1])
+                                max_side_y = max_side_y.max(lp.y.abs() - 1.0);
+                                max_side_x = max_side_x.max(lp.x.abs() - 12.0);
+                            }
+                            let dz_base = z_top_at(lp.x) - base_lz;
+                            if dz_base > 0.06 && dz_base < 0.145 && lp.y.abs() <= 1.0 {
+                                exp_sdfs.push((lp.z - z_top_at(lp.x)) * cos_s);
+                                exp_heights.push(pt.height_mm);
+                            }
+                        }
+                    }
+                }
+                (exp_sdfs, exp_heights, max_side_x, max_side_y)
+            };
+
+            let (s_off, h_off, _, _) = collect_ow_stats(&tp_off);
+            let (s_on, h_on, max_sx, max_sy) = collect_ow_stats(&tp_on);
+            assert!(
+                !s_off.is_empty() && !s_on.is_empty(),
+                "Expected exposed top-facing OuterWall rim samples on 6-deg rail"
+            );
+            let mean = |v: &[f32]| v.iter().sum::<f32>() / (v.len() as f32);
+            let m_s_off = mean(&s_off);
+            let m_s_on = mean(&s_on);
+            let m_h_off = mean(&h_off);
+            let m_h_on = mean(&h_on);
+            assert!(
+                m_s_on - m_s_off >= 0.03,
+                "Exposed OuterWall rim should loft closer to top CAD surface: off={m_s_off:.4}, on={m_s_on:.4}"
+            );
+            assert!(
+                m_h_on > m_h_off + 0.02,
+                "Lofted OuterWall rim should scale height_mm: off={m_h_off:.4}, on={m_h_on:.4}"
+            );
+            assert!(
+                max_sx.is_finite() && max_sy.is_finite() && max_sx <= -0.05 && max_sy <= -0.05,
+                "Lofted OuterWall must stay inside rail side walls: max_sx={max_sx:.4}, max_sy={max_sy:.4}"
+            );
+            let _ = ffi::remove_cad_object(part.object_id);
+        }
+
+        // Part B: Verify the loft ramp climb slope obeys the active tool's physical clearance slope.
+        // Configure a 3-axis tool with ParametricCone half-angle = 70 deg => max climb = 20 deg (tan ≈ 0.364).
+        {
+            let slope_rad = 10.0f32.to_radians();
+            let z_slope_max = 4.0 + 24.0 * slope_rad.tan();
+            let local_verts: [f32; 24] = [
+                -12.0, -8.0, 0.0,
+                12.0, -8.0, 0.0,
+                12.0, 8.0, 0.0,
+                -12.0, 8.0, 0.0,
+                -12.0, -8.0, 4.0,
+                12.0, -8.0, z_slope_max,
+                12.0, 8.0, z_slope_max,
+                -12.0, 8.0, 4.0,
+            ];
+            let tris: [u32; 36] = [
+                0, 2, 1, 0, 3, 2,
+                4, 5, 6, 4, 6, 7,
+                0, 1, 5, 0, 5, 4,
+                1, 2, 6, 1, 6, 5,
+                2, 3, 7, 2, 7, 6,
+                3, 0, 4, 3, 4, 7,
+            ];
+            let part = ffi::register_triangle_mesh("clearance_limited_loft_wedge", &local_verts, &tris);
+            assert!(part.object_id > 0);
+
+            let mut cfg = SlicerConfig::default();
+            cfg.eikonal.order_field_mode = crate::config::OrderFieldMode::HeightOnlyPlanar;
+            cfg.eikonal.voxel_size_mm = 0.25;
+            cfg.eikonal.enable_multi_resolution_grid = false;
+            cfg.slicing.layer_height.target_mm = 0.20;
+            cfg.slicing.layer_height.min_mm = 0.08;
+            cfg.slicing.layer_height.max_mm = 0.36;
+            cfg.slicing.layer_height.first_layer_mm = 0.20;
+            cfg.slicing.inner_wall_count = 1;
+            cfg.slicing.shell_thickness_mm = 2.0;
+            cfg.slicing.enable_support_generation = false;
+            cfg.slicing.enable_auto_conformal_skin = false;
+            cfg.slicing.enable_top_surface_lofting = true;
+
+            let mut tool = cfg.tools[0].clone();
+            tool.has_rotational_axes = false;
+            tool.clearance_mode = crate::config::ClearanceProfileMode::ParametricCone;
+            tool.cone_half_angle_deg = 70.0; // max clearance slope = 20 deg (tan = 0.36397)
+            cfg.machine.kinematics_mode = crate::config::FiveAxisKinematicsMode::ThreeAxis;
+            cfg.tools = vec![tool];
+            cfg.active_tool_index = 0;
+
+            crate::ui::sync_config_to_backend(&cfg);
+            assert!(ffi::recompute_object_fields(part.object_id, 0.25, 4.0));
+            assert!(ffi::select_slicing_isosurfaces(part.object_id, 0.0).valid);
+            let tp = ffi::generate_object_shell_toolpaths(part.object_id, 0.0);
+            assert!(tp.valid);
+
+            let max_allowed_slope = 20.0f32.to_radians().tan() + 0.025;
+            let mut max_observed_slope = 0.0f32;
+            let mut max_height_mm = 0.0f32;
+            for layer in &tp.layers {
+                for path in &layer.paths {
+                    if path.feature_kind > 3 {
+                        continue;
+                    }
+                    for pt in &path.points {
+                        max_height_mm = max_height_mm.max(pt.height_mm);
+                    }
+                    let n = path.points.len();
+                    let edges = if path.is_closed { n } else { n.saturating_sub(1) };
+                    for e in 0..edges {
+                        let a = &path.points[e];
+                        let b = &path.points[(e + 1) % n];
+                        if a.height_mm <= 0.205 && b.height_mm <= 0.205 {
+                            continue;
+                        }
+                        let dxy = (b.x - a.x).hypot(b.y - a.y);
+                        let dz = (b.z - a.z).abs();
+                        if dxy > 0.02 {
+                            let slope = dz / dxy;
+                            max_observed_slope = max_observed_slope.max(slope);
+                            assert!(
+                                slope <= max_allowed_slope,
+                                "Loft ramp edge slope {slope:.4} exceeded tool clearance limit {max_allowed_slope:.4} (dz={dz:.4}, dxy={dxy:.4})"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(
+                max_height_mm > 0.24,
+                "Expected active lofting under clearance limit test, got max_height_mm={max_height_mm:.4}"
+            );
+            let _ = max_observed_slope;
+            let _ = ffi::remove_cad_object(part.object_id);
+        }
+
         crate::ui::sync_config_to_backend(&SlicerConfig::default());
     }
 }

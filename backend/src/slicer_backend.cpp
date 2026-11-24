@@ -2186,6 +2186,7 @@ struct SlicerBackend::Impl {
         true,
         15.0f,
         0,
+        true,
     };
     SupportSpec supportSpec{
         true,
@@ -5676,6 +5677,284 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     }
 
     // ------------------------------------------------------------------------
+    // 3b. Detect Isosurface-Parallel Flat Plateaus per Branch from Exact CAD Triangles
+    // ------------------------------------------------------------------------
+    // Coordinate-free flatness check against the solved Eikonal gradient \hat{n}_\tau = \nabla\tau / |\nabla\tau|
+    // so both planar 3-axis decks and multi-axis tilted/curved isosurface-parallel plateaus are
+    // discovered while never modifying the Eikonal field or violating any slope constraint.
+    struct BranchPlateau {
+        float sMm = 0.0f;
+        float areaMm2 = 0.0f;
+    };
+    std::vector<std::vector<BranchPlateau>> branchPlateaus(branches.size());
+
+    if (!rec.vertexBuffer.empty() && rec.indexBuffer.size() >= 3 && !branches.empty()) {
+        std::vector<SpatialOrientationHint> plateauSkipSkinHints;
+        for (const auto& h : impl_->spatialOrientationHints) {
+            if (h.kind == 2 && h.skin_layer_count > 0 && h.weight > 0.0f) {
+                plateauSkipSkinHints.push_back(h);
+            }
+        }
+
+        auto fineEikAccP = fineEikGrid.getConstAccessor();
+        openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+            fineEikSamplerP(fineEikAccP, fineEikGrid.transform());
+        const float fineTauValidLimit =
+            fineEikGrid.background() - std::max(0.5f * fineVoxelSize, 0.5f);
+
+        auto coarseEikAccP = eikGrid.getConstAccessor();
+        openvdb::tools::GridSampler<openvdb::FloatGrid::ConstAccessor, openvdb::tools::BoxSampler>
+            coarseEikSamplerP(coarseEikAccP, eikGrid.transform());
+
+        auto branchConstAcc = branchGrid.getConstAccessor();
+
+        auto sampleTauAndGradWith = [&](auto& eikSamplerRef,
+                                        float samplerVoxelSize,
+                                        float samplerValidLimit,
+                                        const openvdb::Vec3d& wpSurf,
+                                        const openvdb::Vec3d& wpIn,
+                                        float inOffset,
+                                        float& outTau,
+                                        openvdb::Vec3f& outGradUnit) -> bool {
+            const float tIn = eikSamplerRef.wsSample(wpIn);
+            if (!std::isfinite(tIn) || tIn >= samplerValidLimit) {
+                return false;
+            }
+            const double hStep = 0.5 * static_cast<double>(samplerVoxelSize);
+            const float gx = eikSamplerRef.wsSample(wpIn + openvdb::Vec3d(hStep, 0.0, 0.0)) -
+                             eikSamplerRef.wsSample(wpIn - openvdb::Vec3d(hStep, 0.0, 0.0));
+            const float gy = eikSamplerRef.wsSample(wpIn + openvdb::Vec3d(0.0, hStep, 0.0)) -
+                             eikSamplerRef.wsSample(wpIn - openvdb::Vec3d(0.0, hStep, 0.0));
+            const float gz = eikSamplerRef.wsSample(wpIn + openvdb::Vec3d(0.0, 0.0, hStep)) -
+                             eikSamplerRef.wsSample(wpIn - openvdb::Vec3d(0.0, 0.0, hStep));
+            const openvdb::Vec3f g(
+                gx / static_cast<float>(2.0 * hStep),
+                gy / static_cast<float>(2.0 * hStep),
+                gz / static_cast<float>(2.0 * hStep));
+            const float gLen = g.length();
+            if (!std::isfinite(gLen) || gLen < 0.20f || gLen > 4.0f) {
+                return false;
+            }
+            outGradUnit = g / gLen;
+            const float tSurf = eikSamplerRef.wsSample(wpSurf);
+            outTau = (std::isfinite(tSurf) && tSurf < samplerValidLimit)
+                ? tSurf
+                : (tIn + inOffset * gLen);
+            return std::isfinite(outTau);
+        };
+
+        const float branchTauTol = std::max(0.25f * fineVoxelSize, 0.08f);
+        auto resolveBranchForSample = [&](const openvdb::Vec3d& wpIn,
+                                          const openvdb::Vec3d& wpSurf,
+                                          float tauTri) -> int {
+            if (branches.size() == 1) {
+                const auto& mb0 = branches[0];
+                if (tauTri >= mb0.tauStart - branchTauTol &&
+                    tauTri <= mb0.tauEnd + branchTauTol) {
+                    return 0;
+                }
+                return -1;
+            }
+            auto checkCandidate = [&](int cand) -> bool {
+                if (cand < 0 || static_cast<std::size_t>(cand) >= branches.size()) {
+                    return false;
+                }
+                const auto& mb = branches[static_cast<std::size_t>(cand)];
+                return (tauTri >= mb.tauStart - branchTauTol &&
+                        tauTri <= mb.tauEnd + branchTauTol);
+            };
+            const openvdb::Coord cIn = eikGrid.transform().worldToIndexCellCentered(wpIn);
+            int bId = branchConstAcc.getValue(cIn);
+            if (checkCandidate(bId)) {
+                return bId;
+            }
+            const openvdb::Coord cSurf = eikGrid.transform().worldToIndexCellCentered(wpSurf);
+            bId = branchConstAcc.getValue(cSurf);
+            if (checkCandidate(bId)) {
+                return bId;
+            }
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        const int cand = branchConstAcc.getValue(cIn.offsetBy(dx, dy, dz));
+                        if (checkCandidate(cand)) {
+                            return cand;
+                        }
+                    }
+                }
+            }
+            return -1;
+        };
+
+        constexpr float kPlateauBinMm = 0.02f;
+        constexpr float kCos5Deg = 0.9961947f;
+        std::vector<std::unordered_map<int, std::pair<double, double>>> branchHistBins(branches.size());
+
+        auto recordSample = [&](const openvdb::Vec3f& pSample,
+                                const openvdb::Vec3f& nTri,
+                                float subArea) {
+            if (!plateauSkipSkinHints.empty()) {
+                for (const auto& ih : plateauSkipSkinHints) {
+                    const float dx = pSample.x() - ih.position_bed[0];
+                    const float dy = pSample.y() - ih.position_bed[1];
+                    const float dz = pSample.z() - ih.position_bed[2];
+                    const float rad = std::max(ih.influence_radius_mm, 1.5f * fineVoxelSize);
+                    const float distSq = dx * dx + dy * dy + dz * dz;
+                    const float normalDist =
+                        dx * ih.direction_bed[0] +
+                        dy * ih.direction_bed[1] +
+                        dz * ih.direction_bed[2];
+                    const float maxNormalOffset = std::max(2.5f * fineVoxelSize, 0.25f * rad);
+                    const float dotDir =
+                        nTri.x() * ih.direction_bed[0] +
+                        nTri.y() * ih.direction_bed[1] +
+                        nTri.z() * ih.direction_bed[2];
+                    if (distSq <= rad * rad &&
+                        std::abs(normalDist) <= maxNormalOffset &&
+                        dotDir >= 0.85f) {
+                        return;
+                    }
+                }
+            }
+
+            const openvdb::Vec3d wpSurf(pSample.x(), pSample.y(), pSample.z());
+            const float inOffset = 0.5f * fineVoxelSize;
+            const openvdb::Vec3d wpIn(
+                wpSurf.x() - static_cast<double>(inOffset) * static_cast<double>(nTri.x()),
+                wpSurf.y() - static_cast<double>(inOffset) * static_cast<double>(nTri.y()),
+                wpSurf.z() - static_cast<double>(inOffset) * static_cast<double>(nTri.z()));
+
+            const float sdfIn = sdfSurfaceSampler.wsSample(wpIn);
+            if (!std::isfinite(sdfIn) || sdfIn >= 0.0f) {
+                return;
+            }
+
+            float tauTri = 0.0f;
+            openvdb::Vec3f nTau(0.0f, 0.0f, 1.0f);
+            bool ok = sampleTauAndGradWith(
+                fineEikSamplerP, fineVoxelSize, fineTauValidLimit,
+                wpSurf, wpIn, inOffset, tauTri, nTau);
+            if (!ok && useDualGridExtraction) {
+                ok = sampleTauAndGradWith(
+                    coarseEikSamplerP, voxelSize, validTauLimit,
+                    wpSurf, wpIn, inOffset, tauTri, nTau);
+            }
+            if (!ok || nTri.dot(nTau) < kCos5Deg) {
+                return;
+            }
+
+            const int bId = resolveBranchForSample(wpIn, wpSurf, tauTri);
+            if (bId < 0 || static_cast<std::size_t>(bId) >= branches.size()) {
+                return;
+            }
+            const auto& mb = branches[static_cast<std::size_t>(bId)];
+            const float sTri = mb.tauToArcS(std::clamp(tauTri, mb.tauStart, mb.tauEnd));
+            const int binIdx = static_cast<int>(std::floor(sTri / kPlateauBinMm));
+            auto& entry = branchHistBins[static_cast<std::size_t>(bId)][binIdx];
+            entry.first += static_cast<double>(subArea);
+            entry.second += static_cast<double>(subArea) * static_cast<double>(sTri);
+        };
+
+        const std::size_t numVertsBuf = rec.vertexBuffer.size();
+        for (std::size_t t = 0; t + 2 < rec.indexBuffer.size(); t += 3) {
+            const std::uint32_t i0 = rec.indexBuffer[t + 0];
+            const std::uint32_t i1 = rec.indexBuffer[t + 1];
+            const std::uint32_t i2 = rec.indexBuffer[t + 2];
+            if (i0 >= numVertsBuf || i1 >= numVertsBuf || i2 >= numVertsBuf) {
+                continue;
+            }
+            const auto& rv0 = rec.vertexBuffer[i0];
+            const auto& rv1 = rec.vertexBuffer[i1];
+            const auto& rv2 = rec.vertexBuffer[i2];
+            const openvdb::Vec3f p0(rv0.x, rv0.y, rv0.z);
+            const openvdb::Vec3f p1(rv1.x, rv1.y, rv1.z);
+            const openvdb::Vec3f p2(rv2.x, rv2.y, rv2.z);
+            const openvdb::Vec3f crossN = (p1 - p0).cross(p2 - p0);
+            const float twiceArea = crossN.length();
+            if (!std::isfinite(twiceArea) || twiceArea <= 2.0e-6f) {
+                continue;
+            }
+            const float area = 0.5f * twiceArea;
+            const openvdb::Vec3f nTri = crossN / twiceArea;
+
+            if (area <= 1.0f) {
+                recordSample((p0 + p1 + p2) * (1.0f / 3.0f), nTri, area);
+            } else {
+                const int nDiv = std::clamp(static_cast<int>(std::ceil(std::sqrt(area))), 2, 6);
+                const float invN = 1.0f / static_cast<float>(nDiv);
+                const float subArea = area / static_cast<float>(nDiv * nDiv);
+                for (int i = 0; i < nDiv; ++i) {
+                    for (int j = 0; j < nDiv - i; ++j) {
+                        const float u1 = (static_cast<float>(i) + 1.0f / 3.0f) * invN;
+                        const float v1 = (static_cast<float>(j) + 1.0f / 3.0f) * invN;
+                        const float w1 = 1.0f - u1 - v1;
+                        recordSample(p0 * w1 + p1 * u1 + p2 * v1, nTri, subArea);
+                        if (i + j + 1 < nDiv) {
+                            const float u2 = (static_cast<float>(i) + 2.0f / 3.0f) * invN;
+                            const float v2 = (static_cast<float>(j) + 2.0f / 3.0f) * invN;
+                            const float w2 = 1.0f - u2 - v2;
+                            recordSample(p0 * w2 + p1 * u2 + p2 * v2, nTri, subArea);
+                        }
+                    }
+                }
+            }
+        }
+
+        const float outerWTarget = std::max(0.20f, impl_->shellPathSpec.outer_wall_width.target_mm);
+        const float minPlateauAreaMm2 = std::max(2.0f, 6.0f * outerWTarget * outerWTarget);
+        struct BinAccum {
+            int bin = 0;
+            double area = 0.0;
+            double weightedS = 0.0;
+        };
+
+        for (std::size_t b = 0; b < branches.size(); ++b) {
+            if (branchHistBins[b].empty()) {
+                continue;
+            }
+            std::vector<BinAccum> sortedBins;
+            sortedBins.reserve(branchHistBins[b].size());
+            for (const auto& [bin, val] : branchHistBins[b]) {
+                if (val.first > 1.0e-7) {
+                    sortedBins.push_back(BinAccum{bin, val.first, val.second});
+                }
+            }
+            std::sort(sortedBins.begin(), sortedBins.end(), [](const BinAccum& a, const BinAccum& c) {
+                return a.bin < c.bin;
+            });
+
+            std::size_t idx = 0;
+            while (idx < sortedBins.size()) {
+                double clusterArea = sortedBins[idx].area;
+                double clusterWeightedS = sortedBins[idx].weightedS;
+                int prevBin = sortedBins[idx].bin;
+                ++idx;
+                while (idx < sortedBins.size()) {
+                    const double clusterS = clusterWeightedS / clusterArea;
+                    const double currS = sortedBins[idx].weightedS / sortedBins[idx].area;
+                    if (sortedBins[idx].bin - prevBin <= 3 || std::abs(currS - clusterS) <= 0.06) {
+                        clusterArea += sortedBins[idx].area;
+                        clusterWeightedS += sortedBins[idx].weightedS;
+                        prevBin = sortedBins[idx].bin;
+                        ++idx;
+                    } else {
+                        break;
+                    }
+                }
+                if (clusterArea >= static_cast<double>(minPlateauAreaMm2)) {
+                    branchPlateaus[b].push_back(BranchPlateau{
+                        static_cast<float>(clusterWeightedS / clusterArea),
+                        static_cast<float>(clusterArea),
+                    });
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
     // 4. Bidirectional Layer Relaxation Solver per Branch
     // ------------------------------------------------------------------------
     // Keep parent/child branch boundaries anchored at the exact topological saddle
@@ -5684,18 +5963,52 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
     // - Root branches emit their first layer at s_0 = hFirst (is_first_layer = true).
     // - Non-root branches start their interval at s_0 = 0 (which is the parent's junction layer,
     //   already emitted by the parent branch) and emit layers k = 1 .. N_b.
-    // - Leaf branches anchor their final layer at s_{N_b} = L_b - hTop (is_top_layer = true).
+    // - Flat leaf branches anchor their final layer at s_{N_b} = sTopPlateau - plateauEpsMm
+    //   (pointed/curved leaf peaks remain at L_b - hTop), with is_top_layer = true.
+    // - Internal flat isosurface-parallel plateaus get greedy intermediate pins strictly
+    //   when both adjacent intervals cleanly satisfy [hMin, hMax] without violating slope limits.
     // - Internal branches anchor their final layer at the junction s_{N_b} = L_b.
-    for (auto& mb : branches) {
+    const float plateauEpsMm = std::clamp(0.020f, 0.008f, 0.15f * hMin);
+    const float hPinMinFloor = (hMin < 0.10f && hTarget >= 0.16f) ? 0.10f : hMin;
+    const float hPinMin = std::min(hTarget, std::max(hPinMinFloor, 0.60f * hTarget));
+    const float hPinMax = std::max(hTarget, std::min(hMax, 1.40f * hTarget));
+    const float minDTauPerStepSafe = (hMin < 0.10f && hTarget >= 0.16f) ? 0.115f : 0.0f;
+    const float leafTopWindowOffset = std::clamp(
+        std::max(0.65f * hMin, 0.35f * voxelSize),
+        0.12f,
+        0.45f);
+
+    for (std::size_t bIdx = 0; bIdx < branches.size(); ++bIdx) {
+        auto& mb = branches[bIdx];
         const float L = mb.totalArcLengthMm;
         if (L <= 1.0e-4f) {
             continue;
         }
 
         const float sStart = mb.isRoot ? std::min(hFirst, 0.50f * L) : 0.0f;
-        const float sEnd = mb.isLeaf
-            ? std::max(sStart, L - std::min(hTop, 0.50f * L))
+        bool hasFlatLeafTop = false;
+        float flatTopSMm = L;
+        if (mb.isLeaf && !branchPlateaus[bIdx].empty()) {
+            const float leafTopWindowS = L - leafTopWindowOffset;
+            float bestTopArea = 0.0f;
+            for (const auto& bp : branchPlateaus[bIdx]) {
+                if (bp.sMm >= leafTopWindowS && bp.areaMm2 > bestTopArea) {
+                    bestTopArea = bp.areaMm2;
+                    flatTopSMm = std::min(L, bp.sMm);
+                    hasFlatLeafTop = true;
+                }
+            }
+        }
+
+        float sEnd = mb.isLeaf
+            ? (hasFlatLeafTop
+                   ? std::max(sStart, flatTopSMm - plateauEpsMm)
+                   : std::max(sStart, L - std::min(hTop, 0.50f * L)))
             : L;
+        if (mb.isRoot && mb.isLeaf && hasFlatLeafTop && L <= hFirst + plateauEpsMm) {
+            sEnd = std::max(sStart, L - std::min(hTop, 0.50f * L));
+            hasFlatLeafTop = false;
+        }
         const float spanS = std::max(0.0f, sEnd - sStart);
 
         // Very thin branch case: always emit the anchor layer so no branch is ever dropped
@@ -5712,42 +6025,135 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             continue;
         }
 
-        const int nMin = std::max(1, static_cast<int>(std::ceil(spanS / hMax - 1.0e-5f)));
-        const int nMax = std::max(1, static_cast<int>(std::floor(spanS / hMin + 1.0e-5f)));
-        const int nIdeal = std::max(1, static_cast<int>(std::round(spanS / hTarget)));
-        const int N = (nMin <= nMax) ? std::clamp(nIdeal, nMin, nMax) : nIdeal;
-
-        std::vector<float> sNodes(static_cast<std::size_t>(N) + 1, 0.0f);
-        for (int k = 0; k <= N; ++k) {
-            const float u = static_cast<float>(k) / static_cast<float>(N);
-            sNodes[k] = sStart + u * spanS;
-        }
-
-        // Bidirectional (forward bottom-up + backward top-down) Gauss-Seidel relaxation
-        // accounting for local gradient variations so physical thickness errors are evenly
-        // distributed across the entire branch while strictly respecting [hMin, hMax].
-        if (N >= 2) {
-            for (int iter = 0; iter < 40; ++iter) {
-                // Forward pass: k = 1 .. N - 1 (bottom-up from bed/junction toward peak)
-                for (int k = 1; k < N; ++k) {
-                    const float sMid = 0.5f * (sNodes[k - 1] + sNodes[k + 1]);
-                    const float lo = std::max(sNodes[k - 1] + hMin, sNodes[k + 1] - hMax);
-                    const float hi = std::min(sNodes[k - 1] + hMax, sNodes[k + 1] - hMin);
-                    sNodes[k] = (lo <= hi) ? std::clamp(sMid, lo, hi) : sMid;
+        auto canTileSubinterval = [&](float a, float b) -> bool {
+            const float span = b - a;
+            if (span < hPinMin - 1.0e-4f) {
+                return false;
+            }
+            const int nMin = std::max(1, static_cast<int>(std::ceil(span / hPinMax - 1.0e-5f)));
+            const int nMax = static_cast<int>(std::floor(span / hPinMin + 1.0e-5f));
+            if (nMin > nMax) {
+                return false;
+            }
+            const int nIdeal = std::clamp(
+                std::max(1, static_cast<int>(std::round(span / hTarget))),
+                nMin,
+                nMax);
+            const float stepMean = span / static_cast<float>(nIdeal);
+            if (stepMean < hPinMin - 1.0e-4f || stepMean > hPinMax + 1.0e-4f) {
+                return false;
+            }
+            const float tauA = mb.arcSToTau(a);
+            const float tauB = mb.arcSToTau(b);
+            float gMinLoc = 1.0f, gMeanLoc = 1.0f, gMaxLoc = 1.0f;
+            mb.queryGradRange(tauA, tauB, gMinLoc, gMeanLoc, gMaxLoc);
+            if (gMaxLoc > 0.20f) {
+                const float worstMinStep = (tauB - tauA) / (static_cast<float>(nIdeal) * gMaxLoc);
+                if (worstMinStep < 0.70f * hMin) {
+                    return false;
                 }
+            }
+            if (minDTauPerStepSafe > 0.0f) {
+                const float meanDTau = (tauB - tauA) / static_cast<float>(nIdeal);
+                if (meanDTau < minDTauPerStepSafe) {
+                    return false;
+                }
+            }
+            return true;
+        };
 
-                // Backward pass: k = N - 1 .. 1 (top-down from peak/junction toward bed)
-                for (int k = N - 1; k >= 1; --k) {
-                    const float sMid = 0.5f * (sNodes[k - 1] + sNodes[k + 1]);
-                    const float lo = std::max(sNodes[k - 1] + hMin, sNodes[k + 1] - hMax);
-                    const float hi = std::min(sNodes[k - 1] + hMax, sNodes[k + 1] - hMin);
-                    sNodes[k] = (lo <= hi) ? std::clamp(sMid, lo, hi) : sMid;
+        std::vector<float> anchors = {sStart, sEnd};
+
+        if (!branchPlateaus[bIdx].empty()) {
+            std::vector<BranchPlateau> sortedPlateaus = branchPlateaus[bIdx];
+            std::sort(
+                sortedPlateaus.begin(),
+                sortedPlateaus.end(),
+                [](const BranchPlateau& a, const BranchPlateau& c) {
+                    if (std::abs(a.areaMm2 - c.areaMm2) > 1.0e-3f) {
+                        return a.areaMm2 > c.areaMm2;
+                    }
+                    return a.sMm < c.sMm;
+                });
+
+            const float minAnchorSep = std::max(hPinMin, 0.50f * hTarget);
+            for (const auto& bp : sortedPlateaus) {
+                if (hasFlatLeafTop && bp.sMm >= L - leafTopWindowOffset) {
+                    continue;
+                }
+                const float sPin = bp.sMm - plateauEpsMm;
+                if (sPin <= sStart + hPinMin || sPin >= sEnd - hPinMin) {
+                    continue;
+                }
+                bool tooClose = false;
+                for (const float a : anchors) {
+                    if (std::abs(sPin - a) < minAnchorSep) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                if (tooClose) {
+                    continue;
+                }
+                auto upperIt = std::upper_bound(anchors.begin(), anchors.end(), sPin);
+                if (upperIt == anchors.begin() || upperIt == anchors.end()) {
+                    continue;
+                }
+                const float nextAnchor = *upperIt;
+                const float prevAnchor = *(upperIt - 1);
+                if (canTileSubinterval(prevAnchor, sPin) &&
+                    canTileSubinterval(sPin, nextAnchor)) {
+                    anchors.insert(upperIt, sPin);
                 }
             }
         }
 
-        const int kFirstEmit = mb.isRoot ? 0 : 1;
-        for (int k = kFirstEmit; k <= N; ++k) {
+        std::vector<float> sNodes;
+        sNodes.push_back(anchors.front());
+        for (std::size_t segIdx = 0; segIdx + 1 < anchors.size(); ++segIdx) {
+            const float segA = anchors[segIdx];
+            const float segB = anchors[segIdx + 1];
+            const float segSpan = std::max(0.0f, segB - segA);
+
+            const int nMin = std::max(1, static_cast<int>(std::ceil(segSpan / hMax - 1.0e-5f)));
+            const int nMax = std::max(1, static_cast<int>(std::floor(segSpan / hMin + 1.0e-5f)));
+            const int nIdeal = std::max(1, static_cast<int>(std::round(segSpan / hTarget)));
+            const int segN = (nMin <= nMax) ? std::clamp(nIdeal, nMin, nMax) : nIdeal;
+
+            std::vector<float> segNodes(static_cast<std::size_t>(segN) + 1, 0.0f);
+            for (int k = 0; k <= segN; ++k) {
+                const float u = static_cast<float>(k) / static_cast<float>(segN);
+                segNodes[k] = segA + u * segSpan;
+            }
+
+            // Bidirectional (forward bottom-up + backward top-down) Gauss-Seidel relaxation
+            // accounting for local gradient variations so physical thickness errors are evenly
+            // distributed across each sub-interval while strictly respecting [hMin, hMax].
+            if (segN >= 2) {
+                for (int iter = 0; iter < 40; ++iter) {
+                    for (int k = 1; k < segN; ++k) {
+                        const float sMid = 0.5f * (segNodes[k - 1] + segNodes[k + 1]);
+                        const float lo = std::max(segNodes[k - 1] + hMin, segNodes[k + 1] - hMax);
+                        const float hi = std::min(segNodes[k - 1] + hMax, segNodes[k + 1] - hMin);
+                        segNodes[k] = (lo <= hi) ? std::clamp(sMid, lo, hi) : sMid;
+                    }
+                    for (int k = segN - 1; k >= 1; --k) {
+                        const float sMid = 0.5f * (segNodes[k - 1] + segNodes[k + 1]);
+                        const float lo = std::max(segNodes[k - 1] + hMin, segNodes[k + 1] - hMax);
+                        const float hi = std::min(segNodes[k - 1] + hMax, segNodes[k + 1] - hMin);
+                        segNodes[k] = (lo <= hi) ? std::clamp(sMid, lo, hi) : sMid;
+                    }
+                }
+            }
+
+            for (int k = 1; k <= segN; ++k) {
+                sNodes.push_back(segNodes[k]);
+            }
+        }
+
+        const std::size_t totalN = sNodes.size() - 1;
+        const std::size_t kFirstEmit = mb.isRoot ? 0 : 1;
+        for (std::size_t k = kFirstEmit; k <= totalN; ++k) {
             const float sCurr = sNodes[k];
             const float sPrev = (k == 0) ? 0.0f : sNodes[k - 1];
             const float tauCurr = mb.arcSToTau(sCurr);
@@ -5761,7 +6167,7 @@ SelectedIsosurfacesResult SlicerBackend::selectSlicingIsosurfaces(
             const float rawMinH = (gMaxLocal > 1.0e-4f) ? (dTau / gMaxLocal) : meanH;
             const float rawMaxH = (gMinLocal > 1.0e-4f) ? (dTau / gMinLocal) : meanH;
             const bool isFirst = (mb.isRoot && k == 0);
-            const bool isTop = (mb.isLeaf && k == N);
+            const bool isTop = (mb.isLeaf && k == totalN);
 
             const float hiClamp = std::max(2.0f * hMax, meanH);
             const float minH = isFirst ? meanH : std::clamp(std::min(rawMinH, meanH), 0.02f, meanH);

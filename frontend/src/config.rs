@@ -1323,6 +1323,11 @@ pub struct SlicingProcessConfig {
     /// a single perimeter (`OuterWall` only, with `InnerWall`s replaced by `SolidInfill`), while
     /// deeper conformal patch layers ($m < N_p$) retain the configured `inner_wall_count`.
     pub one_perimeter_on_conformal_patches: bool,
+    /// When true (default), lifts exposed top-surface `InnerWall`, `SolidInfill`, and `GapFill`
+    /// extrusions along the local nozzle axis $\hat{\mathbf{z}}_{\text{nozzle}}$ toward the CAD
+    /// surface (capped at `layer_height.max_mm`) and scales bead height/volume to compensate,
+    /// smoothing shallow non-conformal slopes and recessed top ledges.
+    pub enable_top_surface_lofting: bool,
     /// When true (default) on multi-axis tools (`has_rotational_axes`), outer surfaces (outer walls
     /// and outermost conformal skin layers) orient the tool parallel (or within `outer_surface_parallel_angle_deg`)
     /// to the outward surface normal if reachable; otherwise they fall back to the isosurface normal.
@@ -1379,6 +1384,7 @@ impl Default for SlicingProcessConfig {
             conformal_skin_min_oblique_deg: 12.0,
             conformal_skin_max_slope_deg: 60.0,
             one_perimeter_on_conformal_patches: true,
+            enable_top_surface_lofting: true,
             orient_outer_surfaces_to_normal: true,
             outer_surface_parallel_angle_deg: 15.0,
             color_mixing: crate::color_optics::ColorMixingConfig::default(),
@@ -3808,6 +3814,15 @@ pub const PARAMETER_DOCS: &[ParameterDoc] = &[
         details: "Eliminates multiple concentric inner-wall rings around cutouts and edges on the visible exterior conformal skin surface while keeping full inner walls on deeper patch layers (m < N).",
     },
     ParameterDoc {
+        key: "slicing.enable_top_surface_lofting",
+        category: "Shell & Toolpath Generation",
+        title: "Top-Surface Lofting",
+        units: "bool",
+        default_value: "true",
+        summary: "Lifts exposed top-surface InnerWall, SolidInfill, and GapFill extrusions along the local nozzle axis toward the CAD surface and scales bead height/volume to compensate.",
+        details: "On non-conformal layers, vertices not covered by the next layer (such as shallow slopes just above the conformal cap angle or recessed top ledges) are lifted along the local nozzle axis (z_nozzle) up to layer_height.max_mm while tapering smoothly into the next layer's perimeter and respecting conformal skin caps.",
+    },
+    ParameterDoc {
         key: "slicing.orient_outer_surfaces_to_normal",
         category: "Shell & Toolpath Generation",
         title: "Orient Tool to Outer Surface Normal (Multi-Axis)",
@@ -4937,6 +4952,7 @@ mod tests {
         assert!(lookup_parameter_doc("slicing.conformal_skin_min_oblique_deg").is_some());
         assert!(lookup_parameter_doc("slicing.conformal_skin_max_slope_deg").is_some());
         assert!(lookup_parameter_doc("slicing.one_perimeter_on_conformal_patches").is_some());
+        assert!(lookup_parameter_doc("slicing.enable_top_surface_lofting").is_some());
         let md = generate_parameter_docs_markdown();
         assert!(md.starts_with("# Manifold2 Parameter Reference"));
         assert!(md.contains("gcode.swell_multipliers"));

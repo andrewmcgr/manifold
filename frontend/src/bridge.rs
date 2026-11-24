@@ -294,6 +294,10 @@ pub mod ffi {
         pub outer_surface_parallel_angle_deg: f32,
         /// Brick-layer perimeter staggering mode (`0 = Standard`, `1 = LateralSeamStagger`, `2 = VerticalHalfLayer`, `3 = CombinedLateralAndVertical`).
         pub brick_layer_mode: u8,
+        /// When true, lifts exposed top-surface InnerWall, SolidInfill, and GapFill extrusions along
+        /// the local nozzle axis toward the CAD surface (up to `LayerHeightConfig.max_mm`), increasing
+        /// bead height and extrusion volume to smooth shallow non-conformal top slopes.
+        pub enable_top_surface_lofting: bool,
     }
 
     /// A single 3D vertex along a continuous non-planar extrusion toolpath.

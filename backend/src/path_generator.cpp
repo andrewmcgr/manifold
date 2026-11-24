@@ -1,4 +1,5 @@
 #include "path_generator.h"
+#include "eikonal_solver.h"
 
 #include <algorithm>
 #include <array>
@@ -9,6 +10,7 @@
 #include <memory>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -2874,7 +2876,76 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
         {defaultNozzleAxisBed[0], defaultNozzleAxisBed[1], defaultNozzleAxisBed[2]},
         {0.0f, 0.0f, 1.0f});
 
+    const bool enableTopSurfaceLofting = spec.enable_top_surface_lofting;
     const std::size_t numLayers = selectedLayers.layers.size();
+
+    // Precompute layer metadata and conformal skin spatial index for Top-Surface Lofting
+    // so core layers never loft into an overlying conformal skin cap and non-conformal
+    // layers know the exact isovalue spacing to Layer k+1.
+    std::vector<bool> isConformalSkinFlags(numLayers, false);
+    bool anyConformalSkinLayer = false;
+    for (std::size_t k = 0; k < numLayers; ++k) {
+        const auto& info = selectedLayers.layers[k];
+        const bool uniform = (std::abs(info.max_thickness_mm - info.min_thickness_mm) <= 1.0e-4f);
+        const bool isSkin = uniform && info.is_top_layer && !info.is_first_layer;
+        isConformalSkinFlags[k] = isSkin;
+        anyConformalSkinLayer = anyConformalSkinLayer || isSkin;
+    }
+
+    std::vector<bool> hasNextNonConformalLayer(numLayers, false);
+    std::vector<float> nextLayerDeltaTau(numLayers, 0.0f);
+    for (std::size_t k = 0; k < numLayers; ++k) {
+        if (isConformalSkinFlags[k]) {
+            continue;
+        }
+        const auto& cur = selectedLayers.layers[k];
+        const float minCrossBranchDt = 0.5f * std::max(0.02f, cur.mean_thickness_mm);
+        float bestSameBranch = std::numeric_limits<float>::max();
+        float bestAnyBranch = std::numeric_limits<float>::max();
+        for (std::size_t j = 0; j < numLayers; ++j) {
+            if (j == k || isConformalSkinFlags[j]) {
+                continue;
+            }
+            const auto& oth = selectedLayers.layers[j];
+            const float dt = oth.isovalue - cur.isovalue;
+            if (dt <= 1.0e-4f) {
+                continue;
+            }
+            if (oth.branch_id == cur.branch_id && dt < bestSameBranch) {
+                bestSameBranch = dt;
+            }
+            if (dt >= minCrossBranchDt && dt < bestAnyBranch) {
+                bestAnyBranch = dt;
+            }
+        }
+        if (bestSameBranch < std::numeric_limits<float>::max()) {
+            hasNextNonConformalLayer[k] = true;
+            nextLayerDeltaTau[k] = bestSameBranch;
+        } else if (!cur.is_top_layer && bestAnyBranch < std::numeric_limits<float>::max()) {
+            hasNextNonConformalLayer[k] = true;
+            nextLayerDeltaTau[k] = bestAnyBranch;
+        }
+    }
+
+    const float skinVetoCell = std::max(1.0f, 2.0f * hMax);
+    const float invSkinVetoCell = 1.0f / skinVetoCell;
+    std::unordered_map<GridKey3D, std::vector<Vec3f>, GridKey3DHash> skinVertBuckets;
+    if (enableTopSurfaceLofting && anyConformalSkinLayer) {
+        const float invDedupCell = 1.0f / 0.35f;
+        std::unordered_set<GridKey3D, GridKey3DHash> seenSkinDedup;
+        for (std::size_t k = 0; k < numLayers; ++k) {
+            if (!isConformalSkinFlags[k]) {
+                continue;
+            }
+            for (const auto& rv : selectedLayers.layers[k].vertices) {
+                const Vec3f v{rv.x, rv.y, rv.z};
+                if (seenSkinDedup.insert(toGridKey(v, invDedupCell)).second) {
+                    skinVertBuckets[toGridKey(v, invSkinVetoCell)].push_back(v);
+                }
+            }
+        }
+    }
+
     std::vector<LayerToolpaths> perLayerResults(numLayers);
     std::atomic<std::size_t> completedLayers{0};
 
@@ -5645,6 +5716,48 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     : (isConformalSkinLayer
                         ? (-0.04f * meanLayerH)
                         : -(0.5f * outerW.min_mm));
+                auto sampleSolidInfillExcessSdf = [&](const Vec3f& p) -> float {
+                    const float phiShifted = sampleShiftedSdfForShell(p);
+                    if (isConformalSkinLayer) {
+                        return phiShifted - maxSolidInfillSdf;
+                    }
+                    const float latMargin = 0.5f * outerW.min_mm;
+                    if (phiShifted <= -latMargin) {
+                        return phiShifted + latMargin;
+                    }
+                    if (phiShifted > 0.03f * meanLayerH) {
+                        return phiShifted;
+                    }
+                    const Vec3f zNoz = sampleNozzleAxis(p);
+                    const float hGrad = 0.5f * voxelSize;
+                    const Vec3f nSurf = normalize3(
+                        {sampleSdf({p.x + hGrad, p.y, p.z}) - sampleSdf({p.x - hGrad, p.y, p.z}),
+                         sampleSdf({p.x, p.y + hGrad, p.z}) - sampleSdf({p.x, p.y - hGrad, p.z}),
+                         sampleSdf({p.x, p.y, p.z + hGrad}) - sampleSdf({p.x, p.y, p.z - hGrad})},
+                        zNoz);
+                    const float cNoz = dot3(nSurf, zNoz);
+                    const float hTipMargin = (cNoz > 0.0f)
+                        ? std::min(latMargin, beadTipSupportDistance(cNoz, outerW.min_mm, meanLayerH))
+                        : latMargin;
+                    const float topTol = (cNoz > 0.70f) ? (0.015f * meanLayerH) : 0.0f;
+                    float excess = phiShifted + hTipMargin - topTol;
+                    if (cNoz > 0.50f) {
+                        const Vec3f pDown = p - (zNoz * (latMargin + 0.10f));
+                        const Vec3f nDown = normalize3(
+                            {sampleSdf({pDown.x + hGrad, pDown.y, pDown.z}) -
+                                 sampleSdf({pDown.x - hGrad, pDown.y, pDown.z}),
+                             sampleSdf({pDown.x, pDown.y + hGrad, pDown.z}) -
+                                 sampleSdf({pDown.x, pDown.y - hGrad, pDown.z}),
+                             sampleSdf({pDown.x, pDown.y, pDown.z + hGrad}) -
+                                 sampleSdf({pDown.x, pDown.y, pDown.z - hGrad})},
+                            zNoz);
+                        if (dot3(nDown, zNoz) > -0.50f) {
+                            const float latExcess = sampleShiftedSdfForShell(pDown) + latMargin;
+                            excess = std::max(excess, latExcess);
+                        }
+                    }
+                    return excess;
+                };
 
                 std::vector<float> negDRem(nV, 0.0f);
                 std::vector<float> remOneSidedSpan(nV, 0.0f);
@@ -5696,8 +5809,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                     for (const auto& ch : gapChains) {
                         const auto gatedChains = reclipAndRefineChainToSdf(
                             ch,
-                            maxSolidInfillSdf,
-                            sampleShiftedSdfForShell);
+                            0.0f,
+                            sampleSolidInfillExcessSdf);
                         for (const auto& gch : gatedChains) {
                             ExtrusionPath ep{};
                             if (finalizeExtrusionPath(
@@ -5782,7 +5895,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 (phiDownProbe < sparseCoreSdfThresh) ||
                                 (phiProbe <= sparseCoreSdfThresh);
                             const bool marchingTowardOuterWall =
-                                (phiProbe > maxSolidInfillSdf) ||
+                                (sampleSolidInfillExcessSdf(pProbe) > 0.0f) ||
                                 (-phiDownProbe < wTargetSumConfig && phiDownProbe > phiDown0 + 0.02f);
                             if (!overOrEnteringSparse || marchingTowardOuterWall) {
                                 return;
@@ -5854,7 +5967,7 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 }
 
                                 const float phiCand = sampleShiftedSdfForShell(pCand);
-                                if (phiCand > maxSolidInfillSdf) {
+                                if (sampleSolidInfillExcessSdf(pCand) > 0.0f) {
                                     break;
                                 }
                                 const float phiDownCand =
@@ -5947,8 +6060,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             for (const auto& ch : passChains) {
                                 const auto gatedChains = reclipAndRefineChainToSdf(
                                     ch,
-                                    maxSolidInfillSdf,
-                                    sampleShiftedSdfForShell);
+                                    0.0f,
+                                    sampleSolidInfillExcessSdf);
                                 for (const auto& gch : gatedChains) {
                                     ExtrusionPath ep{};
                                     if (finalizeExtrusionPath(
@@ -5972,8 +6085,8 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                             layerOut.paths,
                             infillAngleDeg,
                             kFeatureSolidInfill,
-                            maxSolidInfillSdf,
-                            sampleShiftedSdfForShell,
+                            0.0f,
+                            sampleSolidInfillExcessSdf,
                             anchorSolidEndpointsToSparseRibs);
                     }
                 }
@@ -6175,6 +6288,495 @@ ObjectToolpathsResult generateShellToolpathsForLayers(
                                 }
                             }
                         }
+                    }
+                }
+
+                // Top-Surface Lofting for exposed OuterWall rims, InnerWall, SolidInfill, and GapFill:
+                // Lifts top-exposed beads along each point's local nozzle axis \hat{z}_nozzle toward
+                // the CAD surface (\phi_sdf = -H_tip) while scaling height_mm (up to min(hMax, width_mm))
+                // so extruded volume increases cleanly on shallow non-conformal slopes and recessed ledges.
+                if (enableTopSurfaceLofting &&
+                    !isConformalSkinLayer &&
+                    !layerInfo.is_first_layer &&
+                    !layerOut.paths.empty()) {
+                    auto smoothstep01 = [](float e0, float e1, float x) -> float {
+                        const float denom = e1 - e0;
+                        if (denom <= 1.0e-6f) {
+                            return (x >= e1) ? 1.0f : 0.0f;
+                        }
+                        const float t = std::clamp((x - e0) / denom, 0.0f, 1.0f);
+                        return t * t * (3.0f - 2.0f * t);
+                    };
+
+                    std::vector<Vec3f> unsupGuardVerts;
+                    if (anyUnsupported || anyWaveOverhang) {
+                        for (std::size_t i = 0; i < nV; ++i) {
+                            if (isUnsupported[i] || isWaveOverhang[i]) {
+                                unsupGuardVerts.push_back(shellMesh.verts[i].pos);
+                            }
+                        }
+                    }
+                    const float unsupLoftGuardRad = 1.5f * outerW.target_mm;
+                    const float unsupLoftGuardRadSq = unsupLoftGuardRad * unsupLoftGuardRad;
+
+                    auto isUnderConformalSkin = [&](const Vec3f& p,
+                                                    const Vec3f& zNoz,
+                                                    float hNext,
+                                                    float w) -> bool {
+                        if (skinVertBuckets.empty()) {
+                            return false;
+                        }
+                        const Vec3f q = p + (zNoz * (0.5f * hNext));
+                        const GridKey3D ck = toGridKey(q, invSkinVetoCell);
+                        const float maxLatSq = (1.25f * w) * (1.25f * w);
+                        const float minDz = -0.15f * hMax;
+                        const float maxDz = hMax + 1.5f * meanLayerH;
+                        for (int dzKey = -1; dzKey <= 1; ++dzKey) {
+                            for (int dyKey = -1; dyKey <= 1; ++dyKey) {
+                                for (int dxKey = -1; dxKey <= 1; ++dxKey) {
+                                    const GridKey3D nk{ck.ix + dxKey, ck.iy + dyKey, ck.iz + dzKey};
+                                    auto it = skinVertBuckets.find(nk);
+                                    if (it == skinVertBuckets.end()) {
+                                        continue;
+                                    }
+                                    for (const Vec3f& sv : it->second) {
+                                        const Vec3f d = sv - p;
+                                        const float dz = dot3(d, zNoz);
+                                        if (dz > minDz && dz < maxDz) {
+                                            const float latSq = lengthSq3(d - (zNoz * dz));
+                                            if (latSq < maxLatSq) {
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return false;
+                    };
+
+                    auto computeNextLayerStep = [&](const Vec3f& p, float h0) -> float {
+                        if (hasNextNonConformalLayer[layerIdx]) {
+                            const float dTau = nextLayerDeltaTau[layerIdx];
+                            if (isUniformThicknessLayer) {
+                                return std::clamp(dTau, layerMinH, 2.0f * hMax);
+                            }
+                            const float g = sampleEikGradNorm(p);
+                            return (g > 0.20f)
+                                ? std::clamp(dTau / g, layerMinH, 2.0f * hMax)
+                                : meanLayerH;
+                        }
+                        return std::max(meanLayerH, std::max(0.05f, hMax - h0));
+                    };
+
+                    auto sampleTopSdfNormal = [&](const Vec3f& pSurf, const Vec3f& zNoz) -> Vec3f {
+                        const float h = 0.5f * voxelSize;
+                        const Vec3f q = pSurf + (zNoz * (0.15f * voxelSize));
+                        const float gx = sampleSdf({q.x + h, q.y, q.z}) - sampleSdf({q.x - h, q.y, q.z});
+                        const float gy = sampleSdf({q.x, q.y + h, q.z}) - sampleSdf({q.x, q.y - h, q.z});
+                        const float gz = sampleSdf({q.x, q.y, q.z + h}) - sampleSdf({q.x, q.y, q.z - h});
+                        return normalize3({gx, gy, gz}, zNoz);
+                    };
+
+                    auto evalRawLoftDeltaH = [&](const ToolpathPoint& pt, bool isOuterWall) -> float {
+                        if (isOuterWall && pt.uses_surface_normal) {
+                            return 0.0f;
+                        }
+                        const Vec3f p{pt.x, pt.y, pt.z};
+                        const Vec3f zNoz = normalize3({pt.nx, pt.ny, pt.nz}, fallbackNozzle);
+                        const float h0 = std::max(0.02f, pt.height_mm);
+                        const float w = std::max(0.05f, pt.width_mm);
+                        const float hCap = std::min(hMax, w);
+                        const float maxLiftByHeight = hCap - h0;
+                        if (maxLiftByHeight <= 0.005f) {
+                            return 0.0f;
+                        }
+                        if (!unsupGuardVerts.empty()) {
+                            for (const Vec3f& up : unsupGuardVerts) {
+                                if (lengthSq3(p - up) <= unsupLoftGuardRadSq) {
+                                    return 0.0f;
+                                }
+                            }
+                        }
+                        const float phi0 = sampleSdf(p);
+                        if (phi0 >= -0.005f) {
+                            return 0.0f;
+                        }
+                        const float hNext = computeNextLayerStep(p, h0);
+                        if (isUnderConformalSkin(p, zNoz, hNext, w)) {
+                            return 0.0f;
+                        }
+                        const float phiNext = sampleSdf(p + (zNoz * hNext));
+                        if (phiNext <= 0.0f) {
+                            return 0.0f;
+                        }
+
+                        float lo = 0.0f;
+                        float hi = hNext;
+                        for (int iter = 0; iter < 6; ++iter) {
+                            const float mid = 0.5f * (lo + hi);
+                            if (sampleSdf(p + (zNoz * mid)) <= 0.0f) {
+                                lo = mid;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        const float dzCad = 0.5f * (lo + hi);
+                        const Vec3f pSurf = p + (zNoz * dzCad);
+
+                        const Vec3f nTop = sampleTopSdfNormal(pSurf, zNoz);
+                        const float cTop = dot3(nTop, zNoz);
+                        const float minCTop = isOuterWall ? 0.70f : 0.45f;
+                        const float fullCTop = isOuterWall ? 0.85f : 0.60f;
+                        if (cTop <= minCTop) {
+                            return 0.0f;
+                        }
+                        const float wSlope = smoothstep01(minCTop, fullCTop, cTop);
+
+                        const float alphaIsoRad =
+                            std::clamp(pt.tool_iso_angle_deg, 0.0f, 90.0f) *
+                            (3.14159265358979323846f / 180.0f);
+                        const float rawFlatNozzleDz = isOuterWall
+                            ? (nozzleDiameterMm * std::sin(alphaIsoRad) * (1.0f - std::cos(alphaIsoRad)))
+                            : 0.0f;
+                        const float outerVdbMargin = isOuterWall ? 0.015f : 0.0f;
+
+                        float dzGeom = std::min(dzCad, maxLiftByHeight);
+                        for (int iter = 0; iter < 2; ++iter) {
+                            const float hEff = std::min(hCap, h0 + dzGeom);
+                            const float hTip = beadTipSupportDistance(cTop, w, hEff);
+                            const float dzFlatNozzle =
+                                isOuterWall ? std::min(rawFlatNozzleDz, 0.45f * hEff) : 0.0f;
+                            dzGeom = std::clamp(
+                                dzCad - (hTip / std::max(cTop, minCTop)) - dzFlatNozzle - outerVdbMargin,
+                                0.0f,
+                                maxLiftByHeight);
+                        }
+                        if (dzGeom <= 0.005f) {
+                            return 0.0f;
+                        }
+
+                        if (isOuterWall) {
+                            const float hGrad = 0.5f * voxelSize;
+                            auto sampleRawSdfNormal = [&](const Vec3f& q) -> Vec3f {
+                                const float gx = sampleSdf({q.x + hGrad, q.y, q.z}) -
+                                                 sampleSdf({q.x - hGrad, q.y, q.z});
+                                const float gy = sampleSdf({q.x, q.y + hGrad, q.z}) -
+                                                 sampleSdf({q.x, q.y - hGrad, q.z});
+                                const float gz = sampleSdf({q.x, q.y, q.z + hGrad}) -
+                                                 sampleSdf({q.x, q.y, q.z - hGrad});
+                                return normalize3({gx, gy, gz}, zNoz);
+                            };
+                            auto isOuterWallLiftSafe = [&](float dz) -> bool {
+                                const float hEff = std::min(hCap, h0 + dz);
+                                const float dzFlatNozzle = std::min(rawFlatNozzleDz, 0.45f * hEff);
+                                const Vec3f q = p + (zNoz * (dz + dzFlatNozzle));
+                                const float phiQ = sampleSdf(q);
+                                const Vec3f nQ = sampleRawSdfNormal(q);
+                                const float hTipQ = beadTipSupportDistance(dot3(nQ, zNoz), w, hEff);
+                                if (phiQ > -hTipQ - 0.010f) {
+                                    return false;
+                                }
+                                const Vec3f qBelow = q - (zNoz * (0.25f * hEff));
+                                const Vec3f nQBelow = sampleRawSdfNormal(qBelow);
+                                const float cBelow = dot3(nQBelow, zNoz);
+                                if (cBelow < 0.50f) {
+                                    const float hTipBelow = beadTipSupportDistance(cBelow, w, hEff);
+                                    if (sampleSdf(qBelow) > -hTipBelow + 0.015f) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            };
+                            if (!isOuterWallLiftSafe(dzGeom)) {
+                                float loSafe = 0.0f;
+                                float hiSafe = dzGeom;
+                                for (int iter = 0; iter < 5; ++iter) {
+                                    const float mid = 0.5f * (loSafe + hiSafe);
+                                    if (isOuterWallLiftSafe(mid)) {
+                                        loSafe = mid;
+                                    } else {
+                                        hiSafe = mid;
+                                    }
+                                }
+                                dzGeom = loSafe;
+                                if (dzGeom <= 0.005f) {
+                                    return 0.0f;
+                                }
+                            }
+                        }
+
+                        const float sTop = std::sqrt(std::max(0.0f, 1.0f - cTop * cTop));
+                        const float dSlope = phiNext / std::max(sTop, 0.08f);
+                        const float phiAbove = sampleSdf(pSurf + (zNoz * (0.65f * w)));
+                        if (phiAbove <= 0.0f) {
+                            return 0.0f;
+                        }
+                        const float dClear = std::min(dSlope, phiAbove);
+                        const float wExp = smoothstep01(0.0f, 0.45f * w, dClear);
+                        return dzGeom * wSlope * wExp;
+                    };
+
+                    auto lerpLoftPt = [](const ToolpathPoint& a,
+                                         const ToolpathPoint& b,
+                                         float t) -> ToolpathPoint {
+                        ToolpathPoint m{};
+                        m.x = a.x + (b.x - a.x) * t;
+                        m.y = a.y + (b.y - a.y) * t;
+                        m.z = a.z + (b.z - a.z) * t;
+                        const Vec3f n = normalize3(
+                            {a.nx + (b.nx - a.nx) * t,
+                             a.ny + (b.ny - a.ny) * t,
+                             a.nz + (b.nz - a.nz) * t},
+                            {a.nx, a.ny, a.nz});
+                        m.nx = n.x;
+                        m.ny = n.y;
+                        m.nz = n.z;
+                        m.width_mm = a.width_mm + (b.width_mm - a.width_mm) * t;
+                        m.height_mm = a.height_mm + (b.height_mm - a.height_mm) * t;
+                        m.tool_iso_angle_deg =
+                            a.tool_iso_angle_deg + (b.tool_iso_angle_deg - a.tool_iso_angle_deg) * t;
+                        m.uses_surface_normal = (t < 0.5f) ? a.uses_surface_normal : b.uses_surface_normal;
+                        m.sdf_mm = a.sdf_mm + (b.sdf_mm - a.sdf_mm) * t;
+                        return m;
+                    };
+
+                    auto tpDist = [](const ToolpathPoint& a, const ToolpathPoint& b) -> float {
+                        const float dx = b.x - a.x;
+                        const float dy = b.y - a.y;
+                        const float dz = b.z - a.z;
+                        return std::sqrt(dx * dx + dy * dy + dz * dz);
+                    };
+
+                    const float nearTopSdf = -(hMax + 1.25f * meanLayerH);
+                    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+                    float maxLoftSlopeRad = 40.4f * kDegToRad;
+                    if (activeTool != nullptr) {
+                        const float alphaClearRad =
+                            ToolClearanceConstraint::computeMaxClearanceSlopeRad(*activeTool);
+                        const float effectiveClearRad = toolHasRotationalAxes
+                            ? std::min(alphaClearRad + maxToolTiltRad, 40.4f * kDegToRad)
+                            : std::min(alphaClearRad, 40.4f * kDegToRad);
+                        maxLoftSlopeRad = std::clamp(effectiveClearRad, 8.0f * kDegToRad, 40.4f * kDegToRad);
+                    }
+                    const float maxLoftSlopeRate = std::tan(maxLoftSlopeRad);
+
+                    auto computeLoftEdgeSteps = [&](const ToolpathPoint& a,
+                                                    const ToolpathPoint& b,
+                                                    float& outMaxFwd,
+                                                    float& outMaxBwd) {
+                        const Vec3f d{b.x - a.x, b.y - a.y, b.z - a.z};
+                        const float ds = length3(d);
+                        const Vec3f zAvg = normalize3(
+                            {a.nx + b.nx, a.ny + b.ny, a.nz + b.nz},
+                            fallbackNozzle);
+                        const float dzBase = dot3(d, zAvg);
+                        const float dsLat = length3(d - (zAvg * dzBase));
+                        const float dzTotalMax = maxLoftSlopeRate * dsLat;
+                        outMaxFwd = std::min(maxLoftSlopeRate * ds, std::max(0.0f, dzTotalMax - dzBase));
+                        outMaxBwd = std::min(maxLoftSlopeRate * ds, std::max(0.0f, dzTotalMax + dzBase));
+                    };
+
+                    for (auto& path : layerOut.paths) {
+                        const bool eligibleOuterWall =
+                            (path.feature_kind == kFeatureOuterWall);
+                        const bool eligibleInnerWall =
+                            (path.feature_kind == kFeatureInnerWall &&
+                             path.wall_index > 0 &&
+                             path.wall_index <= layerNumInnerWalls);
+                        const bool eligibleInfill =
+                            (path.feature_kind == kFeatureSolidInfill ||
+                             path.feature_kind == kFeatureGapFill);
+                        if ((!eligibleOuterWall && !eligibleInnerWall && !eligibleInfill) ||
+                            path.points.size() < 2) {
+                            continue;
+                        }
+
+                        const std::size_t nPts = path.points.size();
+                        const std::size_t numEdges = path.is_closed ? nPts : (nPts - 1);
+                        std::vector<std::uint8_t> edgeNearTop(numEdges, 0);
+                        bool anyNearTop = false;
+                        for (std::size_t e = 0; e < numEdges; ++e) {
+                            const ToolpathPoint& a = path.points[e];
+                            const ToolpathPoint& b = path.points[(e + 1) % nPts];
+                            const Vec3f pA{a.x, a.y, a.z};
+                            const Vec3f pB{b.x, b.y, b.z};
+                            if (sampleSdf(pA) > nearTopSdf ||
+                                sampleSdf(pB) > nearTopSdf) {
+                                edgeNearTop[e] = 1;
+                                anyNearTop = true;
+                                continue;
+                            }
+                            const float edgeLen = dist3(pA, pB);
+                            if (edgeLen > 0.50f) {
+                                const int nProbe = std::max(2, static_cast<int>(std::ceil(edgeLen / 0.60f)));
+                                for (int s = 1; s < nProbe; ++s) {
+                                    const float t = static_cast<float>(s) / static_cast<float>(nProbe);
+                                    if (sampleSdf(lerp3(pA, pB, t)) > nearTopSdf) {
+                                        edgeNearTop[e] = 1;
+                                        anyNearTop = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (!anyNearTop) {
+                            continue;
+                        }
+
+                        std::vector<ToolpathPoint> densePts;
+                        std::vector<std::uint8_t> wasInserted;
+                        densePts.reserve(nPts * 2);
+                        wasInserted.reserve(nPts * 2);
+                        for (std::size_t e = 0; e < numEdges; ++e) {
+                            const ToolpathPoint& a = path.points[e];
+                            const ToolpathPoint& b = path.points[(e + 1) % nPts];
+                            densePts.push_back(a);
+                            wasInserted.push_back(0);
+                            if (edgeNearTop[e] != 0) {
+                                const float edgeLen = tpDist(a, b);
+                                const float avgW = 0.5f * (a.width_mm + b.width_mm);
+                                const float maxStep = std::max(0.25f, 0.65f * avgW);
+                                if (edgeLen > maxStep) {
+                                    const int nSub = static_cast<int>(std::ceil(edgeLen / maxStep));
+                                    for (int s = 1; s < nSub; ++s) {
+                                        const float t = static_cast<float>(s) / static_cast<float>(nSub);
+                                        densePts.push_back(lerpLoftPt(a, b, t));
+                                        wasInserted.push_back(1);
+                                    }
+                                }
+                            }
+                        }
+                        if (!path.is_closed) {
+                            densePts.push_back(path.points.back());
+                            wasInserted.push_back(0);
+                        }
+
+                        const std::size_t mPts = densePts.size();
+                        if (mPts < 2) {
+                            continue;
+                        }
+                        std::vector<float> rawLift(mPts, 0.0f);
+                        float maxRawLift = 0.0f;
+                        for (std::size_t i = 0; i < mPts; ++i) {
+                            const float dh = evalRawLoftDeltaH(densePts[i], eligibleOuterWall);
+                            rawLift[i] = dh;
+                            if (dh > maxRawLift) {
+                                maxRawLift = dh;
+                            }
+                        }
+                        if (maxRawLift < 0.008f) {
+                            continue;
+                        }
+
+                        std::vector<float> deltaH = rawLift;
+                        if (mPts >= 3) {
+                            std::vector<float> smoothed(mPts, 0.0f);
+                            for (int pass = 0; pass < 2; ++pass) {
+                                if (path.is_closed) {
+                                    for (std::size_t i = 0; i < mPts; ++i) {
+                                        const std::size_t iPrev = (i + mPts - 1) % mPts;
+                                        const std::size_t iNext = (i + 1) % mPts;
+                                        const float val =
+                                            0.25f * deltaH[iPrev] +
+                                            0.50f * deltaH[i] +
+                                            0.25f * deltaH[iNext];
+                                        smoothed[i] = std::min(val, rawLift[i]);
+                                    }
+                                } else {
+                                    smoothed[0] = std::min(
+                                        0.75f * deltaH[0] + 0.25f * deltaH[1],
+                                        rawLift[0]);
+                                    for (std::size_t i = 1; i + 1 < mPts; ++i) {
+                                        const float val =
+                                            0.25f * deltaH[i - 1] +
+                                            0.50f * deltaH[i] +
+                                            0.25f * deltaH[i + 1];
+                                        smoothed[i] = std::min(val, rawLift[i]);
+                                    }
+                                    smoothed[mPts - 1] = std::min(
+                                        0.75f * deltaH[mPts - 1] + 0.25f * deltaH[mPts - 2],
+                                        rawLift[mPts - 1]);
+                                }
+                                deltaH.swap(smoothed);
+                            }
+                        }
+
+                        // Slope-rate limit transitions using active tool clearance slope so combined base + loft
+                        // ramps climb smoothly without spikes and strictly respect nozzle clearance limits.
+                        if (path.is_closed) {
+                            for (int pass = 0; pass < 2; ++pass) {
+                                for (std::size_t i = 0; i < mPts; ++i) {
+                                    const std::size_t j = (i + 1) % mPts;
+                                    float maxFwd = 0.0f, maxBwd = 0.0f;
+                                    computeLoftEdgeSteps(densePts[i], densePts[j], maxFwd, maxBwd);
+                                    deltaH[j] = std::min(deltaH[j], deltaH[i] + maxFwd);
+                                }
+                                for (std::size_t k = mPts; k > 0; --k) {
+                                    const std::size_t j = k % mPts;
+                                    const std::size_t i = k - 1;
+                                    float maxFwd = 0.0f, maxBwd = 0.0f;
+                                    computeLoftEdgeSteps(densePts[i], densePts[j], maxFwd, maxBwd);
+                                    deltaH[i] = std::min(deltaH[i], deltaH[j] + maxBwd);
+                                }
+                            }
+                        } else {
+                            for (std::size_t i = 0; i + 1 < mPts; ++i) {
+                                float maxFwd = 0.0f, maxBwd = 0.0f;
+                                computeLoftEdgeSteps(densePts[i], densePts[i + 1], maxFwd, maxBwd);
+                                deltaH[i + 1] = std::min(deltaH[i + 1], deltaH[i] + maxFwd);
+                            }
+                            for (std::size_t i = mPts - 1; i > 0; --i) {
+                                float maxFwd = 0.0f, maxBwd = 0.0f;
+                                computeLoftEdgeSteps(densePts[i - 1], densePts[i], maxFwd, maxBwd);
+                                deltaH[i - 1] = std::min(deltaH[i - 1], deltaH[i] + maxBwd);
+                            }
+                        }
+
+                        for (std::size_t i = 0; i < mPts; ++i) {
+                            if (deltaH[i] > 1.0e-4f) {
+                                ToolpathPoint& pt = densePts[i];
+                                const Vec3f zNoz = normalize3({pt.nx, pt.ny, pt.nz}, fallbackNozzle);
+                                const float hCap = std::min(hMax, std::max(0.05f, pt.width_mm));
+                                pt.x += deltaH[i] * zNoz.x;
+                                pt.y += deltaH[i] * zNoz.y;
+                                pt.z += deltaH[i] * zNoz.z;
+                                pt.height_mm = std::min(hCap, pt.height_mm + deltaH[i]);
+                                pt.sdf_mm = sampleSdf({pt.x, pt.y, pt.z});
+                            }
+                        }
+
+                        rust::Vec<ToolpathPoint> outPts;
+                        outPts.reserve(mPts);
+                        for (std::size_t i = 0; i < mPts; ++i) {
+                            const std::size_t prevIdx = (i > 0) ? (i - 1) : (path.is_closed ? (mPts - 1) : 0);
+                            const std::size_t nextIdx = (i + 1 < mPts) ? (i + 1) : (path.is_closed ? 0 : (mPts - 1));
+                            if (wasInserted[i] != 0 &&
+                                deltaH[i] <= 1.0e-4f &&
+                                deltaH[prevIdx] <= 1.0e-4f &&
+                                deltaH[nextIdx] <= 1.0e-4f) {
+                                continue;
+                            }
+                            outPts.push_back(densePts[i]);
+                        }
+                        if (outPts.size() >= 2) {
+                            path.points = std::move(outPts);
+                        } else {
+                            path.points.clear();
+                            path.points.reserve(mPts);
+                            for (const auto& pt : densePts) {
+                                path.points.push_back(pt);
+                            }
+                        }
+
+                        float newTotalLen = 0.0f;
+                        for (std::size_t i = 0; i + 1 < path.points.size(); ++i) {
+                            newTotalLen += tpDist(path.points[i], path.points[i + 1]);
+                        }
+                        if (path.is_closed && path.points.size() >= 2) {
+                            newTotalLen += tpDist(path.points.back(), path.points.front());
+                        }
+                        path.total_length_mm = newTotalLen;
                     }
                 }
 

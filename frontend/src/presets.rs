@@ -859,6 +859,7 @@ pub struct ProcessPreset {
     #[serde(default)]
     pub brick_layer_mode: BrickLayerMode,
     pub one_perimeter_on_conformal_patches: bool,
+    pub enable_top_surface_lofting: bool,
     pub orient_outer_surfaces_to_normal: bool,
     pub outer_surface_parallel_angle_deg: f32,
     pub wall_print_order: WallPrintOrder,
@@ -965,6 +966,7 @@ impl ProcessPreset {
             inner_wall_count: cfg.slicing.inner_wall_count,
             brick_layer_mode: cfg.slicing.brick_layer_mode,
             one_perimeter_on_conformal_patches: cfg.slicing.one_perimeter_on_conformal_patches,
+            enable_top_surface_lofting: cfg.slicing.enable_top_surface_lofting,
             orient_outer_surfaces_to_normal: cfg.slicing.orient_outer_surfaces_to_normal,
             outer_surface_parallel_angle_deg: cfg.slicing.outer_surface_parallel_angle_deg,
             wall_print_order: cfg.gcode.wall_print_order,
@@ -1048,6 +1050,7 @@ impl ProcessPreset {
         cfg.slicing.inner_wall_count = self.inner_wall_count;
         cfg.slicing.brick_layer_mode = self.brick_layer_mode;
         cfg.slicing.one_perimeter_on_conformal_patches = self.one_perimeter_on_conformal_patches;
+        cfg.slicing.enable_top_surface_lofting = self.enable_top_surface_lofting;
         cfg.slicing.orient_outer_surfaces_to_normal = self.orient_outer_surfaces_to_normal;
         cfg.slicing.outer_surface_parallel_angle_deg = self.outer_surface_parallel_angle_deg;
         cfg.gcode.wall_print_order = self.wall_print_order;
@@ -1163,6 +1166,7 @@ impl ProcessPreset {
             && self.brick_layer_mode == cfg.slicing.brick_layer_mode
             && self.one_perimeter_on_conformal_patches
                 == cfg.slicing.one_perimeter_on_conformal_patches
+            && self.enable_top_surface_lofting == cfg.slicing.enable_top_surface_lofting
             && self.orient_outer_surfaces_to_normal
                 == cfg.slicing.orient_outer_surfaces_to_normal
             && approx_eq(
