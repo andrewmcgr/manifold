@@ -1120,7 +1120,7 @@ void repairIntersectingVoxelSigns(
     const float kSeedMinMm = kIntersectRadiusMm + 1e-3f * voxelSize;
 
     // 26-connected offsets ordered face (6) -> edge (12) -> corner (8).
-    static constexpr std::array<openvdb::Coord, 26> kOffsets26{{
+    static const std::array<openvdb::Coord, 26> kOffsets26{{
         {1, 0, 0},   {-1, 0, 0},  {0, 1, 0},   {0, -1, 0},  {0, 0, 1},   {0, 0, -1},
         {1, 1, 0},   {1, -1, 0},  {-1, 1, 0},  {-1, -1, 0}, {1, 0, 1},   {1, 0, -1},
         {-1, 0, 1},  {-1, 0, -1}, {0, 1, 1},   {0, 1, -1},  {0, -1, 1},  {0, -1, -1},
