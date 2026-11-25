@@ -86,6 +86,30 @@ target_link_libraries(slicer_backend
         TBB::tbb
 )
 
+option(MANIFOLD_ENABLE_PCH "Enable precompiled headers for faster C++ rebuilds" ON)
+if(MANIFOLD_ENABLE_PCH AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.16")
+    target_precompile_headers(slicer_backend PRIVATE
+        <algorithm>
+        <array>
+        <atomic>
+        <cmath>
+        <cstdint>
+        <functional>
+        <limits>
+        <memory>
+        <queue>
+        <string>
+        <unordered_map>
+        <unordered_set>
+        <utility>
+        <vector>
+        <openvdb/openvdb.h>
+        <openvdb/tools/Interpolation.h>
+        <tbb/blocked_range.h>
+        <tbb/parallel_for.h>
+    )
+endif()
+
 install(TARGETS slicer_backend
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib

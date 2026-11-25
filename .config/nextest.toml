@@ -1,0 +1,12 @@
+[test-groups.heavy-backend]
+max-threads = 4
+
+[profile.default]
+slow-timeout = { period = "90s", terminate-after = 4 }
+
+[[profile.default.overrides]]
+filter = 'test(/^field_vis::tests::/) | test(/^cli::tests::test_(cli_headless|bracket_tilt|voron_cube)/) | test(/^io::tests::test_step_assembly/)'
+test-group = 'heavy-backend'
+
+[profile.fast]
+default-filter = 'not (test(/^field_vis::tests::/) | test(/^cli::tests::test_(cli_headless|bracket_tilt|voron_cube)/) | test(/^io::tests::test_step_assembly/))'

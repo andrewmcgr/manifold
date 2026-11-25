@@ -3249,7 +3249,8 @@ mod tests {
     #[test]
     fn test_cli_headless_slice_with_profile_json() {
         let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp_dir = std::env::temp_dir().join("manifold2_cli_test");
+        let tmp_dir =
+            std::env::temp_dir().join(format!("manifold2_cli_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&tmp_dir);
         let profile_path = tmp_dir.join("test_cli_profile.json");
         let gcode_path = tmp_dir.join("test_cli_out.gcode");
@@ -3317,12 +3318,14 @@ mod tests {
 
         let _ = fs::remove_file(&profile_path);
         let _ = fs::remove_file(&gcode_path);
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_cli_calibrate_em_pa_and_transient_subcommands() {
         let _guard = TEST_BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp_dir = std::env::temp_dir().join("manifold2_cli_calib_test");
+        let tmp_dir =
+            std::env::temp_dir().join(format!("manifold2_cli_calib_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&tmp_dir);
 
         let em_p3_path = tmp_dir.join("calib_em_p3.gcode");
@@ -3377,6 +3380,7 @@ mod tests {
         let _ = fs::remove_file(&em_p3_path);
         let _ = fs::remove_file(&pa_dual_path);
         let _ = fs::remove_file(&trans_p2_path);
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]

@@ -33,6 +33,20 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1.10"
 
-[profile.test]
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
 opt-level = 2
+debug = false
+
+[profile.test]
+opt-level = 1
+debug = "line-tables-only"
+lto = "off"
+
+[profile.test.package."*"]
+opt-level = 2
+debug = false
 

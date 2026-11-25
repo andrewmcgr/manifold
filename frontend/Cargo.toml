@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 build = "build.rs"
 
+[features]
+default = []
+dynamic = ["bevy/dynamic_linking"]
+
 [dependencies]
 cxx.workspace = true
 bytemuck.workspace = true

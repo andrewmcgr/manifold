@@ -9337,7 +9337,10 @@ mod tests {
         add_box(-12.0, 12.0, -8.0, 8.0, 1.2, 4.2);
         stl.push_str("endsolid benchy_hull\n");
 
-        let tmp_path = std::env::temp_dir().join("manifold_test_benchy_hull_infill_bounds.stl");
+        let tmp_path = std::env::temp_dir().join(format!(
+            "manifold_test_benchy_hull_infill_bounds_{}.stl",
+            std::process::id()
+        ));
         std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write temporary STL");
         let obj = crate::io::stl::load_stl_file(&tmp_path)
             .expect("Expected synthetic Benchy hull STL import to succeed");
@@ -9482,7 +9485,10 @@ mod tests {
         add_quad([cx1, cy0, 0.0], [cx1, cy1, 0.0], [cx1, cy1, cz1], [cx1, cy0, cz1]);
         stl.push_str("endsolid sloped_deck_with_cabin\n");
 
-        let tmp_path = std::env::temp_dir().join("manifold_test_conformal_skin_deck_cabin.stl");
+        let tmp_path = std::env::temp_dir().join(format!(
+            "manifold_test_conformal_skin_deck_cabin_{}.stl",
+            std::process::id()
+        ));
         std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write temporary STL");
         let obj = crate::io::stl::load_stl_file(&tmp_path)
             .expect("Expected synthetic sloped deck + cabin STL import to succeed");
@@ -9724,7 +9730,10 @@ mod tests {
         add_quad([10.0, -8.0, 4.0], [10.0, 8.0, 4.0], [10.0, 8.0, 8.0], [10.0, -8.0, 8.0]);
         stl.push_str("endsolid stepped_deck_sparse_anchor\n");
 
-        let tmp_path = std::env::temp_dir().join("manifold_test_stepped_deck_sparse_anchor.stl");
+        let tmp_path = std::env::temp_dir().join(format!(
+            "manifold_test_stepped_deck_sparse_anchor_{}.stl",
+            std::process::id()
+        ));
         std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write temporary STL");
         let obj = crate::io::stl::load_stl_file(&tmp_path)
             .expect("Expected synthetic stepped deck STL import to succeed");
@@ -9904,8 +9913,10 @@ mod tests {
         );
         stl.push_str("endsolid benchy_recessed_bow_deck\n");
 
-        let tmp_path =
-            std::env::temp_dir().join("manifold_test_benchy_recessed_bow_deck_clearance.stl");
+        let tmp_path = std::env::temp_dir().join(format!(
+            "manifold_test_benchy_recessed_bow_deck_clearance_{}.stl",
+            std::process::id()
+        ));
         std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write temporary STL");
         let obj = crate::io::stl::load_stl_file(&tmp_path)
             .expect("Expected synthetic Benchy recessed bow deck STL import to succeed");
@@ -10071,7 +10082,10 @@ mod tests {
         }
         stl.push_str("endsolid crowned_block\n");
 
-        let tmp_path = std::env::temp_dir().join("manifold_test_conformal_crowned_block.stl");
+        let tmp_path = std::env::temp_dir().join(format!(
+            "manifold_test_conformal_crowned_block_{}.stl",
+            std::process::id()
+        ));
         std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write crowned block STL");
         let obj = crate::io::stl::load_stl_file(&tmp_path).expect("Expected crowned block STL load");
         let _ = std::fs::remove_file(&tmp_path);
@@ -10326,7 +10340,10 @@ mod tests {
         }
         stl.push_str("endsolid sloped_roof_smokestack\n");
 
-        let tmp_path = std::env::temp_dir().join("manifold_test_sloped_roof_smokestack.stl");
+        let tmp_path = std::env::temp_dir().join(format!(
+            "manifold_test_sloped_roof_smokestack_{}.stl",
+            std::process::id()
+        ));
         std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write smokestack roof STL");
         let obj = crate::io::stl::load_stl_file(&tmp_path)
             .expect("Expected sloped roof smokestack STL load");
@@ -10938,7 +10955,10 @@ mod tests {
         }
         stl.push_str("endsolid flat_surface_with_single_boss\n");
 
-        let tmp_path = std::env::temp_dir().join("manifold_test_flat_surface_single_boss.stl");
+        let tmp_path = std::env::temp_dir().join(format!(
+            "manifold_test_flat_surface_single_boss_{}.stl",
+            std::process::id()
+        ));
         std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write flat+boss STL");
         let obj = crate::io::stl::load_stl_file(&tmp_path)
             .expect("Expected flat+boss STL load to succeed");
@@ -14248,7 +14268,10 @@ mod tests {
         );
         stl.push_str("endsolid conformal_cap_collar\n");
 
-        let tmp_path = std::env::temp_dir().join("manifold_test_conformal_cap_collar.stl");
+        let tmp_path = std::env::temp_dir().join(format!(
+            "manifold_test_conformal_cap_collar_{}.stl",
+            std::process::id()
+        ));
         std::fs::write(&tmp_path, stl.as_bytes()).expect("Failed to write temporary STL");
         let obj = crate::io::stl::load_stl_file(&tmp_path)
             .expect("Expected synthetic conformal cap collar STL import to succeed");
