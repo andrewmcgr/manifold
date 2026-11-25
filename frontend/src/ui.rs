@@ -2562,6 +2562,8 @@ pub fn ui_workspace_system(
                 .clicked()
             {
                 plate.add_plate(&mut object_transforms);
+                vis_state.dirty_planned_gcode = true;
+                vis_state.dirty_toolpaths_mesh = true;
             }
             if let Some(new_p_idx) = switch_to_plate {
                 plate.switch_active_plate(new_p_idx, &mut object_transforms);
@@ -2973,6 +2975,8 @@ pub fn ui_workspace_system(
                                     .clicked()
                                 {
                                     plate.add_plate(&mut object_transforms);
+                                    vis_state.dirty_planned_gcode = true;
+                                    vis_state.dirty_toolpaths_mesh = true;
                                 }
                                 if plate.plates.len() > 1
                                     && render_icon_button(
@@ -2988,11 +2992,23 @@ pub fn ui_workspace_system(
                                     .clicked()
                                 {
                                     let active_idx = plate.active_plate_index;
+                                    let removed_ids: Vec<u64> = plate
+                                        .objects
+                                        .iter()
+                                        .filter(|o| o.plate_index == active_idx)
+                                        .map(|o| o.object_id)
+                                        .collect();
+                                    for id in removed_ids {
+                                        vis_state.plate_unmixed_toolpaths.remove(&id);
+                                        vis_state.plate_mixed_toolpaths.remove(&id);
+                                    }
                                     plate.remove_plate(
                                         &mut commands,
                                         active_idx,
                                         &mut object_transforms,
                                     );
+                                    vis_state.dirty_planned_gcode = true;
+                                    vis_state.dirty_toolpaths_mesh = true;
                                 }
                             });
 
@@ -3018,6 +3034,8 @@ pub fn ui_workspace_system(
                             });
                             if let Some(new_p_idx) = switch_to_plate {
                                 plate.switch_active_plate(new_p_idx, &mut object_transforms);
+                                vis_state.dirty_planned_gcode = true;
+                                vis_state.dirty_toolpaths_mesh = true;
                                 let active_name = plate.active_plate_name().to_string();
                                 let active_cnt = plate.active_plate_object_count();
                                 plate.status_message = format!(
@@ -10859,6 +10877,7 @@ fn spawn_field_compute_task(
     ));
 
     let batch_count = batch.len();
+    let computed_ids: Vec<u64> = batch.iter().map(|(oid, _, _)| *oid).collect();
     let voxel_size = config.eikonal.voxel_size_mm;
     let narrow_band = config.eikonal.narrow_band_width_voxels as f32;
     let task = IoTaskPool::get().spawn(async move {
@@ -10887,7 +10906,7 @@ fn spawn_field_compute_task(
     } else {
         format!("'{object_name}'")
     };
-    vis_state.pending_field_task = Some((object_id, status_target.clone(), task));
+    vis_state.pending_field_task = Some((object_id, status_target.clone(), computed_ids, task));
     plate.status_message = format!(
         "Computing OpenVDB scalar fields for {status_target} in background (voxel {voxel_size:.2} mm)..."
     );
@@ -11038,9 +11057,12 @@ pub fn poll_io_tasks_system(
     }
 
     // 3. Poll pending background OpenVDB scalar field computation task
-    if let Some((obj_id, ref obj_name, ref mut task)) = vis_state.pending_field_task {
+    if let Some((obj_id, ref obj_name, ref computed_ids, ref mut task)) =
+        vis_state.pending_field_task
+    {
         if let Some(succeeded) = block_on(future::poll_once(task)) {
             let finished_name = obj_name.clone();
+            let finished_ids = computed_ids.clone();
             vis_state.pending_field_task = None;
             if succeeded {
                 if plate.selected_object_id == Some(obj_id) {
@@ -11052,7 +11074,7 @@ pub fn poll_io_tasks_system(
                     {
                         vis_state.active_field_name = vis_state.available_fields[0].clone();
                     }
-                    vis_state.mark_all_dirty();
+                    vis_state.mark_objects_dirty(&finished_ids);
                     vis_state.refresh_stats_for(obj_id);
                     if vis_state.show_selected_layers || vis_state.show_toolpaths {
                         let need_toolpaths = vis_state.show_toolpaths;
@@ -11064,6 +11086,11 @@ pub fn poll_io_tasks_system(
                             true,
                             need_toolpaths,
                         );
+                    }
+                } else {
+                    for id in &finished_ids {
+                        vis_state.plate_unmixed_toolpaths.remove(id);
+                        vis_state.plate_mixed_toolpaths.remove(id);
                     }
                 }
                 plate.status_message = format!(
@@ -11109,6 +11136,16 @@ pub fn poll_io_tasks_system(
                     plate.status_message = format!(
                         "Selected {num_layers} non-planar slicing isosurfaces."
                     );
+                }
+            } else {
+                for (oid, res) in plate_toolpaths {
+                    if crate::field_vis::is_valid_nonempty_toolpaths(&res) {
+                        vis_state.plate_unmixed_toolpaths.insert(oid, res);
+                        vis_state.plate_mixed_toolpaths.remove(&oid);
+                    } else {
+                        vis_state.plate_unmixed_toolpaths.remove(&oid);
+                        vis_state.plate_mixed_toolpaths.remove(&oid);
+                    }
                 }
             }
         }
